@@ -3,7 +3,7 @@
 #include "pulsar_engine_internal.h"
 #include "vit_encoder.h"
 #include "cuda/pulsar_cuda_fmha.h"
-#include "cuda/pulsar_cuda_qwen.h"   /* the rows front door's launchers (family-neutral) */
+#include "cuda/pulsar_cuda_rows.h"   /* the rows front door's launchers (family-neutral) */
 
 #include <math.h>
 

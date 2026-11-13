@@ -219,7 +219,7 @@ void server::watchdog_dump(int64_t stalled_s) {
                (long long)stalled_s, s->stall_limit_s, where ? where : "(none yet)", where_age,
                (unsigned long long)g_pulsar_stall.beats.load(std::memory_order_relaxed));
     /* memory: what MemAvailable, swap and the KV figures read now */
-    const uint64_t avail = server_mem_available_bytes();
+    const KvBytes avail = server_mem_available_bytes();
     uint64_t swap_total = 0, swap_free = 0;
     const meminfo_read rt = meminfo_kib("/proc/meminfo", "SwapTotal:", &swap_total);
     const meminfo_read rf = meminfo_kib("/proc/meminfo", "SwapFree:", &swap_free);
@@ -246,7 +246,7 @@ void server::watchdog_dump(int64_t stalled_s) {
                    s->n_queued, s->n_generating, server_judge_queued(s) ? ", a /v1/systemone request with the judge" : "",
                    (double)s->m_kv_touched.raw() / gib,
                    (double)s->m_kv_reserved.raw() / gib, (double)s->m_kv_budget.raw() / gib,
-                   (double)s->guard_touched_ceiling.raw() / gib, (double)avail / gib,
+                   (double)s->guard_touched_ceiling.raw() / gib, (double)avail.raw() / gib,
                    (double)server_mem_floor().raw() / gib, swap);
         for (int i = 0; i < s->n_slots; i++) {
             const int ph = s->m_slot_phase[i];

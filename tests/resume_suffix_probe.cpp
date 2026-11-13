@@ -67,7 +67,7 @@ int main(int argc, char **argv) {
     memset(&toks, 0, sizeof(toks));
     for (int i = 0; i < total; i++) {
         const int id = 1000 + (i * 7919) % 20000;
-        pulsar_tokens_push(&toks, id);
+        pulsar_tokens_push(&toks, TokId{id});
     }
 
     pulsar_session *s = NULL;

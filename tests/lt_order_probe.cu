@@ -1,6 +1,6 @@
 /** @file
  *  L381: does the fixed cuBLASLt GEMM still follow the accumulation order the in-place prompt kernel implements? */
-/* The dense EXL3 prompt arm (src/cuda/mmq/qwen_exl3_dense_prefill.cu) has two kernels with one set of bytes: the
+/* The dense EXL3 prompt arm (src/cuda/mmq/exl3_dense_prefill.cu) has two kernels with one set of bytes: the
  * fixed-algorithm cuBLASLt GEMM -- pulsar_lt_fixed_gemm(PULSAR_LT_A_KN, PULSAR_LT_PROMPT): fp16 W_q [K][N] times fp16
  * rows [M][K], f32 accumulate and output, ONE algorithm a shape (a recorded pick or the first suggestion at 4096
  * rows, split-K off) -- and, for small chunks, dense_inplace_kernel, which reads the trellis in place and accumulates

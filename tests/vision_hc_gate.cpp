@@ -57,12 +57,12 @@ int main(void) {
     {
         std::vector<uint16_t> carrier(carrier_bytes / 2, FILL);
         std::vector<uint16_t> back(carrier_bytes / 2, 0);
-        pulsar_gpu_tensor *d = pulsar_gpu_tensor_alloc(carrier_bytes);
+        pulsar_gpu_tensor *d = pulsar_gpu_tensor_alloc(TensorBytes{carrier_bytes});
         int bad = 0;
-        if (!d || !pulsar_gpu_tensor_write(d, 0, carrier.data(), carrier_bytes) ||
+        if (!d || !pulsar_gpu_tensor_write(d, TensorBytes{0}, carrier.data(), TensorBytes{carrier_bytes}) ||
             !gpu_graph_write_vision_span(d, rows.data(), n_rows, row0, n_tokens) ||
             !pulsar_gpu_end_commands() ||
-            !pulsar_gpu_tensor_read(d, 0, back.data(), carrier_bytes)) {
+            !pulsar_gpu_tensor_read(d, TensorBytes{0}, back.data(), TensorBytes{carrier_bytes})) {
             printf("FAIL launch/copy failed\n");
             failures++;
         } else {
@@ -101,7 +101,7 @@ int main(void) {
     {
         std::vector<uint16_t> carrier(carrier_bytes / 2, FILL);
         std::vector<uint16_t> back(carrier_bytes / 2, 0);
-        pulsar_gpu_tensor *d = pulsar_gpu_tensor_alloc(carrier_bytes);
+        pulsar_gpu_tensor *d = pulsar_gpu_tensor_alloc(TensorBytes{carrier_bytes});
         struct Refuse { const char *name; uint32_t rows_n, at, ntok; const uint16_t *r; bool want; };
         const Refuse cases[] = {
             {"span runs off the end",  n_rows, 7, n_tokens, rows.data(), false},
@@ -112,7 +112,8 @@ int main(void) {
         };
         int bad = 0;
         for (const Refuse &c : cases) {
-            if (!pulsar_gpu_tensor_write(d, 0, carrier.data(), carrier_bytes)) { bad++; break; }
+            if (!pulsar_gpu_tensor_write(d, TensorBytes{0}, carrier.data(),
+                                         TensorBytes{carrier_bytes})) { bad++; break; }
             const bool got = gpu_graph_write_vision_span(d, c.r, c.rows_n, c.at, c.ntok);
             pulsar_gpu_end_commands();
             if (got != c.want) {
@@ -122,7 +123,8 @@ int main(void) {
             }
             if (!got) {
                 /* a refused call must not have touched the carrier */
-                if (!pulsar_gpu_tensor_read(d, 0, back.data(), carrier_bytes)) { bad++; break; }
+                if (!pulsar_gpu_tensor_read(d, TensorBytes{0}, back.data(),
+                                            TensorBytes{carrier_bytes})) { bad++; break; }
                 for (size_t i = 0; i < back.size(); i++) {
                     if (back[i] != FILL) {
                         printf("FAIL %-24s wrote the carrier anyway (word %zu)\n", c.name, i);
@@ -131,7 +133,8 @@ int main(void) {
                     }
                 }
             } else {
-                if (!pulsar_gpu_tensor_read(d, 0, back.data(), carrier_bytes)) { bad++; break; }
+                if (!pulsar_gpu_tensor_read(d, TensorBytes{0}, back.data(),
+                                            TensorBytes{carrier_bytes})) { bad++; break; }
                 if (elem(back, c.at, 0, 0) != rows[0]) {
                     printf("FAIL %-24s did not write row %u\n", c.name, c.at);
                     bad++;
@@ -145,7 +148,7 @@ int main(void) {
 
     /* ---- an undersized carrier is refused, not overrun --------------------- */
     {
-        pulsar_gpu_tensor *small = pulsar_gpu_tensor_alloc(carrier_bytes - PULSAR_HC_ELT_SIZE);
+        pulsar_gpu_tensor *small = pulsar_gpu_tensor_alloc(TensorBytes{carrier_bytes - PULSAR_HC_ELT_SIZE});
         const bool got = small && gpu_graph_write_vision_span(small, rows.data(), n_rows, row0, n_tokens);
         if (!small || got) {
             printf("FAIL undersized carrier was accepted\n");

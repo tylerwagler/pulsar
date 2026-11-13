@@ -60,7 +60,7 @@
         if (err && errlen) snprintf(err, errlen, __VA_ARGS__); \
     } while (0)
 
-void pulsar_multiseq_step_stale(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows, uint32_t live,
+void pulsar_multiseq_step_stale(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows, BankId live,
                                 bool landed) {
     bool live_moved = !landed;   /* a failed sweep: no bank's state is known */
     for (uint32_t k = 0; !live_moved && k < n_rows; k++) live_moved = reqs[k].bank == live;
@@ -94,11 +94,11 @@ static int ds4_batch_step(pulsar_session *s, const pulsar_multiseq_req *reqs, ui
                           const char *what, char *err, size_t errlen) {
     pulsar_engine *e = s->engine;
     int32_t *pos = (int32_t *)xmalloc((size_t)n_rows * sizeof(*pos));
-    int32_t *bank = (int32_t *)xmalloc((size_t)n_rows * sizeof(*bank));
-    int *tokens = (int *)xmalloc((size_t)n_rows * sizeof(*tokens));
+    BankId *bank = (BankId *)xmalloc((size_t)n_rows * sizeof(*bank));
+    TokId *tokens = (TokId *)xmalloc((size_t)n_rows * sizeof(*tokens));
     for (uint32_t k = 0; k < n_rows; k++) {
         pos[k]    = reqs[k].pos.raw();   /* L334: the device rows stay raw */
-        bank[k]   = (int32_t)reqs[k].bank;
+        bank[k]   = reqs[k].bank;
         tokens[k] = reqs[k].token;
     }
     uint32_t headed = 0;

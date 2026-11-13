@@ -73,7 +73,7 @@ int main(int argc, char **argv) {
         std::string answer;
         bool stopped = false;
         for (int i = 0; i < max_new; i++) {
-            const int tok = pulsar_session_argmax(s);
+            const TokId tok = pulsar_session_argmax(s);
             if (pulsar_token_is_stop(e, tok)) { stopped = true; break; }
             size_t n = 0;
             char *piece = pulsar_token_text(e, tok, &n);

@@ -1,7 +1,7 @@
-/* family_inkling.cpp -- the Inkling family's server table (L294 E6; server_family_ops, chat_family.cpp's
+/* inkling_server.cpp -- the Inkling family's server table (L294 E6; server_family_ops, chat_family.cpp's
  * switch names it).
  *
- * Everything here is F5's frontend (src/lib/inkling_chat.h): the render is vLLM's native Inkling renderer
+ * Everything here is F5's frontend (src/families/inkling/inkling_chat.h): the render is vLLM's native Inkling renderer
  * (vllm/renderers/inkling_encoding.py) byte for byte, the effort map its _NAMED_REASONING_EFFORT and
  * _DEFAULT_REASONING_EFFORT, the output parser the kit in Inkling's configuration (vllm/parser/inkling.py), and
  * every suffix hook one of the renderer's own pieces -- so the prompt so far + a hook's bytes == the full render of
@@ -15,10 +15,10 @@
  * call the turn ends inside is broken (L272); a message's text parts arrive joined by the protocol parsers, so
  * they render as one text block where vLLM writes one block a part. */
 /** @file
- *  The Inkling family's server table (server_family_ops) over src/lib/inkling_chat.
+ *  The Inkling family's server table (server_family_ops) over src/families/inkling/inkling_chat.
  */
-#include "pulsar_server_internal.h"
-#include "../lib/inkling_chat.h"
+#include "server/pulsar_server_internal.h"
+#include "inkling_chat.h"
 
 #include <memory>
 #include <string>
@@ -345,6 +345,7 @@ static char *inkling_tool_defs_text(const char *lines, size_t len, char *err, si
     return ok ? server_xstrndup(out.text.data(), out.text.size()) : NULL;
 }
 
+/// Inkling's server table (registered below by SERVER_FAMILY; found by its chat format).
 const server_family_ops k_family_inkling = {
     /* .name                  = */ "Inkling",
     /* .format                = */ PULSAR_CHAT_INKLING,
@@ -362,3 +363,4 @@ const server_family_ops k_family_inkling = {
     /* .find_call_block       = */ inkling_find_call_block,
     /* .tool_defs_text        = */ inkling_tool_defs_text,
 };
+SERVER_FAMILY(k_family_inkling)

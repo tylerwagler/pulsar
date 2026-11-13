@@ -25,6 +25,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <vector>
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "../lib/pulsar_units.h"   /* L334 P2b S7b: StepRow / HeadRow */
 
 /** The rows one step heads into the logits slab -- also the widest verify (every bank's run together), so the
  *  depth of the declared state's verify capture (state_kinds.h PULSAR_STATE_VERIFY_ROWS) and the fused step's head
@@ -52,15 +56,38 @@ typedef enum {
 struct pulsar_driver_heads {
     /// rows headed, <= PULSAR_DRIVER_HEADS_MAX
     uint32_t n = 0;
-    /// [n] step-row index of each logits row, in logits-row order
-    uint32_t row[PULSAR_DRIVER_HEADS_MAX] = {};
+    /// [n] the step row of each logits row, in logits-row order (L334 P2b S7b: head row h is step row row[h])
+    StepRow row[PULSAR_DRIVER_HEADS_MAX] = {};
 };
 /** Step rows [row0, row0 + n). */
 /// @param row0 the first step row headed
 /// @param n    rows headed (n > PULSAR_DRIVER_HEADS_MAX keeps n but fills only the first PULSAR_DRIVER_HEADS_MAX;
 ///             the forward refuses it)
 /// @return the head list
-pulsar_driver_heads pulsar_driver_heads_span(uint32_t row0, uint32_t n);
+pulsar_driver_heads pulsar_driver_heads_span(StepRow row0, StepRows n);
+
+/** L334 P2b S7b: a step row as the index the step's arrays and kernels take (fatal on none()).
+ *  @param r the row */
+/// @return its index
+static inline uint32_t pulsar_row_index(StepRow r) { return (uint32_t)r.before().raw(); }
+/** A head row as the index of its logits row (fatal on none()).
+ *  @param h the row */
+/// @return its index
+static inline uint32_t pulsar_row_index(HeadRow h) { return (uint32_t)h.before().raw(); }
+/** Hazard (b), named: a verify's head row as a step row.  A verify's rows lead the step and every one is headed
+ *  (pulsar_driver_heads_span(0, n_dec)), so head row h IS step row h -- for h inside the verify, and only there; a
+ *  head row past it (a fused step's prompt-run heads) is no verify row, and is fatal here.
+ *  @param h     a head row of the step's verify
+ *  @param n_dec the step's decode / verify rows */
+/// @return the step row it heads
+static inline StepRow pulsar_verify_step_row(HeadRow h, uint32_t n_dec) {
+    if (h.is_none() || (uint32_t)h.raw() >= n_dec) {
+        fprintf(stderr, "pulsar: head row %d is not a verify row (the verify has %u): no step row by identity\n",
+                h.raw(), n_dec);
+        abort();
+    }
+    return StepRow{h.raw()};
+}
 
 struct pulsar_state_set;
 struct pulsar_imatrix_tap;
@@ -126,9 +153,9 @@ struct pulsar_driver_step {
     pulsar_step_mode mode;
     /// rows the step carries, <= pulsar_driver_state::max_rows
     uint32_t n_rows;
-    const int32_t *tokens;                ///< [n_rows] host token ids
+    const TokId *tokens;                  ///< [n_rows] host token ids
     const int32_t *pos;                   ///< [n_rows] host positions
-    const int32_t *bank;                  ///< [n_rows] host bank ids
+    const BankId *bank;                   ///< [n_rows] host bank ids
     /** L268: the family's per-row rope positions (pulsar_driver_ops::rope), or NULL = text positions */
     const uint32_t *rope;
     /** L251 MTP: rows [0, n_dec) are a VERIFY (PREFILL mode, <= PULSAR_DRIVER_HEADS_MAX rows): the ops write their
@@ -197,7 +224,7 @@ typedef struct pulsar_driver_ops {
     pulsar_block_fn block[PULSAR_LAYER_KIND_COUNT];
     /** Step rows [row0, row0 + n) -> logits rows [out0, out0 + n) of the driver's slab, out0 + n <=
      *  PULSAR_DRIVER_HEADS_MAX.  Called once per span of the head list (consecutive rows of one row kind). */
-    bool (*head)(const pulsar_driver_step *st, uint32_t row0, uint32_t n, uint32_t out0);
+    bool (*head)(const pulsar_driver_step *st, StepRow row0, StepRows n, HeadRow out0);
     /** After every forward that started: settle what the step left in flight; on a completed step its own checks
      *  (rule 9).  Returns ok && the step is good. */
     bool (*step_end)(const pulsar_driver_step *st, bool ok);
@@ -205,13 +232,13 @@ typedef struct pulsar_driver_ops {
      *  every row whose next token is now known gets its drafter row (PREFILL: one bank's run; DECODE: one row a bank).
      *  `eval`: the session's single-row eval (a family's diagnostics may head it).  NULL = no drafter lane; a family
      *  that drafts with its MTP modules sets the chained-MTP lane's (spec_mtp.h pulsar_mtp_absorb). */
-    bool (*absorb)(pulsar_session *s, pulsar_step_mode mode, const int32_t *tokens, const int32_t *pos,
-                   const int32_t *bank, uint32_t n, uint32_t row0, bool eval);
+    bool (*absorb)(pulsar_session *s, pulsar_step_mode mode, const TokId *tokens, const int32_t *pos,
+                   const BankId *bank, uint32_t n, uint32_t row0, bool eval);
     /** L296 N9: the family's MTP module declaration (spec_mtp.h), or NULL = none.  When it declares modules the
      *  driver builds the chained-MTP drafter's lane (pulsar_driver_state::mtp) before the declared state. */
     const struct pulsar_mtp_ops *mtp;
     /** Optional (L268): the step's multi-axis rope positions into *out, or NULL = text positions. */
-    const uint32_t *(*rope)(const pulsar_session *s, const int32_t *pos, const int32_t *bank, uint32_t n,
+    const uint32_t *(*rope)(const pulsar_session *s, const int32_t *pos, const BankId *bank, uint32_t n,
                             std::vector<uint32_t> *out);
     /** Optional (L268): a sync chunk's image rows into the step's slots (pulsar_image_merge_chunk's writer).  NULL =
      *  the family serves no images (a sync with images is refused). */
@@ -235,7 +262,7 @@ typedef struct pulsar_driver_ops {
     /** Optional (L329 b2): the family's prompt rows come from a disk-resident row table (Qwen's PLE) -- queue the
      *  rows the tokens prompt[from, to) will gather on the table pool's background class, tagged `tag`
      *  (pulsar_engram_read_ahead); returns the rows queued.  NULL = the family's prefill reads no disk table. */
-    uint32_t (*read_ahead)(const pulsar_engine *e, uint64_t tag, const int32_t *prompt, uint32_t from, uint32_t to);
+    uint32_t (*read_ahead)(const pulsar_engine *e, uint64_t tag, const TokId *prompt, uint32_t from, uint32_t to);
     /** Present with read_ahead: the pool its rows go through (the core cancels a tag's rows and reads the counters). */
     struct pulsar_engram_io *(*read_ahead_pool)(const pulsar_engine *e);
     /** Optional (L338 P2): the engine carries a runtime adapter (a LoRA the family applies on the rows of the banks

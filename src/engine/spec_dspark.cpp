@@ -45,7 +45,7 @@ int gpu_graph_spec_dump_active(void) {
 /// @param refined_ids [n_draft + 1] the chain (carry, then drafts), written after the header
 /// @param n_draft drafts in the step
 static void dspark_dump_step(pulsar_gpu_graph *g, int pos, int first_token,
-                             const int32_t *refined_ids, int n_draft) {
+                             const TokId *refined_ids, int n_draft) {
     /* Read once (no-hot-path-flags): this is called every spec step, and both
      * switches are fixed at start.  The common case is "not dumping", which
      * must cost a single cached load, not two getenv lookups. */
@@ -81,8 +81,8 @@ static void dspark_dump_step(pulsar_gpu_graph *g, int pos, int first_token,
         fwrite(refined_ids, sizeof(int32_t), (size_t)n_draft + 1, f);
         for (int p = 0; p < n_draft; p++) {
             memset(emb, 0, (size_t)PULSAR_N_EMBD * sizeof(float));
-            (void)pulsar_gpu_tensor_read(g->batch_ffn_cur, (uint64_t)p * PULSAR_N_EMBD * 4,
-                                      emb, (uint64_t)PULSAR_N_EMBD * 4);
+            (void)pulsar_gpu_tensor_read(g->batch_ffn_cur, bytes_of<float>((uint64_t)p * PULSAR_N_EMBD),
+                                      emb, bytes_of<float>(PULSAR_N_EMBD));
             fwrite(emb, sizeof(float), PULSAR_N_EMBD, f);
         }
         fclose(f);
@@ -101,14 +101,14 @@ static void dspark_dump_step(pulsar_gpu_graph *g, int pos, int first_token,
     fwrite(refined_ids, sizeof(int32_t), (size_t)n_draft + 1, f);
     for (int i = 0; i < 3; i++) {
         memset(emb, 0, (size_t)PULSAR_N_EMBD * sizeof(float));
-        (void)pulsar_gpu_tensor_read(g->dspark_target_h[i], 0, emb, (uint64_t)PULSAR_N_EMBD * 4);
+        (void)pulsar_gpu_tensor_read(g->dspark_target_h[i], TensorBytes{0}, emb, bytes_of<float>(PULSAR_N_EMBD));
         fwrite(emb, sizeof(float), PULSAR_N_EMBD, f);
     }
     memset(emb, 0, (size_t)PULSAR_N_EMBD * sizeof(float));
-    (void)pulsar_gpu_tensor_read(g->dspark_main_x, 0, emb, (uint64_t)PULSAR_N_EMBD * 4);
+    (void)pulsar_gpu_tensor_read(g->dspark_main_x, TensorBytes{0}, emb, bytes_of<float>(PULSAR_N_EMBD));
     fwrite(emb, sizeof(float), PULSAR_N_EMBD, f);
     memset(voc, 0, (size_t)PULSAR_N_VOCAB * sizeof(float));
-    (void)pulsar_gpu_tensor_read(g->spec_logits, 0, voc, (uint64_t)PULSAR_N_VOCAB * sizeof(float));
+    (void)pulsar_gpu_tensor_read(g->spec_logits, TensorBytes{0}, voc, bytes_of<float>(PULSAR_N_VOCAB));
     fwrite(voc, sizeof(float), PULSAR_N_VOCAB, f);
     /* block-2 output hidden (pre-hc_head) for each draft position [HC, EMBD]. */
     for (int p = 0; p < n_draft; p++) {
@@ -147,9 +147,9 @@ static bool spec_frontier_copy_tables_init(pulsar_gpu_graph *g) {
     if (g->spec_frontier_copy_init) return true;
     pulsar_gpu_tensor *dst[PULSAR_MAX_LAYER * 4];
     pulsar_gpu_tensor *src[PULSAR_MAX_LAYER * 4];
-    uint64_t bytes[PULSAR_MAX_LAYER * 4];
+    TensorBytes bytes[PULSAR_MAX_LAYER * 4];
     uint32_t n = 0;
-    uint64_t mx = 0;
+    TensorBytes mx{0};
     /* CSA2 (L218): the only recurrent state is the ratio-2 kv sources' pending
      * group (kv + score); ratio-1 sources and member layers carry none.
      * V4 has a SECOND such lane: the indexer's own compressor, which exists
@@ -158,12 +158,12 @@ static bool spec_frontier_copy_tables_init(pulsar_gpu_graph *g) {
      * indexer's carry where the rejected draft had put it). */
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (!gpu_graph_layer_has_comp_state(il)) continue;
-        const uint64_t ab = pulsar_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
+        const TensorBytes ab = pulsar_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
         dst[n] = g->spec_attn_state_kv[il];    src[n] = g->layer_attn_state_kv[il];    bytes[n++] = ab;
         dst[n] = g->spec_attn_state_score[il]; src[n] = g->layer_attn_state_score[il]; bytes[n++] = ab;
         if (ab > mx) mx = ab;
         if (g->layer_index_state_kv[il]) {
-            const uint64_t ib = pulsar_gpu_tensor_bytes(g->layer_index_state_kv[il]);
+            const TensorBytes ib = pulsar_gpu_tensor_bytes(g->layer_index_state_kv[il]);
             dst[n] = g->spec_index_state_kv[il];
             src[n] = g->layer_index_state_kv[il];
             bytes[n++] = ib;
@@ -189,7 +189,7 @@ static bool spec_frontier_copy_tables_init(pulsar_gpu_graph *g) {
         fprintf(stderr,
                 "pulsar: spec frontier batched-copy prepare failed (%u descriptors, max %llu B) "
                 "-- refusing the snapshot (no per-tensor copy loop; L190)\n",
-                n, (unsigned long long)mx);
+                n, (unsigned long long)mx.raw());
         return false;                /* init stays 0 -- the next call retries */
     }
     g->spec_snap_copies = snap;
@@ -211,7 +211,8 @@ static bool spec_frontier_snapshot(pulsar_spec_frontier *f, pulsar_session *s) {
 
     bool ok = pulsar_gpu_begin_commands() != 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        f->n_comp[il] = gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il);
+        /* the snapshot's raw copy */
+        f->n_comp[il] = (uint32_t)gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il).raw();
     }
     if (ok && g->spec_frontier_copy_n)
         ok = pulsar_gpu_batched_copy_run(g->spec_snap_copies,
@@ -239,7 +240,7 @@ static bool spec_frontier_restore(pulsar_spec_frontier *f, pulsar_session *s) {
     if (!spec_frontier_copy_tables_init(g)) return false;
     bool ok = pulsar_gpu_begin_commands() != 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        gpu_graph_set_n_comp(g, gpu_graph_cur_bank(g), il, f->n_comp[il]);
+        gpu_graph_set_n_comp(g, gpu_graph_cur_bank(g), il, CompRows{(int)f->n_comp[il]});
     }
     if (ok && g->spec_frontier_copy_n)
         ok = pulsar_gpu_batched_copy_run(g->spec_restore_copies,
@@ -265,10 +266,10 @@ static bool dspark_absorb(pulsar_session *s, uint32_t row, int32_t /*next: DSpar
         /* Async: project_main_x below reads these on the same (per-thread)
          * stream; nothing on the host reads them before the sync that already
          * bounds the step. */
-        if (!pulsar_gpu_tensor_copy_async(g->dspark_target_h[i], 0,
+        if (!pulsar_gpu_tensor_copy_async(g->dspark_target_h[i], TensorBytes{0},
                                  g->dspark_target_h_batch[i],
-                                 (uint64_t)row * PULSAR_N_EMBD * sizeof(float),
-                                 (uint64_t)PULSAR_N_EMBD * sizeof(float))) return false;
+                                 bytes_of<float>((uint64_t)row * PULSAR_N_EMBD),
+                                 bytes_of<float>(PULSAR_N_EMBD))) return false;
     }
     if (!gpu_graph_dspark_project_main_x(g, &e->dspark_model, &e->dspark_weights)) return false;
     /* A failed seed has rolled the drafter rings back; the caller refuses the
@@ -316,7 +317,7 @@ static inline uint64_t dspark_map_size(const pulsar_engine *e, const pulsar_tens
 /// @param err receives the reason on failure
 /// @param errlen its size
 /// @return 0, or -1
-static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, const uint32_t *banks,
+static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, const BankId *banks,
                               uint64_t *const *rngs, int n_sel, bool defer, char *err, size_t errlen) {
     PULSAR_NVTX("redraft group");
     pulsar_engine *e = s->engine;
@@ -324,7 +325,7 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
     const pulsar_dspark_weights *w = &e->dspark_weights;
     const uint32_t embed_dim = 256;
     const uint32_t vocab_size = w->vocab_size;
-    const uint64_t vocab_bytes = (uint64_t)vocab_size * sizeof(float);
+    const TensorBytes vocab_bytes = bytes_of<float>(vocab_size);
     int n_g = 0;
     for (int j = 0; j < n_sel; j++) if (!qs[j]->sample_drafts) n_g++;
     const int n_s = n_sel - n_g;
@@ -334,7 +335,7 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
             return -1;
         }
     /* rows */
-    int32_t draft_ids[PULSAR_DSPARK_DRAFT_ROWS_MAX];
+    TokId draft_ids[PULSAR_DSPARK_DRAFT_ROWS_MAX];
     uint32_t row_bank[PULSAR_DSPARK_DRAFT_ROWS_MAX];
     uint32_t bank_n_raw[PULSAR_MSEQ_MAX][3];
     uint32_t bank_n_draft[PULSAR_MSEQ_MAX];
@@ -342,25 +343,26 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
     uint32_t n_rows = 0, max_draft_g = 0, max_draft_s = 0;
     for (int j = 0; j < n_sel; j++) {
         spec_redraft_req *q = qs[j];
-        if ((banks && banks[j] >= g->banks.n_banks) || n_rows + q->n_draft > PULSAR_DSPARK_DRAFT_ROWS_MAX) {
+        if ((banks && !banks[j].below(g->banks.n_banks)) || n_rows + q->n_draft > PULSAR_DSPARK_DRAFT_ROWS_MAX) {
             snprintf(err, errlen, "dspark draft: rows exceed the drafter budget");
             return -1;
         }
         base_row[j] = (int32_t)n_rows;
         if (banks) {
-            for (uint32_t li = 0; li < 3; li++) bank_n_raw[banks[j]][li] = g->ms_dspark_n_raw[banks[j]][li];
-            bank_n_draft[banks[j]] = q->n_draft;
+            const uint32_t b = pulsar_bank_index(banks[j]);   /* in the pool: checked above */
+            for (uint32_t li = 0; li < 3; li++) bank_n_raw[b][li] = g->ms_dspark_n_raw[b][li];
+            bank_n_draft[b] = q->n_draft;
         }
         for (uint32_t k = 0; k < q->n_draft; k++) {
             /* the noise-token forward: row 0 the carry, the rest DSpark's noise id */
-            draft_ids[n_rows] = k == 0 ? q->next_base : PULSAR_DSPARK_NOISE_TOKEN_ID;
-            row_bank[n_rows] = banks ? banks[j] : 0u;
+            draft_ids[n_rows] = k == 0 ? q->next_base : TokId{PULSAR_DSPARK_NOISE_TOKEN_ID};
+            row_bank[n_rows] = banks ? pulsar_bank_index(banks[j]) : 0u;   /* the forward's row map is raw */
             n_rows++;
         }
         if (j < n_g) { if (q->n_draft > max_draft_g) max_draft_g = q->n_draft; }
         else         { if (q->n_draft > max_draft_s) max_draft_s = q->n_draft; }
         q->refined[0] = q->next_base;
-        for (int k = 1; k < 17; k++) q->refined[k] = 0;
+        for (int k = 1; k < 17; k++) q->refined[k] = TokId{0};
         for (int k = 0; k < 16; k++) q->conf[k] = -1.0f;
         q->have_conf = false;
         q->keep = q->n_draft;
@@ -384,7 +386,7 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
         snprintf(err, errlen, "dspark draft: draft forward failed");
         return -1;
     }
-    if (pulsar_gpu_tensor_bytes(g->dspark_markov_logits) < (uint64_t)n_sel * vocab_bytes) {
+    if (pulsar_gpu_tensor_bytes(g->dspark_markov_logits) < vocab_bytes.times(n_sel)) {
         snprintf(err, errlen, "dspark draft: markov scratch too small");
         return -1;
     }
@@ -393,12 +395,12 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
     memset(meta, 0, sizeof(meta));
     for (int j = 0; j < n_sel; j++) meta[j] = base_row[j];
     /* seed the chain feed: ids[j][0] = next_base */
-    int32_t ids_seed[PULSAR_DSPARK_BANKS_MAX * 17];
+    TokId ids_seed[PULSAR_DSPARK_BANKS_MAX * 17];
     memset(ids_seed, 0, sizeof(ids_seed));
     for (int j = 0; j < n_sel; j++) ids_seed[j * 17] = qs[j]->next_base;
-    if (!pulsar_gpu_tensor_write(g->dspark_bank_meta, 0, meta, sizeof(meta)) ||
-        !pulsar_gpu_tensor_write(g->dspark_refined_ids, 0, ids_seed,
-                                 (uint64_t)n_sel * 17 * sizeof(int32_t))) {
+    if (!pulsar_gpu_tensor_write(g->dspark_bank_meta, TensorBytes{0}, meta, TensorBytes{sizeof(meta)}) ||
+        !pulsar_gpu_tensor_write(g->dspark_refined_ids, TensorBytes{0}, ids_seed,
+                                 bytes_of<int32_t>((uint64_t)n_sel * 17))) {
         snprintf(err, errlen, "dspark draft: meta upload failed");
         return -1;
     }
@@ -426,14 +428,14 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
      * records; THE sampler draws every record's position on the device (L302), a few bytes come back. */
     if (n_s > 0) {
         pulsar_gpu_tensor *refined_s = pulsar_gpu_tensor_view(
-            g->dspark_markov_logits, (uint64_t)n_g * vocab_bytes, (uint64_t)n_s * vocab_bytes);
+            g->dspark_markov_logits, vocab_bytes.times(n_g), vocab_bytes.times(n_s));
         pulsar_gpu_tensor *ids_s = pulsar_gpu_tensor_view(
-            g->dspark_refined_ids, (uint64_t)n_g * 17 * sizeof(int32_t), (uint64_t)n_s * 17 * sizeof(int32_t));
+            g->dspark_refined_ids, bytes_of<int32_t>((uint64_t)n_g * 17), bytes_of<int32_t>((uint64_t)n_s * 17));
         pulsar_gpu_tensor *base_s = pulsar_gpu_tensor_view(
-            g->dspark_bank_meta, (uint64_t)n_g * sizeof(int32_t), (uint64_t)n_s * sizeof(int32_t));
+            g->dspark_bank_meta, bytes_of<int32_t>(n_g), bytes_of<int32_t>(n_s));
         pulsar_gpu_tensor *prev_s = pulsar_gpu_tensor_view(
-            g->dspark_bank_meta, (uint64_t)PULSAR_DSPARK_BANKS_MAX * sizeof(int32_t),
-            (uint64_t)n_s * sizeof(int32_t));
+            g->dspark_bank_meta, bytes_of<int32_t>(PULSAR_DSPARK_BANKS_MAX),
+            bytes_of<int32_t>(n_s));
         bool ok = refined_s && ids_s && base_s && prev_s;
         /* each position's draws in one launch of THE sampler over the refined rows (row j - n_g is record j's) */
         if (ok && vocab_size != (uint32_t)s->engine->logits_width()) {
@@ -441,10 +443,10 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
                     vocab_size, s->engine->logits_width());
             ok = false;
         }
-        int32_t prev[PULSAR_DSPARK_BANKS_MAX];
+        TokId prev[PULSAR_DSPARK_BANKS_MAX];
         for (uint32_t pos = 0; ok && pos < max_draft_s; pos++) {
             for (int j = n_g; j < n_sel; j++) prev[j - n_g] = qs[j]->refined[pos];
-            ok = pulsar_gpu_tensor_write(prev_s, 0, prev, (uint64_t)n_s * sizeof(int32_t)) &&
+            ok = pulsar_gpu_tensor_write(prev_s, TensorBytes{0}, prev, bytes_of<int32_t>(n_s)) &&
                  pulsar_gpu_dspark_markov_step_banks_model(
                      refined_s, ids_s, 17u, g->spec_logits, spec_row_bytes, base_s, prev_s,
                      dspark_map(e, w->markov_w1), dspark_map_size(e, w->markov_w1), w->markov_w1->abs_offset, w->markov_w2->abs_offset,
@@ -476,7 +478,7 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
                     ok = false;
                     break;
                 }
-                qs[who[k]]->refined[pos + 1] = out[k].token;   /* the chain continues SAMPLED */
+                qs[who[k]]->refined[pos + 1] = TokId{out[k].token};   /* the chain continues SAMPLED */
             }
         }
         pulsar_gpu_tensor_free(refined_s);
@@ -490,8 +492,9 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
     }
     /* greedy ids come back in one read */
     if (n_g > 0 && !defer) {
-        int32_t ids_all[PULSAR_DSPARK_BANKS_MAX * 17];
-        if (!pulsar_gpu_tensor_read(g->dspark_refined_ids, 0, ids_all, (uint64_t)n_sel * 17 * sizeof(int32_t))) {
+        TokId ids_all[PULSAR_DSPARK_BANKS_MAX * 17];
+        if (!pulsar_gpu_tensor_read(g->dspark_refined_ids, TensorBytes{0}, ids_all,
+                                    bytes_of<int32_t>((uint64_t)n_sel * 17))) {
             snprintf(err, errlen, "dspark draft: ids readback failed");
             return -1;
         }
@@ -500,25 +503,26 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
     }
     /* the offline-validation / confidence-training dump (single lane): after the markov refine, while
      * batch_ffn_cur still holds the post-hc_head rows the confidence kernel consumes */
-    if (!banks && !defer) dspark_dump_step(g, (int)s->checkpoint.len, (int)qs[0]->next_base, qs[0]->refined,
+    if (!banks && !defer) dspark_dump_step(g, (int)s->checkpoint.len, qs[0]->next_base.raw(), qs[0]->refined,
                                            (int)qs[0]->n_draft);
     /* the confidence head over every row: tok row (j, k) = refined_j[k] -- the draft BEFORE position k, so
      * conf[k] is scored without the draft it judges (the stop is a stopping time) -- then the stop rule */
     const float tau = pulsar_spec_tau(e);
     if (tau > 0.0f) {
-        int32_t toks[PULSAR_DSPARK_DRAFT_ROWS_MAX];
+        TokId toks[PULSAR_DSPARK_DRAFT_ROWS_MAX];
         float confs[PULSAR_DSPARK_DRAFT_ROWS_MAX];
         for (int j = 0; j < n_sel; j++)
             for (uint32_t k = 0; k < qs[j]->n_draft; k++) toks[base_row[j] + k] = qs[j]->refined[k];
         const bool scored =
-            pulsar_gpu_tensor_bytes(g->dspark_conf_tokens) >= (uint64_t)n_rows * sizeof(int32_t) &&
-            pulsar_gpu_tensor_bytes(g->dspark_conf_scores) >= (uint64_t)n_rows * sizeof(float) &&
+            pulsar_gpu_tensor_bytes(g->dspark_conf_tokens) >= bytes_of<int32_t>(n_rows) &&
+            pulsar_gpu_tensor_bytes(g->dspark_conf_scores) >= bytes_of<float>(n_rows) &&
             (defer
                  /* device-to-device: the ids are already in the chain array; a host write here would
                   * force the read this path exists to avoid */
-                 ? pulsar_gpu_tensor_copy(g->dspark_conf_tokens, 0, g->dspark_refined_ids, 0,
-                                          (uint64_t)n_rows * sizeof(int32_t)) != 0
-                 : pulsar_gpu_tensor_write(g->dspark_conf_tokens, 0, toks, (uint64_t)n_rows * sizeof(int32_t)) != 0) &&
+                 ? pulsar_gpu_tensor_copy(g->dspark_conf_tokens, TensorBytes{0}, g->dspark_refined_ids, TensorBytes{0},
+                                          bytes_of<int32_t>(n_rows)) != 0
+                 : pulsar_gpu_tensor_write(g->dspark_conf_tokens, TensorBytes{0}, toks,
+                                           bytes_of<int32_t>(n_rows)) != 0) &&
             pulsar_gpu_dspark_confidence_score_model(g->dspark_conf_scores, g->batch_ffn_cur,
                                                      g->dspark_conf_tokens, dspark_map(e, w->markov_w1), dspark_map_size(e, w->markov_w1),
                                                      w->markov_w1->abs_offset,
@@ -526,7 +530,7 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
                                                      n_rows, PULSAR_N_EMBD, embed_dim, vocab_size,
                                                      w1_bf16,
                                                      w->confidence_proj->type == PULSAR_TENSOR_BF16) &&
-            (defer || pulsar_gpu_tensor_read(g->dspark_conf_scores, 0, confs, (uint64_t)n_rows * sizeof(float)));
+            (defer || pulsar_gpu_tensor_read(g->dspark_conf_scores, TensorBytes{0}, confs, bytes_of<float>(n_rows)));
         if (!scored) {
             /* L190 D4: the stop is scheduled; a scoring failure drafts nothing, loudly */
             snprintf(err, errlen, "dspark draft: confidence scoring failed (the stop is not skipped silently)");
@@ -556,7 +560,7 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
 /// @param min_p request min-p
 /// @param rng the request's stream
 /// @return drafts kept, or PULSAR_DRAFT_REFUSED (said) when the drafting pass failed
-static uint32_t dspark_draft(pulsar_session *s, int next_base, float temperature, int top_k, float top_p, float min_p,
+static uint32_t dspark_draft(pulsar_session *s, TokId next_base, float temperature, int top_k, float top_p, float min_p,
                              uint64_t *rng) {
     spec_redraft_req rec;
     memset(&rec, 0, sizeof rec);
@@ -598,13 +602,13 @@ static void dspark_harvest(pulsar_session *s) {
     pulsar_gpu_graph *g = s->graph;
     const uint32_t n_draft = s->spec.dspark_chain_n;
     if (n_draft == 0 || n_draft > 16u) return;
-    int32_t ids[17];
+    TokId ids[17];
     float conf[16];
     const bool have_conf = s->spec.dspark_chain_conf;
     if (!g->dspark_refined_ids ||
-        !pulsar_gpu_tensor_read(g->dspark_refined_ids, sizeof(int32_t), ids + 1,
-                                (uint64_t)n_draft * sizeof(int32_t)) ||
-        (have_conf && !pulsar_gpu_tensor_read(g->dspark_conf_scores, 0, conf, (uint64_t)n_draft * sizeof(float)))) {
+        !pulsar_gpu_tensor_read(g->dspark_refined_ids, bytes_of<int32_t>(1), ids + 1,
+                                bytes_of<int32_t>(n_draft)) ||
+        (have_conf && !pulsar_gpu_tensor_read(g->dspark_conf_scores, TensorBytes{0}, conf, bytes_of<float>(n_draft)))) {
         fprintf(stderr, "pulsar: dspark chain harvest: the draft %s readback failed -- the chain is dropped "
                         "(0 pendings)\n", have_conf ? "ids or confidence" : "ids");
         s->spec.n_pend = 0;
@@ -634,6 +638,7 @@ static void ds4_arm_verify(pulsar_session *s, uint32_t n_rows) {
     pulsar_gpu_graph *g = s->graph;
     g->dspark_capture_batch_n = n_rows;
     g->spec_comp_save_n = n_rows;
+    if (n_rows) g->spec_comp_saved_rows = n_rows;   /* the bound outlives the disarm */
 }
 
 /* The single lane's verify: ONE batched target forward over the round's rows with the drafter's anchor capture and
@@ -650,7 +655,8 @@ static bool ds4_verify_single(pulsar_session *s, pulsar_spec_round *r, char *err
     pulsar_gpu_graph *g = s->graph;
     g->dspark_capture_batch_n = r->n_batch;
     g->spec_comp_save_n = r->n_batch;   /* Stage-B: save per-position comp projections */
-    const bool ok = gpu_graph_verify_suffix(g, &e->model, &e->weights, &s->checkpoint, (uint32_t)r->saved_len,
+    g->spec_comp_saved_rows = r->n_batch;
+    const bool ok = gpu_graph_verify_suffix(g, &e->model, &e->weights, &s->checkpoint, pulsar_ckpt_raw(r->saved_len),
                                             r->n_batch);
     g->dspark_capture_batch_n = 0;
     g->spec_comp_save_n = 0;
@@ -690,10 +696,10 @@ static int dspark_prime(pulsar_session *s, char *err, size_t errlen) {
     for (; seed_ok && j < take; j++) {
         const uint32_t slot = (first + j) % win;
         for (int i = 0; seed_ok && i < 3; i++) {
-            seed_ok = pulsar_gpu_tensor_copy(g->dspark_target_h[i], 0,
+            seed_ok = pulsar_gpu_tensor_copy(g->dspark_target_h[i], TensorBytes{0},
                                           g->dspark_prompt_h[i],
-                                          (uint64_t)slot * PULSAR_N_EMBD * sizeof(float),
-                                          (uint64_t)PULSAR_N_EMBD * sizeof(float)) != 0;
+                                          bytes_of<float>((uint64_t)slot * PULSAR_N_EMBD),
+                                          bytes_of<float>(PULSAR_N_EMBD)) != 0;
         }
         if (seed_ok)
             seed_ok = gpu_graph_dspark_project_main_x(g, &e->dspark_model, w) &&
@@ -725,7 +731,7 @@ static int dspark_prime(pulsar_session *s, char *err, size_t errlen) {
 /// @param errlen its size
 /// @return 0, or -1
 static int dspark_draft_batch(pulsar_session *s, pulsar_spec_round **rounds,
-                                      const uint32_t *banks, uint64_t **rngs, int n,
+                                      const BankId *banks, uint64_t **rngs, int n,
                                       char *err, size_t errlen) {
     pulsar_gpu_graph *g = s->graph;
     if (!rounds || !banks || !rngs || n <= 0) return 0;
@@ -749,7 +755,7 @@ static int dspark_draft_batch(pulsar_session *s, pulsar_spec_round **rounds,
     /* greedy rounds first, then sampled, so each group is contiguous in rows
      * and in the bank arrays */
     spec_redraft_req *qs[PULSAR_MSEQ_MAX];
-    uint32_t bk[PULSAR_MSEQ_MAX];
+    BankId bk[PULSAR_MSEQ_MAX];
     uint64_t *rg[PULSAR_MSEQ_MAX];
     int n_sel = 0;
     for (int pass = 0; pass < 2; pass++)
@@ -825,15 +831,21 @@ static bool ds4_spec_restore(pulsar_session *s, pulsar_spec_round *r) {
 /// @param s the session
 /// @param r the round
 /// @param commit drafts committed
-/// @param row0 the round's first row in the verify capture
+/// @param row0 the round's first row in the verify capture (a head row: the batched lane's offset in the logits)
 /// @return false = failed
 static bool ds4_commit(pulsar_session *s, pulsar_spec_round *r, uint32_t commit, uint32_t row0) {
     pulsar_engine *e = s->engine;
     /* a full accept: the verify advanced the target state by exactly the committed tokens */
     if (commit == r->K) return true;
+    /* hazard (b), named: the rollforward reads the comp-save rows by STEP row, and row0 is the round's HEAD row --
+     * the same row only because a verify leads its step and heads every row.  Both ends of the rows it reads are
+     * checked against the verify the saves came from (fatal past it). */
+    const uint32_t saved = s->graph->spec_comp_saved_rows;
+    const StepRow save0 = pulsar_verify_step_row(HeadRow{(int)row0}, saved);
+    (void)pulsar_verify_step_row(HeadRow{(int)(row0 + commit)}, saved);
     if (!ds4_spec_restore(s, r)) return false;
-    return gpu_graph_dspark_compressor_rollforward(s->graph, &e->model, &e->weights,
-                                                   (uint32_t)r->saved_len, 1u + commit, row0);
+    return gpu_graph_dspark_compressor_rollforward(s->graph, &e->model, &e->weights, r->saved_len,
+                                                   TokCount{(int)(1u + commit)}, save0);
 }
 
 const pulsar_spec_target_ops k_ds4_spec_target = {
@@ -853,7 +865,7 @@ const pulsar_spec_target_ops k_ds4_spec_target = {
 /// @param banks [n] their banks
 /// @param n rows
 /// @return false = refused
-static bool dspark_absorb_banked(pulsar_session *s, const uint32_t *rows, const uint32_t *banks, const int32_t *,
+static bool dspark_absorb_banked(pulsar_session *s, const uint32_t *rows, const BankId *banks, const TokId *,
                                  uint32_t n) {
     pulsar_engine *e = s->engine;
     return gpu_graph_dspark_seed_rows_banked(s->graph, &e->dspark_model, &e->dspark_weights, rows, banks, n);

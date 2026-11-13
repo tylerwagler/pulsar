@@ -44,7 +44,7 @@ void spill(const std::string &path, const void *p, size_t n) {
 }
 float bf(uint16_t b) { uint32_t u = (uint32_t)b << 16; float f; memcpy(&f, &u, 4); return f; }
 pulsar_gpu_tensor *alloc0(uint64_t bytes) {
-    pulsar_gpu_tensor *t = pulsar_gpu_tensor_alloc(bytes);
+    pulsar_gpu_tensor *t = pulsar_gpu_tensor_alloc(TensorBytes{bytes});
     if (!t || !pulsar_gpu_tensor_fill_f32(t, 0.f, bytes / 4)) { fprintf(stderr, "alloc %llu failed\n", (unsigned long long)bytes); exit(2); }
     return t;
 }
@@ -62,7 +62,7 @@ struct Replay {
         auto up = [&](pulsar_gpu_tensor *t, const uint16_t *src, uint32_t w) {
             buf.resize((size_t)n * w);
             for (size_t i = 0; i < buf.size(); i++) buf[i] = bf(src[(size_t)p0 * w + i]);
-            pulsar_gpu_tensor_write(t, 0, buf.data(), buf.size() * 4);
+            pulsar_gpu_tensor_write(t, TensorBytes{0}, buf.data(), bytes_of<float>(buf.size()));
         };
         up(qg, in.qg, PULSAR_QSA_Q_IN);
         up(k, in.k, PULSAR_QSA_KV_IN);
@@ -82,14 +82,14 @@ struct Replay {
         pulsar_qsa_rope rope;   /* the native rope: the replay's captures are the native model's */
         if (!pulsar_qsa_rope_init(&rope, NULL)) { fprintf(stderr, "rope init refused\n"); exit(1); }
         io.rope = &rope;
-        pulsar_gpu_tensor_fill_f32(sc, 0.f, pulsar_gpu_tensor_bytes(sc) / 4);
+        pulsar_gpu_tensor_fill_f32(sc, 0.f, pulsar_gpu_tensor_bytes(sc).raw() / 4);
         if (!pulsar_gpu_qsa_forward(&L, &seq, 1, rs.data(), rp.data(), n, &io, ws)) { fprintf(stderr, "forward refused\n"); exit(1); }
-        pulsar_gpu_tensor_read(tap, 0, out, (size_t)n * PULSAR_QSA_OUT_DIM * 4);
-        pulsar_gpu_tensor_read(sel, 0, selo, (size_t)n * PULSAR_QSA_TOP_BLOCKS * 4);
+        pulsar_gpu_tensor_read(tap, TensorBytes{0}, out, bytes_of<float>((size_t)n * PULSAR_QSA_OUT_DIM));
+        pulsar_gpu_tensor_read(sel, TensorBytes{0}, selo, bytes_of<uint32_t>((size_t)n * PULSAR_QSA_TOP_BLOCKS));
     }
     void reset() {
-        pulsar_gpu_tensor_fill_f32(seq.kv, 0.f, pulsar_gpu_tensor_bytes(seq.kv) / 4);
-        pulsar_gpu_tensor_fill_f32(seq.bkey, 0.f, pulsar_gpu_tensor_bytes(seq.bkey) / 4);
+        pulsar_gpu_tensor_fill_f32(seq.kv, 0.f, pulsar_gpu_tensor_bytes(seq.kv).raw() / 4);
+        pulsar_gpu_tensor_fill_f32(seq.bkey, 0.f, pulsar_gpu_tensor_bytes(seq.bkey).raw() / 4);
         pulsar_gpu_tensor_fill_f32(seq.stage, 1e30f, PULSAR_QSA_STAGE_BYTES / 4);
     }
 };
@@ -131,8 +131,8 @@ int main(int argc, char **argv) {
         for (uint32_t j = 0; j < n; j++) {
             uint32_t u; memcpy(&u, nf + off[i] + j, 4); b16[j] = (uint16_t)((u + 0x8000u) >> 16);
         }
-        R.norm[i] = pulsar_gpu_tensor_alloc((uint64_t)n * 2);
-        pulsar_gpu_tensor_write(R.norm[i], 0, b16.data(), (uint64_t)n * 2);
+        R.norm[i] = pulsar_gpu_tensor_alloc(bytes_of<uint16_t>(n));
+        pulsar_gpu_tensor_write(R.norm[i], TensorBytes{0}, b16.data(), bytes_of<uint16_t>(n));
     }
     const uint32_t cap = (T + 3u) & ~3u;
     R.seq = {alloc0((uint64_t)cap * PULSAR_QSA_KV_TOKEN_BYTES), alloc0((uint64_t)(cap / 4) * PULSAR_QSA_BKEY_BYTES),
@@ -149,7 +149,7 @@ int main(int argc, char **argv) {
     const double t1 = now();
     printf("replay: T=%u chunk=%u prefill wall %.2f s (incl. host bf16->f32 + readback)\n", T, chunk, t1 - t0);
     std::vector<uint8_t> kv((size_t)T * PULSAR_QSA_KV_TOKEN_BYTES);
-    pulsar_gpu_tensor_read(R.seq.kv, 0, kv.data(), kv.size());
+    pulsar_gpu_tensor_read(R.seq.kv, TensorBytes{0}, kv.data(), TensorBytes{kv.size()});
     spill(dir + "/ours_out.f32", out.data(), out.size() * 4);
     spill(dir + "/ours_sel.u32", sel.data(), sel.size() * 4);
     spill(dir + "/ours_kv.bin", kv.data(), kv.size());
@@ -168,7 +168,7 @@ int main(int argc, char **argv) {
                     memcmp(s2.data(), &sel[(size_t)p * PULSAR_QSA_TOP_BLOCKS], PULSAR_QSA_TOP_BLOCKS * 4) != 0;
         }
         std::vector<uint8_t> kv2(kv.size());
-        pulsar_gpu_tensor_read(R.seq.kv, 0, kv2.data(), kv2.size());
+        pulsar_gpu_tensor_read(R.seq.kv, TensorBytes{0}, kv2.data(), TensorBytes{kv2.size()});
         const bool kv_same = kv2 == kv;
         fail = diff != 0 || !kv_same;
         printf("replay: decode == prefill over the last %u rows: %s (%u rows differ; KV %s)\n", tail,

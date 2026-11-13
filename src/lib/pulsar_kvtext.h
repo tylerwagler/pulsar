@@ -18,19 +18,19 @@
  *  caller frees; NULL when an image block is malformed. */
 /// @param engine  the engine whose vocabulary renders the ids
 /// @param tokens  the token ids
-/// @param out_len receives the text's length in bytes
+/// @param out_len receives the text's length in bytes (L334 P7: TextBytes)
 /// @return the malloc'd text, or NULL when an image block is malformed
 char *pulsar_kvtext_render_tokens_text(pulsar_engine *engine,
                                      const pulsar_tokens *tokens,
-                                     size_t *out_len);
+                                     TextBytes *out_len);
 /** Is `prefix` a byte prefix of `text`?
  *  @param text       the text
  *  @param text_len   its length in bytes
  *  @param prefix     the candidate prefix
  *  @param prefix_len its length in bytes
  *  @return true when prefix_len <= text_len and the bytes agree */
-bool pulsar_kvtext_byte_prefix_match(const char *text, size_t text_len,
-                                   const char *prefix, size_t prefix_len);
+bool pulsar_kvtext_byte_prefix_match(const char *text, TextBytes text_len,
+                                   const char *prefix, TextBytes prefix_len);
 /** L196: does `text` end where `tokens` end?  A checkpoint's text names the
  * bytes of its tokens, so it ends with the EOS piece exactly when the last
  * token is the EOS.  A tool-call turn stops at the closing tool_calls tag
@@ -44,12 +44,12 @@ bool pulsar_kvtext_byte_prefix_match(const char *text, size_t text_len,
 /// @param tokens   the live tokens, or NULL
 /// @return true when the text ends with the EOS piece exactly when the tokens end with the EOS
 bool pulsar_kvtext_text_ends_with_live(pulsar_engine *engine, const char *text,
-                                     size_t text_len, const pulsar_tokens *tokens);
+                                     TextBytes text_len, const pulsar_tokens *tokens);
 /** Replace `dst` with the first `n` tokens of `src` (all of them when it is shorter).
  *  @param dst the destination (emptied first)
  *  @param src the source, or NULL (dst left empty)
  *  @param n   tokens to copy */
-void pulsar_kvtext_tokens_copy_prefix(pulsar_tokens *dst, const pulsar_tokens *src, int n);
+void pulsar_kvtext_tokens_copy_prefix(pulsar_tokens *dst, const pulsar_tokens *src, TokCount n);
 /** `exact_prefix`'s tokens, then `suffix_text` tokenised as RENDERED chat --
  * except the bytes inside `spans`/`n_spans` (the suffix's CLIENT-DATA ranges),
  * which are plain text (L223), so a client spelling in the suffix cannot become

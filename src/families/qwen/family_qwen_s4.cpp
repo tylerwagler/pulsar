@@ -14,8 +14,9 @@
  * are known before the forward) and read from the row file by the Engram pread
  * pool: embed hashes and ISSUES the gather, the PLE op at layer 1 waits for it,
  * so the reads overlap layer 0. */
-#include "pulsar_engine_internal.h"
-#include "exl3_trellis.h"
+#include "engine/pulsar_engine_internal.h"
+#include "family_qwen.h"
+#include "engine/exl3_trellis.h"
 #include "qwen_ngram.h"
 #include "tp/pulsar_tp.h"
 #include "cuda/pulsar_cuda_qwen.h"
@@ -71,7 +72,7 @@ void *dptr(pulsar_gpu_tensor *t) { return pulsar_gpu_tensor_device_ptr(t); }
 bool pulsar_qwen_tp_slices(pulsar_engine *e, pulsar_tp_plan *plan) {
     const pulsar_qwen_shape *s = &g_qwen_shape;
     pulsar_model *m = &e->model;
-    const pulsar_qwen_weights *w = e->qwen_weights;
+    const pulsar_qwen_weights *w = pulsar_qwen_of(e)->weights;
     const uint32_t nr = pulsar_qwen_tp(s);
     const int rank = (int)s->tp_rank;
     /* L272 P0: every range from the ONE range rule (pulsar_tp_owned_range, as DeepSeek's slices and
@@ -289,7 +290,7 @@ head_scratch head_layout(const pulsar_qwen_shape *s) {
 /// @return the view (caller frees), or NULL when the op has no scratch
 pulsar_gpu_tensor *scratch_view(const pulsar_qwen_step *st, pulsar_qwen_op_id op, uint64_t off, uint64_t bytes) {
     pulsar_gpu_tensor *s = st->st->scratch[op];
-    return s ? pulsar_gpu_tensor_view(s, off, bytes) : NULL;
+    return s ? pulsar_gpu_tensor_view(s, TensorBytes{off}, TensorBytes{bytes}) : NULL;
 }
 
 /** Print a step refusal once.
@@ -507,11 +508,11 @@ g.total = o;
 
 /* L251 S3: the QSA op's scratch.  qg/k/v/idx hold the four f32 projections (the
  * op hands the kernel VIEWS of them, because pulsar_qsa_io wants tensors and the
- * scratch IS one); obf16 is the bf16 output the o_proj reads (ac69748f) and a8_sf
- * the scale slab the kernel is handed beside it; ws is pulsar_gpu_qsa_forward's
+ * scratch IS one); obf16 is the bf16 output the o_proj reads (ac69748f; no E4M3 slot, so no scale slab:
+ * L335 removed the a8_sf slab the kernel wrote and nothing read); ws is pulsar_gpu_qsa_forward's
  * workspace; lin_ws is the shared dense workspace. */
 /** The QSA op's scratch layout (qsa_layout): byte offsets into scratch[PULSAR_QWEN_OP_QSA]. */
-struct qsa_scratch { uint64_t qg, k, v, idx, a8_sf, obf16, ws, ws_bytes, lin_ws, lin_ws_bytes, total; };
+struct qsa_scratch { uint64_t qg, k, v, idx, obf16, ws, ws_bytes, lin_ws, lin_ws_bytes, total; };
 
 /** @var qsa_scratch::qg
  *  byte offset in the op's scratch tensor: q_proj output (query | gate), [rows][q_in] f32 */
@@ -521,8 +522,6 @@ struct qsa_scratch { uint64_t qg, k, v, idx, a8_sf, obf16, ws, ws_bytes, lin_ws,
  *  byte offset in the op's scratch tensor: v_proj output, [rows][kv_in] f32 */
 /** @var qsa_scratch::idx
  *  byte offset in the op's scratch tensor: indexer index_qk output, [rows][PULSAR_QSA_IDX_IN] f32 */
-/** @var qsa_scratch::a8_sf
- *  byte offset in the op's scratch tensor: the scale-factor slab passed as pulsar_qsa_io::out_scale (with out_e4m3 NULL) */
 /** @var qsa_scratch::obf16
  *  byte offset in the op's scratch tensor: the attention output, [rows][out_dim] bf16 -- what o_proj reads */
 /** @var qsa_scratch::ws
@@ -556,7 +555,6 @@ qsa_scratch qsa_layout(const pulsar_qwen_shape *s, uint32_t rows, uint32_t ctx) 
     g.k   = o; o += a256((uint64_t)rows * pulsar_qwen_qsa_kv_in(s) * sizeof(float));
     g.v   = o; o += a256((uint64_t)rows * pulsar_qwen_qsa_kv_in(s) * sizeof(float));
     g.idx = o; o += a256((uint64_t)rows * PULSAR_QSA_IDX_IN * sizeof(float));
-    g.a8_sf = o; o += a256(pulsar_gpu_mx_sf_slab_bytes((int)rows, pulsar_gpu_mx_kbp(pulsar_qwen_qsa_out_dim(s))));
     g.ws = o; g.ws_bytes = a256((uint64_t)pulsar_gpu_qsa_workspace_bytes(rows, ctx)); o += g.ws_bytes;
     g.lin_ws = o; g.lin_ws_bytes = qsa_lin_ws(s, rows); o += g.lin_ws_bytes;
     /* L251 / ac69748f: the o_proj's bf16 row */
@@ -674,7 +672,7 @@ static bool admit_moe(const pulsar_qwen_layer_weights &L) {
 }
 
 bool pulsar_qwen_s4_load(pulsar_engine *e, const pulsar_engine_options *opt) {
-    pulsar_qwen_weights *w = e->qwen_weights;
+    pulsar_qwen_weights *w = pulsar_qwen_of(e)->weights;
     const pulsar_qwen_shape *s = &g_qwen_shape;
     bool ok = admit_bf16(w->token_embd) & admit_head(e, w) & admit_gr(w->mixer);
     uint32_t tessera_layers = 0;
@@ -825,16 +823,18 @@ bool pulsar_qwen_s4_embed(const pulsar_qwen_step *st) {
     const pulsar_qwen_shape *s = st->shape;
     const uint32_t n = st->n_rows;
     for (uint32_t r = 0; r < n; r++)
-        if (st->tokens[r] < 0 || (uint32_t)st->tokens[r] >= s->n_vocab) return fail("a token id outside the vocabulary");
+        if (!st->tokens[r].below(s->n_vocab)) return fail("a token id outside the vocabulary");
     /* the MoE non-finite flag starts every step clear (read at pulsar_qwen_s4_step_end) */
     pulsar_gpu_tensor *moe_sc = st->st->scratch[PULSAR_QWEN_OP_MOE];
     static const uint32_t zero = 0;   /* L289: an enqueued write reads it later */
-    if (!moe_sc || !pulsar_gpu_tensor_write_async(moe_sc, moe_layout(st->shape, st->st->max_rows).nf, &zero, sizeof(zero)))
+    if (!moe_sc || !pulsar_gpu_tensor_write_async(moe_sc, TensorBytes{moe_layout(st->shape, st->st->max_rows).nf},
+                                                  &zero, TensorBytes{sizeof(zero)}))
         return fail("could not clear the MoE non-finite flag");
     pulsar_gpu_tensor *tok = st->st->scratch[PULSAR_QWEN_OP_EMBED];
     const pulsar_tensor *te = st->w->token_embd;
     const uint16_t *table = (const uint16_t *)wptr(st, te, "qwen embed_tokens");
-    if (!tok || !table || !pulsar_gpu_tensor_write_async(tok, 0, st->tokens, (uint64_t)n * sizeof(int32_t))) return false;
+    if (!tok || !table || !pulsar_gpu_tensor_write_async(tok, TensorBytes{0}, st->tokens,
+                                                         bytes_of<int32_t>(n))) return false;
     if (pulsar_qwen_embed_launch(table, (const int32_t *)dptr(tok), (int)n, (uint16_t *)dptr(st->streams), 0))
         return false;
 
@@ -847,16 +847,19 @@ bool pulsar_qwen_s4_embed(const pulsar_qwen_step *st) {
         pulsar_gpu_host_free(io->rows);
         pulsar_gpu_host_free(io->map);
         free(io->ids);
-        io->rows = (unsigned char *)pulsar_gpu_host_alloc((uint64_t)n * PULSAR_QWEN_NGRAM_COLS * PULSAR_QWEN_NGRAM_ROW_BYTES);
-        io->map = (int32_t *)pulsar_gpu_host_alloc((uint64_t)n * 5u * sizeof(int32_t));
+        io->rows = (unsigned char *)pulsar_gpu_host_alloc(
+                TensorBytes{PULSAR_QWEN_NGRAM_ROW_BYTES}.times((uint64_t)n * PULSAR_QWEN_NGRAM_COLS));
+        io->map = (int32_t *)pulsar_gpu_host_alloc(bytes_of<int32_t>((uint64_t)n * 5u));
         io->ids = (uint64_t *)xmalloc((size_t)n * PULSAR_QWEN_NGRAM_COLS * sizeof(uint64_t));
         io->cap = io->rows && io->map ? n : 0;
         if (!io->cap) return fail("could not allocate the pinned PLE row buffers");
     }
     for (uint32_t r = 0; r < n; r++) {
-        int32_t *ctx_b = (int32_t *)pulsar_state_host(st->states, PULSAR_QWEN_STATE_NGRAM, (uint32_t)st->bank[r]);   /* oldest first */
+        /* oldest first */
+        int32_t *ctx_b = (int32_t *)pulsar_state_host(st->states, PULSAR_QWEN_STATE_NGRAM, st->bank[r]);
         pulsar_qwen_ngram_ctx ctx = {{ctx_b[0], ctx_b[1]}};
-        pulsar_qwen_ngram_rows(&io->layout, &ctx, &st->tokens[r], 1, io->ids + (size_t)r * PULSAR_QWEN_NGRAM_COLS);
+        pulsar_qwen_ngram_rows(&io->layout, &ctx, pulsar_tok_ids_raw(&st->tokens[r]), 1,
+                               io->ids + (size_t)r * PULSAR_QWEN_NGRAM_COLS);   /* the n-gram hash reads raw ids */
         ctx_b[0] = ctx.prev[0];
         ctx_b[1] = ctx.prev[1];
     }
@@ -865,33 +868,33 @@ bool pulsar_qwen_s4_embed(const pulsar_qwen_step *st) {
     return io->pending != NULL || fail("the PLE gather did not start");
 }
 
-void pulsar_qwen_s4_ple_prefetch(const pulsar_qwen_weights *w, int32_t ctx[2], const int32_t *tokens, uint32_t n) {
+void pulsar_qwen_s4_ple_prefetch(const pulsar_qwen_weights *w, int32_t ctx[2], const TokId *tokens, uint32_t n) {
     pulsar_qwen_ple_io *io = w->ple_io;
     if (!io || n == 0 || n > PULSAR_QWEN_SPEC_ROWS) return;
     for (uint32_t r = 0; r < n; r++)
-        if (tokens[r] < 0 || (uint32_t)tokens[r] >= io->layout.vocab) return;   /* the embed refuses it by name */
+        if (!tokens[r].below(io->layout.vocab)) return;   /* the embed refuses it by name */
     uint64_t ids[PULSAR_QWEN_SPEC_ROWS * PULSAR_QWEN_NGRAM_COLS];
     pulsar_qwen_ngram_ctx c = {{ctx[0], ctx[1]}};
-    pulsar_qwen_ngram_rows(&io->layout, &c, tokens, (int)n, ids);
+    pulsar_qwen_ngram_rows(&io->layout, &c, pulsar_tok_ids_raw(tokens), (int)n, ids);   /* the hash reads raw ids */
     ctx[0] = c.prev[0];
     ctx[1] = c.prev[1];
     pulsar_engram_prefetch(io->io, &io->table, ids, n * PULSAR_QWEN_NGRAM_COLS);
 }
 
-uint32_t pulsar_qwen_s4_ple_read_ahead(const pulsar_qwen_weights *w, uint64_t tag, const int32_t *prompt, uint32_t from,
+uint32_t pulsar_qwen_s4_ple_read_ahead(const pulsar_qwen_weights *w, uint64_t tag, const TokId *prompt, uint32_t from,
                                        uint32_t to) {
     pulsar_qwen_ple_io *io = w ? w->ple_io : NULL;
     if (!io || !io->ahead || !prompt || to <= from) return 0;
     /* the n-gram reaches two tokens back: the context at `from` is the prompt's own (EOS before its start) */
     for (uint32_t i = from >= 2u ? from - 2u : 0u; i < to; i++)
-        if (prompt[i] < 0 || (uint32_t)prompt[i] >= io->layout.vocab) return 0;   /* the embed refuses it by name */
+        if (!prompt[i].below(io->layout.vocab)) return 0;   /* the embed refuses it by name */
     pulsar_qwen_ngram_ctx c;
     pulsar_qwen_ngram_ctx_init(&io->layout, &c);
-    if (from >= 2u) c.prev[0] = prompt[from - 2u];
-    if (from >= 1u) c.prev[1] = prompt[from - 1u];
+    if (from >= 2u) c.prev[0] = prompt[from - 2u].raw();
+    if (from >= 1u) c.prev[1] = prompt[from - 1u].raw();
     const uint32_t n = to - from;
     std::vector<uint64_t> ids((size_t)n * PULSAR_QWEN_NGRAM_COLS);
-    pulsar_qwen_ngram_rows(&io->layout, &c, prompt + from, n, ids.data());
+    pulsar_qwen_ngram_rows(&io->layout, &c, pulsar_tok_ids_raw(prompt + from), n, ids.data());
     return pulsar_engram_read_ahead(io->io, &io->table, ids.data(), n * PULSAR_QWEN_NGRAM_COLS, tag);
 }
 
@@ -911,7 +914,8 @@ bool pulsar_qwen_s4_step_end(const pulsar_qwen_step *st, bool ok) {
     }
     pulsar_gpu_tensor *sc = st->st->scratch[PULSAR_QWEN_OP_MOE];
     uint32_t nf = 0;
-    if (!sc || !pulsar_gpu_tensor_read(sc, moe_layout(st->shape, st->st->max_rows).nf, &nf, sizeof(nf)))
+    if (!sc || !pulsar_gpu_tensor_read(sc, TensorBytes{moe_layout(st->shape, st->st->max_rows).nf}, &nf,
+                                       TensorBytes{sizeof(nf)}))
         return fail("could not read the MoE non-finite flag");
     if (nf) {
         fprintf(stderr, "pulsar: %s: the MoE output of layer %u went non-finite (code 0x%08x) -- refusing the step\n",
@@ -948,16 +952,17 @@ bool pulsar_qwen_s4_ple(const pulsar_qwen_step *st, uint32_t il) {
         const uint32_t e = decode ? q + 1u : (st->n_runs ? st->run_first[q + 1] : n);
         seq_first[q] = (int32_t)f;
         seq_rows[q] = (int32_t)(e - f);
-        seq_bank[q] = st->bank[f];
+        seq_bank[q] = st->bank[f].raw();   /* the uploaded map is int32 */
         for (uint32_t r = f; r < e; r++) { row_seq[r] = (int32_t)q; row_j[r] = (int32_t)(r - f); }
     }
     /* L289: enqueued behind layer 0, not waited for -- the host goes on queueing the step */
-    bool ok = pulsar_gpu_tensor_write_async(sc, p.emb, io->rows, (uint64_t)n * PULSAR_QWEN_HIDDEN * 2u) &&
-              pulsar_gpu_tensor_write_async(sc, p.row_seq, row_seq, (uint64_t)n * 4u) &&
-              pulsar_gpu_tensor_write_async(sc, p.row_j, row_j, (uint64_t)n * 4u) &&
-              pulsar_gpu_tensor_write_async(sc, p.seq_first, seq_first, (uint64_t)n_seq * 4u) &&
-              pulsar_gpu_tensor_write_async(sc, p.seq_rows, seq_rows, (uint64_t)n_seq * 4u) &&
-              pulsar_gpu_tensor_write_async(sc, p.seq_bank, seq_bank, (uint64_t)n_seq * 4u);
+    bool ok = pulsar_gpu_tensor_write_async(sc, TensorBytes{p.emb}, io->rows,
+                                            bytes_of<uint16_t>((uint64_t)n * PULSAR_QWEN_HIDDEN)) &&
+              pulsar_gpu_tensor_write_async(sc, TensorBytes{p.row_seq}, row_seq, bytes_of<int32_t>(n)) &&
+              pulsar_gpu_tensor_write_async(sc, TensorBytes{p.row_j}, row_j, bytes_of<int32_t>(n)) &&
+              pulsar_gpu_tensor_write_async(sc, TensorBytes{p.seq_first}, seq_first, bytes_of<int32_t>(n_seq)) &&
+              pulsar_gpu_tensor_write_async(sc, TensorBytes{p.seq_rows}, seq_rows, bytes_of<int32_t>(n_seq)) &&
+              pulsar_gpu_tensor_write_async(sc, TensorBytes{p.seq_bank}, seq_bank, bytes_of<int32_t>(n_seq));
     if (!ok) return fail("could not stage the PLE rows");
 
     const pulsar_qwen_layer_weights &L = layer_w(st, il);
@@ -1216,13 +1221,13 @@ static bool build_draft_head(const pulsar_qwen_step *st, pulsar_qwen_weights *wm
     const uint32_t nd = wm->n_draft;
     if (!wm->draft_ids || nd == 0 || nd >= s->n_vocab) return fail("the MTP draft vocabulary was not chosen at load");
     const uint16_t *hb = (const uint16_t *)wptr(st, st->w->output, "qwen lm_head");
-    const uint64_t bytes = pulsar_qwen_mxfp8_bytes((int)nd, H);
+    const uint64_t bytes = pulsar_mxfp8_bytes((int)nd, H);
     /* the device id list lives as long as the head (the gather kernel may still be reading it) */
-    wm->draft_ids_dev = pulsar_gpu_tensor_alloc((uint64_t)nd * sizeof(int32_t));
-    wm->draft_head_mx = hb && bytes ? pulsar_gpu_tensor_alloc(bytes) : NULL;
+    wm->draft_ids_dev = pulsar_gpu_tensor_alloc(bytes_of<int32_t>(nd));
+    wm->draft_head_mx = hb && bytes ? pulsar_gpu_tensor_alloc(TensorBytes{bytes}) : NULL;
     const bool ok = wm->draft_ids_dev && wm->draft_head_mx &&
-                    pulsar_gpu_tensor_write(wm->draft_ids_dev, 0, wm->draft_ids, (uint64_t)nd * sizeof(int32_t)) &&
-                    pulsar_qwen_bf16_to_mxfp8(hb, (const int32_t *)dptr(wm->draft_ids_dev), (int)nd, H,
+                    pulsar_gpu_tensor_write(wm->draft_ids_dev, TensorBytes{0}, wm->draft_ids, bytes_of<int32_t>(nd)) &&
+                    pulsar_bf16_to_mxfp8(hb, (const int32_t *)dptr(wm->draft_ids_dev), (int)nd, H,
                                               dptr(wm->draft_head_mx), 0) == 0;
     if (!ok) {
         pulsar_gpu_tensor_free(wm->draft_head_mx);
@@ -1277,17 +1282,18 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n, 
         if (ok && !dh && !stored && !wm->head_mx) {
             const uint16_t *hb = (const uint16_t *)wptr(st, st->w->output, "qwen lm_head");
             if (hb) hb += (uint64_t)v_lo * H;
-            const uint64_t bytes = pulsar_qwen_mxfp8_bytes((int)Vl, H);
-            wm->head_mx = hb && bytes ? pulsar_gpu_tensor_alloc(bytes) : NULL;
-            ok = wm->head_mx && pulsar_qwen_bf16_to_mxfp8(hb, NULL, (int)Vl, H, dptr(wm->head_mx), 0) == 0;
+            const uint64_t bytes = pulsar_mxfp8_bytes((int)Vl, H);
+            wm->head_mx = hb && bytes ? pulsar_gpu_tensor_alloc(TensorBytes{bytes}) : NULL;
+            ok = wm->head_mx && pulsar_bf16_to_mxfp8(hb, NULL, (int)Vl, H, dptr(wm->head_mx), 0) == 0;
             if (ok) fprintf(stderr, "pulsar: %s: lm_head as MXFP8 (%.2f GB, from bf16 %.2f GB)\n", PULSAR_QWEN_ARCH,
                             (double)bytes / 1e9, (double)s->n_vocab * H * 2 / 1e9);
             else if (wm->head_mx) { pulsar_gpu_tensor_free(wm->head_mx); wm->head_mx = NULL; }
         }
         if (ok && dh && !stored && !wm->draft_head_mx) ok = build_draft_head(st, wm);
         /* logits rows [out0, out0 + n) of the slab (the draft head's rows are n_draft wide) */
-        const uint64_t row_bytes = (uint64_t)(dh ? wm->n_draft : s->n_vocab) * sizeof(float);
-        pulsar_gpu_tensor *dst = ok ? pulsar_gpu_tensor_view(st->st->logits, out0 * row_bytes, n * row_bytes) : NULL;
+        const TensorBytes row_bytes = bytes_of<float>((uint64_t)(dh ? wm->n_draft : s->n_vocab));
+        pulsar_gpu_tensor *dst = ok ? pulsar_gpu_tensor_view(st->st->logits, row_bytes.times(out0),
+                                                             row_bytes.times(n)) : NULL;
         ok = ok && dst;
         if (ok) {
             const uint32_t rows = dh ? wm->n_draft : Vl;
@@ -1334,12 +1340,13 @@ bool pulsar_qwen_s4_mtp_combine(const pulsar_qwen_step *st, const void *h) {
     const uint32_t n = st->n_rows;
     if (!M.present || !st->st->mtp) return fail("the MTP combine without the MTP layer");
     for (uint32_t r = 0; r < n; r++)
-        if (st->tokens[r] < 0 || (uint32_t)st->tokens[r] >= s->n_vocab) return fail("a token id outside the vocabulary");
+        if (!st->tokens[r].below(s->n_vocab)) return fail("a token id outside the vocabulary");
     pulsar_gpu_tensor *moe_sc = st->st->scratch[PULSAR_QWEN_OP_MOE];
     static const uint32_t zero = 0;   /* L289: an enqueued write reads it later */
-    if (!moe_sc || !pulsar_gpu_tensor_write_async(moe_sc, moe_layout(st->shape, st->st->max_rows).nf, &zero, sizeof(zero)))
+    if (!moe_sc || !pulsar_gpu_tensor_write_async(moe_sc, TensorBytes{moe_layout(st->shape, st->st->max_rows).nf},
+                                                  &zero, TensorBytes{sizeof(zero)}))
         return fail("could not clear the MoE non-finite flag");
-    if (!pulsar_gpu_tensor_write_async(st->st->mtp_tok, 0, st->tokens, (uint64_t)n * sizeof(int32_t)))
+    if (!pulsar_gpu_tensor_write_async(st->st->mtp_tok, TensorBytes{0}, st->tokens, bytes_of<int32_t>(n)))
         return fail("could not stage the MTP rows' tokens");
     const int H = (int)s->n_embd;
     pulsar_qwen_mtp_dev d{};
@@ -1354,26 +1361,26 @@ bool pulsar_qwen_s4_mtp_combine(const pulsar_qwen_step *st, const void *h) {
     d.fc_hidden = {fh, fh + (uint64_t)H * H, H, H};
     return pulsar_qwen_mtp_combine_launch(&d, (const uint16_t *)h, (const int32_t *)dptr(st->st->mtp_tok), (int)n,
                                           (uint16_t *)dptr(st->streams), dptr(st->st->mtp_ws),
-                                          pulsar_gpu_tensor_bytes(st->st->mtp_ws), 0) == 0 ||
+                                          pulsar_gpu_tensor_bytes(st->st->mtp_ws).raw(), 0) == 0 ||
            fail("the MTP combine failed");
 }
 
-uint64_t pulsar_qwen_s4_draft_top_ws_bytes(void) { return pulsar_qwen_draft_top_ws_bytes(); }
+uint64_t pulsar_qwen_s4_draft_top_ws_bytes(void) { return pulsar_draft_top_ws_bytes(); }
 
-static_assert(PULSAR_QWEN_HEAD_ROWS_MAX <= PULSAR_QWEN_DRAFT_TOP_ROWS_MAX, "every headed MTP row can be picked");
+static_assert(PULSAR_QWEN_HEAD_ROWS_MAX <= PULSAR_DRAFT_TOP_ROWS_MAX, "every headed MTP row can be picked");
 
 bool pulsar_qwen_s4_draft_top(const pulsar_qwen_step *st, uint32_t n) {
     if (!st->draft_head || !st->st->mtp_top || !st->w->n_draft) return fail("the draft pick outside a drafting MTP step");
-    return pulsar_qwen_draft_top_launch((const float *)dptr(st->st->logits), (int)st->w->n_draft, (int)n,
+    return pulsar_draft_top_launch((const float *)dptr(st->st->logits), (int)st->w->n_draft, (int)n,
                                         dptr(st->st->mtp_top), 0) == 0 ||
            fail("the draft pick launch failed");
 }
 
 bool pulsar_qwen_s4_draft_top_read(const pulsar_qwen_state *q, const pulsar_qwen_weights *w, uint32_t n, int32_t *id,
                                    float *conf) {
-    pulsar_qwen_draft_top rec[PULSAR_QWEN_HEAD_ROWS_MAX];
+    pulsar_draft_top rec[PULSAR_QWEN_HEAD_ROWS_MAX];
     if (n == 0 || n > PULSAR_QWEN_HEAD_ROWS_MAX) return fail("a draft pick of no rows or past the head's rows");
-    if (!q->mtp_top || !pulsar_gpu_tensor_read(q->mtp_top, 0, rec, n * sizeof rec[0]))
+    if (!q->mtp_top || !pulsar_gpu_tensor_read(q->mtp_top, TensorBytes{0}, rec, TensorBytes{sizeof(rec[0])}.times(n)))
         return fail("could not read the draft pick");
     for (uint32_t r = 0; r < n; r++) {
         if (rec[r].nan) return fail("the draft head's logits hold a NaN");
@@ -1386,13 +1393,13 @@ bool pulsar_qwen_s4_draft_top_read(const pulsar_qwen_state *q, const pulsar_qwen
 
 /* L295 F3: the n-gram context's verify commit (the declared state's REPLAY, family_qwen.cpp): a bank's context before
  * the step, advanced over the kept tokens as the embed advanced it over every row. */
-bool pulsar_qwen_s4_ngram_replay(const pulsar_qwen_weights *w, int32_t ctx[2], const int32_t *tokens, uint32_t keep) {
+bool pulsar_qwen_s4_ngram_replay(const pulsar_qwen_weights *w, int32_t ctx[2], const TokId *tokens, uint32_t keep) {
     pulsar_qwen_ple_io *io = w->ple_io;
     if (!io) return fail("no PLE row file is open");
     if (keep > PULSAR_QWEN_SPEC_ROWS) return fail("an n-gram replay past the verify width");
     pulsar_qwen_ngram_ctx c = {{ctx[0], ctx[1]}};
     uint64_t ids[PULSAR_QWEN_SPEC_ROWS * PULSAR_QWEN_NGRAM_COLS];
-    pulsar_qwen_ngram_rows(&io->layout, &c, tokens, (int)keep, ids);
+    pulsar_qwen_ngram_rows(&io->layout, &c, pulsar_tok_ids_raw(tokens), (int)keep, ids);   /* the hash reads raw ids */
     ctx[0] = c.prev[0];
     ctx[1] = c.prev[1];
     return true;
@@ -1566,12 +1573,13 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, uint32_t il) {
     /* the per-bank caches: each bank's own KV and pooled-key tensors (L284 #3), its slice of the bank-major
      * index stage.  An evicted bank's are absent; the kernel refuses a row of it ("a sequence's cache is
      * missing"), and the server restores a bank before stepping it. */
-    const uint64_t itb = pulsar_qwen_index_tail_bytes(s);
+    const TensorBytes itb = TensorBytes{pulsar_qwen_index_tail_bytes(s)};
     pulsar_qsa_seq seqs[64];
     for (uint32_t b = 0; ok && b < nb; b++) {
-        seqs[b].kv    = pulsar_state_pool(st->states, il, PULSAR_QWEN_STATE_KV, b);
-        seqs[b].bkey  = pulsar_state_pool(st->states, il, PULSAR_QWEN_STATE_IDX_KEYS, b);
-        seqs[b].stage = pulsar_gpu_tensor_view(pulsar_state_tensor(st->states, il, PULSAR_QWEN_STATE_IDX_TAIL), b * itb, itb);
+        seqs[b].kv    = pulsar_state_pool(st->states, il, PULSAR_QWEN_STATE_KV, BankId{b});
+        seqs[b].bkey  = pulsar_state_pool(st->states, il, PULSAR_QWEN_STATE_IDX_KEYS, BankId{b});
+        seqs[b].stage = pulsar_gpu_tensor_view(pulsar_state_tensor(st->states, il, PULSAR_QWEN_STATE_IDX_TAIL),
+                                               itb.times(b), itb);
         seqs[b].cap   = st->states->ctx;
         views[nv++] = seqs[b].stage;
         ok = seqs[b].stage != NULL;
@@ -1582,8 +1590,10 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, uint32_t il) {
          * capture (L284 #2: a fused step's prompt run behind them is not captured); the core kept each run's stage
          * before the step (pulsar_state_verify_capture) and rebuilds it at the commit (pulsar_state_commit) */
         ok = pulsar_gpu_tensor_copy_async(pulsar_state_capture_tensor(st->states, PULSAR_QWEN_STATE_IDX_TAIL),
-                                          pulsar_state_capture_offset(st->states, il, PULSAR_QWEN_STATE_IDX_TAIL), vi, 0,
-                                          (uint64_t)st->n_dec * PULSAR_QSA_IDX_IN * 4u) != 0;
+                                          TensorBytes{pulsar_state_capture_offset(st->states, il,
+                                                                                  PULSAR_QWEN_STATE_IDX_TAIL)},
+                                          vi, TensorBytes{0},
+                                          bytes_of<float>((uint64_t)st->n_dec * PULSAR_QSA_IDX_IN)) != 0;
         if (!ok) { drop(); return fail("the verify capture of a QSA layer failed"); }
     }
 
@@ -1598,17 +1608,20 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, uint32_t il) {
     const uint64_t OD = pulsar_qwen_qsa_out_dim(s);
     pulsar_gpu_tensor *ws_view = scratch_view(st, PULSAR_QWEN_OP_QSA, g.ws, g.ws_bytes);
     ok = ok && ws_view && attention_calls(st, [&](uint32_t r0, uint32_t m) {
-        pulsar_gpu_tensor *sq = pulsar_gpu_tensor_view(vq, (uint64_t)r0 * QI * 4u, (uint64_t)m * QI * 4u);
-        pulsar_gpu_tensor *sk = pulsar_gpu_tensor_view(vk, (uint64_t)r0 * KVI * 4u, (uint64_t)m * KVI * 4u);
-        pulsar_gpu_tensor *sv = pulsar_gpu_tensor_view(vv, (uint64_t)r0 * KVI * 4u, (uint64_t)m * KVI * 4u);
-        pulsar_gpu_tensor *si = pulsar_gpu_tensor_view(vi, (uint64_t)r0 * PULSAR_QSA_IDX_IN * 4u,
-                                                       (uint64_t)m * PULSAR_QSA_IDX_IN * 4u);
+        pulsar_gpu_tensor *sq = pulsar_gpu_tensor_view(vq, bytes_of<float>((uint64_t)r0 * QI),
+                                                       bytes_of<float>((uint64_t)m * QI));
+        pulsar_gpu_tensor *sk = pulsar_gpu_tensor_view(vk, bytes_of<float>((uint64_t)r0 * KVI),
+                                                       bytes_of<float>((uint64_t)m * KVI));
+        pulsar_gpu_tensor *sv = pulsar_gpu_tensor_view(vv, bytes_of<float>((uint64_t)r0 * KVI),
+                                                       bytes_of<float>((uint64_t)m * KVI));
+        pulsar_gpu_tensor *si = pulsar_gpu_tensor_view(vi, bytes_of<float>((uint64_t)r0 * PULSAR_QSA_IDX_IN),
+                                                       bytes_of<float>((uint64_t)m * PULSAR_QSA_IDX_IN));
         pulsar_qsa_io io{};
         io.qg = sq; io.k = sk; io.v = sv; io.idx = si;
         io.out_bf16 = (uint8_t *)dptr(sc) + g.obf16 + (uint64_t)r0 * OD * 2u;   /* L251 / ac69748f: bf16, not A8 */
         io.out_e4m3 = NULL;
-        io.out_scale = (uint8_t *)dptr(sc) + g.a8_sf;
-        io.out_sf_pitch = pulsar_gpu_mx_kbp(pulsar_qwen_qsa_out_dim(s));
+        io.out_scale = NULL;     /* L335: no E4M3 slot, so no scales -- a slab written and never read is gone */
+        io.out_sf_pitch = 0;
         io.tap_out_f32 = NULL; io.tap_sel = NULL;              /* the lane, not a gate */
         io.tp_ranks = (int)pulsar_qwen_tp(s);
         io.row_rope = st->rope ? st->rope + (size_t)r0 * 6u : NULL;   /* L268: multi-axis rope, NULL for text */
@@ -1616,9 +1629,10 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, uint32_t il) {
         /* row_seq / row_pos are HOST arrays -- pulsar_gpu_qsa_forward walks them on
          * the host to build its row list.  The step already carries them as `bank` /
          * `pos`.  (The GDN call's row_slot is the opposite: a DEVICE pointer.  Passing
-         * the device row_bank here segfaulted the host walk, 18:56.) */
+         * the device row_bank here segfaulted the host walk, 18:56.)  Its bank array is raw: the named crossing. */
+        const uint32_t *row_bank = reinterpret_cast<const uint32_t *>(pulsar_bank_ids_raw(st->bank + r0));
         const bool done = sq && sk && sv && si &&
-                          pulsar_gpu_qsa_forward(&layer, seqs, nb, (const uint32_t *)st->bank + r0,
+                          pulsar_gpu_qsa_forward(&layer, seqs, nb, row_bank,
                                                  (const uint32_t *)st->pos + r0, m, &io, ws_view) == 1;
         for (pulsar_gpu_tensor *t : {sq, sk, sv, si}) pulsar_gpu_tensor_free(t);
         return done;

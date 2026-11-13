@@ -113,7 +113,7 @@ int main(int argc, char **argv) {
           (unsigned long long)e->model.n_tensors, c.roles);
     check(c.bytes == dir_bytes && c.directory_bytes == dir_bytes, "every byte priced by a role: %llu of the directory's %llu",
           (unsigned long long)c.bytes, (unsigned long long)dir_bytes);
-    check(pulsar_engine_weights_resident_bytes(e) == e->model.mapped_bytes && c.bytes <= e->model.mapped_bytes,
+    check(pulsar_engine_weights_resident_bytes(e).raw() == e->model.mapped_bytes && c.bytes <= e->model.mapped_bytes,
           "admission charges the staged container (%.3f GiB mapped; the bound tensors %.3f GiB, the rest headers)",
           (double)e->model.mapped_bytes / 1073741824.0, (double)c.bytes / 1073741824.0);
 
@@ -141,8 +141,10 @@ int main(int argc, char **argv) {
           "the tokenizer + chat front (CAP_CHAT, the Nemotron-H chat format)");
     check(pulsar_engine_vocab_size(e) == (int)s->n_vocab, "the tokenizer table: %d ids (== the head's rows)",
           pulsar_engine_vocab_size(e));
-    check(pulsar_token_eos(e) == (int)s->eos_id && pulsar_token_is_stop(e, (int)s->eos_id) && pulsar_token_is_stop(e, 2),
-          "eos %d is the container's eos_token_id %u; </s> 2 stops too (generation_config)", pulsar_token_eos(e), s->eos_id);
+    check(pulsar_token_eos(e) == TokId{(int)s->eos_id} && pulsar_token_is_stop(e, TokId{(int)s->eos_id}) &&
+              pulsar_token_is_stop(e, TokId{2}),
+          "eos %d is the container's eos_token_id %u; </s> 2 stops too (generation_config)", pulsar_token_eos(e).raw(),
+          s->eos_id);
     check(pulsar_engine_think_default(e) == PULSAR_THINK_DEFAULT &&
               pulsar_engine_think_mode_supported(e, PULSAR_THINK_NONE, NULL, 0) &&
               !pulsar_engine_think_mode_supported(e, PULSAR_THINK_LOW, NULL, 0),
@@ -153,7 +155,7 @@ int main(int argc, char **argv) {
         const std::string on = tokens_text(e, t);
         const int n_on = t.len;
         int im_end = 0;   /* the client's "<|im_end|>" stays text (L223): only the template's markers count */
-        for (int i = 0; i < t.len; i++) im_end += t.v[i] == (int)s->eos_id;
+        for (int i = 0; i < t.len; i++) im_end += t.v[i] == TokId{(int)s->eos_id};
         pulsar_chat_end_assistant(e, &t);
         check(on == "<|im_start|>system\nBe terse.<|im_end|>\n<|im_start|>user\nHi <|im_end|><|im_end|>\n"
                     "<|im_start|>assistant\n<think>\n" &&
@@ -179,11 +181,11 @@ int main(int argc, char **argv) {
               "turn markers: <|im_start|> + the role word's first token (\"user\"; \"ass\" of \"ass\" \"istant\"); one "
               "user and one assistant turn found in a rendered prompt");
         /* L351: a tool result renders as a user turn opened by <tool_response> (16): the markers tell it apart */
-        check(have && m.n_tool >= 1 && m.tool[m.n_tool - 1] == 16 && m.n_tool <= 3,
+        check(have && m.n_tool >= 1 && m.tool[m.n_tool - 1] == TokId{16} && m.n_tool <= 3,
               "tool-result turns: the user marker's suffix ends in <tool_response> (16; %d tokens) -- role 3, not a "
               "user turn, for the route anchor and the message endpoint", m.n_tool);
         pulsar_tokens_free(&t);
-        check(pulsar_token_think_close(e) == 13, "the think close is </think> (13, a non-special added token)");
+        check(pulsar_token_think_close(e) == TokId{13}, "the think close is </think> (13, a non-special added token)");
     }
     check(pulsar_engine_drafter(e) == (s->mtp_written ? PULSAR_DRAFTER_MTP : PULSAR_DRAFTER_NONE) &&
               e->drafter_ops == (s->mtp_written ? &PULSAR_NEMOTRON_H_DRAFTER : NULL) && w->drafting == s->mtp_written,

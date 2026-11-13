@@ -17,7 +17,8 @@
 #include "lib/pulsar_kvdigest.h"
 #include "lib/pulsar_kvpool.h"
 #include "lib/bpe_tokenizer.h"
-#include "lib/nemotron_chat.h"
+#include "families/gemma4/gemma4_chat.h"
+#include "families/nemotron_h/nemotron_chat.h"
 #include "lib/pulsar_grammar.h"
 
 #ifdef PULSAR_SERVER_TEST
@@ -640,6 +641,7 @@ static void test_context_length_error_uses_protocol_standard_shape(void) {
         TEST_ASSERT(strstr(out, "\"param\":\"messages\"") != NULL);
         TEST_ASSERT(strstr(out, "\"n_prompt_tokens\":16") != NULL);
         TEST_ASSERT(strstr(out, "\"n_ctx\":16") != NULL);
+        TEST_ASSERT(strstr(out, "Prompt has 16 tokens, but the configured context size is 16 tokens") != NULL);
         free(out);
         close(sv[0]);
         close(sv[1]);
@@ -658,6 +660,8 @@ static void test_context_length_error_uses_protocol_standard_shape(void) {
         TEST_ASSERT(strstr(out, "{\"type\":\"error\",\"error\"") != NULL);
         TEST_ASSERT(strstr(out, "\"type\":\"invalid_request_error\"") != NULL);
         TEST_ASSERT(strstr(out, "\"n_prompt_tokens\":20") != NULL);
+        /* L252 P5: Anthropic's wording, the text Claude Code matches to compact */
+        TEST_ASSERT(strstr(out, "\"message\":\"prompt is too long: 20 tokens > 20 maximum\"") != NULL);
         free(out);
         close(sv[0]);
         close(sv[1]);
@@ -2406,7 +2410,7 @@ static void test_l344_thinking_budget_parse(void) {
  * follows its first i + off tokens, so the row where budget runs out is forced -- unless a pending token closed
  * the block first.  The mask row allows the close token alone; the others stay the grammar's or unconstrained. */
 static void test_l344_thinking_budget_close_row(void) {
-    const int close = 77;
+    const TokId close{77};
     /* plain: due at the budget, not before; no budget / closed block: never */
     TEST_ASSERT(think_close_row(100, true, 99, close, NULL, 0, 0) == -1);
     TEST_ASSERT(think_close_row(100, true, 100, close, NULL, 0, 0) == 0);
@@ -2414,7 +2418,7 @@ static void test_l344_thinking_budget_close_row(void) {
     TEST_ASSERT(think_close_row(0, true, 5000, close, NULL, 0, 0) == -1);
     TEST_ASSERT(think_close_row(100, false, 100, close, NULL, 0, 0) == -1);
     /* a round with the base unsent (off 1): toks = base + 3 drafts, rows 0..3 */
-    const int r1[] = {5, 6, 7, 8};
+    const TokId r1[] = {TokId{5}, TokId{6}, TokId{7}, TokId{8}};
     TEST_ASSERT(think_close_row(100, true, 96, close, r1, 4, 1) == 3);   /* 96 + base + 3 drafts = 100 at row 3 */
     TEST_ASSERT(think_close_row(100, true, 98, close, r1, 4, 1) == 1);
     TEST_ASSERT(think_close_row(100, true, 99, close, r1, 4, 1) == 0);   /* the base is the budget's last */
@@ -2423,7 +2427,7 @@ static void test_l344_thinking_budget_close_row(void) {
     TEST_ASSERT(think_close_row(100, true, 98, close, r1 + 1, 3, 0) == 2);
     TEST_ASSERT(think_close_row(100, true, 100, close, r1 + 1, 3, 0) == 0);
     /* a draft closes the block before the budget row: nothing forced past it */
-    const int r2[] = {5, close, 7, 8};
+    const TokId r2[] = {TokId{5}, TokId{close.raw()}, TokId{7}, TokId{8}};
     TEST_ASSERT(think_close_row(100, true, 97, close, r2, 4, 1) == -1);
     TEST_ASSERT(think_close_row(100, true, 99, close, r2, 4, 1) == 0);   /* ...but a row before it still is */
 
@@ -2433,9 +2437,10 @@ static void test_l344_thinking_budget_close_row(void) {
     for (size_t i = 0; i < 2 * W; i++) gram[i] = 0x0f0f0f0fu + (uint32_t)i;
     think_masks_lay(out, W, 1, 3, close, gram, 2);
     TEST_ASSERT(!memcmp(out, gram, W * sizeof(uint32_t)));
-    for (size_t w = 0; w < W; w++) TEST_ASSERT(out[W + w] == (w == (size_t)close / 32u ? 1u << (close % 32) : 0u));
+    const uint32_t cb = (uint32_t)close.raw();   /* the close token's bit */
+    for (size_t w = 0; w < W; w++) TEST_ASSERT(out[W + w] == (w == cb / 32u ? 1u << (cb % 32u) : 0u));
     for (size_t w = 0; w < W; w++) TEST_ASSERT(out[2 * W + w] == 0xffffffffu);
-    think_masks_lay(out, W, 0, 1, 0, NULL, 0);
+    think_masks_lay(out, W, 0, 1, TokId{0}, NULL, 0);
     TEST_ASSERT(out[0] == 1u && out[1] == 0u && out[2] == 0u && out[3] == 0u);
 }
 
@@ -3448,7 +3453,7 @@ static void test_anthropic_tool_result_id_validation(void) {
     pthread_mutex_lock(&s.tool_mu);
     s.n_slots = 1; /* live bindings are per-slot; has_call_id scans slots */
     s.slots[0].anthropic_live.valid = true;
-    s.slots[0].anthropic_live.live_tokens = 10;
+    s.slots[0].anthropic_live.live_tokens = TokCount{10};
     id_list_push_unique(&s.slots[0].anthropic_live.call_ids, "toolu_missing");
     pthread_mutex_unlock(&s.tool_mu);
     bool needs_live_tool_state = false;
@@ -3892,6 +3897,136 @@ static void test_qwen_payload_is_sampled_structure_greedy(void) {
     TEST_ASSERT(p.calls()[0].arguments == "{\"s\": \"hello </b\", \"n\": 42, \"o\": {\"k\": \"v \\\" still\"}}");
 }
 
+/* L386: a property's declared type is read through unions and local references (out_tool_param_type), so a
+ * string argument declared `Optional[str]` (pydantic: anyOf string | null), by `$ref`, or by a string enum
+ * stays a string whatever its text -- in the call's arguments and in its streamed fragments, for every
+ * family that types a value by its declaration (Qwen, Nemotron, Gemma). */
+static void test_tool_param_type_reads_unions_and_refs(void) {
+    const char *tools =
+        "[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"parameters\":{\"type\":\"object\","
+        "\"$defs\":{\"Name\":{\"type\":\"string\"},\"Obj\":{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"integer\"}}},"
+        "\"Loop\":{\"$ref\":\"#/$defs/Loop2\"},\"Loop2\":{\"anyOf\":[{\"$ref\":\"#/$defs/Loop\"},{\"type\":\"integer\"}]},"
+        "\"SelfOrStr\":{\"anyOf\":[{\"$ref\":\"#/$defs/SelfOrStr\"},{\"type\":\"string\"}]}},"
+        "\"definitions\":{\"Old\":{\"type\":\"string\"}},"
+        "\"properties\":{"
+        "\"os\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"default\":null},"
+        "\"oi\":{\"anyOf\":[{\"type\":\"integer\"},{\"type\":\"null\"}]},"
+        "\"si\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"integer\"}]},"
+        "\"one\":{\"oneOf\":[{\"type\":\"null\"},{\"type\":\"string\"}]},"
+        "\"all\":{\"allOf\":[{\"$ref\":\"#/$defs/Name\"}]},"
+        "\"all2\":{\"allOf\":[{\"type\":\"string\"},{\"minLength\":1}]},"
+        "\"rs\":{\"$ref\":\"#/$defs/Name\"},\"rd\":{\"$ref\":\"#/definitions/Old\"},\"ro\":{\"$ref\":\"#/$defs/Obj\"},"
+        "\"rmiss\":{\"$ref\":\"#/$defs/Missing\"},\"remote\":{\"$ref\":\"https://example.com/s.json#/$defs/Name\"},"
+        "\"en\":{\"enum\":[\"1\",\"2\"]},\"enm\":{\"enum\":[\"1\",2]},\"cs\":{\"const\":\"7\"},"
+        "\"cy\":{\"$ref\":\"#/$defs/Loop\"},\"cys\":{\"$ref\":\"#/$defs/SelfOrStr\"},"
+        "\"nt\":{\"description\":\"no type\"},\"tw\":{\"type\":\"integer\",\"anyOf\":[{\"type\":\"string\"}]},"
+        "\"ts\":{\"type\":[\"null\",\"string\"]}}}}}]";
+    /* each: the parameter, the text the model wrote, its JSON in the arguments */
+    struct row { const char *key, *text, *json; };
+    static const row rows[] = {
+        {"os", "123", "\"123\""}, {"os", "true", "\"true\""}, {"os", "null", "\"null\""},   /* Optional[str] */
+        {"os", "[1]", "\"[1]\""}, {"os", "hello", "\"hello\""},
+        {"oi", "123", "123"}, {"oi", "null", "null"},              /* Optional[int]: no string in it */
+        {"si", "123", "\"123\""},                                  /* includes string */
+        {"one", "123", "\"123\""},
+        {"all", "123", "\"123\""},                                 /* allOf of one branch is that branch */
+        {"all2", "123", "123"},                                    /* of two: not read */
+        {"rs", "123", "\"123\""}, {"rd", "123", "\"123\""},        /* $defs, definitions */
+        {"ro", "{\"a\": 1}", "{\"a\": 1}"}, {"ro", "123", "123"},  /* a reference to an object */
+        {"rmiss", "123", "123"}, {"remote", "123", "123"},         /* unresolved, not local: nothing declared */
+        {"en", "1", "\"1\""}, {"enm", "1", "1"}, {"cs", "7", "\"7\""},
+        {"cy", "123", "123"},                                      /* a cycle: no hang, nothing declared */
+        {"cys", "123", "\"123\""},                                 /* a cycle beside a string branch */
+        {"nt", "123", "123"}, {"nt", "hello", "\"hello\""},        /* no type: as before */
+        {"tw", "123", "123"},                                      /* a declared type decides alone, as before */
+        {"ts", "123", "\"123\""},
+    };
+    for (const row &rw : rows) {
+        const std::string out = std::string("<tool_call>\n<function=f>\n<parameter=") + rw.key + ">\n" + rw.text +
+                                "\n</parameter>\n</function>\n</tool_call>";
+        const std::string want = std::string("{\"") + rw.key + "\": " + rw.json + "}";
+        for (int bytewise = 0; bytewise < 2; bytewise++) {
+            qwen_output_parser p;
+            char err[160];
+            TEST_ASSERT(p.init(false, tools, err, sizeof err));
+            std::vector<out_event> ev;
+            if (bytewise) for (char c : out) p.feed(&c, 1, &ev);
+            else p.feed(out.data(), out.size(), &ev);
+            p.finish(&ev);
+            std::string streamed;
+            for (const out_event &e : ev)
+                if (e.kind == out_event::TOOL_ARGS) streamed += e.text;
+            streamed += "}";
+            const bool ok = p.errors() == 0 && p.calls().size() == 1 && p.calls()[0].arguments == want && streamed == want;
+            if (!ok)
+                fprintf(stderr, "L386 %s=%s (%s): arguments %s, streamed %s, want %s\n", rw.key, rw.text,
+                        bytewise ? "byte by byte" : "whole", p.calls().empty() ? "-" : p.calls()[0].arguments.c_str(),
+                        streamed.c_str(), want.c_str());
+            TEST_ASSERT(ok);
+        }
+    }
+
+    /* the decode rule follows the same reading: an Optional[str] value is payload, an Optional[int] one is not */
+    for (const char *key : {"os", "oi"}) {
+        qwen_output_parser p;
+        char err[160];
+        TEST_ASSERT(p.init(false, tools, err, sizeof err));
+        std::vector<out_event> ev;
+        const std::string head = std::string("<tool_call>\n<function=f>\n<parameter=") + key + ">\n";
+        p.feed(head.data(), head.size(), &ev);
+        TEST_ASSERT(p.in_payload() == !strcmp(key, "os"));
+    }
+
+    /* Nemotron reads the same body with Python's scalar spelling: None stays the text where string is declared */
+    static const row nrows[] = {
+        {"os", "123", "\"123\""}, {"os", "None", "\"None\""}, {"oi", "123", "123"}, {"oi", "None", "null"},
+        {"rs", "True", "\"True\""}, {"ro", "True", "true"},
+    };
+    for (const row &rw : nrows) {
+        nemotron_output_parser p;
+        char err[160];
+        TEST_ASSERT(p.init(false, tools, err, sizeof err));
+        const std::string out = std::string("<tool_call>\n<function=f>\n<parameter=") + rw.key + ">\n" + rw.text +
+                                "\n</parameter>\n</function>\n</tool_call>";
+        std::vector<out_event> ev;
+        p.feed(out.data(), out.size(), &ev);
+        p.finish(&ev);
+        TEST_ASSERT(p.errors() == 0 && p.calls().size() == 1);
+        TEST_ASSERT(p.calls()[0].arguments == std::string("{\"") + rw.key + "\": " + rw.json + "}");
+    }
+
+    /* Gemma's bare values take the same reading */
+    static const row grows[] = {{"os", "123", "\"123\""}, {"oi", "123", "123"}, {"en", "1", "\"1\""}, {"cy", "123", "123"}};
+    for (const row &rw : grows) {
+        gemma4_output_parser p;
+        char err[160];
+        TEST_ASSERT(p.init(false, tools, err, sizeof err));
+        const std::string out = std::string("<|tool_call>call:f{") + rw.key + ":" + rw.text + "}<tool_call|>";
+        std::vector<out_event> ev;
+        p.feed(out.data(), out.size(), &ev);
+        p.finish(&ev);
+        TEST_ASSERT(p.errors() == 0 && p.calls().size() == 1);
+        TEST_ASSERT(p.calls()[0].arguments == std::string("{\"") + rw.key + "\": " + rw.json + "}");
+    }
+
+    /* the three answers, and a reference diamond (ten levels of ten branches) answered within its budget */
+    pyjson_value t;
+    char jerr[160];
+    TEST_ASSERT(pyjson_parse(tools, strlen(tools), &t, jerr, sizeof jerr));
+    TEST_ASSERT(!strcmp(out_tool_param_type(t, "f", "os"), "string"));
+    TEST_ASSERT(!strcmp(out_tool_param_type(t, "f", "oi"), "other"));
+    TEST_ASSERT(out_tool_param_type(t, "f", "absent") == NULL && out_tool_param_type(t, "g", "os") == NULL);
+    std::string diamond = "[{\"name\":\"d\",\"parameters\":{\"$defs\":{";
+    for (int lvl = 0; lvl < 10; lvl++) {
+        diamond += "\"D" + std::to_string(lvl) + "\":{\"anyOf\":[";
+        for (int b = 0; b < 10; b++) diamond += (b ? ",{\"$ref\":\"#/$defs/D" : "{\"$ref\":\"#/$defs/D") + std::to_string(lvl + 1) + "\"}";
+        diamond += "]},";
+    }
+    diamond += "\"D10\":{\"type\":\"integer\"}},\"properties\":{\"x\":{\"$ref\":\"#/$defs/D0\"}}}}]";
+    TEST_ASSERT(pyjson_parse(diamond.data(), diamond.size(), &t, jerr, sizeof jerr));
+    TEST_ASSERT(!strcmp(out_tool_param_type(t, "d", "x"), "other"));
+}
+
 /* ==== L303: structured outputs -- the grammars, the gate, the protocols ================================== */
 
 /* A toy vocabulary for the grammar tests: every byte is a token (id = byte), then a few multi-byte tokens the
@@ -4210,8 +4345,8 @@ static void test_l303_round_masks_match_plain(void) {
         const std::string head = "ok</think>\n\n<tool_call>\n<func";
         TEST_ASSERT(l303_feed(&srv, &g, head) == head.size());
         const std::string round = refuse ? "tion=sx>\n" : "tion=search>\n<param";   /* base + drafts */
-        std::vector<int> toks;
-        for (char c : round) toks.push_back((uint8_t)c);
+        std::vector<TokId> toks;
+        for (char c : round) toks.push_back(TokId{(uint8_t)c});
         const uint32_t *masks = NULL;
         const int rows = gen_constrain_round(&srv, &g, toks.data(), (int)toks.size(), false, &masks);
         TEST_ASSERT(rows == (int)toks.size() && masks);
@@ -4220,12 +4355,12 @@ static void test_l303_round_masks_match_plain(void) {
         TEST_ASSERT(l303_allows(&srv, &g, 't') && !l303_allows(&srv, &g, 'x'));
         /* step by step, as the plain lane decodes the same tokens */
         size_t i = 0;
-        TEST_ASSERT(gen_constrain_accept(&srv, &g, toks[0]));
+        TEST_ASSERT(gen_constrain_accept(&srv, &g, toks[0].raw()));
         for (; i < (size_t)rows; i++) {
             TEST_ASSERT(gen_constrain_mask(&srv, &g, row.data()));
             TEST_ASSERT(!memcmp(row.data(), masks + i * W, W * sizeof(uint32_t)));
             if (i + 1 == (size_t)rows) break;
-            const int t = toks[i + 1];
+            const int t = toks[i + 1].raw();
             if (!((row[(uint32_t)t >> 5] >> ((uint32_t)t & 31u)) & 1u)) break;   /* the walk stops here */
             TEST_ASSERT(gen_constrain_accept(&srv, &g, t));
         }
@@ -4259,9 +4394,9 @@ static void test_l309_draft_prefix(void) {
         TEST_ASSERT(l303_begin(&srv, &j, &g));
         const std::string head = "ok</think>\n\n<tool_call>\n<func";
         TEST_ASSERT(l303_feed(&srv, &g, head) == head.size());
-        std::vector<int32_t> toks;
-        for (char c : std::string(pc.round)) toks.push_back((uint8_t)c);
-        if (pc.stop_at >= 0) toks[(size_t)pc.stop_at + 1u] = v.stop;
+        std::vector<TokId> toks;
+        for (char c : std::string(pc.round)) toks.push_back(TokId{(uint8_t)c});
+        if (pc.stop_at >= 0) toks[(size_t)pc.stop_at + 1u] = TokId{v.stop};
         const int n = (int)toks.size() - 1;
         const int got = gen_constrain_draft_prefix(&srv, &g, toks[0], toks.data() + 1, n);
         if (got != pc.want) fprintf(stderr, "l309 \"%s\": prefix %d, want %d\n", pc.round, got, pc.want);
@@ -4269,13 +4404,13 @@ static void test_l309_draft_prefix(void) {
         /* the gate is back: the next draw's mask still takes the base, and the round's masks agree with the cut */
         TEST_ASSERT(l303_allows(&srv, &g, 't') && !l303_allows(&srv, &g, 'x'));
         if (pc.stop_at < 0) {
-            std::vector<int> rt(toks.begin(), toks.end());
+            std::vector<TokId> rt(toks.begin(), toks.end());
             const uint32_t *masks = NULL;
             const int rows = gen_constrain_round(&srv, &g, rt.data(), (int)rt.size(), false, &masks);
             TEST_ASSERT(rows == (int)rt.size() && masks);
             int walk = 0;   /* the drafts the masked walk can accept: row i takes draft i */
-            while (walk < n && ((masks[(size_t)walk * W + ((uint32_t)rt[(size_t)walk + 1u] >> 5)] >>
-                                 ((uint32_t)rt[(size_t)walk + 1u] & 31u)) & 1u))
+            while (walk < n && ((masks[(size_t)walk * W + ((uint32_t)rt[(size_t)walk + 1u].raw() >> 5)] >>
+                                 ((uint32_t)rt[(size_t)walk + 1u].raw() & 31u)) & 1u))
                 walk++;
             TEST_ASSERT(walk == got);
         }
@@ -4284,8 +4419,8 @@ static void test_l309_draft_prefix(void) {
     /* no gate: the chain whole */
     gen_state g;
     memset(&g, 0, sizeof g);
-    const int32_t d[3] = {'a', 'b', 'c'};
-    TEST_ASSERT(gen_constrain_draft_prefix(&srv, &g, 'z', d, 3) == 3);
+    const TokId d[3] = {TokId{'a'}, TokId{'b'}, TokId{'c'}};
+    TEST_ASSERT(gen_constrain_draft_prefix(&srv, &g, TokId{'z'}, d, 3) == 3);
     l303_server_free(&srv);
 }
 
@@ -4371,7 +4506,7 @@ static void test_qwen_tool_error_suffix_reminds_the_system_turn(void) {
 
 
 
-/* ---- L294 E6: Inkling's server table (family_inkling.cpp over src/lib/inkling_chat) ------------------------- */
+/* ---- L294 E6: Inkling's server table (inkling_server.cpp over src/families/inkling/inkling_chat) ------------------------- */
 
 /* Render `msgs` with the Inkling family and no engine; `tools` = an OpenAI tools array (NULL = none).  The messages
  * are TAKEN.  `r` (optional) receives the request for the hooks. */
@@ -4616,7 +4751,7 @@ static void test_inkling_tool_error_suffix_reminds_the_system_turn(void) {
 }
 
 
-/* ---- L296 N8: Nemotron-H's server table (family_nemotron_h.cpp over src/lib/nemotron_chat) ---------------------- */
+/* ---- L296 N8: Nemotron-H's server table (nemotron_h_server.cpp over src/families/nemotron_h/nemotron_chat) ---------------------- */
 
 /* Render `msgs` with the Nemotron-H family and no engine; `tools` = an OpenAI tools array (NULL = none).  The
  * messages are TAKEN.  `r` (optional) receives the request for the hooks. */
@@ -4921,7 +5056,7 @@ static void test_nemotron_refusals(void) {
     }
 }
 
-/* ---- L338: Gemma 4's server table (family_gemma4.cpp over src/lib/gemma4_chat) -------------------------------- */
+/* ---- L338: Gemma 4's server table (gemma4_server.cpp over src/families/gemma4/gemma4_chat) -------------------------------- */
 
 /* The effort map: thinking on unless asked off (the server's one rule) -- on writes <|think|> in a system turn, off
  * closes an empty thought channel in the generation prompt; every named effort but none is on (one level). */
@@ -5597,9 +5732,9 @@ static void test_l337_disk_chain_keys_on_the_edited_render(void) {
         TEST_ASSERT(test_seg_put(st, k0, a, b, bt.substr(a, b - a).c_str(), 64, 0x22, k1));
         TEST_ASSERT(test_seg_put(st, k1, b, n, bt.substr(b).c_str(), 64, 0x33, k2));
         pulsar_segstore_seg chain[8];
-        TEST_ASSERT(pulsar_segstore_lookup(st, bt.c_str(), bt.size(), NULL, chain, 8) == 3);
-        const int m = pulsar_segstore_lookup(st, et.c_str(), et.size(), NULL, chain, 8);
-        TEST_ASSERT(m == 1 && chain[0].text_end <= cp);
+        TEST_ASSERT(pulsar_segstore_lookup(st, bt.c_str(), TextBytes{bt.size()}, NULL, chain, 8) == 3);
+        const int m = pulsar_segstore_lookup(st, et.c_str(), TextBytes{et.size()}, NULL, chain, 8);
+        TEST_ASSERT(m == 1 && chain[0].text_end <= TextBytes{cp});
         pulsar_segstore_close(st);
     }
     if (dir) {
@@ -5727,17 +5862,18 @@ static void test_live_tail_joins_before_a_committed_stop(void) {
         const int stops[] = {-1, im_end, endoftext};
         for (int stop : stops) {
             pulsar_tokens live = {0}, tail_t = {0}, joined = {0};
-            for (int t : sampled) pulsar_tokens_push(&live, t);
-            if (stop >= 0) pulsar_tokens_push(&live, stop);
-            for (int t : tail_toks) pulsar_tokens_push(&tail_t, t);
+            for (int t : sampled) pulsar_tokens_push(&live, TokId{t});
+            if (stop >= 0) pulsar_tokens_push(&live, TokId{stop});
+            for (int t : tail_toks) pulsar_tokens_push(&tail_t, TokId{t});
             join_live_history_and_tail(&live, stop >= 0, &tail_t, &joined);
-            TEST_ASSERT(joined.len == (int)want.size() && std::equal(want.begin(), want.end(), joined.v));
+            TEST_ASSERT(joined.len == (int)want.size() &&
+                        std::equal(want.begin(), want.end(), joined.v, [](int w, TokId t) { return t == TokId{w}; }));
             if (stop == im_end) {
                 /* the pre-L290 join: the history after the committed stop doubles the close */
                 pulsar_tokens doubled = {0};
                 join_live_history_and_tail(&live, false, &tail_t, &doubled);
-                TEST_ASSERT(doubled.len == (int)want.size() + 1 && doubled.v[sampled.size()] == im_end &&
-                            doubled.v[sampled.size() + 1] == im_end);
+                TEST_ASSERT(doubled.len == (int)want.size() + 1 && doubled.v[sampled.size()] == TokId{im_end} &&
+                            doubled.v[sampled.size() + 1] == TokId{im_end});
                 pulsar_tokens_free(&doubled);
             }
             pulsar_tokens_free(&live);
@@ -5799,7 +5935,7 @@ static void test_anthropic_tool_use_parses_before_role(void) {
     pthread_mutex_lock(&s.tool_mu);
     s.n_slots = 1;
     s.slots[0].anthropic_live.valid = true;
-    s.slots[0].anthropic_live.live_tokens = 100;
+    s.slots[0].anthropic_live.live_tokens = TokCount{100};
     id_list_push_unique(&s.slots[0].anthropic_live.call_ids, "toolu_current");
     pthread_mutex_unlock(&s.tool_mu);
 
@@ -5921,7 +6057,7 @@ static void test_responses_tool_output_id_validation(void) {
     pthread_mutex_lock(&s.tool_mu);
     s.n_slots = 1;
     s.slots[0].responses_live.valid = true;
-    s.slots[0].responses_live.live_tokens = 10;
+    s.slots[0].responses_live.live_tokens = TokCount{10};
     id_list_push_unique(&s.slots[0].responses_live.call_ids, "call_missing");
     pthread_mutex_unlock(&s.tool_mu);
     err[0] = '\0';
@@ -5971,7 +6107,7 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
     pthread_mutex_lock(&s.tool_mu);
     s.n_slots = 1;
     s.slots[0].responses_live.valid = true;
-    s.slots[0].responses_live.live_tokens = 123;
+    s.slots[0].responses_live.live_tokens = TokCount{123};
     id_list_push_unique(&s.slots[0].responses_live.call_ids, "call_replay");
     pthread_mutex_unlock(&s.tool_mu);
     err[0] = '\0';
@@ -7546,69 +7682,69 @@ static void test_tool_marker_state_ignores_orphan_end(void) {
 
 
 static void test_kv_cache_chat_anchor_uses_last_user_before_assistant(void) {
-    const int user = 9001;
+    const TokId user{9001};
     const int assistant = 9002;
-    const pulsar_turn_markers m = {{user, 0}, 1, {assistant, 0}, 1};
+    const pulsar_turn_markers m = {{user, TokId{0}}, 1, {TokId{assistant}, TokId{0}}, 1};
     kv_disk_cache kc = {0};
     kc.opt = kv_cache_default_options();
     kc.opt.min_tokens = 4;
 
     pulsar_tokens codex = {0};
-    pulsar_tokens_push(&codex, 1);     /* BOS / system */
-    pulsar_tokens_push(&codex, 2);
-    pulsar_tokens_push(&codex, user);  /* environment_context item */
-    pulsar_tokens_push(&codex, 3);
-    pulsar_tokens_push(&codex, 4);
-    pulsar_tokens_push(&codex, user);  /* actual task starts here */
-    pulsar_tokens_push(&codex, 5);
-    pulsar_tokens_push(&codex, assistant);
+    pulsar_tokens_push(&codex, TokId{1});     /* BOS / system */
+    pulsar_tokens_push(&codex, TokId{2});
+    pulsar_tokens_push(&codex, TokId{user});  /* environment_context item */
+    pulsar_tokens_push(&codex, TokId{3});
+    pulsar_tokens_push(&codex, TokId{4});
+    pulsar_tokens_push(&codex, TokId{user});  /* actual task starts here */
+    pulsar_tokens_push(&codex, TokId{5});
+    pulsar_tokens_push(&codex, TokId{assistant});
     TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &codex, &m) == 5);
 
     pulsar_tokens claude = {0};
-    pulsar_tokens_push(&claude, 1);
-    pulsar_tokens_push(&claude, 2);
-    pulsar_tokens_push(&claude, 3);
-    pulsar_tokens_push(&claude, 4);
-    pulsar_tokens_push(&claude, user); /* system reminder and task share a turn */
-    pulsar_tokens_push(&claude, 5);
-    pulsar_tokens_push(&claude, assistant);
+    pulsar_tokens_push(&claude, TokId{1});
+    pulsar_tokens_push(&claude, TokId{2});
+    pulsar_tokens_push(&claude, TokId{3});
+    pulsar_tokens_push(&claude, TokId{4});
+    pulsar_tokens_push(&claude, TokId{user}); /* system reminder and task share a turn */
+    pulsar_tokens_push(&claude, TokId{5});
+    pulsar_tokens_push(&claude, TokId{assistant});
     TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &claude, &m) == 4);
     /* L353: the persist's preamble is the FIRST user marker, the routing anchor stays the last: Claude Code's two-message
      * first turn (typed text in the first) and Codex's (environment first) */
     TEST_ASSERT(kv_cache_preamble_pos(&kc, &claude, &m) == 4);
     TEST_ASSERT(kv_cache_preamble_pos(&kc, &codex, &m) == -1);   /* its first marker, 2, is below min_tokens (4) */
     pulsar_tokens two = {0};
-    for (int t : {1, 2, 3, 4, 5, 6}) pulsar_tokens_push(&two, t);
-    pulsar_tokens_push(&two, user);        /* 6: reminders + the typed text */
-    pulsar_tokens_push(&two, 7);
-    pulsar_tokens_push(&two, user);        /* 8: the environment block */
-    pulsar_tokens_push(&two, 8);
-    pulsar_tokens_push(&two, assistant);
+    for (int t : {1, 2, 3, 4, 5, 6}) pulsar_tokens_push(&two, TokId{t});
+    pulsar_tokens_push(&two, TokId{user});        /* 6: reminders + the typed text */
+    pulsar_tokens_push(&two, TokId{7});
+    pulsar_tokens_push(&two, TokId{user});        /* 8: the environment block */
+    pulsar_tokens_push(&two, TokId{8});
+    pulsar_tokens_push(&two, TokId{assistant});
     TEST_ASSERT(kv_cache_preamble_pos(&kc, &two, &m) == 6);
     TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &two, &m) == 8);
     pulsar_tokens early = {0};
-    for (int t : {1, 2, 3, 4, 5}) pulsar_tokens_push(&early, t);
-    pulsar_tokens_push(&early, assistant); /* no user turn before the assistant's */
-    pulsar_tokens_push(&early, user);
+    for (int t : {1, 2, 3, 4, 5}) pulsar_tokens_push(&early, TokId{t});
+    pulsar_tokens_push(&early, TokId{assistant}); /* no user turn before the assistant's */
+    pulsar_tokens_push(&early, TokId{user});
     TEST_ASSERT(kv_cache_preamble_pos(&kc, &early, &m) == -1);
     pulsar_tokens_free(&two);
     pulsar_tokens_free(&early);
 
     /* L272 B5: Qwen's markers are two tokens, <|im_start|> plus the role word; the
      * anchor is the position of the marker's first token */
-    const int start = 151644, u = 872, a = 77091;
+    const TokId start{151644}, u{872}, a{77091};
     const pulsar_turn_markers q = {{start, u}, 2, {start, a}, 2};
     pulsar_tokens qwen = {0};
-    pulsar_tokens_push(&qwen, start);  /* 0 <|im_start|>system */
-    pulsar_tokens_push(&qwen, 8948);
-    pulsar_tokens_push(&qwen, 2);      /* 2 the system prompt */
-    pulsar_tokens_push(&qwen, 3);
-    pulsar_tokens_push(&qwen, start);  /* 4 <|im_start|>user: the task */
-    pulsar_tokens_push(&qwen, u);
-    pulsar_tokens_push(&qwen, u);      /* 6 the word "user" inside the message: not a marker */
-    pulsar_tokens_push(&qwen, 5);
-    pulsar_tokens_push(&qwen, start);  /* 8 <|im_start|>assistant */
-    pulsar_tokens_push(&qwen, a);
+    pulsar_tokens_push(&qwen, TokId{start});  /* 0 <|im_start|>system */
+    pulsar_tokens_push(&qwen, TokId{8948});
+    pulsar_tokens_push(&qwen, TokId{2});      /* 2 the system prompt */
+    pulsar_tokens_push(&qwen, TokId{3});
+    pulsar_tokens_push(&qwen, TokId{start});  /* 4 <|im_start|>user: the task */
+    pulsar_tokens_push(&qwen, TokId{u});
+    pulsar_tokens_push(&qwen, TokId{u});      /* 6 the word "user" inside the message: not a marker */
+    pulsar_tokens_push(&qwen, TokId{5});
+    pulsar_tokens_push(&qwen, TokId{start});  /* 8 <|im_start|>assistant */
+    pulsar_tokens_push(&qwen, TokId{a});
     TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &qwen, &q) == 4);
     /* a one-token marker table does not match Qwen's two-token turns */
     TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &qwen, &m) == -1);
@@ -7627,24 +7763,27 @@ static void test_l347_anchor_cut(void) {
     kv_disk_cache kc = {0};
     kc.opt = kv_cache_default_options();
     TEST_ASSERT(kc.opt.min_tokens == 512);
-    TEST_ASSERT(kv_cache_anchor_cut(&kc, 21950, 128) == 21888);   /* the 2026-08-11 Claude Code anchor */
-    TEST_ASSERT(kv_cache_anchor_cut(&kc, 2100, 128) == 2048);     /* a judge preamble: the old rule's cut was 0 */
-    TEST_ASSERT(kv_cache_anchor_cut(&kc, 2048, 128) == 2048);     /* on the grid: the anchor itself */
-    TEST_ASSERT(kv_cache_anchor_cut(&kc, 639, 128) == 512);
-    TEST_ASSERT(kv_cache_anchor_cut(&kc, 700, 256) == 512);       /* the family's grid, whatever it is */
+    TEST_ASSERT(kv_cache_anchor_cut(&kc, 21950, TokCount{128}) == 21888);   /* the 2026-08-11 Claude Code anchor */
+    TEST_ASSERT(kv_cache_anchor_cut(&kc, 2100,
+                                    TokCount{128}) == 2048);     /* a judge preamble: the old rule's cut was 0 */
+    TEST_ASSERT(kv_cache_anchor_cut(&kc, 2048, TokCount{128}) == 2048);     /* on the grid: the anchor itself */
+    TEST_ASSERT(kv_cache_anchor_cut(&kc, 639, TokCount{128}) == 512);
+    TEST_ASSERT(kv_cache_anchor_cut(&kc, 700, TokCount{256}) == 512);       /* the family's grid, whatever it is */
     /* nothing below min_tokens, before or after the alignment; no anchor or no grid, no cut */
-    TEST_ASSERT(kv_cache_anchor_cut(&kc, 511, 128) == 0);
-    TEST_ASSERT(kv_cache_anchor_cut(&kc, 1000, 1024) == 0);
-    TEST_ASSERT(kv_cache_anchor_cut(&kc, -1, 128) == 0);
-    TEST_ASSERT(kv_cache_anchor_cut(&kc, 21950, 0) == 0);
+    TEST_ASSERT(kv_cache_anchor_cut(&kc, 511, TokCount{128}) == 0);
+    TEST_ASSERT(kv_cache_anchor_cut(&kc, 1000, TokCount{1024}) == 0);
+    TEST_ASSERT(kv_cache_anchor_cut(&kc, -1, TokCount{128}) == 0);
+    TEST_ASSERT(kv_cache_anchor_cut(&kc, 21950, TokCount{0}) == 0);
     /* an image block that begins below the cut: no anchor (the cold phase is a text sync) */
     pulsar_image_ref imgs[1];
     memset(imgs, 0, sizeof imgs);
     imgs[0].start_pos = 1500;
     int inside = -1;
-    TEST_ASSERT(server_image_cold_cut(kv_cache_anchor_cut(&kc, 2100, 128), imgs, 1, &inside) == 0 && inside == 0);
+    TEST_ASSERT(server_image_cold_cut(kv_cache_anchor_cut(&kc, 2100, TokCount{128}), imgs, 1, &inside) == 0 &&
+                inside == 0);
     imgs[0].start_pos = 2100;
-    TEST_ASSERT(server_image_cold_cut(kv_cache_anchor_cut(&kc, 2100, 128), imgs, 1, &inside) == 2048 && inside == -1);
+    TEST_ASSERT(server_image_cold_cut(kv_cache_anchor_cut(&kc, 2100, TokCount{128}), imgs, 1, &inside) == 2048 &&
+                inside == -1);
 }
 
 /* L310: a disk hit loads only when its measured read beats half the priced prefill of what it adds (Flare 2.10);
@@ -7755,52 +7894,59 @@ static void test_l310_restore_vs_recompute(void) {
  * divergence at 31482 -- the adopt used to win because the disk was only searched when nothing served the prompt. */
 static void test_l318_resume_picks_the_deepest(void) {
     const int G = PULSAR_SERVER_ADOPT_MIN_GAIN;
-    TEST_ASSERT(server_resume_pick(0, 8192, 28672, KV_RESTORE_LOAD) == RESUME_DISK);
-    TEST_ASSERT(server_resume_pick(0, 8192, 28672, KV_RESTORE_UNMEASURED) == RESUME_DISK);
-    TEST_ASSERT(server_resume_pick(0, 8192, 28672, KV_RESTORE_UNPRICED) == RESUME_DISK);
+    TEST_ASSERT(server_resume_pick(PromptToks{0}, PromptToks{8192}, PromptToks{28672}, KV_RESTORE_LOAD) == RESUME_DISK);
+    TEST_ASSERT(server_resume_pick(PromptToks{0}, PromptToks{8192}, PromptToks{28672},
+                                   KV_RESTORE_UNMEASURED) == RESUME_DISK);
+    TEST_ASSERT(server_resume_pick(PromptToks{0}, PromptToks{8192}, PromptToks{28672},
+                                   KV_RESTORE_UNPRICED) == RESUME_DISK);
     /* the in-place shape: the bank's own thinned checkpoint, a deeper chain */
-    TEST_ASSERT(server_resume_pick(8192, 0, 36864, KV_RESTORE_LOAD) == RESUME_DISK);
+    TEST_ASSERT(server_resume_pick(PromptToks{8192}, PromptToks{0}, PromptToks{36864}, KV_RESTORE_LOAD) == RESUME_DISK);
     /* a priced recompute keeps the deeper memory state */
-    TEST_ASSERT(server_resume_pick(0, 8192, 28672, KV_RESTORE_RECOMPUTE) == RESUME_ADOPT);
-    TEST_ASSERT(server_resume_pick(8192, 0, 28672, KV_RESTORE_RECOMPUTE) == RESUME_OWN);
+    TEST_ASSERT(server_resume_pick(PromptToks{0}, PromptToks{8192}, PromptToks{28672},
+                                   KV_RESTORE_RECOMPUTE) == RESUME_ADOPT);
+    TEST_ASSERT(server_resume_pick(PromptToks{8192}, PromptToks{0}, PromptToks{28672},
+                                   KV_RESTORE_RECOMPUTE) == RESUME_OWN);
     /* a chain no deeper than memory never wins, whatever its verdict */
-    TEST_ASSERT(server_resume_pick(0, 30000, 28672, KV_RESTORE_LOAD) == RESUME_ADOPT);
-    TEST_ASSERT(server_resume_pick(30000, 0, 30000, KV_RESTORE_LOAD) == RESUME_OWN);
-    TEST_ASSERT(server_resume_pick(0, 0, 0, KV_RESTORE_LOAD) == RESUME_OWN);
+    TEST_ASSERT(server_resume_pick(PromptToks{0}, PromptToks{30000}, PromptToks{28672},
+                                   KV_RESTORE_LOAD) == RESUME_ADOPT);
+    TEST_ASSERT(server_resume_pick(PromptToks{30000}, PromptToks{0}, PromptToks{30000}, KV_RESTORE_LOAD) == RESUME_OWN);
+    TEST_ASSERT(server_resume_pick(PromptToks{0}, PromptToks{0}, PromptToks{0}, KV_RESTORE_LOAD) == RESUME_OWN);
     /* the adopt counts only past its copy's price, and the disk is priced past what memory then serves */
-    TEST_ASSERT(server_resume_memory_depth(1000, 1000 + G) == 1000);
-    TEST_ASSERT(server_resume_memory_depth(1000, 1001 + G) == 1001 + G);
-    TEST_ASSERT(server_resume_pick(1000, 1000 + G, 0, KV_RESTORE_RECOMPUTE) == RESUME_OWN);
-    TEST_ASSERT(server_resume_pick(1000, 1000 + G, 1100 + G, KV_RESTORE_LOAD) == RESUME_DISK);
+    TEST_ASSERT(server_resume_memory_depth(PromptToks{1000}, PromptToks{1000 + G}) == PromptToks{1000});
+    TEST_ASSERT(server_resume_memory_depth(PromptToks{1000}, PromptToks{1001 + G}) == PromptToks{1001 + G});
+    TEST_ASSERT(server_resume_pick(PromptToks{1000}, PromptToks{1000 + G}, PromptToks{0},
+                                   KV_RESTORE_RECOMPUTE) == RESUME_OWN);
+    TEST_ASSERT(server_resume_pick(PromptToks{1000}, PromptToks{1000 + G}, PromptToks{1100 + G},
+                                   KV_RESTORE_LOAD) == RESUME_DISK);
     TEST_ASSERT(!strcmp(resume_pick_names[RESUME_OWN], "own") && !strcmp(resume_pick_names[RESUME_ADOPT], "adopt") &&
                 !strcmp(resume_pick_names[RESUME_DISK], "disk"));
 }
 
 static void test_kv_cache_chat_anchor_ignores_multiturn_tail(void) {
-    const int user = 9001;
+    const TokId user{9001};
     const int assistant = 9002;
-    const pulsar_turn_markers m = {{user, 0}, 1, {assistant, 0}, 1};
+    const pulsar_turn_markers m = {{user, TokId{0}}, 1, {TokId{assistant}, TokId{0}}, 1};
     kv_disk_cache kc = {0};
     kc.opt = kv_cache_default_options();
     kc.opt.min_tokens = 2;
 
     pulsar_tokens prompt = {0};
-    pulsar_tokens_push(&prompt, 1);
-    pulsar_tokens_push(&prompt, 2);
-    pulsar_tokens_push(&prompt, user);      /* first task */
-    pulsar_tokens_push(&prompt, 3);
-    pulsar_tokens_push(&prompt, assistant); /* stop scanning here */
-    pulsar_tokens_push(&prompt, 4);
-    pulsar_tokens_push(&prompt, user);      /* later turn: not a cold anchor */
-    pulsar_tokens_push(&prompt, 5);
-    pulsar_tokens_push(&prompt, assistant);
+    pulsar_tokens_push(&prompt, TokId{1});
+    pulsar_tokens_push(&prompt, TokId{2});
+    pulsar_tokens_push(&prompt, TokId{user});      /* first task */
+    pulsar_tokens_push(&prompt, TokId{3});
+    pulsar_tokens_push(&prompt, TokId{assistant}); /* stop scanning here */
+    pulsar_tokens_push(&prompt, TokId{4});
+    pulsar_tokens_push(&prompt, TokId{user});      /* later turn: not a cold anchor */
+    pulsar_tokens_push(&prompt, TokId{5});
+    pulsar_tokens_push(&prompt, TokId{assistant});
     TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, &m) == 2);
 
     kc.opt.min_tokens = 3;
     TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, &m) == -1);
     /* unknown markers (the tokenizer does not spell them): no anchor */
-    const pulsar_turn_markers none = {{0, 0}, 0, {0, 0}, 0};
-    const pulsar_turn_markers no_assistant = {{user, 0}, 1, {0, 0}, 0};
+    const pulsar_turn_markers none = {};
+    const pulsar_turn_markers no_assistant = {{user, TokId{0}}, 1, {TokId{0}, TokId{0}}, 0};
     kc.opt.min_tokens = 2;
     TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, &none) == -1);
     TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, &no_assistant) == -1);
@@ -7840,7 +7986,8 @@ static bool test_seg_put(pulsar_segstore *st, const char *parent, uint32_t a, ui
                          uint64_t n, uint8_t fill, char key[41]) {
     test_seg_payload p = { n, fill };
     char err[256];
-    return pulsar_segstore_put(st, parent, a, b, text, strlen(text), n, test_seg_write, 0, NULL, &p, key,
+    return pulsar_segstore_put(st, parent, TokPos{a}, TokPos{b}, text, TextBytes{strlen(text)}, n, test_seg_write, 0,
+                               NULL, &p, key,
                                err, sizeof err);
 }
 
@@ -7858,33 +8005,39 @@ static void test_l338_segstore_reserve_commit(void) {
     TEST_ASSERT(st != NULL);
     char err[256], root[41], k[41];
     pulsar_segstore_job *jr = NULL, *jc = NULL, *again = NULL;
-    TEST_ASSERT(pulsar_segstore_reserve(st, "", 0, 128, "SYSTEM:", 7, 1000, 0, root, &jr, err, sizeof err) == 1);
+    TEST_ASSERT(pulsar_segstore_reserve(st, "", TokPos{0}, TokPos{128}, "SYSTEM:", TextBytes{7}, 1000, 0, root, &jr,
+                                        err, sizeof err) == 1);
     /* pending: a second reserve of the same text writes nothing, a lookup does not see it */
-    TEST_ASSERT(pulsar_segstore_reserve(st, "", 0, 128, "SYSTEM:", 7, 1000, 0, k, &again, err, sizeof err) == 0);
+    TEST_ASSERT(pulsar_segstore_reserve(st, "", TokPos{0}, TokPos{128}, "SYSTEM:", TextBytes{7}, 1000, 0, k, &again,
+                                        err, sizeof err) == 0);
     TEST_ASSERT(again == NULL && !strcmp(k, root));
     pulsar_segstore_seg chain[4];
-    TEST_ASSERT(pulsar_segstore_lookup(st, "SYSTEM: hi", 10, NULL, chain, 4) == 0);
+    TEST_ASSERT(pulsar_segstore_lookup(st, "SYSTEM: hi", TextBytes{10}, NULL, chain, 4) == 0);
     /* a child may name the pending root */
     char child[41];
-    TEST_ASSERT(pulsar_segstore_reserve(st, root, 128, 256, " user", 5, 1000, 0, child, &jc, err, sizeof err) == 1);
+    TEST_ASSERT(pulsar_segstore_reserve(st, root, TokPos{128}, TokPos{256}, " user", TextBytes{5}, 1000, 0, child, &jc,
+                                        err, sizeof err) == 1);
     /* the budget counts both in flight: a third has no room (nothing stored to evict) */
     pulsar_segstore_job *j3 = NULL;
     char k3[41];
-    TEST_ASSERT(pulsar_segstore_reserve(st, "", 0, 128, "OTHER:", 6, 1000, 0, k3, &j3, err, sizeof err) == -1);
+    TEST_ASSERT(pulsar_segstore_reserve(st, "", TokPos{0}, TokPos{128}, "OTHER:", TextBytes{6}, 1000, 0, k3, &j3, err,
+                                        sizeof err) == -1);
     /* written off-thread, committed in order: both indexed, the chain found */
     test_seg_payload p = { 1000, 0x5a };
     TEST_ASSERT(test_job_write(jr, &p, err, sizeof err));
     TEST_ASSERT(test_job_write(jc, &p, err, sizeof err));
     TEST_ASSERT(pulsar_segstore_commit(st, jr, true));
     TEST_ASSERT(pulsar_segstore_commit(st, jc, true));
-    TEST_ASSERT(pulsar_segstore_lookup(st, "SYSTEM: user asks", 17, NULL, chain, 4) == 2);
+    TEST_ASSERT(pulsar_segstore_lookup(st, "SYSTEM: user asks", TextBytes{17}, NULL, chain, 4) == 2);
     /* a parent's failed write drops its child at commit */
     char p2[41], c2[41];
     pulsar_segstore_job *jp2 = NULL, *jc2 = NULL;
     pulsar_segstore_close(st);
     st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);   /* unbounded from here */
-    TEST_ASSERT(pulsar_segstore_reserve(st, "", 0, 128, "B:", 2, 10, 0, p2, &jp2, err, sizeof err) == 1);
-    TEST_ASSERT(pulsar_segstore_reserve(st, p2, 128, 256, " b", 2, 10, 0, c2, &jc2, err, sizeof err) == 1);
+    TEST_ASSERT(pulsar_segstore_reserve(st, "", TokPos{0}, TokPos{128}, "B:", TextBytes{2}, 10, 0, p2, &jp2, err,
+                                        sizeof err) == 1);
+    TEST_ASSERT(pulsar_segstore_reserve(st, p2, TokPos{128}, TokPos{256}, " b", TextBytes{2}, 10, 0, c2, &jc2, err,
+                                        sizeof err) == 1);
     test_seg_payload small = { 10, 0x11 };
     TEST_ASSERT(test_job_write(jc2, &small, err, sizeof err));
     TEST_ASSERT(!pulsar_segstore_commit(st, jp2, false));
@@ -7898,12 +8051,15 @@ static void test_l338_segstore_reserve_commit(void) {
     st = pulsar_segstore_open(dir, 3500, 7, NULL, NULL);   /* the root + child (2 x ~1.17 KB) stored */
     pulsar_segstore_job *jx = NULL, *jy = NULL;
     char kx[41], ky[41];
-    TEST_ASSERT(pulsar_segstore_reserve(st, child, 256, 384, " more", 5, 1000, 0, kx, &jx, err, sizeof err) == 1);
+    TEST_ASSERT(pulsar_segstore_reserve(st, child, TokPos{256}, TokPos{384}, " more", TextBytes{5}, 1000, 0, kx, &jx,
+                                        err, sizeof err) == 1);
     /* another root needs room: the only leaf is `child`, pinned by jx -- refused, nothing evicted */
-    TEST_ASSERT(pulsar_segstore_reserve(st, "", 0, 128, "NEW:", 4, 1200, 0, ky, &jy, err, sizeof err) == -1);
+    TEST_ASSERT(pulsar_segstore_reserve(st, "", TokPos{0}, TokPos{128}, "NEW:", TextBytes{4}, 1200, 0, ky, &jy, err,
+                                        sizeof err) == -1);
     TEST_ASSERT(pulsar_segstore_contains(st, child));
     (void)pulsar_segstore_commit(st, jx, false);   /* abandoned: unpinned, the room released */
-    TEST_ASSERT(pulsar_segstore_reserve(st, "", 0, 128, "NEW:", 4, 1200, 0, ky, &jy, err, sizeof err) == 1);
+    TEST_ASSERT(pulsar_segstore_reserve(st, "", TokPos{0}, TokPos{128}, "NEW:", TextBytes{4}, 1200, 0, ky, &jy, err,
+                                        sizeof err) == 1);
     TEST_ASSERT(!pulsar_segstore_contains(st, child));   /* now the leaf could go */
     (void)pulsar_segstore_commit(st, jy, false);
     pulsar_segstore_close(st);
@@ -7950,7 +8106,7 @@ static void test_l264_segstore_chain_lookup(void) {
     TEST_ASSERT(test_seg_put(st, root, 128, 256, "user B asks", 200, 0x44, b1));
     /* the key rule: a key names the whole text from 0 */
     char k[41];
-    pulsar_segstore_child_key(root, "user A asks", 11, k);
+    pulsar_segstore_child_key(root, "user A asks", TextBytes{11}, k);
     TEST_ASSERT(!strcmp(k, a1));
     /* the same text under the same parent is the same segment */
     char again[41];
@@ -7959,19 +8115,19 @@ static void test_l264_segstore_chain_lookup(void) {
 
     pulsar_segstore_seg chain[8];
     const char *req = "SYSTEM:user A asks and follows up -- and the new turn";
-    int n = pulsar_segstore_lookup(st, req, strlen(req), NULL, chain, 8);
+    int n = pulsar_segstore_lookup(st, req, TextBytes{strlen(req)}, NULL, chain, 8);
     TEST_ASSERT(n == 3);
-    TEST_ASSERT(n == 3 && !strcmp(chain[0].key, root) && !strcmp(chain[2].key, a2) && chain[2].G == 384);
-    TEST_ASSERT(n == 3 && chain[2].text_end == strlen("SYSTEM:user A asks and follows up"));
+    TEST_ASSERT(n == 3 && !strcmp(chain[0].key, root) && !strcmp(chain[2].key, a2) && chain[2].G == TokPos{384});
+    TEST_ASSERT(n == 3 && chain[2].text_end == TextBytes{strlen("SYSTEM:user A asks and follows up")});
     /* a request that diverges inside a segment stops at the one before it */
     const char *edited = "SYSTEM:user A asks and FOLLOWS up";
-    n = pulsar_segstore_lookup(st, edited, strlen(edited), NULL, chain, 8);
+    n = pulsar_segstore_lookup(st, edited, TextBytes{strlen(edited)}, NULL, chain, 8);
     TEST_ASSERT(n == 2 && !strcmp(chain[1].key, a1));
     /* the other conversation shares only the root */
     const char *other = "SYSTEM:user B asks something else";
-    n = pulsar_segstore_lookup(st, other, strlen(other), NULL, chain, 8);
+    n = pulsar_segstore_lookup(st, other, TextBytes{strlen(other)}, NULL, chain, 8);
     TEST_ASSERT(n == 2 && !strcmp(chain[1].key, b1));
-    TEST_ASSERT(pulsar_segstore_lookup(st, "SYS", 3, NULL, chain, 8) == 0);
+    TEST_ASSERT(pulsar_segstore_lookup(st, "SYS", TextBytes{3}, NULL, chain, 8) == 0);
 
     /* the payload round-trips */
     uint64_t pb = 0;
@@ -7981,7 +8137,7 @@ static void test_l264_segstore_chain_lookup(void) {
     /* L347 I3a: a store without a RAM pool keeps no RAM copy: nothing is resident, a mapped part is read off disk
      * (digest checked: the store sealed it) and lent until the unmap */
     {
-        n = pulsar_segstore_lookup(st, req, strlen(req), NULL, chain, 8);
+        n = pulsar_segstore_lookup(st, req, TextBytes{strlen(req)}, NULL, chain, 8);
         TEST_ASSERT(n == 3 && pulsar_kvchain_resident_bytes(st, chain, n) == 0u);
         const uint8_t *pp = NULL;
         uint64_t len = 0;
@@ -8001,8 +8157,8 @@ static void test_l264_segstore_chain_lookup(void) {
     /* reopen: the index and the chain lengths come back from the files */
     pulsar_segstore_close(st);
     st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
-    n = pulsar_segstore_lookup(st, req, strlen(req), NULL, chain, 8);
-    TEST_ASSERT(n == 3 && chain[2].text_end == strlen("SYSTEM:user A asks and follows up"));
+    n = pulsar_segstore_lookup(st, req, TextBytes{strlen(req)}, NULL, chain, 8);
+    TEST_ASSERT(n == 3 && chain[2].text_end == TextBytes{strlen("SYSTEM:user A asks and follows up")});
     /* another model's store sees none of it */
     pulsar_segstore *other_model = pulsar_segstore_open(dir, 0, 8, NULL, NULL);
     TEST_ASSERT(pulsar_segstore_count(other_model) == 0);
@@ -8016,8 +8172,10 @@ static void test_l264_segstore_chain_lookup(void) {
     char bad[41];
     char err[256];
     test_seg_payload p = { 10, 0 };
-    TEST_ASSERT(!pulsar_segstore_put(st, a1, 256, 384, "x", 1, 10, test_seg_write, 0, NULL, &p, bad, err, sizeof err));
-    TEST_ASSERT(!pulsar_segstore_put(st, "", 128, 256, "x", 1, 10, test_seg_write, 0, NULL, &p, bad, err, sizeof err));
+    TEST_ASSERT(!pulsar_segstore_put(st, a1, TokPos{256}, TokPos{384}, "x", TextBytes{1}, 10, test_seg_write, 0, NULL,
+                                     &p, bad, err, sizeof err));
+    TEST_ASSERT(!pulsar_segstore_put(st, "", TokPos{128}, TokPos{256}, "x", TextBytes{1}, 10, test_seg_write, 0, NULL,
+                                     &p, bad, err, sizeof err));
     pulsar_segstore_close(st);
     char cmd[512];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
@@ -8056,25 +8214,97 @@ static void test_l280_kv_identity_rope(void) {
     rmdir(dir);
 }
 
+/// L386: the store's log lines, captured (a pulsar_segstore_log_fn).
+/// @param ud  the std::vector<std::string> that receives them
+/// @param msg one line
+static void l386_log(void *ud, const char *msg) { static_cast<std::vector<std::string> *>(ud)->push_back(msg); }
+
+/* L386: the store identity carries the arithmetic that computed the bytes -- the compute capability, the cuBLASLt
+ * version, the CUDA runtime version -- beside the model word.  The identity differs when any one word differs and
+ * not otherwise; a store opened under another identity indexes none of the segments or restore points (left alone,
+ * not removed) and says so ONCE at the open, naming both identities word by word; the writer's identity reads them
+ * all again.  The values are injected: which values a device reports (pulsar_gpu_arithmetic) only a GPU run shows. */
+static void test_l386_kv_identity_arithmetic(void) {
+    const pulsar_segstore_ident base(pulsar_segstore_identity(2, 36, 0), 121, 130500, 13050);
+    const pulsar_segstore_ident same(pulsar_segstore_identity(2, 36, 0), 121, 130500, 13050);
+    const pulsar_segstore_ident others[] = {
+        {pulsar_segstore_identity(3, 36, 0), 121, 130500, 13050},              /* another model */
+        {pulsar_segstore_identity(2, 4, 0), 121, 130500, 13050},               /* another routed format */
+        {pulsar_segstore_identity(2, 36, 0x1234abcdull), 121, 130500, 13050},  /* another rope */
+        {pulsar_segstore_identity(2, 36, 0), 120, 130500, 13050},              /* another GPU */
+        {pulsar_segstore_identity(2, 36, 0), 121, 130501, 13050},              /* another cuBLASLt */
+        {pulsar_segstore_identity(2, 36, 0), 121, 130500, 13060},              /* another CUDA runtime */
+    };
+    TEST_ASSERT(base == same && !(base != same));
+    for (const pulsar_segstore_ident &o : others) TEST_ASSERT(o != base && !(o == base));
+    /* a bare model word is the identity with no arithmetic recorded, as the host tests' stores open */
+    TEST_ASSERT(pulsar_segstore_ident(base.model) != base && pulsar_segstore_ident(base.model).cc == 0u);
+
+    char tmpl[] = "/tmp/pulsar-seg-arith.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    char root[41], err[256];
+    pulsar_segstore *st = pulsar_segstore_open(dir, 0, base, NULL, NULL);
+    TEST_ASSERT(st && test_seg_put(st, "", 0, 128, "SYSTEM:", 100, 0x11, root));
+    test_seg_payload rp = {64, 0x55};
+    TEST_ASSERT(pulsar_segstore_put_rp(st, root, 64, 0, test_seg_write, &rp, err, sizeof err));
+    pulsar_segstore_close(st);
+    for (const pulsar_segstore_ident &o : others) {
+        std::vector<std::string> lines;
+        pulsar_segstore *other = pulsar_segstore_open(dir, 0, o, l386_log, &lines);
+        TEST_ASSERT(other && pulsar_segstore_count(other) == 0);
+        pulsar_segstore_close(other);
+        int said = 0;
+        for (const std::string &l : lines) {
+            if (l.find("of another identity set aside") == std::string::npos) continue;
+            said++;
+            TEST_ASSERT(l.find(": 1 segments of another identity set aside") != std::string::npos);
+            TEST_ASSERT(l.find("written by [model id 2, routed bits 36, rope fold 0, cc 12.1, cuBLASLt 130500, CUDA "
+                               "runtime 13050]") != std::string::npos);
+            char want[200];
+            snprintf(want, sizeof want, "this process is [model id %u, routed bits %u, rope fold %u, cc %u.%u, cuBLASLt "
+                     "%u, CUDA runtime %u]", (o.model >> 8) & 0xffffu, o.model & 0xffu, o.model >> 24, o.cc / 10,
+                     o.cc % 10, o.gemm_lib, o.runtime);
+            TEST_ASSERT(l.find(want) != std::string::npos);
+        }
+        TEST_ASSERT(said == 1);
+    }
+    /* left alone: the writer's identity indexes the segment and its restore point again, and says nothing of it */
+    std::vector<std::string> lines;
+    st = pulsar_segstore_open(dir, 0, base, l386_log, &lines);
+    pulsar_segstore_seg e;
+    TEST_ASSERT(st && pulsar_segstore_count(st) == 1 && pulsar_segstore_get(st, root, &e) && e.rp_bytes > 0);
+    for (const std::string &l : lines) TEST_ASSERT(l.find("another identity") == std::string::npos);
+    pulsar_segstore_drop(st, root);
+    pulsar_segstore_close(st);
+    rmdir(dir);
+}
+
 /* L323: where a persist ends segments -- the canonical grid.  Every multiple of the grid past the stored chain up to
  * the deepest checkpoint, then (closing) the tail to that checkpoint; never a cut where the writer's own checkpoints
  * fell (2026-10-24: copies cut at turn ends -- [7808,7936) [7936,8064) ... -- deduped nothing). */
 static void test_l323_kvchain_segment_ends(void) {
-    int ends[16];
+    TokPos ends[16];
     /* a prefill from 0 past two grid points: both, and the tail when it closes */
-    TEST_ASSERT(pulsar_kvchain_segment_ends(0, 9088, 4096, false, ends, 16) == 2 && ends[0] == 4096 &&
-                ends[1] == 8192);
-    TEST_ASSERT(pulsar_kvchain_segment_ends(0, 9088, 4096, true, ends, 16) == 3 && ends[2] == 9088);
+    TEST_ASSERT(pulsar_kvchain_segment_ends(TokPos{0}, TokPos{9088}, TokCount{4096}, false, ends, 16) == 2 &&
+                ends[0] == TokPos{4096} &&
+                ends[1] == TokPos{8192});
+    TEST_ASSERT(pulsar_kvchain_segment_ends(TokPos{0}, TokPos{9088}, TokCount{4096}, true, ends, 16) == 3 &&
+                ends[2] == TokPos{9088});
     /* a deepest checkpoint ON the grid is a grid segment, not a tail too */
-    TEST_ASSERT(pulsar_kvchain_segment_ends(4096, 8192, 4096, true, ends, 16) == 1 && ends[0] == 8192);
+    TEST_ASSERT(pulsar_kvchain_segment_ends(TokPos{4096}, TokPos{8192}, TokCount{4096}, true, ends, 16) == 1 &&
+                ends[0] == TokPos{8192});
     /* a turn inside the cell above the stored grid point: only the tail, and nothing while it rides (progress) */
-    TEST_ASSERT(pulsar_kvchain_segment_ends(8192, 9600, 4096, true, ends, 16) == 1 && ends[0] == 9600);
-    TEST_ASSERT(pulsar_kvchain_segment_ends(8192, 9600, 4096, false, ends, 16) == 0);
+    TEST_ASSERT(pulsar_kvchain_segment_ends(TokPos{8192}, TokPos{9600}, TokCount{4096}, true, ends, 16) == 1 &&
+                ends[0] == TokPos{9600});
+    TEST_ASSERT(pulsar_kvchain_segment_ends(TokPos{8192}, TokPos{9600}, TokCount{4096}, false, ends, 16) == 0);
     /* nothing past the stored chain, closing or not; no grid, nothing */
-    TEST_ASSERT(pulsar_kvchain_segment_ends(8192, 8192, 4096, true, ends, 16) == 0);
-    TEST_ASSERT(pulsar_kvchain_segment_ends(0, 9088, 0, true, ends, 16) == 0);
+    TEST_ASSERT(pulsar_kvchain_segment_ends(TokPos{8192}, TokPos{8192}, TokCount{4096}, true, ends, 16) == 0);
+    TEST_ASSERT(pulsar_kvchain_segment_ends(TokPos{0}, TokPos{9088}, TokCount{0}, true, ends, 16) == 0);
     /* the cap bounds the write */
-    TEST_ASSERT(pulsar_kvchain_segment_ends(0, 40960, 4096, true, ends, 3) == 3 && ends[2] == 12288);
+    TEST_ASSERT(pulsar_kvchain_segment_ends(TokPos{0}, TokPos{40960}, TokCount{4096}, true, ends, 3) == 3 &&
+                ends[2] == TokPos{12288});
 }
 
 /* L323 fixtures: a conversation of tokens ("t00000 ", "t00001 ", ...), persisted the way
@@ -8125,24 +8355,25 @@ static void l323_text(int from, int to, std::string *out) {
 static int l323_persist(pulsar_segstore *st, int deepest, int grid, bool close, char tip[41]) {
     std::string full;
     l323_text(0, deepest, &full);
-    const pulsar_segstore_end grid_end = { (uint32_t)grid, false };
+    const pulsar_segstore_end grid_end = { TokCount{(uint32_t)grid}, false };
     pulsar_segstore_seg chain[64];
-    const int c = pulsar_segstore_lookup(st, full.data(), full.size(), &grid_end, chain, 64);
+    const int c = pulsar_segstore_lookup(st, full.data(), TextBytes{full.size()}, &grid_end, chain, 64);
     char parent[41] = "";
     int prev = 0;
-    if (c > 0) { memcpy(parent, chain[c - 1].key, 41); prev = (int)chain[c - 1].G; }
-    int ends[128];
-    const int m = pulsar_kvchain_segment_ends(prev, deepest, grid, close, ends, 64);
+    if (c > 0) { memcpy(parent, chain[c - 1].key, 41); prev = chain[c - 1].G.raw(); }
+    TokPos ends[128];
+    const int m = pulsar_kvchain_segment_ends(TokPos{prev}, TokPos{deepest}, TokCount{grid}, close, ends, 64);
     int written = 0;
     for (int k = 0; k < m; k++) {
-        const int G = ends[k];
+        const int G = ends[k].raw();
         l323_payload p = { (uint32_t)prev, (uint32_t)G, l323_rows_bytes((uint32_t)prev, (uint32_t)G) };
         std::string text;
         l323_text(prev, G, &text);
         char key[41], err[256];
-        pulsar_segstore_child_key(parent, text.data(), text.size(), key);
+        pulsar_segstore_child_key(parent, text.data(), TextBytes{text.size()}, key);
         const bool new_seg = !pulsar_segstore_contains(st, key);
-        TEST_ASSERT(pulsar_segstore_put(st, parent, (uint32_t)prev, (uint32_t)G, text.data(), text.size(), p.bytes,
+        TEST_ASSERT(pulsar_segstore_put(st, parent, TokPos{(uint32_t)prev}, TokPos{(uint32_t)G}, text.data(),
+                                        TextBytes{text.size()}, p.bytes,
                                         l323_payload_write, 0, NULL, &p, key, err, sizeof err));
         written += new_seg ? 1 : 0;
         memcpy(parent, key, 41);
@@ -8186,17 +8417,18 @@ static void test_l323_grid_cut_dedupes_copies(void) {
     /* the grid segments of both copies carry the same keys */
     std::string text;
     l323_text(0, 13000, &text);
-    const pulsar_segstore_end grid_end = { 4096u, false };
+    const pulsar_segstore_end grid_end = { TokCount{4096u}, false };
     pulsar_segstore_seg ca[8], cb[8];
-    const int na = pulsar_segstore_lookup(A, text.data(), text.size(), &grid_end, ca, 8);
-    const int nb = pulsar_segstore_lookup(B, text.data(), text.size(), &grid_end, cb, 8);
+    const int na = pulsar_segstore_lookup(A, text.data(), TextBytes{text.size()}, &grid_end, ca, 8);
+    const int nb = pulsar_segstore_lookup(B, text.data(), TextBytes{text.size()}, &grid_end, cb, 8);
     TEST_ASSERT(na == 3 && nb == 3);
     for (int i = 0; i < na && i < nb; i++) TEST_ASSERT(!strcmp(ca[i].key, cb[i].key) && ca[i].G == cb[i].G);
-    TEST_ASSERT(na == 3 && ca[0].G == 4096 && ca[1].G == 8192 && ca[2].G == 12288);
+    TEST_ASSERT(na == 3 && ca[0].G == TokPos{4096} && ca[1].G == TokPos{8192} && ca[2].G == TokPos{12288});
     /* and their tails too: the tail is a pure function of the history */
     pulsar_segstore_seg fa[8], fb[8];
-    TEST_ASSERT(pulsar_segstore_lookup(A, text.data(), text.size(), NULL, fa, 8) == 4 &&
-                pulsar_segstore_lookup(B, text.data(), text.size(), NULL, fb, 8) == 4 && !strcmp(fa[3].key, fb[3].key));
+    TEST_ASSERT(pulsar_segstore_lookup(A, text.data(), TextBytes{text.size()}, NULL, fa, 8) == 4 &&
+                pulsar_segstore_lookup(B, text.data(), TextBytes{text.size()}, NULL, fb, 8) == 4 &&
+                !strcmp(fa[3].key, fb[3].key));
     /* one store, both copies: B's history after A's writes nothing it already has but its own tail */
     TEST_ASSERT(l323_persist(A, 9000, 4096, true, tip) == 1);
     const int before = pulsar_segstore_count(A);
@@ -8242,11 +8474,11 @@ static void test_l323_tail_supersession(void) {
     l323_persist(st, 4200, 4096, true, t1);   /* [0,4096) + tail [4096,4200) */
     l323_persist(st, 4600, 4096, true, t2);   /* a later tail under the same grid point */
     pulsar_segstore_seg s1, s2;
-    TEST_ASSERT(pulsar_segstore_get(st, t1, &s1) && s1.dominated && s1.G == 4200);
+    TEST_ASSERT(pulsar_segstore_get(st, t1, &s1) && s1.dominated && s1.G == TokPos{4200});
     TEST_ASSERT(pulsar_segstore_get(st, t2, &s2) && !s2.dominated);
     l323_persist(st, 8192, 4096, true, g2);   /* the grid segment that covers both */
     TEST_ASSERT(pulsar_segstore_get(st, t2, &s2) && s2.dominated);
-    TEST_ASSERT(pulsar_segstore_get(st, g2, &s2) && !s2.dominated && s2.G == 8192);
+    TEST_ASSERT(pulsar_segstore_get(st, g2, &s2) && !s2.dominated && s2.G == TokPos{8192});
     /* a branch: same grid parent, text that parts from the main line -- never dominated */
     char bkey[41], err[256];
     std::string head, btext;
@@ -8255,10 +8487,11 @@ static void test_l323_tail_supersession(void) {
     pulsar_segstore_seg grid0;
     std::string t0;
     l323_text(0, 4096, &t0);
-    const pulsar_segstore_end g_end = { 4096u, false };
-    TEST_ASSERT(pulsar_segstore_lookup(st, t0.data(), t0.size(), &g_end, &grid0, 1) == 1);
+    const pulsar_segstore_end g_end = { TokCount{4096u}, false };
+    TEST_ASSERT(pulsar_segstore_lookup(st, t0.data(), TextBytes{t0.size()}, &g_end, &grid0, 1) == 1);
     l323_payload p = { 4096, 4160, l323_rows_bytes(4096, 4160) };
-    TEST_ASSERT(pulsar_segstore_put(st, grid0.key, 4096, 4160, btext.data(), btext.size(), p.bytes,
+    TEST_ASSERT(pulsar_segstore_put(st, grid0.key, TokPos{4096}, TokPos{4160}, btext.data(), TextBytes{btext.size()},
+                                    p.bytes,
                                     l323_payload_write, 0, NULL, &p, bkey, err, sizeof err));
     TEST_ASSERT(l323_put_rp(st, bkey, 4160));
     pulsar_segstore_seg sb;
@@ -8315,9 +8548,10 @@ static void test_l323_state_restore_math(void) {
     /* the whole history: four segments, rows of all four, the tail's restore point */
     l323_text(0, 13000, &req);
     req += "and the next turn";
-    int n = pulsar_kvchain_find(st, req.data(), req.size(), NULL, 0, 0, chain, PULSAR_KVCHAIN_MAX, &bytes, err,
+    int n = pulsar_kvchain_find(st, req.data(), TextBytes{req.size()}, NULL, 0, TokCount{0}, chain, PULSAR_KVCHAIN_MAX,
+                                &bytes, err,
                                 sizeof err);
-    TEST_ASSERT(n == 4 && chain[3].G == 13000 && chain[3].rp_bytes > L323_STATE);
+    TEST_ASSERT(n == 4 && chain[3].G == TokPos{13000} && chain[3].rp_bytes > L323_STATE);
     uint64_t rows = 0;
     for (int i = 0; i < 4; i++) rows += chain[i].payload_bytes;
     TEST_ASSERT(n == 4 && rows == l323_rows_bytes(0, 4096) + l323_rows_bytes(4096, 8192) + l323_rows_bytes(8192, 12288) +
@@ -8327,20 +8561,22 @@ static void test_l323_state_restore_math(void) {
      * the restore stands there and the sync prefills [8192, divergence) */
     l323_text(0, 12500, &req);
     req += "an edit";
-    n = pulsar_kvchain_find(st, req.data(), req.size(), NULL, 0, 0, chain, PULSAR_KVCHAIN_MAX, &bytes, err, sizeof err);
-    TEST_ASSERT(n == 2 && chain[1].G == 8192 && chain[1].rp_bytes > L323_STATE);
+    n = pulsar_kvchain_find(st, req.data(), TextBytes{req.size()}, NULL, 0, TokCount{0}, chain, PULSAR_KVCHAIN_MAX,
+                            &bytes, err, sizeof err);
+    TEST_ASSERT(n == 2 && chain[1].G == TokPos{8192} && chain[1].rp_bytes > L323_STATE);
     TEST_ASSERT(n == 2 && bytes == l323_rows_bytes(0, 4096) + l323_rows_bytes(4096, 8192) + chain[1].rp_bytes);
     TEST_ASSERT(pulsar_kvchain_load_bytes(chain, n) == bytes);
     /* below the first restore point: nothing to restore (4096 has none) */
     l323_text(0, 6000, &req);
     req += "an early edit";
-    TEST_ASSERT(pulsar_kvchain_find(st, req.data(), req.size(), NULL, 0, 0, chain, PULSAR_KVCHAIN_MAX, &bytes, err,
+    TEST_ASSERT(pulsar_kvchain_find(st, req.data(), TextBytes{req.size()}, NULL, 0, TokCount{0}, chain,
+                                    PULSAR_KVCHAIN_MAX, &bytes, err,
                                     sizeof err) == 0);
     /* a restore point added later at 12288 (a chain that ended there): same key, same child, no new segment */
     pulsar_segstore_seg before, after;
     l323_text(0, 12288, &req);
-    const pulsar_segstore_end g_end = { 4096u, false };
-    TEST_ASSERT(pulsar_segstore_lookup(st, req.data(), req.size(), &g_end, chain, 8) == 3);
+    const pulsar_segstore_end g_end = { TokCount{4096u}, false };
+    TEST_ASSERT(pulsar_segstore_lookup(st, req.data(), TextBytes{req.size()}, &g_end, chain, 8) == 3);
     TEST_ASSERT(pulsar_segstore_get(st, chain[2].key, &before) && before.rp_bytes == 0);
     const int count = pulsar_segstore_count(st);
     const uint64_t used = pulsar_segstore_used_bytes(st);
@@ -8350,14 +8586,17 @@ static void test_l323_state_restore_math(void) {
                 pulsar_segstore_used_bytes(st) == used + after.rp_bytes);
     l323_text(0, 12500, &req);
     req += "an edit";
-    n = pulsar_kvchain_find(st, req.data(), req.size(), NULL, 0, 0, chain, PULSAR_KVCHAIN_MAX, &bytes, err, sizeof err);
-    TEST_ASSERT(n == 3 && chain[2].G == 12288);
+    n = pulsar_kvchain_find(st, req.data(), TextBytes{req.size()}, NULL, 0, TokCount{0}, chain, PULSAR_KVCHAIN_MAX,
+                            &bytes, err, sizeof err);
+    TEST_ASSERT(n == 3 && chain[2].G == TokPos{12288});
     /* a progress persist (not closing) leaves no restore point: a chain grown that way is found only to its last one */
     TEST_ASSERT(l323_persist(st, 17000, 4096, false, tip) == 1);   /* [12288,16384) */
     l323_text(0, 16384, &req);
     req += "more";
-    n = pulsar_kvchain_find(st, req.data(), req.size(), NULL, 0, 0, chain, PULSAR_KVCHAIN_MAX, &bytes, err, sizeof err);
-    TEST_ASSERT(n == 4 && chain[3].G == 13000);   /* the old tail's, the deepest restore point the text reproduces */
+    n = pulsar_kvchain_find(st, req.data(), TextBytes{req.size()}, NULL, 0, TokCount{0}, chain, PULSAR_KVCHAIN_MAX,
+                            &bytes, err, sizeof err);
+    TEST_ASSERT(n == 4 &&
+                chain[3].G == TokPos{13000});   /* the old tail's, the deepest restore point the text reproduces */
     pulsar_segstore_close(st);
     l323_rmdir(dir);
     /* a single closing persist: rows only on the grid, the restore point at the tail alone */
@@ -8366,7 +8605,8 @@ static void test_l323_state_restore_math(void) {
     st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
     TEST_ASSERT(l323_persist(st, 9000, 4096, true, tip) == 3);
     l323_text(0, 9000, &req);
-    n = pulsar_kvchain_find(st, req.data(), req.size(), NULL, 0, 0, chain, PULSAR_KVCHAIN_MAX, &bytes, err, sizeof err);
+    n = pulsar_kvchain_find(st, req.data(), TextBytes{req.size()}, NULL, 0, TokCount{0}, chain, PULSAR_KVCHAIN_MAX,
+                            &bytes, err, sizeof err);
     TEST_ASSERT(n == 3 && chain[0].rp_bytes == 0 && chain[1].rp_bytes == 0 && chain[2].rp_bytes > L323_STATE);
     pulsar_segstore_close(st);
     l323_rmdir(dir);
@@ -8396,9 +8636,9 @@ static void test_l347_restore_points(void) {
     /* the lookup that wants a restore point finds none yet; any end finds the chain */
     const char *req = "SYSTEM:user A asks more";
     pulsar_segstore_seg chain[8];
-    const pulsar_segstore_end want = { 0u, true };
-    TEST_ASSERT(pulsar_segstore_lookup(st, req, strlen(req), &want, chain, 8) == 0);
-    TEST_ASSERT(pulsar_segstore_lookup(st, req, strlen(req), NULL, chain, 8) == 2);
+    const pulsar_segstore_end want = { TokCount{0u}, true };
+    TEST_ASSERT(pulsar_segstore_lookup(st, req, TextBytes{strlen(req)}, &want, chain, 8) == 0);
+    TEST_ASSERT(pulsar_segstore_lookup(st, req, TextBytes{strlen(req)}, NULL, chain, 8) == 2);
     {
         const uint8_t *pp = NULL;
         uint64_t len = 0;
@@ -8416,7 +8656,8 @@ static void test_l347_restore_points(void) {
     TEST_ASSERT(pulsar_segstore_get(st, root, &g) && g.rp_bytes > L323_STATE &&
                 pulsar_segstore_used_bytes(st) == used0 + g.rp_bytes);
     /* now the lookup ends at the root, the deepest restore point */
-    TEST_ASSERT(pulsar_segstore_lookup(st, req, strlen(req), &want, chain, 8) == 1 && !strcmp(chain[0].key, root));
+    TEST_ASSERT(pulsar_segstore_lookup(st, req, TextBytes{strlen(req)}, &want, chain, 8) == 1 &&
+                !strcmp(chain[0].key, root));
     /* L347 I3a: map_part reads the restore point back (its payload, digest checked) */
     {
         const uint8_t *pp = NULL;
@@ -8445,7 +8686,8 @@ static void test_l347_restore_points(void) {
     {
         pulsar_segstore_job *j = NULL;
         char k[41];
-        TEST_ASSERT(pulsar_segstore_reserve(st, root, 128, 256, "user B asks", 11, 200, 0, k, &j, err, sizeof err) == 1);
+        TEST_ASSERT(pulsar_segstore_reserve(st, root, TokPos{128}, TokPos{256}, "user B asks", TextBytes{11}, 200, 0, k,
+                                            &j, err, sizeof err) == 1);
         TEST_ASSERT(l323_put_rp(st, k, 256));
         TEST_ASSERT(!pulsar_segstore_contains(st, k));
         test_seg_payload p = { 200, 0x44 };
@@ -8453,14 +8695,15 @@ static void test_l347_restore_points(void) {
         TEST_ASSERT(pulsar_segstore_commit(st, j, true));
         TEST_ASSERT(pulsar_segstore_get(st, k, &g) && g.rp_bytes > L323_STATE);
         const char *rb_req = "SYSTEM:user B asks";
-        TEST_ASSERT(pulsar_segstore_lookup(st, rb_req, strlen(rb_req), &want, chain, 8) == 2);
+        TEST_ASSERT(pulsar_segstore_lookup(st, rb_req, TextBytes{strlen(rb_req)}, &want, chain, 8) == 2);
     }
     /* ... and goes with a failed one (file, count and hook) */
     {
         const uint64_t before = pulsar_segstore_used_bytes(st);
         pulsar_segstore_job *j = NULL;
         char k[41];
-        TEST_ASSERT(pulsar_segstore_reserve(st, root, 128, 256, "user C asks", 11, 200, 0, k, &j, err, sizeof err) == 1);
+        TEST_ASSERT(pulsar_segstore_reserve(st, root, TokPos{128}, TokPos{256}, "user C asks", TextBytes{11}, 200, 0, k,
+                                            &j, err, sizeof err) == 1);
         TEST_ASSERT(l323_put_rp(st, k, 256));
         TEST_ASSERT(!pulsar_segstore_commit(st, j, false));
         snprintf(path, sizeof path, "%s/%s.rp", dir, k);
@@ -8481,15 +8724,16 @@ static void test_l347_restore_points(void) {
         st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
         TEST_ASSERT(access(path, F_OK) != 0 && access(tmp_rp, F_OK) != 0);
         const char *rb_req = "SYSTEM:user B asks";
-        TEST_ASSERT(pulsar_segstore_lookup(st, rb_req, strlen(rb_req), &want, chain, 8) == 2 && chain[1].rp_bytes > 0u);
+        TEST_ASSERT(pulsar_segstore_lookup(st, rb_req, TextBytes{strlen(rb_req)}, &want, chain, 8) == 2 &&
+                    chain[1].rp_bytes > 0u);
         /* another model's store neither indexes nor deletes it */
         pulsar_segstore *other = pulsar_segstore_open(dir, 0, 8, NULL, NULL);
         TEST_ASSERT(pulsar_segstore_count(other) == 0);
         pulsar_segstore_close(other);
-        TEST_ASSERT(pulsar_segstore_lookup(st, rb_req, strlen(rb_req), &want, chain, 8) == 2);
+        TEST_ASSERT(pulsar_segstore_lookup(st, rb_req, TextBytes{strlen(rb_req)}, &want, chain, 8) == 2);
         pulsar_segstore_close(st);
         st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
-        TEST_ASSERT(pulsar_segstore_lookup(st, rb_req, strlen(rb_req), &want, chain, 8) == 2);
+        TEST_ASSERT(pulsar_segstore_lookup(st, rb_req, TextBytes{strlen(rb_req)}, &want, chain, 8) == 2);
         pulsar_segstore_close(st);
     }
     /* eviction: the victim leaf's restore point goes first, its rows at the next eviction */
@@ -8502,7 +8746,7 @@ static void test_l347_restore_points(void) {
         const int segs0 = seen.segs, rps0 = seen.rps;
         char b1[41], c1[41];
         const char *rb_req = "SYSTEM:user B asks";
-        TEST_ASSERT(pulsar_segstore_lookup(st, rb_req, strlen(rb_req), NULL, chain, 8) == 2);
+        TEST_ASSERT(pulsar_segstore_lookup(st, rb_req, TextBytes{strlen(rb_req)}, NULL, chain, 8) == 2);
         memcpy(b1, chain[1].key, 41);
         TEST_ASSERT(test_seg_put(st, root, 128, 256, "user D asks", 900, 0x55, c1));   /* > 400: an eviction */
         TEST_ASSERT(pulsar_segstore_contains(st, b1) && pulsar_segstore_get(st, b1, &g) && g.rp_bytes == 0u);
@@ -8518,15 +8762,15 @@ struct l347_ckpts {
     bool all = true;          ///< a checkpoint at every G
     std::vector<int> held;    ///< else only at these
 };
-static uint64_t l347_src_bytes(void *ud, int G) {
+static uint64_t l347_src_bytes(void *ud, TokPos G) {
     const l347_ckpts *c = (const l347_ckpts *)ud;
     if (c->all) return L323_STATE;
-    for (int g : c->held) if (g == G) return L323_STATE;
+    for (int g : c->held) if (TokPos{g} == G) return L323_STATE;
     return 0;
 }
-static int l347_src_copy(void *ud, int G, const char *key, uint8_t *dst, uint64_t bytes, char *err, size_t errlen) {
+static int l347_src_copy(void *ud, TokPos G, const char *key, uint8_t *dst, uint64_t bytes, char *err, size_t errlen) {
     (void)ud; (void)key; (void)err; (void)errlen;
-    const uint32_t g = (uint32_t)G;   /* l323_rp_write's bytes: its G, then 0xa5 */
+    const uint32_t g = (uint32_t)G.raw();   /* l323_rp_write's bytes: its G, then 0xa5 */
     memcpy(dst, &g, 4);
     memset(dst + 4, 0xa5, (size_t)(bytes - 4));
     return 0;
@@ -8537,36 +8781,38 @@ static int l347_persist(pulsar_segstore *st, int deepest, int grid, unsigned wha
                         pulsar_kvchain_persist_result *r, char tip[41]) {
     std::string full;
     l323_text(0, deepest, &full);
-    const pulsar_segstore_end grid_end = { (uint32_t)grid, false };
+    const pulsar_segstore_end grid_end = { TokCount{(uint32_t)grid}, false };
     pulsar_segstore_seg chain[64];
-    const int c = pulsar_segstore_lookup(st, full.data(), full.size(), &grid_end, chain, 64);
+    const int c = pulsar_segstore_lookup(st, full.data(), TextBytes{full.size()}, &grid_end, chain, 64);
     char parent[41] = "";
     int prev = 0;
-    if (c > 0) { memcpy(parent, chain[c - 1].key, 41); prev = (int)chain[c - 1].G; }
-    int ends[64];
-    const int m = pulsar_kvchain_segment_ends(prev, deepest, grid, (what & PULSAR_KVCHAIN_TAIL) != 0u, ends, 64);
+    if (c > 0) { memcpy(parent, chain[c - 1].key, 41); prev = chain[c - 1].G.raw(); }
+    TokPos ends[64];
+    const int m = pulsar_kvchain_segment_ends(TokPos{prev}, TokPos{deepest}, TokCount{grid},
+                                              (what & PULSAR_KVCHAIN_TAIL) != 0u, ends, 64);
     pulsar_kvchain_link links[64];
     int n = 0, written = 0;
     for (int k = 0; k < m; k++) {
-        const int G = ends[k];
+        const int G = ends[k].raw();
         l323_payload p = { (uint32_t)prev, (uint32_t)G, l323_rows_bytes((uint32_t)prev, (uint32_t)G) };
         std::string text;
         l323_text(prev, G, &text);
         char key[41], err[256];
-        pulsar_segstore_child_key(parent, text.data(), text.size(), key);
+        pulsar_segstore_child_key(parent, text.data(), TextBytes{text.size()}, key);
         written += !pulsar_segstore_contains(st, key);
-        TEST_ASSERT(pulsar_segstore_put(st, parent, (uint32_t)prev, (uint32_t)G, text.data(), text.size(), p.bytes,
+        TEST_ASSERT(pulsar_segstore_put(st, parent, TokPos{(uint32_t)prev}, TokPos{(uint32_t)G}, text.data(),
+                                        TextBytes{text.size()}, p.bytes,
                                         l323_payload_write, 0, NULL, &p, key, err, sizeof err));
         memcpy(parent, key, 41);
         prev = G;
         memcpy(links[n].key, key, 41);
-        links[n++].G = G;
+        links[n++].G = TokPos{G};
     }
-    if (n == 0 && prev > 0) { memcpy(links[0].key, parent, 41); links[n++].G = prev; }
+    if (n == 0 && prev > 0) { memcpy(links[0].key, parent, 41); links[n++].G = TokPos{prev}; }
     memset(r, 0, sizeof *r);
     const pulsar_kvchain_rp_source src = { ck, l347_src_bytes, l347_src_copy };
     const pulsar_kvchain_writer inl = pulsar_kvchain_writer_inline(st);
-    pulsar_kvchain_place_rps(st, links, n, grid, what, &src, &inl, r);
+    pulsar_kvchain_place_rps(st, links, n, TokCount{grid}, what, &src, &inl, r);
     memcpy(tip, parent, 41);
     return written;
 }
@@ -8575,8 +8821,8 @@ static bool l347_seg_at(pulsar_segstore *st, int G, pulsar_segstore_seg *out) {
     std::string text;
     l323_text(0, G, &text);
     pulsar_segstore_seg chain[64];
-    const int n = pulsar_segstore_lookup(st, text.data(), text.size(), NULL, chain, 64);
-    if (n == 0 || (int)chain[n - 1].G != G) return false;
+    const int n = pulsar_segstore_lookup(st, text.data(), TextBytes{text.size()}, NULL, chain, 64);
+    if (n == 0 || chain[n - 1].G.raw() != G) return false;
     *out = chain[n - 1];
     return true;
 }
@@ -8808,7 +9054,7 @@ static void test_l347_i3a_odirect_roundtrip(void) {
     char path[600];
     snprintf(path, sizeof path, "%s/%s.seg", dir, k);
     struct stat sb;
-    TEST_ASSERT(stat(path, &sb) == 0 && sb.st_size == (off_t)pulsar_segstore_seg_file_bytes(3, 5000, 0) &&
+    TEST_ASSERT(stat(path, &sb) == 0 && sb.st_size == (off_t)pulsar_segstore_seg_file_bytes(TextBytes{3}, 5000, 0) &&
                 sb.st_size % PULSAR_KVPOOL_ALIGN != 0);
     {
         const uint8_t *pp = NULL;
@@ -8856,25 +9102,26 @@ static void test_l347_i3a_no_room(void) {
     char R[41], k[41], err[256];
     TEST_ASSERT(test_seg_put(st, "", 0, 128, "root", 1000, 1, R));
     pulsar_segstore_job *j = NULL;
-    TEST_ASSERT(pulsar_segstore_reserve(st, R, 128, 256, "big", 3, 20000, 0, k, &j, err, sizeof err) == -2 && !j);
+    TEST_ASSERT(pulsar_segstore_reserve(st, R, TokPos{128}, TokPos{256}, "big", TextBytes{3}, 20000, 0, k, &j, err,
+                                        sizeof err) == -2 && !j);
     TEST_ASSERT(!pulsar_segstore_contains(st, k) && strstr(err, "RAM pool"));
     /* a restore point too big for the pool: place_rps cannot copy it out, says no_room, writes nothing */
     struct src_ud { uint64_t bytes; } su = { 20000 };
     const pulsar_kvchain_rp_source src = {
-        &su, [](void *ud, int) { return ((src_ud *)ud)->bytes; }, l347_src_copy };
+        &su, [](void *ud, TokPos) { return ((src_ud *)ud)->bytes; }, l347_src_copy };
     const pulsar_kvchain_writer inl = pulsar_kvchain_writer_inline(st);
     pulsar_kvchain_link link;
     memcpy(link.key, R, 41);
-    link.G = 128;
+    link.G = TokPos{128};
     pulsar_kvchain_persist_result r;
     memset(&r, 0, sizeof r);
-    pulsar_kvchain_place_rps(st, &link, 1, 4096, PULSAR_KVCHAIN_RP, &src, &inl, &r);
+    pulsar_kvchain_place_rps(st, &link, 1, TokCount{4096}, PULSAR_KVCHAIN_RP, &src, &inl, &r);
     pulsar_segstore_seg g;
     TEST_ASSERT(r.no_room && r.rp_written == 0 && r.err[0] && pulsar_segstore_get(st, R, &g) && g.rp_bytes == 0u);
     /* one that fits is written */
     su.bytes = 1000;
     memset(&r, 0, sizeof r);
-    pulsar_kvchain_place_rps(st, &link, 1, 4096, PULSAR_KVCHAIN_RP, &src, &inl, &r);
+    pulsar_kvchain_place_rps(st, &link, 1, TokCount{4096}, PULSAR_KVCHAIN_RP, &src, &inl, &r);
     TEST_ASSERT(!r.no_room && r.rp_written == 1 && pulsar_segstore_get(st, R, &g) && g.rp_bytes > 1000u);
     pulsar_segstore_close(st);
     l323_rmdir(dir);
@@ -8884,8 +9131,8 @@ static void test_l347_i3a_no_room(void) {
  * the writes queued before it; a span out of range is refused.  Skipped, said, without a device. */
 static void test_l347_i3a_copy_out(void) {
     const uint64_t n = 3u << 20;
-    pulsar_gpu_tensor *t = pulsar_gpu_tensor_alloc(n);
-    uint8_t *host = (uint8_t *)pulsar_gpu_host_alloc(n);
+    pulsar_gpu_tensor *t = pulsar_gpu_tensor_alloc(TensorBytes{n});
+    uint8_t *host = (uint8_t *)pulsar_gpu_host_alloc(TensorBytes{n});
     if (!t || !host) {
         printf("  [skip] L347 I3a copy-out: no device memory or pinned host memory here\n");
         pulsar_gpu_tensor_free(t);
@@ -8894,13 +9141,15 @@ static void test_l347_i3a_copy_out(void) {
     }
     std::vector<uint8_t> src(n);
     for (uint64_t i = 0; i < n; i++) src[i] = (uint8_t)(i * 2654435761u >> 13);
-    TEST_ASSERT(pulsar_gpu_tensor_write_async(t, 0, src.data(), n) == 1);   /* queued: the fence must cover it */
+    TEST_ASSERT(pulsar_gpu_tensor_write_async(t, TensorBytes{0}, src.data(),
+                                              TensorBytes{n}) == 1);   /* queued: the fence must cover it */
     memset(host, 0xee, n);
-    const pulsar_gpu_copy_span spans[2] = { { t, 0, host + 10, 1000 }, { t, (2u << 20) + 3, host + 5000, 4097 } };
+    const pulsar_gpu_copy_span spans[2] = { { t, TensorBytes{0}, host + 10, TensorBytes{1000} },
+                                            { t, TensorBytes{(2u << 20) + 3}, host + 5000, TensorBytes{4097} } };
     TEST_ASSERT(pulsar_gpu_copy_out(spans, 2) == 1);
     TEST_ASSERT(!memcmp(host + 10, src.data(), 1000) && !memcmp(host + 5000, src.data() + (2u << 20) + 3, 4097));
     TEST_ASSERT(host[9] == 0xee && host[1010] == 0xee && host[5000 + 4097] == 0xee);
-    const pulsar_gpu_copy_span bad = { t, n - 10, host, 11 };
+    const pulsar_gpu_copy_span bad = { t, TensorBytes{n - 10}, host, TensorBytes{11} };
     TEST_ASSERT(pulsar_gpu_copy_out(&bad, 1) == 0);
     pulsar_gpu_tensor_free(t);
     pulsar_gpu_host_free(host);
@@ -8974,11 +9223,14 @@ static void test_l347_i2_trigger_table(void) {
  * so. */
 static void test_l347_i2_periodic(void) {
     TEST_ASSERT(PULSAR_KVCHAIN_RP_EVERY_CELLS == 8);
-    TEST_ASSERT(pulsar_kvchain_rp_periodic(32768, 4096) && pulsar_kvchain_rp_periodic(65536, 4096));
-    TEST_ASSERT(!pulsar_kvchain_rp_periodic(4096, 4096) && !pulsar_kvchain_rp_periodic(28672, 4096) &&
-                !pulsar_kvchain_rp_periodic(36864, 4096));
-    TEST_ASSERT(!pulsar_kvchain_rp_periodic(0, 4096) && !pulsar_kvchain_rp_periodic(32768, 0));
-    TEST_ASSERT(pulsar_kvchain_rp_periodic(1024, 128));
+    TEST_ASSERT(pulsar_kvchain_rp_periodic(TokPos{32768}, TokCount{4096}) &&
+                pulsar_kvchain_rp_periodic(TokPos{65536}, TokCount{4096}));
+    TEST_ASSERT(!pulsar_kvchain_rp_periodic(TokPos{4096}, TokCount{4096}) &&
+                !pulsar_kvchain_rp_periodic(TokPos{28672}, TokCount{4096}) &&
+                !pulsar_kvchain_rp_periodic(TokPos{36864}, TokCount{4096}));
+    TEST_ASSERT(!pulsar_kvchain_rp_periodic(TokPos{0}, TokCount{4096}) &&
+                !pulsar_kvchain_rp_periodic(TokPos{32768}, TokCount{0}));
+    TEST_ASSERT(pulsar_kvchain_rp_periodic(TokPos{1024}, TokCount{128}));
     char tmpl[] = "/tmp/pulsar-l347-per.XXXXXX";
     char *dir = l323_tmpdir(tmpl);
     TEST_ASSERT(dir != NULL);
@@ -9071,10 +9323,10 @@ static void test_l347_i2_older_ends_kept(void) {
     std::string branch;
     l323_text(0, 5061, &branch);
     branch += "an edited turn the conversation never said";
-    const pulsar_segstore_end want = { 0u, true };
+    const pulsar_segstore_end want = { TokCount{0u}, true };
     pulsar_segstore_seg chain[64];
-    const int n = pulsar_segstore_lookup(st, branch.data(), branch.size(), &want, chain, 64);
-    TEST_ASSERT(n == 2 && chain[n > 0 ? n - 1 : 0].G == 5000u && !strcmp(chain[n > 0 ? n - 1 : 0].key, e1.key));
+    const int n = pulsar_segstore_lookup(st, branch.data(), TextBytes{branch.size()}, &want, chain, 64);
+    TEST_ASSERT(n == 2 && chain[n > 0 ? n - 1 : 0].G == TokPos{5000} && !strcmp(chain[n > 0 ? n - 1 : 0].key, e1.key));
     TEST_ASSERT(n == 2 && chain[n > 0 ? n - 1 : 0].rp_bytes > 0u);
     const uint64_t used = pulsar_segstore_used_bytes(st);
     pulsar_segstore_close(st);
@@ -9127,39 +9379,40 @@ static void test_l347_i2_second_sighting(void) {
     std::string anchor;
     l323_text(0, 2048, &anchor);   /* the preamble to a cut at 2048 */
     bool rp = true;
-    TEST_ASSERT(!pulsar_segstore_covers(st, anchor.data(), anchor.size(), &rp) && !rp);   /* empty store */
+    TEST_ASSERT(!pulsar_segstore_covers(st, anchor.data(), TextBytes{anchor.size()}, &rp) && !rp);   /* empty store */
     /* the first request (preamble + its task) trickles its rows: one root tail [0,3000) */
     l347_persist(st, 3000, 4096, l347_writes(KV_PERSIST_PROMPT), &ck, &r, tip);
-    TEST_ASSERT(pulsar_segstore_covers(st, anchor.data(), anchor.size(), &rp) && !rp);   /* second sighting: due */
+    TEST_ASSERT(pulsar_segstore_covers(st, anchor.data(), TextBytes{anchor.size()}, &rp) &&
+                !rp);   /* second sighting: due */
     /* a preamble that parts inside the cut is a first sighting; text past every stored row too */
     std::string other = anchor;
     other[100] = 'X';
-    TEST_ASSERT(!pulsar_segstore_covers(st, other.data(), other.size(), &rp));
+    TEST_ASSERT(!pulsar_segstore_covers(st, other.data(), TextBytes{other.size()}, &rp));
     std::string longer;
     l323_text(0, 3000, &longer);
     longer += "more";
-    TEST_ASSERT(!pulsar_segstore_covers(st, longer.data(), longer.size(), &rp));
+    TEST_ASSERT(!pulsar_segstore_covers(st, longer.data(), TextBytes{longer.size()}, &rp));
     /* across a grid cell: rows [0,4096) + a tail run past an anchor at 5120 */
     l347_persist(st, 6000, 4096, l347_writes(KV_PERSIST_TERMINAL), &ck, &r, tip);
     std::string deep;
     l323_text(0, 5120, &deep);
-    TEST_ASSERT(pulsar_segstore_covers(st, deep.data(), deep.size(), &rp) && !rp);
+    TEST_ASSERT(pulsar_segstore_covers(st, deep.data(), TextBytes{deep.size()}, &rp) && !rp);
     /* past the first HEAD_BYTES of a tail's text: read from its file, also after a restart */
     pulsar_segstore_close(st);
     st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
-    TEST_ASSERT(pulsar_segstore_covers(st, anchor.data(), anchor.size(), &rp) && !rp);
-    TEST_ASSERT(pulsar_segstore_covers(st, deep.data(), deep.size(), &rp) && !rp);
+    TEST_ASSERT(pulsar_segstore_covers(st, anchor.data(), TextBytes{anchor.size()}, &rp) && !rp);
+    TEST_ASSERT(pulsar_segstore_covers(st, deep.data(), TextBytes{deep.size()}, &rp) && !rp);
     std::string late = anchor;
     late[anchor.size() - 3] = 'X';   /* parts after the first 256 bytes */
-    TEST_ASSERT(!pulsar_segstore_covers(st, late.data(), late.size(), &rp));
+    TEST_ASSERT(!pulsar_segstore_covers(st, late.data(), TextBytes{late.size()}, &rp));
     /* the anchor's own persist (the cold phase stopped at 2048): rows and its restore point -- not due again */
     l347_persist(st, 2048, 4096, l347_writes(KV_PERSIST_ANCHOR), &ck, &r, tip);
     TEST_ASSERT(r.rp_written == 1);
-    TEST_ASSERT(pulsar_segstore_covers(st, anchor.data(), anchor.size(), &rp) && rp);
+    TEST_ASSERT(pulsar_segstore_covers(st, anchor.data(), TextBytes{anchor.size()}, &rp) && rp);
     /* rows ending exactly at the cut without a restore point: due (the anchor's was evicted) */
     pulsar_segstore_seg g;
     TEST_ASSERT(l347_seg_at(st, 2048, &g) && pulsar_segstore_drop_rp(st, g.key));
-    TEST_ASSERT(pulsar_segstore_covers(st, anchor.data(), anchor.size(), &rp) && !rp);
+    TEST_ASSERT(pulsar_segstore_covers(st, anchor.data(), TextBytes{anchor.size()}, &rp) && !rp);
     pulsar_segstore_close(st);
     l323_rmdir(dir);
 }
@@ -9337,10 +9590,10 @@ static void test_l354_http_framing(void) {
 #include <sys/resource.h>
 
 /* L353 no. 11's vocabulary: a token is its own text. */
-static char *l353_tok_text(void *ud, int tok, size_t *len) {
+static char *l353_tok_text(void *ud, TokId tok, size_t *len) {
     const char *const *v = (const char *const *)ud;
-    *len = strlen(v[tok]);
-    return strdup(v[tok]);
+    *len = strlen(v[tok.raw()]);
+    return strdup(v[tok.raw()]);
 }
 
 /* L353 nos. 8, 10, 11, 19. */
@@ -9348,7 +9601,8 @@ static void test_l353_routing_fixes(void) {
     /* 11: a seam is a mismatch the cursors realign after; a real divergence isn't one */
     const char *const vocab[] = {"ab", "a", "b", "c"};
     pulsar_prefix_match m;
-    const int live[] = {0, 3}, seam[] = {1, 2, 3}, diverge[] = {1, 3};
+    const TokId live[] = {TokId{0}, TokId{3}}, seam[] = {TokId{1}, TokId{2}, TokId{3}}, diverge[] = {TokId{1},
+        TokId{3}};
     pulsar_tokens_prefix_match_with(l353_tok_text, (void *)vocab, live, 2, seam, 3, &m);
     TEST_ASSERT(m.seamed && m.live_cut.raw() == 2 && m.prompt_cut.raw() == 3);
     pulsar_tokens_prefix_match_with(l353_tok_text, (void *)vocab, live, 2, diverge, 2, &m);
@@ -9501,7 +9755,7 @@ static void test_l372_predecode_failure_ends_the_job(void) {
         j.fd = sv[0];
         session_slot *sl = &s.slots[1];
         sl->provisioned = true;
-        sl->bank = 1;
+        sl->bank = BankId{1};
         sl->preempted = true;
         sl->active_job = &j;
         gen_state *g = (gen_state *)server_xmalloc(sizeof(*g));   /* the slot's own: generate_job_end frees it */
@@ -9534,7 +9788,7 @@ static void test_l372_failed_readmission_marks_the_bank_spilled(void) {
     pthread_mutex_init(&s.mu, NULL);
     s.pool_banks = 2;
     s.n_slots = 2;
-    s.live_bank = -1;   /* nothing installed: the switch below saves no outgoing bank */
+    s.live_bank = BankId::none();   /* nothing installed: the switch below saves no outgoing bank */
     int dummy = 0;
     gen_state g;
     memset(&g, 0, sizeof g);
@@ -9542,7 +9796,7 @@ static void test_l372_failed_readmission_marks_the_bank_spilled(void) {
     g.phase = GEN_DECODE;
     session_slot *v = &s.slots[1];
     v->provisioned = true;
-    v->bank = 1;
+    v->bank = BankId{1};
     v->active_job = (job *)&dummy;
     v->gen = &g;
     v->preempted = true;
@@ -9551,7 +9805,7 @@ static void test_l372_failed_readmission_marks_the_bank_spilled(void) {
     TEST_ASSERT(!v->preempted && v->preempt_path == NULL && v->spilled);
     TEST_ASSERT(g.phase == GEN_FINISH && !strcmp(g.finish, "error") && strstr(g.err, "could not be reloaded") != NULL);
     /* the install is the spilled bank's now: it re-backs (here: refuses) instead of handing out the carry */
-    TEST_ASSERT(!s.bank_switch(1) && v->spilled && s.m_restore_failures == 1);
+    TEST_ASSERT(!s.bank_switch(BankId{1}) && v->spilled && s.m_restore_failures == 1);
     TEST_ASSERT(!s.worker_readmit_preempted());   /* nothing parked any more */
     pthread_mutex_destroy(&s.mu);
 }
@@ -9625,7 +9879,7 @@ static void test_l372_empty_banks_are_not_spill_victims(void) {
     s.n_slots = 3;
     for (int i = 0; i < 3; i++) {
         s.slots[i].provisioned = true;
-        s.slots[i].bank = (uint32_t)i;
+        s.slots[i].bank = BankId{i};
         s.slots[i].last_serviced_us = (uint64_t)(10 * (i + 1));
     }
     int order[PULSAR_SESSION_POOL_CAP];
@@ -9642,9 +9896,9 @@ static void test_l372_judge_ends_a_gone_clients_request(void) {
     server s;
     memset(&s, 0, sizeof s);
     pthread_mutex_init(&s.mu, NULL);
-    s.live_bank = -1;   /* nothing installed: the step saves no outgoing bank */
+    s.live_bank = BankId::none();   /* nothing installed: the step saves no outgoing bank */
     server_judge *J = new server_judge();
-    J->bank = 1;
+    J->bank = BankId{1};
     s.judge = J;
     for (const bool gone : {true, false}) {
         int sv[2];
@@ -9656,7 +9910,7 @@ static void test_l372_judge_ends_a_gone_clients_request(void) {
         pthread_cond_init(&jb.cv, NULL);
         jb.fd = sv[0];
         pulsar_tokens prompt = {0};
-        pulsar_tokens_push(&prompt, 1);
+        pulsar_tokens_push(&prompt, TokId{1});
         jb.prompts.push_back(prompt);
         J->head = J->tail = &jb;
         TEST_ASSERT(server_judge_queued(&s));
@@ -9694,10 +9948,10 @@ static void test_l372_abandoned_prefill_drops_stale_bindings(void) {
         j.fd = sv[0];
         session_slot *sl = &s.slots[1];
         sl->provisioned = true;
-        sl->bank = 1;
+        sl->bank = BankId{1};
         sl->active_job = &j;
         sl->responses_live.valid = sl->anthropic_live.valid = true;
-        sl->responses_live.live_tokens = sl->anthropic_live.live_tokens = 100;
+        sl->responses_live.live_tokens = sl->anthropic_live.live_tokens = TokCount{100};
         gen_state g;
         memset(&g, 0, sizeof g);
         g.j = &j;
@@ -9726,12 +9980,12 @@ static void test_l372_bank_install_failure_keeps_the_first_error(void) {
     gen_state g;
     memset(&g, 0, sizeof g);
     g.phase = GEN_DECODE;
-    gen_bank_install_failed(&g, 3u);
+    gen_bank_install_failed(&g, BankId{3});
     TEST_ASSERT(g.phase == GEN_FINISH && !strcmp(g.finish, "error") && strstr(g.err, "bank 3 state restore failed") != NULL);
     memset(&g, 0, sizeof g);
     g.phase = GEN_DECODE;
     snprintf(g.err, sizeof g.err, "the pair's step failed");
-    gen_bank_install_failed(&g, 3u);
+    gen_bank_install_failed(&g, BankId{3});
     TEST_ASSERT(g.phase == GEN_FINISH && !strcmp(g.finish, "error") && !strcmp(g.err, "the pair's step failed"));
 }
 
@@ -9765,7 +10019,8 @@ static void test_l372_abandoned_decode_is_not_a_turn(void) {
  * to: the preamble's (the first user marker) and the conversation key's (the first assistant marker), which every
  * turn of one conversation shares and two conversations behind one system prompt do not. */
 static void test_l378_token_hash_and_conversation_key(void) {
-    const int v[6] = {1, 2, 3, 4, 5, 6}, w[6] = {1, 2, 3, 9, 9, 9};
+    const TokId v[6] = {TokId{1}, TokId{2}, TokId{3}, TokId{4}, TokId{5}, TokId{6}}, w[6] = {TokId{1}, TokId{2},
+        TokId{3}, TokId{9}, TokId{9}, TokId{9}};
     TEST_ASSERT(server_kv_token_hash(v, 0) == UINT64_C(0xcbf29ce484222325) && server_kv_token_hash(NULL, 0) ==
                                                                                  server_kv_token_hash(v, -1));
     TEST_ASSERT(server_kv_token_hash(v, 3) == UINT64_C(0xfd1f0f4381eb0395));
@@ -9775,15 +10030,16 @@ static void test_l378_token_hash_and_conversation_key(void) {
 
     pulsar_turn_markers m;
     memset(&m, 0, sizeof m);
-    m.user[0] = 900;
+    m.user[0] = TokId{900};
     m.n_user = 1;
-    m.assistant[0] = 901;
+    m.assistant[0] = TokId{901};
     m.n_assistant = 1;
     /* system 10 11 12 | user 20 21 | assistant: turn 1 ends at its generation header, turn 2 carries the reply and
      * the next user turn; another conversation asks something else behind the same system prompt */
-    int t1[] = {10, 11, 12, 900, 20, 21, 901};
-    int t2[] = {10, 11, 12, 900, 20, 21, 901, 30, 31, 900, 40, 901};
-    int o1[] = {10, 11, 12, 900, 50, 51, 52, 901};
+    TokId t1[] = {TokId{10}, TokId{11}, TokId{12}, TokId{900}, TokId{20}, TokId{21}, TokId{901}};
+    TokId t2[] = {TokId{10}, TokId{11}, TokId{12}, TokId{900}, TokId{20}, TokId{21}, TokId{901}, TokId{30}, TokId{31},
+        TokId{900}, TokId{40}, TokId{901}};
+    TokId o1[] = {TokId{10}, TokId{11}, TokId{12}, TokId{900}, TokId{50}, TokId{51}, TokId{52}, TokId{901}};
     const pulsar_tokens p1 = {t1, 7, 7}, p2 = {t2, 12, 12}, q1 = {o1, 8, 8};
     TEST_ASSERT(server_prompt_preamble_end(&p1, &m) == 3 && server_prompt_preamble_end(&p2, &m) == 3);
     TEST_ASSERT(server_prompt_conv_end(&p1, &m) == 6 && server_prompt_conv_end(&p2, &m) == 6 &&
@@ -9798,7 +10054,7 @@ static void test_l378_token_hash_and_conversation_key(void) {
     TEST_ASSERT(server_prompt_preamble_end(&p1, &none) == -1 && server_prompt_conv_end(&p1, &none) == 7);
     TEST_ASSERT(server_prompt_preamble_end(NULL, &m) == -1 && server_prompt_conv_end(NULL, &m) == 0);
     /* an assistant turn before any user turn: no preamble; the key ends at that turn */
-    int a0[] = {10, 901, 11, 900, 12};
+    TokId a0[] = {TokId{10}, TokId{901}, TokId{11}, TokId{900}, TokId{12}};
     const pulsar_tokens pa = {a0, 5, 5};
     TEST_ASSERT(server_prompt_preamble_end(&pa, &m) == -1 && server_prompt_conv_end(&pa, &m) == 1);
     /* the disk tier's preamble rule is this position held to its min_tokens */
@@ -9876,7 +10132,7 @@ static void test_l378_kv_req_line_format(void) {
     pthread_mutex_init(&s.mu, NULL);
     job j;
     memset(&j, 0, sizeof j);
-    int toks[] = {10, 11, 12};
+    TokId toks[] = {TokId{10}, TokId{11}, TokId{12}};
     j.req.prompt = {toks, 3, 3};
     j.req.kind = REQ_COMPLETION;
     snprintf(j.req.hints.session, sizeof j.req.hints.session, "a-session-id-longer-than-sixteen-chars");
@@ -10106,7 +10362,7 @@ static void l379_banks(session_slot *slots, int n, const int *tokens, const bool
     const int min_tokens = kv_cache_default_options().min_tokens;
     for (int i = 0; i < n; i++) {
         slots[i].provisioned = true;
-        slots[i].bank = (uint32_t)i;
+        slots[i].bank = BankId{i};
         slots[i].kv_flags = ro[i] ? KV_HDR_READ_ONLY : 0u;
         slots[i].last_serviced_us = served[i];
         scratch[i] = server_slot_is_scratch(&slots[i], tokens[i], min_tokens);
@@ -10253,7 +10509,7 @@ static void test_l379_scratch_banks_go_first(void) {
         s.n_slots = 3;
         for (int i = 0; i < 3; i++) {
             s.slots[i].provisioned = true;
-            s.slots[i].bank = (uint32_t)i;
+            s.slots[i].bank = BankId{i};
             s.slots[i].last_serviced_us = (uint64_t)(100 * (i + 1));   /* slot 0 is the LRU */
         }
         bool gdom[PULSAR_SESSION_POOL_CAP] = {false}, gscr[PULSAR_SESSION_POOL_CAP] = {false};
@@ -10352,10 +10608,10 @@ static void test_l372_judge_bank_floor_and_release(void) {
     server s;
     memset(&s, 0, sizeof s);
     pthread_mutex_init(&s.mu, NULL);
-    s.live_bank = -1;
+    s.live_bank = BankId::none();
     TEST_ASSERT(!server_judge_releasable(&s) && !server_judge_release(&s) && !server_judge_holds_kv(&s));   /* no judge */
     server_judge *J = new server_judge();
-    J->bank = 1;
+    J->bank = BankId{1};
     s.judge = J;
     TEST_ASSERT(server_judge_releasable(&s));
     TEST_ASSERT(!server_judge_release(&s) && !J->released);   /* nothing resident: nothing freed, nothing to re-back */
@@ -10372,7 +10628,7 @@ static void test_l372_judge_bank_floor_and_release(void) {
         pthread_cond_init(&jb.cv, NULL);
         jb.fd = sv[0];
         pulsar_tokens prompt = {0};
-        pulsar_tokens_push(&prompt, 1);
+        pulsar_tokens_push(&prompt, TokId{1});
         jb.prompts.push_back(prompt);
         J->head = J->tail = &jb;
         /* a judge request running or queued: the bank is its own */
@@ -10381,16 +10637,16 @@ static void test_l372_judge_bank_floor_and_release(void) {
         TEST_ASSERT(!server_judge_holds_kv(&s));   /* a freed bank holds nothing */
         J->released = false;
         /* (a) no box has this much free, and there is no chat bank to spill: refused busy, nothing installed */
-        (void)server_mem_floor_init(UINT64_MAX / 4, KvBytes{0});
+        (void)server_mem_floor_init(KvBytes{UINT64_MAX / 4}, KvBytes{0});
         char err[320] = "";
         TEST_ASSERT(!s.floor_admits_chunk(1024, err, sizeof err) && strstr(err, "not enough memory") != NULL);
         TEST_ASSERT(server_judge_step(&s));
-        (void)server_mem_floor_init(0, KvBytes{0});
+        (void)server_mem_floor_init(KvBytes{0}, KvBytes{0});
         TEST_ASSERT(jb.done && jb.busy && !jb.started && jb.err.find("not enough memory") != std::string::npos);
-        TEST_ASSERT(!server_judge_queued(&s) && !J->released && s.live_bank == -1);
+        TEST_ASSERT(!server_judge_queued(&s) && !J->released && s.live_bank == BankId::none());
         TEST_ASSERT(s.floor_admits_chunk(1024, err, sizeof err));   /* the real floor admits a chunk here */
         /* the budget's half prices the bank's growth by the session: a host-only server has none to hold */
-        TEST_ASSERT(s.budget_admits_growth(1u, 1024, err, sizeof err));
+        TEST_ASSERT(s.budget_admits_growth(BankId{1}, 1024, err, sizeof err));
         pulsar_tokens_free(&jb.prompts[0]);
         pthread_cond_destroy(&jb.cv);
         pthread_mutex_destroy(&jb.mu);
@@ -10620,7 +10876,8 @@ static void test_l353_disk_full_evicts(void) {
     TEST_ASSERT(pulsar_segstore_writes_failed(st) == 0);
     char key[41], err[256];
     pulsar_segstore_job *job = NULL;
-    const int rc = pulsar_segstore_reserve(st, "", 0, 128, "fails", 5, 64, 0, key, &job, err, sizeof err);
+    const int rc = pulsar_segstore_reserve(st, "", TokPos{0}, TokPos{128}, "fails", TextBytes{5}, 64, 0, key, &job, err,
+                                           sizeof err);
     TEST_ASSERT(rc > 0 && job);
     if (job) TEST_ASSERT(!pulsar_segstore_commit(st, job, false));
     TEST_ASSERT(pulsar_segstore_writes_failed(st) == 1 && !pulsar_segstore_contains(st, key));
@@ -10726,13 +10983,14 @@ static void test_l264_segstore_eviction_and_hygiene(void) {
     char err[256];
     pulsar_segstore_close(st);
     st = pulsar_segstore_open(dir, 0, 1, NULL, NULL);
-    TEST_ASSERT(pulsar_segstore_put(st, d, 256, 384, "tool turn", 9, 10, test_seg_write, 5, test_seg_trailer, &p, t,
+    TEST_ASSERT(pulsar_segstore_put(st, d, TokPos{256}, TokPos{384}, "tool turn", TextBytes{9}, 10, test_seg_write, 5,
+                                    test_seg_trailer, &p, t,
                                     err, sizeof err));
     struct seen_t { int n; bool text_ok; bool bytes_ok; } seen = { 0, false, false };
-    pulsar_segstore_foreach_trailer(st, [](FILE *fp, uint64_t bytes, const char *text, size_t len, void *ud) {
+    pulsar_segstore_foreach_trailer(st, [](FILE *fp, uint64_t bytes, const char *text, TextBytes len, void *ud) {
         seen_t *sn = (seen_t *)ud;
         sn->n++;
-        sn->text_ok = len == 9 && !memcmp(text, "tool turn", 9);
+        sn->text_ok = len == TextBytes{9} && !memcmp(text, "tool turn", 9);
         char b[5];
         sn->bytes_ok = bytes == 5 && fread(b, 1, 5, fp) == 5 && !memcmp(b, "TRAIL", 5);
         return true;
@@ -10746,7 +11004,8 @@ static void test_l264_segstore_eviction_and_hygiene(void) {
         for (const off_t cut : {(off_t)170}) {   /* inside its payload (a file with no header of ours is left alone) */
             char torn[41], tp[600];
             test_seg_payload tpay = { 10, 7 };
-            TEST_ASSERT(pulsar_segstore_put(o, "", 0, 128, "torn", 4, 10, test_seg_write, 0, NULL, &tpay, torn, err,
+            TEST_ASSERT(pulsar_segstore_put(o, "", TokPos{0}, TokPos{128}, "torn", TextBytes{4}, 10, test_seg_write, 0,
+                                            NULL, &tpay, torn, err,
                                             sizeof err));
             pulsar_segstore_close(o);
             snprintf(tp, sizeof tp, "%s/%.40s.seg", dir, torn);
@@ -10886,7 +11145,8 @@ static void test_kv_tool_map_restores_before_prompt_render(void) {
         TEST_ASSERT(src.kv_tool_map_serialized_size(dsml, &trailer) && trailer > 0);
         struct ctx_t { server *s; const char *text; } ctx = { &src, dsml };
         char key[41], err[256];
-        TEST_ASSERT(pulsar_segstore_put(st, "", 0, 128, dsml, strlen(dsml), 16,   /* L347 I3a: >= its 8-byte digest */
+        TEST_ASSERT(pulsar_segstore_put(st, "", TokPos{0}, TokPos{128}, dsml, TextBytes{strlen(dsml)}, 16,
+                                          /* L347 I3a: >= its 8-byte digest */
             [](FILE *fp, void *, char *, size_t) { return fwrite("PAYLOAD-DIGEST..", 1, 16, fp) == 16 ? 0 : 1; },
             trailer,
             [](FILE *fp, void *ud, char *, size_t) {
@@ -11190,45 +11450,50 @@ static void test_unterminated_think_stays_off_content(void) {
 
 
 
+/** L333: a test's byte figure entered into the KV accounting's unit (pulsar_units.h); the tests below keep their
+ *  arithmetic in plain integers and type it at the call, as the server types a measured or configured figure. */
+static constexpr KvBytes kvb(uint64_t v) { return KvBytes{v}; }
+
 static void test_kv_admission_budget_math(void) {
     const uint64_t GiB = 1024ull * 1024ull * 1024ull;
 
     /* Budget = usable - weights - overhead - free floor, clamped at 0 (the
      * floor term is the 2026-07-13 lockup fix: a fully committed budget must
      * still leave PULSAR_SERVER_MEM_FLOOR_BYTES of the machine free). */
-    TEST_ASSERT(server_kv_budget_bytes(91ull * GiB) ==
-                PULSAR_SERVER_USABLE_BYTES - 91ull * GiB -
-                PULSAR_SERVER_PROCESS_OVERHEAD_BYTES - PULSAR_SERVER_MEM_FLOOR_BYTES);
-    TEST_ASSERT(server_kv_budget_bytes(200ull * GiB) == 0);  /* weights > usable: no underflow */
+    TEST_ASSERT(server_kv_budget_bytes(kvb(91ull * GiB)) ==
+                kvb(PULSAR_SERVER_USABLE_BYTES - 91ull * GiB -
+                    PULSAR_SERVER_PROCESS_OVERHEAD_BYTES - PULSAR_SERVER_MEM_FLOOR_BYTES));
+    TEST_ASSERT(server_kv_budget_bytes(kvb(200ull * GiB)) == kvb(0));  /* weights > usable: no underflow */
     /* Reserves alone (no weights) must also clamp, not underflow. */
-    TEST_ASSERT(server_kv_budget_bytes(PULSAR_SERVER_USABLE_BYTES) == 0);
+    TEST_ASSERT(server_kv_budget_bytes(kvb(PULSAR_SERVER_USABLE_BYTES)) == kvb(0));
     /* L338 / L347 I4: a discrete card's budget is its own free memory less the margin -- a working set plus the guard's
      * floor (the one reserve), the estimate at sizing */
     const uint64_t Mi = 1024ull * 1024ull;
-    TEST_ASSERT(server_discrete_margin_bytes(0) == PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES);
-    TEST_ASSERT(server_discrete_margin_bytes(PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES) == 1536ull * Mi);
-    TEST_ASSERT(server_kv_budget_discrete_bytes(9ull * GiB, 1ull * GiB) == 9ull * GiB - 1536ull * Mi);
-    TEST_ASSERT(server_kv_budget_discrete_bytes(1536ull * Mi, 1ull * GiB) == 0);   /* exactly the margin */
-    TEST_ASSERT(server_kv_budget_discrete_bytes(1ull * GiB, 1ull * GiB) == 0);      /* no underflow */
+    const KvBytes ws_est = kvb(PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES);
+    TEST_ASSERT(server_discrete_margin_bytes(kvb(0)) == kvb(PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES));
+    TEST_ASSERT(server_discrete_margin_bytes(ws_est) == kvb(1536ull * Mi));
+    TEST_ASSERT(server_kv_budget_discrete_bytes(kvb(9ull * GiB), kvb(1ull * GiB)) == kvb(9ull * GiB - 1536ull * Mi));
+    TEST_ASSERT(server_kv_budget_discrete_bytes(kvb(1536ull * Mi), kvb(1ull * GiB)) == kvb(0));   /* the margin */
+    TEST_ASSERT(server_kv_budget_discrete_bytes(kvb(1ull * GiB), kvb(1ull * GiB)) == kvb(0));     /* no underflow */
     /* the RTX 6000 at startup (2026-11-02): 7.9 GiB free after the weights -> 6.4 GiB, was 5.0 at max(2, total / 8) */
     const uint64_t free6000 = 7900ull * Mi;
-    TEST_ASSERT(server_kv_budget_discrete_bytes(free6000, PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES) ==
-                free6000 - 1536ull * Mi);
+    TEST_ASSERT(server_kv_budget_discrete_bytes(kvb(free6000), ws_est) == kvb(free6000 - 1536ull * Mi));
     /* the warmup's measured working set: free before the create, less free after the warmup, less the session's
      * resident bytes; readings that show none are 0, never an underflow */
-    TEST_ASSERT(server_discrete_working_set_bytes(7900ull * Mi, 2250ull * Mi, 4900ull * Mi) == 750ull * Mi);
-    TEST_ASSERT(server_discrete_working_set_bytes(7900ull * Mi, 3000ull * Mi, 4900ull * Mi) == 0);
-    TEST_ASSERT(server_discrete_working_set_bytes(2000ull * Mi, 3000ull * Mi, 0) == 0);
-    TEST_ASSERT(server_discrete_working_set_bytes(7900ull * Mi, 2250ull * Mi, 4900ull * Mi) <=
-                PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES);   /* the 6000's measured case starts */
-    TEST_ASSERT(server_discrete_working_set_bytes(7900ull * Mi, 1500ull * Mi, 4900ull * Mi) >
-                PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES);   /* 1.5 GiB taken past the session: refused */
+    TEST_ASSERT(server_discrete_working_set_bytes(kvb(7900ull * Mi), kvb(2250ull * Mi), kvb(4900ull * Mi)) ==
+                kvb(750ull * Mi));
+    TEST_ASSERT(server_discrete_working_set_bytes(kvb(7900ull * Mi), kvb(3000ull * Mi), kvb(4900ull * Mi)) == kvb(0));
+    TEST_ASSERT(server_discrete_working_set_bytes(kvb(2000ull * Mi), kvb(3000ull * Mi), kvb(0)) == kvb(0));
+    TEST_ASSERT(server_discrete_working_set_bytes(kvb(7900ull * Mi), kvb(2250ull * Mi), kvb(4900ull * Mi)) <=
+                ws_est);   /* the 6000's measured case starts */
+    TEST_ASSERT(server_discrete_working_set_bytes(kvb(7900ull * Mi), kvb(1500ull * Mi), kvb(4900ull * Mi)) >
+                ws_est);   /* 1.5 GiB taken past the session: refused */
 
     /* Admission: committed + incoming <= budget, with overflow-safe compare. */
-    TEST_ASSERT(server_kv_admits(26ull * GiB, 0, 20ull * GiB));
-    TEST_ASSERT(server_kv_admits(26ull * GiB, 20ull * GiB, 6ull * GiB));   /* exact fit */
-    TEST_ASSERT(!server_kv_admits(26ull * GiB, 20ull * GiB, 7ull * GiB));  /* over by 1 GiB */
-    TEST_ASSERT(!server_kv_admits(26ull * GiB, 0, 27ull * GiB));           /* lone over-budget */
+    TEST_ASSERT(server_kv_admits(kvb(26ull * GiB), kvb(0), kvb(20ull * GiB)));
+    TEST_ASSERT(server_kv_admits(kvb(26ull * GiB), kvb(20ull * GiB), kvb(6ull * GiB)));   /* exact fit */
+    TEST_ASSERT(!server_kv_admits(kvb(26ull * GiB), kvb(20ull * GiB), kvb(7ull * GiB)));  /* over by 1 GiB */
+    TEST_ASSERT(!server_kv_admits(kvb(26ull * GiB), kvb(0), kvb(27ull * GiB)));           /* lone over-budget */
 
     /* GB10 production shape (2026-07-15 re-measure: 18 GiB steady-state
      * process overhead, 4 GiB kernel-breathing-room floor):
@@ -11240,15 +11505,15 @@ static void test_kv_admission_budget_math(void) {
      * admitted three. */
     const uint64_t MiB = 1024ull * 1024ull;
     const uint64_t gb10_weights = 87450ull * MiB;              /* ~85.4 GiB */
-    const uint64_t gb10_budget = server_kv_budget_bytes(gb10_weights);
-    TEST_ASSERT(gb10_budget == PULSAR_SERVER_USABLE_BYTES - gb10_weights -
-                PULSAR_SERVER_PROCESS_OVERHEAD_BYTES - PULSAR_SERVER_MEM_FLOOR_BYTES);
-    TEST_ASSERT(gb10_budget > 13ull * GiB && gb10_budget < 14ull * GiB);   /* ~13.6 GiB */
-    const uint64_t slot64k = 4710ull * MiB;                    /* ~4.6 GiB @ ctx 64k */
-    TEST_ASSERT(server_kv_admits(gb10_budget, 0, slot64k));               /* slot 0, 64k */
-    TEST_ASSERT(server_kv_admits(gb10_budget, 0, 2ull * slot64k));        /* slot 0, 128k bound */
-    TEST_ASSERT(server_kv_admits(gb10_budget, slot64k, slot64k));         /* second slot */
-    TEST_ASSERT(!server_kv_admits(gb10_budget, 2ull * slot64k, slot64k)); /* third refused */
+    const KvBytes gb10_budget = server_kv_budget_bytes(kvb(gb10_weights));
+    TEST_ASSERT(gb10_budget == kvb(PULSAR_SERVER_USABLE_BYTES - gb10_weights -
+                                   PULSAR_SERVER_PROCESS_OVERHEAD_BYTES - PULSAR_SERVER_MEM_FLOOR_BYTES));
+    TEST_ASSERT(gb10_budget > kvb(13ull * GiB) && gb10_budget < kvb(14ull * GiB));   /* ~13.6 GiB */
+    const KvBytes slot64k = kvb(4710ull * MiB);                /* ~4.6 GiB @ ctx 64k */
+    TEST_ASSERT(server_kv_admits(gb10_budget, kvb(0), slot64k));               /* slot 0, 64k */
+    TEST_ASSERT(server_kv_admits(gb10_budget, kvb(0), slot64k.times(2)));      /* slot 0, 128k bound */
+    TEST_ASSERT(server_kv_admits(gb10_budget, slot64k, slot64k));              /* second slot */
+    TEST_ASSERT(!server_kv_admits(gb10_budget, slot64k.times(2), slot64k));    /* third refused */
 }
 
 
@@ -11264,10 +11529,6 @@ static void test_kv_admission_budget_math(void) {
  * 31.24 GiB, nothing touched.  The ledger's share alone was 9.05 GiB of touched KV against 5.18 GiB above the floor:
  * the guard never spilled and the box ran dry (rows/L319.md).  At the ceiling, MemAvailable must still read the
  * floor: avail − (ceiling − touched) >= floor, whatever the inputs. */
-/** L333: a test's byte figure entered into the KV accounting's unit (pulsar_units.h); the tests below keep their
- *  arithmetic in plain integers and type it at the call, as the server types a measured or configured figure. */
-static constexpr KvBytes kvb(uint64_t v) { return KvBytes{v}; }
-
 static void test_guard_touched_budget_is_physical(void) {
     const uint64_t MiB = 1024ull * 1024ull;
     const uint64_t GiB = 1024ull * MiB;
@@ -11306,23 +11567,23 @@ static void test_mem_floor_admits_warmed_box_shape(void) {
      * floor demanded 8.50 and refused (a 0.11 GiB miss with ~5.9 GiB truly
      * free at full commit); the 4 GiB floor must admit — post-admission
      * MemAvailable stays >= ~5.89 GiB, well above the backstop. */
-    const uint64_t est = 2560ull * MiB;                     /* 2.5 GiB session */
-    TEST_ASSERT(server_mem_floor_admits(8590ull * MiB, est));  /* 8.39 GiB avail */
+    const KvBytes est = kvb(2560ull * MiB);                 /* 2.5 GiB session */
+    TEST_ASSERT(server_mem_floor_admits(kvb(8590ull * MiB), est));  /* 8.39 GiB avail */
 
     /* Warmed-box full-commit steady state measured 2026-07-15: 5.96 GiB
      * avail with three live sessions. A further session would leave ~3.4,
      * below the backstop: refuse. */
-    TEST_ASSERT(!server_mem_floor_admits(6103ull * MiB, est)); /* 5.96 GiB avail */
+    TEST_ASSERT(!server_mem_floor_admits(kvb(6103ull * MiB), est)); /* 5.96 GiB avail */
 
     /* A genuinely tight box must always refuse. */
-    TEST_ASSERT(!server_mem_floor_admits(4ull * GiB, est));
+    TEST_ASSERT(!server_mem_floor_admits(kvb(4ull * GiB), est));
     /* Exact boundary: est + floor. */
-    TEST_ASSERT(server_mem_floor_admits(est + PULSAR_SERVER_MEM_FLOOR_BYTES, est));
-    TEST_ASSERT(!server_mem_floor_admits(est + PULSAR_SERVER_MEM_FLOOR_BYTES - 1, est));
+    TEST_ASSERT(server_mem_floor_admits(est + kvb(PULSAR_SERVER_MEM_FLOOR_BYTES), est));
+    TEST_ASSERT(!server_mem_floor_admits(est + kvb(PULSAR_SERVER_MEM_FLOOR_BYTES - 1), est));
     /* Unreadable /proc/meminfo (avail == 0) fails closed. */
-    TEST_ASSERT(!server_mem_floor_admits(0, est));
+    TEST_ASSERT(!server_mem_floor_admits(kvb(0), est));
     /* Overflow guard: absurd estimate must refuse, not wrap. */
-    TEST_ASSERT(!server_mem_floor_admits(UINT64_MAX, UINT64_MAX - 1ull * GiB));
+    TEST_ASSERT(!server_mem_floor_admits(KvBytes::max(), kvb(UINT64_MAX - 1ull * GiB)));
 }
 
 
@@ -11334,13 +11595,13 @@ static void test_mem_floor_admits_warmed_box_shape(void) {
 static void test_session_eviction_ledger_math(void) {
     const uint64_t GiB = 1024ull * 1024ull * 1024ull;
     const uint64_t MiB = 1024ull * 1024ull;
-    const uint64_t budget = server_kv_budget_bytes(87450ull * MiB); /* ~13.6 GiB */
-    const uint64_t slot0 = 4710ull * MiB;   /* startup slot, ctx 64k measured */
-    const uint64_t a = 2560ull * MiB;       /* lazy 64k slot (pc 2048 shape) */
-    const uint64_t b = 2571ull * MiB;       /* same shape, distinct actual */
+    const KvBytes budget = server_kv_budget_bytes(kvb(87450ull * MiB)); /* ~13.6 GiB */
+    const KvBytes slot0 = kvb(4710ull * MiB);   /* startup slot, ctx 64k measured */
+    const KvBytes a = kvb(2560ull * MiB);       /* lazy 64k slot (pc 2048 shape) */
+    const KvBytes b = kvb(2571ull * MiB);       /* same shape, distinct actual */
 
     /* provision slot0 + a + b, filling most of the budget */
-    uint64_t committed = slot0;
+    KvBytes committed = slot0;
     TEST_ASSERT(server_kv_admits(budget, committed, a));
     committed += a;
     TEST_ASSERT(server_kv_admits(budget, committed, b));
@@ -11362,12 +11623,12 @@ static void test_session_eviction_ledger_math(void) {
     committed = server_ledger_release(committed, a);
     TEST_ASSERT(committed == slot0);
     committed = server_ledger_release(committed, slot0);
-    TEST_ASSERT(committed == 0);
+    TEST_ASSERT(committed == kvb(0));
 
     /* releasing more than is committed means the pairing broke: clamp to 0
      * (warns loudly; the MemAvailable floor backstops the over-admission) */
-    TEST_ASSERT(server_ledger_release(1ull * GiB, 2ull * GiB) == 0);
-    TEST_ASSERT(server_ledger_release(0, 1) == 0);
+    TEST_ASSERT(server_ledger_release(kvb(1ull * GiB), kvb(2ull * GiB)) == kvb(0));
+    TEST_ASSERT(server_ledger_release(kvb(0), kvb(1)) == kvb(0));
 }
 
 
@@ -11440,7 +11701,7 @@ static void test_hint_compaction_marks_dead(void) {
     s->n_slots = 4;
     for (int i = 0; i < 4; i++) {
         s->slots[i].provisioned = true;
-        s->slots[i].bank = (uint32_t)i;
+        s->slots[i].bank = BankId{i};
         s->slots[i].last_serviced_us = 100 + (uint64_t)i;
     }
     snprintf(s->slots[1].hint_session, PULSAR_HINT_ID_MAX, "sess-a");
@@ -11468,13 +11729,13 @@ static void test_session_eviction_victim_selection(void) {
     memset(slots, 0, sizeof(slots));
     for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) slots[i].provisioned = true;
     slots[0].last_serviced_us = 1;              /* oldest of all — but pinned */
-    slots[0].est_cost_bytes = 9ull * GiB;
+    slots[0].est_cost_bytes = kvb(9ull * GiB);
     slots[1].last_serviced_us = 100;
-    slots[1].est_cost_bytes = 3ull * GiB;
+    slots[1].est_cost_bytes = kvb(3ull * GiB);
     slots[2].last_serviced_us = 50;
-    slots[2].est_cost_bytes = 2ull * GiB;
+    slots[2].est_cost_bytes = kvb(2ull * GiB);
     slots[3].last_serviced_us = 50;             /* LRU tie with slot 2 */
-    slots[3].est_cost_bytes = 1ull * GiB;       /* ...but cheaper to restore */
+    slots[3].est_cost_bytes = kvb(1ull * GiB);       /* ...but cheaper to restore */
 
     TEST_ASSERT(server_evict_pick_victim(slots, 4, NULL) == 3); /* LRU tie-break */
     bool protect[PULSAR_SESSION_POOL_CAP] = {0};
@@ -11552,18 +11813,18 @@ static void test_l273_image_cold_cut(void) {
 }
 
 static void test_l275_route_turn_anchor(void) {
-    const int user = 9001, assistant = 9002;
-    const pulsar_turn_markers m = {{user, 0}, 1, {assistant, 0}, 1};
+    const TokId user{9001}, assistant{9002};
+    const pulsar_turn_markers m = {{user, TokId{0}}, 1, {assistant, TokId{0}}, 1};
     pulsar_tokens bank = {0};
-    pulsar_tokens_push(&bank, 1);          /* 0 bos */
-    pulsar_tokens_push(&bank, 2);          /* 1 system prompt */
-    pulsar_tokens_push(&bank, user);       /* 2 first task */
-    pulsar_tokens_push(&bank, 3);          /* 3 */
-    pulsar_tokens_push(&bank, assistant);  /* 4 the reply */
-    pulsar_tokens_push(&bank, 4);          /* 5 */
-    pulsar_tokens_push(&bank, user);       /* 6 the tool result / next task */
-    pulsar_tokens_push(&bank, 5);          /* 7 */
-    pulsar_tokens_push(&bank, assistant);  /* 8 the generation prompt */
+    pulsar_tokens_push(&bank, TokId{1});          /* 0 bos */
+    pulsar_tokens_push(&bank, TokId{2});          /* 1 system prompt */
+    pulsar_tokens_push(&bank, TokId{user});       /* 2 first task */
+    pulsar_tokens_push(&bank, TokId{3});          /* 3 */
+    pulsar_tokens_push(&bank, TokId{assistant});  /* 4 the reply */
+    pulsar_tokens_push(&bank, TokId{4});          /* 5 */
+    pulsar_tokens_push(&bank, TokId{user});       /* 6 the tool result / next task */
+    pulsar_tokens_push(&bank, TokId{5});          /* 7 */
+    pulsar_tokens_push(&bank, TokId{assistant});  /* 8 the generation prompt */
     /* the last user marker the bank prefilled, with an exchange before it */
     TEST_ASSERT(server_route_turn_anchor(&bank, bank.len, &m) == 6);
     /* prefilled stops before the second marker: the only user marker has no
@@ -11573,8 +11834,8 @@ static void test_l275_route_turn_anchor(void) {
     /* a prefilled count past the history is clamped to it */
     TEST_ASSERT(server_route_turn_anchor(&bank, bank.len + 10, &m) == 6);
     /* unknown markers (the tokenizer does not spell them, L272 B5): no anchor */
-    const pulsar_turn_markers none = {{0, 0}, 0, {0, 0}, 0};
-    const pulsar_turn_markers no_user = {{0, 0}, 0, {assistant, 0}, 1};
+    const pulsar_turn_markers none = {};
+    const pulsar_turn_markers no_user = {{TokId{0}, TokId{0}}, 0, {assistant, TokId{0}}, 1};
     TEST_ASSERT(server_route_turn_anchor(&bank, bank.len, &none) == -1);
     TEST_ASSERT(server_route_turn_anchor(&bank, bank.len, &no_user) == -1);
     TEST_ASSERT(server_route_turn_anchor(&bank, bank.len, NULL) == -1);
@@ -11582,18 +11843,18 @@ static void test_l275_route_turn_anchor(void) {
     pulsar_tokens_free(&bank);
 
     /* Qwen's two-token markers (L272 B5): the same shape rendered by its template */
-    const int start = 151644, u = 872, a = 77091;
+    const TokId start{151644}, u{872}, a{77091};
     const pulsar_turn_markers q = {{start, u}, 2, {start, a}, 2};
     pulsar_tokens qb = {0};
-    pulsar_tokens_push(&qb, start);  pulsar_tokens_push(&qb, 8948);  /* 0 <|im_start|>system */
-    pulsar_tokens_push(&qb, 2);                                     /* 2 */
-    pulsar_tokens_push(&qb, start);  pulsar_tokens_push(&qb, u);     /* 3 <|im_start|>user */
-    pulsar_tokens_push(&qb, 3);                                     /* 5 */
-    pulsar_tokens_push(&qb, start);  pulsar_tokens_push(&qb, a);     /* 6 <|im_start|>assistant */
-    pulsar_tokens_push(&qb, 4);                                     /* 8 */
-    pulsar_tokens_push(&qb, start);  pulsar_tokens_push(&qb, u);     /* 9 <|im_start|>user */
-    pulsar_tokens_push(&qb, u);                                     /* 11 the word "user" in the message */
-    pulsar_tokens_push(&qb, start);  pulsar_tokens_push(&qb, a);     /* 12 <|im_start|>assistant */
+    pulsar_tokens_push(&qb, TokId{start});  pulsar_tokens_push(&qb, TokId{8948});  /* 0 <|im_start|>system */
+    pulsar_tokens_push(&qb, TokId{2});                                     /* 2 */
+    pulsar_tokens_push(&qb, TokId{start});  pulsar_tokens_push(&qb, TokId{u});     /* 3 <|im_start|>user */
+    pulsar_tokens_push(&qb, TokId{3});                                     /* 5 */
+    pulsar_tokens_push(&qb, TokId{start});  pulsar_tokens_push(&qb, TokId{a});     /* 6 <|im_start|>assistant */
+    pulsar_tokens_push(&qb, TokId{4});                                     /* 8 */
+    pulsar_tokens_push(&qb, TokId{start});  pulsar_tokens_push(&qb, TokId{u});     /* 9 <|im_start|>user */
+    pulsar_tokens_push(&qb, TokId{u});                                     /* 11 the word "user" in the message */
+    pulsar_tokens_push(&qb, TokId{start});  pulsar_tokens_push(&qb, TokId{a});     /* 12 <|im_start|>assistant */
     TEST_ASSERT(server_route_turn_anchor(&qb, qb.len, &q) == 9);
     /* the marker's second token is past what the bank prefilled: no marker there */
     TEST_ASSERT(server_route_turn_anchor(&qb, 10, &q) == -1);
@@ -11616,17 +11877,17 @@ static void test_l275_route_turn_anchor(void) {
  * re-renders that turn "<think></think>answer" (truncate_history_thinking), so it matches the bank through the header
  * and "<think>" only.  A first-turn bank: no last-turn anchor, and before this every such turn took a fresh bank. */
 static void test_l311_route_header_anchor(void) {
-    const int start = 151644, u = 872, a = 77091, nl = 198, think = 151667, think_end = 151668;
+    const TokId start{151644}, u{872}, a{77091}, nl{198}, think{151667}, think_end{151668};
     const pulsar_turn_markers q = {{start, u}, 2, {start, a}, 2};
     pulsar_tokens b = {0};
-    pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, 8948);   /* 0 <|im_start|>system */
-    for (int i = 0; i < 300; i++) pulsar_tokens_push(&b, 1000 + i); /* 2 .. 301 the system prompt + tools */
+    pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, TokId{8948});   /* 0 <|im_start|>system */
+    for (int i = 0; i < 300; i++) pulsar_tokens_push(&b, TokId{1000 + i}); /* 2 .. 301 the system prompt + tools */
     pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, u);      /* 302 <|im_start|>user */
-    for (int i = 0; i < 40; i++) pulsar_tokens_push(&b, 2000 + i);  /* 304 .. 343 the task */
+    for (int i = 0; i < 40; i++) pulsar_tokens_push(&b, TokId{2000 + i});  /* 304 .. 343 the task */
     pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, a);      /* 344 <|im_start|>assistant: the header */
     pulsar_tokens_push(&b, nl);     pulsar_tokens_push(&b, think);  pulsar_tokens_push(&b, nl);   /* 346 .. 348 */
     const int prefilled = b.len;                                    /* 349: the prompt the bank prefilled */
-    for (int i = 0; i < 200; i++) pulsar_tokens_push(&b, 3000 + i); /* the reasoning, decoded */
+    for (int i = 0; i < 200; i++) pulsar_tokens_push(&b, TokId{3000 + i}); /* the reasoning, decoded */
     pulsar_tokens_push(&b, think_end);
     TEST_ASSERT(server_route_header_anchor(&b, prefilled, &q) == 345);
     TEST_ASSERT(server_route_turn_anchor(&b, prefilled, &q) == -1);   /* a first-turn bank has no last-turn anchor */
@@ -11640,7 +11901,7 @@ static void test_l311_route_header_anchor(void) {
     TEST_ASSERT(!server_route_in_place(320, 256, b.len, prefilled, 157, 345));
     /* the header's second token past what the bank prefilled: the marker before it */
     TEST_ASSERT(server_route_header_anchor(&b, 345, &q) == -1);
-    const pulsar_turn_markers none = {{0, 0}, 0, {0, 0}, 0};
+    const pulsar_turn_markers none = {};
     TEST_ASSERT(server_route_header_anchor(&b, prefilled, &none) == -1 && server_route_header_anchor(NULL, 9, &q) == -1);
     pulsar_tokens_free(&b);
 }
@@ -11652,12 +11913,12 @@ static void test_l311_route_header_anchor(void) {
  * last turn, the endpoint the first reply after it, and the next user turn continues in place. */
 static void test_l351_tool_turns(void) {
     const int start = 151644, u = 872, a = 77091, nl = 198, tr = 151665;
-    pulsar_turn_markers q = {{start, u}, 2, {start, a}, 2};
-    q.tool[0] = nl;
-    q.tool[1] = tr;
+    pulsar_turn_markers q = {{TokId{start}, TokId{u}}, 2, {TokId{start}, TokId{a}}, 2};
+    q.tool[0] = TokId{nl};
+    q.tool[1] = TokId{tr};
     q.n_tool = 2;
     pulsar_tokens b = {0};
-    auto push = [&](std::initializer_list<int> ids) { for (int id : ids) pulsar_tokens_push(&b, id); };
+    auto push = [&](std::initializer_list<int> ids) { for (int id : ids) pulsar_tokens_push(&b, TokId{id}); };
     push({start, 8948, 9});                 /* 0 system */
     push({start, u, nl, 11, 12});           /* 3 user: the client's message */
     push({start, a, nl, 20, 21, 22});       /* 8 assistant: reply 1 (a tool call) */
@@ -11681,7 +11942,8 @@ static void test_l351_tool_turns(void) {
     pulsar_tokens b2 = {0};
     for (int i = 0; i < b.len; i++) pulsar_tokens_push(&b2, b.v[i]);
     const int u2 = b2.len;                                           /* 37 the client's next message */
-    for (int id : {start, u, nl, 70, start, a, nl, 80, start, u, nl, tr, 90, start, a, nl, 95, 96}) pulsar_tokens_push(&b2, id);
+    for (int id : {start, u, nl, 70, start, a, nl, 80, start, u, nl, tr, 90, start, a, nl, 95, 96})
+        pulsar_tokens_push(&b2, TokId{id});
     TEST_ASSERT(server_route_turn_anchor(&b2, b2.len, &q) == u2);
     TEST_ASSERT(server_route_turn_anchor(&b2, b2.len, &plain) == u2 + 8);   /* L322 rule's old answer: the tool result */
     /* the endpoint: the first reply after the client's last turn -- the same in every request of the turn */
@@ -11860,32 +12122,32 @@ static void test_l326_responses_tool_search_in_place(void) {
 }
 
 static void test_l322_route_side_call(void) {
-    const int start = 151644, end = 151645, u = 872, a = 77091, nl = 198, think = 151667, think_end = 151668;
+    const TokId start{151644}, end{151645}, u{872}, a{77091}, nl{198}, think{151667}, think_end{151668};
     const pulsar_turn_markers q = {{start, u}, 2, {start, a}, 2};
     pulsar_tokens b = {0};
-    pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, 8948);   /* 0 <|im_start|>system */
-    for (int i = 0; i < 300; i++) pulsar_tokens_push(&b, 1000 + i); /* 2 .. 301 the system prompt + tools */
+    pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, TokId{8948});   /* 0 <|im_start|>system */
+    for (int i = 0; i < 300; i++) pulsar_tokens_push(&b, TokId{1000 + i}); /* 2 .. 301 the system prompt + tools */
     pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, u);      /* 302 <|im_start|>user: the task */
-    for (int i = 0; i < 40; i++) pulsar_tokens_push(&b, 2000 + i);
+    for (int i = 0; i < 40; i++) pulsar_tokens_push(&b, TokId{2000 + i});
     pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, a);      /* 344 turn N-1's header ... */
-    for (int i = 0; i < 100; i++) pulsar_tokens_push(&b, 3000 + i); /* ... and its reply */
+    for (int i = 0; i < 100; i++) pulsar_tokens_push(&b, TokId{3000 + i}); /* ... and its reply */
     pulsar_tokens_push(&b, end);    pulsar_tokens_push(&b, nl);
     const int user_n = b.len;                                       /* 448 <|im_start|>user: turn N */
     pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, u);
-    for (int i = 0; i < 60; i++) pulsar_tokens_push(&b, 4000 + i);
+    for (int i = 0; i < 60; i++) pulsar_tokens_push(&b, TokId{4000 + i});
     pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, a);      /* turn N's header ... */
     pulsar_tokens_push(&b, nl);     pulsar_tokens_push(&b, think);
-    for (int i = 0; i < 200; i++) pulsar_tokens_push(&b, 5000 + i); /* ... its reply, terminal-checkpointed */
+    for (int i = 0; i < 200; i++) pulsar_tokens_push(&b, TokId{5000 + i}); /* ... its reply, terminal-checkpointed */
     pulsar_tokens_push(&b, think_end);
     const int turn_end = b.len;                                     /* the side call's match: all of it */
     pulsar_tokens_push(&b, end);    pulsar_tokens_push(&b, nl);
     const int side_user = b.len;                                    /* the side call's <|im_start|>user */
     pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, u);
-    for (int i = 0; i < 330; i++) pulsar_tokens_push(&b, 6000 + i); /* "SUGGESTION MODE ..." */
+    for (int i = 0; i < 330; i++) pulsar_tokens_push(&b, TokId{6000 + i}); /* "SUGGESTION MODE ..." */
     const int side_header = b.len;
     pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, a);
     pulsar_tokens_push(&b, nl);     pulsar_tokens_push(&b, think);
-    for (int i = 0; i < 250; i++) pulsar_tokens_push(&b, 7000 + i); /* its reply, terminal-checkpointed */
+    for (int i = 0; i < 250; i++) pulsar_tokens_push(&b, TokId{7000 + i}); /* its reply, terminal-checkpointed */
     const int prefilled = b.len, frontier = b.len;
     TEST_ASSERT(server_route_turn_anchor(&b, prefilled, &q) == side_user);
     TEST_ASSERT(server_route_header_anchor(&b, prefilled, &q) == side_header + 1);
@@ -11911,7 +12173,7 @@ static void test_l322_route_side_call(void) {
     for (int i = 0; i < 349; i++) pulsar_tokens_push(&fb, b.v[i]);   /* system, task, turn N-1's header + 3 */
     TEST_ASSERT(server_route_turn_anchor(&fb, fb.len, &q) == -1);
     TEST_ASSERT(server_route_anchor(&fb, fb.len, &q) == 345);
-    const pulsar_turn_markers none = {{0, 0}, 0, {0, 0}, 0};
+    const pulsar_turn_markers none = {};
     TEST_ASSERT(server_route_anchor(&b, prefilled, &none) == -1 && server_route_anchor(NULL, 9, &q) == -1);
     pulsar_tokens_free(&fb);
     pulsar_tokens_free(&b);
@@ -12489,7 +12751,7 @@ static void test_l282_done_slot_is_released(void) {
     pthread_cond_init(&j.cv, NULL);
     session_slot *sl = &s.slots[1];
     sl->provisioned = true;
-    sl->bank = 1;
+    sl->bank = BankId{1};
     sl->state = SLOT_PREFILLING;
     sl->active_job = &j;
     sl->gen = (gen_state *)calloc(1, sizeof(gen_state));
@@ -12498,7 +12760,7 @@ static void test_l282_done_slot_is_released(void) {
     s.worker_service_slot(sl);
     TEST_ASSERT(sl->gen == NULL && sl->active_job == NULL && sl->state == SLOT_IDLE);
     TEST_ASSERT(j.done && s.n_generating == 0);
-    TEST_ASSERT(sl->bank == 1);   /* the bank stays the slot's: a quantum's save after an abandon reads it */
+    TEST_ASSERT(sl->bank == BankId{1});   /* the bank stays the slot's: a quantum's save after an abandon reads it */
     pthread_cond_destroy(&j.cv);
     pthread_mutex_destroy(&j.mu);
 }
@@ -12516,7 +12778,7 @@ static void test_l179_deep_guard_blocks_two_deep_decoders(void) {
         slots[i].provisioned = true;
         slots[i].active_job = (struct job *)&slots;
         slots[i].state = SLOT_DECODING;
-        slots[i].bank = (uint32_t)i;
+        slots[i].bank = BankId{i};
     }
     int n_dec = -1;
     long deep = -1;
@@ -12569,22 +12831,22 @@ static void test_l179_bank_floor_exempts_first_bank(void) {
     const uint64_t marginal = 2560ull * MiB;                 /* 2.5 GiB bank */
     const uint64_t floor = marginal + PULSAR_SERVER_MEM_FLOOR_BYTES;
     /* first bank: exempt everywhere */
-    TEST_ASSERT(!server_bank_floor_refuses(0, false, 0, marginal));
-    TEST_ASSERT(!server_bank_floor_refuses(0, false, floor - 1, marginal));
-    TEST_ASSERT(!server_bank_floor_refuses(0, false, floor, marginal));
-    TEST_ASSERT(!server_bank_floor_refuses(0, false, 1ull * GiB, marginal));
+    TEST_ASSERT(!server_bank_floor_refuses(0, false, kvb(0), kvb(marginal)));
+    TEST_ASSERT(!server_bank_floor_refuses(0, false, kvb(floor - 1), kvb(marginal)));
+    TEST_ASSERT(!server_bank_floor_refuses(0, false, kvb(floor), kvb(marginal)));
+    TEST_ASSERT(!server_bank_floor_refuses(0, false, kvb(1ull * GiB), kvb(marginal)));
     /* second bank onward, fresh pages: gauge and floor both bind */
-    TEST_ASSERT(server_bank_floor_refuses(1, false, 0, marginal));
-    TEST_ASSERT(server_bank_floor_refuses(1, false, floor - 1, marginal));
-    TEST_ASSERT(!server_bank_floor_refuses(1, false, floor, marginal));
-    TEST_ASSERT(server_bank_floor_refuses(3, false, 0, marginal));
-    TEST_ASSERT(server_bank_floor_refuses(3, false, floor - 1, marginal));
-    TEST_ASSERT(!server_bank_floor_refuses(3, false, floor, marginal));
-    TEST_ASSERT(!server_bank_floor_refuses(3, false, 100ull * GiB, marginal));
+    TEST_ASSERT(server_bank_floor_refuses(1, false, kvb(0), kvb(marginal)));
+    TEST_ASSERT(server_bank_floor_refuses(1, false, kvb(floor - 1), kvb(marginal)));
+    TEST_ASSERT(!server_bank_floor_refuses(1, false, kvb(floor), kvb(marginal)));
+    TEST_ASSERT(server_bank_floor_refuses(3, false, kvb(0), kvb(marginal)));
+    TEST_ASSERT(server_bank_floor_refuses(3, false, kvb(floor - 1), kvb(marginal)));
+    TEST_ASSERT(!server_bank_floor_refuses(3, false, kvb(floor), kvb(marginal)));
+    TEST_ASSERT(!server_bank_floor_refuses(3, false, kvb(100ull * GiB), kvb(marginal)));
     /* a recycled bank (resident pages): admitted however tight the box reads */
-    TEST_ASSERT(!server_bank_floor_refuses(15, true, floor - 1, marginal));
-    TEST_ASSERT(!server_bank_floor_refuses(15, true, 4ull * GiB + 1, marginal));
-    TEST_ASSERT(!server_bank_floor_refuses(15, true, 0, marginal));
+    TEST_ASSERT(!server_bank_floor_refuses(15, true, kvb(floor - 1), kvb(marginal)));
+    TEST_ASSERT(!server_bank_floor_refuses(15, true, kvb(4ull * GiB + 1), kvb(marginal)));
+    TEST_ASSERT(!server_bank_floor_refuses(15, true, kvb(0), kvb(marginal)));
 }
 
 /* 2026-09-29 -- which free bank provision_bank takes: the most resident pages,
@@ -12628,27 +12890,27 @@ static void test_refusal_evictable(void) {
 static void test_l179_park_live_bank_only_when_not_in_quantum(void) {
     session_slot slots[4];
     memset(slots, 0, sizeof slots);
-    for (int i = 0; i < 4; i++) slots[i].bank = (uint32_t)i;
+    for (int i = 0; i < 4; i++) slots[i].bank = BankId{i};
     session_slot *dec[2] = {&slots[0], &slots[1]};
     const session_slot *pf = &slots[2];
     const int pool = 4;
     /* live bank is a decoder: no park */
-    TEST_ASSERT(!park_live_bank_needed(0, pool, dec, 2, NULL));
-    TEST_ASSERT(!park_live_bank_needed(1, pool, dec, 2, pf));
+    TEST_ASSERT(!park_live_bank_needed(BankId{0}, pool, dec, 2, NULL));
+    TEST_ASSERT(!park_live_bank_needed(BankId{1}, pool, dec, 2, pf));
     /* live bank is the fused prefill slot: no park */
-    TEST_ASSERT(!park_live_bank_needed(2, pool, dec, 2, pf));
+    TEST_ASSERT(!park_live_bank_needed(BankId{2}, pool, dec, 2, pf));
     /* live bank is in neither: park */
-    TEST_ASSERT(park_live_bank_needed(2, pool, dec, 2, NULL));
-    TEST_ASSERT(park_live_bank_needed(3, pool, dec, 2, pf));
-    TEST_ASSERT(park_live_bank_needed(0, pool, dec, 0, NULL));
+    TEST_ASSERT(park_live_bank_needed(BankId{2}, pool, dec, 2, NULL));
+    TEST_ASSERT(park_live_bank_needed(BankId{3}, pool, dec, 2, pf));
+    TEST_ASSERT(park_live_bank_needed(BankId{0}, pool, dec, 0, NULL));
     /* no live bank / out of pool: nothing to park */
-    TEST_ASSERT(!park_live_bank_needed(-1, pool, dec, 2, pf));
-    TEST_ASSERT(!park_live_bank_needed(pool, pool, dec, 2, pf));
-    TEST_ASSERT(!park_live_bank_needed(3, 0, dec, 0, NULL));
+    TEST_ASSERT(!park_live_bank_needed(BankId::none(), pool, dec, 2, pf));
+    TEST_ASSERT(!park_live_bank_needed(BankId{pool}, pool, dec, 2, pf));
+    TEST_ASSERT(!park_live_bank_needed(BankId{3}, 0, dec, 0, NULL));
     /* a NULL entry in dec is skipped, not dereferenced */
     session_slot *holey[2] = {NULL, &slots[3]};
-    TEST_ASSERT(park_live_bank_needed(2, pool, holey, 2, NULL));
-    TEST_ASSERT(!park_live_bank_needed(3, pool, holey, 2, NULL));
+    TEST_ASSERT(park_live_bank_needed(BankId{2}, pool, holey, 2, NULL));
+    TEST_ASSERT(!park_live_bank_needed(BankId{3}, pool, holey, 2, NULL));
 }
 
 /* L179 branch 2 -- server_worker_main's lane select (w_decode_lane). Invariant:
@@ -12769,7 +13031,7 @@ static void test_l293_batch_leave_stops_at_the_budget(void) {
         g.completion = completion;
         g.batch_active = true;
         g.batch_feed_valid = true;   /* the last step sampled the next feed token */
-        g.batch_feed_token = 42;
+        g.batch_feed_token = TokId{42};
         g.batch_feed_pos = TokPos{100 + completion};
         sl.gen = &g;
         sl.active_job = &j;
@@ -12993,7 +13255,7 @@ static void test_l380_terminal_grace_and_yield(void) {
     s.n_slots = 3;
     for (int i = 0; i < 3; i++) {
         s.slots[i].provisioned = true;
-        s.slots[i].bank = (uint32_t)i;
+        s.slots[i].bank = BankId{i};
     }
     /* the worker's wait: none pending sleeps untimed (< 0); else the earliest pending slot's deadline */
     TEST_ASSERT(s.terminal_wait_s(100.0) < 0.0);
@@ -13035,11 +13297,12 @@ static void test_l380_terminal_grace_and_yield(void) {
     terminal_sync_watch w = { &s, -1, 0 };
     s.head = &queued;
     TEST_ASSERT(!terminal_cancel_cb(&w));
-    terminal_progress_cb(&w, "prefill_chunk", 36480, 36700);
+    terminal_progress_cb(&w, "prefill_chunk", TokPos{36480}, TokCount{36700});
     TEST_ASSERT(w.landed == 0 && !terminal_cancel_cb(&w));
-    terminal_progress_cb(&w, "prefill_chunk", 36608, 36700);
+    terminal_progress_cb(&w, "prefill_chunk", TokPos{36608}, TokCount{36700});
     TEST_ASSERT(w.landed == 1 && terminal_cancel_cb(&w));
-    terminal_progress_cb(&w, "prefill_chunk", 36608, 36701);              /* the second sync's start: no chunk */
+    terminal_progress_cb(&w, "prefill_chunk", TokPos{36608},
+                         TokCount{36701});              /* the second sync's start: no chunk */
     TEST_ASSERT(w.landed == 1);
     s.head = NULL;
     TEST_ASSERT(!terminal_cancel_cb(&w));
@@ -13061,7 +13324,7 @@ static void test_l380_terminal_grace_and_yield(void) {
     sl->turn_ended_at = 100.2;
     TEST_ASSERT(!sl->terminal_pending && s.slot_interrupted_turn(sl) == NULL);
     pulsar_tokens turn = {0};
-    for (int i = 0; i < 700; i++) pulsar_tokens_push(&turn, 1000 + i);
+    for (int i = 0; i < 700; i++) pulsar_tokens_push(&turn, TokId{1000 + i});
     s.slot_terminal_rearm(sl, &turn, true);
     TEST_ASSERT(turn.len == 0 && turn.v == NULL);
     TEST_ASSERT(sl->terminal_pending && sl->terminal_short_first && sl->provisioned);
@@ -13072,7 +13335,7 @@ static void test_l380_terminal_grace_and_yield(void) {
      * (0 here: no session), so the continuation still finds its owner */
     id_list_push_unique(&sl->anthropic_live.call_ids, "toolu_l380t");
     sl->anthropic_live.valid = true;
-    sl->anthropic_live.live_tokens = 700;
+    sl->anthropic_live.live_tokens = TokCount{700};
     stop_list ids = {0};
     id_list_push_unique(&ids, "toolu_l380t");
     TEST_ASSERT(s.anthropic_live_slot_for_ids(&ids) == sl);
@@ -13092,7 +13355,8 @@ static void test_l380_terminal_grace_and_yield(void) {
     live_tool_state_free(&sl->anthropic_live);
 
     /* the bank's tokens must be a prefix of the kept turn for the continuation to be built from it */
-    int a3[] = {1, 2, 3}, a4[] = {1, 2, 3, 4}, b3[] = {1, 9, 3};
+    TokId a3[] = {TokId{1}, TokId{2}, TokId{3}}, a4[] = {TokId{1}, TokId{2}, TokId{3}, TokId{4}}, b3[] = {TokId{1},
+        TokId{9}, TokId{3}};
     const pulsar_tokens p3 = {a3, 3, 3}, p4 = {a4, 4, 4}, q3 = {b3, 3, 3}, none = {NULL, 0, 0};
     TEST_ASSERT(server_tokens_prefix_of(&p3, &p4) && server_tokens_prefix_of(&p4, &p4) && server_tokens_prefix_of(&none, &p3));
     TEST_ASSERT(!server_tokens_prefix_of(&p4, &p3) && !server_tokens_prefix_of(&q3, &p4));
@@ -13350,7 +13614,7 @@ static void test_l380_batch_frontier(void) {
     memset(&g, 0, sizeof g);
     s.n_slots = 2;
     session_slot &sl = s.slots[1];
-    sl.bank = 1u;
+    sl.bank = BankId{1};
     sl.gen = &g;
     g.phase = GEN_DECODE;
     g.batch_active = true;
@@ -13385,13 +13649,13 @@ static void test_l380_batch_frontier(void) {
     sl.active_job = &busy;
     id_list_push_unique(&sl.anthropic_live.call_ids, "toolu_l380");
     sl.anthropic_live.valid = true;
-    sl.anthropic_live.live_tokens = 36000;
+    sl.anthropic_live.live_tokens = TokCount{36000};
     stop_list ids = {0};
     id_list_push_unique(&ids, "toolu_l380");
     TEST_ASSERT(s.anthropic_live_slot_for_ids(&ids) == NULL);
-    sl.anthropic_live.live_tokens = 0;
+    sl.anthropic_live.live_tokens = TokCount{0};
     TEST_ASSERT(s.anthropic_live_slot_for_ids(&ids) == NULL);
-    sl.anthropic_live.live_tokens = 36600;   /* the read is the feed position */
+    sl.anthropic_live.live_tokens = TokCount{36600};   /* the read is the feed position */
     TEST_ASSERT(s.anthropic_live_slot_for_ids(&ids) == &sl);
     id_list_free(&ids);
     live_tool_state_free(&sl.anthropic_live);
@@ -13444,7 +13708,8 @@ static void test_l380_batch_frontier(void) {
     TEST_ASSERT(s.slot_common_prefix(&sl, &any) == 0);
     s.pool_banks = 0;
     /* a slot's history is the engine's tokens, then the batch's commits: its length and its compares read both */
-    int bv[4] = {1, 2, 3, 4}, tv[2] = {5, 6}, wv[6] = {1, 2, 3, 4, 5, 7};
+    TokId bv[4] = {TokId{1}, TokId{2}, TokId{3}, TokId{4}}, tv[2] = {TokId{5}, TokId{6}}, wv[6] = {TokId{1}, TokId{2},
+        TokId{3}, TokId{4}, TokId{5}, TokId{7}};
     pulsar_tokens b = {bv, 4, 4}, t = {tv, 2, 2}, w = {wv, 6, 6}, t0 = {0};
     const slot_tokens two = {&b, &t}, flat = {&w, NULL}, entry = {&b, NULL}, fresh = {&b, &t0}, none = {NULL, NULL};
     TEST_ASSERT(slot_tokens_len(two) == 6 && slot_tokens_len(entry) == 4 && slot_tokens_len(fresh) == 4 &&
@@ -13452,7 +13717,7 @@ static void test_l380_batch_frontier(void) {
     TEST_ASSERT(slot_tokens_common(two, flat) == 5 && slot_tokens_common(flat, two) == 5);   /* parts inside the tail */
     TEST_ASSERT(slot_tokens_common(two, entry) == 4 && slot_tokens_common(two, two) == 6);
     TEST_ASSERT(slot_tokens_common(two, none) == 0 && slot_tokens_common(none, flat) == 0);
-    wv[1] = 9;   /* parts inside the base */
+    wv[1] = TokId{9};   /* parts inside the base */
     TEST_ASSERT(slot_tokens_common(two, flat) == 1);
     pthread_mutex_destroy(&s.tool_mu);
 }
@@ -14237,7 +14502,7 @@ static void l329_fanout(const l329_req *rq, int n, int wait_ms, l329_out *o) {
                     }
                 }
                 r[k].bound = true;
-                r[k].pos = server_resume_memory_depth(0, have);
+                r[k].pos = server_resume_memory_depth(PromptToks{0}, PromptToks{have}).raw();
                 o->resume[k] = r[k].pos;
                 o->bound_at[k] = t;
                 bound_one = true;
@@ -14452,7 +14717,7 @@ static void test_l323_bank_dominated(void) {
     s.n_slots = 4;
     for (int i = 0; i < 4; i++) {
         s.slots[i].provisioned = true;
-        s.slots[i].bank = (uint32_t)i;
+        s.slots[i].bank = BankId{i};
         s.slots[i].last_serviced_us = slots[i].last_serviced_us;
     }
     s.slots[0].last_serviced_us = 70;   /* L328: bank 0 is a candidate like any bank -- here not the LRU one */
@@ -14484,7 +14749,7 @@ static void test_l179_guard_victim_skips_live_spilled(void) {
     static const uint64_t us[5] = {1, 40, 30, 20, 10};   /* bank 0 the oldest */
     for (int i = 0; i < 5; i++) {
         s.slots[i].provisioned = true;
-        s.slots[i].bank = (uint32_t)i;
+        s.slots[i].bank = BankId{i};
         s.slots[i].last_serviced_us = us[i];
     }
     session_slot *dec[2] = {&s.slots[4], &s.slots[3]};
@@ -14744,7 +15009,7 @@ struct l330_bank {
     const char *fail_why = "digest mismatch (corrupt segment)";   ///< ... and the loader's words
 };
 static pulsar_segment_status l330_loader(void *ud, const uint8_t *seg, uint64_t bytes, bool last, const uint8_t *rp,
-                                         uint64_t rp_bytes, int *G, const char *key, char *err, size_t errlen) {
+                                         uint64_t rp_bytes, TokPos *G, const char *key, char *err, size_t errlen) {
     (void)key;
     l330_bank *b = (l330_bank *)ud;
     if (last != (rp != NULL)) {
@@ -14765,7 +15030,7 @@ static pulsar_segment_status l330_loader(void *ud, const uint8_t *seg, uint64_t 
     snprintf(rec, sizeof rec, "%u-%u%s ", h[6], h[7], last ? "L" : "");
     b->order += rec;
     b->pos = (int)h[7];
-    *G = (int)h[7];
+    *G = TokPos{(int)h[7]};
     return PULSAR_SEGMENT_OK;
 }
 static void test_l330_sliced_restore(void) {
@@ -14784,9 +15049,10 @@ static void test_l330_sliced_restore(void) {
     pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
     uint64_t bytes = 0;
     char err[384];
-    const int n = pulsar_kvchain_find(st, req.data(), req.size(), NULL, 0, 0, chain, PULSAR_KVCHAIN_MAX, &bytes, err,
+    const int n = pulsar_kvchain_find(st, req.data(), TextBytes{req.size()}, NULL, 0, TokCount{0}, chain,
+                                      PULSAR_KVCHAIN_MAX, &bytes, err,
                                       sizeof err);
-    TEST_ASSERT(n == 6 && chain[n - 1].G == 21000);
+    TEST_ASSERT(n == 6 && chain[n - 1].G == TokPos{21000});
     if (n != 6) { pulsar_segstore_close(st); l323_rmdir(dir); return; }
     /* the one-shot load: the whole chain as one slice */
     l330_bank one;
@@ -14836,7 +15102,8 @@ static void test_l330_sliced_restore(void) {
         for (int i = 0; i < n; i++) TEST_ASSERT(pulsar_segstore_get(st, chain[i].key, &g));
         uint64_t again = 0;
         pulsar_segstore_seg c2[PULSAR_KVCHAIN_MAX];
-        TEST_ASSERT(pulsar_kvchain_find(st, req.data(), req.size(), NULL, 0, 0, c2, PULSAR_KVCHAIN_MAX, &again, err,
+        TEST_ASSERT(pulsar_kvchain_find(st, req.data(), TextBytes{req.size()}, NULL, 0, TokCount{0}, c2,
+                                        PULSAR_KVCHAIN_MAX, &again, err,
                                         sizeof err) == n);
     }
     /* a read failure mid-chain (segment [8192,12288) corrupt): the slice stops AT it, says which, and the store drops
@@ -14855,7 +15122,8 @@ static void test_l330_sliced_restore(void) {
         TEST_ASSERT(pulsar_segstore_get(st, chain[1].key, &g));   /* above it stays */
         uint64_t left = 0;
         pulsar_segstore_seg c2[PULSAR_KVCHAIN_MAX];
-        TEST_ASSERT(pulsar_kvchain_find(st, req.data(), req.size(), NULL, 0, 0, c2, PULSAR_KVCHAIN_MAX, &left, err,
+        TEST_ASSERT(pulsar_kvchain_find(st, req.data(), TextBytes{req.size()}, NULL, 0, TokCount{0}, c2,
+                                        PULSAR_KVCHAIN_MAX, &left, err,
                                         sizeof err) == 2);
     }
     pulsar_segstore_close(st);
@@ -15016,20 +15284,20 @@ static void test_l281_prefill_chunk_publishes_the_slot_gauges(void) {
     s.slots[0].gen = &g;
     const uint64_t gen0 = s.metrics_generation;
 
-    gen_prefill_progress_cb(&g, "prefill_chunk", 4096, 320284);
+    gen_prefill_progress_cb(&g, "prefill_chunk", TokPos{4096}, TokCount{320284});
     TEST_ASSERT(g.prefill_last_current == 4096 && g.prefill_total == 320284);
     TEST_ASSERT(s.m_slot_prefill_done[0] == 4096);
     TEST_ASSERT(s.m_slot_prefill_total[0] == 320284);
     TEST_ASSERT(s.m_slot_phase[0] == (int)GEN_PREFILL_MAIN + 1);
     TEST_ASSERT(s.metrics_generation == gen0 + 1);
 
-    gen_prefill_progress_cb(&g, "prefill_chunk", 8192, 320284);
+    gen_prefill_progress_cb(&g, "prefill_chunk", TokPos{8192}, TokCount{320284});
     TEST_ASSERT(s.m_slot_prefill_done[0] == 8192);
     TEST_ASSERT(g.prefill_chunks_done == 1);
     TEST_ASSERT(s.metrics_generation == gen0 + 2);
 
     /* a display event is the keepalive's, not a chunk: nothing to publish */
-    gen_prefill_progress_cb(&g, "prefill_display", 8192, 320284);
+    gen_prefill_progress_cb(&g, "prefill_display", TokPos{8192}, TokCount{320284});
     TEST_ASSERT(s.metrics_generation == gen0 + 2);
     pthread_cond_destroy(&s.stream_cv);
     pthread_mutex_destroy(&s.mu);
@@ -15045,13 +15313,13 @@ static void test_l179_evict_reset_leaves_a_reusable_hole(void) {
     memset(&fake_job, 0, sizeof fake_job);
     memset(&fake_gen, 0, sizeof fake_gen);
     sl.provisioned = true;
-    sl.bank = 5;
+    sl.bank = BankId{5};
     sl.committed_pos = TokPos{4096};
     sl.active_job = &fake_job;
     sl.gen = &fake_gen;
     sl.state = SLOT_DECODING;
     sl.ctx_size = 131072;
-    sl.est_cost_bytes = 9ull << 30;
+    sl.est_cost_bytes = kvb(9ull << 30);
     sl.tokens_emitted = 777;
     sl.prefill_counted = 4000;
     sl.last_serviced_us = 123456789ull;
@@ -15062,19 +15330,19 @@ static void test_l179_evict_reset_leaves_a_reusable_hole(void) {
     TEST_ASSERT(sl.active_job == NULL);
     TEST_ASSERT(sl.state == SLOT_EVICTED);
     TEST_ASSERT(sl.ctx_size == 0);
-    TEST_ASSERT(sl.est_cost_bytes == 0);
+    TEST_ASSERT(sl.est_cost_bytes == kvb(0));
     TEST_ASSERT(sl.tokens_emitted == 0);
     TEST_ASSERT(sl.prefill_counted == 0);
     TEST_ASSERT(sl.last_serviced_us == 0);
     /* the caller's facts survive the reset */
-    TEST_ASSERT(sl.bank == 5);
+    TEST_ASSERT(sl.bank == BankId{5});
     TEST_ASSERT(sl.spilled);
     /* an already-empty slot resets to the same hole and reports ctx 0 */
     session_slot empty;
     memset(&empty, 0, sizeof empty);
-    empty.bank = 2;
+    empty.bank = BankId{2};
     TEST_ASSERT(evict_reset_slot_fields(&empty) == 0);
-    TEST_ASSERT(!empty.provisioned && empty.state == SLOT_EVICTED && empty.bank == 2);
+    TEST_ASSERT(!empty.provisioned && empty.state == SLOT_EVICTED && empty.bank == BankId{2});
 }
 
 /* L179 branch 10 -- the fused mixed quantum's head cap (mixed_head_cap).
@@ -15669,17 +15937,17 @@ static void test_mem_floor_is_derived_from_the_watermarks(void) {
         "        high     124302\n"
         "        promo    150000\n"
         "        high_x   99999\n";
-    TEST_ASSERT(server_zoneinfo_high_bytes(zi, 4096) == (2000ull + 124302ull) * 4096ull);
-    TEST_ASSERT(server_zoneinfo_high_bytes("Node 0, zone Normal\n  pages free 5\n", 4096) == 0);   /* none: 0 */
-    TEST_ASSERT(server_zoneinfo_high_bytes("", 4096) == 0);
-    TEST_ASSERT(server_zoneinfo_high_bytes("        high     7", 4096) == 0);   /* a line must be whole */
+    TEST_ASSERT(server_zoneinfo_high_bytes(zi, 4096) == kvb((2000ull + 124302ull) * 4096ull));
+    TEST_ASSERT(server_zoneinfo_high_bytes("Node 0, zone Normal\n  pages free 5\n", 4096) == kvb(0));   /* none: 0 */
+    TEST_ASSERT(server_zoneinfo_high_bytes("", 4096) == kvb(0));
+    TEST_ASSERT(server_zoneinfo_high_bytes("        high     7", 4096) == kvb(0));   /* a line must be whole */
     /* the floor: the margin + the watermarks + the step; every MemAvailable check reads it */
     const uint64_t zone = 486ull * MiB, step = 160ull * MiB;
-    TEST_ASSERT(server_mem_floor_init(zone, kvb(step)) == kvb(PULSAR_SERVER_MEM_FLOOR_BYTES + zone + step));
+    TEST_ASSERT(server_mem_floor_init(kvb(zone), kvb(step)) == kvb(PULSAR_SERVER_MEM_FLOOR_BYTES + zone + step));
     TEST_ASSERT(server_mem_floor() == kvb(PULSAR_SERVER_MEM_FLOOR_BYTES + zone + step));
     const uint64_t F = server_mem_floor().raw();
-    TEST_ASSERT(server_mem_floor_admits(F + 10 * MiB, 10 * MiB));
-    TEST_ASSERT(!server_mem_floor_admits(F + 10 * MiB - 1, 10 * MiB));
+    TEST_ASSERT(server_mem_floor_admits(kvb(F + 10 * MiB), kvb(10 * MiB)));
+    TEST_ASSERT(!server_mem_floor_admits(kvb(F + 10 * MiB - 1), kvb(10 * MiB)));
     /* the guard's ceiling keeps the derived floor free */
     TEST_ASSERT(server_guard_touched_budget(kvb(64ull << 30), kvb(0), kvb(0), kvb(F + 3 * MiB), server_mem_floor()) == kvb(3 * MiB));
     TEST_ASSERT(server_guard_touched_budget(kvb(64ull << 30), kvb(0), kvb(0), kvb(F), server_mem_floor()) == KvBytes{});
@@ -15689,11 +15957,11 @@ static void test_mem_floor_is_derived_from_the_watermarks(void) {
     TEST_ASSERT(!server_headroom_admits(kvb(4), kvb(2), kvb(3)));
     TEST_ASSERT(!server_headroom_admits(kvb(UINT64_MAX), kvb(UINT64_MAX), kvb(2)));
     /* a persist's host demand: the writeback window + two renders of the text, at the bound a token */
-    TEST_ASSERT(server_persist_host_bytes(0) == PULSAR_WRITEBACK_STEP);
-    TEST_ASSERT(server_persist_host_bytes(-5) == PULSAR_WRITEBACK_STEP);
+    TEST_ASSERT(server_persist_host_bytes(0) == kvb(PULSAR_WRITEBACK_STEP));
+    TEST_ASSERT(server_persist_host_bytes(-5) == kvb(PULSAR_WRITEBACK_STEP));
     TEST_ASSERT(server_persist_host_bytes(188416) ==
-                PULSAR_WRITEBACK_STEP + 2ull * 188416ull * PERSIST_TEXT_BYTES_PER_TOKEN);
-    (void)server_mem_floor_init(0, kvb(0));   /* back to the OS margin for the tests after this one */
+                kvb(PULSAR_WRITEBACK_STEP + 2ull * 188416ull * PERSIST_TEXT_BYTES_PER_TOKEN));
+    (void)server_mem_floor_init(kvb(0), kvb(0));   /* back to the OS margin for the tests after this one */
     TEST_ASSERT(server_mem_floor() == kvb(PULSAR_SERVER_MEM_FLOOR_BYTES));
 }
 
@@ -15722,11 +15990,11 @@ static void test_guard_budget_reads_live_memavailable(void) {
     TEST_ASSERT(s.guard_budget() == KvBytes{});
     /* L357: the test route's ledger budget stands in for the startup one: 33 − eager 31 = 2 GiB binds ... */
     s.guard_avail = kvb(F + 20 * GiB);
-    s.guard_test_budget = 33 * GiB;
+    s.set_test_guard_budget(kvb(33 * GiB));
     TEST_ASSERT(s.guard_budget() == kvb(2 * GiB));
-    s.guard_test_budget = 100 * GiB;            /* ... never above the startup ceiling ... */
+    s.set_test_guard_budget(kvb(100 * GiB));    /* ... never above the startup ceiling ... */
     TEST_ASSERT(s.guard_budget() == kvb(5 * GiB));
-    s.guard_test_budget = 0;                    /* ... and 0 restores the startup budget */
+    s.set_test_guard_budget(kvb(0));            /* ... and 0 restores the startup budget */
     TEST_ASSERT(s.guard_budget() == kvb(5 * GiB));
 }
 
@@ -15772,7 +16040,7 @@ static void test_persist_skipped_under_the_floor(void) {
     memset(&s, 0, sizeof s);
     pthread_mutex_init(&s.mu, NULL);
     s.kv.enabled = true;                                 /* a store is configured ... */
-    (void)server_mem_floor_init(UINT64_MAX / 4, kvb(0));      /* ... and no box has this much free */
+    (void)server_mem_floor_init(kvb(UINT64_MAX / 4), kvb(0));      /* ... and no box has this much free */
     int end = -1;
     session_slot sl;   /* L347 I3b: a persist reads its slot's X-Pulsar-KV tokens (none here) */
     memset(&sl, 0, sizeof sl);
@@ -15786,7 +16054,7 @@ static void test_persist_skipped_under_the_floor(void) {
     bool no_room = true;
     TEST_ASSERT(s.kv_cache_persist(&sl, KV_PERSIST_SPILL, nullptr, &no_room) == 0 && !no_room);
     TEST_ASSERT(s.m_persist_skipped == 2);
-    (void)server_mem_floor_init(0, kvb(0));
+    (void)server_mem_floor_init(kvb(0), kvb(0));
     pthread_mutex_destroy(&s.mu);
 }
 
@@ -15862,7 +16130,7 @@ static void test_l347_i3b_read_only_writes_nothing(void) {
     pthread_mutex_init(&s.mu, NULL);
     s.kv.enabled = true;
     /* the witness: a persist the mark lets through reaches the memory floor, which no box clears here */
-    (void)server_mem_floor_init(UINT64_MAX / 4, kvb(0));
+    (void)server_mem_floor_init(kvb(UINT64_MAX / 4), kvb(0));
     session_slot sl;
     memset(&sl, 0, sizeof sl);
     sl.kv_flags = KV_HDR_READ_ONLY;
@@ -15878,7 +16146,7 @@ static void test_l347_i3b_read_only_writes_nothing(void) {
     bool no_room = false;
     TEST_ASSERT(s.kv_cache_persist(&sl, KV_PERSIST_EVICT, nullptr, &no_room) == 0 && no_room);
     TEST_ASSERT(s.m_persist_read_only == 5 && s.m_persist_skipped == 1);
-    (void)server_mem_floor_init(0, kvb(0));
+    (void)server_mem_floor_init(kvb(0), kvb(0));
     pthread_mutex_destroy(&s.mu);
 }
 
@@ -16053,7 +16321,8 @@ static void test_l347_i3b_failure_rules(void) {
     char err[384];
     auto find = [&]() {
         uint64_t b = 0;
-        return pulsar_kvchain_find(st, req.data(), req.size(), NULL, 0, 0, chain, PULSAR_KVCHAIN_MAX, &b, err,
+        return pulsar_kvchain_find(st, req.data(), TextBytes{req.size()}, NULL, 0, TokCount{0}, chain,
+                                   PULSAR_KVCHAIN_MAX, &b, err,
                                    sizeof err);
     };
     int n = find();
@@ -16084,7 +16353,8 @@ static void test_l347_i3b_failure_rules(void) {
         TEST_ASSERT(pulsar_segstore_get(st, chain[5].key, &g) && g.rp_bytes == 0u);
         uint64_t b2 = 0;
         pulsar_segstore_seg c2[PULSAR_KVCHAIN_MAX];
-        TEST_ASSERT(pulsar_kvchain_find(st, req.data(), req.size(), NULL, 0, 0, c2, PULSAR_KVCHAIN_MAX, &b2, err,
+        TEST_ASSERT(pulsar_kvchain_find(st, req.data(), TextBytes{req.size()}, NULL, 0, TokCount{0}, c2,
+                                        PULSAR_KVCHAIN_MAX, &b2, err,
                                         sizeof err) == 2);
     }
     /* a missing restore point file: the same (unreadable is a content fault) */
@@ -16099,7 +16369,7 @@ static void test_l347_i3b_failure_rules(void) {
     /* a flipped byte in a segment's rows (the digest): it and the chain below it go, the stretch above stays */
     TEST_ASSERT(l323_put_rp(st, chain[5].key, 21000) && find() == 6);
     {
-        TEST_ASSERT(l347_i3b_flip(dir, chain[3].key, ".seg", (long)(160 + chain[3].text_len + 64)));
+        TEST_ASSERT(l347_i3b_flip(dir, chain[3].key, ".seg", (long)(160 + chain[3].text_len.raw() + 64)));
         l330_bank b;
         int nx = 0;
         TEST_ASSERT(pulsar_kvchain_load_slice_with(st, chain, n, &nx, n, l330_loader, &b, err, sizeof err) == 1);
@@ -16147,7 +16417,7 @@ static void test_l347_i3b_failure_rules(void) {
             hit->n = n;
             memcpy(hit->chain, chain, sizeof(pulsar_segstore_seg) * (size_t)n);
             kv_restore r;
-            s.kv_restore_begin(&r, hit, 0, false, true);
+            s.kv_restore_begin(&r, hit, TokPos{0}, false, true);
             for (int i = 0; i < n; i++) TEST_ASSERT(pulsar_segstore_is_pinned(st, chain[i].key));
             l347_ckpts ck;
             pulsar_kvchain_persist_result pr;
@@ -16185,11 +16455,13 @@ static void test_l347_i3b_failure_rules(void) {
     /* where a failed restore resumes: the bank's own while the restore wrote nothing into it (it checked the chain
      * first), else nothing of its own -- and another bank's adopt by the same rule as the pick */
     const int gain = PULSAR_SERVER_ADOPT_MIN_GAIN;
-    TEST_ASSERT(server_failed_restore_pick(3000, 0, true) == RESUME_OWN);
-    TEST_ASSERT(server_failed_restore_pick(3000, 3000 + gain, true) == RESUME_OWN);
-    TEST_ASSERT(server_failed_restore_pick(3000, 3001 + gain, true) == RESUME_ADOPT);
-    TEST_ASSERT(server_failed_restore_pick(3000, 3000, false) == RESUME_ADOPT);   /* the bank was written: lost */
-    TEST_ASSERT(server_failed_restore_pick(3000, gain, false) == RESUME_OWN);     /* ...and no adopt worth it: 0 */
+    TEST_ASSERT(server_failed_restore_pick(PromptToks{3000}, PromptToks{0}, true) == RESUME_OWN);
+    TEST_ASSERT(server_failed_restore_pick(PromptToks{3000}, PromptToks{3000 + gain}, true) == RESUME_OWN);
+    TEST_ASSERT(server_failed_restore_pick(PromptToks{3000}, PromptToks{3001 + gain}, true) == RESUME_ADOPT);
+    TEST_ASSERT(server_failed_restore_pick(PromptToks{3000}, PromptToks{3000},
+                                           false) == RESUME_ADOPT);   /* the bank was written: lost */
+    TEST_ASSERT(server_failed_restore_pick(PromptToks{3000}, PromptToks{gain},
+                                           false) == RESUME_OWN);     /* ...and no adopt worth it: 0 */
 }
 
 /* 2026-10-29 (gpuq #491): the per-chunk prefill re-check tries the guard's remedies before it refuses -- spill an
@@ -16506,6 +16778,81 @@ static_assert((TokPos{5} - TokPos{2}).raw() == 3 && (TokPos{5} + TokCount{-7}).r
                   TokPos::after(TokCount{9}).raw() == 9 && TokPos{9}.before().raw() == 9,
               "constexpr, and the arithmetic is int's");
 
+/* L334 P2b: the engine's other index spaces (pulsar_units.h StepRow / HeadRow / CompRow, TokPerRow) -- the
+ * compile-fail checks.  A step row, a headed row, a compressed row and a position never mix; a factor is no row; the
+ * crossings take their factor. */
+/** Can a T be passed where a U goes (by value, implicitly)? */
+template <class T, class U> concept l334_passes = requires(T t) { [](U) {}(t); };
+static_assert(!l333_adds<StepRow, TokCount> && !l333_adds<TokPos, StepRows> && !l333_adds<CompRow, TokCount> &&
+                  !l333_adds<TokPos, CompRows> && !l333_adds<StepRow, CompRows> && !l333_adds<HeadRow, StepRows> &&
+                  l333_adds<StepRow, StepRows> && l333_adds<CompRow, CompRows> && l333_adds<HeadRow, HeadRows>,
+              "each space moves by its own distance only: no batch row moves a position (f7e05077), no comp row (c9dd9499)");
+static_assert(!l334_passes<StepRow, TokPos> && !l334_passes<CompRow, TokPos> && !l334_passes<HeadRow, StepRow> &&
+                  !l334_passes<TokPerRow, CompRow> && !l334_passes<TokPerRow, StepRow> && !l334_passes<int, StepRow> &&
+                  !l334_passes<TokPos, CompRow> && !l334_passes<StepRows, TokCount>,
+              "no space passes for another, a ratio for a row, or an int for any of them");
+static_assert(!std::is_constructible_v<TokPos, StepRow> && !std::is_constructible_v<StepRow, TokPos> &&
+                  !std::is_constructible_v<CompRow, TokPos> && !std::is_constructible_v<HeadRow, StepRow> &&
+                  !std::is_constructible_v<CompRows, TokPerRow> && !std::is_constructible_v<TokPerRow, CompRows>,
+              "not even explicitly: a crossing is a named function that takes its factor (or the run's map)");
+static_assert(!l333_orders<StepRow, TokPos> && !l333_orders<CompRow, TokPos> && !l333_orders<HeadRow, StepRow> &&
+                  !l333_equates<StepRow, TokPos> && !l333_equates<CompRow, StepRow> && l333_orders<StepRow, StepRow>,
+              "rows order and equate within their own space only");
+static_assert(std::is_same_v<decltype(pulsar_comp_row_of(TokPos{}, TokPerRow{})), CompRow> &&
+                  std::is_same_v<decltype(pulsar_comp_row_pos(CompRow{}, TokPerRow{})), TokPos> &&
+                  std::is_same_v<decltype(pulsar_comp_rows_held(TokCount{}, TokPerRow{})), CompRows> &&
+                  std::is_same_v<decltype(pulsar_comp_rows_serve(CompRows{}, TokPerRow{})), TokCount> &&
+                  std::is_same_v<decltype(pulsar_step_run{}.pos_of(StepRow{})), TokPos> &&
+                  std::is_same_v<decltype(pulsar_step_run{}.row_of(TokPos{})), StepRow>,
+              "the crossings' types");
+
+/* L334 P3: a token id is an identity -- the compile-fail checks.  No arithmetic, no ordering, no position / count /
+ * row passes for it or it for them, and no int enters it implicitly (L251's eval(sess, 1, ..) count). */
+template <class A> concept l334_steps = requires(A a) { ++a; };
+static_assert(!l333_adds<TokId, TokCount> && !l333_adds<TokId, TokId> && !l333_adds<TokId, int> && !l334_steps<TokId> &&
+                  !l333_orders<TokId, TokId> && l333_equates<TokId, TokId> && !l333_equates<TokId, int> &&
+                  !l333_equates<TokId, TokPos>,
+              "an id equates with an id only, and moves nowhere");
+static_assert(!l334_passes<int, TokId> && !l334_passes<TokId, int> && !l334_passes<TokCount, TokId> &&
+                  !l334_passes<TokPos, TokId> && !l334_passes<TokId, TokPos> && !l334_passes<StepRow, TokId> &&
+                  !std::is_constructible_v<TokId, TokCount> && !std::is_constructible_v<TokPos, TokId> &&
+                  std::is_constructible_v<TokId, int>,
+              "an int enters an id by name only; a count, a position or a row never does");
+static_assert(TokId::none().raw() == -1 && TokId{-1}.is_none() && !TokId{0}.is_none() && TokId{0}.is_token() &&
+                  !TokId::none().is_token() && TokId{7}.below(8u) && !TokId{8}.below(8u) && !TokId::none().below(8u) &&
+                  TokId{3} == TokId{3} && TokId{3} != TokId{4},
+              "none(), the token test and an authority's bound");
+
+/* L334 P4: a bank id is its own identity -- no token id, step row, layer, count or int passes for it. */
+static_assert(!l334_passes<int, BankId> && !l334_passes<uint32_t, BankId> && !l334_passes<BankId, uint32_t> &&
+                  !l334_passes<TokId, BankId> && !l334_passes<BankId, TokId> && !l334_passes<StepRow, BankId> &&
+                  !l333_equates<BankId, TokId> && !l333_orders<BankId, BankId> && !l333_adds<BankId, int> &&
+                  !std::is_constructible_v<BankId, TokId> && std::is_constructible_v<BankId, uint32_t> &&
+                  BankId::none().is_none() && BankId{3}.below(16u) && !BankId{16}.below(16u),
+              "a bank equates with a bank only; a layer index or a step row is never one (fae579f0)");
+
+/* L334 P2b: the crossings compute what the open-coded expressions did (pos / ratio, row * ratio, len / ratio,
+ * ceil(len / ratio), rows * ratio + ratio - 1, pos0 + (row - first) and its inverse), over a grid of values. */
+static void test_l334_p2b_crossings(void) {
+    for (uint32_t r : {1u, 2u, 4u, 128u}) {
+        const TokPerRow R{r};
+        for (int v : {0, 1, 3, 4, 127, 128, 129, 1000, 65537}) {
+            TEST_ASSERT(pulsar_comp_row_of(TokPos{v}, R).raw() == (int)((uint32_t)v / r));
+            TEST_ASSERT(pulsar_comp_row_pos(CompRow{v}, R).raw() == (int)((uint32_t)v * r));
+            TEST_ASSERT(pulsar_comp_rows_held(TokCount{v}, R).raw() == (int)((uint32_t)v / r));
+            TEST_ASSERT(pulsar_comp_rows_cover(TokCount{v}, R).raw() == (int)(((uint32_t)v + r - 1u) / r));
+            TEST_ASSERT(pulsar_comp_rows_serve(CompRows{v}, R).raw() == (int)((uint32_t)v * r + r - 1u));
+            /* a served length holds exactly `v` rows, and one more token completes the next */
+            TEST_ASSERT(pulsar_comp_rows_held(pulsar_comp_rows_serve(CompRows{v}, R), R).raw() == v);
+        }
+    }
+    const pulsar_step_run run = {StepRow{3}, TokPos{100}, StepRows{5}};
+    for (int k = 0; k < 5; k++) {
+        TEST_ASSERT(run.pos_of(StepRow{3 + k}).raw() == 100 + k);
+        TEST_ASSERT(run.row_of(TokPos{100 + k}).raw() == 3 + k);
+    }
+}
+
 /* L334 P2a: the pair is the int it replaced -- every operator against int, negatives included (none() excepted: it is
  * the one value the operators refuse, as operand or result), and the crossing to the origin is the identity on the raw
  * value. */
@@ -16596,7 +16943,7 @@ static void test_l334_none_fails_closed(void) {
  * continuation's resume is its kept prefix -- one currency with the tokens it serves; a prefix past the live history
  * fails closed. */
 static void test_l334_server_positions(void) {
-    TEST_ASSERT(pulsar_session_bank_pos(NULL, 0).is_none() && server_bank_pos(NULL, 0) == TokPos{0});
+    TEST_ASSERT(pulsar_session_bank_pos(NULL, BankId{0}).is_none() && server_bank_pos(NULL, BankId{0}) == TokPos{0});
     TEST_ASSERT(server_live_continuation_start(TokCount{0}, TokPos{0}) == TokPos{0});
     TEST_ASSERT(server_live_continuation_start(TokCount{389}, TokPos{390}) == TokPos{389});   /* a dropped stop */
     TEST_ASSERT(server_live_continuation_start(TokCount{390}, TokPos{390}) == TokPos{390});
@@ -16717,7 +17064,8 @@ static void test_l353_image_keys(void) {
     char err[256] = "", kx[41], ky[41], kt[41], cx[41], cy[41];
     auto put = [&](const char *parent, uint32_t a, uint32_t b, const char *t, const uint64_t *h, uint32_t n, char *out) {
         pulsar_segstore_job *job = NULL;
-        const int rc = pulsar_segstore_reserve_images(st, parent, a, b, t, strlen(t), h, n, 16, 0, out, &job, err, sizeof err);
+        const int rc = pulsar_segstore_reserve_images(st, parent, TokPos{a}, TokPos{b}, t, TextBytes{strlen(t)}, h, n,
+                                                      16, 0, out, &job, err, sizeof err);
         if (rc > 0) TEST_ASSERT(pulsar_segstore_commit(st, job, pulsar_segstore_job_write(job, err, sizeof err)));
         return rc;
     };
@@ -16727,18 +17075,19 @@ static void test_l353_image_keys(void) {
     TEST_ASSERT(put("", 0, 128, root, NULL, 0, kt) > 0);    /* the same bytes with no image is its own entry too */
     TEST_ASSERT(strcmp(kt, kx) != 0 && strcmp(kt, ky) != 0);
     char plain[41];
-    pulsar_segstore_child_key("", root, strlen(root), plain);
+    pulsar_segstore_child_key("", root, TextBytes{strlen(root)}, plain);
     TEST_ASSERT(strcmp(plain, kt) == 0);                    /* a text span's key is what it always was */
     TEST_ASSERT(put(kx, 128, 256, tail, NULL, 0, cx) > 0);
     TEST_ASSERT(put(ky, 128, 256, tail, NULL, 0, cy) > 0);
     TEST_ASSERT(put("", 0, 128, root, &X, 1, kx) == 0);     /* the same image again is the same segment */
     pulsar_segstore_seg c[4];
     const size_t L = strlen(both);
-    TEST_ASSERT(pulsar_segstore_lookup_images(st, both, L, NULL, &X, 1, c, 4) == 2 && !strcmp(c[1].key, cx));
-    TEST_ASSERT(pulsar_segstore_lookup_images(st, both, L, NULL, &Y, 1, c, 4) == 2 && !strcmp(c[1].key, cy));
+    TEST_ASSERT(pulsar_segstore_lookup_images(st, both, TextBytes{L}, NULL, &X, 1, c, 4) == 2 && !strcmp(c[1].key, cx));
+    TEST_ASSERT(pulsar_segstore_lookup_images(st, both, TextBytes{L}, NULL, &Y, 1, c, 4) == 2 && !strcmp(c[1].key, cy));
     const uint64_t Z = 0x3333u;
-    TEST_ASSERT(pulsar_segstore_lookup_images(st, both, L, NULL, &Z, 1, c, 4) == 1 && !strcmp(c[0].key, kt));   /* text only */
-    TEST_ASSERT(pulsar_segstore_lookup(st, both, L, NULL, c, 4) == 1 && !strcmp(c[0].key, kt));
+    TEST_ASSERT(pulsar_segstore_lookup_images(st, both, TextBytes{L}, NULL, &Z, 1, c, 4) == 1 &&
+                !strcmp(c[0].key, kt));   /* text only */
+    TEST_ASSERT(pulsar_segstore_lookup(st, both, TextBytes{L}, NULL, c, 4) == 1 && !strcmp(c[0].key, kt));
     pulsar_segstore_close(st);
     char cmd[128];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
@@ -16749,7 +17098,10 @@ static void test_l353_image_keys(void) {
 static const char *const l334_vocab[] = {"<ctl>", "X", "a", "b", "c", "d", "ab", "abc", "bc", "cd", "bcd", "Y", "Z"};
 enum { L334_CTL, L334_X, L334_A, L334_B, L334_C, L334_D, L334_AB, L334_ABC, L334_BC, L334_CD, L334_BCD, L334_Y,
        L334_Z };
-static char *l334_text(void *, int token, size_t *len) {
+/** A toy vocabulary entry as the id it is.  @param i the entry  @return its id */
+static TokId l334_id(int i) { return TokId{i}; }
+static char *l334_text(void *, TokId id, size_t *len) {
+    const int token = id.raw();   /* the toy vocabulary's index */
     const char *t = token == L334_CTL ? "" : l334_vocab[token];
     *len = strlen(t);
     return server_xstrdup(t);
@@ -16761,8 +17113,8 @@ static char *l334_text(void *, int token, size_t *len) {
 static void test_l334_prompt_held_across_a_seam(void) {
     /* live X|a|b|cd|Y (bytes 1,2,3,5,6), the request X|abc|d|Y|Z (bytes 1,4,5,6,7): the bytes agree through Y, the
      * ids only on X -- a re-spelled stretch "abcd" that costs 3 live tokens and 2 prompt ones */
-    const int live[] = {L334_X, L334_A, L334_B, L334_CD, L334_Y};
-    const int prompt[] = {L334_X, L334_ABC, L334_D, L334_Y, L334_Z};
+    const TokId live[] = {l334_id(L334_X), l334_id(L334_A), l334_id(L334_B), l334_id(L334_CD), l334_id(L334_Y)};
+    const TokId prompt[] = {l334_id(L334_X), l334_id(L334_ABC), l334_id(L334_D), l334_id(L334_Y), l334_id(L334_Z)};
     pulsar_prefix_match m;
     pulsar_tokens_prefix_match_with(l334_text, NULL, live, 5, prompt, 5, &m);
     TEST_ASSERT(m.seamed && m.live_cut == TokCount{5} && m.prompt_cut == PromptToks{4});
@@ -16785,21 +17137,22 @@ static void test_l334_prompt_held_across_a_seam(void) {
     }
     /* a stretch whose request tokens end before G's byte: live X|abc|d (bytes 1,4,5), the request X|a|b|cd (1,2,3,5);
      * at live 2 (byte 4) the request's X a b lie wholly inside it, "cd" does not (no shared boundary below but X) */
-    const int live2[] = {L334_X, L334_ABC, L334_D};
-    const int prompt2[] = {L334_X, L334_A, L334_B, L334_CD};
+    const TokId live2[] = {l334_id(L334_X), l334_id(L334_ABC), l334_id(L334_D)};
+    const TokId prompt2[] = {l334_id(L334_X), l334_id(L334_A), l334_id(L334_B), l334_id(L334_CD)};
     TEST_ASSERT(pulsar_tokens_prompt_held_with(l334_text, NULL, live2, TokPos{2}, prompt2, 4) == PromptToks{3});
     TEST_ASSERT(pulsar_tokens_prompt_held_with(l334_text, NULL, live2, TokPos{3}, prompt2, 4) == PromptToks{4});
     /* no seam: the identity */
     TEST_ASSERT(pulsar_tokens_prompt_held_with(l334_text, NULL, prompt, TokPos{3}, prompt, 5) == PromptToks{3});
     /* a control token is matched by id only, never by bytes: live X|a|bc (bytes 1,2,4) holds the request's X and
      * "ab", and the count stops at the request's control token whatever bytes follow */
-    const int live3[] = {L334_X, L334_A, L334_BC, L334_Y};
-    const int prompt3[] = {L334_X, L334_AB, L334_CTL, L334_Y};
+    const TokId live3[] = {l334_id(L334_X), l334_id(L334_A), l334_id(L334_BC), l334_id(L334_Y)};
+    const TokId prompt3[] = {l334_id(L334_X), l334_id(L334_AB), l334_id(L334_CTL), l334_id(L334_Y)};
     TEST_ASSERT(pulsar_tokens_prompt_held_with(l334_text, NULL, live3, TokPos{3}, prompt3, 4) == PromptToks{2});
 }
 
 static void pulsar_server_unit_tests_run(void) {
     test_l333_kv_units();
+    test_l334_p2b_crossings();
     test_l334_seam_currencies();
     test_l334_positions_are_ints();
     test_l334_none_fails_closed();
@@ -16964,6 +17317,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l309_draft_prefix();
     test_l303_protocol_fields();
     test_qwen_payload_is_sampled_structure_greedy();
+    test_tool_param_type_reads_unions_and_refs();
     test_qwen_tool_error_suffix_reminds_the_system_turn();
     test_inkling_effort_map();
     test_inkling_hooks_compose_to_the_full_render();
@@ -17045,6 +17399,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l338_segstore_reserve_commit();
     test_l338_kv_writer_lifecycle();
     test_l280_kv_identity_rope();
+    test_l386_kv_identity_arithmetic();
     test_l323_kvchain_segment_ends();
     test_l323_grid_cut_dedupes_copies();
     test_l323_tail_supersession();

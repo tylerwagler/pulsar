@@ -183,13 +183,13 @@ static void verify_row(const float *src, const uint8_t *gr, const float *gdec, l
 /* Pack ROWS rows on the GPU (src -> writeback x) and verify every row; 1 on failure. */
 static int run_leg(const char *name, const float *src) {
     const uint64_t rowb = PULSAR_ATTN_PACK_ROWBYTES(HD);
-    pulsar_gpu_tensor *x = pulsar_gpu_tensor_alloc((uint64_t)ROWS * HD * sizeof(float));
-    pulsar_gpu_tensor *packed = pulsar_gpu_tensor_alloc((uint64_t)ROWS * rowb);
+    pulsar_gpu_tensor *x = pulsar_gpu_tensor_alloc(bytes_of<float>((uint64_t)ROWS * HD));
+    pulsar_gpu_tensor *packed = pulsar_gpu_tensor_alloc(TensorBytes{(uint64_t)ROWS * rowb});
     /* src = x and x = the writeback target: the kernel quantises the f32 rows
      * and leaves the DECODED values behind, which is what makes the device
      * decode checkable from the host. */
     if (!x || !packed ||
-        !pulsar_gpu_tensor_write(x, 0, src, (uint64_t)ROWS * HD * sizeof(float)) ||
+        !pulsar_gpu_tensor_write(x, TensorBytes{0}, src, bytes_of<float>((uint64_t)ROWS * HD)) ||
         !pulsar_gpu_attn_pack_store_tensor(x, x, packed, 0, ROWS, HD) ||
         !pulsar_gpu_synchronize()) {
         fprintf(stderr, "attn-pack-gate: %s: GPU pack FAILED to run\n", name);
@@ -197,8 +197,8 @@ static int run_leg(const char *name, const float *src) {
     }
     uint8_t *gpu_rows = (uint8_t *)malloc((size_t)ROWS * rowb);
     float *gpu_dec = (float *)malloc((size_t)ROWS * HD * sizeof(float));
-    if (!pulsar_gpu_tensor_read(packed, 0, gpu_rows, (uint64_t)ROWS * rowb) ||
-        !pulsar_gpu_tensor_read(x, 0, gpu_dec, (uint64_t)ROWS * HD * sizeof(float))) {
+    if (!pulsar_gpu_tensor_read(packed, TensorBytes{0}, gpu_rows, TensorBytes{(uint64_t)ROWS * rowb}) ||
+        !pulsar_gpu_tensor_read(x, TensorBytes{0}, gpu_dec, bytes_of<float>((uint64_t)ROWS * HD))) {
         fprintf(stderr, "attn-pack-gate: %s: readback FAILED\n", name);
         return 1;
     }

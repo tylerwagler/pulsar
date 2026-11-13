@@ -502,7 +502,7 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
                   "rank 0 mirrored sync send failed");
             CHECK(pulsar_tp_wait_command_ack(tp, sid, "sync", cerr, sizeof(cerr)),
                   "rank 0 mirrored sync ack over %d peers: %s", n - 1, cerr);
-            CHECK(pulsar_tp_send_eval(tp, sid, seq, eval_token),
+            CHECK(pulsar_tp_send_eval(tp, sid, seq, TokId{eval_token}),
                   "rank 0 mirrored eval send failed");
             CHECK(pulsar_tp_wait_command_ack(tp, sid, "eval", cerr, sizeof(cerr)),
                   "rank 0 mirrored eval ack over %d peers: %s", n - 1, cerr);
@@ -568,7 +568,7 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         char cerr[256];
         cerr[0] = 0;
         if (rank == 0) {
-            CHECK(pulsar_tp_send_rewind(tp, void_sid, rewind_pos),
+            CHECK(pulsar_tp_send_rewind(tp, void_sid, TokPos{rewind_pos}),
                   "rank 0 mirrored rewind send failed");
             CHECK(pulsar_tp_send_invalidate(tp, void_sid),
                   "rank 0 mirrored invalidate send failed");
@@ -741,13 +741,13 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         cerr[0] = 0;
         int status = -99;
         if (rank == 0) {
-            CHECK(pulsar_tp_send_bank_state_save(tp, sid, 2u) != 0, "rank 0 bank save send failed");
-            CHECK(pulsar_tp_send_bank_state_restore(tp, sid, 2u) != 0, "rank 0 bank restore send failed");
+            CHECK(pulsar_tp_send_bank_state_save(tp, sid, BankId{2u}) != 0, "rank 0 bank save send failed");
+            CHECK(pulsar_tp_send_bank_state_restore(tp, sid, BankId{2u}) != 0, "rank 0 bank restore send failed");
             CHECK(pulsar_tp_wait_command_status(tp, sid, "bank state restore", &status, cerr, sizeof(cerr)) &&
                   status == 0,
                   "rank 0 restore verdict: want agreed 0, got rc/status %d (%s)", status, cerr);
             /* split verdict (n>=3 only: with one worker there is nobody to disagree) */
-            CHECK(pulsar_tp_send_bank_repoint(tp, sid, 1u) != 0, "rank 0 repoint send failed");
+            CHECK(pulsar_tp_send_bank_repoint(tp, sid, BankId{1u}) != 0, "rank 0 repoint send failed");
             status = -99;
             cerr[0] = 0;
             const int rc = pulsar_tp_wait_command_status(tp, sid, "bank repoint", &status, cerr, sizeof(cerr));
@@ -759,7 +759,7 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
                 CHECK(rc == 1 && status == 0, "rank 0: n=2 repoint verdict 0, got rc=%d status=%d (%s)", rc, status, cerr);
             }
             /* a negative status is a refusal */
-            CHECK(pulsar_tp_send_bank_repoint(tp, sid, 9u) != 0, "rank 0 repoint(9) send failed");
+            CHECK(pulsar_tp_send_bank_repoint(tp, sid, BankId{9u}) != 0, "rank 0 repoint(9) send failed");
             status = -99;
             cerr[0] = 0;
             CHECK(!pulsar_tp_wait_command_status(tp, sid, "bank repoint", &status, cerr, sizeof(cerr)) &&
@@ -916,7 +916,7 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         cerr[0] = 0;
         if (rank == 0) {
             int status = -99;
-            CHECK(pulsar_tp_send_bank_free_physical(tp, sid, 5u) != 0, "rank 0 free-physical send failed");
+            CHECK(pulsar_tp_send_bank_free_physical(tp, sid, BankId{5u}) != 0, "rank 0 free-physical send failed");
             CHECK(pulsar_tp_wait_command_status(tp, sid, "bank free physical", &status, cerr, sizeof(cerr)) && status == 0,
                   "rank 0 free-physical verdict: want 0, got %d (%s)", status, cerr);
         } else {

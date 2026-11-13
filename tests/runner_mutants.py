@@ -31,12 +31,12 @@ MUTANTS = {
     "chunk-resume": (
         "src/engine/sync_driver.cpp",
         "--only=cuda-chunk-neutrality-gate",
-        "    const int rc = ops->prefill(s, prompt, start);\n",
+        "    const int rc = ops->prefill(s, prompt, pulsar_ckpt_pos(start));\n",
         "    /* L317 MUTANT: a resume prefills its first token as another id */\n"
-        "    const int l317_t = start > 0u && (int)start < prompt->len ? prompt->v[start] : -1;\n"
-        "    if (l317_t >= 0) prompt->v[start] = l317_t == 1000 ? 1001 : 1000;\n"
-        "    const int rc = ops->prefill(s, prompt, start);\n"
-        "    if (l317_t >= 0) prompt->v[start] = l317_t;\n"),
+        "    const int l317_t = start > 0u && (int)start < prompt->len ? prompt->v[start].raw() : -1;\n"
+        "    if (l317_t >= 0) prompt->v[start] = TokId{l317_t == 1000 ? 1001 : 1000};\n"
+        "    const int rc = ops->prefill(s, prompt, pulsar_ckpt_pos(start));\n"
+        "    if (l317_t >= 0) prompt->v[start] = TokId{l317_t};\n"),
     "row-sort": (
         "src/cuda/pulsar_cuda_attention.cu",
         "--only=cuda-row-neutrality-gate,cuda-row-neutrality-gate-deep,cuda-row-neutrality-gate-deeper",
@@ -52,14 +52,16 @@ MUTANTS = {
     "adopt-rows": (
         "src/engine/checkpoint.cpp",
         "--only=bank-adopt-gate",
-        "        ok = pulsar_gpu_tensor_copy_async(dp[i].rows, 0, sp[i].rows, 0, rows * sp[i].row_bytes) != 0;\n",
-        "        ok = pulsar_gpu_tensor_copy_async(dp[i].rows, 0, sp[i].rows, 0,   /* L317 MUTANT: one row too few */\n"
-        "                                          (rows - 1u) * sp[i].row_bytes) != 0;\n"),
+        "        ok = pulsar_gpu_tensor_copy_async(dp[i].rows, TensorBytes{0}, sp[i].rows, TensorBytes{0},\n"
+        "                                          TensorBytes{sp[i].row_bytes}.times(rows)) != 0;\n",
+        "        ok = pulsar_gpu_tensor_copy_async(dp[i].rows, TensorBytes{0}, sp[i].rows, TensorBytes{0},\n"
+        "                                          /* L317 MUTANT: one row too few */\n"
+        "                                          TensorBytes{sp[i].row_bytes}.times(rows - 1u)) != 0;\n"),
     "spec-emit": (
         "src/engine/session_spec.cpp",
         "--only=block-spec-gate",
-        "        accepted[n_accept++] = (int)pend[i];\n",
-        "        accepted[n_accept++] = i == 1 ? (int)pend[0] : (int)pend[i];   /* L317 MUTANT: the first draft twice */\n"),
+        "        accepted[n_accept++] = pend[i];\n",
+        "        accepted[n_accept++] = i == 1 ? pend[0] : pend[i];   /* L317 MUTANT: the first draft twice */\n"),
 }
 
 

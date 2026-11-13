@@ -23,8 +23,9 @@
 /* The JSON scanner is shared with the engine's safetensors reader, so it lives
  * in src/lib and is declared there. */
 #include "pulsar_json.h"
-/* L251: the Qwen family's chat renderer, effort authority and output parser. */
-#include "qwen_chat.h"
+/* the output-parser kit every family's server table drives (L295 F8 Q4: no family's chat header here) */
+#include "out_parse_kit.h"
+#include "pyjson.h"
 #include "sched_value.h"
 
 #include <new>
@@ -184,8 +185,8 @@
  * one (a write costs the new tokens, never the history), at prompt end, on
  * progress (one prefill chunk at a time), at the system-prefix cut, on evict and on a Tier-2 spill -- always
  * from checkpoints the live bank already holds; the session is never rolled
- * back to build an entry.  The store is keyed by pulsar_segstore_identity
- * (model + routed-expert format), evicts least-recently-used LEAVES first, and
+ * back to build an entry.  The store is keyed by pulsar_engine_kv_identity
+ * (model, routed-expert format, rope + L386 the device's arithmetic), evicts least-recently-used LEAVES first, and
  * (L347 I3a) writes behind with O_DIRECT from a pinned host pool -- on a
  * discrete-GPU host also the RAM tier the restores read first.
  *
@@ -752,12 +753,33 @@ const server_family_ops *server_family_for_engine(const pulsar_engine *e);
 /// @param s the server
 /// @return the family table
 const server_family_ops *server_tool_family(const server *s);
-/** A family table in its own file (chat_family.cpp's switch names it): Inkling's (family_inkling.cpp). */
-extern const server_family_ops k_family_inkling;
-/** Nemotron-H's (family_nemotron_h.cpp). */
-extern const server_family_ops k_family_nemotron_h;
-/// Gemma 4's table (family_gemma4.cpp, L338).
-extern const server_family_ops k_family_gemma4;
+/* L295 F8 step 5: a family's server table registers itself, by its file (src/families/<name>/<name>_server.cpp, or
+ * chat_family.cpp for DeepSeek's and Qwen's): one SERVER_FAMILY(table) -- a static record linked by a constructor, the
+ * output-parser kit's pattern (no allocation, no destructor: rule 11).  server_family_for_format finds it by its
+ * `format`; nothing else names a table. */
+/** One registered server table. */
+struct server_family_reg {
+    const server_family_ops *ops;   ///< the table (static storage)
+    server_family_reg *next;        ///< the registry's list
+};
+/** Link a table into the registry (SERVER_FAMILY's constructor calls it). */
+/// @param r the record (static storage)
+void server_family_register(server_family_reg *r);
+/// Token pasting for SERVER_FAMILY's unique names.
+#define SERVER_FAMILY_CAT_(a, b) a##b
+/// Expands SERVER_FAMILY_CAT_ after its arguments.
+#define SERVER_FAMILY_CAT(a, b) SERVER_FAMILY_CAT_(a, b)
+/** Register `table` (a server_family_ops) for its `.format`.  Unique names per use (__COUNTER__): the unit-test
+ *  programs compile every server file into one translation unit. */
+#define SERVER_FAMILY(table) SERVER_FAMILY_REC_(table, __COUNTER__)
+/// The record and its constructor.
+#define SERVER_FAMILY_REC_(table, n)                                                                              \
+    namespace {                                                                                                   \
+    server_family_reg SERVER_FAMILY_CAT(server_family_reg_, n) = {&(table), nullptr};                             \
+    __attribute__((constructor)) void SERVER_FAMILY_CAT(server_family_register_, n)(void) {                       \
+        server_family_register(&SERVER_FAMILY_CAT(server_family_reg_, n));                                        \
+    }                                                                                                             \
+    }
 /** The effort names, in the order of server_effort_map::named's columns (chat_family.cpp). */
 extern const char *const k_effort_names[CHAT_EFFORT_NAMES];
 /* What every family's render shares (chat_family.cpp), for a table in its own file: */
@@ -966,9 +988,9 @@ kv_pick kv_pick_of_source(const char *cache_source, bool spill_restored);
  *  whatever changes the bank's conversation drops it. */
 /// @param pick             the state the request's sync starts from
 /// @param at               where it starts computing (kv_req_line::at)
-/// @param bank_prompt_end  the bank's prompt-end record (pulsar_session_bank_prompt_end), 0 = none
+/// @param bank_prompt_end  the bank's prompt-end record (pulsar_session_bank_prompt_end), none() = none
 /// @return true when the request's syncs waive the cut
-bool server_endpoint_waive(kv_pick pick, int at, int bank_prompt_end);
+bool server_endpoint_waive(kv_pick pick, TokPos at, TokPos bank_prompt_end);
 /** L380: the reply a finished turn left on its bank, as the turn's end found it (server::slot_turn_reply): the rows
  *  a terminal checkpoint of the turn syncs.  Positions on the bank's history (the live side).  The next job bound to
  *  the slot takes it (server::gen_begin) and reads its own prompt against it (server_reply_use). */
@@ -1089,7 +1111,7 @@ typedef struct {
 #define KV_REQ_LINE_MAX 1024
 /** FNV-1a 64 over the first `n` token ids (each as 4 little-endian bytes): the ONE hash of the `kv req:` line's
  *  pre, conv and evict_conv.  @param v the tokens  @param n how many (<= 0: the empty hash)  @return the hash */
-uint64_t server_kv_token_hash(const int *v, int n);
+uint64_t server_kv_token_hash(const TokId *v, int n);
 /** @param prompt the prompt's tokens (NULL: -1)
  *  @param m the template's turn markers
  *  @return the position of the first user marker with no assistant marker before it -- the end of the shared
@@ -1487,9 +1509,9 @@ void slot_writer_install(slot_writer *w);  ///< thread-local; NULL uninstalls
  * the prefill log line and the L114 counter (server_jobs.cpp). */
 /// @param ud       the slot's gen_state
 /// @param event    the engine's progress event ("prefill_chunk", ...)
-/// @param current  tokens prefilled so far
+/// @param current  the position the prefill stands at (live-side)
 /// @param total    tokens the sync prefills to
-void gen_prefill_progress_cb(void *ud, const char *event, int current, int total);
+void gen_prefill_progress_cb(void *ud, const char *event, TokPos current, TokCount total);
 /// @param w  the writer
 /// @return false once the writer has failed (a socket error, a stall, an overflow)
 bool slot_writer_flush(slot_writer *w);  ///< non-blocking best effort
@@ -1694,19 +1716,20 @@ extern const char *const resume_pick_names[RESUME_PICKS];
 /** The depth the memory tiers serve: `adopt` (the deepest published checkpoint another bank holds for the prompt, 0
  *  for none) when it starts the sync more than PULSAR_SERVER_ADOPT_MIN_GAIN tokens deeper than `own`, else `own`.
  *  The disk chain is priced past this depth. */
-/// @param own    the depth the bank's own state serves, tokens
+/// @param own    the depth the bank's own state serves, the request's tokens (L334 P7: prompt-side, .served)
 /// @param adopt  the deepest checkpoint another bank publishes for the prompt, tokens (0 = none)
-/// @return the depth, tokens
-int server_resume_memory_depth(int own, int adopt);
+/// @return the depth, the request's tokens
+PromptToks server_resume_memory_depth(PromptToks own, PromptToks adopt);
 /** The decision, pure: the disk chain to `disk` (0: none) wins when it is deeper than server_resume_memory_depth and
  *  its L310 verdict, priced on the tokens it adds past that depth, is not RECOMPUTE; else the adopt when it counts;
  *  else the bank's own state. */
-/// @param own           the depth the bank's own state serves, tokens
-/// @param adopt         the deepest adoptable checkpoint, tokens (0 = none)
-/// @param disk          the disk chain's end, tokens (0 = none)
+/// @param own           the depth the bank's own state serves, the request's tokens (L334 P7: prompt-side)
+/// @param adopt         the deepest adoptable checkpoint, the request's tokens (0 = none)
+/// @param disk          the disk chain's end as the request's tokens (0 = none) -- a chain's end is a live-side
+///                      position; its caller crosses it, marked (L334 P7: P1's reported mix-up)
 /// @param disk_verdict  the chain's restore verdict
 /// @return the pick
-resume_pick server_resume_pick(int own, int adopt, int disk, kv_restore_verdict disk_verdict);
+resume_pick server_resume_pick(PromptToks own, PromptToks adopt, PromptToks disk, kv_restore_verdict disk_verdict);
 /** L347 I3b (plans/124 D7): where a request whose disk restore failed resumes -- the pick without the disk: the bank's
  *  own depth while the restore wrote nothing into it (`bank_kept`: it checked the chain first), else nothing of its
  *  own; or another bank's adopt by the same rule (server_resume_memory_depth).  Never RESUME_DISK.  Pure.
@@ -1714,7 +1737,7 @@ resume_pick server_resume_pick(int own, int adopt, int disk, kv_restore_verdict 
  *  @param adopt     what the best other bank serves now
  *  @param bank_kept the restore never wrote the bank
  *  @return RESUME_OWN or RESUME_ADOPT */
-resume_pick server_failed_restore_pick(int own, int adopt, bool bank_kept);
+resume_pick server_failed_restore_pick(PromptToks own, PromptToks adopt, bool bank_kept);
 
 /** L329 (a): the shared-prefix wait (after TensorFold #1321).  Requests that arrive together on a NEW shared prefix
  *  (Claude Code's subagent fan-out: a dozen requests within seconds over one ~20-25k-token preamble) all bound at
@@ -1984,13 +2007,13 @@ typedef struct {
     bool valid;  ///< the binding below is populated
     /** Token frontier of a live assistant tool-call turn. Continuing from this
      * point preserves hidden thinking and sampled DSML bytes that are not
-     * necessarily present in the client-visible replay. */
-    int live_tokens;
+     * necessarily present in the client-visible replay.  (L334 P7: the live tokens up to it, TokCount) */
+    TokCount live_tokens;
     /** Optional rendered conversation text that the client is expected to replay.
      * Responses uses this because visible replay can omit hidden reasoning.
      * Anthropic currently uses only the call-id side of the state. */
     char *visible_text;
-    size_t visible_len;   ///< length of visible_text in bytes
+    TextBytes visible_len;   ///< length of visible_text in bytes
     /** Tool-call ids generated at the same live frontier. A following tool
      * result for these ids is a direct protocol continuation and should not
      * trigger prompt-prefix matching or checkpoint canonicalization. */
@@ -2009,10 +2032,10 @@ typedef struct {
     /** Token frontier of the live sampled session.  The visible text below is
      * what clients will replay, but the payload at this frontier may also
      * contain hidden thinking tokens that are intentionally absent from that
-     * visible replay. */
-    int live_tokens;
-    char *visible_text;   ///< the replayable text at that frontier, owned
-    size_t visible_len;   ///< its length in bytes
+     * visible replay.  (L334 P7: the live tokens up to it, TokCount) */
+    TokCount live_tokens;
+    char *visible_text;      ///< the replayable text at that frontier, owned
+    TextBytes visible_len;   ///< its length in bytes
 } visible_live_state;
 
 /* ---- Session pool (multi-session serving, increment 1) ----
@@ -2210,18 +2233,18 @@ typedef struct {
  *  plus the guard's floor (PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES, the one reserve).
  *  @param working_set_bytes the working set: PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES at sizing
  *  @return the margin, bytes */
-static inline uint64_t server_discrete_margin_bytes(uint64_t working_set_bytes) {
-    return working_set_bytes + PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES;
+static inline KvBytes server_discrete_margin_bytes(KvBytes working_set_bytes) {
+    return working_set_bytes + KvBytes{PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES};
 }
 /** L347 I4: the working set the warmup measured on a discrete card (0 when the readings say none).
  *  @param free_before_create the device's free memory just before the session's create
  *  @param free_after_warmup  its free memory after the warmup
  *  @param session_resident   what of the session is resident then (its price less untouched demand-paged VA)
  *  @return bytes */
-static inline uint64_t server_discrete_working_set_bytes(uint64_t free_before_create, uint64_t free_after_warmup,
-                                                         uint64_t session_resident) {
-    const uint64_t taken = free_before_create > free_after_warmup ? free_before_create - free_after_warmup : 0;
-    return taken > session_resident ? taken - session_resident : 0;
+static inline KvBytes server_discrete_working_set_bytes(KvBytes free_before_create, KvBytes free_after_warmup,
+                                                        KvBytes session_resident) {
+    const KvBytes taken = free_before_create > free_after_warmup ? free_before_create - free_after_warmup : KvBytes{};
+    return taken > session_resident ? taken - session_resident : KvBytes{};
 }
 /// The box's usable memory for the static admission formula, bytes (an upper bound after warm-up).
 #define PULSAR_SERVER_USABLE_BYTES          (121ull * 1024ull * 1024ull * 1024ull)
@@ -2301,13 +2324,19 @@ typedef struct gen_state gen_state;
  */
 typedef struct session_slot {
     bool         provisioned;  ///< false until admitted; cleared on eviction (the slot is a reusable hole). Every reader that used to skip sess == NULL skips this.
-    uint32_t     bank;  ///< Tier-2: this slot's bank id in the shared pool (slot i -> bank i). 0 in classic (non-pooled) mode.
+    /** Tier-2: this slot's bank id in the shared pool (slot i -> bank i). 0 in classic (non-pooled) mode.  L334 P4:
+     *  typed; a bank finds its slot through server::slot_of_bank. */
+    BankId       bank;
     TokPos       committed_pos;  ///< Tier-2: this bank's committed KV frontier length (== pulsar_session_pos when this bank is the live one). Kept current at every op boundary so routing/metrics can read a non-live bank's position without a bank swap.
     struct job  *active_job;  ///< request bound to this slot, or NULL
     gen_state   *gen;  ///< resumable state for active_job
     slot_state   state;  ///< lifecycle state; SLOT_EVICTED marks a reusable hole
     int          ctx_size;  ///< context this slot was admitted for
-    uint64_t     est_cost_bytes;  ///< ledger-committed session cost (ACTUAL resident bytes once the session exists; the true-cost estimate only gates admission before the create)
+    /** The slot's charge to the session-cost ledger (server::kv_committed_bytes), released on eviction.  Two
+     *  meanings by mode: classic (no pool) -- slot 0's FULL session cost, the actual the create allocated (the
+     *  priced estimate only gates admission before the create); pool mode -- one bank's even-split marginal
+     *  (server::bank_marginal_bytes), charged at provision_bank. */
+    KvBytes      est_cost_bytes;
     uint64_t     tokens_emitted;  ///< decode bookkeeping for the scheduler
     /** L114 counter watermark: session position up to which computed prefill
      * rows have been ticked into w_prefill_chunk_tokens. Advanced by BOTH the
@@ -2617,6 +2646,24 @@ struct server {
      * published under mu for readers on client threads). */
     session_slot slots[PULSAR_SESSION_POOL_CAP];
     int          n_slots;  ///< provisioned slots (worker-owned; published under mu)
+    /** L334 P4: THE slot <-> bank crossing.  Slot i holds bank i by construction (cli_main sets slots[i].bank = i,
+     *  admission sets sl->bank = idx); every slots[] lookup by a bank goes through here, which checks the identity
+     *  (fae579f0 broke on it) and aborts when it does not hold.
+     *  @param b the bank (fatal on none())
+     *  @return the slot that holds bank `b` */
+    session_slot *slot_of_bank(BankId b) {
+        const uint32_t i = pulsar_bank_index(b);
+        if (i >= (uint32_t)PULSAR_SESSION_POOL_CAP || (slots[i].provisioned && slots[i].bank != b)) {
+            fprintf(stderr, "pulsar-server: bank %d has no slot of its own (slot i == bank i broken) -- refusing\n",
+                    b.raw());
+            abort();
+        }
+        return &slots[i];
+    }
+    /** const overload of slot_of_bank.
+     *  @param b the bank
+     *  @return the slot that holds bank `b` */
+    const session_slot *slot_of_bank(BankId b) const { return const_cast<server *>(this)->slot_of_bank(b); }
     /** Tier-2 bank-pool state (worker thread only). `pool_banks` > 0 means the
      * shared-pool flip is active: all live slots share server.sess and each
      * owns one bank; `live_bank` is the bank whose device views + host carry are
@@ -2625,7 +2672,7 @@ struct server {
      * knob and the classic decode lane are deleted — decode runs through the
      * batched quanta at every n >= 1. */
     int          pool_banks;  ///< banks in the shared pool; >0 means the pool flip is active
-    int          live_bank;   ///< bank whose device views + host carry are currently installed
+    BankId       live_bank;   ///< bank whose device views + host carry are installed (none(): nothing, L334 P4)
     /** plan-34 phase-2 inc 5: fused mixed-batch lane (PULSAR_MIXED_BATCH, default OFF,
      * read once at startup). When ON, the worker folds ONE prefilling slot's next
      * chunk (a K-row prefill run) into the decode quantum's first mixed step
@@ -2650,15 +2697,17 @@ struct server {
      * uniform eviction of slot 0 zeroed it, silently poisoning every later
      * provision with ctx 0 (banks the router then skipped forever). */
     int          pool_ctx_size;
-    uint64_t     bank_marginal_bytes;  ///< Tier-2: per-bank ledger charge in pooled mode (even split of the admitted pool cost; conservative, demand-paged reality is smaller). 0 in classic mode.
-    uint64_t     kv_budget_bytes;  ///< admission ceiling computed at startup
+    /** Tier-2: per-bank ledger charge in pooled mode (even split of the admitted pool cost,
+     *  server_session_price::per_bank_charge; conservative, demand-paged reality is smaller). 0 in classic mode. */
+    KvBytes      bank_marginal_bytes;
+    KvBytes      kv_budget_bytes;  ///< admission ceiling computed at startup
     /** Context-scaled KV one bank holds at the configured context — the
      *  compressed rows plus their index. Demand-paged under overcommit, so it is
      *  reserved as VA and resident only on touch; published because dividing the
      *  budget by it is the only way to answer "how many tokens of KV does this
      *  box actually hold", which the configured slot count does not answer. */
     KvBytes      kv_bank_bytes;
-    uint64_t     kv_committed_bytes;  ///< sum of est_cost_bytes over live slots (under mu)
+    KvBytes      kv_committed_bytes;  ///< sum of est_cost_bytes over live slots (under mu)
     /** Tier-2 task #55 increment 2b — proactive-eviction guard. `guard_enabled`
      * gates the whole mechanism (on iff overcommit sized N>1 banks and the disk
      * KV cache is open: a spill persists to it, L264). `guard_touched_budget` is the resident-KV ceiling the guard keeps
@@ -2677,8 +2726,14 @@ struct server {
     KvBytes      guard_budget_said;      ///< the live budget last logged (a move of 0.5 GiB or more is said)
     /** L357: the ledger budget set at run time by the test route POST /test/guard-budget (0 = none: guard_kv_budget
      *  stands).  The run-time twin of PULSAR_SERVER_KV_BUDGET_OVERRIDE, so the live legs that lower the budget share
-     *  one server instead of starting one each.  Written by a client thread, read by guard_budget() (__atomic). */
-    uint64_t     guard_test_budget;
+     *  one server instead of starting one each.  Written by a client thread, read by guard_budget() (__atomic):
+     *  the raw storage `__atomic` needs, read and written only through test_guard_budget / set_test_guard_budget. */
+    uint64_t     guard_test_budget_raw;
+    /// @return the test route's ledger budget (0 = none), an atomic read
+    KvBytes test_guard_budget() const { return KvBytes{__atomic_load_n(&guard_test_budget_raw, __ATOMIC_RELAXED)}; }
+    /// Set the test route's ledger budget (0 = none), an atomic write.
+    /// @param b the budget
+    void set_test_guard_budget(KvBytes b) { __atomic_store_n(&guard_test_budget_raw, b.raw(), __ATOMIC_RELAXED); }
     /** L357: PULSAR_SERVER_TEST_ROUTES=1 at startup -- the /test/ routes answer; otherwise they are unknown paths. */
     bool         test_routes;
     /** L362: when spill_bank last said "nowhere to park the pool" for each bank (server_now_sec; once per 10 s) */
@@ -3103,57 +3158,58 @@ struct server {
     /// @param prompt_n_spans      spans in `prompt_spans`
     /// @param image_hashes        the request's image hashes, in prompt order (a chain loads past an image only on a match)
     /// @param n_images            hashes in `image_hashes`
-    /// @param base                where the bank's own state resumes the prompt, in tokens (0 = nothing)
+    /// @param base                where the bank's own state resumes the prompt, a live-side position (0 = nothing)
     /// @param effective_prompt    receives the prompt to sync: the stored tokens + the tokenized rest of the text
     /// @param loaded_key_out      receives the loaded chain's last segment key (owned; NULL on a miss); may be NULL
     /// @param responses_protocol  the request is a Responses one (the chain's tool maps are read for it)
-    int kv_cache_try_load_text(session_slot *sl, const char *prompt_text,
-                               const pulsar_text_span *prompt_spans, uint32_t prompt_n_spans,
-                               const uint64_t *image_hashes, int n_images, int base,
-                               pulsar_tokens *effective_prompt, char **loaded_key_out, bool responses_protocol);
+    /// @return the position restored, TokPos{0} when nothing was (L334 P7: the int's 0 kept)
+    TokPos kv_cache_try_load_text(session_slot *sl, const char *prompt_text,
+                                  const pulsar_text_span *prompt_spans, uint32_t prompt_n_spans,
+                                  const uint64_t *image_hashes, int n_images, TokPos base,
+                                  pulsar_tokens *effective_prompt, char **loaded_key_out, bool responses_protocol);
     /** L318: the stored chain a restore of `prompt_text` would load (the deepest whose text is a byte prefix of it,
-     * cut at the first image `image_hashes` does not bring), nothing loaded.  @return the position it ends at, 0 for
-     * none. */
+     * cut at the first image `image_hashes` does not bring), nothing loaded.  @return the position it ends at -- a
+     * live-side position in the chain's writer's spelling -- TokPos{0} for none (L334 P7: the int's 0 kept). */
     /// @param prompt_text   the prompt text the chain's text must be a byte prefix of
     /// @param image_hashes  the request's image hashes, in prompt order
     /// @param n_images      hashes in `image_hashes`
     /// @param hit           receives the chain (n = 0 for none) with its bytes and RAM-resident bytes
-    int kv_cache_find(const char *prompt_text, const uint64_t *image_hashes, int n_images, kv_chain_hit *hit);
+    TokPos kv_cache_find(const char *prompt_text, const uint64_t *image_hashes, int n_images, kv_chain_hit *hit);
     /** kv_cache_find() for a request's prompt and images. */
     /// @param req  the request (its prompt_text and images; at most PULSAR_IMAGE_BLOCKS_MAX image hashes are compared)
     /// @param hit  receives the chain, as kv_cache_find
-    /// @return the position the chain ends at, 0 for none
-    int kv_cache_find_req(const request *req, kv_chain_hit *hit);
+    /// @return the position the chain ends at, TokPos{0} for none
+    TokPos kv_cache_find_req(const request *req, kv_chain_hit *hit);
     /** L310: the restore-vs-recompute verdict on `hit`, priced on the tokens it adds past `base` (which it must
      * exceed); counted on /metrics and logged. */
     /// @param hit   a found chain (n > 0)
-    /// @param base  where the bank's own state resumes, in tokens (clamped at 0)
+    /// @param base_at  where the bank's own state resumes, a live-side position (clamped at 0)
     /// @return the verdict (also counted in kv.meter under mu)
-    kv_restore_verdict kv_cache_price(const kv_chain_hit *hit, int base);
+    kv_restore_verdict kv_cache_price(const kv_chain_hit *hit, TokPos base_at);
     /** Load `hit` into the installed bank (live at the chain's end) and build the prompt to sync: the exact stored
      * tokens + the rest of `prompt_text`.  `base` is where the bank would have resumed without it (the restored-tokens
-     * counter).  @return the position restored, 0 when a segment would not load (the bank is then invalid). */
+     * counter).  @return the position restored, TokPos{0} when a segment would not load (the bank is then invalid). */
     /// @param hit                 the chain to load (kv_cache_find)
     /// @param prompt_text         the prompt text the chain's boundary is checked against
     /// @param prompt_spans        its text spans, for tokenizing the rest
     /// @param prompt_n_spans      spans in `prompt_spans`
-    /// @param base                where the bank would have resumed without the chain, in tokens
+    /// @param base                where the bank would have resumed without the chain, a live-side position
     /// @param effective_prompt    receives the prompt to sync
     /// @param loaded_key_out      receives the last segment's key (owned), NULL on failure; may be NULL
     /// @param responses_protocol  the request is a Responses one
-    int kv_cache_load(const kv_chain_hit *hit, const char *prompt_text, const pulsar_text_span *prompt_spans,
-                      uint32_t prompt_n_spans, int base, pulsar_tokens *effective_prompt, char **loaded_key_out,
-                      bool responses_protocol);
+    TokPos kv_cache_load(const kv_chain_hit *hit, const char *prompt_text, const pulsar_text_span *prompt_spans,
+                         uint32_t prompt_n_spans, TokPos base, pulsar_tokens *effective_prompt, char **loaded_key_out,
+                         bool responses_protocol);
     /** L330: start a load of `hit` (nothing read yet); `sliced` prices each segment's read for
      *  server_restore_slice_segments (a one-shot load reads the chain as one slice and needs none).  L347 I3b: the
      *  chain is pinned in the store (pulsar_kvchain_pin) until kv_restore_end. */
     /// @param r       the restore to start (caller-owned; keeps a pointer to `hit`, which must outlive it)
     /// @param hit     the chain to load
-    /// @param base    where the bank's own state resumes, in tokens (clamped at 0)
+    /// @param base    where the bank's own state resumes, a live-side position (clamped at 0)
     /// @param sliced  price each segment's read for sliced loading
     /// @param verify  L347 I3b: check every part of the chain before the first load writes the bank (the bank holds a
     ///                history the request would resume from if the restore fails)
-    void kv_restore_begin(kv_restore *r, const kv_chain_hit *hit, int base, bool sliced, bool verify);
+    void kv_restore_begin(kv_restore *r, const kv_chain_hit *hit, TokPos base, bool sliced, bool verify);
     /** L347 I3b: end a restore begun by kv_restore_begin, loaded or not: the chain's pin is released (idempotent).
      *  @param r the restore */
     void kv_restore_end(kv_restore *r);
@@ -3173,8 +3229,8 @@ struct server {
     int kv_restore_next(kv_restore *r);
     /** L330: the loaded chain's boundary check against `text` (pulsar_kvchain_load_check), then what a load leaves
      *  besides the rows: the read meter's observation, the chain's tool maps, and (when `effective_prompt`) the
-     *  prompt to sync -- the exact stored tokens + the rest of `text`.  @return the position restored, 0 when the
-     *  chain disagrees with its tokens (the bank is then invalid). */
+     *  prompt to sync -- the exact stored tokens + the rest of `text`.  @return the position restored, TokPos{0} when
+     *  the chain disagrees with its tokens (the bank is then invalid). */
     /// @param r                   the restore whose chain is fully read
     /// @param text                the prompt text the chain's boundary is checked against
     /// @param spans               its text spans, for tokenizing the rest
@@ -3182,8 +3238,8 @@ struct server {
     /// @param effective_prompt    receives the prompt to sync; NULL = do not build one
     /// @param loaded_key_out      receives the last segment's key (owned), NULL on failure; may be NULL
     /// @param responses_protocol  the request is a Responses one
-    int kv_restore_finish(kv_restore *r, const char *text, const pulsar_text_span *spans, uint32_t n_spans,
-                          pulsar_tokens *effective_prompt, char **loaded_key_out, bool responses_protocol);
+    TokPos kv_restore_finish(kv_restore *r, const char *text, const pulsar_text_span *spans, uint32_t n_spans,
+                             pulsar_tokens *effective_prompt, char **loaded_key_out, bool responses_protocol);
     /** Tool-output-only Responses continuation.
      * Some clients send just the new tool outputs after a tool call.  There is no
      * long visible prefix to match in that shape; the call_id itself is the
@@ -3378,7 +3434,7 @@ struct server {
     /// @param err        receives the refusal (the numbers, and how many banks were spilled)
     /// @param errlen     its size
     /// @return true when the prefill may run; false = the budget still stands (the caller answers 503)
-    bool budget_admits_growth(uint32_t bank, int end_rows, char *err, size_t errlen);
+    bool budget_admits_growth(BankId bank, int end_rows, char *err, size_t errlen);
     /** The fused / mixed lanes' form: no remedy (banks would move under the step being assembled) and no refusal --
      *  short of the floor the prompt leaves the fused lane (gen->no_fuse) and its classic quantum decides. */
     /// @param sl the slot whose job this is (its gen_state; its bank installed by the caller unless said)
@@ -3626,7 +3682,7 @@ struct server {
     /** Write a formatted event line into the trace for request `id`. */
     /// @param id   the request's trace id (0: ignored)
     /// @param fmt  printf format, then its arguments
-    void trace_event(uint64_t id, const char *fmt, ...);
+    void trace_event(uint64_t id, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
     /** Record how the prompt was resolved: what the caches supplied, what the
      * tool replay matched, and which file was used. This is the record that
      * explains a cold prefill after the fact. */
@@ -3673,20 +3729,20 @@ struct server {
     /// @param bank  the bank to install (out of range, or classic mode: a no-op)
     /// @param was   receives a guard-spilled bank's history when it installs empty (bank_unspill); may be NULL
     /// @return false when the bank is preempted or its state restore failed (the session then holds no valid bank)
-    bool bank_switch(int bank, spilled_history *was = nullptr);
+    bool bank_switch(BankId bank, spilled_history *was = nullptr);
     /** L330: install a guard-spilled bank EMPTY: re-back its physical and invalidate it, its history left on disk
      *  where the spill put it (into `was` when given).  A job bound to it restores that history a slice of segments
      *  a worker turn (gen_begin, GEN_RESTORE_SPILLED); the make-room eviction and the shutdown persist keep what the
      *  spill stored.  The caller saved the outgoing bank (bank_switch).  @return false when it cannot be re-backed. */
     /// @param bank  the spilled bank
     /// @param was   receives its history as spilled (may be NULL)
-    bool bank_unspill(int bank, spilled_history *was);
+    bool bank_unspill(BankId bank, spilled_history *was);
     /** L328 (2): the bank the pool parks on while bank `except`'s physical is freed (free_physical refuses the
      *  installed bank): bank 0 when it is resident and not `except`, else the lowest other resident bank
-     *  (server_park_pick over pulsar_session_bank_is_evicted); -1 when there is none -- the move is refused. */
+     *  (server_park_pick over pulsar_session_bank_is_evicted); none() when there is none -- the move is refused. */
     /// @param except  the bank whose physical is about to be freed
-    /// @return the bank to park on, or -1
-    int park_bank(int except);
+    /// @return the bank to park on, or none()
+    BankId park_bank(BankId except);
     /** L328 (3): an idle provisioned bank that holds nothing -- a fresh bank already provisioned (the one with the
      *  most resident pages); NULL when there is none. */
     /// @return the empty provisioned slot, or NULL (also off the bank pool)
@@ -4221,7 +4277,7 @@ typedef struct trace_cache_diag {
 typedef struct kv_restore {
     const kv_chain_hit *hit;   ///< the chain (pulsar_kvchain_find's), not owned
     int next;                  ///< segments loaded so far
-    int base;                  ///< where the bank resumed without the chain (the restored-tokens counter)
+    TokPos base;               ///< where the bank resumed without the chain (the restored-tokens counter)
     double read_ms;            ///< the slices' own wall time: the read the meter observes
     double slice_max_ms;       ///< the longest slice -- the longest the worker stood still for this restore
     int slices;                ///< slices read
@@ -4268,7 +4324,7 @@ struct gen_restore {
     gen_restore_kind kind;   ///< what completes it
     /** L347 I3b (D7): the resume pick's in-memory sources, for a failed restore (GEN_RESTORE_RESUME): the bank's own
      *  depth (`res` holds its resolution) and the best other bank's */
-    int own;
+    PromptToks own;
     int adopt_src;           ///< the bank adopt would copy from (-1: none)
     kv_chain_hit hit;        ///< the chain
     kv_restore r;            ///< its load
@@ -4301,8 +4357,8 @@ typedef struct server_prefill_progress {
     server *srv;         ///< owning server
     session_slot *slot;  ///< slot whose session is prefilling (worker thread)
     req_kind kind;       ///< which API shape the request arrived on
-    int prompt_tokens;   ///< prompt length being prefilled
-    int cached_tokens;   ///< of those, how many came from cache
+    PromptToks prompt_tokens;   ///< the request's prompt length being prefilled (L334 P7: request-side)
+    TokPos cached_tokens;       ///< where the computed rows start on the prompt the sync runs (L334 P7: live-side)
     char ctx[48];        ///< context span string, for log lines
     const char *phase;   ///< current phase name, for log lines
     bool has_tools;      ///< the request declared tools
@@ -4559,7 +4615,7 @@ struct gen_state {
     bool batch_active;      ///< this slot is in the shared multiseq lane (it leaves at finish, or for the family's
                             ///< speculation once that lane can carry every decoder: server::batch_leave, L271/L284)
     bool batch_feed_valid;  ///< batch_feed_token/_pos hold a real pending commit
-    int  batch_feed_token;  ///< next token to commit
+    TokId batch_feed_token;  ///< next token to commit (L334 P3)
     TokPos batch_feed_pos;  ///< position to commit it at (the bank's KV frontier)
     pulsar_tokens batch_pending;  ///< tokens committed via multiseq since the bank's last host checkpoint
     /** plan-34 inc 5: why this prefill slot is not fusable (NULL: it may fuse) -- a
@@ -4662,7 +4718,7 @@ void buf_putc(buf *b, char c);
  *  past DOT_GRAPH_MAX_NODES and is not drawn.
  *  \hidecallergraph */
 void buf_puts(buf *b, const char *s);
-void buf_printf(buf *b, const char *fmt, ...);
+void buf_printf(buf *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 char *buf_take(buf *b);
 /** L354: say so at startup when a server with no authentication binds past loopback.  @param host the bind address */
 void server_warn_if_exposed(const char *host);
@@ -4772,11 +4828,11 @@ bool request_tokenize_rendered(pulsar_engine *e, struct request *r, char *err, s
 void request_free(request *r);
 bool parse_thinking_control_value(const char **p, bool *thinking_enabled, int *budget_tokens);
 /** L344: the draw at which the budget closes the block, pure (server_sched.cpp). */
-int think_close_row(int budget, bool open, int think_tokens, int close, const int *toks, int n, int off);
+int think_close_row(int budget, bool open, int think_tokens, TokId close, const TokId *toks, int n, int off);
 /** L344: lay the forced-close mask rows, pure (server_sched.cpp). */
-void think_masks_lay(uint32_t *out, size_t W, int row, int rows, int close, const uint32_t *gram, int gram_rows);
+void think_masks_lay(uint32_t *out, size_t W, int row, int rows, TokId close, const uint32_t *gram, int gram_rows);
 /** L344: the draw at which the thinking budget closes the reasoning block (server_sched.cpp). */
-int gen_think_close_row(server *s, const gen_state *g, const int *toks, int n, int off);
+int gen_think_close_row(server *s, const gen_state *g, const TokId *toks, int n, int off);
 /** L344: mask rows forcing the close token at one row (server_sched.cpp). */
 const uint32_t *gen_think_masks(server *s, gen_state *g, int row, int rows, const uint32_t *gram, int gram_rows);
 /** L344: uint32_t words in one sampler mask row. */
@@ -5359,7 +5415,7 @@ bool gen_constrain_accept(struct server *s, struct gen_state *g, int token);
 /// @param base_emitted  the base was already emitted (toks are the drafts)
 /// @param masks  receives the rows (the gate's buffer)
 /// @return rows written, 0, or -1
-int gen_constrain_round(struct server *s, struct gen_state *g, const int *toks, int n, bool base_emitted,
+int gen_constrain_round(struct server *s, struct gen_state *g, const TokId *toks, int n, bool base_emitted,
                         const uint32_t **masks);
 /** L309: how many of a pending chain's `n` drafts (after the not yet emitted `base`) can be accepted under the
  *  grammar: the gate goes through the base and the drafts, as gen_constrain_round's walk does, and back; the first
@@ -5367,11 +5423,11 @@ int gen_constrain_round(struct server *s, struct gen_state *g, const int *toks, 
  *  its chain's last.  `n` when the request has no gate.  -1 = the gate failed (g->err). */
 /// @param s  the server
 /// @param g  the request's generation state
-/// @param base  the round's base token (not yet emitted)
+/// @param base_id  the round's base token (not yet emitted; L334 P3: an id, not the KV cache's `base` count)
 /// @param drafts  the pending drafts
 /// @param n  how many
 /// @return the acceptable prefix length, or -1
-int gen_constrain_draft_prefix(struct server *s, struct gen_state *g, int base, const int32_t *drafts, int n);
+int gen_constrain_draft_prefix(struct server *s, struct gen_state *g, TokId base_id, const TokId *drafts, int n);
 /** The base draw's mask for a speculative round's assemble (live only; the gate's buffer, valid until the next
  *  call).  NULL + g->err on failure. */
 /// @param s  the server
@@ -5386,7 +5442,15 @@ bool gen_client_disconnected(int fd);
  *  error the job already carries is kept: the first cause is the one the client reads.
  *  @param g    the job's state; its err (when empty), finish and phase are set
  *  @param bank the bank, for the message */
-void gen_bank_install_failed(gen_state *g, uint32_t bank);
+void gen_bank_install_failed(gen_state *g, BankId bank);
+/** The context-overflow message in the request's protocol wording: Anthropic's "prompt is too long: N tokens > M
+ *  maximum" (the text Claude Code matches to compact, L252 P5), else the OpenAI-side text.
+ *  @param out             receives the message
+ *  @param n               bytes at out
+ *  @param r               the request (selects the wording; NULL: OpenAI's)
+ *  @param n_prompt_tokens the prompt's tokens
+ *  @param ctx_size        the context size, tokens */
+void context_length_message(char *out, size_t n, const request *r, int n_prompt_tokens, int ctx_size);
 bool http_error_context_length_exceeded(int fd,
                                                const request *r,
                                                int n_prompt_tokens,
@@ -5512,7 +5576,7 @@ void id_list_push_unique(stop_list *ids, const char *id);
 void id_list_free(stop_list *ids);
 void collect_tool_call_ids(const chat_msgs *msgs, stop_list *ids);
 char *path_join(const char *dir, const char *name);
-bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb, uint32_t identity,
+bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb, const pulsar_segstore_ident &identity,
                    kv_cache_options opt, kv_ram_plan ram);
 void kv_cache_close(kv_disk_cache *kc);
 /** L338: index the segments the background writer has finished (the store's thread: the worker, or the close). */
@@ -5528,8 +5592,8 @@ int kv_cache_wait_written(kv_disk_cache *kc);
 /// @param staged    receives the staged bytes
 /// @param uncommitted receives the finished jobs waiting for kv_cache_commit_written
 void kv_cache_writer_state(kv_disk_cache *kc, uint64_t *staged, int *uncommitted);
-char *render_tokens_text(pulsar_engine *engine, const pulsar_tokens *tokens, size_t *out_len);
-void tokens_copy_prefix(pulsar_tokens *dst, const pulsar_tokens *src, int n);
+char *render_tokens_text(pulsar_engine *engine, const pulsar_tokens *tokens, TextBytes *out_len);
+void tokens_copy_prefix(pulsar_tokens *dst, const pulsar_tokens *src, TokCount n);
 /// @param a  a token vector
 /// @param b  another
 /// @return true when `a` is a prefix of `b` (or equal to it)
@@ -5573,7 +5637,7 @@ int build_live_continuation_prompt(pulsar_engine *engine, const pulsar_tokens *l
  *  @param anchor the chat anchor, tokens (-1: none)
  *  @param grid   the resume grid, tokens
  *  @return the cut in tokens, 0 for none */
-int kv_cache_anchor_cut(const kv_disk_cache *kc, int anchor, int grid);
+int kv_cache_anchor_cut(const kv_disk_cache *kc, int anchor, TokCount grid);
 int kv_cache_chat_anchor_pos(const kv_disk_cache *kc, const pulsar_tokens *prompt, const pulsar_turn_markers *m);
 /** L353: where a persisted shared prefix ends: the FIRST user marker -- the system prompt and tools, what conversations
  *  of one client share however their first messages differ.  A function of the prompt's tokens alone, so the restore
@@ -5618,18 +5682,16 @@ bool server_route_in_place(int common, int score, int frontier, int prefilled, i
 int server_image_cold_cut(int cut, const pulsar_image_ref *images, int n_images, int *inside);
 /* The admission budgets (unified memory; a discrete card's own) and the command line with its disk KV directory
  * resolved: defined in cli_main.cpp for main(), unit-tested in server_tests.cpp. */
-uint64_t server_kv_budget_bytes(uint64_t weights_resident_bytes);
-uint64_t server_kv_budget_discrete_bytes(uint64_t free_bytes, uint64_t working_set_bytes);
+KvBytes server_kv_budget_bytes(KvBytes weights_resident_bytes);
+KvBytes server_kv_budget_discrete_bytes(KvBytes free_bytes, KvBytes working_set_bytes);
 server_config server_parse_options(int argc, char **argv);
 void server_resolve_kv_disk_dir(server_config *c);
 /* Admission predicate (defined in cli_main.cpp; unit-tested there). */
-bool server_kv_admits(uint64_t kv_budget_bytes,
-                             uint64_t committed_bytes,
-                             uint64_t incoming_bytes);
+bool server_kv_admits(KvBytes kv_budget_bytes, KvBytes committed_bytes, KvBytes incoming_bytes);
 /* Live MemAvailable floor predicate: kernel-breathing-room backstop applied
  * at provisioning time on top of the ledger (defined in cli_main.cpp;
  * unit-tested there). avail == 0 (unreadable /proc/meminfo) fails closed. */
-bool server_mem_floor_admits(uint64_t avail_bytes, uint64_t est_bytes);
+bool server_mem_floor_admits(KvBytes avail_bytes, KvBytes est_bytes);
 /* L319: the touched-KV ceiling -- min(kv budget − eager, touched + avail − floor); 0 when avail is at or under the
  * floor, or unreadable (defined in cli_main.cpp; unit-tested there).  The startup ceiling reads the post-warmup
  * headroom; the guard's live budget (server::guard_budget) the current one.  What avail and floor are is the device's
@@ -5645,7 +5707,7 @@ KvBytes server_guard_touched_budget(KvBytes kv_budget_bytes, KvBytes eager_bytes
  * and the ledger's share. */
 /// @param discrete the KV lives in a discrete card's memory (pulsar_gpu_integrated() == 0)
 /// @return the headroom reading in bytes (0 = unreadable: every decision fails closed)
-uint64_t server_guard_avail_bytes(bool discrete);
+KvBytes server_guard_avail_bytes(bool discrete);
 /// @param discrete as server_guard_avail_bytes
 /// @return the floor that reading keeps free
 KvBytes server_guard_floor(bool discrete);
@@ -5672,22 +5734,22 @@ KvBytes server_mem_floor(void);
 /// @param zone_high_bytes  the zones' high watermarks, bytes
 /// @param step_bytes  the largest demand of one worker step, bytes
 /// @return the floor, bytes
-KvBytes server_mem_floor_init(uint64_t zone_high_bytes, KvBytes step_bytes);
+KvBytes server_mem_floor_init(KvBytes zone_high_bytes, KvBytes step_bytes);
 /** Sum of every zone's `high` watermark in a /proc/zoneinfo text, in bytes (pages of `page_bytes`); 0 when none
  *  parses (the caller logs it and the floor keeps the OS margin). */
 /// @param zoneinfo  the file's text
 /// @param page_bytes  the page size, bytes
 /// @return bytes
-uint64_t server_zoneinfo_high_bytes(const char *zoneinfo, uint64_t page_bytes);
+KvBytes server_zoneinfo_high_bytes(const char *zoneinfo, uint64_t page_bytes);
 /** /proc/zoneinfo's high watermarks (server_zoneinfo_high_bytes over the live file); 0 when unreadable. */
 /// @return bytes
-uint64_t server_zone_high_watermark_bytes(void);
+KvBytes server_zone_high_watermark_bytes(void);
 /** The host bytes one disk-KV persist of a `tokens`-long history can take beyond the pinned staging buffer: the
  *  writeback window of dirty page cache (PULSAR_WRITEBACK_STEP) and the two renders of the history's text
  *  (pulsar_kvchain_persist), bounded at PERSIST_TEXT_BYTES_PER_TOKEN a token. */
 /// @param tokens  the history's length
 /// @return bytes
-uint64_t server_persist_host_bytes(int tokens);
+KvBytes server_persist_host_bytes(int tokens);
 /// Rendered-text bytes a token is bounded at for a persist's host demand (server_persist_host_bytes).
 #define PERSIST_TEXT_BYTES_PER_TOKEN 64u
 /** Does MemAvailable `avail` leave `floor` after `need` more bytes?  avail 0 (unreadable) is no. */
@@ -5706,7 +5768,7 @@ prefill_mem_step server_prefill_mem_step(KvBytes avail, KvBytes need, KvBytes fl
 /* MemAvailable from /proc/meminfo, in bytes (0 on parse failure — callers
  * fail closed).  Never called on a token/layer hot path (defined in
  * generate.cpp; also used by startup warmup/budget derivation in cli_main.cpp). */
-uint64_t server_mem_available_bytes(void);
+KvBytes server_mem_available_bytes(void);
 
 /* ==== The stall watchdog (watchdog.cpp) ===================================================================
  * The worker marks every CUDA-heavy section it enters (src/lib/pulsar_stall.h; each mark a heartbeat).  A watchdog
@@ -5743,15 +5805,13 @@ bool server_watchdog_busy(const server *s);
  * ledger commits (the actual); 0 when they differ -- the price is the
  * allocator run dry, so a difference is an accounting hole and the caller
  * refuses to start (defined in server_sched.cpp). */
-uint64_t server_reconciled_session_cost(int slot_idx, int ctx,
-                                               uint64_t est_bytes,
-                                               uint64_t actual_bytes);
+KvBytes server_reconciled_session_cost(int slot_idx, int ctx, KvBytes est_bytes, KvBytes actual_bytes);
 /* Eviction ledger release: subtract an evicted slot's committed bytes from
  * the admission ledger total, warning loudly (and clamping to 0, which fails
  * toward over-admission being caught by the MemAvailable floor rather than
  * leaking budget forever) if the pairing ever underflows (defined in
  * generate.cpp; unit-tested in cli_main.cpp). */
-uint64_t server_ledger_release(uint64_t committed_total, uint64_t slot_cost);
+KvBytes server_ledger_release(KvBytes committed_total, KvBytes slot_cost);
 /** L380: a decoder stepping in the plain or mixed batch: in the batch (gen_state::batch_active) and still decoding.
  *  The scope of the saved-carry history read (server::slot_history).  Every way a batch step or the slot's install
  *  can fail ends the decode (GEN_FINISH: a failed or rejected step, a refused draw, a bank that would not install, a
@@ -5782,7 +5842,7 @@ inline int slot_tokens_common(const slot_tokens &a, const slot_tokens &b) {
  *  @param s the pool session
  *  @param bank the bank */
 /// @return the bank's position (0 for no history)
-inline TokPos server_bank_pos(pulsar_session *s, uint32_t bank) {
+inline TokPos server_bank_pos(pulsar_session *s, BankId bank) {
     const TokPos p = pulsar_session_bank_pos(s, bank);
     return p.is_none() ? TokPos{0} : p;
 }
@@ -5918,7 +5978,7 @@ void gen_resolve_sampling(const request *req, float *temperature,
 /// @param n  how many
 /// @param base_emitted  the base was already emitted
 /// @return the greedy-row bit set
-uint32_t gen_spec_greedy_rows(server *s, const gen_state *g, const int *toks, int n, bool base_emitted);
+uint32_t gen_spec_greedy_rows(server *s, const gen_state *g, const TokId *toks, int n, bool base_emitted);
 /** The same over the tokens' texts (NULL = a stop token): the probe itself, engine-free (server tests). */
 /// @param g  the request's generation state
 /// @param pieces  each token's text (NULL = a stop token)

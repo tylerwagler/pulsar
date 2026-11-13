@@ -53,9 +53,9 @@ int GATE_ENTRY(int argc, char **argv) {
         fails++;
     } else {
         for (int i = 0; i < SMOKE_MAX_NEW; i++) {
-            const int tok = pulsar_session_argmax(s);
+            const TokId tok = pulsar_session_argmax(s);
             if (pulsar_token_is_stop(e, tok)) { stopped = true; break; }
-            ids.push_back(tok);
+            ids.push_back(tok.raw());
             size_t n = 0;
             char *piece = pulsar_token_text(e, tok, &n);
             if (piece) { text.append(piece, n); free(piece); }
@@ -71,8 +71,11 @@ int GATE_ENTRY(int argc, char **argv) {
     if (text.find("12") == std::string::npos) { printf("  FAIL  the answer has no \"12\"\n"); fails++; }
     if (!stopped) { printf("  FAIL  no stop token within %d tokens\n", SMOKE_MAX_NEW); fails++; }
     int frame = 0;
-    for (int id : ids) frame += prompt.len > 0 && id == prompt.v[0];
-    if (frame) { printf("  FAIL  the frame opener (id %d) appears %d time(s) in the answer\n", prompt.v[0], frame); fails++; }
+    for (int id : ids) frame += prompt.len > 0 && TokId{id} == prompt.v[0];
+    if (frame) {
+        printf("  FAIL  the frame opener (id %d) appears %d time(s) in the answer\n", prompt.v[0].raw(), frame);
+        fails++;
+    }
     std::vector<int> distinct(ids);
     std::sort(distinct.begin(), distinct.end());
     distinct.erase(std::unique(distinct.begin(), distinct.end()), distinct.end());

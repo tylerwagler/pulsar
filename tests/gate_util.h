@@ -122,21 +122,21 @@ static inline bool gate_width_inexact(int rows) { return rows > pulsar_gpu_matmu
  * frontier counters and host carry) -- and hand back the next token (argmax) through *argtok when asked.  The
  * family-generic twin of gate_fixture.h's gate_populate_bank (which reaches DeepSeek's session graph directly);
  * on DeepSeek the two leave the same device state.  The session does not take ownership of v. */
-static inline bool gate_bank_sync(pulsar_session *s, uint32_t bank, const int *v, int len, int *argtok,
+static inline bool gate_bank_sync(pulsar_session *s, uint32_t bank, const TokId *v, int len, int *argtok,
                                   const char *what) {
     char err[256] = "";
-    if (pulsar_session_bank_repoint(s, bank) != 0) {
+    if (pulsar_session_bank_repoint(s, BankId{bank}) != 0) {
         fprintf(stderr, "%s: bank %u repoint failed\n", what, bank);
         return false;
     }
     pulsar_session_invalidate(s);
-    pulsar_tokens p = { .v = (int *)v, .len = len, .cap = len };
+    pulsar_tokens p = { .v = (TokId *)v, .len = len, .cap = len };
     if (pulsar_session_sync(s, &p, err, sizeof err) != 0) {
         fprintf(stderr, "%s: bank %u sync failed: %s\n", what, bank, err);
         return false;
     }
-    pulsar_session_bank_state_save(s, bank);
-    if (argtok) *argtok = pulsar_session_argmax(s);
+    pulsar_session_bank_state_save(s, BankId{bank});
+    if (argtok) *argtok = pulsar_session_argmax(s).raw();
     return true;
 }
 

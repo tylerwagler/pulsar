@@ -190,7 +190,7 @@ static int run(const dev &d, int k2, int M, int K, int N, std::vector<float> &y,
     return 0;
 }
 
-/* 3. a prompt chunk through the prefill GEMM (qwen_exl3_dense_prefill.cu), graded against the double reference;
+/* 3. a prompt chunk through the prefill GEMM (exl3_dense_prefill.cu), graded against the double reference;
  * y16 = the decode GEMV's M = 16 rows to compare rows 0..15 with. */
 static void grade_prefill(const dev &d, const weight &w, const slot &s, const std::vector<double> &what,
                           const std::vector<double> &yref, int k2, int max_rows, int K, int N, const char *what_s,
@@ -202,10 +202,10 @@ static void grade_prefill(const dev &d, const weight &w, const slot &s, const st
     rc = run(d, k2, max_rows, K, N, y, true);
     CHECK(rc == 0, "prefill M=%d launch rc=%d", max_rows, rc);
     if (!rc) {
-        /* a prompt chunk is the PREFILL GEMM (qwen_exl3_dense_prefill.cu, L251): it sums in its own
+        /* a prompt chunk is the PREFILL GEMM (exl3_dense_prefill.cu, L251): it sums in its own
          * order, so its rows agree with the decode GEMV to rounding, not to the bit -- every
          * row is graded against the double reference instead, rows 0..15 included */
-        /* ...its operand is ONE fp16 plane (qwen_exl3_dense_prefill.cu), so each output is graded
+        /* ...its operand is ONE fp16 plane (exl3_dense_prefill.cu), so each output is graded
          * against that rounding's exact envelope (exl3t_fp16_operand_bound) plus the f32-order
          * tolerance of its row -- not the GEMV's f32-class limit */
         const bool same16 = memcmp(y.data(), y16.data(), y16.size() * sizeof(float)) == 0;

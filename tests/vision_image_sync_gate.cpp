@@ -87,9 +87,9 @@ int main(int argc, char **argv) {
 
         /* The renderer's output: text, the image block, a little more text. */
         pulsar_tokens prompt = {};
-        for (int i = 0; i < start_pos; i++) pulsar_tokens_push(&prompt, 100 + i % 7);
-        for (int i = 0; i < span_len; i++) pulsar_tokens_push(&prompt, vocab + types[i]);
-        for (int i = 0; i < 3; i++) pulsar_tokens_push(&prompt, 200 + i);
+        for (int i = 0; i < start_pos; i++) pulsar_tokens_push(&prompt, TokId{100 + i % 7});
+        for (int i = 0; i < span_len; i++) pulsar_tokens_push(&prompt, TokId{vocab + types[i]});
+        for (int i = 0; i < 3; i++) pulsar_tokens_push(&prompt, TokId{200 + i});
 
         pulsar_image_ref img = { enc.data(), enc.size(), start_pos };
         char err[512] = {0};
@@ -101,9 +101,9 @@ int main(int argc, char **argv) {
                    c, n_vh, n_vw, err);
             bad++;
         } else {
-            const int am = pulsar_session_argmax(sess);
-            if (am < 0 || am >= (int)PULSAR_N_VOCAB) {
-                printf("  FAIL case %u: argmax %d out of range after an image prefill\n", c, am);
+            const TokId am = pulsar_session_argmax(sess);
+            if (!am.below((uint32_t)PULSAR_N_VOCAB)) {
+                printf("  FAIL case %u: argmax %d out of range after an image prefill\n", c, am.raw());
                 bad++;
             }
             /* copy_logits returns the COUNT it copied, not 0 on success. */
@@ -139,8 +139,8 @@ int main(int argc, char **argv) {
         {
             char err3[512] = {0};
             pulsar_tokens p3 = {};
-            for (int i = 0; i < 8; i++) pulsar_tokens_push(&p3, 100 + i);
-            for (int i = 0; i < 3; i++) pulsar_tokens_push(&p3, 200 + i);
+            for (int i = 0; i < 8; i++) pulsar_tokens_push(&p3, TokId{100 + i});
+            for (int i = 0; i < 3; i++) pulsar_tokens_push(&p3, TokId{200 + i});
             /* no sentinels at all, so the block start is a plain text token */
             pulsar_image_ref img3 = { enc.data(), enc.size(), 4 };
             if (pulsar_session_sync_mm(sess, &p3, &img3, 1, err3, sizeof err3) == 0) {
@@ -158,7 +158,7 @@ int main(int argc, char **argv) {
             char err4[512] = {0};
             const char *step = "text sync";
             pulsar_tokens text = {}, turn = {};
-            for (int i = 0; i < 300; i++) pulsar_tokens_push(&text, 100 + i % 7);
+            for (int i = 0; i < 300; i++) pulsar_tokens_push(&text, TokId{100 + i % 7});
             pulsar_session_invalidate(sess);
             bool ok4 = pulsar_session_sync(sess, &text, err4, sizeof err4) == 0;
             if (ok4) step = "decode";
@@ -169,7 +169,7 @@ int main(int argc, char **argv) {
                 /* the installed bank's flag (pulsar_session_bank_comp_stale answers for a bank POOL; this session
                  * is classic, one bank) */
                 step = "stale after the ghost rewind";
-                ok4 = sess->graph->ms_comp_state_stale[gpu_graph_cur_bank(sess->graph)];
+                ok4 = sess->graph->ms_comp_state_stale[pulsar_bank_index(gpu_graph_cur_bank(sess->graph))];
             }
             /* the turn the server builds: the live history, the renderer's placeholder, a little text -- expanded from
              * the live length (a block's layout depends on where it starts, so the golden's block is not reused) */
@@ -182,7 +182,7 @@ int main(int argc, char **argv) {
                 for (int i = 0; i < live_len; i++) pulsar_tokens_push(&raw, live->v[i]);
                 pulsar_tokenize_rendered_chat(e, PULSAR_IMAGE_PLACEHOLDER, &ph);
                 for (int i = 0; i < ph.len; i++) pulsar_tokens_push(&raw, ph.v[i]);
-                for (int i = 0; i < 3; i++) pulsar_tokens_push(&raw, 200 + i);
+                for (int i = 0; i < 3; i++) pulsar_tokens_push(&raw, TokId{200 + i});
                 ok4 = ph.len == 1 && pulsar_expand_image_placeholders(e, &raw, live_len, &img4, 1, &turn, err4,
                                                                       sizeof err4) == 1 && img4.start_pos == live_len;
                 pulsar_tokens_free(&raw);

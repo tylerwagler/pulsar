@@ -85,7 +85,7 @@ int main(int argc, char **argv) {
     check(c.bytes == dir_bytes && c.directory_bytes == dir_bytes,
           "every byte priced by a role: %llu of the directory's %llu", (unsigned long long)c.bytes,
           (unsigned long long)dir_bytes);
-    check(pulsar_engine_weights_resident_bytes(e) == e->model.mapped_bytes && c.bytes <= e->model.mapped_bytes,
+    check(pulsar_engine_weights_resident_bytes(e).raw() == e->model.mapped_bytes && c.bytes <= e->model.mapped_bytes,
           "admission charges the staged container (%.3f GiB mapped; the bound tensors %.3f GiB, the rest headers)",
           (double)e->model.mapped_bytes / 1073741824.0, (double)c.bytes / 1073741824.0);
 
@@ -131,9 +131,11 @@ int main(int argc, char **argv) {
     const bool tok_ok = pulsar_tokenize_text(e, "Hello world", &hello) && hello.len == 2;
     pulsar_turn_markers tm;
     check(pulsar_engine_vocab_size(e) == (int)PULSAR_GEMMA4_SHAPE_26B_A4B.n_vocab && tok_ok &&
-              pulsar_token_is_stop(e, 1) && pulsar_token_is_stop(e, 106) && pulsar_token_is_stop(e, 50) &&
-              !pulsar_token_is_stop(e, 2) && pulsar_token_think_close(e) == 101 && pulsar_chat_turn_markers(e, &tm) &&
-              tm.n_user == 2 && tm.user[0] == 105 && tm.n_assistant == 2 && tm.assistant[0] == 105,
+              pulsar_token_is_stop(e, TokId{1}) && pulsar_token_is_stop(e, TokId{106}) &&
+              pulsar_token_is_stop(e, TokId{50}) &&
+              !pulsar_token_is_stop(e, TokId{2}) && pulsar_token_think_close(e) == TokId{101} &&
+              pulsar_chat_turn_markers(e, &tm) &&
+              tm.n_user == 2 && tm.user[0] == TokId{105} && tm.n_assistant == 2 && tm.assistant[0] == TokId{105},
           "the tokenizer table: %d ids, \"Hello world\" -> %d tokens, stops <eos> <turn|> <|tool_response>, think close "
           "<channel|>, turn markers <|turn> + the role word", pulsar_engine_vocab_size(e), hello.len);
     pulsar_tokens_free(&hello);

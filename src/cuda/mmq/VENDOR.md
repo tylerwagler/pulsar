@@ -29,7 +29,7 @@
 > are gone too (2026-08-19).  The adapter that remains is ours:
 > `ds4_ggml_stubs.{h,cu}`, `ds4_mmq.{h,cu}`, `ds4_mmid.*`, `ds4_mmq_d2r.*`,
 > `ds4_act_block.cuh`, `ds4_quantize_e4m3.cu`, and the EXL3 / Tessera files
-> beside them (`exl3_moe*`, `ds4_exl3_*`, `qwen_exl3_dense_prefill.cu`,
+> beside them (`exl3_moe*`, `ds4_exl3_*`, `exl3_dense_prefill.cu`,
 > `pulsar_tessera.*`; Tessera's own note is `VENDOR-TESSERA.md`).
 >
 > **Everything from "File inventory" down to "pulsar-side provenance" is the

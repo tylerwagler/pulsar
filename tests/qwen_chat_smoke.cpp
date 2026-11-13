@@ -8,7 +8,7 @@
  * them, the stop reason, and the prefill / decode rates.  Not part of the battery: it needs the
  * real container (with the checkpoint's tokenizer.json + generation_config.json beside it). */
 #include "pulsar.h"
-#include "lib/qwen_chat.h"
+#include "../src/families/qwen/qwen_chat.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -84,11 +84,11 @@ int main(int argc, char **argv) {
         if (pulsar_session_copy_logits(sess, row.data(), W) != W) { fprintf(stderr, "qwen-chat-smoke: copy_logits\n"); return 1; }
         int am = 0;
         for (int j = 1; j < W; j++) if (row[j] > row[am]) am = j;
-        pulsar_tokens_push(&prompt, am);
+        pulsar_tokens_push(&prompt, TokId{am});
         n_new++;
-        if (pulsar_token_is_stop(e, am)) { stop_reason = "stop token"; break; }
+        if (pulsar_token_is_stop(e, TokId{am})) { stop_reason = "stop token"; break; }
         size_t n = 0;
-        char *txt = pulsar_token_text(e, am, &n);
+        char *txt = pulsar_token_text(e, TokId{am}, &n);
         parser.feed(txt, n, &ev);
         free(txt);
     }

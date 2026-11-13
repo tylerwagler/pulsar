@@ -586,3 +586,18 @@ out_parser *nemotron_output_parser::clone() const {
     p->rebind_body(&p->body_);
     return p;
 }
+
+/* L295 F8 step 2: this family's parser, by chat format (out_parse_kit.h) */
+/// The family's parser for one turn (OUT_PARSER_FAMILY's factory).
+/// @param thinking   the turn starts in reasoning
+/// @param tools_json the request's tools array as JSON text, or NULL
+/// @param err        receives "tools_not_array: <detail>" on refusal
+/// @param errlen     its size
+/// @return the parser (the caller deletes it), or NULL when the tools are refused
+static out_parser *make_parser(bool thinking, const char *tools_json, char *err, size_t errlen) {
+    nemotron_output_parser *p = new nemotron_output_parser();
+    if (p->init(thinking, tools_json, err, errlen)) return p;
+    delete p;
+    return nullptr;
+}
+OUT_PARSER_FAMILY(PULSAR_CHAT_NEMOTRON_H, make_parser)

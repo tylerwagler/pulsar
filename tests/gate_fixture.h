@@ -56,7 +56,7 @@ static inline bool gate_prefill_suffix_classic(pulsar_session *s, const pulsar_t
  * across banks), classic-sync the prompt, capture the bank's frontier
  * counters, and hand back the next token (argmax) through *argtok when asked.
  * The session does not take ownership of v. */
-static inline bool gate_populate_bank(pulsar_session *s, uint32_t bank, const int *v, int len,
+static inline bool gate_populate_bank(pulsar_session *s, uint32_t bank, const TokId *v, int len,
                                       int *argtok, const char *what) {
     pulsar_gpu_graph *g = s->graph;
     char err[256];
@@ -65,13 +65,13 @@ static inline bool gate_populate_bank(pulsar_session *s, uint32_t bank, const in
         return false;
     }
     pulsar_session_invalidate(s);
-    pulsar_tokens p = { .v = (int *)v, .len = len, .cap = len };
+    pulsar_tokens p = { .v = (TokId *)v, .len = len, .cap = len };
     if (pulsar_session_sync(s, &p, err, sizeof err) != 0) {
         fprintf(stderr, "%s: bank %u sync failed: %s\n", what, bank, err);
         return false;
     }
     gpu_graph_bank_counters_capture(g, bank);
-    if (argtok) *argtok = pulsar_session_argmax(s);
+    if (argtok) *argtok = pulsar_session_argmax(s).raw();
     return true;
 }
 
@@ -111,7 +111,7 @@ static inline std::vector<gate_state_piece> gate_bank_state(pulsar_session *s, u
                                                             uint32_t rows) {
     std::vector<gate_state_piece> out;
     if (!s || !s->states || b >= s->states->n_banks) return out;
-    if (!pulsar_state_fold_flush(s->states, b) || !pulsar_gpu_synchronize()) return out;
+    if (!pulsar_state_fold_flush(s->states, BankId{b}) || !pulsar_gpu_synchronize()) return out;
     const pulsar_state_set *ss = s->states;
     const pulsar_state_plan *p = ss->plan;
     const bool whole = rows == GATE_STATE_WHOLE;
@@ -123,8 +123,8 @@ static inline std::vector<gate_state_piece> gate_bank_state(pulsar_session *s, u
             const pulsar_gpu_tensor *t;
             uint64_t off, n;
             if (d->kind == PULSAR_STATE_POOL) {
-                t = pulsar_state_pool(ss, k, id, b);
-                n = whole ? (t ? pulsar_gpu_tensor_bytes(t) : 0u) : (uint64_t)rows / d->tokens * d->bytes;
+                t = pulsar_state_pool(ss, k, id, BankId{b});
+                n = whole ? pulsar_gpu_tensor_bytes(t).raw() : (uint64_t)rows / d->tokens * d->bytes;
                 off = 0;
             } else {
                 n = d->kind == PULSAR_STATE_STAGED && !whole ? (uint64_t)(rows % d->tokens) * d->bytes
@@ -135,7 +135,7 @@ static inline std::vector<gate_state_piece> gate_bank_state(pulsar_session *s, u
             gate_state_piece pc;
             pc.name = std::string(d->name) + "@" + std::to_string(k);
             pc.bytes.resize(n);
-            ok = t && (n == 0 || pulsar_gpu_tensor_read(t, off, pc.bytes.data(), n) != 0);
+            ok = t && (n == 0 || pulsar_gpu_tensor_read(t, TensorBytes{off}, pc.bytes.data(), TensorBytes{n}) != 0);
             out.push_back(std::move(pc));
         }
     }

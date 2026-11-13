@@ -785,9 +785,9 @@ int ds4_exl3_dense_prompt_describe(int k2, int M, int K, int N, ds4_exl3_dense_p
     return 0;
 }
 
-int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, float *y, int M, int K, int Ny,
+int exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, float *y, int M, int K, int Ny,
                                    uint64_t trellis_bytes, cudaStream_t stream) {
-    const char *tag = "qwen_exl3_dense_prefill_launch";
+    const char *tag = "exl3_dense_prefill_launch";
     if (!w || !x_bf16 || !y || M <= 0 || Ny <= 0 || Ny % 4 || K % EXL3_HAD_BLOCK) {
         fprintf(stderr, "%s: bad arguments (M=%d K=%d N=%d) -- refusing\n", tag, M, K, Ny);
         return -1;

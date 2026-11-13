@@ -18,8 +18,8 @@
 int pulsar_read_hc_carrier_f32(const pulsar_gpu_tensor *t, uint64_t off_elems,
                             float *out, uint64_t n) {
     uint16_t *tmp = (uint16_t *)xmalloc((size_t)n * sizeof(uint16_t));
-    int rc = pulsar_gpu_tensor_read((pulsar_gpu_tensor *)t, off_elems * PULSAR_HC_ELT_SIZE,
-                                 tmp, n * PULSAR_HC_ELT_SIZE);
+    int rc = pulsar_gpu_tensor_read((pulsar_gpu_tensor *)t, elt_bytes(off_elems, PULSAR_HC_ELT_SIZE),
+                                 tmp, elt_bytes(n, PULSAR_HC_ELT_SIZE));
     if (rc == 0) {
         /* Read failed and left tmp uninitialized — do NOT convert it. Callers
          * (the DSpark dumps at session.cpp) memset `out` to zero beforehand and
@@ -46,8 +46,8 @@ static_assert(PULSAR_Q_ELT_SIZE == 2u,
 int pulsar_read_q_f32(const pulsar_gpu_tensor *t, uint64_t off_elems,
                       float *out, uint64_t n) {
     uint16_t *tmp = (uint16_t *)xmalloc((size_t)n * sizeof(uint16_t));
-    int rc = pulsar_gpu_tensor_read((pulsar_gpu_tensor *)t, off_elems * PULSAR_Q_ELT_SIZE,
-                                 tmp, n * PULSAR_Q_ELT_SIZE);
+    int rc = pulsar_gpu_tensor_read((pulsar_gpu_tensor *)t, elt_bytes(off_elems, PULSAR_Q_ELT_SIZE),
+                                 tmp, elt_bytes(n, PULSAR_Q_ELT_SIZE));
     if (rc == 0) {
         /* Same contract as the HC reader: a failed read leaves tmp
          * uninitialised, so do NOT convert it into the caller's buffer. */
@@ -230,7 +230,7 @@ bool gpu_graph_dspark_seed_draft_kv(
              * would be read as if it held a seeded position.  Async: kv_rot is
              * consumed only by the rope/pack kernels that follow on this same
              * (per-thread) stream, so the host wait bought nothing. */
-            if (!pulsar_gpu_tensor_copy_async(kv_rot, 0, kv_norm, 0, kv_bytes)) {
+            if (!pulsar_gpu_tensor_copy_async(kv_rot, TensorBytes{0}, kv_norm, TensorBytes{0}, TensorBytes{kv_bytes})) {
                 seeded = false;
                 break;
             }
@@ -293,7 +293,7 @@ bool gpu_graph_dspark_seed_rows_banked(
         const pulsar_model         *dspark_model,
         const pulsar_dspark_weights *w,
         const uint32_t            *src_rows,
-        const uint32_t            *row_bank,
+        const BankId              *row_bank,
         uint32_t                 n_rows) {
     PULSAR_NVTX("drafter seed (banked)");
     if (n_rows == 0) return true;
@@ -320,16 +320,17 @@ bool gpu_graph_dspark_seed_rows_banked(
         int32_t meta[7 * PULSAR_DSPARK_DRAFT_ROWS_MAX] = {0};
         uint32_t chunk_added[PULSAR_MSEQ_MAX] = {0};
         for (uint32_t t = 0; t < m; t++) {
-            const uint32_t b = row_bank[c0 + t];
+            const uint32_t b = (uint32_t)row_bank[c0 + t].raw();   /* refused below when outside the pool */
             if (b >= g->banks.n_banks) return false;
             const uint32_t k = added[b] + chunk_added[b]++;
             for (uint32_t li = 0; li < 3; li++)
                 meta[(li * 2 + 0) * PULSAR_DSPARK_DRAFT_ROWS_MAX + t] = (int32_t)(g->ms_dspark_n_raw[b][li] + k);
             meta[6 * PULSAR_DSPARK_DRAFT_ROWS_MAX + t] = (int32_t)b;
         }
-        if (!pulsar_gpu_tensor_write(g->dspark_row_meta, 0, meta, sizeof(meta))) return false;
+        if (!pulsar_gpu_tensor_write(g->dspark_row_meta, TensorBytes{0}, meta, TensorBytes{sizeof(meta)})) return false;
         const uint64_t rb = (uint64_t)PULSAR_DSPARK_DRAFT_ROWS_MAX * sizeof(int32_t);
-        pulsar_gpu_tensor *meta_seq = pulsar_gpu_tensor_view(g->dspark_row_meta, 6u * rb, (uint64_t)m * sizeof(int32_t));
+        pulsar_gpu_tensor *meta_seq = pulsar_gpu_tensor_view(g->dspark_row_meta, TensorBytes{rb}.times(6u),
+                                                             bytes_of<int32_t>(m));
         /* main_x rows: concat -> main_proj -> main_norm (E4M3 into main_x's slot) */
         void *cq = NULL, *csf = NULL; int ckbp = 0;
         pulsar_gpu_mxfp8_act_cache_arm(g->dspark_concat, m, concat_dim);
@@ -357,8 +358,9 @@ bool gpu_graph_dspark_seed_rows_banked(
         }
         /* each layer: kv projection, its norm, rope at each row's position, banked ring store */
         for (int li = 0; ok && li < 3; li++) {
-            pulsar_gpu_tensor *rope_pos = pulsar_gpu_tensor_view(g->dspark_row_meta, (uint64_t)(li * 2) * rb,
-                                                                 (uint64_t)m * sizeof(int32_t));
+            pulsar_gpu_tensor *rope_pos = pulsar_gpu_tensor_view(g->dspark_row_meta,
+                                                                 TensorBytes{rb}.times(li * 2),
+                                                                 bytes_of<int32_t>(m));
             ok = rope_pos && pulsar_linear_slot(g->dspark_seed_kv, dspark_model, w->layer[li].attn_kv, PULSAR_N_EMBD, 0, PULSAR_N_HEAD_DIM, g->dspark_main_x, m);
             if (ok) ok = pulsar_gpu_rms_norm_weight_rows_tensor(g->dspark_seed_norm, g->dspark_seed_kv,
                                              tensor_map_base(dspark_model, w->layer[li].attn_kv_a_norm),
@@ -413,7 +415,7 @@ bool gpu_graph_dspark_draft_forward(
         const pulsar_model         *dspark_model,
         const pulsar_dspark_weights *w,
         pulsar_gpu_tensor         *base_logits_out,
-        const int32_t            draft_ids[],
+        const TokId              draft_ids[],
         uint32_t                n_draft) {
     /* L150: the single-bank forward is the banked one at n_banks == 1 -- the
      * scalar-position code path, byte-identical to before. */
@@ -441,7 +443,7 @@ bool gpu_graph_dspark_draft_forward_banks(
         const pulsar_model         *dspark_model,
         const pulsar_dspark_weights *w,
         pulsar_gpu_tensor         *base_logits_out,
-        const int32_t            draft_ids[],
+        const TokId              draft_ids[],
         uint32_t                n_draft,
         uint32_t                n_banks,
         const uint32_t          *row_bank,
@@ -473,18 +475,18 @@ bool gpu_graph_dspark_draft_forward_banks(
             }
             meta[6 * PULSAR_DSPARK_DRAFT_ROWS_MAX + t] = (int32_t)b;
         }
-        if (!pulsar_gpu_tensor_write(g->dspark_row_meta, 0, meta, sizeof(meta))) return false;
+        if (!pulsar_gpu_tensor_write(g->dspark_row_meta, TensorBytes{0}, meta, TensorBytes{sizeof(meta)})) return false;
         const uint64_t rb = (uint64_t)PULSAR_DSPARK_DRAFT_ROWS_MAX * sizeof(int32_t);
         bool vok = true;
         for (uint32_t li = 0; li < 3; li++) {
-            meta_rope[li] = pulsar_gpu_tensor_view(g->dspark_row_meta, (uint64_t)(li * 2 + 0) * rb,
-                                                   (uint64_t)n_draft * sizeof(int32_t));
-            meta_vis[li] = pulsar_gpu_tensor_view(g->dspark_row_meta, (uint64_t)(li * 2 + 1) * rb,
-                                                  (uint64_t)n_draft * sizeof(int32_t));
+            meta_rope[li] = pulsar_gpu_tensor_view(g->dspark_row_meta, TensorBytes{rb}.times(li * 2 + 0),
+                                                   bytes_of<int32_t>(n_draft));
+            meta_vis[li] = pulsar_gpu_tensor_view(g->dspark_row_meta, TensorBytes{rb}.times(li * 2 + 1),
+                                                  bytes_of<int32_t>(n_draft));
             vok = vok && meta_rope[li] && meta_vis[li];
         }
-        meta_seq = pulsar_gpu_tensor_view(g->dspark_row_meta, 6u * rb,
-                                          (uint64_t)n_draft * sizeof(int32_t));
+        meta_seq = pulsar_gpu_tensor_view(g->dspark_row_meta, TensorBytes{rb}.times(6u),
+                                          bytes_of<int32_t>(n_draft));
         if (!vok || !meta_seq) {
             for (uint32_t li = 0; li < 3; li++) {
                 pulsar_gpu_tensor_free(meta_rope[li]);
@@ -535,12 +537,13 @@ bool gpu_graph_dspark_draft_forward_banks(
     /* L335: the embed kernel does not clamp (an id past the vocabulary is an image slot's sentinel there): a draft id
      * outside the vocabulary refuses here, by name. */
     for (uint32_t i = 0; i < n_draft; i++) {
-        if (draft_ids[i] < 0 || draft_ids[i] >= (int32_t)PULSAR_N_VOCAB) {
-            fprintf(stderr, "pulsar: dspark draft token %d at row %u is not a vocab id -- refusing\n", draft_ids[i], i);
+        if (!draft_ids[i].below(PULSAR_N_VOCAB)) {
+            fprintf(stderr, "pulsar: dspark draft token %d at row %u is not a vocab id -- refusing\n",
+                    draft_ids[i].raw(), i);
             return false;
         }
     }
-    if (!pulsar_gpu_tensor_write(tokens_t, 0, draft_ids, (uint64_t)n_draft * sizeof(int32_t)))
+    if (!pulsar_gpu_tensor_write(tokens_t, TensorBytes{0}, draft_ids, bytes_of<int32_t>(n_draft)))
         return false;
     bool ok = pulsar_gpu_embed_tokens_hc_tensor(g->batch_cur_hc,
                                               tokens_t,
@@ -589,11 +592,11 @@ bool gpu_graph_dspark_draft_forward_banks(
         /* --- HC pre-processing --- */
         /* Create views from batch working set */
         pulsar_gpu_tensor *hc_mix_view = pulsar_gpu_tensor_view(
-            g->batch_hc_mix, 0, (uint64_t)n_draft * mix_hc * sizeof(float));
+            g->batch_hc_mix, TensorBytes{0}, bytes_of<float>((uint64_t)n_draft * mix_hc));
         pulsar_gpu_tensor *hc_split_view = pulsar_gpu_tensor_view(
-            g->batch_hc_split, 0, (uint64_t)n_draft * mix_hc * sizeof(float));
+            g->batch_hc_split, TensorBytes{0}, bytes_of<float>((uint64_t)n_draft * mix_hc));
         pulsar_gpu_tensor *ffn_cur_view = pulsar_gpu_tensor_view(
-            g->batch_ffn_cur, 0, (uint64_t)n_draft * PULSAR_N_EMBD * sizeof(float));
+            g->batch_ffn_cur, TensorBytes{0}, bytes_of<float>((uint64_t)n_draft * PULSAR_N_EMBD));
         ok = hc_mix_view && hc_split_view && ffn_cur_view;
         /* RMS norm: flat HC from batch_cur_hc.
          *
@@ -845,13 +848,13 @@ bool gpu_graph_dspark_draft_forward_banks(
          * capacity, ~2.8 ms per call x3 blocks = ~8 ms of pure waste per spec step. */
         if (ok) {
             pulsar_gpu_tensor *after_attn_view = pulsar_gpu_tensor_view(
-                g->batch_after_attn_hc, 0,
-                (uint64_t)n_draft * PULSAR_N_HC * PULSAR_N_EMBD * PULSAR_HC_ELT_SIZE);   /* carrier */
+                g->batch_after_attn_hc, TensorBytes{0},
+                elt_bytes((uint64_t)n_draft * PULSAR_N_HC * PULSAR_N_EMBD, PULSAR_HC_ELT_SIZE));   /* carrier */
             ok = after_attn_view &&
                  pulsar_gpu_hc_expand_split_tensor(
                      after_attn_view, g->batch_attn_out,
                      g->batch_cur_hc, g->batch_hc_split,
-                     PULSAR_N_EMBD, PULSAR_N_HC) != 0;
+                     PULSAR_N_EMBD, PULSAR_N_HC, n_draft) != 0;
             pulsar_gpu_tensor_free(after_attn_view);
         }
 
@@ -891,9 +894,9 @@ bool gpu_graph_dspark_draft_forward_banks(
      * distinct buffer get a copy; the session passes g->spec_logits itself, so
      * skip the self-copy (a same-buffer cudaMemcpy is undefined). */
     if (ok && base_logits_out && base_logits_out != g->spec_logits) {
-        const uint64_t logits_bytes = (uint64_t)n_draft * PULSAR_N_VOCAB * sizeof(float);
-        ok = pulsar_gpu_tensor_copy(base_logits_out, 0,
-                                  g->spec_logits, 0,
+        const TensorBytes logits_bytes = bytes_of<float>((uint64_t)n_draft * PULSAR_N_VOCAB);
+        ok = pulsar_gpu_tensor_copy(base_logits_out, TensorBytes{0},
+                                  g->spec_logits, TensorBytes{0},
                                   logits_bytes) != 0;
     }
 
@@ -953,8 +956,8 @@ bool gpu_graph_encode_output_head(
     if (!rows.ok()) return false;
     pulsar_gpu_tensor *row_hc = gpu_graph_hc_row_view(g->batch_cur_hc, row, hc_dim);
     pulsar_gpu_tensor *row_pre = pulsar_gpu_tensor_view(g->batch_hc_pre,
-                                                        (uint64_t)row * PULSAR_N_HC * sizeof(float),
-                                                        (uint64_t)PULSAR_N_HC * sizeof(float));
+                                                        bytes_of<float>((uint64_t)row * PULSAR_N_HC),
+                                                        bytes_of<float>(PULSAR_N_HC));
     bool ok = row_hc && row_pre && out;
     /* The collapse is SHARED; only the coefficient source differs.  0731 binds
      * output_hc_* and computes its own; V4.1 binds none and collapses with the
@@ -971,12 +974,12 @@ bool gpu_graph_encode_output_head(
                                                         tensor_map_base(model, weights->output_hc_scale), tensor_map_size(model, weights->output_hc_scale),
                                                         weights->output_hc_scale->abs_offset,
                                                         weights->output_hc_base->abs_offset,
-                                                        PULSAR_N_HC, PULSAR_HC_EPS) != 0;
+                                                        PULSAR_N_HC, PULSAR_HC_EPS, 1u) != 0;   /* one row */
         if (ok) {
             gpu_graph_debug_dump_tensor("result_hc_weights", g->output_weights, PULSAR_N_HC, PULSAR_N_LAYER, 0);
         }
         if (ok) ok = pulsar_gpu_hc_weighted_sum_tensor(g->output_embd, row_hc, g->output_weights,
-                                                      PULSAR_N_EMBD, PULSAR_N_HC) != 0;
+                                                      PULSAR_N_EMBD, PULSAR_N_HC, 1u) != 0;
     } else {
         if (ok) {
             gpu_graph_debug_dump_tensor("result_hc_weights", row_pre, PULSAR_N_HC, PULSAR_N_LAYER, 0);
@@ -985,7 +988,7 @@ bool gpu_graph_encode_output_head(
                                                       row_hc,
                                                       row_pre,
                                                       PULSAR_N_EMBD,
-                                                      PULSAR_N_HC) != 0;
+                                                      PULSAR_N_HC, 1u) != 0;
     }
     pulsar_gpu_tensor_free(row_pre);
     pulsar_gpu_tensor_free(row_hc);
@@ -1252,17 +1255,17 @@ static bool gpu_graph_encode_output_head_batch_impl(
     bool ok = true;
     /* the sweep-final rows and the pre the last FFN handed each of them */
     rows_hc = pulsar_gpu_tensor_view(g->batch_cur_hc,
-                                     (uint64_t)row0 * hc_dim * PULSAR_HC_ELT_SIZE,
-                                     (uint64_t)n_tokens * hc_dim * PULSAR_HC_ELT_SIZE);
+                                     elt_bytes((uint64_t)row0 * hc_dim, PULSAR_HC_ELT_SIZE),
+                                     elt_bytes((uint64_t)n_tokens * hc_dim, PULSAR_HC_ELT_SIZE));
     rows_pre = pulsar_gpu_tensor_view(g->batch_hc_pre,
-                                      (uint64_t)row0 * PULSAR_N_HC * sizeof(float),
-                                      (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));
+                                      bytes_of<float>((uint64_t)row0 * PULSAR_N_HC),
+                                      bytes_of<float>((uint64_t)n_tokens * PULSAR_N_HC));
     output_embd = pulsar_gpu_tensor_view(g->batch_ffn_cur,
-                                        0,
-                                        (uint64_t)n_tokens * PULSAR_N_EMBD * sizeof(float));
+                                        TensorBytes{0},
+                                        bytes_of<float>((uint64_t)n_tokens * PULSAR_N_EMBD));
     output_norm = pulsar_gpu_tensor_view(g->batch_ffn_norm,
-                                        0,
-                                        (uint64_t)n_tokens * PULSAR_N_EMBD * sizeof(float));
+                                        TensorBytes{0},
+                                        bytes_of<float>((uint64_t)n_tokens * PULSAR_N_EMBD));
     /* These heads REUSE batch_ffn_norm as output_norm scratch at the same n_tok
      * and in_dim the layer encodes armed it with, so an activation cache that
      * outlived a layer would hit here and quantize the vocab GEMM from stale
@@ -1270,8 +1273,8 @@ static bool gpu_graph_encode_output_head_batch_impl(
      * on the same door, and it is free. */
     pulsar_gpu_mxfp8_act_cache_disarm();
     logits = pulsar_gpu_tensor_view(out,
-                                   0,
-                                   (uint64_t)n_tokens * vocab_dim * sizeof(float));
+                                   TensorBytes{0},
+                                   bytes_of<float>((uint64_t)n_tokens * vocab_dim));
     ok = rows_hc && rows_pre && output_embd && output_norm && logits;
 
     /* The collapse is SHARED; only the coefficient source differs.  A profile that
@@ -1287,10 +1290,10 @@ static bool gpu_graph_encode_output_head_batch_impl(
             fprintf(stderr, "pulsar: output_hc_fn is bound without scale/base -- refusing\n");
             ok = false;
         }
-        pulsar_gpu_tensor *hc_pre = pulsar_gpu_tensor_view(g->batch_hc_mix, 0,
-                                        (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));
-        pulsar_gpu_tensor *hc_w = pulsar_gpu_tensor_view(g->batch_hc_split, 0,
-                                        (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));
+        pulsar_gpu_tensor *hc_pre = pulsar_gpu_tensor_view(g->batch_hc_mix, TensorBytes{0},
+                                        bytes_of<float>((uint64_t)n_tokens * PULSAR_N_HC));
+        pulsar_gpu_tensor *hc_w = pulsar_gpu_tensor_view(g->batch_hc_split, TensorBytes{0},
+                                        bytes_of<float>((uint64_t)n_tokens * PULSAR_N_HC));
         if (!hc_pre || !hc_w) ok = false;
         void *out_flat_b = NULL;
         if (ok && !pulsar_gpu_bf16_act_slot(g->batch_flat_hc, n_tokens,
@@ -1311,9 +1314,9 @@ static bool gpu_graph_encode_output_head_batch_impl(
                                                         weights->output_hc_scale->abs_offset,
                                                         weights->output_hc_base->abs_offset,
                                                         PULSAR_N_HC,
-                                                        PULSAR_HC_EPS) != 0;
+                                                        PULSAR_HC_EPS, n_tokens) != 0;
         if (ok) ok = pulsar_gpu_hc_weighted_sum_tensor(output_embd, rows_hc, hc_w,
-                                                      PULSAR_N_EMBD, PULSAR_N_HC) != 0;
+                                                      PULSAR_N_EMBD, PULSAR_N_HC, n_tokens) != 0;
         pulsar_gpu_tensor_free(hc_w);
         pulsar_gpu_tensor_free(hc_pre);
     } else if (ok) {
@@ -1321,7 +1324,7 @@ static bool gpu_graph_encode_output_head_batch_impl(
                                               rows_hc,
                                               rows_pre,
                                               PULSAR_N_EMBD,
-                                              PULSAR_N_HC) != 0;
+                                              PULSAR_N_HC, n_tokens) != 0;
     }
     void *on_b = NULL;
     if (ok && weights->output->type == PULSAR_TENSOR_BF16 &&
@@ -1394,16 +1397,20 @@ bool gpu_graph_encode_dspark_output_head_batch(
         uint64_t                  vocab_dim) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap ||
         n_tokens > PULSAR_DSPARK_DRAFT_ROWS_MAX || !g->spec_logits) return false;
-    pulsar_gpu_tensor *rows_pre = pulsar_gpu_tensor_view(g->batch_hc_pre, 0, (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));
-    pulsar_gpu_tensor *output_embd = pulsar_gpu_tensor_view(g->batch_ffn_cur, 0, (uint64_t)n_tokens * PULSAR_N_EMBD * sizeof(float));
-    pulsar_gpu_tensor *output_norm = pulsar_gpu_tensor_view(g->batch_ffn_norm, 0, (uint64_t)n_tokens * PULSAR_N_EMBD * sizeof(float));
+    pulsar_gpu_tensor *rows_pre = pulsar_gpu_tensor_view(g->batch_hc_pre, TensorBytes{0},
+                                                         bytes_of<float>((uint64_t)n_tokens * PULSAR_N_HC));
+    pulsar_gpu_tensor *output_embd = pulsar_gpu_tensor_view(g->batch_ffn_cur, TensorBytes{0},
+                                                            bytes_of<float>((uint64_t)n_tokens * PULSAR_N_EMBD));
+    pulsar_gpu_tensor *output_norm = pulsar_gpu_tensor_view(g->batch_ffn_norm, TensorBytes{0},
+                                                            bytes_of<float>((uint64_t)n_tokens * PULSAR_N_EMBD));
     /* These heads REUSE batch_ffn_norm as output_norm scratch at the same n_tok
      * and in_dim the layer encodes armed it with, so an activation cache that
      * outlived a layer would hit here and quantize the vocab GEMM from stale
      * activations.  The FFN encode disarms at its exit; this is the second lock
      * on the same door, and it is free. */
     pulsar_gpu_mxfp8_act_cache_disarm();
-    pulsar_gpu_tensor *logits = pulsar_gpu_tensor_view(g->spec_logits, 0, (uint64_t)n_tokens * vocab_dim * sizeof(float));
+    pulsar_gpu_tensor *logits = pulsar_gpu_tensor_view(g->spec_logits, TensorBytes{0},
+                                                       bytes_of<float>((uint64_t)n_tokens * vocab_dim));
     bool ok = rows_pre && output_embd && output_norm && logits;
     /* The DRAFTER's own head mix (dspark.2.hc_head_*).  Unlike the TARGET head,
      * which uses the fused norm+mix kernel, this one uses the UNFUSED
@@ -1413,10 +1420,10 @@ bool gpu_graph_encode_dspark_output_head_batch(
      * differs.  plans/96-two-profiles-one-engine.md s17. */
     if (ok && dw->hc_head_fn) {
         const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
-        pulsar_gpu_tensor *output_pre = pulsar_gpu_tensor_view(g->batch_hc_mix, 0,
-                                        (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));
-        pulsar_gpu_tensor *mix_weights = pulsar_gpu_tensor_view(g->batch_hc_split, 0,
-                                        (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));
+        pulsar_gpu_tensor *output_pre = pulsar_gpu_tensor_view(g->batch_hc_mix, TensorBytes{0},
+                                        bytes_of<float>((uint64_t)n_tokens * PULSAR_N_HC));
+        pulsar_gpu_tensor *mix_weights = pulsar_gpu_tensor_view(g->batch_hc_split, TensorBytes{0},
+                                        bytes_of<float>((uint64_t)n_tokens * PULSAR_N_HC));
         void *dsp_flat_b = NULL;
         if (!dw->hc_head_scale || !dw->hc_head_base || !output_pre || !mix_weights) {
             fprintf(stderr, "pulsar: drafter head mix: weights or scratch missing -- refusing\n");
@@ -1434,14 +1441,14 @@ bool gpu_graph_encode_dspark_output_head_batch(
                                                         tensor_map_base(dspark_model, dw->hc_head_scale), tensor_map_size(dspark_model, dw->hc_head_scale),
                                                         dw->hc_head_scale->abs_offset,
                                                         dw->hc_head_base->abs_offset,
-                                                        PULSAR_N_HC, PULSAR_HC_EPS) != 0;
+                                                        PULSAR_N_HC, PULSAR_HC_EPS, n_tokens) != 0;
         if (ok) ok = pulsar_gpu_hc_weighted_sum_tensor(output_embd, g->batch_cur_hc, mix_weights,
-                                                      PULSAR_N_EMBD, PULSAR_N_HC) != 0;
+                                                      PULSAR_N_EMBD, PULSAR_N_HC, n_tokens) != 0;
         pulsar_gpu_tensor_free(output_pre);
         pulsar_gpu_tensor_free(mix_weights);
     } else if (ok) {
         ok = pulsar_gpu_hc_weighted_sum_tensor(output_embd, g->batch_cur_hc, rows_pre,
-                                              PULSAR_N_EMBD, PULSAR_N_HC) != 0;
+                                              PULSAR_N_EMBD, PULSAR_N_HC, n_tokens) != 0;
     }
     void *dn_b = NULL;
     if (ok && bw->output->type == PULSAR_TENSOR_BF16 &&

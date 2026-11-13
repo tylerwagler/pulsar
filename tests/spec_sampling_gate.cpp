@@ -142,12 +142,12 @@ static int start_reset(pulsar_session *s, const start_state *st, char *err, size
  * a rewind-based reset came within 92% but not to identity (compressor state,
  * drafter window), so the payload load is the reset where the family has one. */
 static int bank_reset(pulsar_session *s, uint32_t b, const start_state *st, char *err, size_t errlen) {
-    if (pulsar_session_bank_repoint(s, b) != 0) {
+    if (pulsar_session_bank_repoint(s, BankId{b}) != 0) {
         snprintf(err, errlen, "bank %u repoint failed", b);
         return -1;
     }
     if (start_reset(s, st, err, errlen) != 0) return -1;
-    pulsar_session_bank_state_save(s, b);
+    pulsar_session_bank_state_save(s, BankId{b});
     return 0;
 }
 
@@ -175,11 +175,11 @@ static int sampled_plain_batch(pulsar_session *s, const start_state *snap,
         if (pos0 < 0) pos0 = p;
         if (p != pos0) { snprintf(err, errlen, "bank %d at pos %d, bank 0 at %d", b, p, pos0); return -1; }
         rng[b] = traj_seed(t0 + b, 0);
-        const int tok = pulsar_session_sample(s, temp, 0, top_p, min_p, &rng[b]);
-        seq[t0 + b][0] = tok;
+        const TokId tok = pulsar_session_sample(s, temp, 0, top_p, min_p, &rng[b]);
+        seq[t0 + b][0] = tok.raw();
         got[b] = 1;
         live[b] = !pulsar_token_is_stop(e, tok) && DEPTH > 1;
-        reqs[b].bank = (uint32_t)b; reqs[b].pos = TokPos{pos0}; reqs[b].token = tok;
+        reqs[b].bank = BankId{b}; reqs[b].pos = TokPos{pos0}; reqs[b].token = tok;
     }
     for (int step = 1; step < DEPTH; step++) {
         pulsar_multiseq_req batch[SAMPLED_BANKS_PLAIN];
@@ -197,7 +197,7 @@ static int sampled_plain_batch(pulsar_session *s, const start_state *snap,
         /* every bank's row drawn in one device launch, each at its own stream's key (L302) */
         uint32_t qrow[SAMPLED_BANKS_PLAIN];
         pulsar_row_draw d[SAMPLED_BANKS_PLAIN];
-        int drawn[SAMPLED_BANKS_PLAIN];
+        TokId drawn[SAMPLED_BANKS_PLAIN];
         for (uint32_t q = 0; q < m; q++) {
             qrow[q] = q;
             d[q] = pulsar_row_draw{temp, 0, top_p, min_p, &rng[who[q]], false, NULL};
@@ -208,10 +208,10 @@ static int sampled_plain_batch(pulsar_session *s, const start_state *snap,
         }
         for (uint32_t q = 0; q < m; q++) {
             const int b = who[q];
-            const int tok = drawn[q];
+            const int tok = drawn[q].raw();
             seq[t0 + b][got[b]++] = tok;
-            reqs[b].pos += TokCount{1}; reqs[b].token = tok;
-            if (pulsar_token_is_stop(e, tok) || got[b] >= DEPTH) live[b] = 0;
+            reqs[b].pos += TokCount{1}; reqs[b].token = TokId{tok};
+            if (pulsar_token_is_stop(e, TokId{tok}) || got[b] >= DEPTH) live[b] = 0;
         }
     }
     for (int b = 0; b < nb; b++)
@@ -245,17 +245,17 @@ static int sampled_spec_batch(pulsar_session *s, const start_state *snap,
         for (int b = 0; b < nb; b++) {
             begun[b] = 0;
             if (!live[b]) continue;
-            if (!pulsar_session_bank_state_restore(s, (uint32_t)b)) {
+            if (!pulsar_session_bank_state_restore(s, BankId{b})) {
                 snprintf(err, errlen, "bank %d restore failed", b); return -1;
             }
-            first[b] = pulsar_session_spec_next_base(s, temp, 0, top_p, min_p, &rng[b]);
-            if (pulsar_token_is_stop(e, first[b])) {
+            first[b] = pulsar_session_spec_next_base(s, temp, 0, top_p, min_p, &rng[b]).raw();
+            if (pulsar_token_is_stop(e, TokId{first[b]})) {
                 seq[t0 + b][got[b]++] = first[b];
                 live[b] = 0;
-                pulsar_session_bank_state_save(s, (uint32_t)b);
+                pulsar_session_bank_state_save(s, BankId{b});
                 continue;
             }
-            if (pulsar_session_spec_round_begin(s, r[b], first[b], DEPTH - got[b], 17,
+            if (pulsar_session_spec_round_begin(s, r[b], TokId{first[b]}, DEPTH - got[b], 17,
                                                 temp, 0, top_p, min_p, err, errlen) != 0)
                 return -1;
             begun[b] = 1;
@@ -266,8 +266,8 @@ static int sampled_spec_batch(pulsar_session *s, const start_state *snap,
                 return -1;
             }
             row0[b] = rows;
-            rows += pulsar_spec_round_fill_reqs(r[b], (uint32_t)b, reqs + rows);
-            pulsar_session_bank_state_save(s, (uint32_t)b);
+            rows += pulsar_spec_round_fill_reqs(r[b], BankId{b}, reqs + rows);
+            pulsar_session_bank_state_save(s, BankId{b});
             any = 1;
         }
         if (!any) break;
@@ -278,37 +278,37 @@ static int sampled_spec_batch(pulsar_session *s, const start_state *snap,
         pulsar_session_spec_arm_capture(s, 0u);
         if (rc != 0 || out_rows != rows) {
             for (int b = 0; b < nb; b++) if (begun[b]) {
-                pulsar_session_bank_state_restore(s, (uint32_t)b);
+                pulsar_session_bank_state_restore(s, BankId{b});
                 pulsar_session_spec_round_abort(s, r[b]);
             }
             if (rc == 0) snprintf(err, errlen, "decode_mixed returned %u rows for %u", out_rows, rows);
             return -1;
         }
         pulsar_spec_round *cont_r[SAMPLED_BANKS_SPEC];
-        uint32_t cont_b[SAMPLED_BANKS_SPEC];
+        BankId cont_b[SAMPLED_BANKS_SPEC];
         uint64_t *cont_rng[SAMPLED_BANKS_SPEC];
         int nc = 0;
         for (int b = 0; b < nb; b++) {
             if (!begun[b]) continue;
-            if (!pulsar_session_bank_state_restore(s, (uint32_t)b)) {
+            if (!pulsar_session_bank_state_restore(s, BankId{b})) {
                 snprintf(err, errlen, "bank %d restore failed", b); return -1;
             }
-            int accepted[17];
-            const int na = pulsar_session_spec_round_end(s, r[b], first[b], temp, 0, top_p, min_p,
+            TokId accepted[17];
+            const int na = pulsar_session_spec_round_end(s, r[b], TokId{first[b]}, temp, 0, top_p, min_p,
                                                          &rng[b], row0[b], accepted, 17,
                                                          err, errlen);
             if (na < 0) return -1;
-            for (int i = 0; i < na && got[b] < DEPTH; i++) seq[t0 + b][got[b]++] = accepted[i];
-            if (got[b] >= DEPTH || (got[b] > 0 && pulsar_token_is_stop(e, seq[t0 + b][got[b] - 1]))) live[b] = 0;
-            pulsar_session_bank_state_save(s, (uint32_t)b);
-            if (live[b]) { cont_r[nc] = r[b]; cont_b[nc] = (uint32_t)b; cont_rng[nc] = &rng[b]; nc++; }
+            for (int i = 0; i < na && got[b] < DEPTH; i++) seq[t0 + b][got[b]++] = accepted[i].raw();
+            if (got[b] >= DEPTH || (got[b] > 0 && pulsar_token_is_stop(e, TokId{seq[t0 + b][got[b] - 1]}))) live[b] = 0;
+            pulsar_session_bank_state_save(s, BankId{b});
+            if (live[b]) { cont_r[nc] = r[b]; cont_b[nc] = BankId{b}; cont_rng[nc] = &rng[b]; nc++; }
         }
         if (nc > 0) {
             if (pulsar_session_spec_redraft_batch(s, cont_r, cont_b, cont_rng, nc, err, errlen) != 0)
                 return -1;
             for (int i = 0; i < nc; i++) {
                 if (!pulsar_session_bank_state_restore(s, cont_b[i])) {
-                    snprintf(err, errlen, "bank %u restore failed", cont_b[i]); return -1;
+                    snprintf(err, errlen, "bank %d restore failed", cont_b[i].raw()); return -1;
                 }
                 pulsar_session_spec_redraft_commit(s, cont_r[i]);
                 pulsar_session_bank_state_save(s, cont_b[i]);
@@ -396,13 +396,13 @@ static void spec_report(const char *tag, spec_snap a, spec_snap b) {
 static int gate_step_batched(pulsar_session *s, float temperature, int top_k,
                              float top_p, float min_p, uint64_t *rng,
                              char *err, size_t errlen) {
-    int toks[2];
+    TokId toks[2];
     int k = pulsar_session_generate_speculative(s, temperature, top_k, top_p, min_p,
                                                 rng, /*max_tokens=*/1,
                                                 toks, (int)(sizeof(toks)/sizeof(toks[0])),
                                                 err, errlen);
     if (k <= 0) return -1;
-    return toks[0];
+    return toks[0].raw();
 }
 
 int GATE_ENTRY(int argc, char **argv) {
@@ -601,11 +601,11 @@ int GATE_ENTRY(int argc, char **argv) {
                 tok = gate_step_batched(session, 0.0f, 0, 1.0f, 0.0f, &rng,
                                         err, sizeof(err));
                 if (tok < 0) { fprintf(stderr, "ref batched step: %s\n", err); free(lg); goto done; }
-                if (pulsar_token_is_stop(engine, tok)) break;
+                if (pulsar_token_is_stop(engine, TokId{tok})) break;
             } else {
-                tok = pulsar_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng);
-                if (pulsar_token_is_stop(engine, tok)) break;
-                if (pulsar_session_eval(session, tok, err, sizeof(err)) != 0) { free(lg); goto done; }
+                tok = pulsar_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng).raw();
+                if (pulsar_token_is_stop(engine, TokId{tok})) break;
+                if (pulsar_session_eval(session, TokId{tok}, err, sizeof(err)) != 0) { free(lg); goto done; }
             }
             ref_gap[nref] = g;
             ref[nref++] = tok;
@@ -618,7 +618,7 @@ int GATE_ENTRY(int argc, char **argv) {
             int *n = rep == 0 ? &ngot : &ngot2;
             rng = 7;
             while (*n < nref) {
-                int toks[17];
+                TokId toks[17];
                 int k = pulsar_session_generate_speculative(session, 0.0f, 0, 1.0f, 0.0f, &rng,
                                                          nref - *n, toks, 17,
                                                          err, sizeof(err));
@@ -627,7 +627,7 @@ int GATE_ENTRY(int argc, char **argv) {
                     printf("  [round returned k=%d with budget %d -> %d token(s) "
                            "generated but DROPPED from the output]\n",
                            k, nref - *n, k - (nref - *n));
-                for (int i = 0; i < k && *n < nref; i++) dst[(*n)++] = toks[i];
+                for (int i = 0; i < k && *n < nref; i++) dst[(*n)++] = toks[i].raw();
             }
             /* Does the session's COMMITTED history contain tokens the spec path
              * never returned (ghost commit), or vice versa? Either way the

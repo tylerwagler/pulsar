@@ -38,18 +38,18 @@ static bool agent_worker_should_compact(agent_worker *w) {
 /// @brief The single special token `rendered` tokenizes to (see above).
 /// @param engine   the loaded engine
 /// @param rendered the special token's text
-/// @return its id, or -1 when it is not exactly one token
-static int agent_special_token_id(pulsar_engine *engine, const char *rendered) {
+/// @return its id, or none() when it is not exactly one token
+static TokId agent_special_token_id(pulsar_engine *engine, const char *rendered) {
     pulsar_tokens t = {0};
     const bool encoded = pulsar_tokenize_rendered_chat(engine, rendered, &t);
-    int id = encoded && t.len == 1 ? t.v[0] : -1;
+    const TokId id = encoded && t.len == 1 ? t.v[0] : TokId::none();
     pulsar_tokens_free(&t);
     return id;
 }
 
 
 
-int agent_compact_tail_cut(const pulsar_turn_markers *m, const int *v, int target, int bottom) {
+int agent_compact_tail_cut(const pulsar_turn_markers *m, const TokId *v, int target, int bottom) {
     for (int i = target; m && i < bottom; i++) {
         if (pulsar_turn_marker_at(m, v, bottom, i) == 1) return i;
     }
@@ -216,8 +216,8 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
      * cannot accidentally continue from the private compaction exchange. */
     agent_buf summary = {0};
     char eval_err[160] = {0};
-    int think_end_id = pulsar_token_think_close(w->engine);
-    int dsml_id = agent_special_token_id(w->engine, "｜DSML｜");
+    TokId think_end_id = pulsar_token_think_close(w->engine);
+    TokId dsml_id = agent_special_token_id(w->engine, "｜DSML｜");
     double t0 = agent_now_sec();
     for (int i = 0; i < summary_max; i++) {
         if (worker_should_interrupt(w)) {
@@ -234,13 +234,13 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
         }
         /* L373: the summary's decode polls the bash jobs as a turn's does (a compaction runs on the worker thread) */
         if (w->bash_jobs && i > 0 && i % AGENT_BASH_POLL_TOKENS == 0) agent_bash_jobs_poll(w);
-        int token = pulsar_session_argmax(w->session);
+        TokId token = pulsar_session_argmax(w->session);
         if (pulsar_token_is_stop(w->engine, token)) break;
         if (token == think_end_id || token == dsml_id) {
             if (token == dsml_id && summary.len && summary.ptr[summary.len - 1] == '<') {
                 summary.ptr[--summary.len] = '\0';
             }
-            agent_trace(w, "compaction summary stopped before control token id=%d", token);
+            agent_trace(w, "compaction summary stopped before control token id=%d", token.raw());
             break;
         }
         if (pulsar_session_eval(w->session, token, eval_err, sizeof(eval_err)) != 0) {
@@ -357,13 +357,13 @@ int worker_accept_generated_token(agent_worker *w,
                                          agent_stream_renderer *stream,
                                          char *err,
                                          size_t err_len) {
-    if (pulsar_session_eval(w->session, token, err, err_len) != 0)
+    if (pulsar_session_eval(w->session, TokId{token}, err, err_len) != 0)
         return 1;
 
-    pulsar_tokens_push(&w->transcript, token);
+    pulsar_tokens_push(&w->transcript, TokId{token});
 
     size_t text_len = 0;
-    char *text = pulsar_token_text(w->engine, token, &text_len);
+    char *text = pulsar_token_text(w->engine, TokId{token}, &text_len);
     agent_trace_token(w, token, text, text_len, *generated + 1);
     agent_stream_text(stream, text, text_len, false);
     free(text);
@@ -400,7 +400,7 @@ int worker_force_generated_text(agent_worker *w,
         return 1;
     }
     for (int i = 0; i < tokens.len && *generated < max_tokens; i++) {
-        if (worker_accept_generated_token(w, tokens.v[i], generated, t0,
+        if (worker_accept_generated_token(w, tokens.v[i].raw(), generated, t0,
                                           stream, err, err_len) != 0) {
             pulsar_tokens_free(&tokens);
             return 1;

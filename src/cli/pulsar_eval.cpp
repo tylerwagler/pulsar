@@ -2708,7 +2708,7 @@ static int token_rank_in_top(pulsar_session *session, int token, int max_rank) {
     int n = pulsar_session_top_logprobs(session, top, max_rank);
     int rank = 0;
     for (int i = 0; i < n; i++) {
-        if (top[i].id == token) {
+        if (top[i].id == TokId{token}) {
             rank = i + 1;
             break;
         }
@@ -4128,19 +4128,19 @@ static double tui_wait_if_paused(eval_ui *ui, const char *phase) {
  *  honours a pause (the paused time is taken out of the phase's speed).
  *  @param ud      the eval_ui
  *  @param event   the event name; only "prefill_chunk" and "prefill_display" are handled
- *  @param current prefill rows done
+ *  @param current the position the prefill stands at
  *  @param total   prefill rows total */
-static void eval_prefill_progress(void *ud, const char *event, int current, int total) {
+static void eval_prefill_progress(void *ud, const char *event, TokPos current, TokCount total) {
     eval_ui *ui = (eval_ui *)ud;
     if (!ui || !event) return;
     if (strcmp(event, "prefill_chunk") && strcmp(event, "prefill_display"))
         return;
     tui_consume_input(ui);
     tui_run_clock_tick(ui);
-    ui->prefill_current = current;
-    ui->prefill_total = total;
+    ui->prefill_current = current.raw();
+    ui->prefill_total = total.raw();
     double elapsed = now_sec() - ui->phase_start_sec;
-    ui->speed_tps = elapsed > 0.001 ? (double)current / elapsed : 0.0;
+    ui->speed_tps = elapsed > 0.001 ? (double)current.raw() / elapsed : 0.0;
     tui_refresh(ui, "prefill");
     double paused_sec = tui_wait_if_paused(ui, "prefill");
     if (paused_sec > 0.0) ui->phase_start_sec += paused_sec;
@@ -4303,8 +4303,8 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
     pulsar_tokens think_close_tokens = {0};
     /* the tokenizer's ONE think-close id (L272 B11: re-tokenizing the text gave BPE pieces on Qwen) */
     if (generation_in_think) {
-        const int close_id = pulsar_token_think_close(engine);
-        if (close_id < 0) {
+        const TokId close_id = pulsar_token_think_close(engine);
+        if (!close_id.is_token()) {
             fprintf(stderr, "pulsar-eval: the tokenizer has no </think> token to force a close with\n");
             free(raw.v);
             free(question);
@@ -4315,7 +4315,7 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
     if (!tty && plain_in_think) plain_set_thinking_color(use_plain_color);
     tui_refresh(ui, "thinking");
 
-    const int eos = pulsar_token_eos(engine);
+    const int eos = pulsar_token_eos(engine).raw();   /* compared with the loop's raw token */
     double t0 = ui->phase_start_sec;
     int forced_close_pos = -1;
     for (int i = 0; i < generation_limit; i++) {
@@ -4402,25 +4402,25 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
          * tokens were spent before the visible answer could start. */
         if (generation_in_think && think_close_tokens.len > 0) {
             if (forced_close_pos >= 0) {
-                token = think_close_tokens.v[forced_close_pos++];
+                token = think_close_tokens.v[forced_close_pos++].raw();   /* the loop's raw token */
                 if (forced_close_pos >= think_close_tokens.len) forced_close_pos = -1;
             } else if (remaining_budget <= cfg->hard_limit_reply_budget) {
                 close_kind = EVAL_THINK_CLOSE_HARD;
-                token = think_close_tokens.v[0];
+                token = think_close_tokens.v[0].raw();
                 forced_close_pos = think_close_tokens.len > 1 ? 1 : -1;
             } else if (remaining_budget <= cfg->soft_limit_reply_budget &&
                        think_close_tokens.len == 1) {
-                close_rank = token_rank_in_top(session, think_close_tokens.v[0],
+                close_rank = token_rank_in_top(session, think_close_tokens.v[0].raw(),
                                                cfg->soft_limit_think_close_rank);
                 if (close_rank > 0) {
                     close_kind = EVAL_THINK_CLOSE_SOFT;
-                    token = think_close_tokens.v[0];
+                    token = think_close_tokens.v[0].raw();
                 }
             }
         }
         if (token < 0)
             token = pulsar_session_sample(session, cfg->temperature, 0,
-                                       cfg->top_p, cfg->min_p, rng);
+                                       cfg->top_p, cfg->min_p, rng).raw();   /* the loop's -1 = not forced */
         if (token < 0) {
             /* The sampler refused a degenerate row (L188): same exit as a
              * failed eval -- the case is an ERROR, not a shorter answer. */
@@ -4447,7 +4447,7 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
             think_close.remaining_budget = remaining_budget;
             think_close.rank = close_rank;
         }
-        if (pulsar_session_eval(session, token, err, sizeof(err)) != 0) {
+        if (pulsar_session_eval(session, TokId{token}, err, sizeof(err)) != 0) {
             plain_reset_color(use_plain_color);
             ui->generated_tokens[idx] = ui->generated;
             tui_run_clock_stop(ui);
@@ -4464,7 +4464,7 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
         }
 
         size_t len = 0;
-        char *text = pulsar_token_text(engine, token, &len);
+        char *text = pulsar_token_text(engine, TokId{token}, &len);
         buf_append(&raw, text, len);
         ui->generated++;
         ui->generated_tokens[idx] = ui->generated;

@@ -4233,8 +4233,8 @@ int pulsar_tp_send_sync(pulsar_tp *tp, uint64_t session_id,
 }
 
 int pulsar_tp_send_eval(pulsar_tp *tp, uint64_t session_id,
-                        uint64_t seq, int token) {
-    pulsar_tp_eval_command msg = { session_id, seq, (int32_t)token, 0 };
+                        uint64_t seq, TokId token) {
+    pulsar_tp_eval_command msg = { session_id, seq, token.raw(), 0 };   /* the wire's int32 */
     return tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_EVAL, &msg, sizeof(msg));
 }
 
@@ -4280,8 +4280,8 @@ int pulsar_tp_recv_chunk_verdict(pulsar_tp *tp, uint64_t session_id, int *stop,
     return 1;
 }
 
-int pulsar_tp_send_rewind(pulsar_tp *tp, uint64_t session_id, int pos) {
-    pulsar_tp_value_command msg = { session_id, (int32_t)pos, 0 };
+int pulsar_tp_send_rewind(pulsar_tp *tp, uint64_t session_id, TokPos pos) {
+    pulsar_tp_value_command msg = { session_id, (int32_t)pos.raw(), 0 };   /* the wire's int32 */
     return tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_REWIND,
                          &msg, sizeof(msg));
 }
@@ -4363,14 +4363,14 @@ static int tp_send_bank_value(pulsar_tp *tp, uint32_t type, uint64_t session_id,
     pulsar_tp_value_command msg = { session_id, (int32_t)bank, 0 };
     return tp_send_frame_to_peers(tp, type, &msg, sizeof(msg));
 }
-int pulsar_tp_send_bank_state_save(pulsar_tp *tp, uint64_t session_id, uint32_t bank) {
-    return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_STATE_SAVE, session_id, bank);
+int pulsar_tp_send_bank_state_save(pulsar_tp *tp, uint64_t session_id, BankId bank) {
+    return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_STATE_SAVE, session_id, (uint32_t)bank.raw());
 }
-int pulsar_tp_send_bank_state_restore(pulsar_tp *tp, uint64_t session_id, uint32_t bank) {
-    return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_STATE_RESTORE, session_id, bank);
+int pulsar_tp_send_bank_state_restore(pulsar_tp *tp, uint64_t session_id, BankId bank) {
+    return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_STATE_RESTORE, session_id, (uint32_t)bank.raw());
 }
-int pulsar_tp_send_bank_repoint(pulsar_tp *tp, uint64_t session_id, uint32_t bank) {
-    return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_REPOINT, session_id, bank);
+int pulsar_tp_send_bank_repoint(pulsar_tp *tp, uint64_t session_id, BankId bank) {
+    return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_REPOINT, session_id, (uint32_t)bank.raw());
 }
 
 /* The verdict collector behind pulsar_tp_wait_command_status (want_digest 0)
@@ -4595,11 +4595,11 @@ int pulsar_tp_send_segment_reconcile(pulsar_tp *tp, const char *keys, uint32_t n
     return ok;
 }
 
-int pulsar_tp_send_bank_free_physical(pulsar_tp *tp, uint64_t session_id, uint32_t bank) {
-    return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_FREE_PHYSICAL, session_id, bank);
+int pulsar_tp_send_bank_free_physical(pulsar_tp *tp, uint64_t session_id, BankId bank) {
+    return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_FREE_PHYSICAL, session_id, (uint32_t)bank.raw());
 }
-int pulsar_tp_send_bank_alloc_physical(pulsar_tp *tp, uint64_t session_id, uint32_t bank) {
-    return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_ALLOC_PHYSICAL, session_id, bank);
+int pulsar_tp_send_bank_alloc_physical(pulsar_tp *tp, uint64_t session_id, BankId bank) {
+    return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_ALLOC_PHYSICAL, session_id, (uint32_t)bank.raw());
 }
 
 /// Payload prefix of FRAME_SYNC_MM: tokens, then the image table, then the image bytes follow.

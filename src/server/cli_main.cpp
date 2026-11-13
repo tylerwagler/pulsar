@@ -60,7 +60,7 @@ static bool server_warmup_generation(pulsar_engine *engine, pulsar_session *sess
                                      int ctx_size) {
     const double t0 = server_now_sec();
     pulsar_gpu_seg_catalog_open();
-    const uint64_t avail_before = server_mem_available_bytes();
+    const KvBytes avail_before = server_mem_available_bytes();
     /* One full prefill-cap chunk plus a tail: exercises the widened chunk
      * prefill shape AND the sub-chunk tail shape.  The session's resolved
      * cap is used (the config value can be 0 = engine default). */
@@ -94,7 +94,7 @@ static bool server_warmup_generation(pulsar_engine *engine, pulsar_session *sess
     int emitted = 0;
     if (ok) {
         uint64_t rng = 0x5eed5eed5eed5eedULL;
-        int toks[17];
+        TokId toks[17];
         while (emitted < 12) {
             /* whichever drafter runs behind the round API (L272 B12: Qwen's MTP warmed with argmax before) */
             if (pulsar_engine_has_spec_rounds(engine)) {
@@ -109,7 +109,7 @@ static bool server_warmup_generation(pulsar_engine *engine, pulsar_session *sess
                 emitted += n;
                 if (pulsar_token_is_stop(engine, toks[n - 1])) break;
             } else {
-                const int tok = pulsar_session_argmax(session);
+                const TokId tok = pulsar_session_argmax(session);
                 if (pulsar_token_is_stop(engine, tok)) break;
                 if (pulsar_session_eval(session, tok, err, sizeof(err)) != 0) {
                     ok = false;
@@ -157,17 +157,17 @@ static bool server_warmup_generation(pulsar_engine *engine, pulsar_session *sess
     pulsar_tokens_free(&prompt);
     pulsar_tokens_free(&body);
     const uint64_t graph_failed = pulsar_gpu_seg_catalog_close();
-    const uint64_t avail_after = server_mem_available_bytes();
+    const KvBytes avail_after = server_mem_available_bytes();
     if (ok) {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: warmup generation: %d prompt + %d decode tokens "
                    "in %.1f s; MemAvailable %.2f -> %.2f GiB "
                    "(first-generation working set %.2f GiB materialized)",
                    want, emitted, server_now_sec() - t0,
-                   (double)avail_before / (1024.0 * 1024.0 * 1024.0),
-                   (double)avail_after / (1024.0 * 1024.0 * 1024.0),
+                   (double)avail_before.raw() / (1024.0 * 1024.0 * 1024.0),
+                   (double)avail_after.raw() / (1024.0 * 1024.0 * 1024.0),
                    (double)(avail_before > avail_after
-                                ? avail_before - avail_after : 0) /
+                                ? avail_before - avail_after : KvBytes{}).raw() /
                        (1024.0 * 1024.0 * 1024.0));
     } else {
         server_log(PULSAR_LOG_WARNING,
@@ -289,12 +289,13 @@ static bool server_overcommit_enabled(void) {
  * leave the floor free. Returns 0 if the reserves already exceed usable. */
 /// @param weights_resident_bytes the resident weights, bytes
 /// @return the session budget in bytes (0 when the reserves exceed PULSAR_SERVER_USABLE_BYTES)
-uint64_t server_kv_budget_bytes(uint64_t weights_resident_bytes) {
-    uint64_t reserved = weights_resident_bytes +
-                        PULSAR_SERVER_PROCESS_OVERHEAD_BYTES +
-                        PULSAR_SERVER_MEM_FLOOR_BYTES;
-    if (reserved >= PULSAR_SERVER_USABLE_BYTES) return 0;
-    return PULSAR_SERVER_USABLE_BYTES - reserved;
+KvBytes server_kv_budget_bytes(KvBytes weights_resident_bytes) {
+    const KvBytes usable{PULSAR_SERVER_USABLE_BYTES};
+    const KvBytes reserved = weights_resident_bytes +
+                             KvBytes{PULSAR_SERVER_PROCESS_OVERHEAD_BYTES} +
+                             KvBytes{PULSAR_SERVER_MEM_FLOOR_BYTES};
+    if (reserved >= usable) return KvBytes{};
+    return usable - reserved;
 }
 
 /* L338: a DISCRETE card's sessions live in its own memory, which server_kv_budget_bytes' constants (GB10's unified
@@ -305,9 +306,9 @@ uint64_t server_kv_budget_bytes(uint64_t weights_resident_bytes) {
 /// @param free_bytes        the device's free memory, the weights staged
 /// @param working_set_bytes the working set the margin keeps (PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES at sizing)
 /// @return the session budget in bytes (0 when the margin exceeds what is free)
-uint64_t server_kv_budget_discrete_bytes(uint64_t free_bytes, uint64_t working_set_bytes) {
-    const uint64_t margin = server_discrete_margin_bytes(working_set_bytes);
-    return free_bytes > margin ? free_bytes - margin : 0;
+KvBytes server_kv_budget_discrete_bytes(KvBytes free_bytes, KvBytes working_set_bytes) {
+    const KvBytes margin = server_discrete_margin_bytes(working_set_bytes);
+    return free_bytes > margin ? free_bytes - margin : KvBytes{};
 }
 
 #ifndef PULSAR_SERVER_TEST   /* main() only: the harnesses that include this file run no server */
@@ -315,13 +316,55 @@ uint64_t server_kv_budget_discrete_bytes(uint64_t free_bytes, uint64_t working_s
  * else (GB10, or a device that did not answer) the unified one. */
 /// @param weights_resident_bytes the resident weights, bytes (the unified formula's)
 /// @return the session budget in bytes
-static uint64_t server_kv_budget_for_device(uint64_t weights_resident_bytes) {
+static KvBytes server_kv_budget_for_device(KvBytes weights_resident_bytes) {
     if (pulsar_gpu_integrated() == 0) {
         uint64_t free_b = 0, total_b = 0;
         pulsar_gpu_mem_info(&free_b, &total_b);
-        return server_kv_budget_discrete_bytes(free_b, PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES);
+        return server_kv_budget_discrete_bytes(KvBytes{free_b}, KvBytes{PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES});
     }
     return server_kv_budget_bytes(weights_resident_bytes);
+}
+
+/** L335 P6: the session's startup price -- the ONE authority for the figures pool sizing, the admission check, the
+ * create's reconciliation, the ledger's per-bank charge and the guard's eager floor read.  Under overcommit the banked
+ * cost is affine in N, banked(N) = shared + N x (eager + demand), and admission charges only shared + N x eager (the
+ * demand-paged comp/index is VA, physical on touch); without it admission charges the full price.  Each method is the
+ * expression main() computed inline before (the oc_* triple and its sums). */
+struct server_session_price {
+    KvBytes shared;            ///< overcommit: banked(1) less one bank's marginal; zero without overcommit
+    KvBytes eager_per_bank;    ///< overcommit: one bank's eager floor, its marginal less the demand-paged part
+    KvBytes demand_per_bank;   ///< overcommit: one bank's demand-paged comp/index (VA reserved, NOT charged)
+    bool overcommit;           ///< admission charges the eager floor rather than the full price
+    pulsar_engine *engine;     ///< the engine whose dry create is the full price
+    int ctx;                   ///< the per-bank context priced, tokens
+    /// @param n banks
+    /// @return the full price of an n-bank pool: the create run dry (demand-paged VA at full size); 0 if unpriceable
+    KvBytes full(uint32_t n) const { return pulsar_engine_session_cost_bytes_banked(engine, ctx, (int)n); }
+    /// @param n banks
+    /// @return what admission charges for an n-bank pool: shared + n x eager under overcommit, else full(n)
+    KvBytes admission(uint32_t n) const { return overcommit ? shared + eager_per_bank.times(n) : full(n); }
+    /// @param admitted the pool's admitted price (admission() of the pool's size)
+    /// @param n the pool's banks (> 0)
+    /// @return the ledger's even-split per-bank charge, the admitted price over n banks
+    static KvBytes per_bank_charge(KvBytes admitted, uint32_t n) { return KvBytes{admitted.raw() / n}; }
+};
+
+/// @brief The session price at `ctx` (server_session_price); the overcommit split is measured only under overcommit.
+/// @param engine the engine
+/// @param ctx the per-bank context, tokens
+/// @param overcommit admission charges the eager floor (server_overcommit_enabled)
+/// @return the price
+static server_session_price server_session_price_of(pulsar_engine *engine, int ctx, bool overcommit) {
+    server_session_price p{KvBytes{}, KvBytes{}, KvBytes{}, overcommit, engine, ctx};
+    if (overcommit) {
+        const KvBytes banked1 = p.full(1);
+        const KvBytes banked2 = p.full(2);
+        const KvBytes marginal = banked2 > banked1 ? banked2 - banked1 : KvBytes{};
+        p.demand_per_bank = pulsar_engine_demand_paged_bytes_per_bank(engine, ctx);
+        p.eager_per_bank = marginal > p.demand_per_bank ? marginal - p.demand_per_bank : KvBytes{};
+        p.shared = banked1 > marginal ? banked1 - marginal : KvBytes{};
+    }
+    return p;
 }
 #endif /* PULSAR_SERVER_TEST */
 
@@ -334,9 +377,7 @@ static uint64_t server_kv_budget_for_device(uint64_t weights_resident_bytes) {
 /// @param committed_bytes the live sessions' committed cost, bytes
 /// @param incoming_bytes the new session's estimated cost, bytes
 /// @return true when committed + incoming fits the budget (overflow-safe)
-bool server_kv_admits(uint64_t kv_budget_bytes,
-                             uint64_t committed_bytes,
-                             uint64_t incoming_bytes) {
+bool server_kv_admits(KvBytes kv_budget_bytes, KvBytes committed_bytes, KvBytes incoming_bytes) {
     if (incoming_bytes > kv_budget_bytes) return false;      /* guards overflow + lone fit */
     return committed_bytes <= kv_budget_bytes - incoming_bytes;
 }
@@ -353,9 +394,8 @@ bool server_kv_admits(uint64_t kv_budget_bytes,
 /// @param avail_bytes MemAvailable in bytes (0 = unreadable: refused)
 /// @param est_bytes the session's estimated cost, bytes
 /// @return server_headroom_admits over the server's floor
-bool server_mem_floor_admits(uint64_t avail_bytes, uint64_t est_bytes) {
-    /* the ledger's session estimate and the /proc reading enter the floor's unit here */
-    return server_headroom_admits(KvBytes{avail_bytes}, KvBytes{est_bytes}, server_mem_floor());
+bool server_mem_floor_admits(KvBytes avail_bytes, KvBytes est_bytes) {
+    return server_headroom_admits(avail_bytes, est_bytes, server_mem_floor());
 }
 
 bool server_headroom_admits(KvBytes avail, KvBytes need, KvBytes floor) {
@@ -371,12 +411,12 @@ static KvBytes g_server_mem_floor{PULSAR_SERVER_MEM_FLOOR_BYTES};
 
 KvBytes server_mem_floor(void) { return g_server_mem_floor; }
 
-KvBytes server_mem_floor_init(uint64_t zone_high_bytes, KvBytes step_bytes) {
-    g_server_mem_floor = KvBytes{PULSAR_SERVER_MEM_FLOOR_BYTES + zone_high_bytes} + step_bytes;
+KvBytes server_mem_floor_init(KvBytes zone_high_bytes, KvBytes step_bytes) {
+    g_server_mem_floor = KvBytes{PULSAR_SERVER_MEM_FLOOR_BYTES} + zone_high_bytes + step_bytes;
     return g_server_mem_floor;
 }
 
-uint64_t server_zoneinfo_high_bytes(const char *zoneinfo, uint64_t page_bytes) {
+KvBytes server_zoneinfo_high_bytes(const char *zoneinfo, uint64_t page_bytes) {
     uint64_t pages = 0;
     bool any = false;
     for (const char *p = zoneinfo; p && *p;) {
@@ -391,12 +431,12 @@ uint64_t server_zoneinfo_high_bytes(const char *zoneinfo, uint64_t page_bytes) {
         if (!eol) break;
         p = eol + 1;
     }
-    return any ? pages * page_bytes : 0;
+    return KvBytes{any ? pages * page_bytes : 0};   /* the kernel's reserve enters the floor's unit here */
 }
 
-uint64_t server_zone_high_watermark_bytes(void) {
+KvBytes server_zone_high_watermark_bytes(void) {
     FILE *fp = fopen("/proc/zoneinfo", "r");
-    if (!fp) return 0;
+    if (!fp) return KvBytes{};
     std::string text;
     char line[512];
     while (fgets(line, sizeof line, fp)) text += line;
@@ -405,9 +445,9 @@ uint64_t server_zone_high_watermark_bytes(void) {
     return server_zoneinfo_high_bytes(text.c_str(), pg > 0 ? (uint64_t)pg : 4096u);
 }
 
-uint64_t server_persist_host_bytes(int tokens) {
+KvBytes server_persist_host_bytes(int tokens) {
     const uint64_t t = tokens > 0 ? (uint64_t)tokens : 0u;
-    return PULSAR_WRITEBACK_STEP + 2u * t * PERSIST_TEXT_BYTES_PER_TOKEN;
+    return KvBytes{PULSAR_WRITEBACK_STEP + 2u * t * PERSIST_TEXT_BYTES_PER_TOKEN};
 }
 
 /* L319: the resident-KV ceiling every touched-KV decision keys on (the decode guard's spills, L280's prompt
@@ -435,11 +475,11 @@ KvBytes server_guard_touched_budget(KvBytes kv_budget_bytes, KvBytes eager_bytes
 
 
 
-uint64_t server_guard_avail_bytes(bool discrete) {
+KvBytes server_guard_avail_bytes(bool discrete) {
     if (!discrete) return server_mem_available_bytes();
     uint64_t free_b = 0, total_b = 0;
     pulsar_gpu_mem_info(&free_b, &total_b);
-    return free_b;
+    return KvBytes{free_b};   /* the device's reading enters the guard's unit here */
 }
 
 KvBytes server_guard_floor(bool discrete) {
@@ -942,8 +982,8 @@ int main(int argc, char **argv) {
      * + prefill working set + drafter state, pulsar_engine_session_cost_bytes),
      * then gate the slot's graph allocation on it. The scheduler runs the same
      * predicate for every lazily provisioned slot. */
-    const uint64_t weights_resident = pulsar_engine_weights_resident_bytes(engine);
-    const uint64_t kv_budget = server_kv_budget_for_device(weights_resident);
+    const KvBytes weights_resident = pulsar_engine_weights_resident_bytes(engine);
+    const KvBytes kv_budget = server_kv_budget_for_device(weights_resident);
 
     /* Tier-2 pool auto-sizing (batching ON by default, auto-fit). Batching is
      * the default: the bank count is DERIVED from --ctx so a moderate ctx yields
@@ -967,15 +1007,7 @@ int main(int argc, char **argv) {
      * LRU-idle eviction before the physical budget is breached; see
      * server_overcommit_enabled). PULSAR_OVERCOMMIT=0 reverts to full-charge N=1. */
     const bool overcommit = server_overcommit_enabled();
-    uint64_t oc_shared = 0, oc_eager_pb = 0, oc_demand_pb = 0;
-    if (overcommit) {
-        const uint64_t banked1 = pulsar_engine_session_cost_bytes_banked(engine, cfg.ctx_size, 1);
-        const uint64_t banked2 = pulsar_engine_session_cost_bytes_banked(engine, cfg.ctx_size, 2);
-        const uint64_t marginal = banked2 > banked1 ? banked2 - banked1 : 0;
-        oc_demand_pb = pulsar_engine_demand_paged_bytes_per_bank(engine, cfg.ctx_size).raw();   /* into the ledger */
-        oc_eager_pb = marginal > oc_demand_pb ? marginal - oc_demand_pb : 0;
-        oc_shared = banked1 > marginal ? banked1 - marginal : 0;
-    }
+    const server_session_price price = server_session_price_of(engine, cfg.ctx_size, overcommit);
 
     int pool_pinned = 0;
     (void)pulsar_engine_bank_pool(&pool_pinned);
@@ -989,19 +1021,19 @@ int main(int argc, char **argv) {
         static const int ref_ctx[] = {32768, 65536, 131072, 262144, 524288, 1048576};
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: Tier-2 pool fit table (budget %.1f GiB, cap %d banks):",
-                   (double)kv_budget / (1024.0 * 1024.0 * 1024.0), pool_auto_max);
+                   (double)kv_budget.raw() / (1024.0 * 1024.0 * 1024.0), pool_auto_max);
         for (size_t ci = 0; ci < sizeof(ref_ctx) / sizeof(ref_ctx[0]); ci++) {
             const double cost1 =
-                (double)pulsar_engine_session_cost_bytes_banked(engine, ref_ctx[ci], 1)
+                (double)pulsar_engine_session_cost_bytes_banked(engine, ref_ctx[ci], 1).raw()
                 / (1024.0 * 1024.0 * 1024.0);
             int fitN = 1;
             double costN = cost1;
             for (int N = pool_auto_max; N >= 1; N--) {
-                const uint64_t c =
+                const KvBytes c =
                     pulsar_engine_session_cost_bytes_banked(engine, ref_ctx[ci], N);
-                if (c > 0 && server_kv_admits(kv_budget, 0, c)) {
+                if (c > KvBytes{} && server_kv_admits(kv_budget, KvBytes{}, c)) {
                     fitN = N;
-                    costN = (double)c / (1024.0 * 1024.0 * 1024.0);
+                    costN = (double)c.raw() / (1024.0 * 1024.0 * 1024.0);
                     break;
                 }
             }
@@ -1019,14 +1051,12 @@ int main(int argc, char **argv) {
         int chosen = 1;
         if (overcommit) {
             for (int N = pool_auto_max; N >= 1; N--) {
-                const uint64_t cost = oc_shared + (uint64_t)N * oc_eager_pb;
-                if (server_kv_admits(kv_budget, 0, cost)) { chosen = N; break; }
+                if (server_kv_admits(kv_budget, KvBytes{}, price.admission((uint32_t)N))) { chosen = N; break; }
             }
         } else {
             for (int N = pool_auto_max; N >= 1; N--) {
-                const uint64_t c =
-                    pulsar_engine_session_cost_bytes_banked(engine, cfg.ctx_size, N);
-                if (c > 0 && server_kv_admits(kv_budget, 0, c)) { chosen = N; break; }
+                const KvBytes c = price.full((uint32_t)N);
+                if (c > KvBytes{} && server_kv_admits(kv_budget, KvBytes{}, c)) { chosen = N; break; }
             }
         }
         pulsar_engine_set_bank_pool((uint32_t)chosen);
@@ -1037,9 +1067,9 @@ int main(int argc, char **argv) {
                        "demand-paged VA %.2f GiB/bank reserved (physical on touch, NOT "
                        "charged); shared %.2f GiB; admission est %.2f GiB (batching %s)",
                        chosen, cfg.ctx_size,
-                       (double)oc_eager_pb / gib,
-                       (double)oc_demand_pb / gib, (double)oc_shared / gib,
-                       (double)(oc_shared + (uint64_t)chosen * oc_eager_pb) / gib,
+                       (double)price.eager_per_bank.raw() / gib,
+                       (double)price.demand_per_bank.raw() / gib, (double)price.shared.raw() / gib,
+                       (double)price.admission((uint32_t)chosen).raw() / gib,
                        chosen > 1 ? "ON" : "OFF");
         } else {
             server_log(PULSAR_LOG_DEFAULT,
@@ -1053,13 +1083,10 @@ int main(int argc, char **argv) {
      * demand-paged VA, which cudaMallocManaged counts at full size). Under
      * overcommit, admission is gated on the eager-floor est instead so the pool
      * comes up at N>1; the full price is what the create is checked against. */
-    const uint64_t full_banked_est = pulsar_engine_session_cost_bytes(engine, cfg.ctx_size);
-    uint64_t overcommit_admission_est = 0;
-    if (overcommit) {
-        const long finalN = (long)pulsar_engine_bank_pool(NULL);
-        overcommit_admission_est = oc_shared + (uint64_t)finalN * oc_eager_pb;
-    }
-    const uint64_t session_est = overcommit ? overcommit_admission_est : full_banked_est;
+    const uint32_t final_banks = pulsar_engine_bank_pool(NULL);
+    const KvBytes full_banked_est = price.full(final_banks);   /* pulsar_engine_session_cost_bytes: the same pool */
+    const KvBytes overcommit_admission_est = overcommit ? price.admission(final_banks) : KvBytes{};
+    const KvBytes session_est = overcommit ? overcommit_admission_est : full_banked_est;
     if (pulsar_gpu_integrated() == 0) {   /* L338: the discrete card's own memory (server_kv_budget_for_device) */
         uint64_t free_b = 0, total_b = 0;
         pulsar_gpu_mem_info(&free_b, &total_b);
@@ -1068,42 +1095,43 @@ int main(int argc, char **argv) {
                    "(weights_resident=%.1f GiB), margin %.2f GiB (working set estimate %.2f + reserve %.2f; checked "
                    "against the warmup), budget=%.1f GiB",
                    (double)total_b / (1024.0 * 1024.0 * 1024.0), (double)free_b / (1024.0 * 1024.0 * 1024.0),
-                   (double)weights_resident / (1024.0 * 1024.0 * 1024.0),
-                   (double)server_discrete_margin_bytes(PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES) /
+                   (double)weights_resident.raw() / (1024.0 * 1024.0 * 1024.0),
+                   (double)server_discrete_margin_bytes(KvBytes{PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES}).raw() /
                        (1024.0 * 1024.0 * 1024.0),
                    (double)PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES / (1024.0 * 1024.0 * 1024.0),
                    (double)PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES / (1024.0 * 1024.0 * 1024.0),
-                   (double)kv_budget / (1024.0 * 1024.0 * 1024.0));
+                   (double)kv_budget.raw() / (1024.0 * 1024.0 * 1024.0));
     } else {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: session admission: usable=%.1f GiB, weights_resident=%.1f GiB, "
                    "overhead=%.1f GiB, floor=%.1f GiB, budget=%.1f GiB",
                    (double)PULSAR_SERVER_USABLE_BYTES / (1024.0 * 1024.0 * 1024.0),
-                   (double)weights_resident / (1024.0 * 1024.0 * 1024.0),
+                   (double)weights_resident.raw() / (1024.0 * 1024.0 * 1024.0),
                    (double)PULSAR_SERVER_PROCESS_OVERHEAD_BYTES / (1024.0 * 1024.0 * 1024.0),
                    (double)PULSAR_SERVER_MEM_FLOOR_BYTES / (1024.0 * 1024.0 * 1024.0),
-                   (double)kv_budget / (1024.0 * 1024.0 * 1024.0));
+                   (double)kv_budget.raw() / (1024.0 * 1024.0 * 1024.0));
     }
     server_log(PULSAR_LOG_DEFAULT,
                "pulsar-server: session admission: per-session true cost est=%.2f GiB (ctx=%d)",
-               (double)session_est / (1024.0 * 1024.0 * 1024.0),
+               (double)session_est.raw() / (1024.0 * 1024.0 * 1024.0),
                cfg.ctx_size);
-    if (session_est == 0 || !server_kv_admits(kv_budget, 0, session_est)) {
+    if (session_est == KvBytes{} || !server_kv_admits(kv_budget, KvBytes{}, session_est)) {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: session admission REJECTED: est %.2f GiB exceeds budget %.2f GiB "
                    "(reduce --ctx-size)",
-                   (double)session_est / (1024.0 * 1024.0 * 1024.0),
-                   (double)kv_budget / (1024.0 * 1024.0 * 1024.0));
+                   (double)session_est.raw() / (1024.0 * 1024.0 * 1024.0),
+                   (double)kv_budget.raw() / (1024.0 * 1024.0 * 1024.0));
         pulsar_engine_close(engine);
         return 1;
     }
 
     /* L347 I4: the device's free memory before the create -- the warmup's working set is measured against it */
     const bool discrete = pulsar_gpu_integrated() == 0;
-    uint64_t dev_free_before_create = 0;
+    KvBytes dev_free_before_create{};
     if (discrete) {
-        uint64_t total_unused = 0;
-        pulsar_gpu_mem_info(&dev_free_before_create, &total_unused);
+        uint64_t free_b = 0, total_unused = 0;
+        pulsar_gpu_mem_info(&free_b, &total_unused);
+        dev_free_before_create = KvBytes{free_b};
     }
     pulsar_session *session = NULL;
     if (pulsar_session_create(&session, engine, cfg.ctx_size) != 0) {
@@ -1116,11 +1144,11 @@ int main(int argc, char **argv) {
      * and commit the actual to the ledger.  Under overcommit the admission
      * est is the eager floor only; the FULL banked price is what the create
      * allocated (the demand-paged managed VA counts at full size). */
-    const uint64_t session_actual =
+    const KvBytes session_actual =
         server_reconciled_session_cost(0, cfg.ctx_size,
                                        overcommit ? full_banked_est : session_est,
                                        pulsar_session_resident_bytes(session));
-    if (session_actual == 0) {
+    if (session_actual == KvBytes{}) {
         pulsar_session_free(session);
         pulsar_engine_close(engine);
         return 1;
@@ -1138,7 +1166,8 @@ int main(int argc, char **argv) {
         const uint64_t mem_total = kv_host_mem_total();   /* a container's limit, not the host's RAM (L338, CT 130) */
         kv_ram_plan_for(pulsar_gpu_integrated(), mem_total, cfg.kv_ram_mb, &ram.bytes, &ram.retain);
     }
-    const uint64_t kv_pool_charge = cfg.kv_disk_dir && cfg.kv_disk_dir[0] ? ram.bytes : 0u;   /* the host pool the cache opens with */
+    /* the host pool the cache opens with */
+    const KvBytes kv_pool_charge{cfg.kv_disk_dir && cfg.kv_disk_dir[0] ? ram.bytes : 0u};
     if (!server_warmup_generation(engine, session, cfg.ctx_size)) {
         pulsar_session_free(session);
         pulsar_engine_close(engine);
@@ -1159,24 +1188,24 @@ int main(int argc, char **argv) {
      * the session's per-step growth is known: the OS margin, the kernel's high watermarks, and one worker step's
      * host/driver demand -- a prefill chunk's new KV pages on one bank plus a persist at the full context. */
     {
-        const uint64_t zone_high = server_zone_high_watermark_bytes();
+        const KvBytes zone_high = server_zone_high_watermark_bytes();
         const KvBytes chunk_kv = pulsar_session_quantum_growth_bytes_per_bank(
             session, pulsar_kv_rows(pulsar_session_prefill_cap(session)));
-        const uint64_t persist = server_persist_host_bytes(cfg.ctx_size);
-        const KvBytes step = chunk_kv + KvBytes{persist};
+        const KvBytes persist = server_persist_host_bytes(cfg.ctx_size);
+        const KvBytes step = chunk_kv + persist;
         const KvBytes floor = server_mem_floor_init(zone_high, step);
         const double mib = 1024.0 * 1024.0;
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: memory floor %.0f MiB = OS margin %.0f + kernel high watermarks %.0f%s + one "
                    "step's demand %.0f (a %d-token prefill chunk's KV %.0f + a persist at %d tokens %.0f)",
-                   (double)floor.raw() / mib, (double)PULSAR_SERVER_MEM_FLOOR_BYTES / mib, (double)zone_high / mib,
-                   zone_high ? "" : " (/proc/zoneinfo unreadable)", (double)step.raw() / mib,
-                   pulsar_session_prefill_cap(session).raw(), (double)chunk_kv.raw() / mib, cfg.ctx_size,
-                   (double)persist / mib);
+                   (double)floor.raw() / mib, (double)PULSAR_SERVER_MEM_FLOOR_BYTES / mib,
+                   (double)zone_high.raw() / mib, zone_high != KvBytes{} ? "" : " (/proc/zoneinfo unreadable)",
+                   (double)step.raw() / mib, pulsar_session_prefill_cap(session).raw(), (double)chunk_kv.raw() / mib,
+                   cfg.ctx_size, (double)persist.raw() / mib);
     }
-    uint64_t kv_budget_final = kv_budget;
-    uint64_t warm_avail = 0;   /* L319: the touched-KV ceiling's measurement (below) */
-    uint64_t warm_dev_free = 0;   /* L338: its discrete-card reading, the device's free memory at the same point */
+    KvBytes kv_budget_final = kv_budget;
+    KvBytes warm_avail{};   /* L319: the touched-KV ceiling's measurement (below) */
+    KvBytes warm_dev_free{};   /* L338: its discrete-card reading, the device's free memory at the same point */
     KvBytes warm_touched{};
     {
         /* What of slot 0 is RESIDENT now, and so already out of MemAvailable:
@@ -1192,30 +1221,31 @@ int main(int argc, char **argv) {
             ? pulsar_engine_demand_paged_bytes_per_bank(engine, cfg.ctx_size).times((uint64_t)banks_now)
             : KvBytes{};
         const KvBytes touched_now = pulsar_session_touched_kv_bytes(session);
-        /* the KV figures leave the type system here: the measured budget is the untyped session-cost ledger's */
-        const uint64_t untouched_va = (demand_va > touched_now ? demand_va - touched_now : KvBytes{}).raw();
-        const uint64_t resident_now = session_actual > untouched_va ? session_actual - untouched_va : 0;
+        const KvBytes untouched_va = demand_va > touched_now ? demand_va - touched_now : KvBytes{};
+        const KvBytes resident_now = session_actual > untouched_va ? session_actual - untouched_va : KvBytes{};
         /* L347: the disk cache's host pool, opened after this reading, is charged to it now */
-        const uint64_t avail_raw = server_mem_available_bytes();
-        const uint64_t avail_now = avail_raw > kv_pool_charge ? avail_raw - kv_pool_charge : 0u;
+        const KvBytes avail_raw = server_mem_available_bytes();
+        const KvBytes avail_now = avail_raw > kv_pool_charge ? avail_raw - kv_pool_charge : KvBytes{};
         warm_avail = avail_now;
         warm_touched = touched_now;
         if (discrete) warm_dev_free = server_guard_avail_bytes(true);   /* the same reading */
         if (discrete) {
             /* L347 I4: the card's working set, measured -- the KV budget is VRAM, which MemAvailable (the host's) does
              * not describe.  Past the estimate the banks were sized with, the start is refused (rule 9). */
-            uint64_t dev_free_now = 0, total_unused = 0;
-            pulsar_gpu_mem_info(&dev_free_now, &total_unused);
-            const uint64_t ws = server_discrete_working_set_bytes(dev_free_before_create, dev_free_now, resident_now);
+            uint64_t free_b = 0, total_unused = 0;
+            pulsar_gpu_mem_info(&free_b, &total_unused);
+            const KvBytes dev_free_now{free_b};
+            const KvBytes ws = server_discrete_working_set_bytes(dev_free_before_create, dev_free_now, resident_now);
             const double gib = 1024.0 * 1024.0 * 1024.0;
-            if (ws > PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES) {
+            if (ws > KvBytes{PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES}) {
                 server_log(PULSAR_LOG_ERROR,
                            "pulsar-server: refusing to start: the warmup's working set is %.2f GiB (device free %.2f "
                            "GiB before the create, %.2f after the warmup, session resident %.2f) -- past the %.2f GiB "
                            "estimate the banks were sized with (PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES); lower "
                            "--ctx or PULSAR_MSEQ_BANKS, or re-measure the estimate (L347 I4)",
-                           (double)ws / gib, (double)dev_free_before_create / gib, (double)dev_free_now / gib,
-                           (double)resident_now / gib, (double)PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES / gib);
+                           (double)ws.raw() / gib, (double)dev_free_before_create.raw() / gib,
+                           (double)dev_free_now.raw() / gib, (double)resident_now.raw() / gib,
+                           (double)PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES / gib);
                 pulsar_session_free(session);
                 pulsar_engine_close(engine);
                 return 1;
@@ -1224,13 +1254,14 @@ int main(int argc, char **argv) {
                        "pulsar-server: session admission: discrete GPU working set measured %.2f GiB (estimate %.2f; "
                        "device free %.2f GiB before the create, %.2f after the warmup, session resident %.2f); budget "
                        "%.2f GiB; the 2b guard (device free - %.2f GiB) is the run-time backstop",
-                       (double)ws / gib, (double)PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES / gib,
-                       (double)dev_free_before_create / gib, (double)dev_free_now / gib, (double)resident_now / gib,
-                       (double)kv_budget_final / gib, (double)PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES / gib);
-        } else if (avail_now > 0) {
-            const uint64_t floor = server_mem_floor().raw();
-            const uint64_t headroom = avail_now > floor ? avail_now - floor : 0;
-            uint64_t measured = resident_now + headroom;
+                       (double)ws.raw() / gib, (double)PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES / gib,
+                       (double)dev_free_before_create.raw() / gib, (double)dev_free_now.raw() / gib,
+                       (double)resident_now.raw() / gib, (double)kv_budget_final.raw() / gib,
+                       (double)PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES / gib);
+        } else if (avail_now > KvBytes{}) {
+            const KvBytes floor = server_mem_floor();
+            const KvBytes headroom = avail_now > floor ? avail_now - floor : KvBytes{};
+            KvBytes measured = resident_now + headroom;
             /* The measured budget is one-shot and PERMANENT, while the
              * MemAvailable it derives from can read transiently low at
              * startup (a previous model process still releasing memory;
@@ -1244,7 +1275,7 @@ int main(int argc, char **argv) {
              * GENUINELY tight, the LIVE per-attempt floor check
              * (server_mem_floor_admits — truthful post-warmup) is the guard,
              * and it recovers naturally when memory frees. */
-            const uint64_t budget_min = resident_now + session_est;
+            const KvBytes budget_min = resident_now + session_est;
             if (measured < budget_min) {
                 server_log(PULSAR_LOG_WARNING,
                            "pulsar-server: session admission: measured budget "
@@ -1252,9 +1283,9 @@ int main(int argc, char **argv) {
                            "one session est): MemAvailable %.2f GiB reads low "
                            "at startup; the live MemAvailable floor check "
                            "remains the per-attempt guard",
-                           (double)measured / (1024.0 * 1024.0 * 1024.0),
-                           (double)budget_min / (1024.0 * 1024.0 * 1024.0),
-                           (double)avail_now / (1024.0 * 1024.0 * 1024.0));
+                           (double)measured.raw() / (1024.0 * 1024.0 * 1024.0),
+                           (double)budget_min.raw() / (1024.0 * 1024.0 * 1024.0),
+                           (double)avail_now.raw() / (1024.0 * 1024.0 * 1024.0));
                 measured = budget_min;
             }
             if (measured < kv_budget_final) kv_budget_final = measured;
@@ -1263,13 +1294,13 @@ int main(int argc, char **argv) {
                        "(MemAvailable %.2f GiB post-warmup - floor %.2f GiB "
                        "+ slot 0 resident %.2f GiB [priced %.2f, untouched VA %.2f]; "
                        "static bound %.2f GiB)",
-                       (double)kv_budget_final / (1024.0 * 1024.0 * 1024.0),
-                       (double)avail_now / (1024.0 * 1024.0 * 1024.0),
-                       (double)floor / (1024.0 * 1024.0 * 1024.0),
-                       (double)resident_now / (1024.0 * 1024.0 * 1024.0),
-                       (double)session_actual / (1024.0 * 1024.0 * 1024.0),
-                       (double)untouched_va / (1024.0 * 1024.0 * 1024.0),
-                       (double)kv_budget / (1024.0 * 1024.0 * 1024.0));
+                       (double)kv_budget_final.raw() / (1024.0 * 1024.0 * 1024.0),
+                       (double)avail_now.raw() / (1024.0 * 1024.0 * 1024.0),
+                       (double)floor.raw() / (1024.0 * 1024.0 * 1024.0),
+                       (double)resident_now.raw() / (1024.0 * 1024.0 * 1024.0),
+                       (double)session_actual.raw() / (1024.0 * 1024.0 * 1024.0),
+                       (double)untouched_va.raw() / (1024.0 * 1024.0 * 1024.0),
+                       (double)kv_budget.raw() / (1024.0 * 1024.0 * 1024.0));
         }
     }
 
@@ -1340,7 +1371,7 @@ int main(int argc, char **argv) {
                    cfg.engine.prefill_chunk, PULSAR_SESSION_POOL_CAP + 1);
         return 1;
     }
-    s.live_bank = 0;
+    s.live_bank = BankId{0};
     /* L118 (everything is a batch): the three-way scheduler, its
      * spec_max_live crossover knob (PULSAR_SERVER_SPEC_MAX_LIVE), and the
      * PULSAR_CLASSIC_DECODE A/B hatch are DELETED — decode runs through the
@@ -1392,14 +1423,14 @@ int main(int argc, char **argv) {
     }
     s.n_slots = 1;
     s.kv_budget_bytes = kv_budget_final;
-    for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) s.slots[i].bank = (uint32_t)i;
+    for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) s.slots[i].bank = BankId{i}; /* slot i holds bank i */
     if (s.pool_banks > 0) {
         /* Even-split per-bank ledger charge: the whole pool's admitted cost
          * spread across its banks (conservative — demand-paged reality is
          * smaller). Startup commits bank 0's share; each provisioned bank adds
          * one share, so committed == session_est only when all banks are live,
          * and that sum was already verified <= budget above. */
-        s.bank_marginal_bytes = session_est / (uint64_t)pool_banks;
+        s.bank_marginal_bytes = server_session_price::per_bank_charge(session_est, (uint32_t)pool_banks);
         /* Pool mode: NO bank is provisioned at boot — bank 0 is an ordinary
          * bank provisioned on first use like the rest (uniform ledger:
          * committed starts at 0, each provision charges one marginal).  The
@@ -1408,13 +1439,13 @@ int main(int argc, char **argv) {
          * empty boot slot but landing on bank 1), the un-provisionable /
          * un-evictable squatter, and the compensating special cases each of
          * those needed. */
-        s.kv_committed_bytes = 0;
+        s.kv_committed_bytes = KvBytes{};
         /* L347 I4: where the checkpoints are (the store's placement): a discrete card's are pinned host RAM */
         char ckpt_where[96];
-        const uint64_t ckpt_host = pulsar_session_ckpt_host_bytes(session);
-        if (ckpt_host)
+        const KvBytes ckpt_host = pulsar_session_ckpt_host_bytes(session);
+        if (ckpt_host != KvBytes{})
             snprintf(ckpt_where, sizeof ckpt_where, "in pinned host RAM (%.2f GiB), not in the price",
-                     (double)ckpt_host / (1024.0 * 1024.0 * 1024.0));
+                     (double)ckpt_host.raw() / (1024.0 * 1024.0 * 1024.0));
         else
             snprintf(ckpt_where, sizeof ckpt_where, "in device memory, in the price");
         server_log(PULSAR_LOG_DEFAULT,
@@ -1422,8 +1453,8 @@ int main(int argc, char **argv) {
                    "unified batch decode (L118), per-bank marginal %.2f GiB "
                    "(pool resident actual %.2f GiB; grid checkpoints %s)",
                    pool_banks,
-                   (double)s.bank_marginal_bytes / (1024.0 * 1024.0 * 1024.0),
-                   (double)session_actual / (1024.0 * 1024.0 * 1024.0), ckpt_where);
+                   (double)s.bank_marginal_bytes.raw() / (1024.0 * 1024.0 * 1024.0),
+                   (double)session_actual.raw() / (1024.0 * 1024.0 * 1024.0), ckpt_where);
     } else {
         s.kv_committed_bytes = session_actual;
         s.slots[0].est_cost_bytes = session_actual;
@@ -1441,7 +1472,7 @@ int main(int argc, char **argv) {
          * cap it unless the test hook below sets a budget. */
         s.guard_discrete = (pulsar_gpu_integrated() == 0);
         s.guard_floor = server_guard_floor(s.guard_discrete);
-        uint64_t budget = s.guard_discrete ? UINT64_MAX : kv_budget_final;
+        KvBytes budget = s.guard_discrete ? KvBytes::max() : kv_budget_final;
         /* Test hook (restored L264, 2026-10-04: its callers are the guard legs of
          * tools/tp2-l264 -- the spill/restore through the segment chain has no
          * other way to fire at a test's fills). */
@@ -1449,20 +1480,20 @@ int main(int argc, char **argv) {
         if (ov && ov[0]) {
             const unsigned long long b = strtoull(ov, NULL, 10);
             if (b > 0) {
-                budget = (uint64_t)b;
+                budget = KvBytes{(uint64_t)b};
                 server_log(PULSAR_LOG_WARNING, "pulsar-server: guard: KV budget OVERRIDDEN to %.2f GiB (test hook)",
-                           (double)budget / (1024.0 * 1024.0 * 1024.0));
+                           (double)budget.raw() / (1024.0 * 1024.0 * 1024.0));
             }
         }
-        s.guard_eager_bytes = KvBytes{overcommit_admission_est};   /* eager floor resident (the ledger's figure) */
+        s.guard_eager_bytes = overcommit_admission_est;   /* eager floor resident (the ledger's figure) */
         /* L319: the ceiling is the smaller of the ledger's share and the measured headroom (see
          * server_guard_touched_budget); a pool with no measured headroom does not start -- unguarded, its banks
          * would grow until the box runs dry.  2026-10-29: every guard decision reads the LIVE budget under this
          * ceiling (server::guard_budget). */
-        s.guard_kv_budget = KvBytes{budget};
-        const uint64_t guard_warm_avail = s.guard_discrete ? warm_dev_free : warm_avail;
+        s.guard_kv_budget = budget;
+        const KvBytes guard_warm_avail = s.guard_discrete ? warm_dev_free : warm_avail;
         s.guard_touched_ceiling = server_guard_touched_budget(s.guard_kv_budget, s.guard_eager_bytes, warm_touched,
-                                                              KvBytes{guard_warm_avail}, s.guard_floor);
+                                                              guard_warm_avail, s.guard_floor);
         s.guard_enabled = (s.guard_touched_ceiling > KvBytes{});
         const double gib = 1024.0 * 1024.0 * 1024.0;
         if (!s.guard_enabled) {
@@ -1470,28 +1501,29 @@ int main(int argc, char **argv) {
                        "pulsar-server: refusing to start: a %d-bank pool has no touched-KV headroom (%s %.2f GiB "
                        "post-warmup, floor %.2f GiB; kv budget %.2f − eager %.2f GiB) -- lower --ctx or "
                        "PULSAR_MSEQ_BANKS (L319)",
-                       s.pool_banks, s.guard_discrete ? "device free" : "MemAvailable", (double)guard_warm_avail / gib,
+                       s.pool_banks, s.guard_discrete ? "device free" : "MemAvailable",
+                       (double)guard_warm_avail.raw() / gib,
                        (double)s.guard_floor.raw() / gib,
-                       (double)budget / gib, (double)s.guard_eager_bytes.raw() / gib);
+                       (double)budget.raw() / gib, (double)s.guard_eager_bytes.raw() / gib);
             pulsar_session_free(session);
             pulsar_engine_close(engine);
             return 1;
         }
-        if (s.guard_discrete && budget == UINT64_MAX)
+        if (s.guard_discrete && budget == KvBytes::max())
             server_log(PULSAR_LOG_DEFAULT,
                        "pulsar-server: Tier-2 2b guard ENABLED (discrete GPU): touched ceiling %.2f GiB = touched %.2f "
                        "+ device free %.2f − floor %.2f post-warmup; every decision reads the live budget under it "
                        "(touched + device free − floor now); spills persist to the disk KV cache",
                        (double)s.guard_touched_ceiling.raw() / gib, (double)warm_touched.raw() / gib,
-                       (double)guard_warm_avail / gib, (double)s.guard_floor.raw() / gib);
+                       (double)guard_warm_avail.raw() / gib, (double)s.guard_floor.raw() / gib);
         else
             server_log(PULSAR_LOG_DEFAULT,
                        "pulsar-server: Tier-2 2b guard ENABLED: touched ceiling %.2f GiB = min(kv budget %.2f − eager "
                        "%.2f, touched %.2f + %s %.2f − floor %.2f post-warmup); every decision reads the live "
                        "budget under it (touched + %s − floor now); spills persist to the disk KV cache",
-                       (double)s.guard_touched_ceiling.raw() / gib, (double)budget / gib,
+                       (double)s.guard_touched_ceiling.raw() / gib, (double)budget.raw() / gib,
                        (double)s.guard_eager_bytes.raw() / gib, (double)warm_touched.raw() / gib,
-                       s.guard_discrete ? "device free" : "MemAvailable", (double)guard_warm_avail / gib,
+                       s.guard_discrete ? "device free" : "MemAvailable", (double)guard_warm_avail.raw() / gib,
                        (double)s.guard_floor.raw() / gib, s.guard_discrete ? "device free" : "MemAvailable");
     }
     s.sess = session;                /* the one session; slot 0 describes it */
@@ -1767,7 +1799,7 @@ int main(int argc, char **argv) {
         if (s.pool_banks > 0 && !s.bank_switch(sl->bank)) {
             server_log(PULSAR_LOG_DEFAULT,
                        "pulsar-server: slot %d bank %d could not be installed at shutdown; "
-                       "skipping its KV persist", i, sl->bank);
+                       "skipping its KV persist", i, sl->bank.raw());
             continue;
         }
         const pulsar_tokens *tokens = pulsar_session_tokens(s.sess);

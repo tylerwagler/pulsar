@@ -30,9 +30,11 @@ int main() {
     for (int t = 0; t < 3; t++)
         readers.emplace_back([&] {
             while (!stop.load()) {
-                pulsar_segstore_foreach_trailer(st, [](FILE *fp, uint64_t bytes, const char *text, size_t len, void *ud) {
+                pulsar_segstore_foreach_trailer(st, [](FILE *fp, uint64_t bytes, const char *text, TextBytes len,
+                                                       void *ud) {
                     char b[5];
-                    if (bytes != 5 || fread(b, 1, 5, fp) != 5 || memcmp(b, "TRAIL", 5) != 0 || len == 0 || text[0] != 'r') {
+                    if (bytes != 5 || fread(b, 1, 5, fp) != 5 || memcmp(b, "TRAIL", 5) != 0 || len == TextBytes{0} ||
+                        text[0] != 'r') {
                         fprintf(stderr, "a walk read a wrong entry\n");
                         abort();
                     }
@@ -45,7 +47,8 @@ int main() {
 
     /* the worker: a root and leaves appear and go, as commit and eviction do */
     char err[256], root[41], key[41];
-    if (!pulsar_segstore_put(st, "", 0, 128, "root", 4, 256, write_payload, 5, write_trailer, NULL, root, err, sizeof err)) {
+    if (!pulsar_segstore_put(st, "", TokPos{0}, TokPos{128}, "root", TextBytes{4}, 256, write_payload, 5, write_trailer,
+                             NULL, root, err, sizeof err)) {
         fprintf(stderr, "put: %s\n", err);
         return 2;
     }
@@ -53,8 +56,8 @@ int main() {
     for (int i = 0; i < 4000; i++) {
         char text[32];
         const int n = snprintf(text, sizeof text, "r%d", i);
-        if (!pulsar_segstore_put(st, root, 128, 256, text, (size_t)n, 256, write_payload, 5, write_trailer, NULL, key, err,
-                                 sizeof err)) {
+        if (!pulsar_segstore_put(st, root, TokPos{128}, TokPos{256}, text, TextBytes{(size_t)n}, 256, write_payload, 5,
+                                 write_trailer, NULL, key, err, sizeof err)) {
             failures++;
             continue;
         }

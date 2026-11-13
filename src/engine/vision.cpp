@@ -235,11 +235,11 @@ int vision_build_image_block(int n_llm_h, int n_llm_w, int start_pos,
  * `right` is filled with `ends` by the backward pass and then overwritten with
  * the final count by the forward pass, so the reverse cummin needs no second
  * buffer: the forward pass only ever reads right[i] at the i it is writing. */
-void vision_image_visible(const int32_t *ids, int n, int n_vocab, int max_image_tokens,
+void vision_image_visible(const TokId *ids, int n, int n_vocab, int max_image_tokens,
                           int32_t *left, int32_t *right) {
     if (!ids || !left || !right || n <= 0) return;
-    const int32_t start_id = (int32_t)n_vocab + VISION_T_IMAGE_START;
-    const int32_t end_id   = (int32_t)n_vocab + VISION_T_IMAGE_END;
+    const TokId start_id{(int32_t)n_vocab + VISION_T_IMAGE_START};
+    const TokId end_id{(int32_t)n_vocab + VISION_T_IMAGE_END};
 
     int32_t ends = n;
     for (int i = n - 1; i >= 0; i--) {
@@ -292,7 +292,7 @@ bool vision_ds4_expand(const pulsar_image_ref *img, pulsar_tokens *out, char *er
     for (int k = 0; ok && k < prep.span_len; k++) {
         const int role = prep.span_types[k];
         ok = role >= 0 && role <= VISION_T_IMAGE_END;
-        if (ok) pulsar_tokens_push(out, (int)PULSAR_N_VOCAB + role);
+        if (ok) pulsar_tokens_push(out, TokId{(int)PULSAR_N_VOCAB + role});
     }
     if (!ok) snprintf(err, errlen, "the image's block carries an unknown sentinel role");
     vision_prepared_free(&prep);
@@ -314,11 +314,11 @@ bool vision_ds4_expand(const pulsar_image_ref *img, pulsar_tokens *out, char *er
  *
  * This is the one place the sentinel ROLES are turned into token ids for a scan,
  * so the chunk planner and the merge cannot disagree about where a block ends. */
-int vision_span_extent(const int32_t *ids, int n, int n_vocab, int start_pos, int *len_out) {
+int vision_span_extent(const TokId *ids, int n, int n_vocab, int start_pos, int *len_out) {
     if (!ids || !len_out || start_pos < 0 || start_pos >= n) return 0;
-    const int32_t pad_id   = (int32_t)n_vocab + VISION_T_IMAGE_PAD;
-    const int32_t start_id = (int32_t)n_vocab + VISION_T_IMAGE_START;
-    const int32_t end_id   = (int32_t)n_vocab + VISION_T_IMAGE_END;
+    const TokId pad_id{(int32_t)n_vocab + VISION_T_IMAGE_PAD};
+    const TokId start_id{(int32_t)n_vocab + VISION_T_IMAGE_START};
+    const TokId end_id{(int32_t)n_vocab + VISION_T_IMAGE_END};
     int seen_start = 0;
     for (int i = start_pos; i < n; i++) {
         if (!seen_start) {

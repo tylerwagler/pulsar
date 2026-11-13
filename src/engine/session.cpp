@@ -692,7 +692,12 @@ static int open_load(pulsar_engine **out, const pulsar_engine_options *opt) {
         e->directional_steering_ffn_scale = opt->directional_steering_ffn;
     }
     /* the instance lock is the PROCESS's: taken by its first live engine, released with its last (L321 groups) */
-    if (g_live_engines++ == 0) pulsar_acquire_instance_lock();
+    if (g_live_engines++ == 0 && !pulsar_acquire_instance_lock()) {   /* L335: said; an open refuses, never exits */
+        g_live_engines--;   /* e->live is not set yet: destroy() does not count it again */
+        e->destroy();
+        *out = NULL;
+        return 1;
+    }
     e->live = true;
 
     const bool graph_backend = pulsar_backend_uses_graph(opt->backend);
@@ -1164,10 +1169,6 @@ void pulsar_engine::destroy() {
     if (e->family && e->family->unload) e->family->unload(e);   /* L295: the family's opaque state */
     engram_model_free(&e->weights);
     pulsar_tp_plan_free(e);   /* the rank's built slices, before the device goes */
-    if (e->qwen_weights) pulsar_qwen_s4_unload(e->qwen_weights);
-    if (e->qwen_tok) bpe_tokenizer_free(e->qwen_tok);
-    e->qwen_tok = NULL;
-    free(e->qwen_weights);
     e->vocab.vocab_free();
     /* Tear down GPU state (which cudaHostUnregisters the mmap'd weight ranges)
      * before munmap'ing the model — unmapping still-registered pages is UB. */
@@ -1201,22 +1202,23 @@ void pulsar_engine::destroy() {
 /// @return false (said) when an allocation failed; true with nothing to do
 static bool session_alloc_tp_scratch(pulsar_gpu_graph *g, pulsar_tp *tp) {
     if (!tp || !pulsar_tp_row_lane(tp)) return true;
-    const uint64_t vb = pulsar_tp_vec_bytes(tp);
+    const TensorBytes vb = TensorBytes{pulsar_tp_vec_bytes(tp)};
     const uint64_t bytes = pulsar_tp_vocab_own_bytes(tp, (uint32_t)PULSAR_N_VOCAB, (uint32_t)PULSAR_SPEC_LOGITS_ALLOC_ROWS);
-    g->tp_vocab_own = pulsar_gpu_tensor_alloc(bytes);
+    g->tp_vocab_own = pulsar_gpu_tensor_alloc(TensorBytes{bytes});
     if (!g->tp_vocab_own) {
         fprintf(stderr, "pulsar: tp vocab gather scratch (%llu bytes) allocation failed\n",
                 (unsigned long long)bytes);
         return false;
     }
-    g->tp_ain_own = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_TP_BATCH_MAX_ROWS * vb);
+    g->tp_ain_own = pulsar_gpu_tensor_alloc(vb.times(PULSAR_TP_BATCH_MAX_ROWS));
     if (!g->tp_ain_own) {
         fprintf(stderr, "pulsar: tp attention-input gather scratch allocation failed\n");
         return false;
     }
     const uint32_t zero = 0u;
-    g->tp_stage_ticket = pulsar_gpu_tensor_alloc(sizeof(zero));
-    if (!g->tp_stage_ticket || !pulsar_gpu_tensor_write(g->tp_stage_ticket, 0, &zero, sizeof(zero))) {
+    g->tp_stage_ticket = pulsar_gpu_tensor_alloc(TensorBytes{sizeof(zero)});
+    if (!g->tp_stage_ticket || !pulsar_gpu_tensor_write(g->tp_stage_ticket, TensorBytes{0}, &zero,
+                                                        TensorBytes{sizeof(zero)})) {
         fprintf(stderr, "pulsar: tp row-lane stage ticket allocation failed\n");
         return false;
     }
@@ -1260,12 +1262,12 @@ int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size)
     if (!out || !e || ctx_size <= 0) return 1;
     *out = NULL;
     if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 1;
-    const uint64_t alloc_before = pulsar_gpu_tensor_alloc_bytes_current();
+    const TensorBytes alloc_before = pulsar_gpu_tensor_alloc_bytes_current();
     pulsar_session *s = session_build(e, ctx_size, gpu_graph_bank_pool_n());
     if (!s) return 1;
-    s->resident_bytes = pulsar_gpu_tensor_alloc_bytes_current() - alloc_before;
+    s->resident_bytes = (pulsar_gpu_tensor_alloc_bytes_current() - alloc_before).raw();
     /* the kv-state payload staging buffer, pinned once (pulsar_session::io_buf): a session that cannot have it does not open */
-    s->io_buf = (uint8_t *)pulsar_gpu_host_alloc(PULSAR_SESSION_IO_CHUNK);
+    s->io_buf = (uint8_t *)pulsar_gpu_host_alloc(TensorBytes{PULSAR_SESSION_IO_CHUNK});
     if (!s->io_buf) {
         fprintf(stderr, "pulsar: session create: the %u MiB pinned disk-KV staging buffer could not be allocated -- "
                         "refusing\n", PULSAR_SESSION_IO_CHUNK >> 20);
@@ -1287,7 +1289,7 @@ int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size)
 int pulsar_ds4_session_create(pulsar_session *s, uint32_t n_banks) {
     pulsar_engine *e = s->engine;
     const int ctx_size = s->ctx_size;
-    s->prefill_frontier = 0;   /* L195: nothing prefilled yet */
+    s->prefill_frontier = TokPos{0};   /* L195: nothing prefilled yet */
     const uint32_t raw_cap = gpu_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
     const pulsar_layer_weights *shape_layer = weights_first_bound_layer(&e->weights);
     if (!shape_layer) {
@@ -1334,8 +1336,8 @@ int pulsar_ds4_session_create(pulsar_session *s, uint32_t n_banks) {
 }
 
 
-uint64_t pulsar_session_resident_bytes(const pulsar_session *s) {
-    return s ? s->resident_bytes : 0;
+KvBytes pulsar_session_resident_bytes(const pulsar_session *s) {
+    return KvBytes{s ? s->resident_bytes : 0};
 }
 
 
@@ -1346,22 +1348,22 @@ uint64_t pulsar_session_resident_bytes(const pulsar_session *s) {
  * (cudaMallocManaged) subset.  Not in the price, on either side: allocations made on demand after create
  * (gpu_graph_ensure_batch_ffn_out, the multiseq descriptors, the batched-copy descriptor tables); the
  * server's memory floor absorbs those. */
-uint64_t pulsar_engine::session_cost_bytes_banked(int ctx_size, int n_banks, uint64_t *managed_bytes) {
+KvBytes pulsar_engine::session_cost_bytes_banked(int ctx_size, int n_banks, KvBytes *managed_bytes) {
     auto *e = this;
-    if (managed_bytes) *managed_bytes = 0;
-    if (!e || ctx_size <= 0 || n_banks < 1) return 0;
-    if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 0;
+    if (managed_bytes) *managed_bytes = KvBytes{};
+    if (!e || ctx_size <= 0 || n_banks < 1) return KvBytes{};
+    if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return KvBytes{};
     pulsar_gpu_tensor_dry_begin();
     pulsar_session *s = session_build(e, ctx_size, (uint32_t)n_banks);
     const bool ok = s != NULL;
     if (s) s->destroy();
-    uint64_t bytes = 0, managed = 0;
+    TensorBytes bytes{0}, managed{0};
     pulsar_gpu_tensor_dry_end(&bytes, &managed);
-    if (managed_bytes && ok) *managed_bytes = managed;
-    return ok ? bytes : 0;
+    if (managed_bytes && ok) *managed_bytes = kv_bytes_of(managed);
+    return ok ? kv_bytes_of(bytes) : KvBytes{};
 }
 
-uint64_t pulsar_engine::session_cost_bytes(int ctx_size) {
+KvBytes pulsar_engine::session_cost_bytes(int ctx_size) {
     return session_cost_bytes_banked(ctx_size, (int)gpu_graph_bank_pool_n());
 }
 
@@ -1481,8 +1483,8 @@ int pulsar_session::common_prefix(const pulsar_tokens *prompt) {
  * ids) only match by ID: a boundary mismatch involving one stops the walk
  * conservatively — role markers must never byte-alias into content. */
 void pulsar_tokens_prefix_match_with(pulsar_token_text_fn text, void *ud,
-                                     const int *a, int a_len,
-                                     const int *b, int b_len,
+                                     const TokId *a, int a_len,
+                                     const TokId *b, int b_len,
                                      pulsar_prefix_match *out) {
     out->live_cut = TokCount{0};
     out->prompt_cut = PromptToks{0};
@@ -1536,13 +1538,13 @@ done:
 }
 
 /* The engine's vocabulary for the seam walks. */
-char *pulsar_engine_token_text_fn(void *ud, int token, size_t *len) {
+char *pulsar_engine_token_text_fn(void *ud, TokId token, size_t *len) {
     return pulsar_token_text((pulsar_engine *)ud, token, len);
 }
 
 void pulsar_tokens_prefix_match(pulsar_engine *e,
-                                const int *a, int a_len,
-                                const int *b, int b_len,
+                                const TokId *a, int a_len,
+                                const TokId *b, int b_len,
                                 pulsar_prefix_match *out) {
     if (!e) {
         out->live_cut = TokCount{0};
@@ -1557,8 +1559,8 @@ void pulsar_tokens_prefix_match(pulsar_engine *e,
  * `at` -- the prompt-side position when `at` is one.  Past it (a re-spelled stretch the walk did not close before
  * `at`) the request's tokens are counted while each is byte-equal to the live bytes that follow and ends at or before
  * `at`'s byte; a control token (no text) or a differing byte stops the count. */
-PromptToks pulsar_tokens_prompt_held_with(pulsar_token_text_fn text, void *ud, const int *live, TokPos at,
-                                          const int *prompt, int prompt_len) {
+PromptToks pulsar_tokens_prompt_held_with(pulsar_token_text_fn text, void *ud, const TokId *live, TokPos at,
+                                          const TokId *prompt, int prompt_len) {
     pulsar_prefix_match m;
     pulsar_tokens_prefix_match_with(text, ud, live, at.raw(), prompt, prompt_len, &m);
     if (TokPos::after(m.live_cut) == at) return m.prompt_cut;
@@ -1610,10 +1612,12 @@ bool pulsar_session_token_is_id(const pulsar_session *s, int token, char *err, s
  * deleted as callerless the same morning, then the spec mid-block stop path
  * turned out to need exactly it (it was full-session invalidate before,
  * which threw away the whole live KV on every mid-block tool-call stop). */
-void pulsar_session::rewind(int pos) {
+void pulsar_session::rewind(TokPos at) {
     auto *s = this;
-    if (pos < 0) pos = 0;
-    if (pos > s->checkpoint.len) pos = s->checkpoint.len;
+    /* none() or a negative raw (a TP frame's value) rewinds to 0 and a position past the history to its end, as
+     * the int did */
+    const TokPos end = s->hist_end();
+    const TokPos pos = at.is_none() || at.raw() < 0 ? TokPos{0} : at > end ? end : at;
     s->trim_history(pos);
     s->logits_stale = true;
     /* The compressed frontier of every kv source follows the position law on
@@ -1623,11 +1627,12 @@ void pulsar_session::rewind(int pos) {
      * be raised here.  Rows beyond the clamp are invisible (readers cap at
      * n_comp) and are rewritten by the next emit at that index; the clamp also
      * drops the grid checkpoints above pos (gpu_graph_set_n_comp). */
-    const uint32_t rw_bank = gpu_graph_cur_bank(s->graph);
+    const BankId rw_bank = gpu_graph_cur_bank(s->graph);
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
-        const uint32_t want = (uint32_t)pos / pulsar_layer_compress_ratio(il);
-        if (gpu_graph_n_comp(s->graph, rw_bank, il) > want) gpu_graph_set_n_comp(s->graph, rw_bank, il, want);
+        const CompRows want = pulsar_comp_rows_held(pos.before(), TokPerRow{pulsar_layer_compress_ratio(il)});
+        if (gpu_graph_n_comp(s->graph, rw_bank, il) > want)
+            gpu_graph_set_n_comp(s->graph, rw_bank, il, want);
     }
     /* The VALUE half (L264).  The recurrent lanes and the raw window at pos are
      * re-established in exactly two cases: position 0, whose state is the
@@ -1638,36 +1643,37 @@ void pulsar_session::rewind(int pos) {
      * 0).  Nothing decodes from a rewound position directly: a rewind ends a
      * generation (a stop's ghost tail, L073) or is the first half of a sync. */
     bool ok = true;
-    if (pos == 0) {
+    if (pos == TokPos{0}) {
         /* Position 0 is where a bank changes conversations (invalidate, a cold
          * rebuild, an evicted bank's reuse): none of its checkpoints describes
          * the next one, including those a spill kept while its frontier sat at 0
          * and the clamp above therefore could not drop. */
         pulsar_ckpt_drop_bank(&s->graph->ckpt, rw_bank);
-        ok = gpu_graph_compressor_state_reset(s->graph, rw_bank);
+        ok = gpu_graph_compressor_state_reset(s->graph, pulsar_bank_index(rw_bank));
     }
-    else if (pulsar_ckpt_best(&s->graph->ckpt, rw_bank, (uint32_t)pos) == (uint32_t)pos)
-        ok = pulsar_ckpt_restore(&s->graph->ckpt, rw_bank, (uint32_t)pos);
+    else if (pulsar_ckpt_best(&s->graph->ckpt, rw_bank, pos) == pos)
+        ok = pulsar_ckpt_restore(&s->graph->ckpt, rw_bank, pos);
     else {
-        s->graph->ms_comp_state_stale[rw_bank] = true;
+        s->graph->ms_comp_state_stale[pulsar_bank_index(rw_bank)] = true;
         return;
     }
     if (!ok) {
-        fprintf(stderr, "pulsar: rewind to %d on bank %u: state copy failed -- checkpoint invalidated\n", pos, rw_bank);
+        fprintf(stderr, "pulsar: rewind to %d on bank %d: state copy failed -- checkpoint invalidated\n", pos.raw(),
+                rw_bank.raw());
         s->checkpoint_valid = false;
         return;
     }
-    s->graph->ms_comp_state_stale[rw_bank] = false;
+    s->graph->ms_comp_state_stale[pulsar_bank_index(rw_bank)] = false;
 }
 
 
-void pulsar_session::trim_history(int pos) {
+void pulsar_session::trim_history(TokPos pos) {
     auto *s = this;
     /* The image blocks above the new end are gone from the live KV: their records go with them or a later request
      * could reuse rows that no longer exist (L226).  L281: the blocks BELOW it survive, records and all -- before,
      * one cut block dropped the whole identity and the next image request rebuilt every block from 0. */
-    pulsar_image_identity_trim(&s->live_images, (uint32_t)(pos < 0 ? 0 : pos));
-    s->checkpoint.len = pos;
+    pulsar_image_identity_trim(&s->live_images, (uint32_t)pos.before().raw());
+    s->checkpoint.len = pos.before().raw();   /* the token_vec's int length (hist_end() reads it back) */
     spec_lookahead_reset(s);
     /* Rewound positions' drafter rows are stale; empty the window (it refills
      * from the prompt capture on the next prefill, or from commits). */
@@ -1677,10 +1683,10 @@ void pulsar_session::trim_history(int pos) {
 }
 
 
-bool pulsar_session::restore_checkpoint(uint32_t G) {
+bool pulsar_session::restore_checkpoint(TokPos G) {
     auto *s = this;
-    const uint32_t bank = gpu_graph_cur_bank(s->graph);
-    if (!s->checkpoint_valid || G == 0u || G > (uint32_t)s->checkpoint.len ||
+    const BankId bank = gpu_graph_cur_bank(s->graph);
+    if (!s->checkpoint_valid || G.is_none() || G <= TokPos{0} || G > s->hist_end() ||
         pulsar_ckpt_best(&s->graph->ckpt, bank, G) != G) return false;
     if (!pulsar_ckpt_restore(&s->graph->ckpt, bank, G)) {
         /* The device copies were issued in part: the bank's state is no longer
@@ -1688,11 +1694,11 @@ bool pulsar_session::restore_checkpoint(uint32_t G) {
         s->checkpoint_valid = false;
         return false;
     }
-    s->trim_history((int)G);
+    s->trim_history(G);
     s->logits_stale = true;
     /* The checkpoint was captured where a prefill reached G, and a frontier
      * that fell below G since would have dropped it. */
-    s->prefill_frontier = (int)G;
+    s->prefill_frontier = G;
     return true;
 }
 
@@ -1709,7 +1715,7 @@ int pulsar_session::ctx() {
 }
 
 
-TokPos pulsar_session_resume_origin(pulsar_session *s) { return TokPos{s->resume_origin}; }   /* -1 enters as none() */
+TokPos pulsar_session_resume_origin(pulsar_session *s) { return s->resume_origin; }
 
 TokCount pulsar_session_prefill_cap(pulsar_session *s) {
     return TokCount{s ? (int)s->prefill_cap : 0};

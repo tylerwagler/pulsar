@@ -319,9 +319,9 @@ static void live_tool_state_clear_locked(live_tool_state *st) {
     stop_list_clear(&st->call_ids);
     free(st->visible_text);
     st->visible_text = NULL;
-    st->visible_len = 0;
+    st->visible_len = TextBytes{0};
     st->valid = false;
-    st->live_tokens = 0;
+    st->live_tokens = TokCount{0};
 }
 
 
@@ -343,8 +343,8 @@ static void visible_live_clear_locked(visible_live_state *st) {
     if (!st) return;
     free(st->visible_text);
     st->visible_text = NULL;
-    st->visible_len = 0;
-    st->live_tokens = 0;
+    st->visible_len = TextBytes{0};
+    st->live_tokens = TokCount{0};
     st->valid = false;
 }
 
@@ -367,13 +367,13 @@ void server::responses_live_remember(session_slot *sl, const char *visible_text,
     pulsar::ScopedLock lk(&s->tool_mu);
     live_tool_state_clear_locked(&sl->responses_live);
     sl->responses_live.visible_text = server_xstrdup(visible_text);
-    sl->responses_live.visible_len = strlen(visible_text);
+    sl->responses_live.visible_len = TextBytes{strlen(visible_text)};
     if (calls) {
         for (int i = 0; i < calls->len; i++) {
             id_list_push_unique(&sl->responses_live.call_ids, calls->v[i].id);
         }
     }
-    sl->responses_live.live_tokens = s->slot_frontier_pos(sl).raw();
+    sl->responses_live.live_tokens = TokCount{s->slot_frontier_pos(sl).raw()};   /* the tokens before the frontier */
     sl->responses_live.valid = true;
 }
 
@@ -387,7 +387,7 @@ void server::anthropic_live_remember(session_slot *sl, const tool_calls *calls) 
     for (int i = 0; i < calls->len; i++) {
         id_list_push_unique(&sl->anthropic_live.call_ids, calls->v[i].id);
     }
-    sl->anthropic_live.live_tokens = s->slot_frontier_pos(sl).raw();
+    sl->anthropic_live.live_tokens = TokCount{s->slot_frontier_pos(sl).raw()};   /* the tokens before the frontier */
     sl->anthropic_live.valid = sl->anthropic_live.call_ids.len > 0;
 }
 
@@ -465,7 +465,7 @@ static bool live_state_matches_ids_locked(const live_tool_state *st,
                                           const stop_list *ids,
                                           int live_tokens) {
     bool ok = st->valid &&
-              st->live_tokens == live_tokens &&
+              st->live_tokens == TokCount{live_tokens} &&
               st->call_ids.len == ids->len;
     for (int i = 0; ok && i < ids->len; i++) {
         ok = id_list_contains(&st->call_ids, ids->v[i]);

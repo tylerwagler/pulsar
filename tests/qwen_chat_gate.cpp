@@ -33,7 +33,7 @@
 #include <vector>
 
 #include "bpe_gate_util.h"
-#include "../src/lib/qwen_chat.h"
+#include "../src/families/qwen/qwen_chat.h"
 
 /* T3's context for one codepoint c (tests/qwen/gen_qwen_goldens.py sweep_text) */
 static std::string qwen_sweep_context(const std::string &c) { return "x" + c + c + c + " " + c + "1'" + c + "\n"; }

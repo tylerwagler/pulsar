@@ -101,10 +101,10 @@ int main(int argc, char **argv) {
          * placeholder, then a tail.  Placing it at start_pos makes the block land
          * exactly where the golden's block sits, so the types are comparable. */
         pulsar_tokens in = {};
-        for (int i = 0; i < start_pos; i++) pulsar_tokens_push(&in, TEXT + i % 7);
-        pulsar_tokens_push(&in, PLACEHOLDER);
-        pulsar_tokens_push(&in, TEXT + 1);
-        pulsar_tokens_push(&in, TEXT + 2);
+        for (int i = 0; i < start_pos; i++) pulsar_tokens_push(&in, TokId{(int)TEXT + i % 7});
+        pulsar_tokens_push(&in, TokId{(int)PLACEHOLDER});
+        pulsar_tokens_push(&in, TokId{(int)TEXT + 1});
+        pulsar_tokens_push(&in, TokId{(int)TEXT + 2});
 
         pulsar_tokens out = {};
         pulsar_image_ref img = { enc.data(), enc.size(), -1 };
@@ -124,9 +124,9 @@ int main(int argc, char **argv) {
             bad++;
         }
         for (int i = 0; i < span_len && !bad; i++) {
-            if (out.v[start_pos + i] != vocab + types[i]) {
+            if (out.v[start_pos + i] != TokId{vocab + types[i]}) {
                 printf("  FAIL case %u: id[%d] = %d, want vocab+%d = %d\n", c, start_pos + i,
-                       out.v[start_pos + i], types[i], vocab + types[i]);
+                       out.v[start_pos + i].raw(), types[i], vocab + types[i]);
                 bad++;
             }
         }

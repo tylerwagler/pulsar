@@ -767,15 +767,16 @@ static void test_agent_bash_teardown(void) {
     if (timed) {
         usleep(1100 * 1000);
         AGENT_TEST_ASSERT(!agent_on_worker_thread(&w));           /* no worker thread: this one is "the UI's" */
-        worker_progress_cb(&w, "prefill_chunk", 10, 100);
+        worker_progress_cb(&w, "prefill_chunk", TokPos{10}, TokCount{100});
         AGENT_TEST_ASSERT(timed->running && !timed->timed_out);   /* not polled */
         w.worker_tid = pthread_self();
         w.worker_running = true;
         AGENT_TEST_ASSERT(agent_on_worker_thread(&w));
-        worker_progress_cb(&w, "prefill_display", 10, 100);       /* the display event polls nothing */
+        worker_progress_cb(&w, "prefill_display", TokPos{10},
+                           TokCount{100});       /* the display event polls nothing */
         AGENT_TEST_ASSERT(timed->running && !timed->timed_out);
         for (int i = 0; timed->running && i < 2500; i++) {
-            worker_progress_cb(&w, "prefill_chunk", 10, 100);
+            worker_progress_cb(&w, "prefill_chunk", TokPos{10}, TokCount{100});
             usleep(2000);
         }
         AGENT_TEST_ASSERT(!timed->running && timed->timed_out);

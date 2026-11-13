@@ -913,19 +913,20 @@ int pulsar_gpu_output_hc_weights_tensor(
         uint64_t                scale_offset,
         uint64_t                base_offset,
         uint32_t                n_hc,
-        float                   eps) {
-    if (!out || !pre || !model_map || n_hc == 0) return 0;
+        float                   eps,
+        uint32_t                n_tokens) {
+    if (!out || !pre || !model_map || n_hc == 0 || n_tokens == 0) return 0;
     const uint64_t row_bytes = (uint64_t)n_hc * sizeof(float);
-    if (out->bytes < row_bytes || out->bytes % row_bytes != 0 || pre->bytes < out->bytes ||
+    /* L334 P5 S4: the caller's live rows, never out's allocation (f3a617af / d0b2fdb5); both must hold them */
+    if (out->bytes < n_tokens * row_bytes || pre->bytes < n_tokens * row_bytes ||
         scale_offset > model_size || sizeof(float) > model_size - scale_offset ||
         base_offset > model_size || row_bytes > model_size - base_offset) {
         return 0;
     }
-    const uint64_t n_tokens = out->bytes / row_bytes;
     const float *scale = (const float *)cuda_model_range_ptr(model_map, scale_offset, sizeof(float), "output_hc_scale");
     const float *base = (const float *)cuda_model_range_ptr(model_map, base_offset, row_bytes, "output_hc_base");
     if (!scale || !base) return 0;
-    const uint64_t n = n_tokens * n_hc;
+    const uint64_t n = (uint64_t)n_tokens * n_hc;
     output_hc_weights_kernel<<<(uint32_t)((n + 255) / 256), 256>>>(
             (float *)out->ptr, (const float *)pre->ptr, scale, base,
             n_hc, (uint32_t)n_tokens, eps);
@@ -971,10 +972,13 @@ int pulsar_gpu_hc_norm_mix_tensor(
 }
 
 
-int pulsar_gpu_hc_weighted_sum_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *residual_hc, const pulsar_gpu_tensor *weights, uint32_t n_embd, uint32_t n_hc) {
-    if (!out || !residual_hc || !weights || n_embd == 0 || n_hc == 0) return 0;
-    uint32_t n_tokens = (uint32_t)(out->bytes / ((uint64_t)n_embd * sizeof(float)));
-    /* n_tokens comes from the OUTPUT; bound the carrier input too, mirroring
+int pulsar_gpu_hc_weighted_sum_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *residual_hc,
+                                      const pulsar_gpu_tensor *weights, uint32_t n_embd, uint32_t n_hc,
+                                      uint32_t n_tokens) {
+    if (!out || !residual_hc || !weights || n_embd == 0 || n_hc == 0 || n_tokens == 0) return 0;
+    /* L334 P5 S4: the caller's live rows (never out's allocation); the output must hold them */
+    if (out->bytes < (uint64_t)n_tokens * n_embd * sizeof(float)) return 0;
+    /* bound the carrier input too, mirroring
      * pulsar_gpu_hc_split_weighted_sum_tensor. The BF16 narrowing removed the
      * accidental 2x margin that made an over-read harmless (task #62). */
     if (residual_hc->bytes < (uint64_t)n_tokens * n_hc * n_embd * PULSAR_HC_ELT_SIZE ||
@@ -1140,9 +1144,12 @@ static bool hc_expand_split_sizes_ok(const char *what, uint32_t n_tokens, const 
     return true;
 }
 
-int pulsar_gpu_hc_expand_split_tensor(pulsar_gpu_tensor *out_hc, const pulsar_gpu_tensor *block_out, const pulsar_gpu_tensor *residual_hc, const pulsar_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
-    if (!out_hc || !block_out || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
-    uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE));
+int pulsar_gpu_hc_expand_split_tensor(pulsar_gpu_tensor *out_hc, const pulsar_gpu_tensor *block_out,
+                                      const pulsar_gpu_tensor *residual_hc, const pulsar_gpu_tensor *split,
+                                      uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens) {
+    if (!out_hc || !block_out || !residual_hc || !split || n_embd == 0 || n_hc == 0 || n_tokens == 0) return 0;
+    /* L334 P5 S4: the caller's live rows (f3a617af: a 4096-row buffer expanded whole); the output must hold them */
+    if (out_hc->bytes < (uint64_t)n_tokens * n_hc * n_embd * PULSAR_HC_ELT_SIZE) return 0;
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
     if (!hc_expand_split_sizes_ok("hc_expand_split", n_tokens, block_out, NULL, residual_hc, split, n_embd, n_hc))
         return 0;
@@ -1161,9 +1168,14 @@ int pulsar_gpu_hc_expand_split_tensor(pulsar_gpu_tensor *out_hc, const pulsar_gp
 
 
 
-int pulsar_gpu_hc_expand_add_split_tensor(pulsar_gpu_tensor *out_hc, const pulsar_gpu_tensor *block_out, const pulsar_gpu_tensor *block_add, const pulsar_gpu_tensor *residual_hc, const pulsar_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
-    if (!out_hc || !block_out || !block_add || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
-    uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE));
+int pulsar_gpu_hc_expand_add_split_tensor(pulsar_gpu_tensor *out_hc, const pulsar_gpu_tensor *block_out,
+                                          const pulsar_gpu_tensor *block_add, const pulsar_gpu_tensor *residual_hc,
+                                          const pulsar_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc,
+                                          uint32_t n_tokens) {
+    if (!out_hc || !block_out || !block_add || !residual_hc || !split || n_embd == 0 || n_hc == 0 || n_tokens == 0)
+        return 0;
+    /* L334 P5 S4: the caller's live rows (never out's allocation); the output must hold them */
+    if (out_hc->bytes < (uint64_t)n_tokens * n_hc * n_embd * PULSAR_HC_ELT_SIZE) return 0;
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
     if (!hc_expand_split_sizes_ok("hc_expand_add_split", n_tokens, block_out, block_add, residual_hc, split, n_embd,
                                   n_hc))

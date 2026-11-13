@@ -59,6 +59,8 @@
  * used first.  Apart from that, pulsar_segstore_pin holds a key against eviction while a restore
  * reads its chain (the same count as a write in flight's parent). */
 
+#include "pulsar_units.h"   /* TokPos / TokCount: a segment's span; TextBytes: its text (L334 P7) */
+
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -66,12 +68,13 @@
 /// Magic of a .seg file's header: "PSG1".
 #define PULSAR_SEGSTORE_MAGIC   0x31475350u   /* "PSG1" */
 /// Store format version; v3 (L347): rows-only payloads, the state in the key's .rp.  Older versions are removed at open.
-#define PULSAR_SEGSTORE_VERSION 5u            /* v5 (L353): a key covers the span's image content hashes; v2 (L323): the header carries the payload's state bytes; v3 (L347): no state part (the word is 0), the state at G is the key's .rp; v4 (L347 I3a): the payloads' digest is pulsar_kvdigest v2, sealed and checked by the store */
+#define PULSAR_SEGSTORE_VERSION 6u            /* v5 (L353): a key covers the span's image content hashes; v2 (L323): the header carries the payload's state bytes; v3 (L347): no state part (the word is 0), the state at G is the key's .rp; v4 (L347 I3a): the payloads' digest is pulsar_kvdigest v2, sealed and checked by the store; v6 (L386): the header carries the writer's arithmetic (pulsar_segstore_ident) */
 /// Magic of a .rp file's header: "PRP1" (L347).
 #define PULSAR_SEGSTORE_RP_MAGIC   0x31505250u   /* "PRP1" */
 /// Restore point file format version; v2 (L347 I2): the header's word at 12 is the restore point's flags; v3 (L347
-/// I3a): the payload's digest is pulsar_kvdigest v2.  Older versions are removed at open.
-#define PULSAR_SEGSTORE_RP_VERSION 3u
+/// I3a): the payload's digest is pulsar_kvdigest v2; v4 (L386): the header carries the writer's arithmetic
+/// (pulsar_segstore_ident).  Older versions are removed at open.
+#define PULSAR_SEGSTORE_RP_VERSION 4u
 /// L375 (O25): a part whose file read fails this many times in a row with a persistent errno (EIO, EACCES, EISDIR,
 /// ...; never ENOENT, which is a fault at once, and never a passing shortage -- EMFILE, ENFILE, ENOMEM, ENOBUFS,
 /// EAGAIN -- which counts nothing: L353 no. 13) is reported as a content fault and dropped by its reader.
@@ -100,10 +103,11 @@ typedef struct {
     /// This segment's key: 40 hex chars of sha1(parent || text) + NUL
     char key[41];
     char parent[41];          ///< "" for a root
-    /** Token span [G_prev, G): G_prev is the parent's end (0 for a root), G this segment's end. */
-    uint32_t G_prev, G;       ///< token span
-    uint64_t text_end;        ///< bytes of chain text from position 0 to G (index-derived)
-    uint64_t text_len;        ///< this segment's own text bytes
+    /** Token span [G_prev, G): G_prev is the parent's end (0 for a root), G this segment's end -- live-side
+     *  positions on the writer's history (L334 P7: TokPos; the file holds them as uint32). */
+    TokPos G_prev, G;         ///< token span
+    TextBytes text_end;       ///< bytes of chain text from position 0 to G (index-derived)
+    TextBytes text_len;       ///< this segment's own text bytes
     /// Engine payload bytes (rows only, L347), pulsar_session_copy_out_segment's output
     uint64_t payload_bytes;
     uint64_t rp_bytes;        ///< L347: bytes of the key's .rp file, the restore point at G (0 = none)
@@ -128,8 +132,8 @@ typedef struct {
 /** L323: which chain ends a lookup accepts.  `grid`: the last segment's G is a multiple of it (0 = any end);
  *  `state`: the last segment has a restore point (L347). */
 typedef struct {
-    /// In tokens: the chain's end G must be a multiple of it (0 = any end)
-    uint32_t grid;
+    /// In tokens: the chain's end G must be a multiple of it (0 = any end; L334 P7: TokCount)
+    TokCount grid;
     /// The last segment must have a restore point (rp_bytes > 0)
     bool state;
 } pulsar_segstore_end;
@@ -148,14 +152,15 @@ typedef int (*pulsar_segstore_write_fn)(FILE *fp, void *ud, char *err, size_t er
 /// @param model_id          the model id (low 16 bits used)
 /// @param routed_quant_bits the routed-expert format's bits (low 8 bits used)
 /// @param rope_id           the family's rope_id; 0 for the rope the model id implies
-/// @return the 32-bit store identity: model_id << 8 | bits, with a nonzero rope fold in the top byte when rope_id != 0
-/** What a store's segments were computed by: the model, its routed-expert
+/// @return the identity's 32-bit model word: model_id << 8 | bits, with a nonzero rope fold in the top byte when
+///         rope_id != 0
+/** The model word of a store's identity (pulsar_segstore_ident::model): the model, its routed-expert
  * format (pulsar_engine_routed_quant_bits -- the IQ2, MXFP4 and EXL3 builds of
  * one model share a model id and a KV row layout, so a segment's shape cannot
  * tell them apart, but their KV differs) AND its rope where the model id does
  * not fix it (L280: the family's rope_id, 0 for the rope the model id implies;
  * Qwen under YaRN writes other K bytes into the same layout).  The one rule
- * both writers and readers key with; callers take it from
+ * both writers and readers key with; callers take the whole identity from
  * pulsar_engine_kv_identity.
  *
  * A rope_id of 0 leaves the identity as it was before L280 (model_id << 8 |
@@ -176,17 +181,53 @@ static inline uint32_t pulsar_segstore_identity(uint32_t model_id, uint32_t rout
     return id;
 }
 
+/** L386: a store's whole identity -- what computed its KV bytes: the model word (pulsar_segstore_identity: the model,
+ * its routed-expert format, its rope) AND the arithmetic that ran it on this device (pulsar_gpu_arithmetic: the compute
+ * capability, the cuBLASLt version, the CUDA runtime version).  A prefill's bytes depend on all of them: the fixed
+ * GEMM's algorithm picks are keyed by (compute capability, cuBLASLt version), and a shape with no recorded pick takes
+ * cuBLASLt's first suggestion, which another library may change; another architecture runs other kernels.  So a
+ * resume of KV written by other arithmetic would not equal the cold prefill.  Every .seg and .rp header carries all
+ * four words; the store indexes only files whose four match its own.
+ *
+ * What does NOT belong here: anything that does not change bytes (the git sha, the version string, a timestamp),
+ * since each value is a store wiped.  The engine's own numerics need no word of their own: a numerics change bumps
+ * PULSAR_SESSION_SEGMENT_VERSION and PULSAR_SESSION_KV_PAYLOAD_VERSION (pulsar.h; L292 and L370 did, with no format
+ * change), which every load checks.
+ *
+ * A bare model word converts to an identity with no arithmetic recorded (zeros): the host tests' stores. */
+struct pulsar_segstore_ident {
+    uint32_t model = 0;      ///< pulsar_segstore_identity: model id, routed-expert format, rope
+    uint32_t cc = 0;         ///< the device's compute capability, major * 10 + minor
+    uint32_t gemm_lib = 0;   ///< cublasLtGetVersion()
+    uint32_t runtime = 0;    ///< cudaRuntimeGetVersion()
+    pulsar_segstore_ident() = default;
+    /** @param model_word pulsar_segstore_identity
+     *  @param cc_        the compute capability, major * 10 + minor
+     *  @param lt         the cuBLASLt version
+     *  @param rt         the CUDA runtime version */
+    pulsar_segstore_ident(uint32_t model_word, uint32_t cc_ = 0, uint32_t lt = 0, uint32_t rt = 0)
+        : model(model_word), cc(cc_), gemm_lib(lt), runtime(rt) {}
+    /** @param o another identity @return true when every word matches */
+    bool operator==(const pulsar_segstore_ident &o) const {
+        return model == o.model && cc == o.cc && gemm_lib == o.gemm_lib && runtime == o.runtime;
+    }
+    /** @param o another identity @return true when any word differs */
+    bool operator!=(const pulsar_segstore_ident &o) const { return !(*this == o); }
+};
+
 /// @param dir          the store directory (created when missing; must be writable)
 /// @param budget_bytes byte budget for the .seg and .rp files; 0 = unbounded
-/// @param identity     pulsar_segstore_identity of the writer; segments of another identity are skipped
+/// @param identity     the writer's identity (pulsar_engine_kv_identity); files of another identity are skipped
 /// @param log          message sink, or NULL
 /// @param log_ud       context for `log`
 /// @return the open store (close with pulsar_segstore_close), or NULL when the directory cannot be created, written or listed
 /** Open (create) the store and index its segments.  budget_bytes 0 = unbounded.
- * Segments of another identity (pulsar_segstore_identity), of another format,
+ * Segments of another identity (pulsar_segstore_ident), of another format,
  * or unreadable are skipped and left alone -- except a segment of an OLDER store
- * version, which no build of this format reads: it is removed (L323). */
-pulsar_segstore *pulsar_segstore_open(const char *dir, uint64_t budget_bytes, uint32_t identity,
+ * version, which no build of this format reads: it is removed (L323).  L386: the
+ * segments of another identity are said once at the open (to `log`): how many, and
+ * the first one's identity beside this store's, word by word. */
+pulsar_segstore *pulsar_segstore_open(const char *dir, uint64_t budget_bytes, const pulsar_segstore_ident &identity,
                                       pulsar_segstore_log_fn log, void *log_ud);
 /** Close the store and free its index and its RAM copies (no job may be out); the segment files stay on disk.
  *  @param st the store, or NULL */
@@ -204,7 +245,7 @@ void pulsar_segstore_set_ram(pulsar_segstore *st, pulsar_kvpool *pool, bool reta
 /// @param len    bytes of `text`
 /// @param out    receives the 40 hex chars of sha1(parent || text) and a NUL
 /** The key rule, the one authority for it. */
-void pulsar_segstore_child_key(const char *parent, const char *text, size_t len, char out[41]);
+void pulsar_segstore_child_key(const char *parent, const char *text, TextBytes len, char out[41]);
 
 /** L353: a segment's key: its parent, its text, and the content hashes of the image blocks in its span.  An image block
  *  renders as a fixed placeholder, so without the hashes two same-size images share every key: "the same key is the
@@ -215,7 +256,7 @@ void pulsar_segstore_child_key(const char *parent, const char *text, size_t len,
  *  @param hashes [n] the span's image content hashes, in position order
  *  @param n      hashes
  *  @param out    receives the 40 hex digits and a NUL */
-void pulsar_segstore_child_key_images(const char *parent, const char *text, size_t len, const uint64_t *hashes,
+void pulsar_segstore_child_key_images(const char *parent, const char *text, TextBytes len, const uint64_t *hashes,
                                       uint32_t n, char out[41]);
 
 /** L353: pulsar_segstore_lookup for a request carrying images: each child's key is reproduced from the request's bytes
@@ -230,7 +271,7 @@ void pulsar_segstore_child_key_images(const char *parent, const char *text, size
  *  @param chain  receives the deepest accepted chain, root first
  *  @param cap    entries `chain` holds
  *  @return segments in `chain`, 0 when none */
-int pulsar_segstore_lookup_images(pulsar_segstore *st, const char *text, size_t len, const pulsar_segstore_end *want,
+int pulsar_segstore_lookup_images(pulsar_segstore *st, const char *text, TextBytes len, const pulsar_segstore_end *want,
                                   const uint64_t *hashes, uint32_t n, pulsar_segstore_seg *chain, int cap);
 
 /// @param st    the store
@@ -242,7 +283,7 @@ int pulsar_segstore_lookup_images(pulsar_segstore *st, const char *text, size_t 
 /// @return the chain's length, 0 when no chain matches
 /** The deepest chain (by G, then by text) whose text is a byte prefix of text[0, len) and whose last segment `want`
  * accepts (NULL: any), root first, at most `cap` long.  Returns its length (0: none). */
-int pulsar_segstore_lookup(pulsar_segstore *st, const char *text, size_t len, const pulsar_segstore_end *want,
+int pulsar_segstore_lookup(pulsar_segstore *st, const char *text, TextBytes len, const pulsar_segstore_end *want,
                            pulsar_segstore_seg *chain, int cap);
 /** Is `key` stored?
  *  @param st  the store, or NULL (false)
@@ -276,8 +317,8 @@ bool pulsar_segstore_get(pulsar_segstore *st, const char key[41], pulsar_segstor
  * from parent and text here, so a caller cannot store a segment under the
  * wrong name.  The written key is returned in key_out.  The same key twice is one
  * segment: a put of a stored key writes nothing. */
-bool pulsar_segstore_put(pulsar_segstore *st, const char *parent, uint32_t G_prev, uint32_t G,
-                         const char *text, size_t text_len,
+bool pulsar_segstore_put(pulsar_segstore *st, const char *parent, TokPos G_prev, TokPos G,
+                         const char *text, TextBytes text_len,
                          uint64_t payload_bytes, pulsar_segstore_write_fn write_payload,
                          uint64_t trailer_bytes, pulsar_segstore_write_fn write_trailer,
                          void *ud, char key_out[41], char *err, size_t errlen);
@@ -307,10 +348,10 @@ typedef struct pulsar_segstore_job pulsar_segstore_job;
 /// @param job_out       receives the job
 /// @param err           receives a reason on failure
 /// @param errlen        size of `err`
-int pulsar_segstore_reserve_images(pulsar_segstore *st, const char *parent, uint32_t G_prev, uint32_t G, const char *text,
-                                   size_t text_len, const uint64_t *hashes, uint32_t n_hashes, uint64_t payload_bytes,
-                                   uint64_t trailer_bytes, char key_out[41], pulsar_segstore_job **job_out, char *err,
-                                   size_t errlen);
+int pulsar_segstore_reserve_images(pulsar_segstore *st, const char *parent, TokPos G_prev, TokPos G, const char *text,
+                                   TextBytes text_len, const uint64_t *hashes, uint32_t n_hashes,
+                                   uint64_t payload_bytes, uint64_t trailer_bytes, char key_out[41],
+                                   pulsar_segstore_job **job_out, char *err, size_t errlen);
 
 /// @param st            the store
 /// @param parent        the parent's key, "" for a root (stored, or pending)
@@ -326,8 +367,8 @@ int pulsar_segstore_reserve_images(pulsar_segstore *st, const char *parent, uint
 /// @param errlen        size of `err`
 /// @return 1: a job to write and commit; 0: the store holds (or is writing) what this write would; -1: refused; -2:
 ///         no room in the RAM pool now (nothing changed but evictions; the caller may wait for its writer and retry)
-int pulsar_segstore_reserve(pulsar_segstore *st, const char *parent, uint32_t G_prev, uint32_t G, const char *text,
-                            size_t text_len, uint64_t payload_bytes, uint64_t trailer_bytes, char key_out[41],
+int pulsar_segstore_reserve(pulsar_segstore *st, const char *parent, TokPos G_prev, TokPos G, const char *text,
+                            TextBytes text_len, uint64_t payload_bytes, uint64_t trailer_bytes, char key_out[41],
                             pulsar_segstore_job **job_out, char *err, size_t errlen);
 /** L347 I3a: a restore point's reserve -- the restore point of stored (or pending) segment `key`, as a job like a
  *  segment's: room made (never `key`), its image allocated with its header, the key pinned until the commit; the
@@ -363,10 +404,10 @@ const char *pulsar_segstore_job_key(const pulsar_segstore_job *job);
 int pulsar_segstore_job_kind(const pulsar_segstore_job *job);
 /// @param job the job
 /// @return its first token position (0 for a restore point)
-uint32_t pulsar_segstore_job_G_prev(const pulsar_segstore_job *job);
+TokPos pulsar_segstore_job_G_prev(const pulsar_segstore_job *job);
 /// @param job the job
 /// @return its end position (a restore point: its segment's, 0 while that one is pending)
-uint32_t pulsar_segstore_job_G(const pulsar_segstore_job *job);
+TokPos pulsar_segstore_job_G(const pulsar_segstore_job *job);
 /// @param job the job
 /// @return the file's bytes
 uint64_t pulsar_segstore_job_bytes(const pulsar_segstore_job *job);
@@ -387,7 +428,7 @@ uint8_t *pulsar_segstore_job_trailer(pulsar_segstore_job *job);
  *  @param payload_bytes its payload's bytes
  *  @param trailer_bytes its trailer's bytes
  *  @return the file's bytes */
-uint64_t pulsar_segstore_seg_file_bytes(uint64_t text_len, uint64_t payload_bytes, uint64_t trailer_bytes);
+uint64_t pulsar_segstore_seg_file_bytes(TextBytes text_len, uint64_t payload_bytes, uint64_t trailer_bytes);
 /** L347 I3a: a restore point file's bytes (header, payload).
  *  @param rp_bytes the restore point's bytes
  *  @return the file's bytes */
@@ -437,7 +478,7 @@ bool pulsar_segstore_flag_rp(pulsar_segstore *st, const char key[41], uint32_t f
  *  @param len       bytes of it to cover
  *  @param rp_at_len receives whether a chain ending at `len` has a restore point
  *  @return true when stored rows cover text[0, len) */
-bool pulsar_segstore_covers(pulsar_segstore *st, const char *text, size_t len, bool *rp_at_len);
+bool pulsar_segstore_covers(pulsar_segstore *st, const char *text, TextBytes len, bool *rp_at_len);
 /** L347 I3a: a stored part's payload for a load: its RAM copy when it has one, else its file read whole with O_DIRECT
  *  into an image, checked (size, header, the payload's digest) -- kept as its RAM copy with the RAM tier, else lent
  *  until the unmap.  The part stays mapped (never evicted from RAM) until pulsar_segstore_unmap_part.
@@ -534,7 +575,7 @@ uint64_t pulsar_segstore_release(pulsar_segstore *st, const char tip[41], const 
  *  @param text_len      bytes of `text`
  *  @param ud            context given to pulsar_segstore_foreach_trailer
  *  @return false to stop the walk */
-typedef bool (*pulsar_segstore_trailer_fn)(FILE *fp, uint64_t trailer_bytes, const char *text, size_t text_len,
+typedef bool (*pulsar_segstore_trailer_fn)(FILE *fp, uint64_t trailer_bytes, const char *text, TextBytes text_len,
                                            void *ud);
 /** Run `fn` over every segment that carries a trailer, in index order.  L353: the one call safe off the store's thread
  *  (a chat parse's): it copies the entries under a lock and reads the files without it, so one evicted meanwhile is

@@ -78,7 +78,7 @@ struct judge_job {
 
 /// The judge: its bank, head, calibration and queue (server::judge; NULL = no /v1/systemone).
 struct server_judge {
-    int bank = -1;                        ///< the reserved bank
+    BankId bank = BankId::none();        ///< the reserved bank (L334 P4: typed)
     uint32_t slots = 0;                   ///< the head's slots
     uint32_t width = 0;                   ///< the hidden width
     const float *w = nullptr;             ///< head weight [slots][width] (the container's mapping)
@@ -222,7 +222,7 @@ void judge_finish(judge_job *jb, const char *why) {
 
 bool server_judge_open(server *s, const char *container_dir, int bank, char *err, size_t errlen) {
     server_judge *J = new server_judge();
-    J->bank = bank;
+    J->bank = BankId{bank};
     J->slots = pulsar_engine_decision_head(s->engine, &J->w, &J->b, &J->width);
     if (!J->slots) {
         snprintf(err, errlen, "the container carries no decision head");
@@ -274,19 +274,19 @@ bool server_judge_open(server *s, const char *container_dir, int bank, char *err
     }
     /* the bank: empty, the adapter on, saved -- nothing installed after (the worker installs what it serves) */
     pulsar_session *pool = s->sess;
-    if (!pulsar_session_bank_state_restore(pool, (uint32_t)bank)) {
+    if (!pulsar_session_bank_state_restore(pool, BankId{bank})) {
         snprintf(err, errlen, "bank %d could not be installed", bank);
         delete J;
         return false;
     }
     pulsar_session_invalidate(pool);
-    if (!pulsar_session_set_bank_adapter(pool, (uint32_t)bank, true)) {
+    if (!pulsar_session_set_bank_adapter(pool, BankId{bank}, true)) {
         snprintf(err, errlen, "bank %d refused the adapter", bank);
         delete J;
         return false;
     }
-    pulsar_session_bank_state_save(pool, (uint32_t)bank);
-    s->live_bank = -1;
+    pulsar_session_bank_state_save(pool, BankId{bank});
+    s->live_bank = BankId::none();
     s->judge = J;
     server_log(PULSAR_LOG_DEFAULT,
                "pulsar-server: /v1/systemone on bank %d (reserved, the adapter on): decision head %u slots over %u, "
@@ -320,26 +320,26 @@ bool server_judge_holds_kv(server *s) {
         pulsar::ScopedLock lk(&s->mu);
         if (!J->head) return false;
     }
-    return pulsar_session_bank_touched_kv_bytes(s->sess, (uint32_t)J->bank) > KvBytes{};
+    return pulsar_session_bank_touched_kv_bytes(s->sess, J->bank) > KvBytes{};
 }
 
 bool server_judge_release(server *s) {
     server_judge *J = s->judge;
     if (!server_judge_releasable(s)) return false;
     pulsar_session *pool = s->sess;
-    const KvBytes held = pulsar_session_bank_touched_kv_bytes(pool, (uint32_t)J->bank);
+    const KvBytes held = pulsar_session_bank_touched_kv_bytes(pool, J->bank);
     if (held == KvBytes{}) return false;   /* nothing resident: freeing it makes no room */
-    if (s->live_bank < 0) {
+    if (s->live_bank.is_none()) {
         /* nothing the server installed: the engine's bank may be the judge's own (its step leaves it so) */
-        const int park = s->park_bank(J->bank);
-        if (park < 0 || !pulsar_session_bank_state_restore(pool, (uint32_t)park)) return false;
+        const BankId park = s->park_bank(J->bank);
+        if (park.is_none() || !pulsar_session_bank_state_restore(pool, park)) return false;
         s->live_bank = park;
-        s->slots[park].committed_pos = pulsar_session_pos(pool);
+        s->slot_of_bank(park)->committed_pos = pulsar_session_pos(pool);
     }
-    if (!pulsar_session_bank_free_physical(pool, (uint32_t)J->bank)) return false;
+    if (!pulsar_session_bank_free_physical(pool, J->bank)) return false;
     J->released = true;
     server_log(PULSAR_LOG_DEFAULT, "pulsar-server: /v1/systemone: bank %d's KV freed for chat (%.2f GiB; no judge "
-               "request waits): the next one re-backs it empty and prefills again", J->bank,
+               "request waits): the next one re-backs it empty and prefills again", J->bank.raw(),
                (double)held.raw() / (1024.0 * 1024.0 * 1024.0));
     return true;
 }
@@ -379,7 +379,7 @@ bool server_judge_step(server *s) {
      * with the guard's spills as its relief; short of either the request is answered 503 with the retry hint.  Before
      * anything is installed: the bank stays valid where it stands, and the next request resumes on it. */
     if (!s->floor_admits_chunk(JUDGE_CHUNK_TOKENS, err_floor, sizeof err_floor) ||
-        !s->budget_admits_growth((uint32_t)J->bank, jb->prompts[jb->at].len, err_floor, sizeof err_floor)) {
+        !s->budget_admits_growth(J->bank, jb->prompts[jb->at].len, err_floor, sizeof err_floor)) {
         server_log(PULSAR_LOG_WARNING, "pulsar-server: /v1/systemone REFUSED (503): %s", err_floor);
         pop();
         jb->busy = true;
@@ -387,24 +387,24 @@ bool server_judge_step(server *s) {
         return true;
     }
     /* install the judge bank: the chat bank installed saved first (bank_switch's rule) */
-    if (s->live_bank >= 0 && s->live_bank != J->bank) {
-        s->slots[s->live_bank].committed_pos = pulsar_session_pos(pool);
-        pulsar_session_bank_state_save(pool, (uint32_t)s->live_bank);
+    if (s->live_bank.is_token() && s->live_bank != J->bank) {
+        s->slot_of_bank(s->live_bank)->committed_pos = pulsar_session_pos(pool);
+        pulsar_session_bank_state_save(pool, s->live_bank);
     }
-    s->live_bank = -1;
+    s->live_bank = BankId::none();
     /* L372 (O12 b): a bank freed for chat is re-backed, and comes back EMPTY (its carry still names the freed rows) */
     const bool reback = J->released;
-    if ((reback && !pulsar_session_bank_alloc_physical(pool, (uint32_t)J->bank)) ||
-        !pulsar_session_bank_state_restore(pool, (uint32_t)J->bank)) {
+    if ((reback && !pulsar_session_bank_alloc_physical(pool, J->bank)) ||
+        !pulsar_session_bank_state_restore(pool, J->bank)) {
         pop();
         judge_finish(jb, reback ? "the judge bank could not be re-backed" : "the judge bank could not be installed");
         return true;
     }
     if (reback) {
         pulsar_session_invalidate(pool);
-        pulsar_session_bank_state_save(pool, (uint32_t)J->bank);
+        pulsar_session_bank_state_save(pool, J->bank);
         J->released = false;
-        server_log(PULSAR_LOG_DEFAULT, "pulsar-server: /v1/systemone: bank %d re-backed empty", J->bank);
+        server_log(PULSAR_LOG_DEFAULT, "pulsar-server: /v1/systemone: bank %d re-backed empty", J->bank.raw());
     }
     char err[256] = "";
     const pulsar_tokens &P = jb->prompts[jb->at];
@@ -458,12 +458,12 @@ bool server_judge_step(server *s) {
     } else if (ok) {
         jb->pos = target;
     }
-    pulsar_session_bank_state_save(pool, (uint32_t)J->bank);   /* nothing installed after: live_bank stays -1 */
+    pulsar_session_bank_state_save(pool, J->bank);   /* nothing installed after: live_bank stays -1 */
     if (!ok) {
         /* a failed sync leaves the bank's history unknown: empty it, the adapter kept */
-        if (pulsar_session_bank_state_restore(pool, (uint32_t)J->bank)) {
+        if (pulsar_session_bank_state_restore(pool, J->bank)) {
             pulsar_session_invalidate(pool);
-            pulsar_session_bank_state_save(pool, (uint32_t)J->bank);
+            pulsar_session_bank_state_save(pool, J->bank);
         }
         pop();
         char why[320];

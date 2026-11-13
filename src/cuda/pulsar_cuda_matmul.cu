@@ -2284,16 +2284,47 @@ static int cuda_matmul_fp8_mx_window(pulsar_gpu_tensor *out, const void *model_m
             uint32_t red = CUBLASLT_REDUCTION_SCHEME_NONE;
             cublasLtMatmulPreferenceSetAttribute(pf, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &red, sizeof(red));
         }
-        int got = 0;
-        cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(g_cublaslt, ne.op, ne.la, ne.lb, ne.ld, ne.ld, pf, 1, &ne.h, &got);
+        /* L382, the L183 pin on this arm: ONE algorithm per (shape, output dtype), chosen at the canonical row count
+         * and used at every row count.  The NONE reduction mask alone does not make a row's bytes independent of the
+         * rows sharing the call: the heuristic picks by M, and two non-split-K MXFP8 kernels accumulate K in
+         * different orders -- measured on DeepSeek's 4096 -> 512 (nine kernels between 9 and 1024 rows), which left a
+         * resume from the 128-row grid point 3.56 away from the cold prefill (session-contract C1/C2 at 128).  This
+         * arm only ever sees PREFILL rows (decode rows take the MMA / GEMV arms below the dispatch), so the pin
+         * costs no decode step; the canonical chunk keeps the kernel it had. */
+        static thread_local std::unordered_map<lt_cache_key, cublasLtMatmulAlgo_t, lt_cache_key_hash> canon_algo;
+        const lt_cache_key sk = {in_dim, out_dim, 0u, (uint64_t)out_f16};
+        auto cit = canon_algo.find(sk);
+        cublasStatus_t hs = CUBLAS_STATUS_SUCCESS;
+        int got = 1;
+        if (cit == canon_algo.end()) {
+            cublasLtMatrixLayout_t lb_c, ld_c;
+            cublasLtMatrixLayoutCreate(&lb_c, CUDA_R_8F_E4M3, in_dim, PULSAR_PREFILL_CHUNK_DEFAULT, in_dim);
+            cublasLtMatrixLayoutCreate(&ld_c, out_f16 ? CUDA_R_16F : CUDA_R_32F, out_dim, PULSAR_PREFILL_CHUNK_DEFAULT,
+                                       out_dim);
+            got = 0;
+            hs = cublasLtMatmulAlgoGetHeuristic(g_cublaslt, ne.op, ne.la, lb_c, ld_c, ld_c, pf, 1, &ne.h, &got);
+            cublasLtMatrixLayoutDestroy(lb_c); cublasLtMatrixLayoutDestroy(ld_c);
+            if (hs == CUBLAS_STATUS_SUCCESS && got) cit = canon_algo.emplace(sk, ne.h.algo).first;
+        }
         cublasLtMatmulPreferenceDestroy(pf);
         if (hs != CUBLAS_STATUS_SUCCESS || !got) {
             cublasLtMatrixLayoutDestroy(ne.la); cublasLtMatrixLayoutDestroy(ne.lb);
             cublasLtMatrixLayoutDestroy(ne.ld); cublasLtMatmulDescDestroy(ne.op);
             return cuda_refuse("cuda_matmul_fp8_mx_window", "%s: cuBLASLt has no fixed-order MXFP8 kernel for %llu -> "
-                               "%llu at %d rows (%s output; heuristic status %d)", label ? label : "mxfp8",
-                               (unsigned long long)in_dim, (unsigned long long)out_dim, ntok, out_f16 ? "f16" : "f32",
-                               (int)hs);
+                               "%llu at the canonical %d rows (%s output; heuristic status %d)", label ? label : "mxfp8",
+                               (unsigned long long)in_dim, (unsigned long long)out_dim,
+                               (int)PULSAR_PREFILL_CHUNK_DEFAULT, out_f16 ? "f16" : "f32", (int)hs);
+        }
+        ne.h.algo = cit->second;
+        cublasLtMatmulHeuristicResult_t chk;
+        const cublasStatus_t cs = cublasLtMatmulAlgoCheck(g_cublaslt, ne.op, ne.la, ne.lb, ne.ld, ne.ld, &ne.h.algo, &chk);
+        if (cs != CUBLAS_STATUS_SUCCESS || chk.state != CUBLAS_STATUS_SUCCESS || chk.workspaceSize > wz) {
+            cublasLtMatrixLayoutDestroy(ne.la); cublasLtMatrixLayoutDestroy(ne.lb);
+            cublasLtMatrixLayoutDestroy(ne.ld); cublasLtMatmulDescDestroy(ne.op);
+            return cuda_refuse("cuda_matmul_fp8_mx_window", "%s: the shape's fixed MXFP8 kernel (chosen at %d rows) does "
+                               "not support %d rows (%llu -> %llu, %s output; check %d/%d)", label ? label : "mxfp8",
+                               (int)PULSAR_PREFILL_CHUNK_DEFAULT, ntok, (unsigned long long)in_dim,
+                               (unsigned long long)out_dim, out_f16 ? "f16" : "f32", (int)cs, (int)chk.state);
         }
         e = &cache.emplace(ck, ne).first->second;
     }
@@ -2333,8 +2364,8 @@ static int cuda_matmul_fp8_mx_tensor_labeled(pulsar_gpu_tensor *out, const void 
 
 
 /* The canonical row count at which a prefill GEMM arm chooses its ONE kernel
- * per shape (the production prefill chunk): the plain-weight arm (L183) and
- * the attn-out 'a' arm (L195) both pin here.  It IS the default prefill chunk, read from its one definition (L375:
+ * per shape (the production prefill chunk): the plain-weight arm (L183),
+ * the attn-out 'a' arm (L195) and the MXFP8 window arm above (L382) all pin here.  It IS the default prefill chunk, read from its one definition (L375:
  * it was a second 4096). */
 /// The canonical row count a prefill cuBLASLt arm chooses its one kernel at: the default prefill chunk.
 #define PULSAR_BF16_LT_CANON_ROWS ((int)PULSAR_PREFILL_CHUNK_DEFAULT)

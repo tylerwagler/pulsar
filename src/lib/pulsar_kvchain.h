@@ -117,7 +117,7 @@ pulsar_kvchain_writer pulsar_kvchain_writer_inline(pulsar_segstore *st);
 /** What a persist did. */
 typedef struct {
     int written;        ///< new segments, copied out and handed to the writer (L338: committed later, on its thread)
-    int end;            ///< the chain's end after the write (0: none)
+    TokPos end;         ///< the chain's end after the write (position 0: none -- L334 P7 kept the int's 0)
     uint64_t bytes;     ///< payload + trailer bytes copied out
     uint64_t rp_bytes;  ///< L347: bytes of the restore points this persist copied out (chain end and periodic; 0: none)
     int rp_written;     ///< L347 I2: how many restore points it handed to the writer
@@ -133,7 +133,7 @@ typedef struct {
  *  lands a chunk, and captures a grid checkpoint, on each absolute multiple of it (prefill_loop.cpp). */
 /// @param s the session
 /// @return the grid in tokens: the session's prefill chunk
-int pulsar_kvchain_grid(pulsar_session *s);
+TokCount pulsar_kvchain_grid(pulsar_session *s);
 
 /** L323: where the segments of a chain stored to `prev` (a grid point, or 0) end when the history's deepest grid
  *  checkpoint is `deepest`: every multiple of `grid` in (prev, deepest], then, with `tail`, the tail to `deepest`
@@ -145,18 +145,18 @@ int pulsar_kvchain_grid(pulsar_session *s);
 /// @param ends    receives the segment ends, ascending
 /// @param cap     capacity of `ends`
 /// @return the number of ends written
-int pulsar_kvchain_segment_ends(int prev, int deepest, int grid, bool tail, int *ends, int cap);
+int pulsar_kvchain_segment_ends(TokPos prev, TokPos deepest, TokCount grid, bool tail, TokPos *ends, int cap);
 
 /** L347 I2: is `G` a periodic restore point -- a positive multiple of PULSAR_KVCHAIN_RP_EVERY_CELLS cells of `grid`?
  *  @param G    a segment end
  *  @param grid the disk grid (pulsar_kvchain_grid)
  *  @return true when a persist passing G writes a restore point there */
-bool pulsar_kvchain_rp_periodic(int G, int grid);
+bool pulsar_kvchain_rp_periodic(TokPos G, TokCount grid);
 
 /** L347 I2: one segment of a persisted chain: its key and its end. */
 typedef struct {
     char key[41];   ///< the segment's key
-    int G;          ///< its end
+    TokPos G;       ///< its end
 } pulsar_kvchain_link;
 
 /** L347 I2: where a persist's restore points come from -- the installed bank's checkpoints in pulsar_kvchain_persist,
@@ -165,10 +165,10 @@ typedef struct {
     /// context for both hooks
     void *ud;
     /** The restore point's bytes at G; 0 = there is no checkpoint at G (nothing is written there). */
-    uint64_t (*bytes)(void *ud, int G);
+    uint64_t (*bytes)(void *ud, TokPos G);
     /** L347 I3a: copy exactly those bytes for G, the restore point of segment `key`, into `dst` (its digest slot is
      *  the writer's); 0 on success, else err. */
-    int (*copy)(void *ud, int G, const char *key, uint8_t *dst, uint64_t bytes, char *err, size_t errlen);
+    int (*copy)(void *ud, TokPos G, const char *key, uint8_t *dst, uint64_t bytes, char *err, size_t errlen);
 } pulsar_kvchain_rp_source;
 
 /** L347 I2: the restore point policy of a persist that stored (or found stored) the segments `links` (ascending; the
@@ -185,7 +185,8 @@ typedef struct {
  *  @param src    the checkpoints
  *  @param writer where the copied-out restore points go
  *  @param r      the persist's result */
-void pulsar_kvchain_place_rps(pulsar_segstore *st, const pulsar_kvchain_link *links, int n, int grid, unsigned what,
+void pulsar_kvchain_place_rps(pulsar_segstore *st, const pulsar_kvchain_link *links, int n, TokCount grid,
+                              unsigned what,
                               const pulsar_kvchain_rp_source *src, const pulsar_kvchain_writer *writer,
                               pulsar_kvchain_persist_result *r);
 
@@ -205,7 +206,8 @@ void pulsar_kvchain_place_rps(pulsar_segstore *st, const pulsar_kvchain_link *li
 /// @param writer     where the copied-out files go (required)
 /// @param out        receives what the persist did, or NULL
 /// @return the number of segments written
-int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, int min_tokens, unsigned what,
+int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, TokCount min_tokens,
+                           unsigned what,
                            const pulsar_kvchain_trailer *trailer, const pulsar_kvchain_writer *writer,
                            pulsar_kvchain_persist_result *out);
 
@@ -226,9 +228,9 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
 /// @param err          receives why a stored chain was cut short
 /// @param errlen       size of `err`
 /// @return the chain's length; 0 when there is none
-int pulsar_kvchain_find(pulsar_segstore *st, const char *text, size_t text_len, const uint64_t *image_hashes,
-                        int n_images, int min_tokens, pulsar_segstore_seg *chain, int cap, uint64_t *bytes, char *err,
-                        size_t errlen);
+int pulsar_kvchain_find(pulsar_segstore *st, const char *text, TextBytes text_len, const uint64_t *image_hashes,
+                        int n_images, TokCount min_tokens, pulsar_segstore_seg *chain, int cap, uint64_t *bytes,
+                        char *err, size_t errlen);
 /** L323: the bytes a load of `chain` (n segments) reads -- every segment's rows and trailer, the last one's restore
  *  point file too (L347) -- the read pulsar_kvchain_find prices against the prefill it saves. */
 /// @param chain the chain, root first
@@ -264,7 +266,7 @@ uint64_t pulsar_kvchain_segment_load_bytes(const pulsar_segstore_seg *chain, int
 /// @param err      receives a reason on failure
 /// @param errlen   size of `err`
 typedef pulsar_segment_status (*pulsar_kvchain_segment_loader)(void *ud, const uint8_t *seg, uint64_t bytes, bool last,
-                                                               const uint8_t *rp, uint64_t rp_bytes, int *G,
+                                                               const uint8_t *rp, uint64_t rp_bytes, TokPos *G,
                                                                const char *key, char *err, size_t errlen);
 /** L347 I3b: one segment's check, nothing written (pulsar_session_check_segment's contract). */
 /// @param ud       the checker's context
@@ -354,8 +356,8 @@ void pulsar_kvchain_pin(pulsar_segstore *st, const pulsar_segstore_seg *chain, i
 int pulsar_kvchain_load_slice(pulsar_segstore *st, pulsar_session *s, const pulsar_segstore_seg *chain, int n,
                               int *next, int k, char *err, size_t errlen);
 /** L330: a loaded chain's last word (L196): the bank's tokens end at the chain's end and agree with `text` at its
- *  boundary.  Returns the position (the chain is touched); 0 when they disagree (the chain's last segment is dropped,
- *  the bank invalidated, `err` says so). */
+ *  boundary.  Returns the position (the chain is touched); position 0 when they disagree (the chain's last segment is
+ *  dropped, the bank invalidated, `err` says so) -- L334 P7 kept the int's 0 for "nothing": a chain never ends at 0. */
 /// @param st     the store
 /// @param e      the engine
 /// @param s      the session whose installed bank holds the loaded chain
@@ -364,13 +366,13 @@ int pulsar_kvchain_load_slice(pulsar_segstore *st, pulsar_session *s, const puls
 /// @param n      its segment count
 /// @param err    receives the disagreement
 /// @param errlen size of `err`
-/// @return the bank's position, 0 when tokens and text disagree
-int pulsar_kvchain_load_check(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const char *text,
-                              const pulsar_segstore_seg *chain, int n, char *err, size_t errlen);
+/// @return the bank's position, TokPos{0} when tokens and text disagree
+TokPos pulsar_kvchain_load_check(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const char *text,
+                                 const pulsar_segstore_seg *chain, int n, char *err, size_t errlen);
 /** L310: load the `n` segments pulsar_kvchain_find returned for `text` into the installed bank -- the whole chain as
- *  one slice, then the boundary check.  Returns the position the bank stands at; 0 when a segment would not load or
- *  the chain disagrees with its tokens at the boundary (that chain is dropped, the bank invalidated, `err` says
- *  which).  The chain is touched on success. */
+ *  one slice, then the boundary check.  Returns the position the bank stands at; position 0 (L334 P7: the int's 0
+ *  kept for "nothing loaded") when a segment would not load or the chain disagrees with its tokens at the boundary
+ *  (that chain is dropped, the bank invalidated, `err` says which).  The chain is touched on success. */
 /// @param st     the store
 /// @param e      the engine
 /// @param s      the session whose installed bank is loaded
@@ -379,16 +381,17 @@ int pulsar_kvchain_load_check(pulsar_segstore *st, pulsar_engine *e, pulsar_sess
 /// @param n      its segment count
 /// @param err    receives the reason on failure
 /// @param errlen size of `err`
-/// @return the position the bank stands at; 0 on failure
-int pulsar_kvchain_load(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const char *text,
-                        const pulsar_segstore_seg *chain, int n, char *err, size_t errlen);
+/// @return the position the bank stands at; TokPos{0} on failure
+TokPos pulsar_kvchain_load(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const char *text,
+                           const pulsar_segstore_seg *chain, int n, char *err, size_t errlen);
 
 /** Restore the deepest stored chain for `text` into the installed bank (see
  *  above), at most `cap` segments reported in `chain` (*n_out of them).  `image_hashes` are the content hashes
  *  (pulsar_image_hash) of the images the history must hold, in order -- a request's images, or a spilled bank's own
  *  records (pulsar_session_image_hashes); NULL / 0 for none: the chain loads only as far as its records match them.
- *  Returns the position it stands at, 0 when nothing was loaded; `err` says why when a stored chain was refused or
- *  stopped short of its end.  A chain ending below `min_tokens` is not loaded.  The chain is touched on success. */
+ *  Returns the position it stands at, position 0 when nothing was loaded (L334 P7: the int's 0 kept); `err` says
+ *  why when a stored chain was refused or stopped short of its end.  A chain ending below `min_tokens` is not
+ *  loaded.  The chain is touched on success. */
 /// @param st           the store
 /// @param e            the engine
 /// @param s            the session whose installed bank is restored
@@ -402,9 +405,9 @@ int pulsar_kvchain_load(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s
 /// @param n_out        receives the number of segments reported
 /// @param err          receives why a stored chain was refused or stopped short
 /// @param errlen       size of `err`
-/// @return the position the bank stands at, 0 when nothing was loaded
-int pulsar_kvchain_restore(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const char *text,
-                           size_t text_len, const uint64_t *image_hashes, int n_images, int min_tokens,
-                           pulsar_segstore_seg *chain, int cap, int *n_out, char *err, size_t errlen);
+/// @return the position the bank stands at, TokPos{0} when nothing was loaded
+TokPos pulsar_kvchain_restore(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const char *text,
+                              TextBytes text_len, const uint64_t *image_hashes, int n_images, TokCount min_tokens,
+                              pulsar_segstore_seg *chain, int cap, int *n_out, char *err, size_t errlen);
 
 #endif

@@ -40,7 +40,7 @@
 // a launch carries up to 32 decode rows as 16-row passes over trellis words it
 // reads once (L341), and rows past 32 run 32-row launches in turn (L288 C1).
 // Prompt chunks take
-// the prompt arm (qwen_exl3_dense_prefill.cu), which agrees to rounding: the
+// the prompt arm (exl3_dense_prefill.cu), which agrees to rounding: the
 // fixed-algorithm tensor-core GEMM on the weight decoded to fp16, or -- a chunk
 // of up to DS4_EXL3_DENSE_PROMPT_INPLACE_ROWS rows, on a device where it is
 // established (L381, ds4_exl3_dense_prompt_arm) -- a kernel that reads the
@@ -102,7 +102,7 @@ int ds4_exl3_dense_launch(
     void         * workspace,
     size_t         workspace_bytes,
     cudaStream_t   stream,
-    /* L266: a prompt chunk takes the prompt arm at every M, one arithmetic (qwen_exl3_dense_prefill.cu), so a
+    /* L266: a prompt chunk takes the prompt arm at every M, one arithmetic (exl3_dense_prefill.cu), so a
      * prompt cut anywhere is byte-identical to one prefilled whole; false: decode rows, the GEMV at
      * every M (16-row passes in a launch of up to 32 rows, L341; 32-row launches past that, L288 C1) */
     bool           prompt = false);
@@ -122,7 +122,7 @@ int ds4_exl3_dense_launch(
 /// @param trellis_bytes bytes of the slice's trellis plane (suh follows it).
 /// @param stream the stream.
 /// @return 0, -1 refused, -3 launch failure.
-int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, float *y, int M, int K, int N,
+int exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, float *y, int M, int K, int N,
                                    uint64_t trellis_bytes, cudaStream_t stream);
 
 /** The most projections one ds4_exl3_dense_multi_launch carries. */
@@ -264,7 +264,7 @@ int ds4_exl3_dense_gemv_describe(int k2, int M, int c32, ds4_exl3_dense_gemv_des
  *  in place iff  the device is sm_12x (cc / 10 == 12)
  *            and 1 <= M <= DS4_EXL3_DENSE_PROMPT_INPLACE_ROWS (256)
  *  and then only for a (device, K, N, rate) whose FIRST such launch in the process ran both kernels on its own
- *  operands and found every output byte equal (qwen_exl3_dense_prefill.cu, "the check"); one mismatch turns the
+ *  operands and found every output byte equal (exl3_dense_prefill.cu, "the check"); one mismatch turns the
  *  in-place kernel off for the whole process, loudly.
  *
  *  Why the device: the equality is a property of the VENDOR kernel -- cuBLASLt's fp16 GEMM for a (compute capability,

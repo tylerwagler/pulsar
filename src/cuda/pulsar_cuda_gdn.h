@@ -51,7 +51,7 @@
 #ifdef __CUDACC__
 #include <cuda_runtime.h>
 #else
-/* The engine's family ops (src/engine/family_qwen_s4.cpp) call the launcher
+/* The engine's family ops (src/families/qwen/family_qwen_s4.cpp) call the launcher
  * from a CUDA-free TU: the runtime's own typedef is all it needs (it passes 0,
  * the per-thread default stream the engine runs on).  Same guard as
  * pulsar_cuda_qwen.h. */

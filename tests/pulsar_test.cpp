@@ -6,9 +6,7 @@
 #include "../src/server/api_parse.cpp"
 #include "../src/server/chat_family.cpp"
 #include "../src/server/context_edit.cpp"
-#include "../src/server/family_inkling.cpp"
-#include "../src/server/family_nemotron_h.cpp"
-#include "../src/server/family_gemma4.cpp"
+#include "family_servers.inc"   /* every module's server table (generated: Makefile FAMILY_SERVERS_INC) */
 #include "../src/server/constrain.cpp"
 #include "../src/server/genmsg.cpp"
 #include "../src/server/deepseek_dsml.cpp"
@@ -40,6 +38,7 @@
 #include "../src/families/gemma4/gemma4.h"         /* L375: each family's tokenizer table and its model's tok */
 #include "../src/families/nemotron_h/nemotron_h.h"
 #include "../src/families/inkling/inkling.h"
+#include "../src/families/qwen/family_qwen.h"          /* L295 F8 Q2: Qwen's tokenizer table and pulsar_qwen_model */
 /* the frozen host sampler (L302): spec-math's oracle */
 #include "sampler_host_ref.h"
 #ifndef PULSAR_NO_GPU
@@ -225,7 +224,7 @@ static bool test_hex_to_bytes(const char *hex, unsigned char *out, int cap, int 
     return true;
 }
 
-static bool test_token_bytes_equal(pulsar_engine *engine, int token,
+static bool test_token_bytes_equal(pulsar_engine *engine, TokId token,
                                    const unsigned char *want, int want_len) {
     size_t got_len = 0;
     char *got = pulsar_token_text(engine, token, &got_len);
@@ -235,8 +234,9 @@ static bool test_token_bytes_equal(pulsar_engine *engine, int token,
     return eq;
 }
 
-static void test_long_prefill_progress(void *ud, const char *event, int current, int total) {
+static void test_long_prefill_progress(void *ud, const char *event, TokPos current_at, TokCount total_n) {
     (void)ud;
+    const int current = current_at.raw(), total = total_n.raw();
     if (strcmp(event, "prefill_chunk")) return;
     if (current == 0 || current == total || current % 8192 == 0) {
         fprintf(stderr, "pulsar-test: long-context prefill %d/%d\n", current, total);
@@ -280,8 +280,8 @@ static void test_long_story_fact_recall(void) {
     int generated = 0;
     bool decode_ok = true;
     for (; generated < 350; generated++) {
-        int token = pulsar_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng);
-        if (token < 0) { decode_ok = false; break; }   /* degenerate row refused (L188) */
+        TokId token = pulsar_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng);
+        if (!token.is_token()) { decode_ok = false; break; }   /* degenerate row refused (L188) */
         if (token == pulsar_token_eos(engine)) break;
 
         size_t piece_len = 0;
@@ -432,7 +432,7 @@ static void test_logprob_vector_case(pulsar_engine *engine, const test_vec_case 
     for (int i = 0; i < vc->nsteps; i++) {
         const test_vec_step *step = &vc->steps[i];
         int nscore = pulsar_session_top_logprobs(session, scores, 20);
-        int token = pulsar_session_argmax(session);
+        TokId token = pulsar_session_argmax(session);
         if (!test_token_bytes_equal(engine, token, step->selected, step->selected_len)) {
             fprintf(stderr, "pulsar-test: vector %s step %d selected token mismatch\n",
                     vc->id, i);
@@ -443,7 +443,7 @@ static void test_logprob_vector_case(pulsar_engine *engine, const test_vec_case 
             bool found = false;
             float local_lp = 0.0f;
             for (int j = 0; j < nscore; j++) {
-                if (scores[j].id < 0) continue;
+                if (!scores[j].id.is_token()) continue;
                 if (test_token_bytes_equal(engine, scores[j].id,
                                            step->top[t].bytes,
                                            step->top[t].len)) {
@@ -789,8 +789,8 @@ static bool test_mpp_capture(pulsar_engine *engine, const test_mpp_eq_case *tc,
 
     int n = 0;
     while (ok && n < tc->gen_steps) {
-        const int token = pulsar_session_argmax(session);
-        gen[n++] = token;
+        const TokId token = pulsar_session_argmax(session);
+        gen[n++] = token.raw();
         if (n < tc->gen_steps && pulsar_session_eval(session, token, err, sizeof(err)) != 0) {
             fprintf(stderr, "pulsar-test: Tensor equivalence %s: eval of step %d refused: %s\n", tc->id, n, err);
             ok = false;
@@ -969,7 +969,7 @@ static void test_image_conversation_reuse_matches_cold(void) {
     /* Turn 2 = turn 1 + a few more text tokens (the client's next question). */
     pulsar_tokens turn2 = {0};
     pulsar_tokens_copy(&turn2, &turn1);
-    for (int t = 700; t < 712; t++) pulsar_tokens_push(&turn2, t);
+    for (int t = 700; t < 712; t++) pulsar_tokens_push(&turn2, TokId{t});
 
     const int vocab = pulsar_engine_logits_width(engine);
     float *reuse_logits = (float *)xmalloc((size_t)vocab * sizeof(float));
@@ -1036,8 +1036,9 @@ struct test_quantum {
     int start;    /* the position the quantum began at: the planner's first event (-1 until it arrives) */
     int chunks;   /* chunks landed past it */
 };
-static void test_quantum_progress(void *ud, const char *event, int current, int) {
+static void test_quantum_progress(void *ud, const char *event, TokPos current_at, TokCount) {
     test_quantum *q = (test_quantum *)ud;
+    const int current = current_at.raw();
     if (strcmp(event, "prefill_chunk") != 0) return;
     if (q->start < 0) q->start = current;   /* the walk announces where it starts before any chunk runs */
     else if (current > q->start) q->chunks++;
@@ -1174,7 +1175,7 @@ static void test_image_chain_round_trip(void) {
     char err[384] = {0};
     pulsar_tokens longer = {0};
     pulsar_tokens_copy(&longer, &prompt);
-    for (int t = 700; t < 740; t++) pulsar_tokens_push(&longer, t);
+    for (int t = 700; t < 740; t++) pulsar_tokens_push(&longer, TokId{t});
     const int vocab = pulsar_engine_logits_width(engine), ctx = longer.len + 1024;
     char tmpl[] = "/tmp/pulsar-image-chain.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -1191,13 +1192,14 @@ static void test_image_chain_round_trip(void) {
     pulsar_kvchain_persist_result pr;
     memset(&pr, 0, sizeof pr);
     const pulsar_kvchain_writer inl = pulsar_kvchain_writer_inline(st);
-    if (ok) pulsar_kvchain_persist(st, engine, sa, 0, PULSAR_KVCHAIN_TAIL | PULSAR_KVCHAIN_RP, NULL, &inl, &pr);
+    if (ok)
+        pulsar_kvchain_persist(st, engine, sa, TokCount{0}, PULSAR_KVCHAIN_TAIL | PULSAR_KVCHAIN_RP, NULL, &inl, &pr);
     fprintf(stderr, "image-chain gate: %d-token prompt, block at %d; persisted %d segment(s) to %d%s%s\n", prompt.len,
-            img.start_pos, pr.written, pr.end, pr.err[0] ? " -- " : "", pr.err);
-    TEST_ASSERT(pr.written > 0 && pr.end > img.start_pos);   /* the chain goes past the image */
+            img.start_pos, pr.written, pr.end.raw(), pr.err[0] ? " -- " : "", pr.err);
+    TEST_ASSERT(pr.written > 0 && pr.end.raw() > img.start_pos);   /* the chain goes past the image */
     if (sa) pulsar_session_free(sa);
 
-    size_t tlen = 0;
+    TextBytes tlen{0};
     char *text = pulsar_kvtext_render_tokens_text(engine, &longer, &tlen);
     const uint64_t right = pulsar_image_hash(&img), wrong = right ^ 1u;
     pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
@@ -1208,11 +1210,11 @@ static void test_image_chain_round_trip(void) {
     float *cold = (float *)xmalloc((size_t)vocab * sizeof(float));
     pulsar_session *sb = NULL;
     TEST_ASSERT(pulsar_session_create(&sb, engine, ctx) == 0);
-    const int G = sb && text ? pulsar_kvchain_restore(st, engine, sb, text, tlen, &right, 1, 0, chain, PULSAR_KVCHAIN_MAX,
-                                                       &nseg, err, sizeof err) : 0;
+    const int G = sb && text ? pulsar_kvchain_restore(st, engine, sb, text, tlen, &right, 1, TokCount{0}, chain,
+                                                       PULSAR_KVCHAIN_MAX, &nseg, err, sizeof err).raw() : 0;
     fprintf(stderr, "image-chain gate: restore with the image stands at %d (%d segment(s))%s%s\n", G, nseg,
             err[0] ? " -- " : "", err);
-    TEST_ASSERT(G == pr.end);
+    TEST_ASSERT(G == pr.end.raw());
     pulsar_image_ref ib = img;
     bool okb = G > 0 && pulsar_session_sync_mm(sb, &longer, &ib, 1, err, sizeof err) == 0 &&
                pulsar_session_copy_logits(sb, reused, vocab) == vocab;
@@ -1240,8 +1242,8 @@ static void test_image_chain_round_trip(void) {
     pulsar_session *sd = NULL;
     TEST_ASSERT(pulsar_session_create(&sd, engine, ctx) == 0);
     err[0] = '\0';
-    const int Gd = sd && text ? pulsar_kvchain_restore(st, engine, sd, text, tlen, &wrong, 1, 0, chain,
-                                                        PULSAR_KVCHAIN_MAX, &nseg, err, sizeof err) : -1;
+    const int Gd = sd && text ? pulsar_kvchain_restore(st, engine, sd, text, tlen, &wrong, 1, TokCount{0}, chain,
+                                                        PULSAR_KVCHAIN_MAX, &nseg, err, sizeof err).raw() : -1;
     fprintf(stderr, "image-chain gate: restore with another image stands at %d -- %s\n", Gd, err);
     TEST_ASSERT(Gd >= 0 && Gd <= img.start_pos);
     if (sd) pulsar_session_free(sd);
@@ -1262,9 +1264,10 @@ static void test_image_chain_round_trip(void) {
     TEST_ASSERT(oky);
     pulsar_kvchain_persist_result py;
     memset(&py, 0, sizeof py);
-    if (oky) pulsar_kvchain_persist(st, engine, sy, 0, PULSAR_KVCHAIN_TAIL | PULSAR_KVCHAIN_RP, NULL, &inl, &py);
-    fprintf(stderr, "image-chain gate: the same-size other image persisted %d segment(s) to %d%s%s\n", py.written, py.end,
-            py.err[0] ? " -- " : "", py.err);
+    if (oky)
+        pulsar_kvchain_persist(st, engine, sy, TokCount{0}, PULSAR_KVCHAIN_TAIL | PULSAR_KVCHAIN_RP, NULL, &inl, &py);
+    fprintf(stderr, "image-chain gate: the same-size other image persisted %d segment(s) to %d%s%s\n", py.written,
+            py.end.raw(), py.err[0] ? " -- " : "", py.err);
     if (sy) pulsar_session_free(sy);
     const uint64_t hash_y = pulsar_image_hash(&iy);
     for (int which = 0; which < 2; which++) {
@@ -1273,12 +1276,12 @@ static void test_image_chain_round_trip(void) {
         pulsar_session *se = NULL, *sf = NULL;
         TEST_ASSERT(pulsar_session_create(&se, engine, ctx) == 0 && pulsar_session_create(&sf, engine, ctx) == 0);
         err[0] = '\0';
-        const int Ge = se && text ? pulsar_kvchain_restore(st, engine, se, text, tlen, &h, 1, 0, chain, PULSAR_KVCHAIN_MAX,
-                                                            &nseg, err, sizeof err) : -1;
+        const int Ge = se && text ? pulsar_kvchain_restore(st, engine, se, text, tlen, &h, 1, TokCount{0}, chain,
+                                                            PULSAR_KVCHAIN_MAX, &nseg, err, sizeof err).raw() : -1;
         fprintf(stderr, "image-chain gate: same-size image %c restores to %d%s%s\n", which ? 'Y' : 'X', Ge,
                 err[0] ? " -- " : "", err);
         TEST_ASSERT(Ge >= 0);
-        if (which) TEST_ASSERT(Ge == py.end);   /* Y was stored, not dropped as "already held" */
+        if (which) TEST_ASSERT(Ge == py.end.raw());   /* Y was stored, not dropped as "already held" */
         else TEST_ASSERT(Ge <= img.start_pos);  /* X's end state is gone, and Y's is not X's */
         const bool oke = se && sf && pulsar_session_sync_mm(se, &longer, &ir, 1, err, sizeof err) == 0 &&
                          pulsar_session_copy_logits(se, reused, vocab) == vocab &&
@@ -1577,9 +1580,9 @@ static void test_tool_call_quality_one(void) {
     bool decode_ok = true;
     g.finish = "length";
     for (int i = 0; ps && i < r->max_tokens; i++) {
-        int token = pulsar_session_sample(session, r->temperature, r->top_k,
-                                       r->top_p, r->min_p, &rng);
-        if (token < 0) { decode_ok = false; break; }   /* degenerate row refused (L188) */
+        TokId token = pulsar_session_sample(session, r->temperature, r->top_k,
+                                         r->top_p, r->min_p, &rng);
+        if (!token.is_token()) { decode_ok = false; break; }   /* degenerate row refused (L188) */
         if (pulsar_token_is_stop(engine, token)) {
             g.finish = "stop";
             break;
@@ -2297,20 +2300,20 @@ static void test_lib_think_scan(void) {
  * history is none(), an empty valid history is position 0 -- and bank_adopt's refusals carry their status apart from
  * the position (the ADOPTED / NONE paths need a model: bank_adopt_gate). */
 static void test_l334_bank_pos_and_adopt_result(void) {
-    int toks[7] = {1, 2, 3, 4, 5, 6, 7};
+    TokId toks[7] = {TokId{1}, TokId{2}, TokId{3}, TokId{4}, TokId{5}, TokId{6}, TokId{7}};
     const pulsar_tokens empty = {toks, 0, 7}, seven = {toks, 7, 7};
     TEST_ASSERT(pulsar_bank_pos_of(4, 4, &seven).is_none());   /* out of range, whatever it is handed */
     TEST_ASSERT(pulsar_bank_pos_of(9, 4, NULL).is_none());
     TEST_ASSERT(pulsar_bank_pos_of(1, 4, NULL).is_none());     /* no history: never populated / invalidated */
     TEST_ASSERT(pulsar_bank_pos_of(1, 4, &empty) == TokPos{0});
     TEST_ASSERT(pulsar_bank_pos_of(3, 4, &seven) == TokPos{7});
-    TEST_ASSERT(pulsar_session_bank_pos(NULL, 0).is_none());
+    TEST_ASSERT(pulsar_session_bank_pos(NULL, BankId{0}).is_none());
     char err[160] = "";
-    const pulsar_bank_adopt_result r = pulsar_session_bank_adopt(NULL, 1, &seven, err, sizeof err);
+    const pulsar_bank_adopt_result r = pulsar_session_bank_adopt(NULL, BankId{1}, &seven, err, sizeof err);
     TEST_ASSERT(r.status == PULSAR_ADOPT_REFUSED && r.at.is_none() && strstr(err, "no session") != NULL);
     pulsar_session *none_s = NULL;
     err[0] = '\0';
-    const pulsar_bank_adopt_result q = pulsar_session_bank_adopt(none_s, 1, NULL, err, sizeof err);
+    const pulsar_bank_adopt_result q = pulsar_session_bank_adopt(none_s, BankId{1}, NULL, err, sizeof err);
     TEST_ASSERT(q.status == PULSAR_ADOPT_REFUSED && q.at.is_none() && err[0] != '\0');
 }
 
@@ -2422,18 +2425,20 @@ static void test_l375_tokenizer_refusal_is_a_result(void) {
     pulsar_gemma4_model *gm = new pulsar_gemma4_model();
     pulsar_nemotron_h_model *nm = new pulsar_nemotron_h_model();
     pulsar_inkling_model *im = new pulsar_inkling_model();
+    pulsar_qwen_model *qm = new pulsar_qwen_model();   /* L295 F8 Q1: Qwen's tokenizer is its family state's */
+    qm->tok = tok;
     gm->tok = nm->tok = im->tok = tok;
-    void *const state[] = {NULL, gm, nm, im};
+    void *const state[] = {qm, gm, nm, im};
     for (size_t c = 0; c < sizeof cases / sizeof cases[0]; c++) {
         pulsar_family fam{};
         fam.arch = fam.name = cases[c].name;
         fam.caps = PULSAR_FAMILY_CAP_CHAT;
         fam.tokenizer = cases[c].table;
+        if (cases[c].fmt == PULSAR_CHAT_QWEN) fam.id = PULSAR_FAMILY_ID_QWEN4_EXP;   /* pulsar_qwen_of reads the id */
         g_fmt = cases[c].fmt;
         fam.chat_format = [](const pulsar_engine *) { return g_fmt; };
         pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
         e->family = &fam;
-        e->qwen_tok = tok;
         e->family_state = state[c];
         const char *text = "hello world";
         const pulsar_text_span good[2] = {{0u, 5u}, {6u, 11u}}, bad[2] = {{6u, 11u}, {0u, 5u}};
@@ -2461,9 +2466,9 @@ static void test_l375_tokenizer_refusal_is_a_result(void) {
         const int before = out.len;
         TEST_ASSERT(pulsar_chat_append_turn(e, &out, &ok, 1, true, PULSAR_THINK_NONE) && out.len > before);
         pulsar_tokens_free(&out);
-        e->qwen_tok = NULL;
         free(e);
     }
+    delete qm;
     delete gm;
     delete nm;
     delete im;
@@ -2480,9 +2485,11 @@ static void test_l375_refused_render_fails_the_request(void) {
     fam.arch = fam.name = "qwen";
     fam.caps = PULSAR_FAMILY_CAP_CHAT;
     fam.tokenizer = &k_qwen_tokenizer;
+    fam.id = PULSAR_FAMILY_ID_QWEN4_EXP;   /* pulsar_qwen_of reads the id */
+    pulsar_qwen_model qm = {NULL, tok};
     pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
     e->family = &fam;
-    e->qwen_tok = tok;
+    e->family_state = &qm;
     request r;
     request_init(&r, REQ_CHAT, 16);
     TEST_ASSERT(parse_refusal_get() == PARSE_REFUSED_REQUEST);
@@ -2528,7 +2535,6 @@ static void test_l375_refused_render_fails_the_request(void) {
     TEST_ASSERT(answer(true).find("overloaded_error") != std::string::npos);
     request_init(&r, REQ_CHAT, 16);
     request_free(&r);
-    e->qwen_tok = NULL;
     free(e);
 }
 
@@ -2556,19 +2562,21 @@ static void test_l375_template_refusal_is_a_result(void) {
     pulsar_gemma4_model *gm = new pulsar_gemma4_model();
     pulsar_nemotron_h_model *nm = new pulsar_nemotron_h_model();
     pulsar_inkling_model *im = new pulsar_inkling_model();
+    pulsar_qwen_model *qm = new pulsar_qwen_model();   /* L295 F8 Q1: Qwen's tokenizer is its family state's */
+    qm->tok = tok;
     gm->tok = nm->tok = im->tok = tok;
-    void *const state[] = {NULL, gm, nm, im};
+    void *const state[] = {qm, gm, nm, im};
     const pulsar_chat_message hi = {"user", "hello", false, NULL};
     for (size_t c = 0; c < sizeof cases / sizeof cases[0]; c++) {
         pulsar_family fam{};
         fam.arch = fam.name = cases[c].name;
         fam.caps = PULSAR_FAMILY_CAP_CHAT;
         fam.tokenizer = cases[c].table;
+        if (cases[c].fmt == PULSAR_CHAT_QWEN) fam.id = PULSAR_FAMILY_ID_QWEN4_EXP;   /* pulsar_qwen_of reads the id */
         g_fmt = cases[c].fmt;
         fam.chat_format = [](const pulsar_engine *) { return g_fmt; };
         pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
         e->family = &fam;
-        e->qwen_tok = tok;
         e->family_state = state[c];
         pulsar_tokens out = {0};
         /* these templates render thinking on (their default effort) or off: "low" is no level of theirs */
@@ -2582,9 +2590,9 @@ static void test_l375_template_refusal_is_a_result(void) {
         const int turn = out.len;
         TEST_ASSERT(pulsar_chat_end_assistant(e, &out) && out.len > turn);
         pulsar_tokens_free(&out);
-        e->qwen_tok = NULL;
         free(e);
     }
+    delete qm;
     delete gm;
     delete nm;
     delete im;
@@ -2769,7 +2777,7 @@ static bool test_tokens_identical(const pulsar_tokens *a, const pulsar_tokens *b
     return true;
 }
 
-static bool test_tokens_contain_id(const pulsar_tokens *t, int id) {
+static bool test_tokens_contain_id(const pulsar_tokens *t, TokId id) {
     for (int i = 0; i < t->len; i++) if (t->v[i] == id) return true;
     return false;
 }
@@ -2816,7 +2824,7 @@ static void test_control_token_span_edge(void) {
         token_vec out = {};
         v.tokenize_rendered_chat_spans_vocab(text, spans, n, &out);
         const int got = out.len;
-        for (int i = 0; i < out.len; i++) TEST_ASSERT(out.v[i] == 7);
+        for (int i = 0; i < out.len; i++) TEST_ASSERT(out.v[i] == TokId{7});
         token_vec_free(&out);
         return got;
     };
@@ -2938,25 +2946,26 @@ static void test_control_token_spans(void) {
     {
         const pulsar_text_span whole[2] = {{10, 20}, {30, 40}};
         uint32_t n = 0;
-        pulsar_text_span *sl = pulsar_text_spans_slice(whole, 2, 15, 20, &n);   /* [15,35) */
+        pulsar_text_span *sl = pulsar_text_spans_slice(whole, 2, TextBytes{15}, TextBytes{20}, &n);   /* [15,35) */
         TEST_ASSERT(sl != NULL && n == 2);
         if (sl) {
             TEST_ASSERT(sl[0].lo == 0 && sl[0].hi == 5);
             TEST_ASSERT(sl[1].lo == 15 && sl[1].hi == 20);
         }
         free(sl);
-        sl = pulsar_text_spans_slice(whole, 2, 12, 100, &n);                    /* clamped */
+        sl = pulsar_text_spans_slice(whole, 2, TextBytes{12}, TextBytes{100}, &n);                    /* clamped */
         TEST_ASSERT(sl != NULL && n == 2);
         if (sl) {
             TEST_ASSERT(sl[0].lo == 0 && sl[0].hi == 8);
             TEST_ASSERT(sl[1].lo == 18 && sl[1].hi == 28);
         }
         free(sl);
-        sl = pulsar_text_spans_slice(whole, 2, 21, 5, &n);                      /* between ranges */
+        sl = pulsar_text_spans_slice(whole, 2, TextBytes{21}, TextBytes{5},
+                                     &n);                      /* between ranges */
         TEST_ASSERT(sl == NULL && n == 0);
-        sl = pulsar_text_spans_slice(whole, 2, 100, 5, &n);                     /* past the end */
+        sl = pulsar_text_spans_slice(whole, 2, TextBytes{100}, TextBytes{5}, &n);                     /* past the end */
         TEST_ASSERT(sl == NULL && n == 0);
-        sl = pulsar_text_spans_slice(NULL, 0, 0, 10, &n);
+        sl = pulsar_text_spans_slice(NULL, 0, TextBytes{0}, TextBytes{10}, &n);
         TEST_ASSERT(sl == NULL && n == 0);
     }
 }
@@ -3046,7 +3055,7 @@ static void test_control_tokens(pulsar_engine *e, test_control_probe *p) {
     TEST_ASSERT(n_vocab > 0);
     for (int id = 0; id < n_vocab; id++) {
         size_t n = 0;
-        char *t = pulsar_token_text(e, id, &n);
+        char *t = pulsar_token_text(e, TokId{id}, &n);
         bool text = t && n && strlen(t) == n;
         for (size_t k = 0; text && k < n;) {
             const int m = utf8_seq_ok((const unsigned char *)t + k, n - k);
@@ -3056,11 +3065,11 @@ static void test_control_tokens(pulsar_engine *e, test_control_probe *p) {
         if (text) {
             pulsar_tokens rendered = {0};
             pulsar_tokenize_rendered_chat(e, t, &rendered);
-            if (rendered.len == 1 && rendered.v[0] == id) {
+            if (rendered.len == 1 && rendered.v[0] == TokId{id}) {
                 pulsar_tokens plain = {0};
                 pulsar_tokenize_text(e, t, &plain);
-                if (!test_tokens_contain_id(&plain, id)) {
-                    pulsar_tokens_push(&p->ids, id);
+                if (!test_tokens_contain_id(&plain, TokId{id})) {
+                    pulsar_tokens_push(&p->ids, TokId{id});
                     p->literals.push_back(std::string(t, n));
                 }
                 pulsar_tokens_free(&plain);
@@ -4010,7 +4019,7 @@ static void test_l308_copy_estimate(void) {
  * PULSAR_DRIVER_SCRATCH_MAX were never allocated and the family's ops read NULL.  Host: the refusal comes before
  * the family's create or any allocation. */
 static bool test_driver_never(const pulsar_driver_step *) { return false; }
-static bool test_driver_head_never(const pulsar_driver_step *, uint32_t, uint32_t, uint32_t) { return false; }
+static bool test_driver_head_never(const pulsar_driver_step *, StepRow, StepRows, HeadRow) { return false; }
 static void test_driver_scratch_cap(void) {
     static pulsar_driver_ops ops{};
     ops.embed = test_driver_never;
@@ -4033,6 +4042,18 @@ static void test_driver_scratch_cap(void) {
  * row at or past the pool's capacity is refused there by name, before the family's trunk or any launch: a decode
  * row, the plain eval's row, and a verify run whose first row fits and whose second does not.  Host: a driver family
  * with no trunk (reaching it would crash the test), a state set of one 8-position bank. */
+/* L334 P2b S7b: the step's head list and its named crossings -- a span heads consecutive step rows, a verify's head
+ * row is its step row by the named identity (pulsar_verify_step_row; past the verify it is fatal, not tested here),
+ * and a run's map turns its rows into positions and back. */
+static void test_driver_head_rows(void) {
+    const pulsar_driver_heads h = pulsar_driver_heads_span(StepRow{5}, StepRows{3});
+    TEST_ASSERT(h.n == 3u && h.row[0] == StepRow{5} && h.row[2] == StepRow{7} && pulsar_row_index(h.row[1]) == 6u);
+    TEST_ASSERT(pulsar_verify_step_row(HeadRow{0}, 4u) == StepRow{0} &&
+                pulsar_verify_step_row(HeadRow{3}, 4u) == StepRow{3});
+    const pulsar_step_run kept{StepRow{2}, TokPos{100}, StepRows{4}};
+    TEST_ASSERT(kept.pos_of(StepRow{2}) == TokPos{100} && kept.pos_of(StepRow{5}) == TokPos{103});
+    TEST_ASSERT(kept.row_of(TokPos{101}) == StepRow{3} && pulsar_row_index(kept.row_of(TokPos{103})) == 5u);
+}
 static uint32_t test_driver_width(const pulsar_engine *) { return 4u; }
 static void test_driver_context_bound(void) {
     static pulsar_driver_ops ops{};
@@ -4046,7 +4067,7 @@ static void test_driver_context_bound(void) {
     pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
     e->family = &fam;
     pulsar_state_set *ss = (pulsar_state_set *)xcalloc(1, sizeof(*ss));
-    uint32_t bank_pos = 8u;
+    TokPos bank_pos = TokPos{8};
     bool stale = false;
     ss->n_banks = 1u;
     ss->ctx = 8u;
@@ -4062,18 +4083,18 @@ static void test_driver_context_bound(void) {
     s->ctx_size = 8;
 
     char err[256] = "";
-    pulsar_multiseq_req at_ctx = { 0u, TokPos{8}, 1 };
+    pulsar_multiseq_req at_ctx = { BankId{0}, TokPos{8}, TokId{1} };
     TEST_ASSERT(pulsar_driver_decode_multiseq(s, &at_ctx, 1u, NULL, 0, err, sizeof err) == -1 && err[0]);
-    TEST_ASSERT(bank_pos == 8u);                       /* nothing moved */
-    for (int i = 0; i < 8; i++) token_vec_push(&s->checkpoint, 1);
+    TEST_ASSERT(bank_pos == TokPos{8});                       /* nothing moved */
+    for (int i = 0; i < 8; i++) token_vec_push(&s->checkpoint, TokId{1});
     err[0] = '\0';
-    TEST_ASSERT(pulsar_driver_eval_row(s, 1, err, sizeof err) == 1 && err[0] && bank_pos == 8u);
-    bank_pos = 7u;                                     /* a verify of [7, 8]: its second row is past the pool */
-    const pulsar_multiseq_req run[2] = { { 0u, TokPos{7}, 1 }, { 0u, TokPos{8}, 1 } };
+    TEST_ASSERT(pulsar_driver_eval_row(s, 1, err, sizeof err) == 1 && err[0] && bank_pos == TokPos{8});
+    bank_pos = TokPos{7};                                     /* a verify of [7, 8]: its second row is past the pool */
+    const pulsar_multiseq_req run[2] = { { BankId{0}, TokPos{7}, TokId{1} }, { BankId{0}, TokPos{8}, TokId{1} } };
     uint32_t headed = 9u;
     err[0] = '\0';
     TEST_ASSERT(pulsar_driver_decode_mixed(s, run, 2u, NULL, 0, &headed, PULSAR_MSEQ_HEAD_ALL_ROWS, err, sizeof err) == -1 &&
-                err[0] && headed == 0u && bank_pos == 7u);
+                err[0] && headed == 0u && bank_pos == TokPos{7});
     token_vec_free(&s->checkpoint);
     free(s);
     free(d);
@@ -4183,17 +4204,18 @@ static void test_bank_carry_restore(void) {
     pulsar_bank_carry *c = &s->bank_carry[1];
     c->valid = true;
     c->checkpoint_valid = true;
-    c->prefill_frontier = 3;
-    for (int t : {1, 2, 3}) token_vec_push(&c->checkpoint, t);
-    token_vec_push(&s->checkpoint, 9);
+    c->prefill_frontier = TokPos{3};
+    for (int t : {1, 2, 3}) token_vec_push(&c->checkpoint, TokId{t});
+    token_vec_push(&s->checkpoint, TokId{9});
     s->checkpoint_valid = false;
-    s->prefill_frontier = 1;
+    s->prefill_frontier = TokPos{1};
     s->logits_stale = true;
     s->dev.n_banks = 0;   /* the live row's copy refuses bank 1 before any device work */
     TEST_ASSERT(!pulsar_bank_carry_restore_view(s, 1));
-    TEST_ASSERT(s->checkpoint.len == 1 && s->checkpoint.v[0] == 9 && !s->checkpoint_valid && s->prefill_frontier == 1);
+    TEST_ASSERT(s->checkpoint.len == 1 && s->checkpoint.v[0] == TokId{9} && !s->checkpoint_valid &&
+                s->prefill_frontier == TokPos{1});
     TEST_ASSERT(!pulsar_bank_carry_restore_view(s, 0));   /* nothing saved: false, nothing said or moved */
-    TEST_ASSERT(s->checkpoint.len == 1 && s->checkpoint.v[0] == 9);
+    TEST_ASSERT(s->checkpoint.len == 1 && s->checkpoint.v[0] == TokId{9});
     pulsar_tokens_free(&c->checkpoint);
     pulsar_tokens_free(&s->checkpoint);
     free(s->bank_carry);
@@ -4208,7 +4230,7 @@ static void test_bank_carry_restore(void) {
  * places that would act on it (the sync's entry, a same-bank restore without a carry) drop it first
  * (pulsar_session_dirty_view_drop).  Host only: the flags, the reader and the rule; the step itself is a GPU gate's. */
 static int test_mseq_bank_count(pulsar_session *) { return 3; }
-static uint32_t test_mseq_live_bank1(pulsar_session *) { return 1u; }
+static BankId test_mseq_live_bank1(pulsar_session *) { return BankId{1}; }
 static void test_multiseq_step_view(void) {
     static pulsar_family fam{};
     static pulsar_family_bank_ops bops{};
@@ -4220,10 +4242,10 @@ static void test_multiseq_step_view(void) {
     e->family = &fam;
     pulsar_session *s = (pulsar_session *)xcalloc(1, sizeof(*s));
     s->engine = e;
-    for (int t : {5, 6, 7, 8}) token_vec_push(&s->checkpoint, t);
+    for (int t : {5, 6, 7, 8}) token_vec_push(&s->checkpoint, TokId{t});
     const uint32_t live = 1u;
-    const pulsar_multiseq_req others[2] = { {0u, TokPos{10}, 1}, {2u, TokPos{20}, 2} };
-    const pulsar_multiseq_req with_live[2] = { {0u, TokPos{10}, 1}, {1u, TokPos{4}, 2} };
+    const pulsar_multiseq_req others[2] = { {BankId{0}, TokPos{10}, TokId{1}}, {BankId{2}, TokPos{20}, TokId{2}} };
+    const pulsar_multiseq_req with_live[2] = { {BankId{0}, TokPos{10}, TokId{1}}, {BankId{1}, TokPos{4}, TokId{2}} };
     auto arm = [&]() {
         s->checkpoint_valid = true;
         s->mseq_dirty = false;
@@ -4231,7 +4253,7 @@ static void test_multiseq_step_view(void) {
     };
     /* the other banks step: the installed bank still reads its history; nothing may continue it */
     arm();
-    pulsar_multiseq_step_stale(s, others, 2u, live, true);
+    pulsar_multiseq_step_stale(s, others, 2u, BankId{live}, true);
     TEST_ASSERT(s->checkpoint_valid && s->mseq_dirty && !s->spec.spec_carry_valid);
     TEST_ASSERT(pulsar_bank_history(s, live) == &s->checkpoint && pulsar_bank_history(s, live)->len == 4);
     /* ... and a sync or a carry-less restore of it drops the view before acting, as when the step dropped it */
@@ -4242,19 +4264,19 @@ static void test_multiseq_step_view(void) {
     pulsar_session_dirty_view_drop(s);
     TEST_ASSERT(s->checkpoint_valid);
     /* a row of the installed bank moved its KV past the view: no history */
-    pulsar_multiseq_step_stale(s, with_live, 2u, live, true);
+    pulsar_multiseq_step_stale(s, with_live, 2u, BankId{live}, true);
     TEST_ASSERT(!s->checkpoint_valid && s->mseq_dirty && !s->spec.spec_carry_valid);
     TEST_ASSERT(pulsar_bank_history(s, live) == NULL);
     /* the last row alone decides too, and a one-row step of another bank does not */
     arm();
-    pulsar_multiseq_step_stale(s, with_live + 1, 1u, live, true);
+    pulsar_multiseq_step_stale(s, with_live + 1, 1u, BankId{live}, true);
     TEST_ASSERT(!s->checkpoint_valid);
     arm();
-    pulsar_multiseq_step_stale(s, others + 1, 1u, live, true);
+    pulsar_multiseq_step_stale(s, others + 1, 1u, BankId{live}, true);
     TEST_ASSERT(s->checkpoint_valid && s->mseq_dirty);
     /* a sweep that failed leaves no bank's state known, whoever its rows were */
     arm();
-    pulsar_multiseq_step_stale(s, others, 2u, live, false);
+    pulsar_multiseq_step_stale(s, others, 2u, BankId{live}, false);
     TEST_ASSERT(!s->checkpoint_valid && s->mseq_dirty && !s->spec.spec_carry_valid);
     pulsar_tokens_free(&s->checkpoint);
     free(s);
@@ -4278,15 +4300,16 @@ static void test_multiseq_step_view(void) {
  * and the reconciliation at batch_leave are a GPU gate's. */
 static int test_bh_bank_count(pulsar_session *) { return 4; }
 static uint32_t g_test_bh_live = 1u;
-static uint32_t test_bh_live(pulsar_session *) { return g_test_bh_live; }
+static BankId test_bh_live(pulsar_session *) { return BankId{g_test_bh_live}; }
 static pulsar_ckpt_store *g_test_bh_store = NULL;
 static pulsar_ckpt_store *test_bh_store(pulsar_session *) { return g_test_bh_store; }
-static bool test_bh_resident(const pulsar_session *, uint32_t) { return false; }
+static bool test_bh_resident(const pulsar_session *, BankId) { return false; }
 static KvBytes test_bh_growth(pulsar_session *, KvRows q) { return KvBytes{(uint64_t)q.raw() * 1000u}; }
-static bool test_bh_not_stale(void *, uint32_t) { return false; }
-static char *test_bh_text(pulsar_engine *, int token, size_t *len) {
+static bool test_bh_not_stale(void *, BankId) { return false; }
+static char *test_bh_text(pulsar_engine *, TokId token, size_t *len) {
     char buf[16];
-    const int n = snprintf(buf, sizeof buf, "<%d>", token);   /* one spelling a token: no seam in these histories */
+    /* one spelling a token: no seam in these histories */
+    const int n = snprintf(buf, sizeof buf, "<%d>", token.raw());
     if (len) *len = (size_t)n;
     return strdup(buf);
 }
@@ -4324,63 +4347,65 @@ static void test_batch_history(void) {
     fs->bank_carry_n = 4;
 
     /* the token streams: P the decoder's prompt; C, D, E, U continuations */
-    std::vector<int> P, lead, resend, wait_p;
-    for (int i = 0; i < 600; i++) P.push_back(1000 + i);
+    std::vector<TokId> P, lead, resend, wait_p;
+    for (int i = 0; i < 600; i++) P.push_back(TokId{1000 + i});
     lead = P;
-    for (int i = 0; i < 200; i++) lead.push_back(3000 + i);
+    for (int i = 0; i < 200; i++) lead.push_back(TokId{3000 + i});
     wait_p = lead;                                             /* P + C: shares 800 with the leader's prompt */
-    for (int i = 0; i < 600; i++) lead.push_back(4000 + i);    /* the leader's prompt: P + C + D, 1400 */
-    for (int i = 0; i < 500; i++) wait_p.push_back(6000 + i);  /* the waiter's: P + C + E, 1300 */
+    for (int i = 0; i < 600; i++) lead.push_back(TokId{4000 + i});    /* the leader's prompt: P + C + D, 1400 */
+    for (int i = 0; i < 500; i++) wait_p.push_back(TokId{6000 + i});  /* the waiter's: P + C + E, 1300 */
     resend = P;
-    for (int i = 0; i < 100; i++) resend.push_back(7000 + i);  /* the re-send: P + U, 700 */
+    for (int i = 0; i < 100; i++) resend.push_back(TokId{7000 + i});  /* the re-send: P + U, 700 */
     auto carry = [&](uint32_t bank, int n, const std::vector<int> &more) {
         pulsar_bank_carry *c = &fs->bank_carry[bank];
         pulsar_tokens_free(&c->checkpoint);
         for (int i = 0; i < n; i++) token_vec_push(&c->checkpoint, P[(size_t)i]);
-        for (int t : more) token_vec_push(&c->checkpoint, t);
+        for (int t : more) token_vec_push(&c->checkpoint, TokId{t});
         c->valid = true;
         c->checkpoint_valid = true;
-        c->prefill_frontier = n;
+        c->prefill_frontier = TokPos{n};
     };
     carry(0, 300, {});            /* idle: the first half of the decoder's prompt */
     carry(1, 600, {});            /* the decoder's bank as it entered the batch */
     carry(2, 128, {});            /* a prefilling leader, standing at 128 */
     carry(3, 600, {5001, 5002});  /* idle: the decoder's prompt and its first two batch commits */
     /* the installed bank's live view: the step moved the bank past it */
-    for (int t : P) token_vec_push(&fs->checkpoint, t);
+    for (TokId t : P) token_vec_push(&fs->checkpoint, t);
     fs->checkpoint_valid = false;
-    fs->prefill_frontier = 600;
+    fs->prefill_frontier = TokPos{600};
 
     /* the engine's two views of the installed bank, and of one that is not */
-    TEST_ASSERT(pulsar_bank_history(fs, 1) == NULL && pulsar_session_bank_tokens(fs, 1) == NULL);
+    TEST_ASSERT(pulsar_bank_history(fs, 1) == NULL && pulsar_session_bank_tokens(fs, BankId{1}) == NULL);
     TEST_ASSERT(pulsar_bank_history_as(fs, 1, PULSAR_BANK_VIEW_SAVED) == &fs->bank_carry[1].checkpoint);
-    TEST_ASSERT(pulsar_session_bank_tokens_as(fs, 1, PULSAR_BANK_VIEW_SAVED) == &fs->bank_carry[1].checkpoint);
+    TEST_ASSERT(pulsar_session_bank_tokens_as(fs, BankId{1}, PULSAR_BANK_VIEW_SAVED) == &fs->bank_carry[1].checkpoint);
     TEST_ASSERT(pulsar_bank_history(fs, 0) == &fs->bank_carry[0].checkpoint &&
                 pulsar_bank_history_as(fs, 0, PULSAR_BANK_VIEW_SAVED) == &fs->bank_carry[0].checkpoint);
-    TEST_ASSERT(bops.prefill_frontier(fs, 1, PULSAR_BANK_VIEW_CURRENT) == 0u &&
-                bops.prefill_frontier(fs, 1, PULSAR_BANK_VIEW_SAVED) == 600u &&
-                bops.prefill_frontier(fs, 0, PULSAR_BANK_VIEW_CURRENT) == 300u);
-    fs->bank_carry[1].prefill_frontier = 590;   /* the saved view's frontier is the carry's, not the live view's */
-    TEST_ASSERT(bops.prefill_frontier(fs, 1, PULSAR_BANK_VIEW_SAVED) == 590u);
-    fs->bank_carry[1].prefill_frontier = 600;
+    TEST_ASSERT(bops.prefill_frontier(fs, BankId{1}, PULSAR_BANK_VIEW_CURRENT) == TokPos{0} &&
+                bops.prefill_frontier(fs, BankId{1}, PULSAR_BANK_VIEW_SAVED) == TokPos{600} &&
+                bops.prefill_frontier(fs, BankId{0}, PULSAR_BANK_VIEW_CURRENT) == TokPos{300});
+    fs->bank_carry[1].prefill_frontier = TokPos{590};   /* the saved view's frontier is the carry's, not the live view's */
+    TEST_ASSERT(bops.prefill_frontier(fs, BankId{1}, PULSAR_BANK_VIEW_SAVED) == TokPos{590});
+    fs->bank_carry[1].prefill_frontier = TokPos{600};
     /* a valid live view is the current read, whatever the carry says (the generic contract: not the carry) */
     fs->checkpoint_valid = true;
     fs->checkpoint.len = 10;
-    TEST_ASSERT(pulsar_bank_history(fs, 1) == &fs->checkpoint && pulsar_session_bank_pos(fs, 1) == TokPos{10});
+    TEST_ASSERT(pulsar_bank_history(fs, 1) == &fs->checkpoint && pulsar_session_bank_pos(fs, BankId{1}) == TokPos{10});
     fs->checkpoint.len = 600;
     fs->checkpoint_valid = false;
     {
         pulsar_tokens pr = {resend.data(), (int)resend.size(), (int)resend.size()};
-        TEST_ASSERT(pulsar_session_bank_resume_at(fs, 1, &pr, NULL, 0).served == PromptToks{0});
-        const pulsar_bank_resume sv = pulsar_session_bank_resume_at_as(fs, 1, PULSAR_BANK_VIEW_SAVED, &pr, NULL, 0);
+        TEST_ASSERT(pulsar_session_bank_resume_at(fs, BankId{1}, &pr, NULL, 0).served == PromptToks{0});
+        const pulsar_bank_resume sv = pulsar_session_bank_resume_at_as(fs, BankId{1}, PULSAR_BANK_VIEW_SAVED, &pr,
+                                                                       NULL, 0);
         TEST_ASSERT(sv.served == PromptToks{600} && sv.at == TokPos{600} && sv.why == PULSAR_RESUME_CONTINUES);
         /* not continued (decode rows in the history at entry): the grid checkpoint within the saved prefill */
-        fs->bank_carry[1].prefill_frontier = 520;
+        fs->bank_carry[1].prefill_frontier = TokPos{520};
         st->pos[1][0] = 512u;
-        const pulsar_bank_resume gp = pulsar_session_bank_resume_at_as(fs, 1, PULSAR_BANK_VIEW_SAVED, &pr, NULL, 0);
+        const pulsar_bank_resume gp = pulsar_session_bank_resume_at_as(fs, BankId{1}, PULSAR_BANK_VIEW_SAVED, &pr,
+                                                                       NULL, 0);
         TEST_ASSERT(gp.served == PromptToks{512} && gp.at == TokPos{512} && gp.why == PULSAR_RESUME_POINT);
         st->pos[1][0] = 0u;
-        fs->bank_carry[1].prefill_frontier = 600;
+        fs->bank_carry[1].prefill_frontier = TokPos{600};
     }
 
     /* the server: bank i is slot i; slot 1 decodes in the batch, slot 2 prefills, slots 0 and 3 are idle */
@@ -4396,7 +4421,7 @@ static void test_batch_history(void) {
     s.slot_trivial_common_tokens = 64;
     s.prefix_wait_ms = 1000;
     for (int i = 0; i < 4; i++) {
-        s.slots[i].bank = (uint32_t)i;
+        s.slots[i].bank = BankId{i};
         s.slots[i].provisioned = true;
         s.slots[i].ctx_size = 4096;
     }
@@ -4417,7 +4442,7 @@ static void test_batch_history(void) {
     g.batch_active = true;
     g.batch_feed_valid = true;
     g.batch_feed_pos = TokPos{603};
-    for (int t : {5001, 5002, 5003}) pulsar_tokens_push(&g.batch_pending, t);
+    for (int t : {5001, 5002, 5003}) pulsar_tokens_push(&g.batch_pending, TokId{t});
     pulsar_tokens lead_t = {lead.data(), (int)lead.size(), (int)lead.size()};
     session_slot &ld = s.slots[2];
     ld.active_job = &lead_job;
@@ -4462,10 +4487,10 @@ static void test_batch_history(void) {
         TEST_ASSERT(hist_len[0] == 300 && hist_len[1] == 603 && hist_len[2] == 128 && hist_len[3] == 602);
         TEST_ASSERT(common_rows[0][1] == 300 && common_rows[3][1] == 602 && common_rows[1][3] == -1);
         /* another third token on the idle bank: not the decoder's history any more */
-        fs->bank_carry[3].checkpoint.v[601] = 9999;
+        fs->bank_carry[3].checkpoint.v[601] = TokId{9999};
         s.dominated_slots(dom);
         TEST_ASSERT(dom[0] && !dom[1] && !dom[3]);
-        fs->bank_carry[3].checkpoint.v[601] = 5002;
+        fs->bank_carry[3].checkpoint.v[601] = TokId{5002};
         /* the census: 3 + 6 + 1 + 6 pages of 100 held, 6 distinct (the decoder's six), the deepest pair 602 */
         s.kv_dup_census_update();
         TEST_ASSERT(s.m_dup.grid == 100 && s.m_dup.banks == 4 && s.m_dup.pages_resident == 16u &&
@@ -4535,7 +4560,7 @@ static void test_batch_history(void) {
  * to mark whatever sat in the bank's slot valid), a step row kept for a bank (the mixed lane's prefill end) makes it
  * valid, and invalidate clears it.  Host only: dry tensors (every copy a no-op that succeeds); no draw is launched,
  * since each one asserted here refuses before the device. */
-static uint32_t test_live_bank0(pulsar_session *) { return 0u; }
+static BankId test_live_bank0(pulsar_session *) { return BankId{0}; }
 static void test_live_row_valid(void) {
     static pulsar_family fam{};
     static pulsar_family_session_ops sops{};
@@ -4552,7 +4577,7 @@ static void test_live_row_valid(void) {
     s->logits = (float *)xcalloc(8, sizeof(float));
     pulsar_gpu_tensor_dry_begin();
     const bool alloc = pulsar_session_dev_alloc(s, 2);
-    pulsar_gpu_tensor *rows = pulsar_gpu_tensor_alloc(2u * 8u * sizeof(float));
+    pulsar_gpu_tensor *rows = pulsar_gpu_tensor_alloc(bytes_of<float>(2u * 8u));
     pulsar_gpu_tensor_dry_end(NULL, NULL);
     TEST_ASSERT(alloc && rows);
     if (alloc && rows) {
@@ -4596,7 +4621,7 @@ static void test_live_row_valid(void) {
  *        leave the view, which is then no position's.
  *   L155 an end whose accepted[] cannot hold the base and every draft the round verified refuses before it commits.
  *   O37  a refused banked absorb at a batch round's end fails each bank that had rows and invalidates its view. */
-static bool test_absorb_banked_refuses(pulsar_session *, const uint32_t *, const uint32_t *, const int32_t *, uint32_t) {
+static bool test_absorb_banked_refuses(pulsar_session *, const uint32_t *, const BankId *, const TokId *, uint32_t) {
     return false;
 }
 static void test_spec_round_refusals(void) {
@@ -4611,27 +4636,27 @@ static void test_spec_round_refusals(void) {
     pulsar_session *s = (pulsar_session *)xcalloc(1, sizeof(*s));
     s->engine = e;
     s->ctx_size = 6;
-    for (int t : {1, 2, 3}) token_vec_push(&s->checkpoint, t);
+    for (int t : {1, 2, 3}) token_vec_push(&s->checkpoint, TokId{t});
     s->checkpoint_valid = true;
     pulsar_spec_round *r = pulsar_spec_round_new();
     char err[200] = "";
-    int acc[17];
-    const int32_t truth[17] = {0};
+    TokId acc[17];
+    const TokId truth[17] = {};
     /* O38: no drafter */
     TEST_ASSERT(pulsar_session_spec_round_begin_local(s, r, 4, 17, 17, 0.0f, 0, 1.0f, 0.0f, err, sizeof err) == -1 &&
                 strstr(err, "no drafter") != NULL && s->checkpoint.len == 3 && s->checkpoint_valid);
     TEST_ASSERT(pulsar_session_spec_round_end_local(s, r, 4, 0.0f, 0, 1.0f, 0.0f, 0u, NULL, 0u, NULL, 0u, acc, 17, err,
                                                     sizeof err) == -1 && strstr(err, "no drafter") != NULL);
-    TEST_ASSERT(pulsar_session_spec_round_end_forced(s, r, 4, 0.0f, 0, 1.0f, 0.0f, NULL, 0u, truth, acc, 17, err,
+    TEST_ASSERT(pulsar_session_spec_round_end_forced(s, r, TokId{4}, 0.0f, 0, 1.0f, 0.0f, NULL, 0u, truth, acc, 17, err,
                                                      sizeof err) == -1 && strstr(err, "no drafter") != NULL);
     pulsar_spec_step st[2] = {};
-    st[0].bank = 0;
-    st[1].bank = 1;
+    st[0].bank = BankId{0};
+    st[1].bank = BankId{1};
     st[0].round = st[1].round = r;
     uint32_t rows = 7;
     pulsar_session_spec_assemble_batch_local(s, st, 2, 16u, NULL, &rows);   /* no bank op is reached: fam.banks is NULL */
     TEST_ASSERT(rows == 0u && st[0].status == PULSAR_SPEC_STEP_FAILED && st[1].status == PULSAR_SPEC_STEP_FAILED &&
-                st[1].first_token == -1 && strstr(st[1].err, "no drafter") != NULL);
+                st[1].first_token.is_none() && strstr(st[1].err, "no drafter") != NULL);
     st[0].status = st[1].status = PULSAR_SPEC_STEP_OK;
     pulsar_session_spec_round_end_batch_local(s, st, 2);
     TEST_ASSERT(st[0].status == PULSAR_SPEC_STEP_FAILED && st[1].status == PULSAR_SPEC_STEP_FAILED &&
@@ -4639,21 +4664,22 @@ static void test_spec_round_refusals(void) {
     e->drafter_ops = &drafter;
     /* O39: five drafts pending at position 3 of a 6-token context -- rows at 3, 4, 5: the base and two drafts */
     s->spec.n_pend = 5;
-    s->spec.pend_base = 4;
-    s->spec.pend_pos = 3;
+    s->spec.pend_base = TokId{4};
+    s->spec.pend_pos = TokPos{3};
     s->spec.pend_top_p = 1.0f;
-    for (int i = 0; i < 5; i++) s->spec.pend[i] = 5;
+    for (int i = 0; i < 5; i++) s->spec.pend[i] = TokId{5};
     TEST_ASSERT(pulsar_session_spec_round_begin_local(s, r, 4, 17, 17, 0.0f, 0, 1.0f, 0.0f, err, sizeof err) == 0);
-    TEST_ASSERT(pulsar_spec_round_n_rows(r) == 3u && s->checkpoint.len == 6 && pulsar_spec_round_saved_len(r) == 3);
+    TEST_ASSERT(pulsar_spec_round_n_rows(r) == 3u && s->checkpoint.len == 6 &&
+                pulsar_spec_round_saved_len(r) == TokPos{3});
     /* L155: accepted[] of 2 for a round of 3 rows -- refused before anything commits, the round undone */
-    TEST_ASSERT(pulsar_session_spec_round_end_forced(s, r, 4, 0.0f, 0, 1.0f, 0.0f, NULL, 0u, truth, acc, 2, err,
+    TEST_ASSERT(pulsar_session_spec_round_end_forced(s, r, TokId{4}, 0.0f, 0, 1.0f, 0.0f, NULL, 0u, truth, acc, 2, err,
                                                      sizeof err) == -1 && strstr(err, "accepted[]") != NULL);
     TEST_ASSERT(s->checkpoint.len == 3 && !s->checkpoint_valid);
     /* O37: a begun round whose end cannot walk (sampled, no stream) is undone */
     s->checkpoint_valid = true;
     s->spec.n_pend = 1;
-    s->spec.pend_base = 4;
-    s->spec.pend_pos = 3;
+    s->spec.pend_base = TokId{4};
+    s->spec.pend_pos = TokPos{3};
     s->spec.pend_temp = 0.7f;
     s->spec.pend_top_p = 1.0f;
     TEST_ASSERT(pulsar_session_spec_round_begin_local(s, r, 4, 17, 17, 0.7f, 0, 1.0f, 0.0f, err, sizeof err) == 0 &&
@@ -4663,7 +4689,7 @@ static void test_spec_round_refusals(void) {
     TEST_ASSERT(s->checkpoint.len == 3 && !s->checkpoint_valid);
     /* O39: a bank at the context has no row for a base */
     s->checkpoint_valid = true;
-    for (int t : {4, 5, 6}) token_vec_push(&s->checkpoint, t);
+    for (int t : {4, 5, 6}) token_vec_push(&s->checkpoint, TokId{t});
     TEST_ASSERT(pulsar_session_spec_round_begin_local(s, r, 4, 17, 17, 0.0f, 0, 1.0f, 0.0f, err, sizeof err) == -1 &&
                 strstr(err, "context is full") != NULL && s->checkpoint.len == 6 && s->checkpoint_valid);
     /* O37: the batch end's banked absorb refuses -- bank 1 had rows: its step fails and its saved view is no
@@ -4681,7 +4707,7 @@ static void test_spec_round_refusals(void) {
     st[0].err[0] = st[1].err[0] = '\0';
     s->seed_defer.active = true;
     s->seed_defer.n = 2;
-    s->seed_defer.bank[0] = s->seed_defer.bank[1] = 1u;
+    s->seed_defer.bank[0] = s->seed_defer.bank[1] = BankId{1};
     pulsar_spec_absorb_deferred(s, st, 2);
     TEST_ASSERT(st[1].status == PULSAR_SPEC_STEP_FAILED && strstr(st[1].err, "absorb") != NULL &&
                 !s->bank_carry[1].checkpoint_valid);
@@ -4700,11 +4726,14 @@ static void test_spec_round_refusals(void) {
 static void test_qwen_eos(void) {
     const bpe_tokenizer *tok = qwen_test_tokenizer();
     if (!tok) return;   /* failed by name inside */
+    pulsar_family fam{};
+    fam.id = PULSAR_FAMILY_ID_QWEN4_EXP;   /* pulsar_qwen_of reads the id */
+    pulsar_qwen_model qm = {NULL, (bpe_tokenizer *)tok};
     pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
-    e->qwen_tok = (bpe_tokenizer *)tok;
+    e->family = &fam;
+    e->family_state = &qm;
     TEST_ASSERT(!bpe_tokenizer_stop_ids(tok).empty());
-    TEST_ASSERT(k_qwen_tokenizer.eos(e) == bpe_tokenizer_stop_ids(tok).front());
-    e->qwen_tok = NULL;
+    TEST_ASSERT(k_qwen_tokenizer.eos(e) == TokId{bpe_tokenizer_stop_ids(tok).front()});
     free(e);
     const char *dir = getenv("PULSAR_TEST_QWEN_TOKENIZER");
     std::string tj;
@@ -4729,7 +4758,7 @@ static void test_qwen_eos(void) {
 static void test_api_err_null(void) {
     pulsar_tokens prompt = {0};
     TEST_ASSERT(pulsar_session_restore_checkpoint(NULL, TokPos{0}, NULL, 64) == 1);
-    TEST_ASSERT(pulsar_session_bank_adopt(NULL, 1u, &prompt, NULL, 64).status == PULSAR_ADOPT_REFUSED);
+    TEST_ASSERT(pulsar_session_bank_adopt(NULL, BankId{1}, &prompt, NULL, 64).status == PULSAR_ADOPT_REFUSED);
     TEST_ASSERT(pulsar_session_copy_out_segment(NULL, TokPos{0}, TokPos{0}, NULL, NULL, 0, NULL, 64) == 1);
     TokPos G = TokPos{7};
     TEST_ASSERT(pulsar_session_load_segment(NULL, NULL, 0, false, NULL, 0, &G, NULL, NULL, 64) ==
@@ -4784,10 +4813,10 @@ static void test_tokenizer_refusals(void) {
     TEST_ASSERT(!pulsar_chat_end_assistant(e, &out) && out.len == 0);
     TEST_ASSERT(!pulsar_encode_chat_prompt(e, NULL, "hi", PULSAR_THINK_NONE, &out) && out.len == 0);
     size_t len = 7;
-    TEST_ASSERT(pulsar_token_text(e, 1, &len) == NULL && len == 0);
-    TEST_ASSERT(pulsar_token_eos(e) == -1);
-    TEST_ASSERT(pulsar_token_is_stop(e, 1));   /* fail closed: a generation ends */
-    TEST_ASSERT(pulsar_token_think_close(e) == -1);
+    TEST_ASSERT(pulsar_token_text(e, TokId{1}, &len) == NULL && len == 0);
+    TEST_ASSERT(pulsar_token_eos(e).is_none());
+    TEST_ASSERT(pulsar_token_is_stop(e, TokId{1}));   /* fail closed: a generation ends */
+    TEST_ASSERT(pulsar_token_think_close(e).is_none());
     pulsar_turn_markers tm;
     TEST_ASSERT(!pulsar_chat_turn_markers(e, &tm) && tm.n_user == 0 && tm.n_assistant == 0);
     TEST_ASSERT(!pulsar_tokenize_text(e, "again", &out) && out.len == 0);   /* said once: the log has one line */
@@ -4887,12 +4916,12 @@ static void bpe_ref_emit_piece(const pulsar_vocab *vocab, pulsar_str raw_piece, 
         const std::string whole(sym[i].ptr, (size_t)sym[i].len);   /* the encoding has no NUL: byte 0 maps to U+0100 */
         int token = vocab->vocab_find(whole.c_str());
         if (token >= 0) {
-            token_vec_push(out, token);
+            token_vec_push(out, TokId{token});
         } else {
             for (uint64_t j = 0; j < sym[i].len; j++) {
                 const char one[2] = { sym[i].ptr[j], '\0' };
                 token = vocab->vocab_find(one);
-                if (token >= 0) token_vec_push(out, token);
+                if (token >= 0) token_vec_push(out, TokId{token});
             }
         }
         free(sym[i].ptr);
@@ -5070,7 +5099,7 @@ static void test_bpe_merge(void) {
     size_t back = 0;
     for (int i = 0; i < out.len; i++) {
         size_t len = 0;
-        free(vocab_token_text(&v, out.v[i], &len));
+        free(vocab_token_text(&v, out.v[i].raw(), &len));
         back += len;
     }
     TEST_ASSERT(back == run.size());
@@ -5633,20 +5662,20 @@ static void test_fused_sched(void) {
 
 /* L311: the record pool and the endpoint cut, host only -- a fake kv-state whose walk moves no byte (every slab NULL,
  * every record's capacity above the walk's size, so nothing allocates), on a split-invariant grid of 128. */
-static bool fake_walk(void *, int, bool, pulsar_gpu_tensor *, uint64_t, uint32_t, uint64_t *bytes) {
+static bool fake_walk(void *, int, bool, pulsar_gpu_tensor *, uint64_t, TokPos, uint64_t *bytes) {
     if (bytes) *bytes = 1024;
     return true;
 }
-static uint32_t fake_min_ckpt(void *) { return 1u; }
-static bool fake_true_why(void *, uint32_t, char *, size_t) { return true; }
-static bool fake_true_at(void *, uint32_t) { return true; }
+static TokPos fake_min_ckpt(void *) { return pulsar_ckpt_pos(1u); }
+static bool fake_true_why(void *, TokPos, char *, size_t) { return true; }
+static bool fake_true_at(void *, TokPos) { return true; }
 static void fake_restored(void *) {}
-static bool fake_install(void *, uint32_t, uint32_t) { return true; }
+static bool fake_install(void *, TokPos, TokCount) { return true; }
 /* L326: one pool a bank (one token a row, 16 B), rows a dry tensor */
 static pulsar_gpu_tensor *fake_rows[3];
-static uint32_t fake_bank_pools(void *, uint32_t bank, pulsar_kv_pool *out, uint32_t cap) {
-    if (bank >= 3u || cap < 1u || !fake_rows[bank]) return 0u;
-    out[0] = {fake_rows[bank], 1u, 16u, false};
+static uint32_t fake_bank_pools(void *, BankId bank, pulsar_kv_pool *out, uint32_t cap) {
+    if (!bank.below(3u) || cap < 1u || !fake_rows[pulsar_bank_index(bank)]) return 0u;
+    out[0] = {fake_rows[pulsar_bank_index(bank)], TokPerRow{1u}, 16u, false};
     return 1u;
 }
 
@@ -5656,17 +5685,18 @@ struct ckpt_tier_state {
     pulsar_gpu_tensor *t;   ///< the "state": what a walk copies
     uint64_t n;             ///< its bytes
 };
-static bool tier_walk(void *state, int dir, bool, pulsar_gpu_tensor *slab, uint64_t off, uint32_t, uint64_t *bytes) {
+static bool tier_walk(void *state, int dir, bool, pulsar_gpu_tensor *slab, uint64_t off, TokPos, uint64_t *bytes) {
     const ckpt_tier_state *ts = (const ckpt_tier_state *)state;
     if (dir < 0) {
         *bytes = ts->n;
         return true;
     }
-    return (dir == 0 ? pulsar_gpu_tensor_copy_async(slab, off, ts->t, 0, ts->n)
-                     : pulsar_gpu_tensor_copy_async(ts->t, 0, slab, off, ts->n)) != 0;
+    return (dir == 0 ? pulsar_gpu_tensor_copy_async(slab, TensorBytes{off}, ts->t, TensorBytes{0}, TensorBytes{ts->n})
+                     : pulsar_gpu_tensor_copy_async(ts->t, TensorBytes{0}, slab, TensorBytes{off},
+                                                    TensorBytes{ts->n})) != 0;
 }
-static uint32_t tier_min_ckpt(void *) { return 128u; }
-static bool tier_noted(void *, uint32_t, bool *capture, char *, size_t) {
+static TokPos tier_min_ckpt(void *) { return pulsar_ckpt_pos(128u); }
+static bool tier_noted(void *, TokPos, bool *capture, char *, size_t) {
     *capture = true;
     return true;
 }
@@ -5674,7 +5704,7 @@ static bool tier_noted(void *, uint32_t, bool *capture, char *, size_t) {
 /// @param v  the byte every state byte becomes (queued on this thread's stream, as a step's writes are)
 static void tier_fill(ckpt_tier_state *ts, std::vector<uint8_t> &host, uint8_t v) {
     for (uint64_t i = 0; i < ts->n; i++) host[i] = (uint8_t)(v + i * 7u);
-    TEST_ASSERT(pulsar_gpu_tensor_write_async(ts->t, 0, host.data(), ts->n) == 1);
+    TEST_ASSERT(pulsar_gpu_tensor_write_async(ts->t, TensorBytes{0}, host.data(), TensorBytes{ts->n}) == 1);
 }
 /// @return true when every byte of `got` is the fill of `v`
 static bool tier_is(const uint8_t *got, uint64_t n, uint8_t v) {
@@ -5713,7 +5743,9 @@ static void test_ckpt_host_tier(void) {
             pulsar_ckpt_store *st = (pulsar_ckpt_store *)calloc(1, sizeof(pulsar_ckpt_store));
             pulsar_gpu_tensor_dry_begin();
             TEST_ASSERT(pulsar_ckpt_alloc_tier(st, &ops, &dry_state, nb, host != 0));
-            pulsar_gpu_tensor_dry_end(&price[host][nb - 1u], NULL);
+            TensorBytes priced{0};
+            pulsar_gpu_tensor_dry_end(&priced, NULL);
+            price[host][nb - 1u] = priced.raw();
             TEST_ASSERT(st->lane == NULL && pulsar_ckpt_host_bytes(st) == 0u);   /* a price pins nothing */
             pulsar_ckpt_release(st);
             free(st);
@@ -5725,7 +5757,7 @@ static void test_ckpt_host_tier(void) {
            (unsigned long long)price[0][0], (unsigned long long)price[0][1], (unsigned long long)price[1][0],
            (unsigned long long)price[1][1]);
     /* (2) + (3) */
-    ckpt_tier_state ts = {pulsar_gpu_tensor_alloc(32u << 20), 32u << 20};
+    ckpt_tier_state ts = {pulsar_gpu_tensor_alloc(TensorBytes{32u << 20}), 32u << 20};
     if (!ts.t || pulsar_ckpt_host_tier() < 0) {
         printf("  [skip] L347 I4 tiers on a device: no device here\n");
         pulsar_gpu_tensor_free(ts.t);
@@ -5757,46 +5789,50 @@ static void test_ckpt_host_tier(void) {
         pulsar_ckpt_slot_at at;
         /* two captures, the second queued while the first's copy may still run */
         tier_fill(&ts, fill, 1);
-        TEST_ASSERT(pulsar_ckpt_landed(st, 0, 256));
+        TEST_ASSERT(pulsar_ckpt_landed(st, BankId{0}, TokPos{256}));
         int in_flight = st->host ? pulsar_gpu_lane_pending(st->lane, PULSAR_CKPT_STAGES + 0u) : 0;
         tier_fill(&ts, fill, 2);
-        TEST_ASSERT(pulsar_ckpt_landed(st, 0, 384));
+        TEST_ASSERT(pulsar_ckpt_landed(st, BankId{0}, TokPos{384}));
         /* a host reader gets the bytes its capture copied, after waiting for that slot alone */
-        TEST_ASSERT(pulsar_ckpt_locate(st, 0, 256, &at) && pulsar_ckpt_slot_get(st, &at, got.data()) &&
+        TEST_ASSERT(pulsar_ckpt_locate(st, BankId{0}, TokPos{256}, &at) && pulsar_ckpt_slot_get(st, &at, got.data()) &&
                     tier_is(got.data(), n, 1));
         TEST_ASSERT(!st->host || pulsar_gpu_lane_pending(st->lane, PULSAR_CKPT_STAGES + at.slot) == 0);
-        TEST_ASSERT(pulsar_ckpt_locate(st, 0, 384, &at) && pulsar_ckpt_slot_get(st, &at, got.data()) &&
+        TEST_ASSERT(pulsar_ckpt_locate(st, BankId{0}, TokPos{384}, &at) && pulsar_ckpt_slot_get(st, &at, got.data()) &&
                     tier_is(got.data(), n, 2));
         /* a restore puts the state back (and drops what is above) */
         tier_fill(&ts, fill, 3);
-        TEST_ASSERT(pulsar_ckpt_restore(st, 0, 256) && !pulsar_ckpt_holds(st, 0, 384));
-        TEST_ASSERT(pulsar_gpu_tensor_read(ts.t, 0, got.data(), n) == 1 && tier_is(got.data(), n, 1));
+        TEST_ASSERT(pulsar_ckpt_restore(st, BankId{0}, TokPos{256}) && !pulsar_ckpt_holds(st, BankId{0}, TokPos{384}));
+        TEST_ASSERT(pulsar_gpu_tensor_read(ts.t, TensorBytes{0}, got.data(),
+                                           TensorBytes{n}) == 1 && tier_is(got.data(), n, 1));
         /* the same slot captured twice back to back: the newer bytes win (the reuse waits for the older copy) */
         tier_fill(&ts, fill, 4);
-        TEST_ASSERT(pulsar_ckpt_landed(st, 0, 512));
+        TEST_ASSERT(pulsar_ckpt_landed(st, BankId{0}, TokPos{512}));
         tier_fill(&ts, fill, 5);
-        TEST_ASSERT(pulsar_ckpt_landed(st, 0, 512));
-        TEST_ASSERT(pulsar_ckpt_locate(st, 0, 512, &at) && pulsar_ckpt_slot_get(st, &at, got.data()) &&
+        TEST_ASSERT(pulsar_ckpt_landed(st, BankId{0}, TokPos{512}));
+        TEST_ASSERT(pulsar_ckpt_locate(st, BankId{0}, TokPos{512}, &at) && pulsar_ckpt_slot_get(st, &at, got.data()) &&
                     tier_is(got.data(), n, 5));
         /* a claim over a slot just captured waits for that copy, then the host writes it and a restore reads it */
         tier_fill(&ts, fill, 6);
-        TEST_ASSERT(pulsar_ckpt_landed(st, 0, 640));
-        TEST_ASSERT(pulsar_ckpt_claim(st, 0, 768, &at));
+        TEST_ASSERT(pulsar_ckpt_landed(st, BankId{0}, TokPos{640}));
+        TEST_ASSERT(pulsar_ckpt_claim(st, BankId{0}, TokPos{768}, &at));
         for (uint64_t i = 0; i < n; i++) fill[i] = (uint8_t)(7u + i * 7u);
         TEST_ASSERT(pulsar_ckpt_slot_put(st, &at, fill.data()));
-        pulsar_ckpt_commit(st, 0, at.slot, 768);
+        pulsar_ckpt_commit(st, BankId{0}, at.slot, TokPos{768});
         tier_fill(&ts, fill, 8);
-        TEST_ASSERT(pulsar_ckpt_restore(st, 0, 768));
-        TEST_ASSERT(pulsar_gpu_tensor_read(ts.t, 0, got.data(), n) == 1 && tier_is(got.data(), n, 7));
+        TEST_ASSERT(pulsar_ckpt_restore(st, BankId{0}, TokPos{768}));
+        TEST_ASSERT(pulsar_gpu_tensor_read(ts.t, TensorBytes{0}, got.data(),
+                                           TensorBytes{n}) == 1 && tier_is(got.data(), n, 7));
         /* a record: captured, the state overwritten, restored */
-        int toks[800];
-        for (int i = 0; i < 800; i++) toks[i] = i;
+        TokId toks[800];
+        for (int i = 0; i < 800; i++) toks[i] = TokId{i};
         tier_fill(&ts, fill, 9);
-        TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_ENDPOINT, 777, toks, NULL, 0, NULL));
+        TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{0}, PULSAR_CKPT_REC_ENDPOINT, TokPos{777}, toks, NULL, 0,
+                                               NULL));
         tier_fill(&ts, fill, 10);
-        const pulsar_ckpt_record *r = pulsar_ckpt_record_of(st, 0, PULSAR_CKPT_REC_ENDPOINT);
-        TEST_ASSERT(r && pulsar_ckpt_record_restore(st, 0, r, NULL, 0));
-        TEST_ASSERT(pulsar_gpu_tensor_read(ts.t, 0, got.data(), n) == 1 && tier_is(got.data(), n, 9));
+        const pulsar_ckpt_record *r = pulsar_ckpt_record_of(st, BankId{0}, PULSAR_CKPT_REC_ENDPOINT);
+        TEST_ASSERT(r && pulsar_ckpt_record_restore(st, BankId{0}, r, NULL, 0));
+        TEST_ASSERT(pulsar_gpu_tensor_read(ts.t, TensorBytes{0}, got.data(),
+                                           TensorBytes{n}) == 1 && tier_is(got.data(), n, 9));
         printf("  L347 I4 %s tier round trip OK (first capture %s when the next was queued)\n",
                host ? "host" : "device", in_flight == 1 ? "still in flight" : "already landed");
         pulsar_ckpt_release(st);
@@ -5813,7 +5849,7 @@ static void test_ckpt_host_tier(void) {
  * the unread rows never pass the pool's cap; a pool destroyed with read-ahead queued frees it.  (3) Memory pressure:
  * the admit rule.  (4) No served prompt, no read-ahead: an unlicensed session never reaches the family's reader. */
 static int g_fake_ahead_calls = 0;
-static uint32_t fake_ahead_read(const pulsar_engine *, uint64_t, const int32_t *, uint32_t from, uint32_t to) {
+static uint32_t fake_ahead_read(const pulsar_engine *, uint64_t, const TokId *, uint32_t from, uint32_t to) {
     g_fake_ahead_calls++;
     return (to - from) * 16u;
 }
@@ -5821,8 +5857,8 @@ static pulsar_engram_io *fake_ahead_pool(const pulsar_engine *) { return NULL; }
 static void test_read_ahead(void) {
     /* (1) the rule */
     const uint32_t W = 4096, LEN = 20000;
-    std::vector<int> p(LEN), q(LEN);
-    for (uint32_t i = 0; i < LEN; i++) p[i] = q[i] = (int)(i * 7u % 1000u);
+    std::vector<TokId> p(LEN), q(LEN);
+    for (uint32_t i = 0; i < LEN; i++) p[i] = q[i] = TokId{(int)(i * 7u % 1000u)};
     pulsar_read_ahead_mark m = {}, nx = {};
     uint32_t f = 0, t = 0;
     bool drop = false;
@@ -5845,12 +5881,12 @@ static void test_read_ahead(void) {
     m = {};
     TEST_ASSERT(pulsar_read_ahead_plan(&m, p.data(), LEN, W, W, &f, &t, &drop, &nx));
     m = nx;
-    q[W + 10] += 1;
+    q[W + 10] = TokId{q[W + 10].raw() + 1};
     TEST_ASSERT(pulsar_read_ahead_plan(&m, q.data(), LEN, W + 512, W, &f, &t, &drop, &nx) && drop && f == W + 512 &&
                 t == 2 * W + 512);
     /* ... and a token the n-gram reaches back to (two before the record) counts too */
     q = p;
-    q[W - 2] += 1;
+    q[W - 2] = TokId{q[W - 2].raw() + 1};
     TEST_ASSERT(pulsar_read_ahead_plan(&m, q.data(), LEN, W + 512, W, &f, &t, &drop, &nx) && drop);
     /* a bank that went back (a resume below the record) drops and reads from where it stands */
     TEST_ASSERT(pulsar_read_ahead_plan(&m, p.data(), LEN, 128, W, &f, &t, &drop, &nx) && drop && f == 128);
@@ -5954,7 +5990,7 @@ static void test_read_ahead(void) {
     fs->prefill_cap = W;
     TEST_ASSERT(fs->prefill_ahead == NULL);   /* the default: unlicensed */
     TEST_ASSERT(pulsar_session_read_ahead(fs, 0, fs->prefill_ahead, W) == 0 && g_fake_ahead_calls == 0);
-    TEST_ASSERT(pulsar_session_prompt_read_ahead(fs, 0, NULL, (int)W) == 0 && g_fake_ahead_calls == 0);
+    TEST_ASSERT(pulsar_session_prompt_read_ahead(fs, BankId{0}, NULL, (int)W) == 0 && g_fake_ahead_calls == 0);
     pulsar_tokens served = {p.data(), (int)LEN, (int)LEN};
     pulsar_session_set_prefill_ahead(fs, &served);
     const uint32_t got = pulsar_session_read_ahead(fs, 0, fs->prefill_ahead, W);
@@ -5988,28 +6024,30 @@ static void test_ckpt_records(void) {
     TEST_ASSERT(pulsar_ckpt_records_for(1) == 2u && pulsar_ckpt_records_for(4) == 6u && pulsar_ckpt_records_for(16) == 24u);
     st->n_rec = pulsar_ckpt_records_for(2);   /* 3 records for 2 banks */
     for (uint32_t i = 0; i < st->n_rec; i++) st->rec[i].cap = 1u << 20;
-    int toks[600];
-    for (int i = 0; i < 600; i++) toks[i] = 1000 + i;
+    TokId toks[600];
+    for (int i = 0; i < 600; i++) toks[i] = TokId{1000 + i};
     float lg[4] = {1, 2, 3, 4}, out[4] = {0};
     /* a prompt end keeps logits, an endpoint none; a kind and its logits must agree */
-    TEST_ASSERT(!pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_END, 300, toks, NULL, 0, NULL));
-    TEST_ASSERT(!pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_ENDPOINT, 297, toks, lg, 4, NULL));
-    TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_END, 300, toks, lg, 4, NULL));
-    TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_ENDPOINT, 297, toks, NULL, 0, NULL));
-    TEST_ASSERT(pulsar_ckpt_end(st, 0) == 300u && pulsar_ckpt_end(st, 1) == 0u);
+    TEST_ASSERT(!pulsar_ckpt_record_capture(st, BankId{0}, PULSAR_CKPT_REC_END, TokPos{300}, toks, NULL, 0, NULL));
+    TEST_ASSERT(!pulsar_ckpt_record_capture(st, BankId{0}, PULSAR_CKPT_REC_ENDPOINT, TokPos{297}, toks, lg, 4, NULL));
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{0}, PULSAR_CKPT_REC_END, TokPos{300}, toks, lg, 4, NULL));
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{0}, PULSAR_CKPT_REC_ENDPOINT, TokPos{297}, toks, NULL, 0, NULL));
+    TEST_ASSERT(pulsar_ckpt_end(st, BankId{0}) == TokPos{300} && pulsar_ckpt_end(st, BankId{1}).is_none());
     /* the deepest matching record within the limit; a resume AT a record without logits is not one */
-    const pulsar_ckpt_record *r = pulsar_ckpt_record_best(st, 0, toks, 600, 600, 600, NULL);
+    const pulsar_ckpt_record *r = pulsar_ckpt_record_best(st, BankId{0}, toks, TokCount{600}, TokPos{600},
+                                                          TokCount{600}, NULL);
     TEST_ASSERT(r && r->T == 300u && r->kind == PULSAR_CKPT_REC_END);
-    r = pulsar_ckpt_record_best(st, 0, toks, 600, 299, 600, NULL);
+    r = pulsar_ckpt_record_best(st, BankId{0}, toks, TokCount{600}, TokPos{299}, TokCount{600}, NULL);
     TEST_ASSERT(r && r->T == 297u && r->kind == PULSAR_CKPT_REC_ENDPOINT);
-    TEST_ASSERT(pulsar_ckpt_record_best(st, 0, toks, 600, 297, 297, NULL) == NULL);   /* AT 297: no logits there */
-    r = pulsar_ckpt_record_best(st, 0, toks, 600, 300, 300, NULL);
+    /* AT 297: no logits there */
+    TEST_ASSERT(pulsar_ckpt_record_best(st, BankId{0}, toks, TokCount{600}, TokPos{297}, TokCount{297}, NULL) == NULL);
+    r = pulsar_ckpt_record_best(st, BankId{0}, toks, TokCount{600}, TokPos{300}, TokCount{300}, NULL);
     TEST_ASSERT(r && r->T == 300u);
     /* other ids below T: no match; another bank: none */
-    toks[100] = 7;
-    TEST_ASSERT(pulsar_ckpt_record_best(st, 0, toks, 600, 600, 600, NULL) == NULL);
-    toks[100] = 1100;
-    TEST_ASSERT(pulsar_ckpt_record_best(st, 1, toks, 600, 600, 600, NULL) == NULL);
+    toks[100] = TokId{7};
+    TEST_ASSERT(pulsar_ckpt_record_best(st, BankId{0}, toks, TokCount{600}, TokPos{600}, TokCount{600}, NULL) == NULL);
+    toks[100] = TokId{1100};
+    TEST_ASSERT(pulsar_ckpt_record_best(st, BankId{1}, toks, TokCount{600}, TokPos{600}, TokCount{600}, NULL) == NULL);
     {
         /* L350: a record holds its images; it matches only a request with the same blocks below its T */
         pulsar_image_identity a, b, text;
@@ -6023,105 +6061,124 @@ static void test_ckpt_records(void) {
         a.b[0].grid_w = 8;
         b = a;
         b.b[0].content = 0xB0Bull;   /* another image in the same placeholder ids */
-        TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_ENDPOINT, 297, toks, NULL, 0, &a));
-        const pulsar_ckpt_record *ri = pulsar_ckpt_record_best(st, 0, toks, 600, 299, 600, &a);
+        TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{0}, PULSAR_CKPT_REC_ENDPOINT, TokPos{297}, toks, NULL, 0,
+                                               &a));
+        const pulsar_ckpt_record *ri = pulsar_ckpt_record_best(st, BankId{0}, toks, TokCount{600}, TokPos{299},
+                                                               TokCount{600}, &a);
         TEST_ASSERT(ri && ri->T == 297u && ri->img && ri->img->n == 1u && ri->img->b[0].content == 0xA11CEull);
-        TEST_ASSERT(pulsar_ckpt_record_best(st, 0, toks, 600, 299, 600, &b) == NULL);      /* other image */
-        TEST_ASSERT(pulsar_ckpt_record_best(st, 0, toks, 600, 299, 600, &text) == NULL);   /* a text request */
-        TEST_ASSERT(pulsar_ckpt_record_best(st, 0, toks, 600, 299, 600, NULL) == NULL);    /* priced from ids */
+        /* other image */
+        TEST_ASSERT(pulsar_ckpt_record_best(st, BankId{0}, toks, TokCount{600}, TokPos{299}, TokCount{600},
+                                            &b) == NULL);
+        /* a text request */
+        TEST_ASSERT(pulsar_ckpt_record_best(st, BankId{0}, toks, TokCount{600}, TokPos{299}, TokCount{600},
+                                            &text) == NULL);
+        /* priced from ids */
+        TEST_ASSERT(pulsar_ckpt_record_best(st, BankId{0}, toks, TokCount{600}, TokPos{299}, TokCount{600},
+                                            NULL) == NULL);
         /* a request block straddling T: no resume there */
         pulsar_image_identity wide = a;
         wide.n = 2;
         wide.b[1] = a.b[0];
         wide.b[1].start = 290;
         wide.b[1].end = 354;
-        TEST_ASSERT(pulsar_ckpt_record_best(st, 0, toks, 600, 299, 600, &wide) == NULL);
+        TEST_ASSERT(pulsar_ckpt_record_best(st, BankId{0}, toks, TokCount{600}, TokPos{299}, TokCount{600},
+                                            &wide) == NULL);
         /* a block past T is not the record's business */
         wide.b[1].start = 300;
         wide.b[1].end = 364;
-        TEST_ASSERT(pulsar_ckpt_record_best(st, 0, toks, 600, 299, 600, &wide) == ri);
+        TEST_ASSERT(pulsar_ckpt_record_best(st, BankId{0}, toks, TokCount{600}, TokPos{299}, TokCount{600},
+                                            &wide) == ri);
         /* a text capture over the same record slot clears its images */
-        TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_ENDPOINT, 297, toks, NULL, 0, NULL));
-        ri = pulsar_ckpt_record_best(st, 0, toks, 600, 299, 600, NULL);
+        TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{0}, PULSAR_CKPT_REC_ENDPOINT, TokPos{297}, toks, NULL, 0,
+                                               NULL));
+        ri = pulsar_ckpt_record_best(st, BankId{0}, toks, TokCount{600}, TokPos{299}, TokCount{600}, NULL);
         TEST_ASSERT(ri && ri->T == 297u && (!ri->img || ri->img->n == 0u));
-        TEST_ASSERT(pulsar_ckpt_record_best(st, 0, toks, 600, 299, 600, &a) == NULL);
+        TEST_ASSERT(pulsar_ckpt_record_best(st, BankId{0}, toks, TokCount{600}, TokPos{299}, TokCount{600},
+                                            &a) == NULL);
     }
     /* a second capture of a kind replaces the bank's first */
-    TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_END, 310, toks, lg, 4, NULL));
-    TEST_ASSERT(pulsar_ckpt_end(st, 0) == 310u);
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{0}, PULSAR_CKPT_REC_END, TokPos{310}, toks, lg, 4, NULL));
+    TEST_ASSERT(pulsar_ckpt_end(st, BankId{0}) == TokPos{310});
     uint32_t n0 = 0;
-    for (uint32_t i = 0; i < st->n_rec; i++) n0 += st->rec[i].T != 0u && st->rec[i].bank == 0u;
+    for (uint32_t i = 0; i < st->n_rec; i++) n0 += st->rec[i].T != 0u && st->rec[i].bank == BankId{0};
     TEST_ASSERT(n0 == 2u);
     /* a full pool evicts the least recently used: bank 1 takes the third record, then its endpoint takes the oldest
      * (bank 0's endpoint, captured before its newer prompt end) */
-    TEST_ASSERT(pulsar_ckpt_record_capture(st, 1, PULSAR_CKPT_REC_END, 200, toks, lg, 4, NULL));
-    TEST_ASSERT(pulsar_ckpt_record_capture(st, 1, PULSAR_CKPT_REC_ENDPOINT, 190, toks, NULL, 0, NULL));
-    TEST_ASSERT(pulsar_ckpt_record_of(st, 0, PULSAR_CKPT_REC_ENDPOINT) == NULL);
-    TEST_ASSERT(pulsar_ckpt_end(st, 0) == 310u && pulsar_ckpt_end(st, 1) == 200u);
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{1}, PULSAR_CKPT_REC_END, TokPos{200}, toks, lg, 4, NULL));
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{1}, PULSAR_CKPT_REC_ENDPOINT, TokPos{190}, toks, NULL, 0, NULL));
+    TEST_ASSERT(pulsar_ckpt_record_of(st, BankId{0}, PULSAR_CKPT_REC_ENDPOINT) == NULL);
+    TEST_ASSERT(pulsar_ckpt_end(st, BankId{0}) == TokPos{310} && pulsar_ckpt_end(st, BankId{1}) == TokPos{200});
     /* a restore puts the bank at T, hands back the logits, drops its records above T, stamps the record used */
-    r = pulsar_ckpt_record_of(st, 1, PULSAR_CKPT_REC_ENDPOINT);
-    TEST_ASSERT(r && pulsar_ckpt_record_restore(st, 1, r, NULL, 0));
-    TEST_ASSERT(pulsar_ckpt_end(st, 1) == 0u && pulsar_ckpt_record_of(st, 1, PULSAR_CKPT_REC_ENDPOINT));
-    TEST_ASSERT(!pulsar_ckpt_record_restore(st, 0, r, NULL, 0));   /* not bank 0's */
-    r = pulsar_ckpt_record_of(st, 0, PULSAR_CKPT_REC_END);
-    TEST_ASSERT(r && pulsar_ckpt_record_restore(st, 0, r, out, 4) && out[3] == 4.0f);
+    r = pulsar_ckpt_record_of(st, BankId{1}, PULSAR_CKPT_REC_ENDPOINT);
+    TEST_ASSERT(r && pulsar_ckpt_record_restore(st, BankId{1}, r, NULL, 0));
+    TEST_ASSERT(pulsar_ckpt_end(st, BankId{1}).is_none() && pulsar_ckpt_record_of(st, BankId{1},
+                                                                                  PULSAR_CKPT_REC_ENDPOINT));
+    TEST_ASSERT(!pulsar_ckpt_record_restore(st, BankId{0}, r, NULL, 0));   /* not bank 0's */
+    r = pulsar_ckpt_record_of(st, BankId{0}, PULSAR_CKPT_REC_END);
+    TEST_ASSERT(r && pulsar_ckpt_record_restore(st, BankId{0}, r, out, 4) && out[3] == 4.0f);
     /* the frontier rule: a history lowered below T drops the record; a dropped bank holds none */
-    pulsar_ckpt_frontier_lowered(st, 0, 309);
-    TEST_ASSERT(pulsar_ckpt_end(st, 0) == 0u);
-    pulsar_ckpt_drop_bank(st, 1);
-    TEST_ASSERT(pulsar_ckpt_record_of(st, 1, PULSAR_CKPT_REC_ENDPOINT) == NULL);
+    pulsar_ckpt_frontier_lowered(st, BankId{0}, TokCount{309});
+    TEST_ASSERT(pulsar_ckpt_end(st, BankId{0}).is_none());
+    pulsar_ckpt_drop_bank(st, BankId{1});
+    TEST_ASSERT(pulsar_ckpt_record_of(st, BankId{1}, PULSAR_CKPT_REC_ENDPOINT) == NULL);
     /* a record recycled from a prompt end into an endpoint keeps no logits (a resume AT it would read them) */
-    TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_END, 120, toks, lg, 4, NULL));
-    pulsar_ckpt_drop_bank(st, 0);
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{0}, PULSAR_CKPT_REC_END, TokPos{120}, toks, lg, 4, NULL));
+    pulsar_ckpt_drop_bank(st, BankId{0});
     for (uint32_t i = 0; i < st->n_rec; i++)
-        TEST_ASSERT(pulsar_ckpt_record_capture(st, i % 2u, i < 2u ? PULSAR_CKPT_REC_ENDPOINT : PULSAR_CKPT_REC_END,
-                                               100u + i, toks, i < 2u ? NULL : lg, i < 2u ? 0u : 4u, NULL));
-    TEST_ASSERT(pulsar_ckpt_record_best(st, 0, toks, 600, 100, 100, NULL) == NULL);
+        TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{i % 2u},
+                                               i < 2u ? PULSAR_CKPT_REC_ENDPOINT : PULSAR_CKPT_REC_END,
+                                               TokPos{100u + i}, toks, i < 2u ? NULL : lg, i < 2u ? 0u : 4u, NULL));
+    TEST_ASSERT(pulsar_ckpt_record_best(st, BankId{0}, toks, TokCount{600}, TokPos{100}, TokCount{100}, NULL) == NULL);
     for (uint32_t i = 0; i < st->n_rec; i++)
         TEST_ASSERT((st->rec[i].kind == PULSAR_CKPT_REC_END) == (st->rec[i].logits != NULL));
     /* L313: an adopt between banks refuses without paired pools (this store has none), and from the bank itself */
     bool moved = true;
-    TEST_ASSERT(!pulsar_ckpt_adopt(st, 0, 1, 101, NULL, &moved) && !moved);   /* L375 O43: refused before dst moved */
+    /* L375 O43: refused before dst moved */
+    TEST_ASSERT(!pulsar_ckpt_adopt(st, BankId{0}, BankId{1}, TokPos{101}, NULL, &moved) && !moved);
     moved = true;
-    TEST_ASSERT(!pulsar_ckpt_adopt(st, 0, 0, 100, NULL, &moved) && !moved);
-    pulsar_ckpt_drop_bank(st, 0);
-    pulsar_ckpt_drop_bank(st, 1);
+    TEST_ASSERT(!pulsar_ckpt_adopt(st, BankId{0}, BankId{0}, TokPos{100}, NULL, &moved) && !moved);
+    pulsar_ckpt_drop_bank(st, BankId{0});
+    pulsar_ckpt_drop_bank(st, BankId{1});
     /* L326: lending a record stamps it used.  Dry tensors (every copy a no-op that succeeds) give the banks paired
      * pools and the records slabs.  The full pool's least recently used record is the lender's prompt end; bank 1
      * adopts it: the copy takes another slot (it took the lent record's own, so none was made) and the next capture
      * evicts another record (it evicted the record bank 1 was just served from). */
     pulsar_gpu_tensor_dry_begin();
-    for (uint32_t b = 0; b < 3u; b++) fake_rows[b] = pulsar_gpu_tensor_alloc(600u * 16u);
-    for (uint32_t i = 0; i < st->n_rec; i++) st->rec[i].slab = pulsar_gpu_tensor_alloc(st->rec[i].cap);
+    for (uint32_t b = 0; b < 3u; b++) fake_rows[b] = pulsar_gpu_tensor_alloc(TensorBytes{600u * 16u});
+    for (uint32_t i = 0; i < st->n_rec; i++) st->rec[i].slab = pulsar_gpu_tensor_alloc(TensorBytes{st->rec[i].cap});
     pulsar_gpu_tensor_dry_end(NULL, NULL);
     ops.bank_pools = fake_bank_pools;
-    TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_END, 300, toks, lg, 4, NULL));   /* the oldest */
-    TEST_ASSERT(pulsar_ckpt_record_capture(st, 2, PULSAR_CKPT_REC_END, 250, toks, lg, 4, NULL));
-    TEST_ASSERT(pulsar_ckpt_record_capture(st, 2, PULSAR_CKPT_REC_ENDPOINT, 240, toks, NULL, 0, NULL));
-    r = pulsar_ckpt_record_of(st, 0, PULSAR_CKPT_REC_END);
+    /* the oldest */
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{0}, PULSAR_CKPT_REC_END, TokPos{300}, toks, lg, 4, NULL));
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{2}, PULSAR_CKPT_REC_END, TokPos{250}, toks, lg, 4, NULL));
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{2}, PULSAR_CKPT_REC_ENDPOINT, TokPos{240}, toks, NULL, 0, NULL));
+    r = pulsar_ckpt_record_of(st, BankId{0}, PULSAR_CKPT_REC_END);
     {
         /* L375 O46: a bank on the runtime adapter and a plain one do not adopt from each other -- refused before dst
          * moves (O43), whichever of the two is adapted; two banks of a kind do */
         uint8_t adapter[3] = {1, 0, 0};
         st->bank_adapter = adapter;
         moved = true;
-        TEST_ASSERT(r && !pulsar_ckpt_adopt(st, 1, 0, 300, r, &moved) && !moved);
+        TEST_ASSERT(r && !pulsar_ckpt_adopt(st, BankId{1}, BankId{0}, TokPos{300}, r, &moved) && !moved);
         adapter[0] = 0;
         adapter[1] = 1;
         moved = true;
-        TEST_ASSERT(!pulsar_ckpt_adopt(st, 1, 0, 300, r, &moved) && !moved);
-        TEST_ASSERT(pulsar_ckpt_end(st, 1) == 0u && pulsar_ckpt_end(st, 0) == 300u);   /* nothing lent, nothing dropped */
+        TEST_ASSERT(!pulsar_ckpt_adopt(st, BankId{1}, BankId{0}, TokPos{300}, r, &moved) && !moved);
+        /* nothing lent, nothing dropped */
+        TEST_ASSERT(pulsar_ckpt_end(st, BankId{1}).is_none() && pulsar_ckpt_end(st, BankId{0}) == TokPos{300});
         adapter[0] = 1;
-        TEST_ASSERT(pulsar_ckpt_adopt(st, 1, 0, 300, r, &moved) && moved);
+        TEST_ASSERT(pulsar_ckpt_adopt(st, BankId{1}, BankId{0}, TokPos{300}, r, &moved) && moved);
         st->bank_adapter = NULL;
     }
-    TEST_ASSERT(pulsar_ckpt_end(st, 1) == 300u && pulsar_ckpt_end(st, 0) == 300u);   /* dst's copy, the lender's own */
-    TEST_ASSERT(pulsar_ckpt_record_capture(st, 1, PULSAR_CKPT_REC_ENDPOINT, 290, toks, NULL, 0, NULL));
-    TEST_ASSERT(pulsar_ckpt_end(st, 0) == 300u);                                    /* still the lender's */
-    TEST_ASSERT(pulsar_ckpt_record_of(st, 2, PULSAR_CKPT_REC_ENDPOINT) == NULL);   /* the LRU went instead */
+    /* dst's copy, the lender's own */
+    TEST_ASSERT(pulsar_ckpt_end(st, BankId{1}) == TokPos{300} && pulsar_ckpt_end(st, BankId{0}) == TokPos{300});
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{1}, PULSAR_CKPT_REC_ENDPOINT, TokPos{290}, toks, NULL, 0, NULL));
+    /* still the lender's */
+    TEST_ASSERT(pulsar_ckpt_end(st, BankId{0}) == TokPos{300});
+    TEST_ASSERT(pulsar_ckpt_record_of(st, BankId{2}, PULSAR_CKPT_REC_ENDPOINT) == NULL);   /* the LRU went instead */
     ops.bank_pools = NULL;
     for (uint32_t b = 0; b < 3u; b++) {
-        pulsar_ckpt_drop_bank(st, b);
+        pulsar_ckpt_drop_bank(st, BankId{b});
         pulsar_gpu_tensor_free(fake_rows[b]);
         fake_rows[b] = NULL;
     }
@@ -6130,17 +6187,21 @@ static void test_ckpt_records(void) {
     pulsar_prefill_shape shape = {4096u, 4096u, 1u};
     pulsar_tokens p = {toks, 400, 400};
     pulsar_prefill_plan plan;
-    pulsar_prefill_plan_init(&plan, &shape, 0u, st, NULL, &p, NULL, 0);
-    TEST_ASSERT(plan.endpoint == 0u && pulsar_prefill_plan_next_end(&plan, 0u, 400u) == 384u);
+    pulsar_prefill_plan_init(&plan, &shape, TokPos{0}, st, NULL, &p, NULL, 0);
+    /* the planner's next chunk end, in raw positions (the table below reads as the walk's cuts) */
+    const auto NEXT = [&plan](uint32_t a, uint32_t b) {
+        return pulsar_ckpt_raw(pulsar_prefill_plan_next_end(&plan, pulsar_ckpt_pos(a), pulsar_ckpt_pos(b)));
+    };
+    TEST_ASSERT(plan.endpoint == 0u && NEXT(0u, 400u) == 384u);
     plan.endpoint = 297u;
-    TEST_ASSERT(pulsar_prefill_plan_next_end(&plan, 0u, 400u) == 297u);
-    TEST_ASSERT(pulsar_prefill_plan_next_end(&plan, 297u, 400u) == 384u);
-    TEST_ASSERT(pulsar_prefill_plan_next_end(&plan, 384u, 400u) == 400u);
+    TEST_ASSERT(NEXT(0u, 400u) == 297u);
+    TEST_ASSERT(NEXT(297u, 400u) == 384u);
+    TEST_ASSERT(NEXT(384u, 400u) == 400u);
     /* an endpoint past the grid point: [0, 384), [384, 390), [390, 400) */
     plan.endpoint = 390u;
-    TEST_ASSERT(pulsar_prefill_plan_next_end(&plan, 0u, 400u) == 384u);
-    TEST_ASSERT(pulsar_prefill_plan_next_end(&plan, 384u, 400u) == 390u);
-    TEST_ASSERT(pulsar_prefill_plan_next_end(&plan, 390u, 400u) == 400u);
+    TEST_ASSERT(NEXT(0u, 400u) == 384u);
+    TEST_ASSERT(NEXT(384u, 400u) == 390u);
+    TEST_ASSERT(NEXT(390u, 400u) == 400u);
     /* L380: a waived endpoint is planned as none -- the walk makes the grid cut and no other: [0, 384), [384, 400).
      * The waiver holds only for a caller that gave it and only with no grid point past the endpoint (the last grid
      * checkpoint then stands within a grid step below it) */
@@ -6152,47 +6213,48 @@ static void test_ckpt_records(void) {
     for (int waived = 0; waived < 2; waived++) {
         plan.endpoint = pulsar_prefill_endpoint_waived(st, 390u, 400u, waived != 0) ? 0u : 390u;
         uint32_t ends[4] = {0}, n = 0;
-        for (uint32_t pos = 0u; pos < 400u && n < 4u; pos = ends[n++]) ends[n] = pulsar_prefill_plan_next_end(&plan, pos, 400u);
+        for (uint32_t pos = 0u; pos < 400u && n < 4u; pos = ends[n++]) ends[n] = NEXT(pos, 400u);
         if (waived) TEST_ASSERT(n == 2u && ends[0] == 384u && ends[1] == 400u);
         else TEST_ASSERT(n == 3u && ends[0] == 384u && ends[1] == 390u && ends[2] == 400u);
     }
     /* a resumed walk too, with no grid point ahead of it: one chunk instead of two */
     plan.endpoint = 0u;
-    TEST_ASSERT(pulsar_prefill_plan_next_end(&plan, 385u, 400u) == 400u);
+    TEST_ASSERT(NEXT(385u, 400u) == 400u);
     plan.endpoint = 396u;
-    TEST_ASSERT(pulsar_prefill_plan_next_end(&plan, 385u, 400u) == 396u);
+    TEST_ASSERT(NEXT(385u, 400u) == 396u);
 
     /* L380: when a request's syncs waive the cut (server_endpoint_waive) -- the per-bank state is the store's
      * prompt-end record, so it follows the record's life.  Bank 0, a conversation's requests in order: */
-    for (uint32_t b = 0; b < 3u; b++) pulsar_ckpt_drop_bank(st, b);
+    for (uint32_t b = 0; b < 3u; b++) pulsar_ckpt_drop_bank(st, BankId{b});
     const auto WAIVE = [st](kv_pick pick, int at, uint32_t bank) {
-        return server_endpoint_waive(pick, at, (int)pulsar_ckpt_end(st, bank));
+        return server_endpoint_waive(pick, TokPos{at}, pulsar_ckpt_end(st, BankId{bank}));
     };
     /* no history: the cut, wherever the request starts */
     TEST_ASSERT(!WAIVE(KV_PICK_NONE, 0, 0) && !WAIVE(KV_PICK_OWN, 300, 0) && !WAIVE(KV_PICK_LIVE, 300, 0));
     /* its first prompt ended at 300 (endpoint 297); the next request starts there, or past it on the live rows */
-    TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_END, 300, toks, lg, 4, NULL));
-    TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_ENDPOINT, 297, toks, NULL, 0, NULL));
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{0}, PULSAR_CKPT_REC_END, TokPos{300}, toks, lg, 4, NULL));
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{0}, PULSAR_CKPT_REC_ENDPOINT, TokPos{297}, toks, NULL, 0, NULL));
     TEST_ASSERT(WAIVE(KV_PICK_OWN, 300, 0) && WAIVE(KV_PICK_LIVE, 345, 0));
     TEST_ASSERT(!WAIVE(KV_PICK_OWN, 300, 1));   /* another bank's prompt end is not this bank's evidence */
     /* a request that starts below it -- from the endpoint record, or the grid under it -- cuts again... */
     TEST_ASSERT(!WAIVE(KV_PICK_OWN, 297, 0) && !WAIVE(KV_PICK_OWN, 256, 0) && !WAIVE(KV_PICK_NONE, 0, 0));
     /* ...and the resume itself drops the prompt end above it, so nothing waives until a prompt ends again and a
      * request starts at or past THAT end */
-    r = pulsar_ckpt_record_of(st, 0, PULSAR_CKPT_REC_ENDPOINT);
-    TEST_ASSERT(r && pulsar_ckpt_record_restore(st, 0, r, NULL, 0) && pulsar_ckpt_end(st, 0) == 0u);
+    r = pulsar_ckpt_record_of(st, BankId{0}, PULSAR_CKPT_REC_ENDPOINT);
+    TEST_ASSERT(r && pulsar_ckpt_record_restore(st, BankId{0}, r, NULL, 0) && pulsar_ckpt_end(st, BankId{0}).is_none());
     TEST_ASSERT(!WAIVE(KV_PICK_OWN, 297, 0) && !WAIVE(KV_PICK_OWN, 420, 0));
-    TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_END, 420, toks, lg, 4, NULL));
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{0}, PULSAR_CKPT_REC_END, TokPos{420}, toks, lg, 4, NULL));
     TEST_ASSERT(!WAIVE(KV_PICK_OWN, 417, 0) && WAIVE(KV_PICK_OWN, 420, 0) && WAIVE(KV_PICK_OWN, 500, 0));
     /* another state than the bank's own never waives, whatever stands: an adopt (even of a prompt end, whose copy
      * the adopter keeps), a disk chain, a spill restore */
     TEST_ASSERT(!WAIVE(KV_PICK_ADOPT, 420, 0) && !WAIVE(KV_PICK_DISK, 420, 0) && !WAIVE(KV_PICK_SPILLED, 420, 0));
     /* the bank's history falls below the prompt end (a rewind, a restore of a lower checkpoint): the cut */
-    pulsar_ckpt_frontier_lowered(st, 0, 419);
-    TEST_ASSERT(pulsar_ckpt_end(st, 0) == 0u && !WAIVE(KV_PICK_OWN, 420, 0));
+    pulsar_ckpt_frontier_lowered(st, BankId{0}, TokCount{419});
+    TEST_ASSERT(pulsar_ckpt_end(st, BankId{0}).is_none() && !WAIVE(KV_PICK_OWN, 420, 0));
     /* the bank is invalidated, evicted or given to another conversation (its checkpoints and records dropped) */
-    TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_END, 420, toks, lg, 4, NULL) && WAIVE(KV_PICK_OWN, 420, 0));
-    pulsar_ckpt_drop_bank(st, 0);
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{0}, PULSAR_CKPT_REC_END, TokPos{420}, toks, lg, 4, NULL) &&
+                WAIVE(KV_PICK_OWN, 420, 0));
+    pulsar_ckpt_drop_bank(st, BankId{0});
     TEST_ASSERT(!WAIVE(KV_PICK_OWN, 420, 0) && !WAIVE(KV_PICK_LIVE, 600, 0));
     pulsar_ckpt_release(st);
     free(st);
@@ -6257,7 +6319,7 @@ static void test_lane_cost_fit(void) {
 /* L281: the core image identity (image_identity.cpp) over DeepSeek's sentinel geometry -- records per block, a
  * rewind keeps the survivors, a chain persists past a block only with its record, -1 for a malformed block. */
 static bool test_ds_sentinel(const pulsar_engine *, int32_t id) { return id >= (int32_t)PULSAR_N_VOCAB; }
-static bool test_ds_extent(const pulsar_engine *, const int32_t *ids, int n, int start, int *len) {
+static bool test_ds_extent(const pulsar_engine *, const TokId *ids, int n, int start, int *len) {
     return vision_span_extent(ids, n, (int)PULSAR_N_VOCAB, start, len) != 0;
 }
 /* L268: multi-axis rope positions (pulsar_image_rope3, the core's, for any family whose image blocks have a 2D grid)
@@ -6304,7 +6366,8 @@ static void test_lib_image_identity(void) {
     const int PAD = V + PULSAR_VISION_ROLE_IMAGE_PAD, START = V + PULSAR_VISION_ROLE_IMAGE_START,
               END = V + PULSAR_VISION_ROLE_IMAGE_END;
     /* text, block A [3,8), text, block B [9,12), text */
-    int ids[] = {5, 6, 7, PAD, START, 9, 9, END, 10, START, 9, END, 11, 12};
+    TokId ids[] = {TokId{5}, TokId{6}, TokId{7}, TokId{PAD}, TokId{START}, TokId{9}, TokId{9}, TokId{END}, TokId{10},
+        TokId{START}, TokId{9}, TokId{END}, TokId{11}, TokId{12}};
     const int n = 14;
     uint8_t a_bytes[] = {1, 2, 3}, b_bytes[] = {4, 5, 6}, c_bytes[] = {7, 8, 9};
     pulsar_image_ref imgs[2] = {{a_bytes, sizeof a_bytes, 3}, {b_bytes, sizeof b_bytes, 9}};
@@ -6330,12 +6393,12 @@ static void test_lib_image_identity(void) {
     TEST_ASSERT(pulsar_image_persist_end(&v, NULL, ids, n, &upto8) == 9);
     none.n = 0;
     TEST_ASSERT(pulsar_image_persist_end(&v, NULL, ids, n, &none) == 3);
-    int text_only[] = {5, 6, 7, 8};
+    TokId text_only[] = {TokId{5}, TokId{6}, TokId{7}, TokId{8}};
     TEST_ASSERT(pulsar_image_persist_end(&v, NULL, text_only, 4, &none) == 4);
-    int unterminated[] = {5, 6, START, 9, 9};
+    TokId unterminated[] = {TokId{5}, TokId{6}, TokId{START}, TokId{9}, TokId{9}};
     TEST_ASSERT(pulsar_image_persist_end(&v, NULL, unterminated, 5, &none) == -1);
     /* a family with no image geometry: no id is a sentinel (Qwen's ids above DeepSeek's vocab are text) */
-    int qwen_like[] = {248046, 5, 248044};
+    TokId qwen_like[] = {TokId{248046}, TokId{5}, TokId{248044}};
     TEST_ASSERT(pulsar_image_persist_end(NULL, NULL, qwen_like, 3, &none) == 3);
     /* L335: a span's blocks are one run of the records (a segment writes them from the first), checked */
     uint32_t first = 9, nb = 9;
@@ -6367,7 +6430,7 @@ static void test_lib_image_identity(void) {
     TEST_ASSERT(!pulsar_image_holds_below(e, NULL, &prompt, imgs, 2, 8));       /* a bank holding no image */
     TEST_ASSERT(pulsar_image_holds_below(e, NULL, &prompt, imgs, 2, 3));
     /* the licence: an extension of a history keeps it only when the held images are the request's */
-    int hist_ids[12];
+    TokId hist_ids[12];
     memcpy(hist_ids, ids, sizeof hist_ids);
     pulsar_tokens hist = {hist_ids, 12, 12};
     pulsar_image_licence lic;
@@ -6377,7 +6440,7 @@ static void test_lib_image_identity(void) {
     TEST_ASSERT(lic.extends_live && !lic.keep);
     pulsar_image_licence_decide(e, &hist, NULL, &prompt, imgs, 2, &lic);
     TEST_ASSERT(lic.extends_live && !lic.keep);
-    hist_ids[1] = 42;                  /* the history parts from the prompt: no extension to license */
+    hist_ids[1] = TokId{42};                  /* the history parts from the prompt: no extension to license */
     pulsar_image_licence_decide(e, &hist, &all, &prompt, imgs, 2, &lic);
     TEST_ASSERT(!lic.extends_live && lic.common == 1);
     pulsar_image_licence_decide(e, NULL, &all, &prompt, imgs, 2, &lic);   /* no valid history */
@@ -6486,6 +6549,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--fused-sched", "fused-sched", "the round selection simulated on L304's logged costs: L304's and L277's cases, the stall, no prompt, the cold fit (L312)", test_fused_sched},
     {"--read-ahead", "read-ahead", "the next-chunk PLE read-ahead: its rule (one chunk ahead, each row once, a changed prompt drops), the pool's background class (bytes unchanged, below every gather, cancel, accounting) (L329 b2)", test_read_ahead},
     {"--driver-scratch", "driver-scratch", "a driver family past PULSAR_DRIVER_SCRATCH_MAX scratch arenas is refused at the session's create, never capped (L335)", test_driver_scratch_cap},
+    {"--driver-head-rows", "driver-head-rows", "the step's head list and its crossings: a span heads consecutive rows, a verify's head row is its step row by name, a run maps rows to positions (L334 P2b S7b)", test_driver_head_rows},
     {"--driver-context-bound", "driver-context-bound", "the driver's one context bound: a decode, eval or verify row at or past the pool's capacity is refused before the family's trunk (L375)", test_driver_context_bound},
     {"--spec-env", "spec-env", "PULSAR_SPEC_DEPTH / PULSAR_SPEC_TAU: one parse, an unparsable value refused by name at the open (L375)", test_spec_env},
     {"--st-integers", "st-integers", "the safetensors header's integers are exact: a fractional or past-2^53 shape is refused (L335)", test_st_exact_integers},

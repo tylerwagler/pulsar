@@ -126,6 +126,27 @@ struct out_grammar {
     const char *reasoning_prefix = nullptr;
 };
 
+struct pyjson_value;
+
+/** The type a request's tools declare for parameter `key` of function `fn`: the ONE schema reading every
+ * call body that types a value by its declaration shares (Qwen's and Nemotron's XML parameters, Gemma's bare
+ * values).  "string" when the declared type is or includes string, "other" for any other declaration, NULL
+ * when the tool or the property is not declared.
+ *
+ * The declaration is the property's `type` (a name, or a list of names) when it has one -- and then only
+ * that.  Without a `type` (L386), the property's union and reference keywords are read: `anyOf` / `oneOf`
+ * include string when any branch does (pydantic's `Optional[str]` is `{"anyOf": [{"type": "string"},
+ * {"type": "null"}]}`), an `allOf` of exactly one branch is that branch, a `$ref` to `#/$defs/NAME` or
+ * `#/definitions/NAME` is that member of the function's `parameters` object (no other reference is
+ * followed; a reference back into its own chain is a cycle and declares nothing), and an `enum` whose
+ * values are all strings or a string `const` is a string.  A property with none of these is "other". */
+/// @param tools the request's tools array (OpenAI shape: each `{"type": "function", "function": {...}}`,
+///              or the function object itself)
+/// @param fn    a function name
+/// @param key   one of its parameters
+/// @return "string", "other", or NULL (the tool or the property is not declared)
+const char *out_tool_param_type(const pyjson_value &tools, const std::string &fn, const std::string &key);
+
 /** The reader of a call's body: the bytes between the marker that opened the call and the marker that
  * closes it.  The kit owns the call's index, the events' order and the call list; the reader owns the
  * body's syntax. */
@@ -328,3 +349,42 @@ private:
     /// The well-formed calls read so far.
     std::vector<out_call> calls_;
 };
+
+/* ---- L295 F8 step 2: the output parser of a chat format, registered by the family's own frontend file ----------
+ * Code that holds only a chat format (the agent: pulsar_engine_chat_format) builds that family's parser here instead
+ * of switching on family names.  Each family's frontend file declares ONE record with OUT_PARSER_FAMILY (a static
+ * record linked at load by a constructor, as pulsar_gpu.h's arch records are: no allocation, no destructor -- rule
+ * 11).  A family whose parser exists but is not offered (parked) registers a refusal with OUT_PARSER_FAMILY_REFUSED. */
+
+/** Build and init a family's output parser for one turn: NULL + `err` when the request's tools are refused. */
+typedef out_parser *(*out_parser_make_fn)(bool thinking, const char *tools_json, char *err, size_t errlen);
+
+/** One chat format's parser registration. */
+struct out_parser_family {
+    int chat_format;            ///< the pulsar_chat_format it reads (pulsar.h)
+    out_parser_make_fn make;    ///< builds the parser; NULL when refused
+    const char *refusal;        ///< why it is not offered (a parked family), or NULL
+    out_parser_family *next;    ///< the registry's list
+};
+
+/** Link a record into the registry (OUT_PARSER_FAMILY's constructor calls it). */
+/// @param f the record (static storage)
+void out_parser_family_register(out_parser_family *f);
+
+/** The registration of `chat_format`, or NULL when no family registered one. */
+/// @param chat_format a pulsar_chat_format value
+/// @return the record, or NULL
+const out_parser_family *out_parser_family_find(int chat_format);
+
+/** Declare this file's family parser: `make` builds it for `chat_format`. */
+#define OUT_PARSER_FAMILY(chat_format, make) OUT_PARSER_FAMILY_REC_(chat_format, make, NULL)
+/** Declare that `chat_format`'s parser is not offered, saying why. */
+#define OUT_PARSER_FAMILY_REFUSED(chat_format, why) OUT_PARSER_FAMILY_REC_(chat_format, NULL, why)
+/// The record and its constructor (one per file).
+#define OUT_PARSER_FAMILY_REC_(chat_format, make, why)                                                              \
+    namespace {                                                                                                     \
+    out_parser_family out_parser_family_rec_ = {(int)(chat_format), (make), (why), nullptr};                        \
+    __attribute__((constructor)) void out_parser_family_register_(void) {                                           \
+        out_parser_family_register(&out_parser_family_rec_);                                                        \
+    }                                                                                                               \
+    }

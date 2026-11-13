@@ -17,7 +17,7 @@
  *
  * Model-free except E.  Usage: router_gate [inkling-router.bin] */
 #include "pulsar_gpu.h"
-#include "pulsar_cuda_qwen.h"
+#include "pulsar_cuda_rows.h"
 #include "pulsar_cuda_router.h"
 
 #include <cuda_runtime.h>
@@ -257,11 +257,13 @@ static dev_out route(const router_case &rc, const std::vector<float> &lg, const 
         const uint64_t ob = l.bias.empty() ? 0 : map_put(l.bias.data(), (size_t)E * 4);
         const uint64_t ovl = l.alt_bias.empty() ? 0 : map_put(l.alt_bias.data(), (size_t)E * 4);
         const uint64_t oh = l.table.empty() ? 0 : map_put(l.table.data(), l.table.size() * 4);
-        pulsar_gpu_tensor *tl = pulsar_gpu_tensor_alloc((uint64_t)T * E * 4), *ts = pulsar_gpu_tensor_alloc((uint64_t)T * K * 4),
-                          *tw = pulsar_gpu_tensor_alloc((uint64_t)T * K * 4), *tp = pulsar_gpu_tensor_alloc((uint64_t)T * E * 4),
-                          *tt = pulsar_gpu_tensor_alloc((uint64_t)T * 4);
-        pulsar_gpu_tensor_write(tl, 0, lg.data(), (uint64_t)T * E * 4);
-        pulsar_gpu_tensor_write(tt, 0, tok.data(), (uint64_t)T * 4);
+        pulsar_gpu_tensor *tl = pulsar_gpu_tensor_alloc(bytes_of<float>((uint64_t)T * E)),
+                          *ts = pulsar_gpu_tensor_alloc(bytes_of<int32_t>((uint64_t)T * K)),
+                          *tw = pulsar_gpu_tensor_alloc(bytes_of<float>((uint64_t)T * K)),
+                          *tp = pulsar_gpu_tensor_alloc(bytes_of<float>((uint64_t)T * E)),
+                          *tt = pulsar_gpu_tensor_alloc(bytes_of<int32_t>(T));
+        pulsar_gpu_tensor_write(tl, TensorBytes{0}, lg.data(), bytes_of<float>((uint64_t)T * E));
+        pulsar_gpu_tensor_write(tt, TensorBytes{0}, tok.data(), bytes_of<int32_t>(T));
         const int ok = pulsar_gpu_router_select_batch_tensor(ts, tw, tp, g_map.data(), g_map.size(), ob, !l.bias.empty(),
                                                              oh, l.table.empty() ? 0 : (uint32_t)l.table_rows, tl, tt,
                                                              (uint32_t)E, (uint32_t)K, c.route_scale, (uint32_t)T, ovl,
@@ -269,9 +271,9 @@ static dev_out route(const router_case &rc, const std::vector<float> &lg, const 
         o.rc = ok ? 0 : -1;
         o.sel.resize((size_t)T * K); o.w.resize((size_t)T * K); o.probs.resize((size_t)T * E);
         CK(cudaDeviceSynchronize());
-        pulsar_gpu_tensor_read(ts, 0, o.sel.data(), o.sel.size() * 4);
-        pulsar_gpu_tensor_read(tw, 0, o.w.data(), o.w.size() * 4);
-        pulsar_gpu_tensor_read(tp, 0, o.probs.data(), o.probs.size() * 4);
+        pulsar_gpu_tensor_read(ts, TensorBytes{0}, o.sel.data(), bytes_of<int32_t>(o.sel.size()));
+        pulsar_gpu_tensor_read(tw, TensorBytes{0}, o.w.data(), bytes_of<float>(o.w.size()));
+        pulsar_gpu_tensor_read(tp, TensorBytes{0}, o.probs.data(), bytes_of<float>(o.probs.size()));
         pulsar_gpu_tensor_free(tl); pulsar_gpu_tensor_free(ts); pulsar_gpu_tensor_free(tw);
         pulsar_gpu_tensor_free(tp); pulsar_gpu_tensor_free(tt);
         return o;

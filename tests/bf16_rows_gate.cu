@@ -35,7 +35,7 @@
  * usage: ./tests/bf16_rows_gate
  */
 #include "cuda/pulsar_cuda_bf16_rows.cuh"
-#include "cuda/pulsar_cuda_qwen.h"
+#include "cuda/pulsar_cuda_rows.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>

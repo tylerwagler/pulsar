@@ -1110,7 +1110,7 @@ void agent_publish_untrusted(agent_worker *w, const char *s, size_t n);
 /** printf-style agent_publish.
  *  @param w   the worker
  *  @param fmt printf format, then its arguments */
-void agent_publishf(agent_worker *w, const char *fmt, ...);
+void agent_publishf(agent_worker *w, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 /** Set the worker's state (clearing prefill_tps outside PREFILL and greedy_sampling outside GENERATING) and
  *  wake the UI.  Takes w->mu.
  *  @param w     the worker
@@ -1124,7 +1124,7 @@ void agent_set_error(agent_worker *w, const char *msg);
 /** Append one timestamped line to the trace file (no-op without one).  Takes w->mu.
  *  @param w   the worker
  *  @param fmt printf format, then its arguments */
-void agent_trace(agent_worker *w, const char *fmt, ...);
+void agent_trace(agent_worker *w, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 /** Trace one token: its index, id, escaped text and hex bytes.  No-op without a trace file; takes w->mu.
  *  @param w        the worker
  *  @param token    the token id
@@ -1267,9 +1267,9 @@ bool agent_on_worker_thread(agent_worker *w);
  *  once a second itself.
  *  @param ud      the agent_worker
  *  @param event   the event name
- *  @param current tokens processed so far (absolute position)
+ *  @param current the position the prefill stands at (absolute)
  *  @param total   the prompt's tokens (absolute): the bar ends at total - progress_base */
-void worker_progress_cb(void *ud, const char *event, int current, int total);
+void worker_progress_cb(void *ud, const char *event, TokPos current, TokCount total);
 /** Whether an interrupt or stop is pending.  Takes w->mu.
  *  @param w the worker
  *  @return true to abandon the current operation */
@@ -1409,7 +1409,7 @@ void agent_turn_add_tool(agent_worker *w, const char *name, const char *content)
  *  @param v     the tokens
  *  @param n     their count
  *  @return true when the last turn is an assistant turn left open */
-bool agent_tokens_turn_open(const pulsar_turn_markers *m, const int *end, int n_end, const int *v, int n);
+bool agent_tokens_turn_open(const pulsar_turn_markers *m, const TokId *end, int n_end, const TokId *v, int n);
 /** L373: whether the transcript ends inside an open assistant turn (agent_tokens_turn_open with the loaded family's
  *  markers).  The transcript is the ONE authority: a turn that made calls where calls continue the turn (Gemma, L365),
  *  or one an error left unclosed, reads the same live, after /new, a session switch or a reload.
@@ -1863,7 +1863,7 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
  *  @param target the first index the tail may start at
  *  @param bottom the tail's end (exclusive)
  *  @return the tail's start, or `bottom` (no tail) when the window holds no user turn marker */
-int agent_compact_tail_cut(const pulsar_turn_markers *m, const int *v, int target, int bottom);
+int agent_compact_tail_cut(const pulsar_turn_markers *m, const TokId *v, int target, int bottom);
 /** agent_worker_compact when the transcript passes AGENT_COMPACT_SOFT_PERCENT or leaves too few tokens free.
  *  @param w       the worker
  *  @param reason  why, for the status line

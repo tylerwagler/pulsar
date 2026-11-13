@@ -39,8 +39,8 @@ void trace_cache_capture(
     if (d->count > TRACE_CACHE_WINDOW) d->count = TRACE_CACHE_WINDOW;
     for (int i = 0; i < d->count; i++) {
         int pos = start + i;
-        d->live_id[i] = live && pos < live->len ? live->v[pos] : -1;
-        d->prompt_id[i] = prompt && pos < prompt->len ? prompt->v[pos] : -1;
+        d->live_id[i] = live && pos < live->len ? live->v[pos].raw() : -1;   /* the trace's JSON ints */
+        d->prompt_id[i] = prompt && pos < prompt->len ? prompt->v[pos].raw() : -1;
     }
 }
 
@@ -100,7 +100,7 @@ static void trace_write_token(FILE *fp, pulsar_engine *engine, int token) {
         return;
     }
     size_t len = 0;
-    char *piece = pulsar_token_text(engine, token, &len);
+    char *piece = pulsar_token_text(engine, TokId{token}, &len);
     fprintf(fp, "%d ", token);
     trace_write_escaped_bytes(fp, piece, len);
     free(piece);

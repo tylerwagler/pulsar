@@ -8,7 +8,7 @@ session core (`src/engine/family.h`; the registry is `k_families` in
 | Family (`general.architecture`) | Models | Module |
 | --- | --- | --- |
 | `deepseek4` | DeepSeek V4 Flash (0731 / Vision-Exp) and V4.1 | `src/engine/family_deepseek.cpp` + the DeepSeek forward |
-| `qwen4_exp` | Qwen3.8-Flash-Next | `src/engine/family_qwen*.cpp` |
+| `qwen4_exp` | Qwen3.8-Flash-Next | `src/families/qwen/family_qwen*.cpp` |
 | `inkling` | Inkling | `src/families/inkling/` |
 | `nemotron_h` | Nemotron-3.5 Super | `src/families/nemotron_h/` |
 | `nemotron_enc` | Nemotron-3.5 Embed-8B / Rerank-8B (encoders) | `src/families/nemotron_enc/` |
@@ -36,7 +36,7 @@ GPU path calls — it is not dead CPU-backend code.
   must be fully resident: a checkpoint that does not fit is rejected at load,
   never partially streamed. The exceptions are tables a format declares
   disk-resident and reads by row on purpose: Qwen's PLE n-gram row file
-  (opened in `src/engine/family_qwen_s4.cpp`, the next prompt chunk's rows
+  (opened in `src/families/qwen/family_qwen_s4.cpp`, the next prompt chunk's rows
   read ahead, L329b) and DeepSeek V4.1's Engram table (L242). Such tables
   must sit on local NVMe.
 - Preserve correctness before speed. Do not keep a faster path with

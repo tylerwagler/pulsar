@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate src/engine/qwen_draft_vocab.inc: the Qwen MTP draft head's frequency-ranked ids beyond the 64 Ki prefix.
+"""Generate src/families/qwen/qwen_draft_vocab.inc: the Qwen MTP draft head's frequency-ranked ids beyond the 64 Ki prefix.
 
 The draft head (family_qwen.cpp qwen_draft_vocab, L251 / L288) scores a subset of the vocabulary: every id below 65,536, the added /
 special ids, and -- from this list -- the most frequent ids above the prefix.  Drafts are proposals the target
@@ -19,7 +19,7 @@ separator) under the tokenizer: the engine recomputes it from the checkpoint's t
 mismatch (a list made for another tokenizer would rank the wrong tokens).
 
   U=~/Projects/AI/upstream
-  python3 tools/qwen/draft_vocab.py TOKENIZER_JSON src/engine/qwen_draft_vocab.inc --default 16384 --max 32768 \
+  python3 tools/qwen/draft_vocab.py TOKENIZER_JSON src/families/qwen/qwen_draft_vocab.inc --default 16384 --max 32768 \
       '/usr/lib/python3.13/**/*.py' "$U/**/*.md" "$U/**/*.py" "$U/**/*.cpp" "$U/**/*.h" "$U/**/*.rs" "$U/**/*.ts" \
       "$U/**/*.js" "$U/**/*.sh" "$U/**/*.c" "$U/**/*.cu" 'GUTENBERG_DIR/*.txt'
   (Gutenberg ebook ids 1342 84 1661 98 11 345 174 2600 1400 768 1260 5200 4300 76 1952 16328 205 3207 1497 2554

@@ -62,8 +62,8 @@ static void run(pulsar_engine *e, int NB, float temp, int rounds_max, bool repor
         pulsar_tokens p;
         memset(&p, 0, sizeof p);
         pulsar_tokenize_text(e, prompts[b % 4], &p);
-        ok = pulsar_session_bank_state_restore(s, (uint32_t)b) && pulsar_session_sync(s, &p, err, sizeof(err)) == 0;
-        if (ok) pulsar_session_bank_state_save(s, (uint32_t)b);
+        ok = pulsar_session_bank_state_restore(s, BankId{b}) && pulsar_session_sync(s, &p, err, sizeof(err)) == 0;
+        if (ok) pulsar_session_bank_state_save(s, BankId{b});
         pulsar_tokens_free(&p);
     }
     CHECK(ok, "%d bank(s) prefilled: %s", NB, err);
@@ -72,7 +72,7 @@ static void run(pulsar_engine *e, int NB, float temp, int rounds_max, bool repor
     for (int b = 0; b < NB; b++) { rd[b] = pulsar_spec_round_new(); rngs[b] = 0x1302u + (uint64_t)b; }
     const uint32_t width = pulsar_engine_fused_heads_max(e);
     std::vector<pulsar_multiseq_req> reqs(width);
-    static int acc[32][PULSAR_SPEC_LOGITS_ROWS + 1];
+    static TokId acc[32][PULSAR_SPEC_LOGITS_ROWS + 1];
     uint64_t sum[PH_COUNT] = {}, worst[PH_COUNT] = {}, d2h_bytes = 0;
     int rounds = 0, rows_total = 0;
     std::vector<bool> done(NB, false);   /* a bank whose stream ended (its base token is EOS, or the context) */
@@ -83,7 +83,7 @@ static void run(pulsar_engine *e, int NB, float temp, int rounds_max, bool repor
         for (int b = 0; b < NB; b++) {
             if (done[b]) continue;
             memset(&st[m], 0, sizeof st[m]);
-            st[m].bank = (uint32_t)b;
+            st[m].bank = BankId{b};
             st[m].round = rd[b];
             st[m].temperature = temp;
             st[m].top_p = 1.0f;
@@ -104,7 +104,7 @@ static void run(pulsar_engine *e, int NB, float temp, int rounds_max, bool repor
         for (int i = 0; i < m; i++) {
             if (st[i].status == PULSAR_SPEC_STEP_OK) { st[live] = st[i]; bank_of[live++] = bank_of[i]; }
             else if (st[i].status == PULSAR_SPEC_STEP_EOS || st[i].status == PULSAR_SPEC_STEP_LENGTH) done[bank_of[i]] = true;
-            else if (!why[0]) snprintf(why, sizeof why, "bank %u status %d: %.150s", st[i].bank, (int)st[i].status, st[i].err);
+            else if (!why[0]) snprintf(why, sizeof why, "bank %d status %d: %.150s", st[i].bank.raw(), (int)st[i].status, st[i].err);
         }
         m = live;
         if (m == 0 && !why[0]) break;   /* every bank's stream ended: the rounds measured so far stand */
@@ -128,13 +128,14 @@ static void run(pulsar_engine *e, int NB, float temp, int rounds_max, bool repor
         pulsar_gpu_sync_stats_get(&c3);
         for (int i = 0; ok && i < m; i++) {
             ok = st[i].status == PULSAR_SPEC_STEP_OK;
-            if (!ok) snprintf(err, sizeof err, "round_end bank %u: %s", st[i].bank, st[i].err);
+            if (!ok) snprintf(err, sizeof err, "round_end bank %d: %s", st[i].bank.raw(), st[i].err);
         }
         if (!ok) break;
         pulsar_spec_round *rr[32];
         uint64_t *rp[32];
-        for (int i = 0; i < m; i++) { rr[i] = rd[bank_of[i]]; rp[i] = &rngs[bank_of[i]]; }
-        ok = pulsar_session_spec_redraft_batch(s, rr, bank_of, rp, m, err, sizeof(err)) == 0 &&
+        BankId rb[32];
+        for (int i = 0; i < m; i++) { rr[i] = rd[bank_of[i]]; rp[i] = &rngs[bank_of[i]]; rb[i] = BankId{bank_of[i]}; }
+        ok = pulsar_session_spec_redraft_batch(s, rr, rb, rp, m, err, sizeof(err)) == 0 &&
              pulsar_session_spec_redraft_commit_batch(s, st, m) == 0;
         pulsar_gpu_sync_stats_get(&c4);
         if (tick < 2) continue;   /* the first rounds warm the lane (graph captures, prime) */

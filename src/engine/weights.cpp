@@ -809,7 +809,13 @@ static uint32_t model_read_u32_array(const pulsar_model *m, const char *key, uin
 static void validate_attention_layout_metadata(const pulsar_model *m) {
     uint32_t ratios[PULSAR_MAX_LAYER];
     const uint32_t n_ratio = model_read_u32_array(m, "deepseek4.attention.compress_ratios", ratios, PULSAR_MAX_LAYER);
-    if (n_ratio < PULSAR_N_LAYER) pulsar_die("deepseek4.attention.compress_ratios is shorter than the layer count");
+    if (n_ratio == 0) return;   /* L335: the read said why and counted the refusal -- one message, the load stops */
+    if (n_ratio < PULSAR_N_LAYER) {
+        fprintf(stderr, "pulsar: deepseek4.attention.compress_ratios has %u entries, the model has %u layers -- refusing\n",
+                n_ratio, (unsigned)PULSAR_N_LAYER);
+        pulsar_load_refuse();
+        return;
+    }
 
     const pulsar_shape *sh = &g_pulsar_shape;
     pulsar_array_ref probe;
@@ -852,7 +858,7 @@ static void validate_attention_layout_metadata(const pulsar_model *m) {
         pulsar_load_refuse();
         return;
     }
-    pulsar_attn_layout_install(ratios, kv_sources, n_kv, index_sources, n_index, candidate);
+    (void)pulsar_attn_layout_install(ratios, kv_sources, n_kv, index_sources, n_index, candidate);   /* a refusal is counted */
 }
 
 

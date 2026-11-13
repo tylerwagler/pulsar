@@ -117,7 +117,7 @@ int GATE_ENTRY(int argc, char **argv) {
             pulsar_tokens p = toks; p.len = start;
             if (pulsar_session_sync(s, &p, err, sizeof err) != 0) { fprintf(stderr, "sync: %s\n", err); goto done; }
         }
-        pulsar_session_bank_state_save(s, 0u);
+        pulsar_session_bank_state_save(s, BankId{0});
         /* the stream the drafts read: a forced end draws nothing and leaves it alone, so the probe steps it past
          * each round's committed tokens itself, as a production round end does */
         uint64_t rng = 0x5eed1182ull;
@@ -128,43 +128,46 @@ int GATE_ENTRY(int argc, char **argv) {
         int pos = start;   /* committed prefix length; toks.v[pos] is the next true token */
         while (n_meas < n_pos) {
             if (pos + 20 > ctx) { fprintf(stderr, "context exhausted at pos %d after %d measured positions\n", pos, n_meas); break; }
-            if (!pulsar_session_bank_state_restore(s, bank0)) { fprintf(stderr, "bank restore failed\n"); goto done; }
+            if (!pulsar_session_bank_state_restore(s, BankId{bank0})) { fprintf(stderr,
+                                                                                "bank restore failed\n"); goto done; }
             /* the draft for the token at pos+1, drafted by the previous forced end (none before the first round);
              * harvest first: the chain may still be in flight */
             pulsar_session_spec_chain_harvest(s);
             const bool have_q = s->spec.n_pend > 0u;
-            const int draft0 = have_q ? (int)s->spec.pend[0] : -1;
+            const int draft0 = have_q ? s->spec.pend[0].raw() : -1;
             if (!have_q && n_rounds >= 3 && n_meas == 0) {
                 /* the first round has nothing pending by construction; from
                  * the second on a missing draft is a broken redraft, not data */
                 fprintf(stderr, "no pending draft after %d rounds (bank depth %d, quenched %d) -- the redraft is not producing\n",
-                        n_rounds, pulsar_session_bank_spec_depth(s, 0u), (int)s->spec.spec_quenched);
+                        n_rounds, pulsar_session_bank_spec_depth(s, BankId{0}), (int)s->spec.spec_quenched);
                 goto done;
             }
             int first;
             if (n_rounds == 0) {
-                first = toks.v[pos];
+                first = toks.v[pos].raw();
             } else {
-                first = pulsar_session_spec_next_base(s, temperature, top_k, top_p, min_p, rngp);
-                if (first != toks.v[pos]) {
-                    fprintf(stderr, "forced carry lost: next_base=%d truth=%d at pos %d\n", first, toks.v[pos], pos);
+                first = pulsar_session_spec_next_base(s, temperature, top_k, top_p, min_p, rngp).raw();
+                if (first != toks.v[pos].raw()) {
+                    fprintf(stderr, "forced carry lost: next_base=%d truth=%d at pos %d\n", first, toks.v[pos].raw(),
+                            pos);
                     goto done;
                 }
             }
-            if (pulsar_session_spec_round_begin(s, r, first, 17, 17, temperature, top_k, top_p, min_p, err, sizeof err) != 0) {
+            if (pulsar_session_spec_round_begin(s, r, TokId{first}, 17, 17, temperature, top_k, top_p, min_p, err,
+                                                sizeof err) != 0) {
                 fprintf(stderr, "round_begin at %d: %s\n", pos, err);
                 goto done;
             }
             pulsar_multiseq_req reqs[17];
-            const uint32_t rows = pulsar_spec_round_fill_reqs(r, bank0, reqs);
-            pulsar_session_bank_state_save(s, bank0);
+            const uint32_t rows = pulsar_spec_round_fill_reqs(r, BankId{bank0}, reqs);
+            pulsar_session_bank_state_save(s, BankId{bank0});
             pulsar_session_spec_arm_capture(s, rows);
             uint32_t out_rows = 0;
             const int drc = pulsar_session_decode_mixed(s, reqs, rows, logits, (int)(rows * (uint32_t)width),
                                                         &out_rows, PULSAR_MSEQ_HEAD_ALL_ROWS, err, sizeof err);
             pulsar_session_spec_arm_capture(s, 0u);
             if (drc != 0 || out_rows != rows) {
-                pulsar_session_bank_state_restore(s, bank0);
+                pulsar_session_bank_state_restore(s, BankId{bank0});
                 pulsar_session_spec_round_abort(s, r);
                 fprintf(stderr, "decode_mixed at %d: rc=%d rows=%u/%u %s\n", pos, drc, out_rows, rows, err);
                 goto done;
@@ -178,30 +181,34 @@ int GATE_ENTRY(int argc, char **argv) {
                 const uint32_t row0 = 0;
                 const pulsar_row_draw dp = {temperature, top_k, top_p, min_p, &at, false, NULL};
                 const pulsar_row_draw dm = {temperature, top_k, top_p, min_p, NULL, true, NULL};
-                int tp = -1, tm = -1;
-                if (pulsar_session_draw_rows(s, &row0, &dp, 1, &tp) != 0 || pulsar_session_draw_rows(s, &row0, &dm, 1, &tm) != 0 ||
-                    tp < 0 || tm < 0) {
+                TokId tp_id = TokId::none(), tm_id = TokId::none();
+                const bool drew = pulsar_session_draw_rows(s, &row0, &dp, 1, &tp_id) == 0 &&
+                                  pulsar_session_draw_rows(s, &row0, &dm, 1, &tm_id) == 0;
+                const int tp = tp_id.raw(), tm = tm_id.raw();
+                if (!drew || tp < 0 || tm < 0) {
                     fprintf(stderr, "the target row's draws failed at %d\n", pos);
                     goto done;
                 }
                 accept += tp == draft0;
                 mode_hit += tm == draft0;
-                truth_hit += (draft0 == toks.v[pos + 1]);
+                truth_hit += (draft0 == toks.v[pos + 1].raw());
                 n_meas++;
                 if (n_meas % 250 == 0)
                     printf("  %5d positions: draft==target draw=%.4f  draft==p argmax=%.4f  draft==truth=%.4f\n",
                            n_meas, (double)accept / n_meas, (double)mode_hit / n_meas, (double)truth_hit / n_meas);
             }
             /* forced end: the corpus decides acceptance and the carry */
-            if (!pulsar_session_bank_state_restore(s, bank0)) { fprintf(stderr, "bank restore failed\n"); goto done; }
-            int accepted[17];
-            const int na = pulsar_session_spec_round_end_forced(s, r, first, temperature, top_k, top_p, min_p,
+            if (!pulsar_session_bank_state_restore(s, BankId{bank0})) { fprintf(stderr,
+                                                                                "bank restore failed\n"); goto done; }
+            TokId accepted[17];
+            const int na = pulsar_session_spec_round_end_forced(s, r, TokId{first}, temperature, top_k, top_p, min_p,
                                                                 rngp, 0u, toks.v + pos + 1, accepted, 17,
                                                                 err, sizeof err);
             if (na < 0) { fprintf(stderr, "round_end_forced at %d: %s\n", pos, err); goto done; }
             for (int i = 0; i < na; i++) {
                 if (accepted[i] != toks.v[pos + i]) {
-                    fprintf(stderr, "forced round committed %d at pos %d, truth %d\n", accepted[i], pos + i, toks.v[pos + i]);
+                    fprintf(stderr, "forced round committed %d at pos %d, truth %d\n", accepted[i].raw(), pos + i,
+                            toks.v[pos + i].raw());
                     goto done;
                 }
             }
@@ -215,14 +222,15 @@ int GATE_ENTRY(int argc, char **argv) {
              * the measurement; re-arm it every round, as a request boundary
              * does.  The probe measures the drafter, not the controller. */
             spec_quench_reset(s);
-            pulsar_session_bank_state_save(s, bank0);
-            pulsar_spec_round *rr = r; uint32_t bb = bank0;
+            pulsar_session_bank_state_save(s, BankId{bank0});
+            pulsar_spec_round *rr = r; const BankId bb{bank0};
             if (pulsar_session_spec_redraft_batch(s, &rr, &bb, &rngp, 1, err, sizeof err) != 0) {
                 fprintf(stderr, "redraft at %d: %s\n", pos, err); goto done;
             }
-            if (!pulsar_session_bank_state_restore(s, bank0)) { fprintf(stderr, "bank restore failed\n"); goto done; }
+            if (!pulsar_session_bank_state_restore(s, BankId{bank0})) { fprintf(stderr,
+                                                                                "bank restore failed\n"); goto done; }
             pulsar_session_spec_redraft_commit(s, r);
-            pulsar_session_bank_state_save(s, bank0);
+            pulsar_session_bank_state_save(s, BankId{bank0});
         }
         if (n_meas == 0) { fprintf(stderr, "nothing measured\n"); goto done; }
         printf("TEACHER-FORCED: positions=%d start=%d rounds=%d temp=%.2f top_k=%d top_p=%.2f min_p=%.2f | "

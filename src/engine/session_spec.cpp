@@ -70,13 +70,13 @@ uint32_t pulsar_spec_cur_depth(const pulsar_session *s) {
  * alone (pulsar_spec_keep_picked, L301) at the copy acceptance the engine has measured.  The verify is unchanged, so
  * every emitted token is still the target's.  A backward scan of the history: O(history) a round, no index to keep in
  * step with a history that rewinds and resyncs. */
-uint32_t pulsar_spec_copy_chain(pulsar_session *s, uint32_t bank, int32_t next_base, uint32_t max, int32_t *out) {
+uint32_t pulsar_spec_copy_chain(pulsar_session *s, uint32_t bank, TokId next_base, uint32_t max, TokId *out) {
     const uint32_t m = PULSAR_SPEC_COPY_MATCH;
     const pulsar_tokens *h = pulsar_bank_history(s, bank);
     if (!h || max == 0u || (uint32_t)h->len + 1u < 2u * m) return 0;
-    const int32_t *v = h->v;
+    const TokId *v = h->v;
     const uint32_t L = (uint32_t)h->len + 1u;   /* the history, then next_base at index L - 1 */
-    auto at = [&](uint32_t i) -> int32_t { return i + 1u < L ? v[i] : next_base; };
+    auto at = [&](uint32_t i) -> TokId { return i + 1u < L ? v[i] : next_base; };
     const uint32_t need = max < m ? max : m;
     uint32_t best = 0, best_at = 0;
     /* an earlier copy starts at i <= L - m - 1 (L - m is the tail itself); latest first */
@@ -145,11 +145,11 @@ void pulsar_spec_copy_age(pulsar_spec_carry_state *sp, uint32_t tokens) {
     sp->copy_unseen = sp->copy_unseen > UINT32_MAX - tokens ? UINT32_MAX : sp->copy_unseen + tokens;
 }
 
-void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, int next_base, float temperature, int top_k,
+void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, TokId next_base, float temperature, int top_k,
                                 float top_p, float min_p) {
     q->valid = true;
     q->done = false;
-    q->next_base = (int32_t)next_base;
+    q->next_base = next_base;
     q->n_draft = pulsar_spec_cur_depth(s);
     q->temperature = temperature;
     q->top_k = top_k;
@@ -172,8 +172,8 @@ void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, int next
     bool reprobe = false;
     const uint32_t admit = pulsar_spec_copy_price(&s->spec, pulsar_spec_tau(s->engine), cap, q->conf, &reprobe);
     if (admit == 0u) return;   /* before the history scan: a quenched request pays nothing for it */
-    int32_t cp[16];
-    const uint32_t n_cp = pulsar_spec_copy_chain(s, pulsar_session_live_bank(s), next_base, cap, cp);
+    TokId cp[16];
+    const uint32_t n_cp = pulsar_spec_copy_chain(s, pulsar_bank_index(pulsar_session_live_bank(s)), next_base, cap, cp);
     if (n_cp == 0) return;
     q->keep = n_cp < admit ? n_cp : admit;
     q->refined[0] = q->next_base;
@@ -229,10 +229,11 @@ static void spec_round_undo(pulsar_session *s, pulsar_spec_round *r) {
 /// @param row the committed verify row
 /// @param next the token after it
 /// @return false when seed_defer is full (PULSAR_SPEC_LOGITS_ROWS + 1 rows)
-static bool spec_absorb_defer(pulsar_session *s, uint32_t row, int32_t next) {
+static bool spec_absorb_defer(pulsar_session *s, uint32_t row, TokId next) {
     if (s->seed_defer.n >= PULSAR_SPEC_LOGITS_ROWS + 1) return false;
     s->seed_defer.src_row[s->seed_defer.n] = row;
-    s->seed_defer.bank[s->seed_defer.n] = pulsar_session_live_bank(s);
+    /* fatal on none() */
+    s->seed_defer.bank[s->seed_defer.n] = BankId{pulsar_bank_index(pulsar_session_live_bank(s))};
     s->seed_defer.next_tok[s->seed_defer.n] = next;
     s->seed_defer.n++;
     return true;
@@ -246,18 +247,19 @@ static bool spec_absorb_defer(pulsar_session *s, uint32_t row, int32_t next) {
 /// @param next [n] the token after each row
 /// @param n rows
 /// @return false = the drafter refused (or seed_defer is full)
-static bool spec_absorb_rows(pulsar_session *s, uint32_t row0, const int32_t *next, uint32_t n) {
+static bool spec_absorb_rows(pulsar_session *s, uint32_t row0, const TokId *next, uint32_t n) {
     bool ok = true;
     if (s->seed_defer.active) {
         for (uint32_t m = 0; ok && m < n; m++) ok = spec_absorb_defer(s, row0 + m, next[m]);
         return ok;
     }
     if (spec_drafter(s)->absorb) {
-        for (uint32_t m = 0; ok && m < n; m++) ok = spec_drafter(s)->absorb(s, row0 + m, next[m]);
+        for (uint32_t m = 0; ok && m < n; m++) ok = spec_drafter(s)->absorb(s, row0 + m, next[m].raw());
         return ok;
     }
-    uint32_t rows[PULSAR_SPEC_LOGITS_ROWS + 1], banks[PULSAR_SPEC_LOGITS_ROWS + 1];
-    const uint32_t bank = pulsar_session_live_bank(s);
+    uint32_t rows[PULSAR_SPEC_LOGITS_ROWS + 1];
+    BankId banks[PULSAR_SPEC_LOGITS_ROWS + 1];
+    const BankId bank = BankId{pulsar_bank_index(pulsar_session_live_bank(s))};   /* fatal on none() */
     for (uint32_t m = 0; m < n; m++) { rows[m] = row0 + m; banks[m] = bank; }
     return spec_drafter(s)->absorb_banked(s, rows, banks, next, n);
 }
@@ -566,11 +568,11 @@ static bool spec_walk_rounds(pulsar_session *s, const spec_walk_round *w, uint32
             q.min_p = w[i].min_p;
             q.key = pulsar_sample_key(w[i].rng, j + 1u);   /* row j draws the token j + 1 places past the base */
             q.flags = greedy ? PULSAR_GPU_SAMPLE_GREEDY : 0u;
-            q.probe = j < r->K ? r->pend[j] : -1;
+            q.probe = j < r->K ? r->pend[j].raw() : -1;   /* the device sampler's int32 */
             rows[m] = w[i].row0 + j;
             masks[m] = w[i].masks && j < w[i].mask_rows ? w[i].masks + (size_t)j * words : NULL;
             if (j < r->K) {
-                run.pend[j] = r->pend[j];
+                run.pend[j] = r->pend[j].raw();   /* the device walk's int32 */
                 run.greedy_rows |= greedy ? 1u << j : 0u;
             }
             m++;
@@ -579,7 +581,7 @@ static bool spec_walk_rounds(pulsar_session *s, const spec_walk_round *w, uint32
     const uint64_t walk_off = (uint64_t)PULSAR_GPU_SAMPLE_ROWS_MAX * sizeof(pulsar_gpu_sample_out);
     if (!s->draw_rows_dev(s->dev.step_rows, rows, m, reqs, masks) ||
         !pulsar_gpu_spec_walk(s->dev.out, 0, m, runs, n, s->dev.out, walk_off) ||
-        !pulsar_gpu_tensor_read(s->dev.out, walk_off, out, (uint64_t)n * sizeof(*out))) {
+        !pulsar_gpu_tensor_read(s->dev.out, TensorBytes{walk_off}, out, TensorBytes{sizeof(*out)}.times(n))) {
         snprintf(err, errlen, "spec walk: the device sampler failed over %u rows", m);
         return false;
     }
@@ -644,12 +646,12 @@ static int spec_round_begin(pulsar_session *s, int first_token,
         void *snap = r->snap;
         memset(r, 0, sizeof(*r));
         r->snap = snap;
-        r->base = (int32_t)first_token;
+        r->base = TokId{first_token};
     }
     uint32_t &K = r->K;
     uint32_t &n_batch = r->n_batch;
-    int &saved_len = r->saved_len;
-    int32_t (&pend)[16] = r->pend;
+    TokPos &saved_len = r->saved_len;
+    TokId (&pend)[16] = r->pend;
     float (&pend_conf)[16] = r->pend_conf;
     (void)pend_conf; (void)n_batch;
     /* Pending drafts continue from the greedy base we predicted last step; if
@@ -658,7 +660,7 @@ static int spec_round_begin(pulsar_session *s, int first_token,
     pulsar_session_spec_chain_harvest(s);   /* L108 P2 */
     K = s->spec.n_pend;
     if (K > 16u) K = 16u;
-    if (K && s->spec.pend_base != (int32_t)first_token) K = 0;
+    if (K && s->spec.pend_base != TokId{first_token}) K = 0;
     /* Position guard — ACCEPTANCE, not exactness. The drafts were conditioned on
      * the old position; pend_base is a token VALUE, so a plain eval
      * that advances the session (tool injection, </think> recovery) followed by
@@ -669,7 +671,7 @@ static int spec_round_begin(pulsar_session *s, int first_token,
      * whatever was drafted (spec_accept_walk), so a stale draft can only fail
      * to match.  Mirrors carry_pos_match. (checkpoint.len is still the drafting-step value
      * here: this runs before the first_token push below.) */
-    if (K && s->spec.pend_pos != (int32_t)s->checkpoint.len) K = 0;
+    if (K && s->spec.pend_pos != s->hist_end()) K = 0;
     /* Params guard -- also acceptance, not exactness. Drafts drawn under params X
      * and verified under params Y are verified exactly (the walk emits the
      * target's draw under Y whatever was drafted); drafts drawn under X rarely
@@ -702,9 +704,9 @@ static int spec_round_begin(pulsar_session *s, int first_token,
         return -1;
     }
 
-    saved_len = s->checkpoint.len;
-    token_vec_push(&s->checkpoint, first_token);
-    for (uint32_t i = 0; i < K; i++) token_vec_push(&s->checkpoint, (int)pend[i]);
+    saved_len = s->hist_end();
+    token_vec_push(&s->checkpoint, TokId{first_token});
+    for (uint32_t i = 0; i < K; i++) token_vec_push(&s->checkpoint, pend[i]);
     return 0;
 }
 
@@ -748,8 +750,8 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                           int round_banks,
                           bool defer_redraft,
                           double t0,
-                          const int32_t *forced_truth,
-                          int *accepted, int accepted_cap,
+                          const TokId *forced_truth,
+                          TokId *accepted, int accepted_cap,
                           char *err, size_t errlen) {
     pulsar_engine *e = s->engine;
     static int dspark_stats_env = -1;
@@ -757,8 +759,8 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
     int n_accept = 0;
     const uint32_t K = r->K;
     const uint32_t n_batch = r->n_batch;
-    const int saved_len = r->saved_len;
-    int32_t (&pend)[16] = r->pend;
+    const TokPos saved_len = r->saved_len;
+    TokId (&pend)[16] = r->pend;
     float (&pend_conf)[16] = r->pend_conf;
     (void)pend_conf; (void)t0; (void)dspark_stats;
     /* L155: the round hands back every position it commits, so accepted[] must hold the base and all K drafts it
@@ -767,7 +769,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
      * anything is committed, and the round undone.  With room for 1 + K the emit below never stops short of the
      * commit: the stop clamp cuts the commit AT the first stop token, the only other thing that ends the emit. */
     if (accepted_cap < 1 + (int)K) {
-        s->checkpoint.len = saved_len;
+        s->hist_set_end(saved_len);
         spec_round_undo(s, r);
         snprintf(err, errlen, "spec round end: accepted[] holds %d tokens, the round verified %u drafts (it needs %u)",
                  accepted_cap, K, 1u + K);
@@ -792,7 +794,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
          * production. */
         commit_rc = 0;
         while ((uint32_t)commit_rc < K && pend[commit_rc] == forced_truth[commit_rc]) commit_rc++;
-        carry_tok = (int)forced_truth[commit_rc];
+        carry_tok = forced_truth[commit_rc].raw();
     } else {
         /* the device walk's verdict: a refused row ends the round -- unless it is a full accept's carry row and the
          * stop clamp below cuts the round before it (that carry is never emitted; the host walk drew it from the
@@ -819,7 +821,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         if (commit_rc >= 0) pulsar_spec_calibration_note(e, r->copy, pend_conf, wv->label, wv->hit, wv->n_label);
     }
     if (commit_rc < 0) {
-        s->checkpoint.len = saved_len;
+        s->hist_set_end(saved_len);
         spec_round_undo(s, r);
         snprintf(err, errlen, masks ? "spec walk: a row past the round's masks, or a masked row with no drawable "
                                       "token (L303)" : "spec walk: the sampler refused a verify row");
@@ -842,11 +844,11 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
      * stop set (pulsar_token_is_stop; L284: the round cut only at the one eos
      * id, so a Qwen draft of <|endoftext|> committed past it and the server
      * invalidated the bank for the ghost tail). */
-    if (pulsar_token_is_stop(e, first_token)) {
+    if (pulsar_token_is_stop(e, TokId{first_token})) {
         commit = 0;
     } else {
         for (int i = 0; i < commit; i++) {
-            if (pulsar_token_is_stop(e, (int)pend[i])) { commit = i + 1; break; }
+            if (pulsar_token_is_stop(e, TokId{pend[i]})) { commit = i + 1; break; }
         }
     }
 
@@ -920,7 +922,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
             fprintf(stderr,
                     "pulsar: spec yield-quench pos=%d steps=%u debt=%.2f ewma=%.2f "
                     "-> plain decode for request remainder%s\n",
-                    saved_len + 1 + commit, s->spec.spec_quench_steps,
+                    (saved_len + TokCount{1 + commit}).raw(), s->spec.spec_quench_steps,
                     (double)s->spec.spec_quench_debt, (double)s->spec.spec_quench_ewma,
                     "");
         }
@@ -928,7 +930,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
 
     /* The live row: the last committed position's distribution, on the device (L302). */
     if (!s->live_from_rows(s->dev.step_rows, row0 + (uint32_t)commit)) {
-        s->checkpoint.len = saved_len;
+        s->hist_set_end(saved_len);
         spec_round_undo(s, r);
         snprintf(err, errlen, "spec round: the live row could not be taken from the verify");
         s->checkpoint_valid = false;
@@ -944,7 +946,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
     if (carry_tok < 0 && !(carry_refused && commit < commit_rc)) {
         /* the committed row has no drawable distribution (the sampler said why): no carry can be honest, so the
          * round fails */
-        s->checkpoint.len = saved_len;
+        s->hist_set_end(saved_len);
         spec_round_undo(s, r);
         snprintf(err, errlen, "spec round: the sampler refused the carry row");
         s->checkpoint_valid = false;
@@ -956,7 +958,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
      * from the inputs saved during the verify -- bit-identical, no replay), then the drafter absorbs
      * the committed rows 0..commit from its own captured features (row j = f(h_j)), each with the
      * token that follows it: the next committed token, or the carry after the last. */
-    s->checkpoint.len = saved_len;
+    s->hist_set_end(saved_len);
     bool ok_state;
     {
         PULSAR_NVTX("spec: commit");   /* rule 5: the round's phases are named on the timeline */
@@ -964,10 +966,10 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
     }
     if (ok_state) {
         PULSAR_NVTX("spec: absorb");
-        s->checkpoint.len = saved_len + 1 + commit;
-        int32_t next[PULSAR_SPEC_LOGITS_ROWS + 1];
+        s->hist_set_end(saved_len + TokCount{1 + commit});
+        TokId next[PULSAR_SPEC_LOGITS_ROWS + 1];
         uint32_t n_abs = 0;
-        for (int m = 0; m <= commit && m < (int)n_batch; m++) next[n_abs++] = m < commit ? pend[m] : (int32_t)carry_tok;
+        for (int m = 0; m <= commit && m < (int)n_batch; m++) next[n_abs++] = m < commit ? pend[m] : TokId{carry_tok};
         ok_state = spec_absorb_rows(s, row0, next, n_abs);
     }
     if (spec_target(s)->release) spec_target(s)->release(s, r);
@@ -978,11 +980,11 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
     }
 
     /* Emit first_token + accepted drafts. */
-    accepted[n_accept++] = first_token;
-    bool hit_eos = pulsar_token_is_stop(e, first_token);
+    accepted[n_accept++] = TokId{first_token};
+    bool hit_eos = pulsar_token_is_stop(e, TokId{first_token});
     for (int i = 0; i < commit && n_accept < accepted_cap && !hit_eos; i++) {
-        accepted[n_accept++] = (int)pend[i];
-        if (pulsar_token_is_stop(e, (int)pend[i])) hit_eos = true;
+        accepted[n_accept++] = pend[i];
+        if (pulsar_token_is_stop(e, pend[i])) hit_eos = true;
     }
     /* the stream steps past every token the round emitted: the carry sits at the next index, and the next
      * chain's drafts past it (L288 sdet; a teacher-forced end draws nothing and leaves the stream alone) */
@@ -996,14 +998,14 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
      * so the next generate_speculative call forwards it as batch position 0;
      * pre-draft the NEXT block conditioned on it. */
     const int next_base = carry_tok;
-    s->spec.spec_carry_token = (int32_t)carry_tok;
+    s->spec.spec_carry_token = TokId{carry_tok};
     s->spec.spec_carry_valid = !hit_eos;
-    s->spec.spec_carry_pos = (int32_t)s->checkpoint.len;
+    s->spec.spec_carry_pos = s->hist_end();
     s->spec.spec_carry_temp = carry_temp;
     s->spec.spec_carry_top_k = top_k;
     s->spec.spec_carry_top_p = top_p;
     s->spec.spec_carry_min_p = min_p;
-    if (hit_eos || pulsar_token_is_stop(e, next_base) || s->spec.spec_quenched) {
+    if (hit_eos || pulsar_token_is_stop(e, TokId{next_base}) || s->spec.spec_quenched) {
         /* Quenched: don't draft the next chain — the carry persisted above is
          * still the correctly-distributed next base, which the next
          * generate_speculative call consumes before routing plain. */
@@ -1020,13 +1022,13 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
          * cannot serve simply takes a plain n=1 step next round. */
         pulsar_spec_drop_pendings(&s->spec);
         spec_redraft_req *q = &r->redraft;
-        pulsar_spec_draft_req_init(s, q, next_base, carry_temp, top_k, top_p, min_p);
+        pulsar_spec_draft_req_init(s, q, TokId{next_base}, carry_temp, top_k, top_p, min_p);
         return n_accept;
     }
     uint32_t keep;
     {
         PULSAR_NVTX("spec: draft");
-        keep = spec_drafter(s)->draft(s, next_base, carry_temp, top_k, top_p, min_p, rng);
+        keep = spec_drafter(s)->draft(s, TokId{next_base}, carry_temp, top_k, top_p, min_p, rng);
     }
     if (keep == PULSAR_DRAFT_REFUSED) {   /* L306: the drafter refused the next chain (its line says why) */
         snprintf(err, errlen, "spec round: the drafter refused the next chain");
@@ -1061,7 +1063,7 @@ static int spec_single_round(pulsar_session *s, int first_token,
                              float temperature, int top_k,
                              float top_p, float min_p,
                              uint64_t *rng,
-                             int *accepted, int accepted_cap,
+                             TokId *accepted, int accepted_cap,
                              char *err, size_t errlen) {
     pulsar_engine *e = s->engine;
     const double t0 = now_sec();
@@ -1091,7 +1093,7 @@ static int spec_single_round(pulsar_session *s, int first_token,
         }
     }
     if (!verified) {
-        s->checkpoint.len = r.saved_len;
+        s->hist_set_end(r.saved_len);
         spec_round_undo(s, &r);
         s->checkpoint_valid = false;
         free(r.snap);
@@ -1151,7 +1153,7 @@ static int spec_base_draw(pulsar_session *s, float temperature, int top_k, float
 int pulsar_session::generate_speculative(float temperature, int top_k,
                                      float top_p, float min_p, uint64_t *rng,
                                      int max_tokens,
-                                     int *accepted, int accepted_cap,
+                                     TokId *accepted, int accepted_cap,
                                      char *err, size_t errlen) {
     auto *s = this;
     if (!s || max_tokens <= 0 || accepted_cap <= 0 || !accepted) return 0;
@@ -1171,9 +1173,9 @@ int pulsar_session::generate_speculative(float temperature, int top_k,
     /* the carry is only valid at the exact position it was drawn at; any
      * session advance outside this path (sync, plain eval, tool injection)
      * means s->logits no longer matches the carry's source distribution */
-    const bool carry_pos_match = s->spec.spec_carry_pos == (int32_t)s->checkpoint.len;
+    const bool carry_pos_match = s->spec.spec_carry_pos == s->hist_end();
     if (s->spec.spec_carry_valid && carry_params_match && carry_pos_match) {
-        first = (int)s->spec.spec_carry_token;
+        first = s->spec.spec_carry_token.raw();
         s->spec.spec_carry_valid = false;
     } else {
         /* no carry, or params changed mid-stream (e.g. tool-call payloads
@@ -1185,10 +1187,10 @@ int pulsar_session::generate_speculative(float temperature, int top_k,
             return -1;
         }
     }
-    if (pulsar_token_is_stop(s->engine, first)) {
+    if (pulsar_token_is_stop(s->engine, TokId{first})) {
         /* never forward EOS through the target (matches the old caller loops,
          * which broke before eval) */
-        accepted[0] = first;
+        accepted[0] = TokId{first};
         if (rng) pulsar_sample_advance(rng, 1u);
         return 1;
     }
@@ -1197,7 +1199,7 @@ int pulsar_session::generate_speculative(float temperature, int top_k,
      * already correctly distributed, so this is a pure speed decision. */
     if (!spec_drafter(s) || s->spec.spec_quenched) {
         if (pulsar_session_family_eval(s, first, err, errlen) != 0) return -1;
-        accepted[0] = first;
+        accepted[0] = TokId{first};
         if (rng) pulsar_sample_advance(rng, 1u);
         return 1;
     }
@@ -1210,7 +1212,7 @@ int pulsar_session::generate_speculative(float temperature, int top_k,
 
 int pulsar_session::eval_speculative_block(int first_token,
                                         int max_tokens,
-                                        int *accepted, int accepted_cap,
+                                        TokId *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
     auto *s = this;
     if (!s || max_tokens <= 0 || accepted_cap <= 0 || !accepted) return 0;
@@ -1224,7 +1226,7 @@ int pulsar_session::eval_speculative_block(int first_token,
     }
     if (!spec_drafter(s) || s->spec.spec_quenched) {
         if (pulsar_session_family_eval(s, first_token, err, errlen) != 0) return -1;
-        accepted[0] = first_token;
+        accepted[0] = TokId{first_token};
         return 1;
     }
     /* The fused loop -- one batched forward/step plus transactional no-replay
@@ -1265,9 +1267,9 @@ int pulsar_session_spec_next_base_local(pulsar_session *s, float temperature,
     const bool carry_params_match =
         s->spec.spec_carry_temp == temperature && s->spec.spec_carry_top_k == top_k &&
         s->spec.spec_carry_top_p == top_p && s->spec.spec_carry_min_p == min_p;
-    const bool carry_pos_match = s->spec.spec_carry_pos == (int32_t)s->checkpoint.len;
+    const bool carry_pos_match = s->spec.spec_carry_pos == s->hist_end();
     if (s->spec.spec_carry_valid && carry_params_match && carry_pos_match) {
-        first = (int)s->spec.spec_carry_token;
+        first = s->spec.spec_carry_token.raw();
         s->spec.spec_carry_valid = false;
     } else {
         s->spec.spec_carry_valid = false;
@@ -1288,11 +1290,11 @@ uint32_t pulsar_spec_round_n_rows(const pulsar_spec_round *r) {
     return r->n_batch;
 }
 
-uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, uint32_t bank, pulsar_multiseq_req *out) {
+uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, BankId bank_id, pulsar_multiseq_req *out) {
     for (uint32_t i = 0; i < r->n_batch; i++) {
-        out[i].bank = bank;
-        out[i].pos = TokPos{r->saved_len + (int32_t)i};   /* L334: the round's body stays raw (P2b) */
-        out[i].token = i == 0 ? (int)r->base : (int)r->pend[i - 1];
+        out[i].bank = bank_id;
+        out[i].pos = r->saved_len + TokCount{(int)i};
+        out[i].token = i == 0 ? r->base : TokId{r->pend[i - 1]};
     }
     return r->n_batch;
 }
@@ -1325,8 +1327,8 @@ static int spec_round_end_walked(pulsar_session *s, pulsar_spec_round *r,
                                  float min_p, uint32_t greedy_rows,
                                  const uint32_t *masks, uint32_t mask_rows, uint64_t *rng,
                                  const pulsar_gpu_spec_walk_out *wv, uint32_t row0, int round_banks,
-                                 const int32_t *forced_truth,
-                                 int *accepted, int accepted_cap,
+                                 const TokId *forced_truth,
+                                 TokId *accepted, int accepted_cap,
                                  char *err, size_t errlen) {
     return spec_round_end(s, r, first_token,
                           temperature, top_k, top_p, min_p, greedy_rows, masks, mask_rows, rng,
@@ -1358,7 +1360,7 @@ int pulsar_session_spec_round_end_local(pulsar_session *s, pulsar_spec_round *r,
                                float min_p, uint32_t greedy_rows,
                                const uint32_t *masks, uint32_t mask_rows, uint64_t *rng,
                                uint32_t row0,
-                               int *accepted, int accepted_cap,
+                               TokId *accepted, int accepted_cap,
                                char *err, size_t errlen) {
     if (spec_no_drafter(s, "spec round end", err, errlen)) return -1;   /* no round can have begun */
     if (temperature > 0.0f && !rng) {
@@ -1379,13 +1381,14 @@ int pulsar_session_spec_round_end_local(pulsar_session *s, pulsar_spec_round *r,
 }
 
 int pulsar_session_spec_round_end_forced(pulsar_session *s, pulsar_spec_round *r,
-                                      int first_token,
+                                      TokId first_token_id,
                                       float temperature, int top_k, float top_p,
                                       float min_p, uint64_t *rng,
                                       uint32_t row0,
-                                      const int32_t *truth,
-                                      int *accepted, int accepted_cap,
+                                      const TokId *truth,
+                                      TokId *accepted, int accepted_cap,
                                       char *err, size_t errlen) {
+    const int first_token = first_token_id.raw();   /* L334 P3: the round's body is raw (its fields: S2 next) */
     if (spec_no_drafter(s, "spec round_end_forced", err, errlen)) return -1;   /* no round can have begun */
     if (!truth) {
         snprintf(err, errlen, "spec round_end_forced: no truth");
@@ -1422,7 +1425,7 @@ int pulsar_session_spec_round_end_forced(pulsar_session *s, pulsar_spec_round *r
 
 /* L150: every live round drafts in ONE drafter pass over all the banks, no bank switch. */
 int pulsar_session_spec_redraft_batch_local(pulsar_session *s, pulsar_spec_round **rounds,
-                                      const uint32_t *banks, uint64_t **rngs, int n,
+                                      const BankId *banks, uint64_t **rngs, int n,
                                       char *err, size_t errlen) {
     if (!rounds || !banks || !rngs || n <= 0) return 0;
     if (spec_no_drafter(s, "redraft batch", err, errlen)) return -1;
@@ -1447,7 +1450,7 @@ void pulsar_spec_redraft_stamp(pulsar_session *s, spec_redraft_req *q) {
     s->spec.n_pend = q->keep;
     s->spec.pend_copy = q->copied;
     for (uint32_t i = 0; i < q->keep; i++) s->spec.pend[i] = q->refined[i + 1];
-    s->spec.pend_pos = (int32_t)s->checkpoint.len;
+    s->spec.pend_pos = s->hist_end();
     s->spec.pend_temp = q->temperature;
     s->spec.pend_top_k = q->top_k;
     s->spec.pend_top_p = q->top_p;
@@ -1492,7 +1495,7 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
     *n_rows_out = 0;
     if (spec_steps_no_drafter(s, steps, n, "spec assemble batch")) {
         for (int i = 0; i < n; i++) {   /* the phase's outputs, as a step that drew nothing leaves them */
-            steps[i].first_token = -1;
+            steps[i].first_token = TokId::none();
             steps[i].row0 = 0;
             steps[i].n_rows = 0;
         }
@@ -1501,7 +1504,7 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
     for (int i = 0; i < n; i++) {
         pulsar_spec_step *st = &steps[i];
         spec_step_reset(st);
-        st->first_token = -1;
+        st->first_token = TokId::none();
         st->row0 = 0;
         st->n_rows = 0;
         if (!spec_bank_restore(s, st->bank)) {
@@ -1520,11 +1523,11 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
         } else {
             const int first = pulsar_session_spec_next_base_local(s, st->temperature, st->top_k,
                                                                   st->top_p, st->min_p, st->masks, st->rng);
-            st->first_token = first;
+            st->first_token = TokId{first};
             if (first < 0) {
                 st->status = PULSAR_SPEC_STEP_FAILED;
                 snprintf(st->err, sizeof st->err, "sampler refused a degenerate logits row (L188)");
-            } else if (pulsar_token_is_stop(s->engine, first)) {
+            } else if (pulsar_token_is_stop(s->engine, TokId{first})) {
                 st->status = PULSAR_SPEC_STEP_EOS;
             } else if (pulsar_session_spec_round_begin_local(s, st->round, first, st->max_tokens,
                                                              /* the round's rows are at most the cap_rows the budget
@@ -1567,7 +1570,7 @@ void pulsar_spec_absorb_deferred(pulsar_session *s, pulsar_spec_step *steps, int
             bool had = false;
             for (uint32_t k = 0; k < s->seed_defer.n && !had; k++) had = s->seed_defer.bank[k] == st->bank;
             if (!had) continue;
-            pulsar_bank_view_invalidate(s, st->bank);
+            pulsar_bank_view_invalidate(s, pulsar_bank_index(st->bank));
             if (st->status != PULSAR_SPEC_STEP_OK) continue;
             st->status = PULSAR_SPEC_STEP_FAILED;
             st->round->redraft.valid = false;
@@ -1608,13 +1611,13 @@ void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_st
     for (int i = 0; i < n; i++) {
         pulsar_spec_step *st = &steps[i];
         spec_step_reset(st);
-        st->pos_before = TokPos{pulsar_spec_round_saved_len(st->round)};
+        st->pos_before = pulsar_spec_round_saved_len(st->round);
         st->pos_after = TokPos::none();   /* until the round ends */
         const bool begun = spec_round_begun(st->round);
         if (!spec_bank_restore(s, st->bank)) {
             /* L375 O37: the bank cannot be installed to undo its round, so its saved view -- which still holds the
              * round's base and unverified drafts -- names no position */
-            if (begun) pulsar_bank_view_invalidate(s, st->bank);
+            if (begun) pulsar_bank_view_invalidate(s, pulsar_bank_index(st->bank));
             st->status = PULSAR_SPEC_STEP_RESTORE_FAILED;
             continue;
         }
@@ -1625,7 +1628,7 @@ void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_st
             /* L375 O37: a round that never reaches spec_round_end is undone here (round_end undoes its own failures) */
             spec_round_undo_begun(s, st->round);
         } else
-            na = spec_round_end_walked(s, st->round, st->first_token, st->temperature, st->top_k, st->top_p,
+            na = spec_round_end_walked(s, st->round, st->first_token.raw(), st->temperature, st->top_k, st->top_p,
                                        st->min_p, st->greedy_rows, st->masks, st->mask_rows, st->rng,
                                        &wv[widx[i]], st->row0, n /* L263: the step's flat cost is shared n ways */,
                                        NULL, st->accepted, st->accepted_cap, st->err, sizeof st->err);
@@ -1669,22 +1672,22 @@ int pulsar_spec_steps_verdict(pulsar_spec_phase phase, const pulsar_spec_step *s
     h = spec_fp(h, n_rows);
     for (int i = 0; i < n; i++) {
         const pulsar_spec_step *st = &steps[i];
-        h = spec_fp(h, st->bank);
+        h = spec_fp(h, (uint32_t)st->bank.raw());
         h = spec_fp(h, (uint32_t)st->status);
         if (phase == PULSAR_SPEC_PHASE_ASSEMBLE) {
-            h = spec_fp(h, (uint32_t)st->first_token);
+            h = spec_fp(h, (uint32_t)st->first_token.raw());
             h = spec_fp(h, st->row0);
             h = spec_fp(h, st->n_rows);
         } else if (phase == PULSAR_SPEC_PHASE_ROUND_END) {
             h = spec_fp(h, (uint32_t)st->pos_after.raw());
             h = spec_fp(h, (uint32_t)st->n_accepted);
-            for (int t = 0; t < st->n_accepted; t++) h = spec_fp(h, (uint32_t)st->accepted[t]);
+            for (int t = 0; t < st->n_accepted; t++) h = spec_fp(h, (uint32_t)st->accepted[t].raw());
         }
     }
     return (int)(h & 0x3fffffffu) + 1;
 }
 
-int pulsar_session_spec_redraft_peek(const pulsar_spec_round *r, int32_t ids[17], float conf[16],
+int pulsar_session_spec_redraft_peek(const pulsar_spec_round *r, TokId ids[17], float conf[16],
                                      uint32_t *n_draft, uint32_t *keep, int *sampled) {
     if (!r || !r->redraft.valid || !r->redraft.done) return 0;
     const spec_redraft_req *q = &r->redraft;
@@ -1696,19 +1699,20 @@ int pulsar_session_spec_redraft_peek(const pulsar_spec_round *r, int32_t ids[17]
     return 1;
 }
 
-uint32_t pulsar_session_bank_pendings(const pulsar_session *s, uint32_t bank, int32_t *base, int32_t tok[16],
+uint32_t pulsar_session_bank_pendings(const pulsar_session *s, BankId bank_id, TokId *base, TokId tok[16],
                                       float conf[16]) {
+    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */
     /* L108 P2: the live session's pending count may still be an
      * in-flight chain; complete it before peeking. Logically a lazy
      * read-completion, not observable-state mutation. */
     pulsar_session_spec_chain_harvest((pulsar_session *)s);
 
-    *base = -1;
+    *base = TokId::none();
     const pulsar_spec_carry_state *sp = s ? pulsar_spec_bank_shadow((pulsar_session *)s, bank) : NULL;
     if (!sp) return 0;
     uint32_t n = sp->n_pend;
     if (n > 16u) n = 16u;
-    *base = sp->pend_base;
+    *base = TokId{sp->pend_base};
     for (uint32_t i = 0; i < n; i++) {
         tok[i] = sp->pend[i];
         conf[i] = sp->pend_conf[i];
@@ -1718,7 +1722,7 @@ uint32_t pulsar_session_bank_pendings(const pulsar_session *s, uint32_t bank, in
 
 const pulsar_spec_carry_state *pulsar_spec_bank_shadow(pulsar_session *s, uint32_t bank) {
     if (!s) return NULL;
-    if (bank == pulsar_session_live_bank(s)) return &s->spec;
+    if (BankId{bank} == pulsar_session_live_bank(s)) return &s->spec;
     /* a non-live bank's saved shadow: the core's carry, for every family (L272 P2) */
     return s->bank_carry && bank < s->bank_carry_n && s->bank_carry[bank].valid ? &s->bank_carry[bank].spec : NULL;
 }
@@ -1743,8 +1747,8 @@ void pulsar_spec_shadow_restore(pulsar_session *s, const pulsar_spec_carry_state
     s->spec = *src;
 }
 
-int pulsar_spec_round_saved_len(const pulsar_spec_round *r) {
-    return r ? r->saved_len : -1;
+TokPos pulsar_spec_round_saved_len(const pulsar_spec_round *r) {
+    return r ? r->saved_len : TokPos::none();
 }
 
 uint32_t pulsar_session_spec_next_rows_max(const pulsar_session *s) {
@@ -1764,7 +1768,7 @@ void pulsar_session_spec_arm_capture_local(pulsar_session *s, uint32_t n_rows) {
 void pulsar_session_spec_round_abort_local(pulsar_session *s, pulsar_spec_round *r) {
     /* Mirror the fused loop's forward-failure branch: drop the pushed rows,
      * restore the frontier, release the snapshot. */
-    s->checkpoint.len = r->saved_len;
+    s->hist_set_end(r->saved_len);
     spec_round_undo(s, r);
     s->checkpoint_valid = false;
 }

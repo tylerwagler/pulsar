@@ -16,9 +16,10 @@
 #include "pulsar_engine_internal.h"
 #include "lib/pulsar_stall.h"
 
-void pulsar_prefill_plan_init(pulsar_prefill_plan *p, const pulsar_prefill_shape *shape, uint32_t start,
+void pulsar_prefill_plan_init(pulsar_prefill_plan *p, const pulsar_prefill_shape *shape, TokPos start_at,
                               const pulsar_ckpt_store *store, const pulsar_engine *e, const pulsar_tokens *prompt,
                               const pulsar_image_ref *images, int n_images) {
+    const uint32_t start = pulsar_ckpt_raw(start_at);   /* the planner's chunk arithmetic is raw (typed at its API) */
     p->grid_cap = shape->cap;
     p->chunk_cap = start != 0u && shape->resumed_cap < shape->cap ? shape->resumed_cap : shape->cap;
     p->align = shape->align;
@@ -35,7 +36,7 @@ uint32_t pulsar_prompt_endpoint(pulsar_engine *e, const pulsar_ckpt_store *store
     pulsar_turn_markers m;
     if (!pulsar_chat_turn_markers(e, &m)) return 0u;
     const int E = pulsar_turn_endpoint(&m, prompt->v, prompt->len);   /* L351: the turn's first reply */
-    return E > 0 && (uint32_t)E >= store->ops->min_checkpoint(store->state) ? (uint32_t)E : 0u;
+    return E > 0 && (uint32_t)E >= pulsar_ckpt_raw(store->ops->min_checkpoint(store->state)) ? (uint32_t)E : 0u;
 }
 
 /* L268: the image block a cut at `cut` would split -- [bs, be) with bs < cut < be -- or false.  The FIRST such
@@ -59,7 +60,8 @@ static bool prefill_plan_block_across(const pulsar_prefill_plan *p, uint32_t cut
     return false;
 }
 
-uint32_t pulsar_prefill_plan_next_end(const pulsar_prefill_plan *p, uint32_t pos0, uint32_t end) {
+TokPos pulsar_prefill_plan_next_end(const pulsar_prefill_plan *p, TokPos pos0_at, TokPos end_at) {
+    const uint32_t pos0 = pulsar_ckpt_raw(pos0_at), end = pulsar_ckpt_raw(end_at);   /* raw inside (typed at its API) */
     const uint32_t remaining = end - pos0;
     /* snap to the absolute grid of the cap after any unaligned start: a resume (start != 0) lands on the cold
      * prefill's boundaries, and so does the chunk after an image cut below -- on the cold pass too, which is what
@@ -88,7 +90,8 @@ uint32_t pulsar_prefill_plan_next_end(const pulsar_prefill_plan *p, uint32_t pos
     /* L264 / P13: the final chunk stops at the last grid point inside it (pulsar_ckpt_final_cut), so the prefill
      * leaves the checkpoint the next turn resumes from -- not when that point falls inside an image block */
     if (pos0 + chunk == end) {
-        const uint32_t cut = pulsar_ckpt_final_cut(p->store, pos0, end);
+        const uint32_t cut =
+            pulsar_ckpt_raw(pulsar_ckpt_final_cut(p->store, pulsar_ckpt_pos(pos0), pulsar_ckpt_pos(end)));
         uint32_t bs = 0, be = 0;
         if (!prefill_plan_block_across(p, cut, &bs, &be)) chunk = cut - pos0;
     }
@@ -99,16 +102,18 @@ uint32_t pulsar_prefill_plan_next_end(const pulsar_prefill_plan *p, uint32_t pos
         uint32_t bs = 0, be = 0;
         if (!prefill_plan_block_across(p, p->endpoint, &bs, &be)) chunk = p->endpoint - pos0;
     }
-    return pos0 + chunk;
+    return pulsar_ckpt_pos(pos0 + chunk);
 }
 
-int pulsar_prefill_walk_run(const pulsar_prefill_walk *w, uint32_t start, uint32_t end) {
+int pulsar_prefill_walk_run(const pulsar_prefill_walk *w, TokPos start_at, TokPos end_at) {
+    const uint32_t start = pulsar_ckpt_raw(start_at), end = pulsar_ckpt_raw(end_at);   /* raw inside */
     for (uint32_t pos0 = start; pos0 < end;) {
         if (w->stop && w->stop(w->ud)) {
             (void)pulsar_gpu_synchronize();   /* L188: drain before handing the stream to whatever runs next */
             return PULSAR_SESSION_SYNC_INTERRUPTED;
         }
-        const uint32_t chunk_end = pulsar_prefill_plan_next_end(w->plan, pos0, end);
+        const uint32_t chunk_end =
+            pulsar_ckpt_raw(pulsar_prefill_plan_next_end(w->plan, pulsar_ckpt_pos(pos0), end_at));
         if (chunk_end <= pos0 || chunk_end > end) {
             fprintf(stderr, "pulsar: prefill walk: a chunk from %u cut at %u (prompt ends at %u)\n", pos0, chunk_end, end);
             return 1;
@@ -151,16 +156,16 @@ int pulsar_prefill_walk_run(const pulsar_prefill_walk *w, uint32_t start, uint32
  *  @param from the range's first position
  *  @param to   one past its last
  *  @return the hash */
-static uint64_t read_ahead_hash(const int *v, uint32_t from, uint32_t to) {
+static uint64_t read_ahead_hash(const TokId *v, uint32_t from, uint32_t to) {
     uint64_t h = 1469598103934665603ull;
     for (uint32_t i = from >= 2u ? from - 2u : 0u; i < to; i++) {
-        h ^= (uint32_t)v[i];
+        h ^= (uint32_t)v[i].raw();
         h *= 1099511628211ull;
     }
     return h ^ ((uint64_t)from << 32) ^ to;
 }
 
-bool pulsar_read_ahead_plan(const pulsar_read_ahead_mark *mark, const int *prompt, uint32_t len, uint32_t run_end,
+bool pulsar_read_ahead_plan(const pulsar_read_ahead_mark *mark, const TokId *prompt, uint32_t len, uint32_t run_end,
                             uint32_t window, uint32_t *from, uint32_t *to, bool *drop, pulsar_read_ahead_mark *next) {
     *from = *to = run_end;
     *drop = false;
@@ -262,9 +267,9 @@ void pulsar_session_read_ahead_cancel(pulsar_session *s, uint32_t bank) {
 
 /** Report prefill progress to the session's progress and display-progress hooks (each when set).
  *  @param s       the session
- *  @param current tokens prefilled so far
+ *  @param current the position the prefill stands at (L334 P7: TokPos)
  *  @param total   the prompt's tokens */
-static void prefill_loop_progress(pulsar_session *s, int current, int total) {
+static void prefill_loop_progress(pulsar_session *s, TokPos current, TokCount total) {
     if (s->progress) s->progress(s->progress_ud, "prefill_chunk", current, total);
     if (s->display_progress) s->display_progress(s->display_progress_ud, "prefill_display", current, total);
 }
@@ -279,7 +284,7 @@ struct prefill_loop_ctx {
     /// the whole prompt (token ids); borrowed
     const pulsar_tokens *prompt;
     /// the live bank the walk prefills (pulsar_session_live_bank at the loop's start)
-    uint32_t bank;
+    BankId bank;
     /// the session's checkpoint store the landed hook captures into; borrowed
     pulsar_ckpt_store *ckpt;
     /// the family's chunk forward, called once per chunk
@@ -309,7 +314,7 @@ static bool prefill_loop_chunk(void *ud, uint32_t pos0, uint32_t rows, bool last
     /* L329 (b2): the next chunk's rows, read while this one computes (queued first; this chunk's own gather, issued
      * at its embed, goes ahead of them) -- for a SERVED prompt only: the one a server named for this sync
      * (pulsar_session_set_prefill_ahead); a sync nobody licensed (a gate, the CLI, imatrix) passes NULL, reads nothing */
-    (void)pulsar_session_read_ahead(c->s, c->bank, c->s->prefill_ahead, pos0 + rows);
+    (void)pulsar_session_read_ahead(c->s, pulsar_bank_index(c->bank), c->s->prefill_ahead, pos0 + rows);
     const double t0 = now_sec();
     pulsar_stall_mark("prefill chunk");
     if (!c->chunk(c->s, c->prompt, pos0, rows, last, c->ud) || pulsar_gpu_end_commands() == 0) return false;
@@ -327,13 +332,13 @@ static bool prefill_loop_landed(void *ud, uint32_t chunk_end) {
     pulsar_session *s = c->s;
     for (int i = s->checkpoint.len; i < (int)chunk_end; i++) token_vec_push(&s->checkpoint, c->prompt->v[i]);
     s->checkpoint_valid = true;
-    if (!pulsar_ckpt_landed(c->ckpt, c->bank, chunk_end)) return false;
+    if (!pulsar_ckpt_landed(c->ckpt, c->bank, TokPos{(int)chunk_end})) return false;
     /* L311: the walk stands at the prompt's message endpoint -- record it (said when it cannot be) */
     if (chunk_end == c->endpoint)   /* L350: with the request's images below it (none for a text history) */
-        (void)pulsar_ckpt_record_capture(c->ckpt, c->bank, PULSAR_CKPT_REC_ENDPOINT, chunk_end, c->prompt->v, NULL, 0u,
+        (void)pulsar_ckpt_record_capture(c->ckpt, c->bank, PULSAR_CKPT_REC_ENDPOINT, TokPos{(int)chunk_end}, c->prompt->v, NULL, 0u,
                                          s->sync_n_images > 0 ? &s->sync_identity : NULL);
     c->at_resume_point = c->ckpt->ops->split_invariant || chunk_end % c->ckpt->ops->resume_grid == 0u;
-    prefill_loop_progress(s, (int)chunk_end, c->prompt->len);
+    prefill_loop_progress(s, TokPos{(int)chunk_end}, TokCount{c->prompt->len});
     return true;
 }
 
@@ -345,8 +350,9 @@ static bool prefill_loop_stop(void *ud) {
     return c->at_resume_point && pulsar_session_cancelled(c->s);
 }
 
-int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start, pulsar_prefill_chunk_fn chunk,
+int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, TokPos start_at, pulsar_prefill_chunk_fn chunk,
                         void *ud) {
+    const uint32_t start = pulsar_ckpt_raw(start_at);   /* raw inside (typed at its API) */
     const uint32_t end = (uint32_t)prompt->len;
     pulsar_prefill_shape shape = {};
     s->engine->family->session->sync->prefill_shape(s, &shape);
@@ -356,7 +362,7 @@ int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, uint32_t
         return 1;
     }
     pulsar_prefill_plan plan;
-    pulsar_prefill_plan_init(&plan, &shape, start, ckpt, s->engine, prompt, s->sync_images, s->sync_n_images);
+    pulsar_prefill_plan_init(&plan, &shape, start_at, ckpt, s->engine, prompt, s->sync_images, s->sync_n_images);
     /* L311: the prompt's message endpoint past the walk's start is cut at and recorded.  L350: an image request's
      * too -- its records keep the request's image identity (s->sync_identity) -- but never a history whose images
      * are the bank's and not this request's (a text request over an image KV), nor a cut inside a block */
@@ -374,10 +380,10 @@ int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, uint32_t
             static bool announced = false;   /* rule 5: the path taken, once */
             if (waived && !announced) {
                 announced = true;
-                fprintf(stderr, "pulsar: L380 endpoint cut waived: bank %u prefills [%u, %u) without the cut at its "
+                fprintf(stderr, "pulsar: L380 endpoint cut waived: bank %d prefills [%u, %u) without the cut at its "
                                 "message endpoint %u (the request resumed at or past the bank's previous prompt end; "
                                 "counted per request: kv req epcut=0)\n",
-                        pulsar_session_live_bank(s), start, end, E);
+                        pulsar_session_live_bank(s).raw(), start, end, E);
             }
         }
     }
@@ -400,10 +406,10 @@ int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, uint32_t
     s->checkpoint.len = 0;
     for (uint32_t i = 0; i < start; i++) token_vec_push(&s->checkpoint, prompt->v[i]);
     s->checkpoint_valid = start > 0u;
-    prefill_loop_progress(s, (int)start, prompt->len);
+    prefill_loop_progress(s, TokPos{(int)start}, TokCount{prompt->len});
     prefill_loop_ctx c = { s, prompt, pulsar_session_live_bank(s), ckpt, chunk, ud, plan.endpoint, true };
     const pulsar_prefill_walk w = { &plan, prefill_loop_chunk, prefill_loop_landed, prefill_loop_stop, &c };
-    const int rc = pulsar_prefill_walk_run(&w, start, end);
+    const int rc = pulsar_prefill_walk_run(&w, start_at, pulsar_ckpt_pos(end));
     /* the logits are the prompt's next-token row only when the final chunk ran (a stop leaves the view
      * at a boundary, a failure leaves it at the last chunk that landed) */
     s->logits_stale = rc != 0;
@@ -415,7 +421,7 @@ int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, uint32_t
     if (rc == 0 && (s->sync_n_images > 0 || s->live_images.n == 0)) {
         const float *live = s->live_host();   /* L302: the record keeps the row on the host */
         if (live)
-            (void)pulsar_ckpt_record_capture(ckpt, c.bank, PULSAR_CKPT_REC_END, end, prompt->v, live,
+            (void)pulsar_ckpt_record_capture(ckpt, c.bank, PULSAR_CKPT_REC_END, TokPos{(int)end}, prompt->v, live,
                                              (uint32_t)pulsar_engine_logits_width(s->engine),
                                              s->sync_n_images > 0 ? &s->sync_identity : NULL);
     }

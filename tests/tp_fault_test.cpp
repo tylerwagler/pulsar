@@ -195,7 +195,7 @@ static void run_leader(int port, int mode) {
         /* Control-path death: the worker is already gone.  send_eval may
          * succeed (buffered) or fail (RST) -- either way wait_command_ack
          * must read EOF and latch failed(). */
-        (void)pulsar_tp_send_eval(tp, 4242u, 7, 9);
+        (void)pulsar_tp_send_eval(tp, 4242u, 7, TokId{9});
         char e2[256] = "";
         const int rc = pulsar_tp_wait_command_ack(tp, 4242u, "eval", e2, sizeof(e2));
         CHECK(rc == 0, "wait_command_ack rc=%d (want 0)", rc);
@@ -206,13 +206,13 @@ static void run_leader(int port, int mode) {
     }
     if (mode == 3) {
         static float out[MODE3_GATE_BYTES / 4], in[MODE3_GATE_BYTES / 4];
-        CHECK(pulsar_tp_send_eval(tp, MODE3_SID, 1, 11) == 1, "C: leader send_eval 1");
+        CHECK(pulsar_tp_send_eval(tp, MODE3_SID, 1, TokId{11}) == 1, "C: leader send_eval 1");
         fill_pat(out, 0, 1, MODE3_GATE_BYTES / 4);
         CHECK(pulsar_tp_big_gate_exchange(tp, 0, 1, out, in, MODE3_GATE_BYTES) == 1, "C: leader step-1 gate");
         verify_pat(in, 1, 1, MODE3_GATE_BYTES / 4);
         CHECK(pulsar_tp_defer_command_ack_digest(tp, MODE3_SID, "eval at position 1", mode3_digest()) == 1,
               "C: leader defer 1");
-        CHECK(pulsar_tp_send_eval(tp, MODE3_SID, 2, 12) == 1, "C: leader send_eval 2");
+        CHECK(pulsar_tp_send_eval(tp, MODE3_SID, 2, TokId{12}) == 1, "C: leader send_eval 2");
         /* this rank's body of step 2 fails before its gate: pulsar_session_eval's failure path */
         const double t0 = tp_now_sec();
         pulsar_tp_drain_command_acks(tp);

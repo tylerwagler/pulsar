@@ -8,15 +8,15 @@
  * container without them does not load.
  *
  * The chat front (pulsar_chat_open / _append_turn / _end_assistant: the CLI REPL and the agent) is F5's renderer,
- * src/lib/inkling_chat -- the head is the full render of the system message plus the effort line, a turn the
+ * src/families/inkling/inkling_chat -- the head is the full render of the system message plus the effort line, a turn the
  * renderer's turn piece, the close its <|content_model_end_sampling|> -- so head + turns + sampled turns is the
  * conversation's full render (inkling-chat-gate S1 grades the pieces).  The server renders with the same library
- * behind its family table (src/server/family_inkling.cpp). */
+ * behind its family table (src/families/inkling/inkling_server.cpp). */
 /** @file inkling_tokenizer.cpp
  *  @brief Inkling's tokenizer table and chat front: the shared BPE engine (tiktoken o200k) and F5's renderer. */
 #include "inkling.h"
 #include "lib/bpe_tokenizer.h"
-#include "lib/inkling_chat.h"
+#include "inkling_chat.h"
 
 #include <string.h>
 #include <sys/stat.h>
@@ -71,7 +71,7 @@ bool encode_into(const pulsar_engine *e, const char *text, size_t len, const pul
         if (why && whylen) snprintf(why, whylen, "%s", err);
         return false;
     }
-    for (int id : ids) pulsar_tokens_push(out, id);
+    for (int id : ids) pulsar_tokens_push(out, TokId{id});
     return true;
 }
 
@@ -247,9 +247,9 @@ bool turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
         }
         return false;
     }
-    out->user[0] = user;
+    out->user[0] = TokId{user};
     out->n_user = 1;
-    out->assistant[0] = model;
+    out->assistant[0] = TokId{model};
     out->n_assistant = 1;
     return true;
 }
@@ -260,12 +260,12 @@ bool turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
  *  @param tokens  the ids to print */
 void dump(pulsar_engine *e, FILE *fp, const pulsar_tokens *tokens) {
     fprintf(fp, "[");
-    for (int i = 0; i < tokens->len; i++) fprintf(fp, "%s%d", i ? ", " : "", tokens->v[i]);
+    for (int i = 0; i < tokens->len; i++) fprintf(fp, "%s%d", i ? ", " : "", tokens->v[i].raw());
     fprintf(fp, "]\n");
     for (int i = 0; i < tokens->len; i++) {
         size_t n = 0;
-        char *piece = token_text(e, tokens->v[i], &n);
-        fprintf(fp, "%6d  ", tokens->v[i]);
+        char *piece = token_text(e, tokens->v[i].raw(), &n);
+        fprintf(fp, "%6d  ", tokens->v[i].raw());
         pulsar_dump_piece_quoted(fp, piece, n);
         fputc('\n', fp);
         free(piece);
@@ -279,16 +279,27 @@ int n_tokens(pulsar_engine *e) { return bpe_tokenizer_n_tokens(TOK(e)); }
 
 }  // namespace
 
+/* L334 P3: the family's ids leave the tokenizer here, typed (its internals stay raw). */
+/** pulsar_family_tokenizer::is_stop, typed.  @param e the engine  @param t the token  @return is_stop's */
+static bool is_stop_op(pulsar_engine *e, TokId t) { return is_stop(e, t.raw()); }
+/** pulsar_family_tokenizer::eos, typed.  @param e the engine  @return eos's (-1 enters as none()) */
+static TokId eos_op(pulsar_engine *e) { return TokId{eos(e)}; }
+/** pulsar_family_tokenizer::token_text, typed.  @param e the engine  @param t the token  @param len its length
+ *  @return token_text's */
+static char *token_text_op(pulsar_engine *e, TokId t, size_t *len) { return token_text(e, t.raw(), len); }
+/** pulsar_family_tokenizer::think_close, typed.  @param e the engine  @return think_close's (-1: none()) */
+static TokId think_close_op(pulsar_engine *e) { return TokId{think_close(e)}; }
+
 const pulsar_family_tokenizer PULSAR_INKLING_TOKENIZER = {
     /* .encode_text              = */ encode_text,
     /* .encode_rendered          = */ encode_rendered,
     /* .chat_open                = */ chat_open,
     /* .chat_turn                = */ chat_turn,
     /* .chat_end_assistant       = */ chat_end_assistant,
-    /* .is_stop                  = */ is_stop,
-    /* .eos                      = */ eos,
-    /* .token_text               = */ token_text,
-    /* .think_close              = */ think_close,
+    /* .is_stop                  = */ is_stop_op,
+    /* .eos                      = */ eos_op,
+    /* .token_text               = */ token_text_op,
+    /* .think_close              = */ think_close_op,
     /* .turn_markers             = */ turn_markers,
     /* .dump                     = */ dump,
     /* .n_tokens                 = */ n_tokens,

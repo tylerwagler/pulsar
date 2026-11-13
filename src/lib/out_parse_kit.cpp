@@ -10,6 +10,7 @@
 
 #include "pulsar_utf8.h"
 #include "pyjson.h"
+#include "xml_call_body.h"
 
 namespace {
 
@@ -323,6 +324,86 @@ bool out_parser::raw_span(size_t *lo, size_t *hi) const {
     return true;
 }
 
+/* ---- the declared type of a tool parameter ----------------------------------------------------- */
+
+namespace {
+
+/// References followed in one chain: deeper declares nothing (a real schema nests two or three).
+constexpr int kParamRefDepth = 8;
+/// Schema nodes one parameter's reading may visit: a schema past it declares nothing (a `$ref` diamond
+/// would otherwise visit 2^depth nodes for every parameter of every call).
+constexpr int kParamNodeBudget = 64;
+
+/* Whether schema node `s` declares string among its types (out_tool_param_type's rule).  `root` is the
+ * function's parameters object (the base of its local references); `chain[0..n_chain)` the reference
+ * targets on the way here; `budget` the nodes left to visit. */
+/// @param root    the function's `parameters` object
+/// @param s       the schema node
+/// @param chain   the `$ref` targets followed to reach `s` (room for kParamRefDepth)
+/// @param n_chain how many
+/// @param budget  in/out: nodes left to visit
+/// @return true when `s` declares string (or a union that includes it)
+bool schema_declares_string(const pyjson_value &root, const pyjson_value &s, const pyjson_value **chain, int n_chain,
+                            int *budget) {
+    if (--*budget < 0 || s.kind != pyjson_value::OBJ) return false;
+    if (const pyjson_value *type = s.get("type")) {   /* a declared type decides alone, as it always did */
+        if (type->kind == pyjson_value::STR) return type->s == "string";
+        if (type->kind == pyjson_value::ARR)
+            for (const pyjson_value &t : type->a)
+                if (t.kind == pyjson_value::STR && t.s == "string") return true;
+        return false;
+    }
+    const pyjson_value *ref = s.get("$ref");
+    if (ref && ref->kind == pyjson_value::STR) {
+        static const char *const kLocal[][2] = {{"#/$defs/", "$defs"}, {"#/definitions/", "definitions"}};
+        for (const auto &l : kLocal) {
+            const size_t n = strlen(l[0]);
+            if (ref->s.compare(0, n, l[0])) continue;
+            const pyjson_value *defs = root.get(l[1]);
+            const pyjson_value *to = defs ? defs->get(ref->s.c_str() + n) : NULL;
+            bool stop = !to || n_chain == kParamRefDepth;   /* unresolved, too deep, or a cycle */
+            for (int i = 0; i < n_chain && !stop; i++) stop = chain[i] == to;
+            if (stop) break;
+            chain[n_chain] = to;
+            if (schema_declares_string(root, *to, chain, n_chain + 1, budget)) return true;
+            break;
+        }
+    }
+    for (const char *k : {"anyOf", "oneOf"})
+        if (const pyjson_value *u = s.get(k); u && u->kind == pyjson_value::ARR)
+            for (const pyjson_value &b : u->a)
+                if (schema_declares_string(root, b, chain, n_chain, budget)) return true;
+    const pyjson_value *all = s.get("allOf");
+    if (all && all->kind == pyjson_value::ARR && all->a.size() == 1 &&
+        schema_declares_string(root, all->a[0], chain, n_chain, budget))
+        return true;
+    const pyjson_value *en = s.get("enum");
+    if (en && en->kind == pyjson_value::ARR && !en->a.empty() &&
+        std::all_of(en->a.begin(), en->a.end(), [](const pyjson_value &v) { return v.kind == pyjson_value::STR; }))
+        return true;
+    const pyjson_value *c = s.get("const");
+    return c && c->kind == pyjson_value::STR;
+}
+
+}  // namespace
+
+const char *out_tool_param_type(const pyjson_value &tools, const std::string &fn, const std::string &key) {
+    for (const pyjson_value &tool : tools.a) {
+        const pyjson_value *f = tool.get("function");
+        if (!f) f = &tool;
+        const pyjson_value *name = f->get("name");
+        if (!name || name->kind != pyjson_value::STR || name->s != fn) continue;
+        const pyjson_value *params = f->get("parameters");
+        const pyjson_value *props = params ? params->get("properties") : NULL;
+        const pyjson_value *prop = props ? props->get(key.c_str()) : NULL;
+        if (!prop) return NULL;
+        const pyjson_value *chain[kParamRefDepth];
+        int budget = kParamNodeBudget;
+        return schema_declares_string(*params, *prop, chain, 0, &budget) ? "string" : "other";
+    }
+    return NULL;
+}
+
 /* ---- the shared JSON call body ----------------------------------------------------------------- */
 
 void out_json_call_body::open() {
@@ -465,5 +546,250 @@ bool out_json_call_body::close(const std::string &b, int index, std::vector<out_
     }
     call->name = name->s;
     call->arguments = args && args_hi_ != std::string::npos ? b.substr(args_lo_, args_hi_ - args_lo_) : "{}";
+    return true;
+}
+
+/* ---- L295 F8 step 2: the chat-format registry of family parsers ---- */
+
+/// The registry's list (zero-initialised before any constructor runs, so registration order does not matter).
+static out_parser_family *g_out_parser_families = nullptr;
+
+void out_parser_family_register(out_parser_family *f) {
+    f->next = g_out_parser_families;
+    g_out_parser_families = f;
+}
+
+const out_parser_family *out_parser_family_find(int chat_format) {
+    for (const out_parser_family *f = g_out_parser_families; f; f = f->next)
+        if (f->chat_format == chat_format) return f;
+    return nullptr;
+}
+
+/* ---- the XML tool-call body (moved from qwen_output.cpp, L295 F8 step 1) ---- */
+
+void xml_call_body::open() {
+    began_ = false;
+    fn_.clear();
+    pay_ = payload_scan();
+}
+
+/* One "<parameter=KEY>\nVALUE\n</parameter>" of function `fn` at b[*i]: 1 = read (*key, the typed *v,
+ * *i past it), 0 = not complete yet, -1 = not a parameter; *why names what is missing or wrong.  The one
+ * reading close and the stream share. */
+int xml_call_body::read_param(const std::string &b, size_t *i, const std::string &fn, std::string *key,
+                              pyjson_value *v, const char **why) const {
+    static const char kParam[] = "<parameter=";
+    const size_t n = strlen(kParam), rem = b.size() - *i;
+    if (b.compare(*i, std::min(rem, n), kParam, std::min(rem, n))) {
+        *why = "expected <parameter= or </function>";
+        return -1;
+    }
+    *why = "unterminated <parameter=KEY>";
+    if (rem < n) return 0;
+    const size_t at = *i + n;
+    const size_t key_end = b.find('>', at);
+    if (b.find('\n', at) < key_end) return -1;
+    if (key_end == std::string::npos) return 0;
+    *why = "unterminated parameter value";
+    const size_t close = b.find("</parameter>", key_end + 1);
+    if (close == std::string::npos) return 0;
+    *key = b.substr(at, key_end - at);
+    size_t vlo = key_end + 1, vhi = close;
+    if (vlo < vhi && b[vlo] == '\n') vlo++;
+    if (vhi > vlo && b[vhi - 1] == '\n') vhi--;
+    const std::string text = b.substr(vlo, vhi - vlo);
+    *i = close + 12;
+    /* A value is JSON only when the schema does not declare it a string
+     * AND the text is exactly what tojson would have written for it: the
+     * template writes every non-string with tojson, so text in any other
+     * spelling can only have been a raw string. */
+    *v = pyjson_value();
+    const char *type = out_tool_param_type(tools, fn, *key);
+    char jerr[8];
+    bool as_json = !(type && !strcmp(type, "string")) && pyjson_parse(text.data(), text.size(), v, jerr, sizeof jerr);
+    if (as_json) {
+        std::string canon;
+        pyjson_dump(*v, &canon);
+        as_json = v->kind != pyjson_value::STR && canon == text;   /* strings are written raw, never tojson */
+        /* a template that spells scalars with str() wrote no "true" / "false" / "null" */
+        if (python_scalars && (v->kind == pyjson_value::BOOL || v->kind == pyjson_value::NUL)) as_json = false;
+    }
+    if (!as_json && python_scalars && !(type && !strcmp(type, "string")) &&
+        (text == "True" || text == "False" || text == "None")) {
+        *v = pyjson_value();
+        v->kind = text == "None" ? pyjson_value::NUL : pyjson_value::BOOL;
+        v->b = text == "True";
+        return 1;
+    }
+    if (!as_json) {
+        *v = pyjson_value();
+        v->kind = pyjson_value::STR;
+        v->s = text;
+    }
+    return 1;
+}
+
+/* The open call's parameters that closed since the last call, as TOOL_ARGS fragments. */
+void xml_call_body::stream_params(const std::string &b, int index, std::vector<out_event> *ev) {
+    static const char kFnEnd[] = "</function>";
+    while (!arg_stop_) {
+        size_t i = arg_pos_;
+        while (i < b.size() && (b[i] == ' ' || b[i] == '\n' || b[i] == '\t' || b[i] == '\r')) i++;
+        const size_t rem = b.size() - i;
+        if (!rem || !b.compare(i, std::min(rem, strlen(kFnEnd)), kFnEnd, std::min(rem, strlen(kFnEnd))))
+            return;   /* the call's close is close()'s */
+        std::string key;
+        pyjson_value v;
+        const char *why = NULL;
+        const int r = read_param(b, &i, fn_, &key, &v, &why);
+        if (r == 0) return;
+        if (r < 0) {
+            arg_stop_ = true;   /* close() names the fault */
+            return;
+        }
+        pyjson_value one;
+        one.kind = pyjson_value::OBJ;
+        one.o.emplace_back(key, std::move(v));
+        std::string d;
+        pyjson_dump(one, &d);   /* {"key": value} */
+        out_event e;
+        e.kind = out_event::TOOL_ARGS;
+        e.index = index;
+        e.text = arg_n_ ? ", " + d.substr(1, d.size() - 2) : d.substr(0, d.size() - 1);
+        ev->push_back(std::move(e));
+        arg_n_++;
+        arg_pos_ = i;
+    }
+}
+
+/* Advance pay_ over the body's new bytes (the kit holds a partial "</tool_call>" out of it: `held`).  A
+ * parameter value starts past "<parameter=KEY>" and ends at the first "</parameter>" -- close()'s
+ * reading. */
+void xml_call_body::scan_payload(const std::string &b, size_t held) {
+    static const char kParam[] = "<parameter=", kParamEnd[] = "</parameter>";
+    payload_scan &ps = pay_;
+    for (;;) {
+        if (!ps.value) {
+            const size_t at = b.find(kParam, ps.pos);
+            if (at == std::string::npos) {
+                ps.pos = b.size() > strlen(kParam) ? std::max(ps.pos, b.size() - strlen(kParam)) : ps.pos;
+                break;
+            }
+            const size_t gt = b.find('>', at);
+            if (gt == std::string::npos) {
+                ps.pos = at;
+                break;
+            }
+            const char *type = out_tool_param_type(tools, fn_, b.substr(at + strlen(kParam), gt - at - strlen(kParam)));
+            ps.value = true;
+            ps.is_string = type && !strcmp(type, "string");
+            ps.json_str = ps.esc = false;
+            ps.pos = ps.vstart = gt + 1;
+            continue;
+        }
+        bool closed = false;
+        while (ps.pos < b.size()) {
+            if (!b.compare(ps.pos, strlen(kParamEnd), kParamEnd)) {
+                ps.pos += strlen(kParamEnd);
+                ps.value = false;
+                closed = true;
+                break;
+            }
+            if (b[ps.pos] == '<' && b.size() - ps.pos < strlen(kParamEnd) &&
+                !b.compare(ps.pos, b.size() - ps.pos, kParamEnd, b.size() - ps.pos))
+                break;   /* a partial closer waits for its next bytes */
+            const char c = b[ps.pos++];
+            if (ps.is_string) continue;
+            if (ps.json_str) {
+                if (ps.esc) ps.esc = false;
+                else if (c == '\\') ps.esc = true;
+                else if (c == '"') ps.json_str = false;
+            } else if (c == '"') {
+                ps.json_str = true;
+            }
+        }
+        if (!closed) break;
+    }
+    /* the payload: inside a string value or a JSON string, past the template's leading newline, not on
+     * "</" of a closer (this block's or the held "</tool_call>") */
+    const size_t pending = b.size() - std::min(ps.pos, b.size());
+    ps.payload = ps.value && (ps.is_string || ps.json_str) && b.size() > ps.vstart && pending < 2 && held < 2;
+}
+
+void xml_call_body::grow(const std::string &b, size_t held, bool closing, int index,
+                         std::vector<out_event> *ev) {
+    if (!began_) {
+        /* announce the call as soon as its name is complete */
+        size_t i = 0;
+        while (i < b.size() && (b[i] == ' ' || b[i] == '\n' || b[i] == '\t' || b[i] == '\r')) i++;
+        if (!b.compare(i, 10, "<function=")) {
+            const size_t e = b.find('>', i + 10);
+            const size_t nl = b.find('\n', i + 10);
+            if (e != std::string::npos && nl > e) {
+                out_event ev_begin;
+                ev_begin.kind = out_event::TOOL_BEGIN;
+                ev_begin.index = index;
+                ev_begin.name = b.substr(i + 10, e - i - 10);
+                fn_ = ev_begin.name;
+                ev->push_back(std::move(ev_begin));
+                began_ = true;
+                arg_pos_ = e + 1;
+                arg_n_ = 0;
+                arg_stop_ = false;
+            }
+        }
+    }
+    if (!began_) return;
+    if (!closing) scan_payload(b, held);
+    stream_params(b, index, ev);   /* closing: a last parameter closed in this piece goes out before the end */
+}
+
+/* The body of one <tool_call> ... </tool_call>. */
+bool xml_call_body::close(const std::string &b, int index, std::vector<out_event> *ev, out_call *call,
+                          const char **why, size_t *at) {
+    size_t i = 0;
+    auto skip_ws = [&]() {
+        while (i < b.size() && (b[i] == ' ' || b[i] == '\n' || b[i] == '\t' || b[i] == '\r')) i++;
+    };
+    auto fail = [&](const char *w) {
+        *why = w;
+        *at = i;
+        return false;
+    };
+    skip_ws();
+    if (b.compare(i, 10, "<function=")) return fail("expected <function=");
+    i += 10;
+    const size_t name_end = b.find('>', i);
+    if (name_end == std::string::npos || b.find('\n', i) < name_end) return fail("unterminated <function=NAME>");
+    const std::string name = b.substr(i, name_end - i);
+    i = name_end + 1;
+    pyjson_value args;
+    args.kind = pyjson_value::OBJ;
+    for (;;) {
+        skip_ws();
+        if (!b.compare(i, 11, "</function>")) {
+            i += 11;
+            break;
+        }
+        std::string key;
+        pyjson_value v;
+        const char *w = NULL;
+        if (read_param(b, &i, name, &key, &v, &w) != 1) return fail(w);
+        bool replaced = false;   /* a repeated key: first position, last value */
+        for (auto &kv : args.o)
+            if (kv.first == key) { kv.second = v; replaced = true; }
+        if (!replaced) args.o.emplace_back(key, std::move(v));
+    }
+    skip_ws();
+    if (i != b.size()) return fail("text after </function>");
+    call->name = name;
+    pyjson_dump(args, &call->arguments);
+    if (!began_) {
+        out_event e;
+        e.kind = out_event::TOOL_BEGIN;
+        e.index = index;
+        e.name = name;
+        ev->push_back(std::move(e));
+    }
     return true;
 }

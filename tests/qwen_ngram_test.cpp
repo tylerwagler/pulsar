@@ -21,7 +21,7 @@
  *
  * usage: qwen_ngram_test VECTORS [--no-rows | --rowfile PATH] */
 #include "pulsar_engine_internal.h"
-#include "qwen_ngram.h"
+#include "../src/families/qwen/qwen_ngram.h"
 
 #include <stdint.h>
 #include <stdio.h>

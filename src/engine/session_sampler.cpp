@@ -29,15 +29,17 @@ bool pulsar_session_dev_alloc(pulsar_session *s, uint32_t n_banks) {
     const uint32_t W = (uint32_t)s->engine->logits_width();
     pulsar_session_dev_rows &d = s->dev;
     d.n_banks = n_banks ? n_banks : 1u;
-    d.live = pulsar_gpu_tensor_alloc((uint64_t)W * sizeof(float));
-    d.bank_rows = pulsar_gpu_tensor_alloc((uint64_t)d.n_banks * W * sizeof(float));
+    d.live = pulsar_gpu_tensor_alloc(bytes_of<float>(W));
+    d.bank_rows = pulsar_gpu_tensor_alloc(bytes_of<float>((uint64_t)d.n_banks * W));
     /* the sampler's scratch, the logprob passes' too (one stream: never both at once) */
-    d.scratch = pulsar_gpu_tensor_alloc(std::max(pulsar_gpu_sample_scratch_bytes(W), pulsar_gpu_logprobs_scratch_bytes(W)));
-    d.out = pulsar_gpu_tensor_alloc(dev_digest_off() + sizeof(uint64_t));
-    d.mask = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_GPU_SAMPLE_ROWS_MAX * mask_words(s) * sizeof(uint32_t));
-    d.lp = pulsar_gpu_tensor_alloc(PULSAR_GPU_SAMPLE_ROWS_MAX * sizeof(pulsar_gpu_logprob_row));
+    d.scratch = pulsar_gpu_tensor_alloc(
+            TensorBytes{std::max(pulsar_gpu_sample_scratch_bytes(W), pulsar_gpu_logprobs_scratch_bytes(W))});
+    d.out = pulsar_gpu_tensor_alloc(TensorBytes{dev_digest_off() + sizeof(uint64_t)});
+    d.mask = pulsar_gpu_tensor_alloc(bytes_of<uint32_t>((uint64_t)PULSAR_GPU_SAMPLE_ROWS_MAX * mask_words(s)));
+    d.lp = pulsar_gpu_tensor_alloc(bytes_of<pulsar_gpu_logprob_row>(PULSAR_GPU_SAMPLE_ROWS_MAX));
     d.bank_valid = (bool *)xcalloc(d.n_banks, sizeof(bool));   /* L375: no bank holds a row yet */
-    d.chain_out = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_GPU_CHAINS_MAX * PULSAR_GPU_CHAIN_SLOTS_MAX * sizeof(int32_t));
+    d.chain_out = pulsar_gpu_tensor_alloc(
+            bytes_of<int32_t>((uint64_t)PULSAR_GPU_CHAINS_MAX * PULSAR_GPU_CHAIN_SLOTS_MAX));
     d.host_stale = false;
     d.live_valid = false;   /* L354: nothing has written the live row: the readers refuse */
     d.step_rows = NULL;
@@ -64,8 +66,8 @@ void pulsar_session_dev_free(pulsar_session *s) {
 /* ---- the live row ------------------------------------------------------------------------------------------- */
 
 bool pulsar_session::live_from_rows(const pulsar_gpu_tensor *rows, uint32_t row) {
-    const uint64_t rb = (uint64_t)engine->logits_width() * sizeof(float);
-    if (!rows || !pulsar_gpu_tensor_copy(dev.live, 0, rows, (uint64_t)row * rb, rb)) {
+    const TensorBytes rb = bytes_of<float>((uint64_t)engine->logits_width());
+    if (!rows || !pulsar_gpu_tensor_copy(dev.live, TensorBytes{0}, rows, rb.times(row), rb)) {
         fprintf(stderr, "pulsar: session: the live row could not be taken from row %u of the step\n", row);
         return false;
     }
@@ -77,7 +79,7 @@ bool pulsar_session::live_from_rows(const pulsar_gpu_tensor *rows, uint32_t row)
 bool pulsar_session::live_from_host(const float *row) {
     const uint64_t rb = (uint64_t)engine->logits_width() * sizeof(float);
     if (row != logits) memcpy(logits, row, rb);
-    if (!pulsar_gpu_tensor_write(dev.live, 0, logits, rb)) return false;
+    if (!pulsar_gpu_tensor_write(dev.live, TensorBytes{0}, logits, TensorBytes{rb})) return false;
     dev.host_stale = false;
     dev.live_valid = true;
     return true;
@@ -98,7 +100,8 @@ const pulsar_gpu_tensor *pulsar_session::live_dev() {
 const float *pulsar_session::live_host() {
     if (!live_dev()) return NULL;
     if (dev.host_stale) {
-        if (!pulsar_gpu_tensor_read(dev.live, 0, logits, (uint64_t)engine->logits_width() * sizeof(float))) {
+        if (!pulsar_gpu_tensor_read(dev.live, TensorBytes{0}, logits,
+                                    bytes_of<float>((uint64_t)engine->logits_width()))) {
             fprintf(stderr, "pulsar: session: the live row's readback failed\n");
             return NULL;
         }
@@ -108,16 +111,17 @@ const float *pulsar_session::live_host() {
 }
 
 bool pulsar_session::live_save_bank(uint32_t bank) {
-    const uint64_t rb = (uint64_t)engine->logits_width() * sizeof(float);
-    if (bank >= dev.n_banks || !pulsar_gpu_tensor_copy(dev.bank_rows, (uint64_t)bank * rb, dev.live, 0, rb)) return false;
+    const TensorBytes rb = bytes_of<float>((uint64_t)engine->logits_width());
+    if (bank >= dev.n_banks || !pulsar_gpu_tensor_copy(dev.bank_rows, rb.times(bank), dev.live, TensorBytes{0},
+                                                       rb)) return false;
     dev.bank_valid[bank] = dev.live_valid;   /* L375: a view with no row saves none */
     return true;
 }
 
 bool pulsar_session::step_row_to_bank(uint32_t row, uint32_t bank) {
-    const uint64_t rb = (uint64_t)engine->logits_width() * sizeof(float);
+    const TensorBytes rb = bytes_of<float>((uint64_t)engine->logits_width());
     if (!dev.step_rows || row >= dev.step_n || bank >= dev.n_banks ||
-        !pulsar_gpu_tensor_copy(dev.bank_rows, (uint64_t)bank * rb, dev.step_rows, (uint64_t)row * rb, rb)) {
+        !pulsar_gpu_tensor_copy(dev.bank_rows, rb.times(bank), dev.step_rows, rb.times(row), rb)) {
         fprintf(stderr, "pulsar: session: row %u of the step could not become bank %u's row\n", row, bank);
         return false;
     }
@@ -126,8 +130,8 @@ bool pulsar_session::step_row_to_bank(uint32_t row, uint32_t bank) {
 }
 
 bool pulsar_session::live_restore_bank(uint32_t bank) {
-    const uint64_t rb = (uint64_t)engine->logits_width() * sizeof(float);
-    if (bank >= dev.n_banks || !pulsar_gpu_tensor_copy(dev.live, 0, dev.bank_rows, (uint64_t)bank * rb, rb))
+    const TensorBytes rb = bytes_of<float>((uint64_t)engine->logits_width());
+    if (bank >= dev.n_banks || !pulsar_gpu_tensor_copy(dev.live, TensorBytes{0}, dev.bank_rows, rb.times(bank), rb))
         return false;
     dev.host_stale = true;
     dev.live_valid = dev.bank_valid[bank];   /* L375: the bank's row, or the fact that it has none */
@@ -168,8 +172,8 @@ static bool draw_launch(pulsar_session *s, const pulsar_gpu_tensor *rows, uint32
         reqs[k].row = row_index[k];
         n_rows = row_index[k] + 1u > n_rows ? row_index[k] + 1u : n_rows;
         if (masks && masks[k]) {
-            if (!pulsar_gpu_tensor_write(dev.mask, (uint64_t)n_mask * words * sizeof(uint32_t), masks[k],
-                                         (uint64_t)words * sizeof(uint32_t)))
+            if (!pulsar_gpu_tensor_write(dev.mask, bytes_of<uint32_t>((uint64_t)n_mask * words), masks[k],
+                                         bytes_of<uint32_t>(words)))
                 return false;
             reqs[k].mask_row = n_mask++;
         }
@@ -191,7 +195,7 @@ bool pulsar_session::draw_rows_width(const pulsar_gpu_tensor *rows, uint32_t wid
                                      const uint32_t *row_index, uint32_t n, pulsar_gpu_sample_req *reqs,
                                      pulsar_gpu_sample_out *out) {
     if (!draw_launch(this, rows, width, id_map, row_index, n, reqs, NULL)) return false;
-    if (!pulsar_gpu_tensor_read(dev.out, 0, out, (uint64_t)n * sizeof(*out))) {
+    if (!pulsar_gpu_tensor_read(dev.out, TensorBytes{0}, out, TensorBytes{sizeof(*out)}.times(n))) {
         fprintf(stderr, "pulsar: session: the device sampler's readback failed\n");
         return false;
     }
@@ -202,7 +206,7 @@ bool pulsar_session::draw_rows_width(const pulsar_gpu_tensor *rows, uint32_t wid
 bool pulsar_session::draw_rows(const pulsar_gpu_tensor *rows, const uint32_t *row_index, uint32_t n,
                                pulsar_gpu_sample_req *reqs, const uint32_t *const *masks, pulsar_gpu_sample_out *out) {
     if (!draw_launch(this, rows, (uint32_t)engine->logits_width(), NULL, row_index, n, reqs, masks)) return false;
-    if (!pulsar_gpu_tensor_read(dev.out, 0, out, (uint64_t)n * sizeof(*out))) {
+    if (!pulsar_gpu_tensor_read(dev.out, TensorBytes{0}, out, TensorBytes{sizeof(*out)}.times(n))) {
         fprintf(stderr, "pulsar: session: the device sampler's readback failed\n");
         return false;
     }
@@ -218,7 +222,7 @@ bool pulsar_session::draw_chains(const pulsar_gpu_tensor *cand, uint64_t cand_of
                                  const pulsar_gpu_chain_req *reqs, uint32_t n, int32_t *tokens) {
     return pulsar_gpu_sample_chains(cand, cand_off, scores, scores_off, slots, topk, vocab, reqs, n, dev.chain_out,
                                     0) &&
-           pulsar_gpu_tensor_read(dev.chain_out, 0, tokens, (uint64_t)n * slots * sizeof(int32_t));
+           pulsar_gpu_tensor_read(dev.chain_out, TensorBytes{0}, tokens, bytes_of<int32_t>((uint64_t)n * slots));
 }
 
 /// A draw request from a row draw: its params, the key at its stream's next index (0 with no stream).
@@ -244,7 +248,7 @@ static void draw_req(const pulsar_row_draw *d, pulsar_gpu_sample_req *q) {
 /// @param tokens [n] receives the tokens (negative = refused row)
 /// @return 0, or 1 refused (bad n, a sampled draw with no stream, a failed launch)
 static int session_draw(pulsar_session *s, const pulsar_gpu_tensor *rows, const uint32_t *row_index,
-                        const pulsar_row_draw *d, uint32_t n, int *tokens) {
+                        const pulsar_row_draw *d, uint32_t n, TokId *tokens) {
     pulsar_gpu_sample_req reqs[PULSAR_GPU_SAMPLE_ROWS_MAX];
     pulsar_gpu_sample_out out[PULSAR_GPU_SAMPLE_ROWS_MAX];
     const uint32_t *masks[PULSAR_GPU_SAMPLE_ROWS_MAX];
@@ -256,7 +260,7 @@ static int session_draw(pulsar_session *s, const pulsar_gpu_tensor *rows, const 
     }
     if (!s->draw_rows(rows, row_index, n, reqs, masks, out)) return 1;
     for (uint32_t k = 0; k < n; k++) {
-        tokens[k] = out[k].token;
+        tokens[k] = TokId{out[k].token};   /* the device sampler's int32 */
         if (out[k].token >= 0 && d[k].rng) pulsar_sample_advance(d[k].rng, 1u);
     }
     return 0;
@@ -264,9 +268,9 @@ static int session_draw(pulsar_session *s, const pulsar_gpu_tensor *rows, const 
 
 int pulsar_session::draw(const pulsar_row_draw *d) {
     const uint32_t zero = 0;
-    int tok = PULSAR_SAMPLE_REFUSED;
+    TokId tok = TokId{PULSAR_SAMPLE_REFUSED};
     const pulsar_gpu_tensor *live = live_dev();
-    return live && session_draw(this, live, &zero, d, 1, &tok) == 0 ? tok : PULSAR_SAMPLE_REFUSED;
+    return live && session_draw(this, live, &zero, d, 1, &tok) == 0 ? tok.raw() : PULSAR_SAMPLE_REFUSED;
 }
 
 int pulsar_session::sample(float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
@@ -289,7 +293,7 @@ int pulsar_session::argmax_excluding(int excluded_id) {
     return draw(&d);
 }
 
-int pulsar_session::draw_step_rows(const uint32_t *rows, const pulsar_row_draw *d, uint32_t n, int *tokens) {
+int pulsar_session::draw_step_rows(const uint32_t *rows, const pulsar_row_draw *d, uint32_t n, TokId *tokens) {
     for (uint32_t k = 0; k < n; k++)
         if (!dev.step_rows || rows[k] >= dev.step_n) {
             fprintf(stderr, "pulsar: session: a draw of row %u of a step that headed %u -- refusing\n", rows[k],
@@ -314,11 +318,11 @@ static bool session_logprobs(pulsar_session *s, const pulsar_gpu_tensor *rows, u
     const uint32_t W = (uint32_t)s->engine->logits_width();
     /* the scored token rides the sampler's out block, where a lane's own draw would sit */
     const pulsar_gpu_sample_out t = {token, 0u, 0.0f, 0u};
-    if (!pulsar_gpu_tensor_write(s->dev.out, 0, &t, sizeof(t)) ||
+    if (!pulsar_gpu_tensor_write(s->dev.out, TensorBytes{0}, &t, TensorBytes{sizeof(t)}) ||
         !pulsar_gpu_logprobs_rows(rows, (uint64_t)row * W * sizeof(float), W, W, 1, NULL, 0, NULL,
                                   token >= 0 ? s->dev.out : NULL, 0, sizeof(t) / sizeof(int32_t), (uint32_t)k,
                                   s->dev.scratch, s->dev.lp) ||
-        !pulsar_gpu_tensor_read(s->dev.lp, 0, L, sizeof(*L))) {
+        !pulsar_gpu_tensor_read(s->dev.lp, TensorBytes{0}, L, TensorBytes{sizeof(*L)})) {
         fprintf(stderr, "pulsar: session: the device logprobs failed\n");
         return false;
     }
@@ -330,7 +334,7 @@ static bool session_logprobs(pulsar_session *s, const pulsar_gpu_tensor *rows, u
 static int clip_k(int k) { return k < 0 ? 0 : k > (int)PULSAR_GPU_LOGPROB_TOPK_MAX ? (int)PULSAR_GPU_LOGPROB_TOPK_MAX : k; }
 /// @param t a device token score
 /// @return it as the public pulsar_token_score
-static pulsar_token_score score(const pulsar_gpu_token_score &t) { return pulsar_token_score{t.id, t.logit, t.logprob}; }
+static pulsar_token_score score(const pulsar_gpu_token_score &t) { return pulsar_token_score{TokId{t.id}, t.logit, t.logprob}; }
 
 /* the host scorers' contracts: top fills k entries (k clipped to the width; -1 / NEG_INF past the finite ones) and
  * returns that count, 0 for a row with no finite value; the token's 1, or 0 with `out` untouched */
@@ -339,7 +343,7 @@ static pulsar_token_score score(const pulsar_gpu_token_score &t) { return pulsar
 /// @param k entries (already clipped)
 static void fill_top(const pulsar_gpu_logprob_row &L, pulsar_token_score *top, int k) {
     for (int i = 0; i < k; i++)
-        top[i] = (uint32_t)i < L.n_top ? score(L.top[i]) : pulsar_token_score{-1, PULSAR_NEG_INF, PULSAR_NEG_INF};
+        top[i] = (uint32_t)i < L.n_top ? score(L.top[i]) : pulsar_token_score{TokId::none(), PULSAR_NEG_INF, PULSAR_NEG_INF};
 }
 
 int pulsar_session::top_logprobs(pulsar_token_score *out, int k) {
@@ -377,7 +381,7 @@ int pulsar_session::step_row_logprobs(uint32_t row, int token, pulsar_token_scor
 bool pulsar_session::rows_digest(const pulsar_gpu_tensor *rows, uint32_t row0, uint32_t n, uint64_t *out) {
     const uint32_t W = (uint32_t)engine->logits_width();
     if (!rows || !pulsar_gpu_rows_digest(rows, (uint64_t)row0 * W * sizeof(float), n, W, dev.out, dev_digest_off()) ||
-        !pulsar_gpu_tensor_read(dev.out, dev_digest_off(), out, sizeof(*out))) {
+        !pulsar_gpu_tensor_read(dev.out, TensorBytes{dev_digest_off()}, out, TensorBytes{sizeof(*out)})) {
         fprintf(stderr, "pulsar: session: the rows' digest failed\n");
         return false;
     }

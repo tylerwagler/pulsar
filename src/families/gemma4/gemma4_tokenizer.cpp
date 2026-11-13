@@ -7,14 +7,14 @@
  * files).  A container without them does not load.
  *
  * The chat front (pulsar_chat_open / _append_turn / _end_assistant: the CLI REPL and the agent) is the renderer,
- * src/lib/gemma4_chat: the head is <bos> and the system turn (thinking's <|think|>, the system text), a turn the
+ * src/families/gemma4/gemma4_chat: the head is <bos> and the system turn (thinking's <|think|>, the system text), a turn the
  * renderer's messages and generation prompt, the close the "<turn|>\n" a sampled turn's tail opens with.  The server
- * renders with the same library behind its family table (src/server/family_gemma4.cpp). */
+ * renders with the same library behind its family table (src/families/gemma4/gemma4_server.cpp). */
 /** @file gemma4_tokenizer.cpp
  *  @brief Gemma 4's tokenizer table: the shared BPE engine's SentencePiece-BPE row. */
 #include "gemma4.h"
 #include "lib/bpe_tokenizer.h"
-#include "lib/gemma4_chat.h"
+#include "gemma4_chat.h"
 
 #include <string.h>
 #include <sys/stat.h>
@@ -69,7 +69,7 @@ bool encode_into(const pulsar_engine *e, const char *text, size_t len, const pul
         if (why && whylen) snprintf(why, whylen, "%s", err);
         return false;
     }
-    for (int id : ids) pulsar_tokens_push(out, id);
+    for (int id : ids) pulsar_tokens_push(out, TokId{id});
     return true;
 }
 
@@ -249,10 +249,10 @@ bool turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
                     model.v[0] != system.v[0] && user.v[0] != system.v[0];
     pulsar_tokens_free(&system);
     if (ok) {
-        out->user[0] = start;
+        out->user[0] = TokId{start};
         out->user[1] = user.v[0];
         out->n_user = 2;
-        out->assistant[0] = start;
+        out->assistant[0] = TokId{start};
         out->assistant[1] = model.v[0];
         out->n_assistant = 2;
     } else {
@@ -274,12 +274,12 @@ bool turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
  *  @param tokens  the ids to print */
 void dump(pulsar_engine *e, FILE *fp, const pulsar_tokens *tokens) {
     fprintf(fp, "[");
-    for (int i = 0; i < tokens->len; i++) fprintf(fp, "%s%d", i ? ", " : "", tokens->v[i]);
+    for (int i = 0; i < tokens->len; i++) fprintf(fp, "%s%d", i ? ", " : "", tokens->v[i].raw());
     fprintf(fp, "]\n");
     for (int i = 0; i < tokens->len; i++) {
         size_t n = 0;
-        char *piece = token_text(e, tokens->v[i], &n);
-        fprintf(fp, "%6d  ", tokens->v[i]);
+        char *piece = token_text(e, tokens->v[i].raw(), &n);
+        fprintf(fp, "%6d  ", tokens->v[i].raw());
         pulsar_dump_piece_quoted(fp, piece, n);
         fputc('\n', fp);
         free(piece);
@@ -293,19 +293,60 @@ int n_tokens(pulsar_engine *e) { return bpe_tokenizer_n_tokens(TOK(e)); }
 
 }  // namespace
 
+/** pulsar_family_tokenizer::calls_continue_turn: Gemma 4 answers a tool call inside its model turn (L338). */
+/// @param e the engine (unused: every Gemma 4 engine does)
+/// @return true
+static bool calls_continue_turn(const pulsar_engine *e) {
+    (void)e;
+    return true;
+}
+
+/** pulsar_family_tokenizer::opens_reasoning: the rendered prompt's own markers decide (moved from the engine's
+ *  tokenizer.cpp, L295 F8 step 3). */
+/// @param e          the engine
+/// @param tokens     the prompt
+/// @param think_mode unused: the template's markers already say it
+/// @return true when the prompt's tail opens a thought channel
+static bool opens_reasoning(pulsar_engine *e, const pulsar_tokens *tokens, pulsar_think_mode think_mode) {
+    (void)think_mode;
+    /* the tail is enough: the markers it looks for close a turn's last few tokens */
+    const int from = tokens && tokens->len > 64 ? tokens->len - 64 : 0;
+    std::string text;
+    for (int i = from; tokens && i < tokens->len; i++) {
+        size_t n = 0;
+        char *t = pulsar_token_text(e, tokens->v[i], &n);
+        text.append(t, n);
+        free(t);
+    }
+    return gemma4_prompt_opens_reasoning(text.c_str());
+}
+
+/* L334 P3: the family's ids leave the tokenizer here, typed (its internals stay raw). */
+/** pulsar_family_tokenizer::is_stop, typed.  @param e the engine  @param t the token  @return is_stop's */
+static bool is_stop_op(pulsar_engine *e, TokId t) { return is_stop(e, t.raw()); }
+/** pulsar_family_tokenizer::eos, typed.  @param e the engine  @return eos's (-1 enters as none()) */
+static TokId eos_op(pulsar_engine *e) { return TokId{eos(e)}; }
+/** pulsar_family_tokenizer::token_text, typed.  @param e the engine  @param t the token  @param len its length
+ *  @return token_text's */
+static char *token_text_op(pulsar_engine *e, TokId t, size_t *len) { return token_text(e, t.raw(), len); }
+/** pulsar_family_tokenizer::think_close, typed.  @param e the engine  @return think_close's (-1: none()) */
+static TokId think_close_op(pulsar_engine *e) { return TokId{think_close(e)}; }
+
 const pulsar_family_tokenizer PULSAR_GEMMA4_TOKENIZER = {
     /* .encode_text              = */ encode_text,
     /* .encode_rendered          = */ encode_rendered,
     /* .chat_open                = */ chat_open,
     /* .chat_turn                = */ chat_turn,
     /* .chat_end_assistant       = */ chat_end_assistant,
-    /* .is_stop                  = */ is_stop,
-    /* .eos                      = */ eos,
-    /* .token_text               = */ token_text,
-    /* .think_close              = */ think_close,
+    /* .is_stop                  = */ is_stop_op,
+    /* .eos                      = */ eos_op,
+    /* .token_text               = */ token_text_op,
+    /* .think_close              = */ think_close_op,
     /* .turn_markers             = */ turn_markers,
     /* .dump                     = */ dump,
     /* .n_tokens                 = */ n_tokens,
+    /* .calls_continue_turn      = */ calls_continue_turn,
+    /* .opens_reasoning          = */ opens_reasoning,
 };
 
 bool pulsar_gemma4_load_tokenizer(pulsar_gemma4_model *w, const char *model_path) {

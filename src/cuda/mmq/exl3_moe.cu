@@ -9,7 +9,7 @@
 #include "ds4_mmid.cuh"
 #include "ds4_mmq.h"
 #include "../pulsar_cuda_scratch.h"
-#include "../pulsar_cuda_qwen.h"   /* pulsar_ffn_act */
+#include "../pulsar_cuda_rows.h"   /* pulsar_ffn_act */
 #include "cuda/pulsar_cuda_mx.cuh"
 #include "engine/exl3_trellis.h"
 

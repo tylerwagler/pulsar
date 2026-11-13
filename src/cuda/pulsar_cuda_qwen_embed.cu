@@ -3,7 +3,7 @@
 /* Qwen3.8-Flash-Next (L251 S4): the token embedding into the four residual
  * streams, and the two engine-facing lookups the family ops need -- a weight's
  * device pointer and an EXL3 expert stack's pointer table -- so the ops
- * (src/engine/family_qwen_s4.cpp) stay CUDA-free.  Contracts in
+ * (src/families/qwen/family_qwen_s4.cpp) stay CUDA-free.  Contracts in
  * pulsar_cuda_qwen.h. */
 #include "pulsar_cuda_internal.h"
 #include "pulsar_cuda_qwen.h"

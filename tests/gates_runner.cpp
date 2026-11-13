@@ -63,7 +63,7 @@
  * not the whole table.
  *
  * `--needs=a,b` (L278) restricts a model -- the primary too, before any `--model` -- to the table entries whose needs
- * include at least one of those (tokenizer, spec, fixtures, vision, block, graphs).  The table's needs column stays the
+ * include at least one of those (tokenizer, spec, fixtures, vision, block, graphs, state).  The table's needs column stays the
  * one authority; no list of gate names.
  *
  * PULSAR_GATES_SECTIONS=FILE (make gates): one line `cuda-runner-gate [<family>] SECONDS` per hosted model is
@@ -219,6 +219,10 @@ enum {
     NEED_STEP_GRAPHS   = 1u << 5,   /* L357: the core driver graphs its decode / verify steps (the family's driver ops
                                      * stage them, step_driver.cpp graphable) -- read from pulsar_driver_ops::stage,
                                      * the second reach past the public queries (there is no query for it) */
+    NEED_STATE         = 1u << 6,   /* L382: the declared state (state_kinds.h) the state readers grade -- a family on
+                                     * the core step driver with a state plan; DeepSeek V4 keeps its own caches (a
+                                     * session's s->states is NULL there) -- read from the family's driver and the
+                                     * engine's state plan, the third reach past the public queries */
 };
 
 static const char *need_name(uint32_t bit) {
@@ -229,6 +233,7 @@ static const char *need_name(uint32_t bit) {
     case NEED_VISION:        return "a vision tower (images)";
     case NEED_BLOCK:         return "a block drafter (LiLiCorr, DFlash2)";
     case NEED_STEP_GRAPHS:   return "graphed driver steps (the family's driver ops stage its decode / verify steps)";
+    case NEED_STATE:         return "declared state (state_kinds.h: a family on the core step driver)";
     }
     return "?";
 }
@@ -257,7 +262,7 @@ typedef struct {
 static bool parse_needs(const char *list, uint32_t *out, const char **bad) {
     static const struct { const char *name; uint32_t bit; } k[] = {
         {"tokenizer", NEED_TOKENIZER}, {"spec", NEED_SPEC}, {"fixtures", NEED_FIXTURES}, {"vision", NEED_VISION},
-        {"block", NEED_BLOCK}, {"graphs", NEED_STEP_GRAPHS},
+        {"block", NEED_BLOCK}, {"graphs", NEED_STEP_GRAPHS}, {"state", NEED_STATE},
     };
     *out = 0;
     for (const char *p = list; *p;) {
@@ -432,11 +437,12 @@ static int host_model(hosted_model *hm, const char *path, bool primary) {
     if (pulsar_engine_has_vision(e)) hm->has |= NEED_VISION;
     if (pulsar_engine_drafter(e) == PULSAR_DRAFTER_BLOCK) hm->has |= NEED_BLOCK;
     if (e->family->driver && e->family->driver->stage) hm->has |= NEED_STEP_GRAPHS;
+    if (e->family->driver && e->state_plan.n_slots > 0) hm->has |= NEED_STATE;
     if (primary) hm->has |= NEED_FIXTURES;
-    printf("\ngates_runner: hosting %s (%s%s):%s%s%s%s%s\n", path, hm->family, primary ? ", primary" : "",
+    printf("\ngates_runner: hosting %s (%s%s):%s%s%s%s%s%s\n", path, hm->family, primary ? ", primary" : "",
            hm->has & NEED_TOKENIZER ? " tokenizer" : "", hm->has & NEED_SPEC ? " spec" : "",
            hm->has & NEED_BLOCK ? " block" : "", hm->has & NEED_VISION ? " vision" : "",
-           hm->has & NEED_STEP_GRAPHS ? " step-graphs" : "");
+           hm->has & NEED_STEP_GRAPHS ? " step-graphs" : "", hm->has & NEED_STATE ? " state" : "");
     fflush(stdout);
     return 0;
 }
@@ -546,7 +552,7 @@ int main(int argc, char **argv) {
             const char *bad = argv[i] + 8;
             if (!parse_needs(argv[i] + 8, &cur->needs_any, &bad)) {
                 fprintf(stderr, "gates_runner: --needs=%s: '%s' is not a need (tokenizer, spec, fixtures, vision, block, "
-                                "graphs)\n", argv[i] + 8, bad);
+                                "graphs, state)\n", argv[i] + 8, bad);
                 return 2;
             }
             i += 1;
@@ -648,9 +654,10 @@ int main(int argc, char **argv) {
          * accounting, head graph replay), on the declared state and the core step driver: an idle
          * bank untouched by its neighbours' batched steps, batch order and a batchmate's position invisible to a row;
          * touched KV == the physical a fill takes and a bank free returns; a replayed decode / verify step graph ==
-         * the eager step at the same row count */
-        {"bank-isolation-gate",       gate_bank_isolation_gate_main,    3, NULL, NULL, {NULL}, 0},
-        {"kv-accounting-gate",        gate_kv_accounting_gate_main,     2, NULL, NULL, {NULL}, 0},
+         * the eager step at the same row count.  L382: the first two read the declared state, which DeepSeek V4 (the
+         * gates-dev primary) does not have -- N/A there by name, not a FAIL on the gate's own refusal */
+        {"bank-isolation-gate",       gate_bank_isolation_gate_main,    3, NULL, NULL, {NULL}, NEED_STATE},
+        {"kv-accounting-gate",        gate_kv_accounting_gate_main,     2, NULL, NULL, {NULL}, NEED_STATE},
         {"graph-eager-gate",          gate_graph_eager_gate_main,       4, NULL, NULL, {NULL},
          NEED_SPEC | NEED_STEP_GRAPHS},
     };

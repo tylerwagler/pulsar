@@ -76,8 +76,8 @@ static bool read_images(const char *path, std::vector<std::vector<uint8_t>> *out
 static bool build_prompt(pulsar_engine *e, int pre, int total, pulsar_image_ref *img, pulsar_tokens *out,
                          int *block_len, char *err, size_t errlen) {
     pulsar_tokens raw = {};
-    for (int i = 0; i < pre; i++) pulsar_tokens_push(&raw, 100 + i % 7);
-    pulsar_tokens_push(&raw, e->family->vision->placeholder_id(e));
+    for (int i = 0; i < pre; i++) pulsar_tokens_push(&raw, TokId{100 + i % 7});
+    pulsar_tokens_push(&raw, TokId{e->family->vision->placeholder_id(e)});
     bool ok = pulsar_expand_image_placeholders(e, &raw, 0, img, 1, out, err, errlen) == 1;
     pulsar_tokens_free(&raw);
     if (ok && !(img->start_pos == pre &&
@@ -87,7 +87,7 @@ static bool build_prompt(pulsar_engine *e, int pre, int total, pulsar_image_ref 
     }
     if (!ok) return false;
     const int end = total > 0 ? total : (int)((out->len + VCG_GRID - 1u) / VCG_GRID * VCG_GRID) + 3;
-    for (int i = out->len; i < end; i++) pulsar_tokens_push(out, 200 + i % 5);
+    for (int i = out->len; i < end; i++) pulsar_tokens_push(out, TokId{200 + i % 5});
     return out->len == end;
 }
 
@@ -98,12 +98,13 @@ static uint32_t plan_chunks(pulsar_session *s, const pulsar_tokens *p, const pul
     pulsar_prefill_shape shape = {};
     s->engine->family->session->sync->prefill_shape(s, &shape);
     pulsar_prefill_plan plan;
-    pulsar_prefill_plan_init(&plan, &shape, start, pulsar_session_kv_store(s), s->engine, p, img, 1);
+    pulsar_prefill_plan_init(&plan, &shape, pulsar_ckpt_pos(start), pulsar_session_kv_store(s), s->engine, p, img, 1);
     uint32_t owner = UINT32_MAX;
     size_t w = 0;
     desc[0] = 0;
     for (uint32_t pos = start; pos < (uint32_t)p->len;) {
-        const uint32_t end = pulsar_prefill_plan_next_end(&plan, pos, (uint32_t)p->len);
+        const TokPos end_at = pulsar_prefill_plan_next_end(&plan, pulsar_ckpt_pos(pos), pulsar_ckpt_pos((uint32_t)p->len));
+        const uint32_t end = pulsar_ckpt_raw(end_at);
         if (end <= pos) break;
         if (bs >= pos && bs < end) owner = pos;
         if (w < n) w += (size_t)snprintf(desc + w, n - w, " [%u,%u)", pos, end);

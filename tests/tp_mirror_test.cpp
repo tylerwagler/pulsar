@@ -111,9 +111,9 @@ static pulsar_session *fabricate_session(pulsar_engine *e, uint64_t mirror_id) {
     return s;
 }
 
-static void fill_prompt(pulsar_tokens *p, int *v, int n) {
+static void fill_prompt(pulsar_tokens *p, TokId *v, int n) {
     std::memset(p, 0, sizeof(*p));
-    for (int i = 0; i < n; i++) v[i] = 100 + i;
+    for (int i = 0; i < n; i++) v[i] = TokId{100 + i};
     p->v = v;
     p->len = n;
     p->cap = n;
@@ -123,21 +123,21 @@ static void fill_prompt(pulsar_tokens *p, int *v, int n) {
 
 static int run_leader(pulsar_tp *tp) {
     char err[512];
-    int toks[16];
+    TokId toks[16];
     pulsar_tokens prompt;
     fill_prompt(&prompt, toks, 16);
 
     /* A. Four acked operations for an unknown session: each must come back as
      * a failed ACK naming the operation.  send_* reporting nonzero is itself
      * the convention check. */
-    CHECK(pulsar_tp_send_sync(tp, SID, prompt.v, (uint32_t)prompt.len) != 0,
+    CHECK(pulsar_tp_send_sync(tp, SID, pulsar_tok_ids_raw(prompt.v), (uint32_t)prompt.len) != 0,
           "send_sync must report success as nonzero");
     err[0] = 0;
     CHECK(!pulsar_tp_wait_command_ack(tp, SID, "sync", err, sizeof(err)) &&
           std::strstr(err, "sync failed") != NULL,
           "the leader must read the worker's sync refusal as a failed ack: %s", err);
 
-    CHECK(pulsar_tp_send_eval(tp, SID, 4242, 99) != 0, "send_eval must report success as nonzero");
+    CHECK(pulsar_tp_send_eval(tp, SID, 4242, TokId{99}) != 0, "send_eval must report success as nonzero");
     err[0] = 0;
     CHECK(!pulsar_tp_wait_command_ack(tp, SID, "eval", err, sizeof(err)) &&
           std::strstr(err, "eval failed") != NULL,
@@ -181,7 +181,8 @@ static int run_leader(pulsar_tp *tp) {
      * NEGATIVE status and the verdict collector reads it as a refusal. */
     {
         int status = -99;
-        CHECK(pulsar_tp_send_bank_state_restore(tp, SID, 1u) != 0, "send_bank_state_restore must report success");
+        CHECK(pulsar_tp_send_bank_state_restore(tp, SID, BankId{1u}) != 0,
+              "send_bank_state_restore must report success");
         err[0] = 0;
         CHECK(!pulsar_tp_wait_command_status(tp, SID, "bank state restore", &status, err, sizeof(err)) &&
               std::strstr(err, "refused") != NULL,
@@ -206,7 +207,8 @@ static int run_leader(pulsar_tp *tp) {
         CHECK(!pulsar_tp_wait_command_status(tp, SID, "spec_next_base", &status, err, sizeof(err)) &&
               std::strstr(err, "refused") != NULL,
               "an unknown-session spec_next_base must come back as a refusal: %s", err);
-        CHECK(pulsar_tp_send_bank_alloc_physical(tp, SID, 2u) != 0, "send_bank_alloc_physical must report success");
+        CHECK(pulsar_tp_send_bank_alloc_physical(tp, SID, BankId{2u}) != 0,
+              "send_bank_alloc_physical must report success");
         err[0] = 0;
         CHECK(!pulsar_tp_wait_command_status(tp, SID, "bank alloc physical", &status, err, sizeof(err)) &&
               std::strstr(err, "refused") != NULL,
@@ -228,8 +230,8 @@ static int run_leader(pulsar_tp *tp) {
 
     /* B. A void frame for an unknown session marks the worker's pair failed
      * silently; the next acked frame must carry that back AT ONCE. */
-    CHECK(pulsar_tp_send_rewind(tp, SID, 12) != 0, "send_rewind must report success as nonzero");
-    CHECK(pulsar_tp_send_sync(tp, SID, prompt.v, 4) != 0, "post-void sync send failed");
+    CHECK(pulsar_tp_send_rewind(tp, SID, TokPos{12}) != 0, "send_rewind must report success as nonzero");
+    CHECK(pulsar_tp_send_sync(tp, SID, pulsar_tok_ids_raw(prompt.v), 4) != 0, "post-void sync send failed");
     err[0] = 0;
     CHECK(!pulsar_tp_wait_command_ack(tp, SID, "sync", err, sizeof(err)),
           "the leader must see the worker's refusal after the void divergence");
@@ -270,7 +272,7 @@ static int run_worker(pulsar_tp *tp) {
      * by name, before any frame moves. */
     {
         pulsar_session *s = fabricate_session(e, SID);
-        int toks[4];
+        TokId toks[4];
         pulsar_tokens prompt;
         fill_prompt(&prompt, toks, 4);
         const int rc = pulsar_session_sync_mm(s, &prompt, NULL, 0, err, sizeof(err));

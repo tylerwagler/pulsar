@@ -115,7 +115,7 @@ typedef struct pulsar_family_vision {
      *  artifact has none) */
     bool (*is_sentinel)(const pulsar_engine *e, int32_t id);
     /** true and *len = the block's length when `ids[start..]` begins an image block */
-    bool (*block_extent)(const pulsar_engine *e, const int32_t *ids, int n, int start, int *len);
+    bool (*block_extent)(const pulsar_engine *e, const TokId *ids, int n, int start, int *len);
     /** The text a chat renderer writes where one image goes; it carries the placeholder token once. */
     const char *placeholder_text;
     /** The placeholder token the expansion replaces, one per image, or -1 when the tokenizer has none. */
@@ -129,7 +129,7 @@ typedef struct pulsar_family_vision {
     /** The `block_len` rows image `img` puts at its block `ids[0..block_len)`, into `out`.  `tower` is the image's
      *  tower output (n_tower rows, position-independent) when the core's cache holds it; NULL = run the tower and
      *  hand its output to the core through *tower_out / *n_tower_out (malloc'd; the core caches and frees it). */
-    bool (*block_rows)(const pulsar_engine *e, const pulsar_image_ref *img, const int32_t *ids, int block_len,
+    bool (*block_rows)(const pulsar_engine *e, const pulsar_image_ref *img, const TokId *ids, int block_len,
                        const uint16_t *tower, int n_tower, uint16_t **tower_out, int *n_tower_out, uint16_t *out,
                        char *err, size_t errlen);
     /** Optional (NULL = blocks have no 2D layout): the block's grid in rows, *h x *w = its length -- what
@@ -274,13 +274,13 @@ typedef struct pulsar_family_tokenizer {
     /** Append the close of a sampled assistant turn. */
     bool (*chat_end_assistant)(pulsar_engine *e, pulsar_tokens *tokens);
     /** true when `token` is any of the tokenizer's stop ids. */
-    bool (*is_stop)(pulsar_engine *e, int token);
+    bool (*is_stop)(pulsar_engine *e, TokId token);
     /** The stop id a caller that needs ONE uses (pulsar_token_is_stop tests them all). */
-    int (*eos)(pulsar_engine *e);
+    TokId (*eos)(pulsar_engine *e);
     /** `token`'s bytes, malloc'd and NUL-terminated (empty for an id outside the table). */
-    char *(*token_text)(pulsar_engine *e, int token, size_t *len);
+    char *(*token_text)(pulsar_engine *e, TokId token, size_t *len);
     /** The token id that closes a thinking span, or -1 when the tokenizer has none. */
-    int (*think_close)(pulsar_engine *e);
+    TokId (*think_close)(pulsar_engine *e);
     /** The turn markers the server's prefix anchors scan for; false = unknown (said once). */
     bool (*turn_markers)(pulsar_engine *e, pulsar_turn_markers *out);
     /** --dump-tokens: the ids, then one line per token. */
@@ -288,6 +288,12 @@ typedef struct pulsar_family_tokenizer {
     /** Ids in the tokenizer's TABLE (pulsar_engine_vocab_size), not the logits row width (L295 F5: the
      *  hook replaces the engine's branch on which family's tokenizer is loaded). */
     int (*n_tokens)(pulsar_engine *e);
+    /** L295 F8 step 3: the model answers a tool call INSIDE its assistant turn (pulsar.h pulsar_chat_calls_continue_turn:
+     *  the turn stays open and the next one opens with the responses).  NULL = false (the turn closes at a call). */
+    bool (*calls_continue_turn)(const pulsar_engine *e);
+    /** L295 F8 step 3: does the generation prompt in `tokens` open a reasoning span (pulsar.h
+     *  pulsar_chat_opens_reasoning)?  NULL = the think mode decides (pulsar_think_mode_enabled). */
+    bool (*opens_reasoning)(pulsar_engine *e, const pulsar_tokens *tokens, pulsar_think_mode think_mode);
 } pulsar_family_tokenizer;
 
 /** L351: fill `m`'s tool-result suffix (pulsar_turn_markers::tool) for a template that renders a tool message as a
@@ -317,44 +323,44 @@ typedef struct {
     int (*count)(pulsar_session *s);
     /** The live host view into bank's carry -- the core's pulsar_bank_carry_save_view (L272 P2) plus any
      *  device side of the family's own; the history readers are the core's (pulsar_bank_history). */
-    void (*save)(pulsar_session *s, uint32_t bank);
+    void (*save)(pulsar_session *s, BankId bank);
     /** Make `bank` live: the core's pulsar_bank_carry_restore_view, and what a bank with no carry means.
      *  false = refused. */
-    bool (*restore)(pulsar_session *s, uint32_t bank);
+    bool (*restore)(pulsar_session *s, BankId bank);
     /** L266: the family's grid checkpoints (kv_state.h), keyed by bank like DeepSeek's graph.ckpt. */
     struct pulsar_ckpt_store *(*kv_store)(pulsar_session *s);
     /** L266: where `bank`'s prefill-only history ends (the deepest point a checkpoint may sit), in the host view
      *  asked (L380, pulsar_bank_view: a family that keeps the fact in the host view reads the saved one's). */
-    uint32_t (*prefill_frontier)(pulsar_session *s, uint32_t bank, pulsar_bank_view view);
+    TokPos (*prefill_frontier)(pulsar_session *s, BankId bank, pulsar_bank_view view);
     /** L266: the bank sync / eval run on (the store's walk reads and writes this one). */
-    uint32_t (*live)(pulsar_session *s);
+    BankId (*live)(pulsar_session *s);
     /** L270: the demand-paged (physical-on-touch) KV bytes ONE bank reserves at ctx_size -- the share
      * admission prices as it is touched, not up front. */
     KvBytes (*demand_paged_bytes)(pulsar_engine *e, int ctx_size);
     /** L270: `bank`'s touched demand-paged KV: what its pages physically hold. */
-    KvBytes (*touched_kv_bytes)(pulsar_session *s, uint32_t bank);
+    KvBytes (*touched_kv_bytes)(pulsar_session *s, BankId bank);
     /** L270: the most one bank's touched KV can grow over q token rows (a decode quantum, a prompt, a chunk): the
      *  family's one conversion of rows to bytes (L333). */
     KvBytes (*growth_bytes)(pulsar_session *s, KvRows q);
     /** L284 #3: return an idle bank's demand-paged KV physical (cudaFree) -- the
      *  pulsar_session_bank_free_physical contract: false ONLY on a refusal (the live bank, a
      *  bank out of range) with nothing freed; true = the bank is evicted, its touched KV 0. */
-    bool (*free_physical)(pulsar_session *s, uint32_t bank);
+    bool (*free_physical)(pulsar_session *s, BankId bank);
     /** L284 #3: re-back an evicted bank (fresh managed tensors, physical on touch).  Idempotent;
      *  on a failure the bank is left wholly evicted.  The caller reloads its KV (segment chain). */
-    bool (*alloc_physical)(pulsar_session *s, uint32_t bank);
+    bool (*alloc_physical)(pulsar_session *s, BankId bank);
     /** L284 #3: true while any of the bank's demand-paged KV is missing. */
-    bool (*is_evicted)(const pulsar_session *s, uint32_t bank);
+    bool (*is_evicted)(const pulsar_session *s, BankId bank);
     /** Optional.  Point the device views at `bank` without its host carry (0 = done, 1 = refused).
      *  NULL = the family's repoint IS a restore (Qwen: nothing on the device to point). */
-    int (*repoint)(pulsar_session *s, uint32_t bank);
+    int (*repoint)(pulsar_session *s, BankId bank);
     /** Optional, present exactly when the family declares PULSAR_FAMILY_CAP_REWIND (pulsar_family_for_model
      *  asserts it): trim the live bank's history to `pos` (pulsar.h pulsar_session_rewind). */
-    void (*rewind)(pulsar_session *s, int pos);
+    void (*rewind)(pulsar_session *s, TokPos pos);
     /** Optional.  A standalone restore of the live bank to its grid checkpoint at G, history trimmed to G
      *  (pulsar_session_restore_checkpoint).  NULL = the family restores a checkpoint only as its sync resumes
      *  from it, and a segment chain's last restore is the store's alone (L272 B1). */
-    bool (*restore_checkpoint)(pulsar_session *s, uint32_t G);
+    bool (*restore_checkpoint)(pulsar_session *s, TokPos G);
     /** Are the session's banks a pool -- per-bank device state the batched lanes address by bank?  (DeepSeek:
      *  false with the pool disabled, where bank 0 is the classic tensors though count() says 1.)  The round
      *  core defers its drafter seeds to one banked pass only on a pool (seed_defer, L260). */

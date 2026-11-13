@@ -59,7 +59,7 @@ void logprob_ledger_free(logprob_ledger *lg) {
 /// @return the length of the filled prefix (entries before the first id < 0)
 static int logprob_trim(const pulsar_token_score *top, int n) {
     int i = 0;
-    while (i < n && top[i].id >= 0) i++;
+    while (i < n && top[i].id.is_token()) i++;
     return i;
 }
 
@@ -75,7 +75,7 @@ static int logprob_trim(const pulsar_token_score *top, int n) {
 void logprob_capture_session(logprob_ledger *lg, pulsar_session *sess, int token) {
     if (!lg || !lg->enabled) return;
     pulsar_token_score chosen;
-    lg->pending_logprob = pulsar_session_token_logprob(sess, token, &chosen)
+    lg->pending_logprob = pulsar_session_token_logprob(sess, TokId{token}, &chosen)
                               ? chosen.logprob : -INFINITY;
     lg->pending_n_top = lg->top_k > 0
                             ? logprob_trim(lg->pending_top,
@@ -100,7 +100,7 @@ void logprob_capture_row(logprob_ledger *lg, pulsar_session *sess, uint32_t row,
     pulsar_token_score chosen;
     int have = 0, n_top = 0;
     const int k = lg->top_k > 0 ? lg->top_k : 0;
-    if (pulsar_session_step_row_logprobs(sess, row, token, &chosen, &have, k ? lg->pending_top : NULL, k, &n_top) != 0) {
+    if (pulsar_session_step_row_logprobs(sess, row, TokId{token}, &chosen, &have, k ? lg->pending_top : NULL, k, &n_top) != 0) {
         have = 0;
         n_top = 0;
     }
@@ -153,7 +153,7 @@ bool logprob_commit(logprob_ledger *lg, pulsar_engine *engine, int token,
         for (int i = 0; i < e->n_top; i++) {
             size_t n = 0;
             char *text = pulsar_token_text(engine, lg->pending_top[i].id, &n);
-            e->top[i].token = lg->pending_top[i].id;
+            e->top[i].token = lg->pending_top[i].id.raw();
             e->top[i].piece = text ? text : server_xstrndup("", 0);
             e->top[i].piece_len = text ? n : 0;
             e->top[i].logprob = lg->pending_top[i].logprob;

@@ -57,7 +57,7 @@ static double maxdiff(const std::vector<float> &a, const std::vector<float> &b) 
 }
 
 /* the logits after the sync, then after each of the 4 decode steps */
-static bool after_sync(pulsar_session *s, const int32_t *next, int W, std::vector<std::vector<float>> *out, char *err,
+static bool after_sync(pulsar_session *s, const TokId *next, int W, std::vector<std::vector<float>> *out, char *err,
                        size_t errlen) {
     out->clear();
     out->push_back(logits_of(s, W));
@@ -95,7 +95,7 @@ int main(int argc, char **argv) {
     }
     const int D = atoi(pos[2]);
     const std::string dir = pos[3];
-    std::vector<int32_t> ids;
+    std::vector<TokId> ids;   /* the file's int32 ids, read as the bytes they are */
     {
         FILE *f = fopen(pos[1], "rb");
         if (!f) { fprintf(stderr, "qwen-deep-probe: cannot open %s\n", pos[1]); return 2; }
@@ -120,7 +120,7 @@ int main(int argc, char **argv) {
     if (pulsar_engine_open(&e, &opt) != 0) { fprintf(stderr, "qwen-deep-probe: %s did not open\n", pos[0]); return 2; }
     const int W = pulsar_engine_logits_width(e);
     const int ctx = D + 4 + n_spec + 1024;
-    const int32_t *next = &ids[(size_t)D];
+    const TokId *next = &ids[(size_t)D];
     char err[512] = "";
     printf("qwen-deep-probe: D %d, ctx %d, rope-yarn %g, spec %d tokens\n", D, ctx, yarn, n_spec);
 
@@ -129,7 +129,7 @@ int main(int argc, char **argv) {
          * step -- then the same save / load / 8-step comparison as below */
         pulsar_engine_set_bank_pool(1);
         pulsar_session *s = NULL, *x = NULL;
-        pulsar_tokens P = {(int *)ids.data(), D, D};
+        pulsar_tokens P = {ids.data(), D, D};
         const double t0 = now_s();
         bool ok = pulsar_session_create(&s, e, ctx) == 0 && pulsar_session_sync(s, &P, err, sizeof err) == 0;
         CHECK(ok, "COLD sync(P[0:%d]): %.1f s %s", D, now_s() - t0, err);
@@ -138,7 +138,7 @@ int main(int argc, char **argv) {
         uint64_t rng = 7;
         int got = 0, rounds = 0;
         while (ok && got < n_spec) {
-            int buf[17];
+            TokId buf[17];
             const int n = pulsar_session_generate_speculative(s, 0.0f, 0, 1.0f, 0.0f, &rng, n_spec - got, buf, 17, err,
                                                               sizeof err);
             if (n <= 0) { ok = false; break; }
@@ -168,7 +168,7 @@ int main(int argc, char **argv) {
         for (int i = 0; ok && i < 8; i++) {
             const std::vector<float> ls = logits_of(s, W), lx = logits_of(x, W);
             diff_rows += ls.size() != lx.size() || memcmp(ls.data(), lx.data(), ls.size() * sizeof(float)) != 0;
-            const int t = pulsar_session_argmax(s);
+            const TokId t = pulsar_session_argmax(s);
             ok = pulsar_session_eval(s, t, err, sizeof err) == 0 && pulsar_session_eval(x, t, err, sizeof err) == 0;
         }
         CHECK(ok && diff_rows == 0, "PAYLOAD the loaded frontier's logits and next 8 decode steps == the live session's "
@@ -187,19 +187,19 @@ int main(int argc, char **argv) {
     {
         pulsar_engine_set_bank_pool(1);
         pulsar_session *s = NULL;
-        pulsar_tokens P = {(int *)ids.data(), D, D};
+        pulsar_tokens P = {ids.data(), D, D};
         const double t0 = now_s();
         bool ok = pulsar_session_create(&s, e, ctx) == 0 && pulsar_session_sync(s, &P, err, sizeof err) == 0;
         const double t1 = now_s();
         const uint64_t touched = ok ? pulsar_session_touched_kv_bytes(s).raw() : 0;
-        const uint64_t resident = ok ? pulsar_session_resident_bytes(s) : 0;
+        const uint64_t resident = ok ? pulsar_session_resident_bytes(s).raw() : 0;
         CHECK(ok, "COLD sync(P[0:%d]) in one call: %.1f s (%.0f tok/s); touched KV %.2f GiB (%.0f B/token), resident %.2f GiB %s",
               D, t1 - t0, D / (t1 - t0), touched / 1073741824.0, (double)touched / D, resident / 1073741824.0, err);
         ok = ok && after_sync(s, next, W, &cold, err, sizeof err);
         CHECK(ok && cold.size() == 5, "COLD logits + 4 decode steps %s", err);
         for (int i = 0; ok && i < n_spec; i++) {
-            const int t = pulsar_session_argmax(s);
-            plain.push_back(t);
+            const TokId t = pulsar_session_argmax(s);
+            plain.push_back(t.raw());
             ok = pulsar_session_eval(s, t, err, sizeof err) == 0;
         }
         CHECK(ok && (int)plain.size() == n_spec, "COLD plain greedy %d tokens %s", n_spec, err);
@@ -217,7 +217,7 @@ int main(int argc, char **argv) {
     {
         pulsar_engine_set_bank_pool(1);
         pulsar_session *s = NULL;
-        pulsar_tokens Pk = {(int *)ids.data(), k, k}, P = {(int *)ids.data(), D, D};
+        pulsar_tokens Pk = {ids.data(), k, k}, P = {ids.data(), D, D};
         const bool grid_ok = pulsar_session_create(&s, e, ctx) == 0 && pulsar_session_resume_grid(s) == grid;
         CHECK(grid_ok, "the resume grid is %u", grid);
         const double t0 = now_s();
@@ -257,7 +257,7 @@ int main(int argc, char **argv) {
     {
         pulsar_engine_set_bank_pool(1);
         pulsar_session *s = NULL, *x = NULL;
-        pulsar_tokens P = {(int *)ids.data(), D, D};
+        pulsar_tokens P = {ids.data(), D, D};
         FILE *a = fopen(f1.c_str(), "rb"), *b = fopen(f2.c_str(), "rb"), *r = fopen(frp.c_str(), "rb");
         TokPos g1{0}, g2{0};
         const double t0 = now_s();
@@ -284,12 +284,12 @@ int main(int argc, char **argv) {
         uint64_t rng = 7;
         const bool has_spec = pulsar_engine_has_spec_rounds(e);
         while (ok && has_spec && (int)spec.size() < n_spec) {
-            int buf[17];
+            TokId buf[17];
             const int n = pulsar_session_generate_speculative(s, 0.0f, 0, 1.0f, 0.0f, &rng, n_spec - (int)spec.size(), buf,
                                                               17, err, sizeof err);
             if (n <= 0) { ok = false; break; }
             rounds++;
-            for (int i = 0; i < n && (int)spec.size() < n_spec; i++) spec.push_back(buf[i]);
+            for (int i = 0; i < n && (int)spec.size() < n_spec; i++) spec.push_back(buf[i].raw());
         }
         pulsar_engine_spec_metrics(e, &m1);
         int first_diff = -1;
@@ -320,7 +320,7 @@ int main(int argc, char **argv) {
         for (int i = 0; ok && i < 8; i++) {
             const std::vector<float> ls = logits_of(s, W), lx = logits_of(x, W);
             diff_rows += ls.size() != lx.size() || memcmp(ls.data(), lx.data(), ls.size() * sizeof(float)) != 0;
-            const int t = pulsar_session_argmax(s);
+            const TokId t = pulsar_session_argmax(s);
             ok = pulsar_session_eval(s, t, err, sizeof err) == 0 && pulsar_session_eval(x, t, err, sizeof err) == 0;
         }
         CHECK(ok && diff_rows == 0, "PAYLOAD the loaded frontier's logits and next 8 decode steps == the live session's "

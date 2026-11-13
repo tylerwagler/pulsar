@@ -55,7 +55,7 @@ typedef struct CUstream_st *cudaStream_t;
 
 #include <stdint.h>
 
-#include "pulsar_cuda_qwen.h"   /* pulsar_rows_linear: the rows front door's Linear reference */
+#include "pulsar_cuda_rows.h"   /* pulsar_rows_linear: the rows front door's Linear reference */
 
 #ifdef __cplusplus
 extern "C" {

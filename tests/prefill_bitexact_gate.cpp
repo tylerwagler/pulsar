@@ -518,10 +518,10 @@ static int prefill_logits_ctx(uint32_t depth, float *out, int width, int ctx) {
     }
     pulsar_tokens p;
     memset(&p, 0, sizeof(p));
-    p.v = (int *)malloc((size_t)depth * sizeof(int));
+    p.v = (TokId *)malloc((size_t)depth * sizeof(TokId));
     if (!p.v) { pulsar_session_free(s); return 0; }
     p.len = p.cap = (int)depth;
-    memcpy(p.v, g_toks.v, (size_t)depth * sizeof(int));
+    memcpy(p.v, g_toks.v, (size_t)depth * sizeof(TokId));
 
     char err[256];
     const int rc = pulsar_session_sync(s, &p, err, sizeof(err));
@@ -926,7 +926,7 @@ static int run_check_reference(const char *model, const char *ref_path,
     const int ncmp = (int)rh.width < width ? (int)rh.width : width;
 
     memset(&g_toks, 0, sizeof(g_toks));
-    g_toks.v = (int *)tok_raw;
+    g_toks.v = (TokId *)tok_raw;   /* the file's int32 ids, read as the bytes they are */
     g_toks.len = g_toks.cap = n_toks;
 
     /* Smallest 4096-multiple that clears the deepest row, plus one chunk of

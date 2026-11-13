@@ -5,7 +5,8 @@
  * the source module's `ngram_ids` on the calibration corpus. */
 
 #include "qwen_ngram.h"
-#include "pulsar_engine_internal.h"
+#include "engine/pulsar_engine_internal.h"
+#include "family_qwen.h"
 
 #include <errno.h>
 #include <fcntl.h>

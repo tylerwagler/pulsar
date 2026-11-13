@@ -104,8 +104,8 @@ typedef struct pulsar_drafter_ops {
      *  round's rows together (absorb_banked), in the single lane too. */
     bool (*absorb)(struct pulsar_session *s, uint32_t row, int32_t next);
     /** Every deferred row in one pass, no bank switch: rows[i] of banks[i], followed by next[i]. */
-    bool (*absorb_banked)(struct pulsar_session *s, const uint32_t *rows, const uint32_t *banks,
-                          const int32_t *next, uint32_t n);
+    bool (*absorb_banked)(struct pulsar_session *s, const uint32_t *rows, const BankId *banks,
+                          const TokId *next, uint32_t n);
     /** Draft the installed bank's next chain after `next_base`: up to the session's depth, cut by the stop
      *  rule, each draft with a confidence (or -1), sampled drafts (temperature > 0) drawn from the
      *  request-filtered proposal q at the draft's own key -- draft j at pulsar_sample_key(*rng, j), the key the
@@ -114,13 +114,13 @@ typedef struct pulsar_drafter_ops {
      *  Returns the pending count kept, or PULSAR_DRAFT_REFUSED: the drafter refused the chain (its line says why), and
      *  the round refuses with it (L306) -- it never continues as a plain round.  The drafter's conditioning
      *  features are those of the last committed row: the round's absorb ran before this. */
-    uint32_t (*draft)(struct pulsar_session *s, int next_base, float temperature, int top_k, float top_p,
+    uint32_t (*draft)(struct pulsar_session *s, TokId next_base, float temperature, int top_k, float top_p,
                       float min_p, uint64_t *rng);
     /** Optional.  Finish a deferred device draft into the installed bank's pendings. */
     void (*harvest)(struct pulsar_session *s);
     /** N banks' drafts in one pass, no bank switch, each result into rounds[i]->redraft; byte-exact with
      *  `draft` for each bank.  0, or -1 with `err` on a device failure. */
-    int (*draft_batch)(struct pulsar_session *s, struct pulsar_spec_round **rounds, const uint32_t *banks,
+    int (*draft_batch)(struct pulsar_session *s, struct pulsar_spec_round **rounds, const BankId *banks,
                        uint64_t **rngs, int n, char *err, size_t errlen);
     /** Optional (L306).  The drafter's own graph catalog at the startup warmup: run every shape its captured draft
      *  pass takes live (bank counts x attention bounds) twice on the installed bank, writing no state, inside the

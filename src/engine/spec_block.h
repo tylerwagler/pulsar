@@ -371,7 +371,7 @@ bool pulsar_block_tap(pulsar_driver_state *d, uint32_t il, uint32_t sub, const u
 /// @param row0 the step row of the first
 /// @param eval the single-row eval (passed to the MTP lane)
 /// @return false = refused (said); true with no lane
-bool pulsar_drafter_lane_absorb(pulsar_session *s, pulsar_step_mode mode, const int32_t *tokens, const int32_t *pos,
-                                const int32_t *bank, uint32_t n, uint32_t row0, bool eval);
+bool pulsar_drafter_lane_absorb(pulsar_session *s, pulsar_step_mode mode, const TokId *tokens, const int32_t *pos,
+                                const BankId *bank, uint32_t n, uint32_t row0, bool eval);
 
 #endif /* PULSAR_SPEC_BLOCK_H */

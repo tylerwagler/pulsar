@@ -83,7 +83,7 @@ int GATE_ENTRY(int argc, char **argv) {
     memset(&canon, 0, sizeof(canon));
     pulsar_tokens split;
     memset(&split, 0, sizeof(split));
-    int *live = NULL;
+    TokId *live = NULL;
     int rc = 1;
     {
     size_t text_len = 0;
@@ -112,7 +112,7 @@ int GATE_ENTRY(int argc, char **argv) {
         pulsar_tokenize_text(e, rest, &pb);
         pulsar_tokens joined;
         memset(&joined, 0, sizeof(joined));
-        joined.v = (int *)malloc(sizeof(int) * (size_t)(pa.len + pb.len));
+        joined.v = (TokId *)malloc(sizeof(TokId) * (size_t)(pa.len + pb.len));
         joined.cap = pa.len + pb.len;
         for (int m = 0; m < pa.len; m++) joined.v[joined.len++] = pa.v[m];
         for (int m = 0; m < pb.len; m++) joined.v[joined.len++] = pb.v[m];
@@ -131,11 +131,11 @@ int GATE_ENTRY(int argc, char **argv) {
 
     /* live variant = canon with canon[k] replaced by its split pieces */
     const int live_len = canon.len - 1 + split.len;
-    live = (int *)malloc(sizeof(int) * (size_t)live_len);
-    memcpy(live, canon.v, sizeof(int) * (size_t)k);
-    memcpy(live + k, split.v, sizeof(int) * (size_t)split.len);
+    live = (TokId *)malloc(sizeof(TokId) * (size_t)live_len);
+    memcpy(live, canon.v, sizeof(TokId) * (size_t)k);
+    memcpy(live + k, split.v, sizeof(TokId) * (size_t)split.len);
     memcpy(live + k + split.len, canon.v + k + 1,
-           sizeof(int) * (size_t)(canon.len - k - 1));
+           sizeof(TokId) * (size_t)(canon.len - k - 1));
 
     /* ---- leg 1: the byte walk crosses the seam ---- */
     {
@@ -182,9 +182,9 @@ int GATE_ENTRY(int argc, char **argv) {
         if (toks && toks->len == want_len) {
             CHECK(toks->v[k] == split.v[0] && toks->v[k + 1] == split.v[1],
                   "seam ids replaced (%d,%d) want (%d,%d) — live KV was rebuilt",
-                  toks->v[k], toks->v[k + 1], split.v[0], split.v[1]);
+                  toks->v[k].raw(), toks->v[k + 1].raw(), split.v[0].raw(), split.v[1].raw());
             CHECK(toks->v[want_len - 1] == canon.v[c2 - 1],
-                  "suffix tail %d want %d", toks->v[want_len - 1], canon.v[c2 - 1]);
+                  "suffix tail %d want %d", toks->v[want_len - 1].raw(), canon.v[c2 - 1].raw());
         }
         pulsar_session_free(s);
     }
@@ -211,10 +211,10 @@ int GATE_ENTRY(int argc, char **argv) {
         const int tail = 30;                   /* "generated reasoning", stripped */
         pulsar_tokens plive;
         memset(&plive, 0, sizeof(plive));
-        plive.v = (int *)malloc(sizeof(int) * (size_t)(l1 + tail));
+        plive.v = (TokId *)malloc(sizeof(TokId) * (size_t)(l1 + tail));
         plive.cap = l1 + tail;
-        memcpy(plive.v, live, sizeof(int) * (size_t)l1);
-        memcpy(plive.v + l1, canon.v + 400, sizeof(int) * (size_t)tail);
+        memcpy(plive.v, live, sizeof(TokId) * (size_t)l1);
+        memcpy(plive.v + l1, canon.v + 400, sizeof(TokId) * (size_t)tail);
         plive.len = l1 + tail;
         CHECK(pulsar_session_sync(s, &plive, err, sizeof(err)) == 0,
               "leg3 live sync failed: %s", err);
@@ -224,10 +224,10 @@ int GATE_ENTRY(int argc, char **argv) {
         const int newn = 12;
         pulsar_tokens pecho;
         memset(&pecho, 0, sizeof(pecho));
-        pecho.v = (int *)malloc(sizeof(int) * (size_t)(c1 + newn));
+        pecho.v = (TokId *)malloc(sizeof(TokId) * (size_t)(c1 + newn));
         pecho.cap = c1 + newn;
-        memcpy(pecho.v, canon.v, sizeof(int) * (size_t)c1);
-        memcpy(pecho.v + c1, canon.v + 700, sizeof(int) * (size_t)newn);
+        memcpy(pecho.v, canon.v, sizeof(TokId) * (size_t)c1);
+        memcpy(pecho.v + c1, canon.v + 700, sizeof(TokId) * (size_t)newn);
         pecho.len = c1 + newn;
 
         /* The walk must stop at the shared boundary, not inside either tail —
@@ -249,10 +249,10 @@ int GATE_ENTRY(int argc, char **argv) {
         if (toks && toks->len == want_len) {
             CHECK(toks->v[k] == split.v[0] && toks->v[k + 1] == split.v[1],
                   "leg3 seam ids replaced (%d,%d) want (%d,%d) — live KV was rebuilt",
-                  toks->v[k], toks->v[k + 1], split.v[0], split.v[1]);
+                  toks->v[k].raw(), toks->v[k + 1].raw(), split.v[0].raw(), split.v[1].raw());
             CHECK(toks->v[want_len - 1] == canon.v[700 + newn - 1],
                   "leg3 suffix tail %d want %d",
-                  toks->v[want_len - 1], canon.v[700 + newn - 1]);
+                  toks->v[want_len - 1].raw(), canon.v[700 + newn - 1].raw());
         }
         free(pecho.v);
         free(plive.v);

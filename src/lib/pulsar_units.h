@@ -1,5 +1,6 @@
 /** @file
- *  Typed quantities that share a raw integer type but must never mix (L333, L334): KvRows, KvBytes, TokCount, PromptToks, TokPos */
+ *  Typed quantities that share a raw integer type but must never mix (L333, L334): KvRows, KvBytes, TokCount,
+ *  PromptToks, TokPos, the P2b index spaces, TokId, BankId, TensorBytes, TextBytes */
 #ifndef PULSAR_UNITS_H
 #define PULSAR_UNITS_H
 
@@ -272,5 +273,283 @@ static_assert(sizeof(TokCount) == sizeof(int) && sizeof(PromptToks) == sizeof(in
 static_assert(sizeof(TokPos) == sizeof(int) && std::is_trivial<TokPos>::value &&
                   std::is_standard_layout<TokPos>::value,
               "a position is as cheap as the int it replaces (memset / calloc-safe)");
+
+/* ---- L334 phase 2b: the engine's other index spaces -------------------------------------------------------------
+ * A position on the token sequence is not a row of a batched step, and neither is a row of a compressed KV cache; all
+ * three were uint32 / int side by side in the same signatures (gpu_graph_index_comp_update took a batch row, a
+ * position and a compressed row, three uint32_t in a row -- f7e05077 passed the row for the position, c9dd9499 a
+ * compressed row for one).  Each space is its own affine pair, as TokPos / TokCount:
+ *
+ *   StepRow / StepRows   a row of one batched step (the step's row map gives each its position and bank);
+ *   HeadRow / HeadRows   a headed row of a step (the logits rows: a verify capture, the draw), a SUBSET of the step's
+ *                        rows -- head row h is step row heads.row[h], equal to h only where every row is headed (a
+ *                        verify prefix), and that identity is crossed by name, never assumed;
+ *   CompRow / CompRows   a row of a compressed KV cache or a pool that holds several tokens a row;
+ *   TokPerRow            the factor between tokens and such rows (a compress ratio, a pool's tokens per row): nonzero,
+ *                        not a count of anything -- a ratio can no longer be passed where a row or a position goes.
+ *
+ * The crossings are named and take their factor (below): a position's compressed row, the first position of a
+ * compressed row, the rows a history holds or covers, the history a row count serves, and a run's row map. */
+
+/** Tag of StepRows (never instantiated). */
+struct pulsar_step_rows_tag;
+/** Tag of HeadRows (never instantiated). */
+struct pulsar_head_rows_tag;
+/** Tag of CompRows (never instantiated). */
+struct pulsar_comp_rows_tag;
+/** Tag of TokPerRow (never instantiated). */
+struct pulsar_tok_per_row_tag;
+
+/** Rows of a batched step: a count, or the distance between two of its rows (L334 P2b). */
+typedef pulsar_unit<pulsar_step_rows_tag, int> StepRows;
+/** A row of a batched step (none() = no row). */
+typedef pulsar_point<StepRows> StepRow;
+/** Headed rows of a step (its logits rows): a count or a distance (L334 P2b). */
+typedef pulsar_unit<pulsar_head_rows_tag, int> HeadRows;
+/** A headed row of a step: an index into its logits / verify capture (none() = no row). */
+typedef pulsar_point<HeadRows> HeadRow;
+/** Rows of a compressed KV cache or of a pool holding several tokens a row: a count or a distance (L334 P2b). */
+typedef pulsar_unit<pulsar_comp_rows_tag, int> CompRows;
+/** A row of a compressed cache / multi-token pool (none() = no row). */
+typedef pulsar_point<CompRows> CompRow;
+/** Tokens a row of a compressed cache or pool holds: a compress ratio, a pool's tokens per row (nonzero). */
+typedef pulsar_unit<pulsar_tok_per_row_tag, uint32_t> TokPerRow;
+
+/** A factor of 0 tokens a row is no factor (fatal): the crossings below divide by it.
+ *  @param r the factor */
+inline void pulsar_tok_per_row_check(TokPerRow r) {
+    if (r.raw() == 0u) {
+        fprintf(stderr, "pulsar: 0 tokens a row is no compress ratio\n");
+        abort();
+    }
+}
+
+/** The compressed row a position's token lands in: floor(pos / r) (the position law; fatal on none()).
+ *  @param p the position
+ *  @param r tokens a row */
+/// @return its row
+inline CompRow pulsar_comp_row_of(TokPos p, TokPerRow r) {
+    pulsar_tok_per_row_check(r);
+    return CompRow{(int)((uint32_t)p.before().raw() / r.raw())};
+}
+/** The first position of a compressed row: row * r (a group's start: where its rope / its tokens begin).
+ *  @param row the row (fatal on none())
+ *  @param r   tokens a row */
+/// @return its first position
+inline TokPos pulsar_comp_row_pos(CompRow row, TokPerRow r) {
+    pulsar_tok_per_row_check(r);
+    return TokPos{(int)((uint32_t)row.before().raw() * r.raw())};
+}
+/** The rows a history of `len` tokens has completed: floor(len / r) (a compressed cache's frontier).
+ *  @param len the tokens
+ *  @param r   tokens a row */
+/// @return complete rows
+inline CompRows pulsar_comp_rows_held(TokCount len, TokPerRow r) {
+    pulsar_tok_per_row_check(r);
+    return CompRows{(int)((uint32_t)len.raw() / r.raw())};
+}
+/** The rows that cover `len` tokens: ceil(len / r) (a pool's rows for a partial last row; pricing).
+ *  @param len the tokens
+ *  @param r   tokens a row */
+/// @return covering rows
+inline CompRows pulsar_comp_rows_cover(TokCount len, TokPerRow r) {
+    pulsar_tok_per_row_check(r);
+    return CompRows{(int)(((uint32_t)len.raw() + r.raw() - 1u) / r.raw())};
+}
+/** The longest history `rows` complete rows serve: rows * r + r - 1 tokens (the deepest length whose floor(len / r)
+ *  is `rows` -- what a lowered compressed frontier still serves).
+ *  @param rows complete rows
+ *  @param r    tokens a row */
+/// @return the tokens
+inline TokCount pulsar_comp_rows_serve(CompRows rows, TokPerRow r) {
+    pulsar_tok_per_row_check(r);
+    return TokCount{(int)((uint32_t)rows.raw() * r.raw() + r.raw() - 1u)};
+}
+
+/** One run of a batched step: consecutive rows from `first` holding one bank's consecutive positions from `pos0`, one
+ *  token a row -- the row map's one shape (the driver's run_first / run_pos0, a verify round, a prefill chunk).  Its
+ *  two crossings are the only way between a step row and a position. */
+struct pulsar_step_run {
+    StepRow first;  ///< the run's first row in the step
+    TokPos pos0;    ///< the position its first row holds
+    StepRows n;     ///< rows in the run
+    /** The position row `row` holds: pos0 + (row - first).
+     *  @param row a row of this run */
+    /// @return its position
+    TokPos pos_of(StepRow row) const { return pos0 + TokCount{(row - first).raw()}; }
+    /** The row that holds position `p`: first + (p - pos0).
+     *  @param p a position of this run */
+    /// @return its row
+    StepRow row_of(TokPos p) const { return first + StepRows{(p - pos0).raw()}; }
+};
+
+static_assert(sizeof(StepRow) == sizeof(int) && sizeof(HeadRow) == sizeof(int) && sizeof(CompRow) == sizeof(int) &&
+                  sizeof(TokPerRow) == sizeof(uint32_t) && std::is_trivial<StepRow>::value &&
+                  std::is_trivial<CompRow>::value && std::is_trivial<pulsar_step_run>::value,
+              "the P2b index spaces are as cheap as the ints they replace (memset / calloc-safe)");
+
+/* ---- L334 phase 3: vocabulary token ids ---------------------------------------------------------------------------
+ * A token id names WHICH token; a position or a count says where / how many.  All three were int side by side
+ * (L251 passed a count of 1 where eval took an id; spec_round_begin(int first_token, int max_tokens, ...)).  An id
+ * is an identity, not a quantity: it compares equal or not and nothing else -- no arithmetic, no ordering, no vocab
+ * of its own.  Which ids are valid is a question for an AUTHORITY (the tokenizer's size, the logits width, a family's
+ * image sentinels at or past the vocab), asked by name where it applies; the type only refuses the confusions. */
+
+/** An identity of the token vocabulary: == / != only; -1 is none() ("no token": a refused sample, an absent marker). */
+template <class Tag, class Rep>
+class pulsar_id {
+    static_assert(std::is_signed<Rep>::value, "an id's sentinel is -1: it is held signed");
+    /// The raw value of none().
+    static constexpr Rep kNone = Rep(-1);
+
+public:
+    /** Uninitialised, as the integer it replaces (value-initialise for id 0). */
+    pulsar_id() = default;
+    /** Enter from a raw integer (explicit only; bool and floating point are refused; -1 enters as none()).
+     *  @param v the raw id */
+    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    constexpr explicit pulsar_id(I v) : v_(static_cast<Rep>(v)) {}
+    /** No token. */
+    /// @return the none() sentinel (raw -1)
+    static constexpr pulsar_id none() { return pulsar_id(kNone); }
+    /** Is this none()? */
+    /// @return true for none()
+    constexpr bool is_none() const { return v_ == kNone; }
+    /** Is this a token at all -- not negative (none(), or a negative a caller forged)?  The vocab bound is an
+     *  authority's (below()), not this. */
+    /// @return true for a non-negative id
+    constexpr bool is_token() const { return v_ >= 0; }
+    /** Is this a token below `n` -- an authority's vocab bound (the tokenizer's size, the logits width)?
+     *  @param n the bound */
+    /// @return true when 0 <= id < n
+    constexpr bool below(uint32_t n) const { return v_ >= 0 && (uint32_t)v_ < n; }
+    /** The raw id, where it leaves the type system: a device upload, a table index, printf, the wire. */
+    /// @return the id as `Rep` (none() as -1)
+    constexpr Rep raw() const { return v_; }
+    /** The same token (none() equals none() only). */
+    friend constexpr bool operator==(pulsar_id a, pulsar_id b) { return a.v_ == b.v_; }
+    /** Another token. */
+    friend constexpr bool operator!=(pulsar_id a, pulsar_id b) { return a.v_ != b.v_; }
+
+private:
+    Rep v_;  ///< the id; -1 = none()
+};
+
+/** Tag of TokId (never instantiated). */
+struct pulsar_tok_id_tag;
+/** A vocabulary token id (L334 P3). */
+typedef pulsar_id<pulsar_tok_id_tag, int32_t> TokId;
+
+static_assert(sizeof(TokId) == sizeof(int32_t) && std::is_trivial<TokId>::value &&
+                  std::is_standard_layout<TokId>::value,
+              "a token id is as cheap as the int32 it replaces (memset / calloc-safe; arrays of it upload as int32)");
+
+/** L334 P3b: an id array as the int32 array a kernel launch on host memory or a wire struct reads -- the ONE crossing
+ *  of a TokId array into raw ids (TokId is exactly an int32: same size, trivial, standard layout).  Byte copies
+ *  (uploads, memcpy, fwrite, digests) take the TokId array as it is and need no crossing.
+ *  @param ids the id array */
+/// @return the same memory as int32 ids
+inline const int32_t *pulsar_tok_ids_raw(const TokId *ids) { return reinterpret_cast<const int32_t *>(ids); }
+/** The writable form of pulsar_tok_ids_raw (a wire struct or kernel output filled in place).
+ *  @param ids the id array */
+/// @return the same memory as int32 ids
+inline int32_t *pulsar_tok_ids_raw(TokId *ids) { return reinterpret_cast<int32_t *>(ids); }
+/** The reverse crossing: raw int32 ids (a received wire frame, a kernel's host output) viewed as TokIds, in place --
+ *  no copy (a sync's prompt can be a million ids).
+ *  @param raw the int32 ids */
+/// @return the same memory as token ids
+inline const TokId *pulsar_tok_ids_of(const int32_t *raw) { return reinterpret_cast<const TokId *>(raw); }
+
+/* ---- L334 phase 4: bank ids -------------------------------------------------------------------------------------
+ * A bank is one conversation's KV / state slot in a session's pool.  Its id sat as uint32_t beside a layer index
+ * (gpu_graph_n_comp(g, bank, il) vs the views' (g, il, bank)), a checkpoint slot, a decl id, a step row and the
+ * server's slot index (fae579f0: slot i == bank i taken for granted, and a slots[] bound taken from the bank count).
+ * An id like TokId: == / != only, none() = -1 (no bank installed), below(n) against an authority's count (the pool,
+ * PULSAR_MSEQ_MAX); is_token() reads "a real bank" here. */
+/** Tag of BankId (never instantiated). */
+struct pulsar_bank_tag;
+/** A bank id in a session's pool (L334 P4). */
+typedef pulsar_id<pulsar_bank_tag, int32_t> BankId;
+
+/** A bank as the index of a per-bank array (fatal on none(): indexing with "no bank" is always a bug).
+ *  @param b the bank */
+/// @return its index
+inline uint32_t pulsar_bank_index(BankId b) {
+    if (!b.is_token()) {
+        fprintf(stderr, "pulsar: bank %d is no bank -- refusing to index with it\n", b.raw());
+        abort();
+    }
+    return (uint32_t)b.raw();
+}
+
+/** L334 P4 S5: a bank array as the int32 array a kernel launch on host memory or a wire struct reads -- the named
+ *  crossing (BankId is exactly an int32).  Byte copies (uploads, memcpy) take BankId arrays as they are.
+ *  @param banks the bank array */
+/// @return the same memory as int32 bank ids
+inline const int32_t *pulsar_bank_ids_raw(const BankId *banks) { return reinterpret_cast<const int32_t *>(banks); }
+/** The reverse, in place: raw int32 bank ids viewed as BankIds.  @param raw the int32 ids */
+/// @return the same memory as bank ids
+inline const BankId *pulsar_bank_ids_of(const int32_t *raw) { return reinterpret_cast<const BankId *>(raw); }
+
+static_assert(sizeof(BankId) == sizeof(int32_t) && std::is_trivial<BankId>::value &&
+                  std::is_standard_layout<BankId>::value,
+              "a bank id is as cheap as the int32 it replaces (arrays of it upload as int32)");
+
+/* ---- L334 phase 5: tensor bytes -----------------------------------------------------------------------------------
+ * A tensor's extent or an offset into it, in BYTES -- beside element counts, row counts and float counts of the same
+ * uint64_t in the GPU host API (f3a617af / d0b2fdb5: a launcher took the allocation's bytes for its live rows;
+ * 22c92f71: element size x width priced where a packed row's bytes belonged; read / read_f32, write / write_q_f32,
+ * alloc / alloc_elt are byte and element twins of the same shape).  Its own unit, not KvBytes (that is what the KV
+ * accounting prices; kv_bytes_of crosses by name).  Offsets are TensorBytes too: a distance from the tensor's base.
+ * Element counts stay raw at the element APIs -- the byte APIs no longer take them. */
+/** Tag of TensorBytes (never instantiated). */
+struct pulsar_tensor_bytes_tag;
+/** Bytes of a tensor's extent, or a byte offset into one (L334 P5). */
+typedef pulsar_unit<pulsar_tensor_bytes_tag> TensorBytes;
+
+/** The bytes of `n` elements of T: the named form of `n * sizeof(T)`.
+ *  @param n the elements */
+/// @return their bytes
+template <class T>
+constexpr TensorBytes bytes_of(uint64_t n) { return TensorBytes{n * (uint64_t)sizeof(T)}; }
+/** The bytes of `n` elements of `esz` bytes each (a format's element size: *_ELT_SIZE, alloc_elt).
+ *  @param n   the elements
+ *  @param esz bytes per element */
+/// @return their bytes
+constexpr TensorBytes elt_bytes(uint64_t n, uint64_t esz) { return TensorBytes{n * esz}; }
+/** Tensor bytes as what the KV accounting prices -- the one crossing into KvBytes (a pool's resident extent).
+ *  @param b the tensor bytes */
+/// @return the same bytes as KvBytes
+constexpr KvBytes kv_bytes_of(TensorBytes b) { return KvBytes{b.raw()}; }
+
+static_assert(sizeof(TensorBytes) == sizeof(uint64_t) && std::is_trivial<TensorBytes>::value,
+              "tensor bytes are as cheap as the uint64_t they replace");
+
+
+/* ---- L334 phase 7: rendered-text bytes ----------------------------------------------------------------------------
+ * The disk KV chains (pulsar_segstore.h, pulsar_kvchain.h) and the server's KV cache key a history by the bytes its
+ * tokens RENDER to (pulsar_kvtext_render_tokens_text), so a chain's text length sat beside its token span G -- a
+ * uint64_t / size_t of text beside a uint32_t / int of tokens, in the same signatures (pulsar_segstore_put took
+ * (G_prev, G, text, text_len) in a row).  The bugs were semantic, not arithmetic: a chain's text carrying an EOS its
+ * tokens lacked (27d5bff6: a text end taken for a token end), and byte spans cut from the wrong text (9637c76b).
+ *
+ *   TextBytes   a length of rendered text in bytes -- a segment's own text, a chain's text from byte 0 to its G, a
+ *               request's rendered prompt -- or an offset into such a text, which IS the length up to it: no point
+ *               type and no sentinel (an offset is never "none").
+ *
+ * The rules are the P1 ones: no implicit conversion, arithmetic and ordering only within the unit (uint64_t's), .raw()
+ * where the bytes leave the type system (a memcmp / memcpy, a hash's update, a printf, a file offset).  A token
+ * position or count never becomes a byte length: the two meet only where a chain is checked (a stored text_end against
+ * the length its G tokens render to).  pulsar_text_span {lo, hi} (pulsar.h) stays a renderer's uint32 pair; a span
+ * built from TextBytes crosses with .raw().  Out of scope: a segment file's header / payload / trailer offsets (the
+ * file format's arithmetic, HDR + text_len + payload via .raw()), byte offsets inside the tokenizer and BPE, JSON body
+ * offsets. */
+/** Tag of TextBytes (never instantiated). */
+struct pulsar_text_bytes_tag;
+/** Bytes of rendered text: a length, or an offset from byte 0 (the length up to it) (L334 P7). */
+typedef pulsar_unit<pulsar_text_bytes_tag> TextBytes;
+
+static_assert(sizeof(TextBytes) == sizeof(uint64_t) && std::is_trivial<TextBytes>::value,
+              "text bytes are as cheap as the uint64_t they replace");
 
 #endif

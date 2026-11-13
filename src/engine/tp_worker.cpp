@@ -48,9 +48,9 @@ struct pulsar_tp_worker_slot {
     pulsar_spec_round **rounds;
     /// entries of `rounds` (grown to cover the highest bank named)
     uint32_t n_rounds;
-    /// scratch for the accept walk's output, [accepted_cap] ints; owned, its contents unread
-    int *accepted;          /* the accept walk's output, unread here */
-    /// capacity of `accepted` in ints
+    /// scratch for the accept walk's output, [accepted_cap] ids; owned, its contents unread
+    TokId *accepted;        /* the accept walk's output, unread here */
+    /// capacity of `accepted` in ids
     int accepted_cap;
 };
 
@@ -107,18 +107,24 @@ static pulsar_spec_round *worker_round(pulsar_tp_worker_slot *slot, int bank) {
     return slot->rounds[bank];
 }
 
-/** The slot's accept-walk scratch, grown to at least `cap` ints (and at least 1).
+/** The slot's accept-walk scratch, grown to at least `cap` ids (and at least 1).
  *  @param slot the session's slot
- *  @param cap  ints wanted
+ *  @param cap  ids wanted
  *  @return the scratch (owned by the slot) */
-static int *worker_accepted(pulsar_tp_worker_slot *slot, int cap) {
+static TokId *worker_accepted(pulsar_tp_worker_slot *slot, int cap) {
     if (cap < 1) cap = 1;
     if (cap > slot->accepted_cap) {
-        slot->accepted = (int *)xrealloc(slot->accepted, (size_t)cap * sizeof(int));
+        slot->accepted = (TokId *)xrealloc(slot->accepted, (size_t)cap * sizeof(TokId));
         slot->accepted_cap = cap;
     }
     return slot->accepted;
 }
+
+/** A frame's token ids (the wire's int32) viewed as ids in place -- the TP edge on the receiving side, borrowed as
+ *  before P3b (no copy).
+ *  @param raw the frame's ids
+ *  @return the same memory as token ids */
+static const TokId *worker_tok_ids(const int *raw) { return pulsar_tok_ids_of(raw); }
 
 bool pulsar_engine_is_tp_worker(const pulsar_engine *e) {
     return e && e->tp && pulsar_tp_rank(e->tp) != 0;
@@ -384,9 +390,9 @@ static void worker_segment_reconcile(pulsar_engine *e, const char *keys, uint32_
  *  @param rows receives [c->n_items] requests */
 static void worker_rows(const pulsar_tp_command *c, pulsar_multiseq_req *rows) {
     for (uint32_t i = 0; i < c->n_items; i++) {
-        rows[i].bank  = (uint32_t)c->items[i].bank;
+        rows[i].bank  = BankId{c->items[i].bank};
         rows[i].pos   = TokPos{c->items[i].pos};   /* the wire's int32 */
-        rows[i].token = c->items[i].token;
+        rows[i].token = TokId{c->items[i].token};
     }
 }
 
@@ -451,8 +457,8 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
          * same bytes at the same start positions the leader's did. */
         int rc = 1;
         if (!worker_refused(e, c, "sync", &slot, ferr, sizeof(ferr))) {
-            pulsar_tokens borrowed;
-            borrowed.v = c->tokens;
+            pulsar_tokens borrowed;   /* the frame's ids, borrowed in place (no copy) */
+            borrowed.v = const_cast<TokId *>(worker_tok_ids(c->tokens));
             borrowed.len = (int)c->n_tokens;
             borrowed.cap = (int)c->n_tokens;
             rc = pulsar_session_family_sync(slot->s, &borrowed, c->n_images ? c->images : NULL, (int)c->n_images, ferr,
@@ -476,13 +482,13 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         if (!worker_refused(e, c, "sync check", &slot, ferr, sizeof(ferr))) {
             const int pos = slot->s->checkpoint.len;
             const uint64_t digest = pulsar_session_checkpoint_digest(slot->s);
-            if (pos == c->value && digest == c->seq) {
+            if (TokPos{pos} == pulsar_tp_command_pos(c) && digest == c->seq) {
                 status = 0;
             } else {
                 fprintf(stderr, "pulsar: tp worker: sync check: this rank's cached state differs "
                                 "from the leader's -- leader pos %d digest %016llx, this rank pos %d "
                                 "digest %016llx; refusing the sync (L250)\n",
-                        c->value, (unsigned long long)c->seq, pos, (unsigned long long)digest);
+                        pulsar_tp_command_pos(c).raw(), (unsigned long long)c->seq, pos, (unsigned long long)digest);
             }
         } else {
             fprintf(stderr, "pulsar: tp worker: sync check refused: %s\n", ferr);
@@ -500,7 +506,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
                          "the ranks are out of lockstep, refusing to decode",
                          (unsigned long long)c->seq, (unsigned long long)pos);
             } else {
-                rc = pulsar_session_family_eval(slot->s, c->value, ferr, sizeof(ferr));
+                rc = pulsar_session_family_eval(slot->s, pulsar_tp_command_token(c).raw(), ferr, sizeof(ferr));
             }
         }
         if (rc != 0) {
@@ -574,8 +580,11 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             pulsar_tp_mirror_fail_void(tp, op, ferr);
             return 1;
         }
-        if (c->type == PULSAR_TP_FRAME_REWIND) slot->s->engine->family->banks->rewind(slot->s, c->value);   /* the leader sends one only with CAP_REWIND */
-        else                                   pulsar_session_family_invalidate(slot->s);
+        /* the leader sends one only with CAP_REWIND */
+        if (c->type == PULSAR_TP_FRAME_REWIND)
+            slot->s->engine->family->banks->rewind(slot->s, pulsar_tp_command_pos(c));
+        else
+            pulsar_session_family_invalidate(slot->s);
         return 1;
     }
 
@@ -584,7 +593,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             pulsar_tp_mirror_fail_void(tp, "bank state save", ferr);
             return 1;
         }
-        slot->s->engine->family->banks->save(slot->s, (uint32_t)c->value);
+        slot->s->engine->family->banks->save(slot->s, pulsar_tp_command_bank(c));
         return 1;
 
     case PULSAR_TP_FRAME_BANK_STATE_RESTORE:
@@ -597,7 +606,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         int status = -1;
         if (!worker_refused(e, c, op, &slot, ferr, sizeof(ferr))) {
             const pulsar_family_bank_ops *ops = slot->s->engine->family->banks;
-            const uint32_t bank = (uint32_t)c->value;
+            const BankId bank = pulsar_tp_command_bank(c);
             /* a family without a repoint never sends one (its repoint is a restore frame) */
             status = restore ? (ops->restore(slot->s, bank) ? 0 : 1) : ops->repoint ? ops->repoint(slot->s, bank) : 1;
             if (status < 0) status = 1;
@@ -612,13 +621,15 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             pulsar_tp_mirror_fail_void(tp, "note committed tokens", ferr);
             return 1;
         }
-        pulsar_session_note_committed(slot->s, c->tokens, (int)c->n_tokens);
+    {
+        pulsar_session_note_committed(slot->s, worker_tok_ids(c->tokens), (int)c->n_tokens);
         return 1;
+    }
 
     case PULSAR_TP_FRAME_NOTE_PREFILLED: {
         int status = -1;
         if (!worker_refused(e, c, "note prefilled", &slot, ferr, sizeof(ferr))) {
-            status = slot->s->note_prefilled(c->tokens, (int)c->n_tokens, c->value) != 0 ? 1 : 0;
+            status = slot->s->note_prefilled(worker_tok_ids(c->tokens), (int)c->n_tokens, c->value) != 0 ? 1 : 0;
         } else {
             fprintf(stderr, "pulsar: tp worker: note prefilled refused: %s\n", ferr);
         }
@@ -677,7 +688,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
                 fprintf(stderr, "pulsar: tp worker: %s\n", ferr);
             } else {
                 uint64_t rng = c->spec.rng;
-                int *acc = worker_accepted(slot, c->spec.i2);
+                TokId *acc = worker_accepted(slot, c->spec.i2);
                 const int na = pulsar_session_spec_round_end_local(slot->s, r, c->spec.i0,
                                                                    c->spec.temperature, c->spec.top_k, c->spec.top_p,
                                                                    c->spec.min_p, 0u, NULL, 0u, &rng, (uint32_t)c->spec.i3,
@@ -703,9 +714,9 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         int status = 1;
         if (!worker_refused(e, c, "verify_profile", &slot, ferr, sizeof(ferr))) {
             double base[PULSAR_SPEC_LOGITS_ROWS + 1];
-            if (c->spec.bank < 0 || (uint32_t)c->spec.bank != pulsar_session_live_bank(slot->s))
-                snprintf(ferr, sizeof(ferr), "tp: verify_profile names bank %d, this rank has bank %u installed",
-                         c->spec.bank, pulsar_session_live_bank(slot->s));
+            if (c->spec.bank < 0 || BankId{c->spec.bank} != pulsar_session_live_bank(slot->s))
+                snprintf(ferr, sizeof(ferr), "tp: verify_profile names bank %d, this rank has bank %d installed",
+                         c->spec.bank, pulsar_session_live_bank(slot->s).raw());
             else if (pulsar_session_verify_profile_local(slot->s, (uint32_t)c->spec.i0, c->spec.i1 ? base : NULL,
                                                          ferr, sizeof(ferr)))
                 status = 0;
@@ -728,7 +739,9 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
                 rngs[i] = &states[i];
                 if (!rounds[i]) ok = 0;
             }
-            const int rc = ok ? pulsar_session_spec_redraft_batch_local(slot->s, rounds, c->spec_banks, rngs, (int)n,
+            /* the wire's uint32 bank ids viewed as BankIds (the same bytes): the named crossing */
+            const BankId *banks = pulsar_bank_ids_of(reinterpret_cast<const int32_t *>(c->spec_banks));
+            const int rc = ok ? pulsar_session_spec_redraft_batch_local(slot->s, rounds, banks, rngs, (int)n,
                                                                         ferr, sizeof(ferr)) : -1;
             free(rounds); free(states); free(rngs);
             status = rc == 0 ? 0 : 1;
@@ -761,20 +774,20 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             uint64_t rngs[PULSAR_TP_SPEC_STEPS_MAX];
             int cap_total = 0;
             for (int i = 0; i < n; i++) cap_total += c->spec_steps[i].i2 > 0 ? c->spec_steps[i].i2 : 0;
-            int *acc = worker_accepted(slot, cap_total);
+            TokId *acc = worker_accepted(slot, cap_total);
             int ok = 1;
             for (int i = 0, off = 0; i < n; i++) {
                 const pulsar_tp_spec_command *r = &c->spec_steps[i];
                 pulsar_spec_step *st = &steps[i];
                 memset(st, 0, sizeof(*st));
-                st->bank = (uint32_t)r->bank;
+                st->bank = BankId{r->bank};
                 st->round = worker_round(slot, r->bank);
                 st->temperature = r->temperature; st->top_k = r->top_k;
                 st->top_p = r->top_p; st->min_p = r->min_p;
                 rngs[i] = r->rng;
                 st->rng = &rngs[i];
                 st->max_tokens = r->i0;
-                st->first_token = r->i0;
+                st->first_token = TokId{r->i0};
                 st->k_alloc = r->i1;
                 st->accepted_cap = r->i2;
                 st->accepted = acc + off;
@@ -807,7 +820,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             }
             for (int i = 0; i < n; i++)
                 if (steps[i].status == PULSAR_SPEC_STEP_FAILED || steps[i].status == PULSAR_SPEC_STEP_RESTORE_FAILED)
-                    fprintf(stderr, "pulsar: tp worker: %s bank %u: status %d %s\n", op, steps[i].bank,
+                    fprintf(stderr, "pulsar: tp worker: %s bank %d: status %d %s\n", op, steps[i].bank.raw(),
                             steps[i].status, steps[i].err);
         } else fprintf(stderr, "pulsar: tp worker: %s refused: %s\n", op, ferr);
         return worker_ack(e, c->session_id, status, err, errlen);
@@ -819,7 +832,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         int status = -1;
         if (!worker_refused(e, c, "generate_speculative", &slot, ferr, sizeof(ferr))) {
             uint64_t rng = c->spec.rng;
-            int *acc = worker_accepted(slot, c->spec.i2);
+            TokId *acc = worker_accepted(slot, c->spec.i2);
             const int n = slot->s->generate_speculative(c->spec.temperature, c->spec.top_k, c->spec.top_p, c->spec.min_p,
                                                         &rng, c->spec.i0, acc, c->spec.i2, ferr, sizeof(ferr));
             status = n + 1;
@@ -851,8 +864,8 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         int status = -1;
         if (!worker_refused(e, c, op, &slot, ferr, sizeof(ferr))) {
             const pulsar_family_bank_ops *ops = slot->s->engine->family->banks;
-            const bool okb = freeing ? ops->free_physical(slot->s, (uint32_t)c->value)
-                                     : ops->alloc_physical(slot->s, (uint32_t)c->value);
+            const BankId bank = pulsar_tp_command_bank(c);
+            const bool okb = freeing ? ops->free_physical(slot->s, bank) : ops->alloc_physical(slot->s, bank);
             status = okb ? 0 : 1;
         } else fprintf(stderr, "pulsar: tp worker: %s refused: %s\n", op, ferr);
         return worker_ack(e, c->session_id, status, err, errlen);

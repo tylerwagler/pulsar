@@ -87,16 +87,16 @@ static double maxabs_of(const float *a, const float *b, int n) {
  * prefills per depth, 380k tokens of the story gate's 392 s.  The resume is ANNOUNCED (origin) and the identity
  * is ASSERTED in this gate, not argued: the depth's widest wide run is the one cold run, repeated at the end
  * through this path and compared byte for byte (see the depth loop). */
-static bool prefix_cold(pulsar_session *s, const int *toks, uint32_t n) {
+static bool prefix_cold(pulsar_session *s, const TokId *toks, uint32_t n) {
     /* L357: the family-generic bank sync (it saves the bank's carry, which a later run re-installs after its
      * multiseq step); gate_populate_bank reached DeepSeek's session graph, NULL on Qwen */
     return gate_bank_sync(s, 0, toks, (int)n, NULL, "decode reference prefix");
 }
-static bool prefix_resumed(pulsar_session *s, const int *toks, uint32_t n, int *origin) {
+static bool prefix_resumed(pulsar_session *s, const TokId *toks, uint32_t n, int *origin) {
     char err[256];
     /* a multiseq step left the classic view stale (session_multiseq.cpp); the carry saved after the last sync
      * re-establishes it, as the server's bank switch does */
-    if (!pulsar_session_bank_state_restore(s, 0)) { fprintf(stderr, "decode reference: bank 0 restore failed\n"); return false; }
+    if (!pulsar_session_bank_state_restore(s, BankId{0})) { fprintf(stderr, "decode reference: bank 0 restore failed\n"); return false; }
     const int G = pulsar_session_checkpoint_best(s, TokPos{(int)n}).raw();
     if (G <= 0) {
         fprintf(stderr, "decode reference: no grid checkpoint at or below %u -- the cold prefill left none\n", n);
@@ -105,7 +105,7 @@ static bool prefix_resumed(pulsar_session *s, const int *toks, uint32_t n, int *
     /* L357: no explicit restore -- a family that restores a grid checkpoint only as a sync resumes from it (Qwen)
      * refuses one; the sync below resumes from the deepest checkpoint at or below n on every family, and the
      * origin check after it asserts it was G */
-    pulsar_tokens p = { .v = (int *)toks, .len = (int)n, .cap = (int)n };
+    pulsar_tokens p = { .v = (TokId *)toks, .len = (int)n, .cap = (int)n };
     if (pulsar_session_sync(s, &p, err, sizeof err) != 0) {
         fprintf(stderr, "decode reference: resume sync to %u failed: %s\n", n, err);
         return false;
@@ -121,18 +121,20 @@ static bool prefix_resumed(pulsar_session *s, const int *toks, uint32_t n, int *
         fprintf(stderr, "decode reference: the sync to %u resumed from %d (checkpoint_best %d), past its target\n", n, O, G);
         return false;
     }
-    pulsar_session_bank_state_save(s, 0);
+    pulsar_session_bank_state_save(s, BankId{0});
     *origin = O < 0 ? (int)n : O;
     return true;
 }
 
 /* the w rows of the w tokens ending at depth d over bank 0's prefix [0, d - w): one w-wide decode step, or
  * (serial) w one-row steps -- into `out` (w x width) */
-static bool decode_rows(pulsar_session *s, const int *toks, uint32_t d, uint32_t w, float *out, int width,
+static bool decode_rows(pulsar_session *s, const TokId *toks, uint32_t d, uint32_t w, float *out, int width,
                         bool serial) {
     bool ok = true;
     pulsar_multiseq_req rq[PULSAR_SPEC_LOGITS_ROWS];
-    for (uint32_t j = 0; j < w; j++) { rq[j].bank = 0; rq[j].pos = TokPos{(int32_t)(d - w + j)}; rq[j].token = toks[d - w + j]; }
+    for (uint32_t j = 0; j < w; j++) {
+        rq[j].bank = BankId{0}; rq[j].pos = TokPos{(int32_t)(d - w + j)}; rq[j].token = toks[d - w + j];
+    }
     float *lg = (float *)malloc((size_t)w * (size_t)width * sizeof(float));
     uint32_t nr = 0;
     char err[256];
@@ -201,11 +203,11 @@ int GATE_ENTRY(int argc, char **argv) {
     fclose(fp);
     size_t tb = 0;
     char *traw = gate_read_file(argv[3], &tb);
-    if (!traw || tb % sizeof(int) || tb / sizeof(int) < h.depths[h.n_depths - 1]) {
+    if (!traw || tb % sizeof(TokId) || tb / sizeof(TokId) < h.depths[h.n_depths - 1]) {
         fprintf(stderr, "tokens %s unreadable or too short for depth %u\n", argv[3], h.depths[h.n_depths - 1]);
         return 1;
     }
-    const int *toks = (const int *)traw;
+    const TokId *toks = (const TokId *)traw;   /* the file's int32 ids, read as the bytes they are */
 
     pulsar_engine *e = NULL;
     pulsar_engine_options o;

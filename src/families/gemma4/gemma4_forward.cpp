@@ -47,7 +47,7 @@
 #include "gemma4.h"
 #include "cuda/pulsar_cuda_attn_gqa.h"
 #include "cuda/pulsar_cuda_head.h"
-#include "cuda/pulsar_cuda_qwen.h"     /* the rows front door's launchers + the rows MoE block (family-neutral) */
+#include "cuda/pulsar_cuda_rows.h"     /* the rows front door's launchers + the rows MoE block (family-neutral) */
 #include "cuda/pulsar_cuda_router.h"
 #include "cuda/pulsar_cuda_rowops.h"
 #include "cuda/pulsar_cuda_f16_rows.h"   /* L338: the runtime LoRA (pulsar_rows_lora_launch) */
@@ -427,7 +427,7 @@ struct g4_state : pulsar_driver_state {
     /// Host [max_rows + 1]: each sequence's first row, then n_rows
     uint32_t *seq_first;
     /// Host [max_rows]: each sequence's bank
-    int32_t *seq_bank;
+    BankId *seq_bank;
     /// Host [max_rows]: each row's sequence (F1's)
     uint32_t *row_seq;
     /// Host [max_rows]: each row's position (F1's)
@@ -512,9 +512,9 @@ bool constants(const pulsar_engine *e, g4_state *st) {
             memcpy(&es[(size_t)il * s.n_expert + x], &u, 4);
         }
     }
-    return pulsar_gpu_tensor_write(st->rope_tab, 0, tab.data(), (uint64_t)P * 4u) &&
-           pulsar_gpu_tensor_write(st->ones, 0, ones.data(), (uint64_t)s.head_dim * 2u) &&
-           pulsar_gpu_tensor_write(st->escale, 0, es.data(), (uint64_t)es.size() * 4u);
+    return pulsar_gpu_tensor_write(st->rope_tab, TensorBytes{0}, tab.data(), bytes_of<float>(P)) &&
+           pulsar_gpu_tensor_write(st->ones, TensorBytes{0}, ones.data(), bytes_of<uint16_t>(s.head_dim)) &&
+           pulsar_gpu_tensor_write(st->escale, TensorBytes{0}, es.data(), bytes_of<float>((uint64_t)es.size()));
 }
 
 /** pulsar_driver_ops::create: the residual and normed rows, the device constants, the host tables, the attention
@@ -527,13 +527,13 @@ pulsar_driver_state *create(pulsar_session *s, uint32_t n_banks) {
     const pulsar_gemma4_shape &sh = W(e)->shape;
     g4_state *st = (g4_state *)xcalloc(1, sizeof(*st));
     const uint64_t R = s->prefill_cap, NL = e->plan.n_layer;
-    st->h = pulsar_gpu_tensor_alloc(R * sh.n_embd * 2u);
-    st->xa = pulsar_gpu_tensor_alloc(R * sh.n_embd * 2u);
-    st->rope_tab = pulsar_gpu_tensor_alloc((uint64_t)sh.head_dim / 2u * 4u);
-    st->ones = pulsar_gpu_tensor_alloc((uint64_t)sh.head_dim * 2u);
-    st->escale = pulsar_gpu_tensor_alloc(NL * sh.n_expert * 4u);
+    st->h = pulsar_gpu_tensor_alloc(bytes_of<uint16_t>(R * sh.n_embd));
+    st->xa = pulsar_gpu_tensor_alloc(bytes_of<uint16_t>(R * sh.n_embd));
+    st->rope_tab = pulsar_gpu_tensor_alloc(bytes_of<float>((uint64_t)sh.head_dim / 2u));
+    st->ones = pulsar_gpu_tensor_alloc(bytes_of<uint16_t>(sh.head_dim));
+    st->escale = pulsar_gpu_tensor_alloc(bytes_of<float>(NL * sh.n_expert));
     st->seq_first = (uint32_t *)xmalloc((R + 1u) * sizeof(uint32_t));
-    st->seq_bank = (int32_t *)xmalloc(R * sizeof(int32_t));
+    st->seq_bank = (BankId *)xmalloc(R * sizeof(BankId));
     st->row_seq = (uint32_t *)xmalloc(R * sizeof(uint32_t));
     st->row_pos = (uint32_t *)xmalloc(R * sizeof(uint32_t));
     st->row_adapter = (uint8_t *)xcalloc(R, 1);
@@ -545,8 +545,8 @@ pulsar_driver_state *create(pulsar_session *s, uint32_t n_banks) {
     st->attn_call = (pulsar_gqa_call *)xcalloc(2u * NL, sizeof(pulsar_gqa_call));
     st->attn_off = (uint64_t *)xcalloc(2u * NL, sizeof(uint64_t));
     st->attn_desc_host = (uint8_t *)xmalloc(2u * NL * st->attn_desc_max);
-    st->attn_desc = pulsar_gpu_tensor_alloc(2u * NL * st->attn_desc_max);
-    st->last_hidden = pulsar_gpu_tensor_alloc((uint64_t)sh.n_embd * 2u);
+    st->attn_desc = pulsar_gpu_tensor_alloc(TensorBytes{2u * NL * st->attn_desc_max});
+    st->last_hidden = pulsar_gpu_tensor_alloc(bytes_of<uint16_t>(sh.n_embd));
     const bool ok = st->h && st->xa && st->rope_tab && st->ones && st->escale && st->attn_desc && st->last_hidden &&
                     constants(e, st);
     if (!ok) {
@@ -702,8 +702,9 @@ bool build_tables(const g4_step *st) {
     pulsar_gpu_tensor *rt = q->scratch[ARENA_ROWS];
     const rows_scratch L = rows_layout(q->max_rows);
     static const uint32_t zero = 0;   /* L289: an enqueued write reads it later */
-    const bool ok = rt != NULL && pulsar_gpu_tensor_write_async(rt, L.ids, st->tokens, (uint64_t)n * 4u) != 0 &&
-                    pulsar_gpu_tensor_write_async(rt, L.nf, &zero, sizeof(zero)) != 0;
+    const bool ok = rt != NULL && pulsar_gpu_tensor_write_async(rt, TensorBytes{L.ids}, st->tokens,
+                                                                bytes_of<int32_t>(n)) != 0 &&
+                    pulsar_gpu_tensor_write_async(rt, TensorBytes{L.nf}, &zero, TensorBytes{sizeof(zero)}) != 0;
     return ok || fail("could not upload the step's tables");
 }
 
@@ -741,12 +742,12 @@ bool plan_call(const g4_step *st, uint32_t il, uint32_t bound, uint64_t off, uin
     if (!full && !ring) return failf("a window layer's ring is missing", il);
     for (uint32_t j = 0; j < q->n_seq; j++) {
         pulsar_gqa_seq &sq = q->seqs[j];
-        const uint32_t bank = (uint32_t)q->seq_bank[j];
+        const uint32_t bank = pulsar_bank_index(q->seq_bank[j]);   /* in the pool: the driver's forward checked */
         if (full) {
-            pulsar_gpu_tensor *pool = pulsar_state_pool(st->states, il, PULSAR_GEMMA4_STATE_KV_FULL, bank);
+            pulsar_gpu_tensor *pool = pulsar_state_pool(st->states, il, PULSAR_GEMMA4_STATE_KV_FULL, q->seq_bank[j]);
             if (!pool) return failf("a global layer's pool is evicted", il);
             sq.kv = dptr(pool);
-            sq.bytes = pulsar_gpu_tensor_bytes(pool);
+            sq.bytes = pulsar_gpu_tensor_bytes(pool).raw();
         } else {
             sq.kv = (uint8_t *)dptr(ring) + (uint64_t)bank * ring_bank;
             sq.bytes = ring_bank;
@@ -774,22 +775,25 @@ bool stage(const pulsar_driver_step *st0, uint64_t *graph_key) {
     g4_state *q = st->st;
     *graph_key = 0;
     for (uint32_t r = 0; r < st->n_rows; r++)
-        if (st->tokens[r] < 0 || (uint32_t)st->tokens[r] >= st->w->shape.n_vocab) return fail("a token id outside the vocabulary");
+        if (!st->tokens[r].below(st->w->shape.n_vocab)) return fail("a token id outside the vocabulary");
     if (!build_tables(st)) return false;
     const uint32_t bound = attn_bound(st);
     const uint64_t stride = a256(pulsar_gqa_desc_bytes(st->n_rows));
     for (uint32_t il = 0; il < st->plan->n_layer; il++)
         if (!plan_call(st, il, bound, (uint64_t)il * 2u * stride, stride)) return false;
-    if (pulsar_gpu_tensor_write_async(q->attn_desc, 0, q->attn_desc_host, (uint64_t)st->plan->n_layer * 2u * stride) == 0)
+    if (pulsar_gpu_tensor_write_async(q->attn_desc, TensorBytes{0}, q->attn_desc_host,
+                                      TensorBytes{stride}.times((uint64_t)st->plan->n_layer * 2u)) == 0)
         return fail("could not upload the attention descriptors");
     /* L338 P2: the rows whose bank runs the runtime adapter (the LoRAs launch on them only) */
     q->step_adapter = false;
     for (uint32_t r = 0; r < st->n_rows; r++) {
-        q->row_adapter[r] = q->bank_adapter && q->bank_adapter[st->bank[r]] ? 1u : 0u;
+        /* in the pool: the driver's forward checked the step's banks */
+        q->row_adapter[r] = q->bank_adapter && q->bank_adapter[pulsar_bank_index(st->bank[r])] ? 1u : 0u;
         q->step_adapter |= q->row_adapter[r] != 0;
     }
-    if (q->step_adapter && pulsar_gpu_tensor_write_async(q->scratch[ARENA_ROWS], rows_layout(q->max_rows).ad,
-                                                         q->row_adapter, st->n_rows) == 0)
+    if (q->step_adapter && pulsar_gpu_tensor_write_async(q->scratch[ARENA_ROWS],
+                                                         TensorBytes{rows_layout(q->max_rows).ad},
+                                                         q->row_adapter, TensorBytes{st->n_rows}) == 0)
         return fail("could not upload the adapter rows");
     /* the key: the "G4" tag in bits 48..63, bit 47 the LoRAs launched (L338 P2: which rows they touch is the mask's,
      * read at replay), the bound in bits 1..32, bit 0 set (a key is nonzero); a decode step's shapes follow from the
@@ -1097,11 +1101,13 @@ bool block(const pulsar_driver_step *st0, uint32_t il) {
 /** pulsar_driver_ops::head: step rows [row0, row0 + n) of xa (output_norm of h) -> the EXL3 head (the decode arm at
  *  every call) -> logits rows [out0, out0 + n), soft-capped.
  *  @param st0   the trunk's step
- *  @param row0  the first step row headed
- *  @param n     the row count
- *  @param out0  the first logits row written
+ *  @param row0_at the first step row headed
+ *  @param n_rows  the row count
+ *  @param out0_at the first logits row written
  *  @return true = launched; false = refused (said) */
-bool head(const pulsar_driver_step *st0, uint32_t row0, uint32_t n, uint32_t out0) {
+bool head(const pulsar_driver_step *st0, StepRow row0_at, StepRows n_rows, HeadRow out0_at) {
+    /* the step's row / logits-row indices for the kernels (L334 P2b S7b: typed at the op) */
+    const uint32_t row0 = pulsar_row_index(row0_at), n = (uint32_t)n_rows.raw(), out0 = pulsar_row_index(out0_at);
     const g4_step *st = S(st0);
     const pulsar_gemma4_shape &s = st->w->shape;
     if (n == 0 || row0 + n > st->n_rows || out0 + n > PULSAR_DRIVER_HEADS_MAX) return fail("head rows out of range");
@@ -1117,8 +1123,9 @@ bool head(const pulsar_driver_step *st0, uint32_t row0, uint32_t n, uint32_t out
     if (pulsar_head_logits_finish_launch(&hd, logits, n, s.n_vocab, 0) != 0) return fail("the logits finish refused");
     /* L338 P2: the last headed row's final-norm hidden, kept for the decision head (pulsar_session_copy_hidden; which
      * row it is, is the driver's record: pulsar_driver_state::hidden_bank / hidden_pos) */
-    const uint64_t rb = (uint64_t)s.n_embd * 2u;
-    if (pulsar_gpu_tensor_copy_async(st->st->last_hidden, 0, st->st->xa, (uint64_t)(row0 + n - 1) * rb, rb) == 0)
+    const TensorBytes rb = bytes_of<uint16_t>(s.n_embd);
+    if (pulsar_gpu_tensor_copy_async(st->st->last_hidden, TensorBytes{0}, st->st->xa, rb.times(row0 + n - 1),
+                                     rb) == 0)
         return fail("could not keep the last row's hidden");
     return true;
 }
@@ -1137,7 +1144,8 @@ uint32_t hidden(pulsar_session *s, float *out, uint32_t cap) {
         return 0;
     }
     std::vector<uint16_t> h(E);
-    if (pulsar_gpu_synchronize() == 0 || !pulsar_gpu_tensor_read(q->last_hidden, 0, h.data(), (uint64_t)E * 2u)) {
+    if (pulsar_gpu_synchronize() == 0 || !pulsar_gpu_tensor_read(q->last_hidden, TensorBytes{0}, h.data(),
+                                                                 bytes_of<uint16_t>(E))) {
         fail("could not read the last row's hidden");
         return 0;
     }
@@ -1157,7 +1165,8 @@ bool step_end(const pulsar_driver_step *st0, bool ok) {
     if (!ok) return false;
     const g4_step *st = S(st0);
     uint32_t nf = 0;
-    if (!pulsar_gpu_tensor_read(st->st->scratch[ARENA_ROWS], rows_layout(st->st->max_rows).nf, &nf, sizeof(nf)))
+    if (!pulsar_gpu_tensor_read(st->st->scratch[ARENA_ROWS], TensorBytes{rows_layout(st->st->max_rows).nf}, &nf,
+                                TensorBytes{sizeof(nf)}))
         return fail("could not read the MoE non-finite flag");
     if (nf & 0x800000u) {
         fprintf(stderr, "pulsar: %s: an attention operand (q / k / v) of layer %u is outside fp16's range, which this "

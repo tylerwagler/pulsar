@@ -22,8 +22,8 @@
 static const pulsar_drafter_ops *g_block;   /* the engine's block drafter */
 
 /* the block drafter's draft with the session's lane detached: its own refusal path */
-static uint32_t refusing_draft(pulsar_session *s, int next_base, float temperature, int top_k, float top_p, float min_p,
-                               uint64_t *rng) {
+static uint32_t refusing_draft(pulsar_session *s, TokId next_base, float temperature, int top_k, float top_p,
+                               float min_p, uint64_t *rng) {
     pulsar_block_lane *lane = s->driver->block;
     s->driver->block = NULL;
     const uint32_t k = g_block->draft(s, next_base, temperature, top_k, top_p, min_p, rng);
@@ -57,7 +57,8 @@ int GATE_ENTRY(int argc, char **argv) {
     if (story.len > 400) story.len = 400;   /* the story's first 400 tokens: the prompt */
     if (ok) ok = pulsar_session_sync(s, &story, err, sizeof err) == 0;
     uint64_t rng = 0;
-    int toks[17], emitted = 0;
+    TokId toks[17];
+    int emitted = 0;
     for (int i = 0; ok && i < 4; i++) {
         s->spec.spec_quenched = false;
         const int n = pulsar_session_generate_speculative(s, 0.0f, 0, 1.0f, 0.0f, &rng, 16, toks, 17, err, sizeof err);

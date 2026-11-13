@@ -247,9 +247,10 @@ bool gpu_graph_load_directional_steering(
     float *dirs = (float *)xmalloc((size_t)n * sizeof(dirs[0]));
     bool ok = read_f32_binary_file(path, dirs, n);
     if (ok) {
-        g->directional_steering_dirs = pulsar_gpu_tensor_alloc(n * sizeof(dirs[0]));
+        g->directional_steering_dirs = pulsar_gpu_tensor_alloc(TensorBytes{sizeof(dirs[0])}.times(n));
         ok = g->directional_steering_dirs != NULL &&
-             pulsar_gpu_tensor_write(g->directional_steering_dirs, 0, dirs, n * sizeof(dirs[0])) != 0;
+             pulsar_gpu_tensor_write(g->directional_steering_dirs, TensorBytes{0}, dirs,
+                                     TensorBytes{sizeof(dirs[0])}.times(n)) != 0;
     }
     free(dirs);
 

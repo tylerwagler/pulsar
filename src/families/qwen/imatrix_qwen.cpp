@@ -15,7 +15,7 @@
  *
  * An entry is the checkpoint's own tensor name and sum(x[col]^2) / rows per input column; an expert-stacked
  * tensor carries `n_expert` such vectors.  Nothing about the forward changes: the tap only reads. */
-#include "pulsar_engine_internal.h"
+#include "engine/pulsar_engine_internal.h"
 #include "family_qwen.h"
 #include <map>
 #include <string>
@@ -84,7 +84,7 @@ static float bf16_f32(uint16_t b) {
 /// @param bytes length
 /// @return false on a failed read
 static bool tap_read(pulsar_imatrix_tap *t, const void *dev, void *host, uint64_t bytes) {
-    if (pulsar_gpu_device_read(dev, host, bytes)) return true;
+    if (pulsar_gpu_device_read(dev, host, TensorBytes{bytes})) return true;
     t->failed = true;
     return false;
 }

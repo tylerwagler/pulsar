@@ -125,7 +125,7 @@ fp16 and a fixed-algorithm cuBLASLt GEMM for bulk chunks, and, for chunks of up
 to 256 rows on the devices where it is established, a kernel that reads the
 trellis in place and reproduces that GEMM's bytes (`ds4_exl3_dense_prompt_arm`;
 each shape is checked against the GEMM once a process, and a mismatch keeps
-every prompt chunk on the GEMM -- `src/cuda/mmq/qwen_exl3_dense_prefill.cu`).
+every prompt chunk on the GEMM -- `src/cuda/mmq/exl3_dense_prefill.cu`).
 
 ## Correctness discipline
 

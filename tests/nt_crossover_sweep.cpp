@@ -38,7 +38,7 @@ static void fill_rand(pulsar_gpu_tensor *t, uint64_t n_floats, uint32_t seed) {
         s = s * 1664525u + 1013904223u;
         h[i] = ((float)(s >> 8) / 16777216.0f - 0.5f) * 2.0f;
     }
-    pulsar_gpu_tensor_write(t, 0, h, n_floats * sizeof(float));
+    pulsar_gpu_tensor_write(t, TensorBytes{0}, h, bytes_of<float>(n_floats));
     free(h);
 }
 
@@ -177,8 +177,8 @@ int main(int argc, char **argv) {
         const pulsar_tensor *w = shapes[si].w;
         gemm_ctx c;
         c.e = e; c.w = w; c.in_dim = w->dim[0]; c.out_dim = w->dim[1];
-        c.x = pulsar_gpu_tensor_alloc((uint64_t)MMAX * c.in_dim * sizeof(float));
-        c.out = pulsar_gpu_tensor_alloc((uint64_t)MMAX * c.out_dim * sizeof(float));
+        c.x = pulsar_gpu_tensor_alloc(bytes_of<float>((uint64_t)MMAX * c.in_dim));
+        c.out = pulsar_gpu_tensor_alloc(bytes_of<float>((uint64_t)MMAX * c.out_dim));
         if (!c.x || !c.out) { fprintf(stderr, "alloc failed for %s\n", shapes[si].name); return 1; }
         fill_rand(c.x, (uint64_t)MMAX * c.in_dim, 7u + (uint32_t)si);
         /* L151-D (2026-09-03): arm the E4M3 activation slot and let one
@@ -242,15 +242,15 @@ int main(int argc, char **argv) {
         a.rank = PULSAR_N_LORA_O;
         const uint64_t q_dim = (uint64_t)PULSAR_N_HEAD * PULSAR_N_HEAD_DIM;
         a.heads = pulsar_gpu_tensor_alloc_elt((uint64_t)MMAX * q_dim, PULSAR_HEADS_ELT_SIZE, PULSAR_HEADS_ELT_FMT);
-        a.low = pulsar_gpu_tensor_alloc((uint64_t)MMAX * a.n_groups * a.rank * sizeof(float));
-        a.out = pulsar_gpu_tensor_alloc((uint64_t)MMAX * PULSAR_N_EMBD * sizeof(float));
+        a.low = pulsar_gpu_tensor_alloc(bytes_of<float>((uint64_t)MMAX * a.n_groups * a.rank));
+        a.out = pulsar_gpu_tensor_alloc(bytes_of<float>((uint64_t)MMAX * PULSAR_N_EMBD));
         if (!a.heads || !a.low || !a.out) { fprintf(stderr, "attn-out alloc failed\n"); return 1; }
         /* heads may be a 16-bit carrier: write zeros-ish bytes; timing is data-independent */
         {
-            const uint64_t bytes = pulsar_gpu_tensor_bytes(a.heads);
+            const uint64_t bytes = pulsar_gpu_tensor_bytes(a.heads).raw();
             uint8_t *h = (uint8_t *)calloc(1, bytes);
             for (uint64_t i = 0; i < bytes; i += 7) h[i] = (uint8_t)(i * 31u);
-            pulsar_gpu_tensor_write(a.heads, 0, h, bytes);
+            pulsar_gpu_tensor_write(a.heads, TensorBytes{0}, h, TensorBytes{bytes});
             free(h);
         }
         const double wbytes = ((double)L->attn_output_a->elements + (double)L->attn_output_b->elements) * 1.03;

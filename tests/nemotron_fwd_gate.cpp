@@ -69,7 +69,7 @@ static std::vector<int32_t> read_ids(const char *path) {
 static pulsar_tokens toks(const std::vector<int32_t> &ids, size_t lo, size_t hi) {
     pulsar_tokens t;
     memset(&t, 0, sizeof(t));
-    for (size_t i = lo; i < hi && i < ids.size(); i++) pulsar_tokens_push(&t, ids[i]);
+    for (size_t i = lo; i < hi && i < ids.size(); i++) pulsar_tokens_push(&t, TokId{ids[i]});
     return t;
 }
 
@@ -123,7 +123,7 @@ static std::vector<std::vector<float>> run(pulsar_engine *e, const std::vector<i
     if (ok) {
         out.push_back(logits_of(s, W));
         for (int i = 0; i < 4 && ok; i++) {
-            ok = pulsar_session_eval(s, kDecode[i], err, sizeof(err)) == 0;
+            ok = pulsar_session_eval(s, TokId{kDecode[i]}, err, sizeof(err)) == 0;
             if (ok) out.push_back(logits_of(s, W));
         }
     }
@@ -179,7 +179,7 @@ static int capture(pulsar_engine *e, const std::vector<int32_t> &ids, const char
         pulsar_tokens_free(&P);
         const double t0 = gate_now_s();
         for (int i = 0; ok && i < T; i++) {
-            if (i > 0) ok = pulsar_session_eval(s, ids[(size_t)i], err, sizeof(err)) == 0;
+            if (i > 0) ok = pulsar_session_eval(s, TokId{ids[(size_t)i]}, err, sizeof(err)) == 0;
             const std::vector<float> l = ok ? logits_of(s, W) : std::vector<float>();
             ok = ok && !l.empty() && fwrite(l.data(), sizeof(float), l.size(), fp) == l.size();
         }
@@ -220,7 +220,7 @@ static void exact(pulsar_engine *e, const std::vector<int32_t> &ids, int W) {
             pulsar_tokens P = b % 2 ? toks(ids, lb0, lb0 + lb) : toks(ids, 0, la);
             bool ok = pulsar_session_sync(s, &P, err, sizeof(err)) == 0;
             for (int step = 0; ok && step < 2; step++) {
-                ok = pulsar_session_eval(s, next[(b + step) % 4], err, sizeof(err)) == 0;
+                ok = pulsar_session_eval(s, TokId{next[(b + step) % 4]}, err, sizeof(err)) == 0;
                 if (ok) alone[b].push_back(logits_of(s, W));
             }
             pulsar_tokens_free(&P);
@@ -235,14 +235,15 @@ static void exact(pulsar_engine *e, const std::vector<int32_t> &ids, int W) {
             for (int b = 0; b < 4; b++) {
                 pulsar_tokens P = b % 2 ? toks(ids, lb0, lb0 + lb) : toks(ids, 0, la);
                 pos[b] = P.len;
-                CHECK(pulsar_session_bank_state_restore(s, (uint32_t)b) && pulsar_session_sync(s, &P, err, sizeof(err)) == 0,
+                CHECK(pulsar_session_bank_state_restore(s, BankId{b}) &&
+                          pulsar_session_sync(s, &P, err, sizeof(err)) == 0,
                       "X2 bank %d prefills %d tokens: %s", b, P.len, err);
-                pulsar_session_bank_state_save(s, (uint32_t)b);
+                pulsar_session_bank_state_save(s, BankId{b});
                 pulsar_tokens_free(&P);
             }
             for (int step = 0; step < 2; step++) {
                 pulsar_multiseq_req rows[4];
-                for (int b = 0; b < 4; b++) rows[b] = {(uint32_t)b, TokPos{pos[b] + step}, next[(b + step) % 4]};
+                for (int b = 0; b < 4; b++) rows[b] = {BankId{b}, TokPos{pos[b] + step}, TokId{next[(b + step) % 4]}};
                 std::vector<float> out((size_t)4 * W);
                 err[0] = '\0';
                 const int rc = pulsar_session_decode_multiseq(s, rows, 4, out.data(), 4 * W, err, sizeof(err));
@@ -274,7 +275,7 @@ static void exact(pulsar_engine *e, const std::vector<int32_t> &ids, int W) {
         if (pulsar_session_create(&s, e, ctx) == 0 && s) {
             pulsar_tokens P = toks(ids, 0, 1);
             bool ok = pulsar_session_sync(s, &P, err, sizeof(err)) == 0;
-            for (size_t i = 1; ok && i < n; i++) ok = pulsar_session_eval(s, ids[i], err, sizeof(err)) == 0;
+            for (size_t i = 1; ok && i < n; i++) ok = pulsar_session_eval(s, TokId{ids[i]}, err, sizeof(err)) == 0;
             if (ok) dec = logits_of(s, W);
             pulsar_tokens_free(&P);
             pulsar_session_free(s);
@@ -305,7 +306,7 @@ static void exact(pulsar_engine *e, const std::vector<int32_t> &ids, int W) {
             if (ok) {
                 got.push_back(logits_of(s, W));
                 for (int i = 0; i < 4 && ok; i++) {
-                    ok = pulsar_session_eval(s, kDecode[i], err, sizeof(err)) == 0;
+                    ok = pulsar_session_eval(s, TokId{kDecode[i]}, err, sizeof(err)) == 0;
                     if (ok) got.push_back(logits_of(s, W));
                 }
             }
@@ -326,8 +327,9 @@ static void exact(pulsar_engine *e, const std::vector<int32_t> &ids, int W) {
         CHECK(made, "X5 three sessions");
         if (made) {
             pulsar_tokens P = toks(ids, 0, 777);
-            bool ok = pulsar_session_sync(a, &P, err, sizeof(err)) == 0 && pulsar_session_eval(a, 1000, err, sizeof(err)) == 0 &&
-                      pulsar_session_eval(a, 2024, err, sizeof(err)) == 0;
+            bool ok = pulsar_session_sync(a, &P, err, sizeof(err)) == 0 &&
+                      pulsar_session_eval(a, TokId{1000}, err, sizeof(err)) == 0 &&
+                      pulsar_session_eval(a, TokId{2024}, err, sizeof(err)) == 0;
             CHECK(ok, "X5 session A at 777 + 2 decoded: %s", err);
             pulsar_tokens_free(&P);
             /* the payload */
@@ -351,9 +353,9 @@ static void exact(pulsar_engine *e, const std::vector<int32_t> &ids, int W) {
             CHECK(sn, "X5 a snapshot saved and loaded into a fresh session: %s", err);
             pulsar_session_snapshot_free(&snap);
             for (int i = 0; ok && i < 4; i++) {
-                const bool ea = pulsar_session_eval(a, kDecode[i], err, sizeof(err)) == 0;
-                const bool eb = pulsar_session_eval(b, kDecode[i], err, sizeof(err)) == 0;
-                const bool ec = sn && pulsar_session_eval(c, kDecode[i], err, sizeof(err)) == 0;
+                const bool ea = pulsar_session_eval(a, TokId{kDecode[i]}, err, sizeof(err)) == 0;
+                const bool eb = pulsar_session_eval(b, TokId{kDecode[i]}, err, sizeof(err)) == 0;
+                const bool ec = sn && pulsar_session_eval(c, TokId{kDecode[i]}, err, sizeof(err)) == 0;
                 double d1 = 0, d2 = 0;
                 const std::vector<float> la = logits_of(a, W);
                 CHECK(ea && eb && same(la, logits_of(b, W), &d1), "X5 decode %d: payload-restored == original (max |diff| "
@@ -375,7 +377,8 @@ static void exact(pulsar_engine *e, const std::vector<int32_t> &ids, int W) {
         char err[256] = "";
         if (pulsar_session_create(&s, e, ctx) == 0 && s) {
             pulsar_tokens A = toks(ids, 0, 500);
-            if (pulsar_session_sync(s, &A, err, sizeof(err)) == 0 && pulsar_session_eval(s, ta, err, sizeof(err)) == 0)
+            if (pulsar_session_sync(s, &A, err, sizeof(err)) == 0 &&
+                pulsar_session_eval(s, TokId{ta}, err, sizeof(err)) == 0)
                 ref = logits_of(s, W);
             pulsar_tokens_free(&A);
             pulsar_session_free(s);
@@ -384,11 +387,14 @@ static void exact(pulsar_engine *e, const std::vector<int32_t> &ids, int W) {
         s = NULL;
         if (pulsar_session_create(&s, e, ctx) == 0 && s) {
             pulsar_tokens A = toks(ids, 0, 500), B = toks(ids, 600, 900);
-            bool ok = pulsar_session_bank_state_restore(s, 0) && pulsar_session_sync(s, &A, err, sizeof(err)) == 0;
-            pulsar_session_bank_state_save(s, 0);
-            ok = ok && pulsar_session_bank_state_restore(s, 1) && pulsar_session_sync(s, &B, err, sizeof(err)) == 0;
-            pulsar_session_bank_state_save(s, 1);
-            ok = ok && pulsar_session_bank_state_restore(s, 0) && pulsar_session_eval(s, ta, err, sizeof(err)) == 0;
+            bool ok = pulsar_session_bank_state_restore(s, BankId{0}) &&
+                pulsar_session_sync(s, &A, err, sizeof(err)) == 0;
+            pulsar_session_bank_state_save(s, BankId{0});
+            ok = ok && pulsar_session_bank_state_restore(s, BankId{1}) &&
+                pulsar_session_sync(s, &B, err, sizeof(err)) == 0;
+            pulsar_session_bank_state_save(s, BankId{1});
+            ok = ok && pulsar_session_bank_state_restore(s, BankId{0}) &&
+                 pulsar_session_eval(s, TokId{ta}, err, sizeof(err)) == 0;
             double d = 0;
             CHECK(ok && same(logits_of(s, W), ref, &d), "X6 bank 0 after bank 1's prefill == one-bank A + token (max "
                   "|diff| %.3g): %s", d, err);
@@ -411,8 +417,8 @@ static bool decode_run(pulsar_engine *e, const std::vector<int32_t> &ids, int ba
     std::vector<int> pos((size_t)banks), next((size_t)banks);
     for (int b = 0; ok && b < banks; b++) {
         pulsar_tokens P = toks(ids, (size_t)b * 37u, (size_t)b * 37u + (size_t)prompt);
-        ok = (banks == 1 || pulsar_session_bank_state_restore(s, (uint32_t)b)) && pulsar_session_sync(s, &P, err, sizeof(err)) == 0;
-        if (ok && banks > 1) pulsar_session_bank_state_save(s, (uint32_t)b);
+        ok = (banks == 1 || pulsar_session_bank_state_restore(s, BankId{b})) && pulsar_session_sync(s, &P, err, sizeof(err)) == 0;
+        if (ok && banks > 1) pulsar_session_bank_state_save(s, BankId{b});
         pos[(size_t)b] = P.len;
         next[(size_t)b] = ok ? argmax(logits_of(s, W)) : 0;
         pulsar_tokens_free(&P);
@@ -422,7 +428,8 @@ static bool decode_run(pulsar_engine *e, const std::vector<int32_t> &ids, int ba
     for (int step = 0; ok && step < steps; step++) {
         if (step == warm) { (void)pulsar_gpu_synchronize(); t0 = gate_now_s(); }
         std::vector<pulsar_multiseq_req> rows((size_t)banks);
-        for (int b = 0; b < banks; b++) rows[(size_t)b] = {(uint32_t)b, TokPos{pos[(size_t)b] + step}, next[(size_t)b]};
+        for (int b = 0; b < banks; b++)
+            rows[(size_t)b] = {BankId{b}, TokPos{pos[(size_t)b] + step}, TokId{next[(size_t)b]}};
         ok = pulsar_session_decode_multiseq(s, rows.data(), (uint32_t)banks, lg.data(), banks * W, err, sizeof(err)) == 0;
         /* the next token in place (a per-row copy is a fresh 512 KiB allocation a step: page faults the timing
          * would charge to the engine); the rows kept only when the caller compares them */

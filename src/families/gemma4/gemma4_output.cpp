@@ -215,26 +215,6 @@ const out_grammar &gemma4_output_grammar(void) {
     return g;
 }
 
-bool gemma4_call_body::declared_string(const std::string &fn, const std::string &key) const {
-    for (const pyjson_value &tool : tools.a) {
-        const pyjson_value *f = tool.get("function");
-        if (!f) f = &tool;
-        const pyjson_value *name = f->get("name");
-        if (!name || name->kind != pyjson_value::STR || name->s != fn) continue;
-        const pyjson_value *params = f->get("parameters");
-        const pyjson_value *props = params ? params->get("properties") : NULL;
-        const pyjson_value *prop = props ? props->get(key.c_str()) : NULL;
-        const pyjson_value *type = prop ? prop->get("type") : NULL;
-        if (!type) return false;
-        if (type->kind == pyjson_value::STR) return type->s == "string";
-        if (type->kind == pyjson_value::ARR)
-            for (const pyjson_value &t : type->a)
-                if (t.kind == pyjson_value::STR && t.s == "string") return true;
-        return false;
-    }
-    return false;
-}
-
 void gemma4_call_body::open() {
     began_ = false;
     args_lo_ = scan_ = 0;
@@ -294,7 +274,10 @@ bool gemma4_call_body::close(const std::string &b, int index, std::vector<out_ev
         size_t opens = 0, closes = 0;
         for (char c : text) opens += c == '(', closes += c == ')';
         if (!text.empty() && (text.back() == '}' || (text.back() == ')' && opens < closes))) text.pop_back();
-        const string_keys declared = [this, &name](const std::string &key) { return declared_string(name, key); };
+        const string_keys declared = [this, &name](const std::string &key) {
+            const char *t = out_tool_param_type(tools, name, key);
+            return t && !strcmp(t, "string");
+        };
         args = parse_fields(text, &declared);
     }
     if (!began_) {
@@ -348,3 +331,18 @@ bool gemma4_prompt_opens_reasoning(const char *prompt) {
     }
     return true;
 }
+
+/* L295 F8 step 2: this family's parser, by chat format (out_parse_kit.h) */
+/// The family's parser for one turn (OUT_PARSER_FAMILY's factory).
+/// @param thinking   the turn starts in reasoning
+/// @param tools_json the request's tools array as JSON text, or NULL
+/// @param err        receives "tools_not_array: <detail>" on refusal
+/// @param errlen     its size
+/// @return the parser (the caller deletes it), or NULL when the tools are refused
+static out_parser *make_parser(bool thinking, const char *tools_json, char *err, size_t errlen) {
+    gemma4_output_parser *p = new gemma4_output_parser();
+    if (p->init(thinking, tools_json, err, errlen)) return p;
+    delete p;
+    return nullptr;
+}
+OUT_PARSER_FAMILY(PULSAR_CHAT_GEMMA4, make_parser)

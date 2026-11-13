@@ -132,7 +132,10 @@ PULSAR_INC = -Isrc -Isrc/lib -Isrc/vendor -I$(CUDA_HOME)/include
 ENGINE_SRCS = $(wildcard src/engine/*.cpp)
 # L295: the family modules (src/families/<name>/, the plugin layout) are engine objects; a new family adds a
 # directory, not a line here.
-FAMILY_SRCS = $(wildcard src/families/*/*.cpp)
+# L295 F8 step 5: a module's SERVER table (src/families/<name>/<name>_server.cpp) is a server object, not an engine
+# one: it depends on src/server and registers itself (SERVER_FAMILY), so it rides in SERVER_SRCS.
+FAMILY_SERVER_SRCS = $(wildcard src/families/*/*_server.cpp)
+FAMILY_SRCS = $(filter-out $(FAMILY_SERVER_SRCS),$(wildcard src/families/*/*.cpp))
 ENGINE_OBJS = $(ENGINE_SRCS:.cpp=.o) $(FAMILY_SRCS:.cpp=.o)
 # Two-rank TP transport + host-pinned GPU slab (slice 4b).  Only the pieces the
 # engine calls: pulsar_tp.o (pure host, g++) and pulsar_tp_gpu.o (needs the CUDA
@@ -141,7 +144,7 @@ ENGINE_OBJS = $(ENGINE_SRCS:.cpp=.o) $(FAMILY_SRCS:.cpp=.o)
 TP_OBJS = src/tp/pulsar_tp.o src/tp/pulsar_tp_gpu.o
 AGENT_SRCS = $(wildcard src/agent/*.cpp)
 AGENT_OBJS = $(AGENT_SRCS:.cpp=.o)
-SERVER_SRCS = $(wildcard src/server/*.cpp)
+SERVER_SRCS = $(wildcard src/server/*.cpp) $(FAMILY_SERVER_SRCS)
 SERVER_OBJS = $(SERVER_SRCS:.cpp=.o)
 SERVER_HDRS = $(wildcard src/server/*.h)
 # CUTLASS TUs need the CUTLASS include path + c++17; they build via dedicated rules below,
@@ -168,10 +171,11 @@ LIB_HDRS = src/lib/pulsar_help.h src/lib/pulsar_kvtext.h src/lib/pulsar_segstore
 # $(CORE_OBJS) needs it.  ALL_OBJS globs src/lib/*.cpp but is only used to
 # derive .d files, and link rules use $^, so there is no duplicate object.
 # The frontend (L251 S5; the shared kit since L295 F5) rides here too -- the BPE engine, the output-parser
-# kit, the Qwen and Inkling renderers and parser configurations: each family loads its tokenizer at open and the engine's
+# kit (every chat family's renderer and parser lives in src/families/<name>/, L295 F8): each
+# family loads its tokenizer at open and the engine's
 # tokenizer entries dispatch to it, so every target linking $(CORE_OBJS) references it.
-FRONTEND_OBJS = src/lib/bpe_tokenizer.o src/lib/pyjson.o src/lib/qwen_chat.o src/lib/qwen_output.o src/lib/out_parse_kit.o \
-                src/lib/inkling_chat.o src/lib/nemotron_chat.o src/lib/chat_render_kit.o src/lib/gemma4_chat.o src/lib/gemma4_output.o
+FRONTEND_OBJS = src/lib/bpe_tokenizer.o src/lib/pyjson.o src/lib/out_parse_kit.o \
+                src/lib/chat_render_kit.o
 # L347 I3a: the disk KV payload digest (the engine's payload streams, the segment store and the TP workers share it)
 # and the store's host memory pool ride here too: the engine references the digest, the store both.
 KVIO_OBJS = src/lib/pulsar_kvdigest.o src/lib/pulsar_kvpool.o
@@ -688,7 +692,7 @@ segstore-tsan: tests/segstore_tsan
 tests/lt_picks: tests/lt_picks.cu src/cuda/pulsar_cuda_lt_fixed.o src/cuda/pulsar_cuda_lt_fixed.h Makefile
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/lt_picks.cu src/cuda/pulsar_cuda_lt_fixed.o $(CUDA_LDLIBS)
 # L381: does the fixed cuBLASLt GEMM still follow the accumulation order the EXL3 dense arm's in-place prompt kernel
-# implements (qwen_exl3_dense_prefill.cu)?  Exit 0 iff every dense prompt shape is reproduced, byte for byte, by the
+# implements (exl3_dense_prefill.cu)?  Exit 0 iff every dense prompt shape is reproduced, byte for byte, by the
 # shipped order.  `lt-order-gate` is its battery form (kernels tier: a GPU, no model): on a device the rule gives the
 # in-place kernel (sm_12x) a vendor change fails it; elsewhere it is N/A.  Run by hand without --gate to establish the
 # order on a new architecture, and after a toolchain move (docs/QA_BEFORE_RELEASES.md) -- usage in the file's header.
@@ -1197,10 +1201,10 @@ scratch-poison-gate-mutant: tests/scratch_poison_gate_mutant
 # the container's PENGRAM1 v2 row file (tools/container/ple_rows.py); empty = read the
 # checkpoint's shard parts named in the vectors instead
 QWEN_NGRAM_ROWFILE ?=
-tests/qwen_ngram_test: tests/qwen_ngram_test.cpp src/engine/qwen_ngram.cpp src/engine/qwen_ngram.h \
+tests/qwen_ngram_test: tests/qwen_ngram_test.cpp src/families/qwen/qwen_ngram.cpp src/families/qwen/qwen_ngram.h \
                        src/engine/engram.cpp src/engine/log.cpp src/engine/alloc.cpp Makefile \
                        src/engine/pulsar_engine_internal.h
-	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -o $@ tests/qwen_ngram_test.cpp src/engine/qwen_ngram.cpp \
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -Isrc/families/qwen -o $@ tests/qwen_ngram_test.cpp src/families/qwen/qwen_ngram.cpp \
 		src/engine/engram.cpp src/engine/log.cpp src/engine/alloc.cpp -lpthread
 .PHONY: qwen-ngram-test
 qwen-ngram-test: tests/qwen_ngram_test
@@ -1214,9 +1218,9 @@ qwen-ngram-test: tests/qwen_ngram_test
 QWEN_TOK_DIR ?= $(call need_path,QWEN_TOK_DIR)
 QWEN_RENDER_CASES ?= $(call need_path,QWEN_RENDER_CASES)
 QWEN_CALIB ?= $(call need_path,QWEN_CALIB)
-QWEN_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/lib/qwen_chat.cpp src/lib/qwen_output.cpp src/lib/out_parse_kit.cpp
+QWEN_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/families/qwen/qwen_chat.cpp src/families/qwen/qwen_output.cpp src/lib/out_parse_kit.cpp
 tests/qwen_chat_gate: tests/qwen_chat_gate.cpp tests/bpe_gate_util.h $(QWEN_CHAT_SRCS) src/lib/bpe_tokenizer.h \
-                      src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/lib/qwen_chat.h src/lib/out_parse_kit.h src/lib/pulsar_utf8.h src/lib/chat_refuse.h \
+                      src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/families/qwen/qwen_chat.h src/lib/out_parse_kit.h src/lib/xml_call_body.h src/lib/pulsar_utf8.h src/lib/chat_refuse.h \
                       src/lib/sha1.hpp Makefile
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/lib -o $@ tests/qwen_chat_gate.cpp $(QWEN_CHAT_SRCS)
 .PHONY: qwen-chat-gate
@@ -1231,10 +1235,10 @@ qwen-chat-gate: tests/qwen_chat_gate
 # parser engine (goldens from tests/nemotron/gen_nemotron_goldens.py).  Model-free; the inputs are the checkpoint's
 # tokenizer files and the L216 corpus.
 NEMOTRON_TOK_DIR ?= $(call need_path,NEMOTRON_TOK_DIR)
-NEMOTRON_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/lib/nemotron_chat.cpp src/lib/chat_render_kit.cpp src/lib/qwen_output.cpp \
+NEMOTRON_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/families/nemotron_h/nemotron_chat.cpp src/lib/chat_render_kit.cpp \
                      src/lib/out_parse_kit.cpp
 tests/nemotron_chat_gate: tests/nemotron_chat_gate.cpp tests/bpe_gate_util.h $(NEMOTRON_CHAT_SRCS) src/lib/bpe_tokenizer.h \
-                          src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/lib/nemotron_chat.h src/lib/qwen_chat.h \
+                          src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/families/nemotron_h/nemotron_chat.h src/lib/xml_call_body.h \
                           src/lib/out_parse_kit.h src/lib/pulsar_utf8.h src/lib/chat_refuse.h src/lib/sha1.hpp Makefile
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/lib -o $@ tests/nemotron_chat_gate.cpp $(NEMOTRON_CHAT_SRCS)
 .PHONY: nemotron-chat-gate
@@ -1261,10 +1265,10 @@ nemotron-enc-tok-gate: tests/nemotron_enc_tok_gate
 # turn-by-turn front's composition (C1); goldens from tests/gemma4/gen_tok_goldens.py and gen_render_goldens.py.
 # Model-free; GEMMA4_TOK_DIR holds the checkpoint's tokenizer.json + generation_config.json (the container's copies).
 GEMMA4_TOK_DIR ?= $(call need_path,GEMMA4_TOK_DIR)
-GEMMA4_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/lib/gemma4_chat.cpp src/lib/gemma4_output.cpp \
+GEMMA4_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/families/gemma4/gemma4_chat.cpp src/families/gemma4/gemma4_output.cpp \
                    src/lib/chat_render_kit.cpp src/lib/out_parse_kit.cpp
 tests/gemma4_chat_gate: tests/gemma4_chat_gate.cpp tests/bpe_gate_util.h $(GEMMA4_CHAT_SRCS) src/lib/bpe_tokenizer.h \
-                        src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/lib/gemma4_chat.h src/lib/chat_render_kit.h src/lib/out_parse_kit.h \
+                        src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/families/gemma4/gemma4_chat.h src/lib/chat_render_kit.h src/lib/out_parse_kit.h \
                         src/lib/chat_refuse.h src/lib/pulsar_utf8.h src/lib/sha1.hpp Makefile
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/lib -o $@ tests/gemma4_chat_gate.cpp $(GEMMA4_CHAT_SRCS)
 .PHONY: gemma4-chat-gate
@@ -2422,12 +2426,18 @@ GEMMA4_REF_ANCHORS = --ref-dir $(call ref_dir_for,$(GEMMA4_GATE_MODEL)) --ref-to
 # L370's two attention faults (a bounded split grid one chunk short; the arm chosen by the call, not the row) had no
 # instrument: session-contract (C1 restore == cold, B6 / F1 verify == decode), bank-adopt, bank-isolation,
 # block-spec, scratch-poison and graph-eager now run on its pack; session-contract and bank-isolation on Nemotron's.
+# L382 (Tyler 2026-11-12: "382 yes"): a DeepSeek lane on the fixture (FRONTIER_MODEL), the contracts no other family's
+# pack can stand in for: session-contract (a cut / resume == cold: the 128-row cut sat broken from 2026-11-03, when
+# DeepSeek left the runner, until 8ab1e6ed), chunk-neutrality, and cuda-multiseq (banks decoding side by side == each
+# alone: DeepSeek's bank isolation, which bank-isolation-gate cannot grade -- it reads declared state, NEED_STATE).
 RUNNER_HOSTED_ARGS ?= --model $(LILICORR_GATE_MODEL) \
 	--gates=session-contract-gate,bank-isolation-gate,block-spec-gate,scratch-poison-gate,bank-adopt-gate,graph-eager-gate,cuda-reference-gate-story,cuda-reference-gate-code \
 	$(NEMOTRON_REF_ANCHORS) \
 	--model $(GEMMA4_GATE_MODEL) \
 	--gates=session-contract-gate,bank-isolation-gate,block-spec-gate,scratch-poison-gate,bank-adopt-gate,graph-eager-gate,cuda-reference-gate-story,cuda-reference-gate-code \
-	$(GEMMA4_REF_ANCHORS)
+	$(GEMMA4_REF_ANCHORS) \
+	--model $(FRONTIER_MODEL) \
+	--gates=session-contract-gate,cuda-chunk-neutrality-gate,cuda-multiseq-gate
 # Extra runner options for the primary (e.g. `--needs=fixtures`); empty = its whole table.  gates-dev calls the runner
 # itself and is unaffected.
 RUNNER_PRIMARY_ARGS ?=
@@ -2661,7 +2671,7 @@ gates-dev:
 	    for p in $$paths; do \
 	      case "$$p" in \
 	        *vision*) cls=vision; vision=1 ;; \
-	        src/engine/family*|src/families/*|src/engine/role_bind*|tests/nemotron_*|src/engine/*qwen*|tests/qwen_*|tests/session_contract*|src/engine/state_kinds*|src/engine/step_driver*|tests/state_kinds*|src/engine/session*|src/engine/safetensors*|src/engine/model.cpp|src/engine/weights*|src/engine/tensor_bind*|tests/loader_*|src/engine/sync_driver*|src/engine/prefill_loop*|src/engine/checkpoint*|src/engine/kv_state*) cls=engine; family=1 ;; \
+	        src/engine/family*|src/families/*|src/engine/role_bind*|tests/nemotron_*|src/engine/*qwen*|src/families/qwen/*|tests/qwen_*|tests/session_contract*|src/engine/state_kinds*|src/engine/step_driver*|tests/state_kinds*|src/engine/session*|src/engine/safetensors*|src/engine/model.cpp|src/engine/weights*|src/engine/tensor_bind*|tests/loader_*|src/engine/sync_driver*|src/engine/prefill_loop*|src/engine/checkpoint*|src/engine/kv_state*) cls=engine; family=1 ;; \
 	        *exl3*) cls=exl3; exl3=1 ;; \
 	        *gdn*) cls=gdn; gdn=1 ;; \
 	        *sconv*|*mamba2*|src/cuda/pulsar_cuda_head*|tests/head_*|*rowops*) cls=blocks; blocks=1 ;; \
@@ -2676,9 +2686,9 @@ gates-dev:
 	      case "$$p" in *router*|*moe*) router=1 ;; esac; \
 	      case "$$p" in *bf16_rows*|*nvfp4*|*weight_format*|src/engine/linear.cpp|src/engine/moe.cpp) bf16=1 ;; esac; \
 	      case "$$p" in *sampler*|*libm*|src/engine/spec_dspark.cpp|src/engine/session_spec.cpp|src/engine/spec_mtp.cpp|src/engine/spec_block.cpp) minp=1 ;; esac; \
-	      case "$$p" in *spec_block*|*blockdraft*|*candsel*|*lilicorr*|*mtp_spec*|*attn_gqa*|*rope*|src/engine/session_spec.cpp|src/families/nemotron_h/*|src/engine/family_qwen.cpp) drafter=1 ;; esac; \
+	      case "$$p" in *spec_block*|*blockdraft*|*candsel*|*lilicorr*|*mtp_spec*|*attn_gqa*|*rope*|src/engine/session_spec.cpp|src/families/nemotron_h/*|src/families/qwen/family_qwen.cpp) drafter=1 ;; esac; \
 	      case "$$p" in src/server/server_jobs.cpp|src/server/server_sched.cpp|src/server/kv_cache.cpp|src/lib/pulsar_kvchain*|src/lib/pulsar_segstore*|src/lib/pulsar_kvdigest*|src/lib/pulsar_kvpool*) resume=1 ;; esac; \
-	      case "$$p" in src/server/*|src/lib/*_chat*|src/lib/pyjson*|src/lib/bpe_tokenizer*|src/lib/pulsar_json*|src/lib/out_parse*|src/lib/chat_render*) render=1 ;; esac; \
+	      case "$$p" in src/server/*|src/lib/*_chat*|src/families/*/*_chat*|src/families/*/*_output*|src/families/*/*_server*|src/lib/xml_call_body*|src/lib/pyjson*|src/lib/bpe_tokenizer*|src/lib/pulsar_json*|src/lib/out_parse*|src/lib/chat_render*) render=1 ;; esac; \
 	      case "$$p" in src/server/cli_main.cpp|src/server/server_sched.cpp|src/engine/state_kinds*|src/engine/session_banks*|tests/server_kv_headroom_live.py) kvmem=1 ;; esac; \
 	      case "$$p" in src/engine/family_deepseek*|src/engine/kv_state_ds4*|src/engine/spec_dspark*|src/engine/gpu_*|src/cuda/pulsar_cuda_csa2*|src/cuda/pulsar_cuda_dspark*|src/cuda/mmq/ds4_mmq*|src/cuda/mmq/ds4_mmid*|src/cuda/mmq/ds4_mxfp8*|src/cuda/mmq/ds4_quantize*|src/server/deepseek_*|src/server/parser_deepseek*|tests/live_legs.py) ds4legs=1 ;; esac; \
 	      case "$$p" in src/cuda/pulsar_cuda_runtime.cu|src/cuda/*scratch*|src/engine/gpu_graph_*|src/engine/gpu_decode.cpp|src/engine/step_driver*|src/engine/spec_block*|src/engine/verify_curve.cpp|*scratch_poison*) poison=1 ;; esac; \
@@ -2803,6 +2813,19 @@ src/engine/%.o: src/engine/%.cpp src/engine/pulsar_engine_internal.h src/engine/
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
 src/families/%.o: src/families/%.cpp src/engine/pulsar_engine_internal.h src/engine/role_bind.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
+# A module's server table builds as the server's objects do (the shorter stem wins over the rule above).
+src/families/%_server.o: src/families/%_server.cpp $(SERVER_HDRS) src/pulsar.h $(LIB_HDRS)
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
+
+# The unit-test programs compile the server whole (tests/pulsar_test.cpp, api_golden, sse_golden, grammar_bench):
+# they include every module's server table through this generated list, so a new family edits none of them.
+# Rewritten only when the list changes (no needless rebuilds), through a per-process temp file: the release tier
+# builds several of these programs at once (battery #714 lost a shared .tmp to a parallel mv).
+FAMILY_SERVERS_INC = tests/family_servers.inc
+$(FAMILY_SERVERS_INC): FORCE
+	@t=$@.$$$$.tmp; { echo '/* generated by the Makefile (FAMILY_SERVER_SRCS): every module'"'"'s server table */'; \
+	  for f in $(sort $(FAMILY_SERVER_SRCS)); do echo "#include \"../$$f\""; done; } > $$t; \
+	  if cmp -s $$t $@; then rm -f $$t; else mv -f $$t $@; fi
 
 # L216: vision.cpp ports the checkpoint's image_processor.py, whose results are
 # FLOORS of float64 expressions -- so it must evaluate them exactly as the
@@ -2848,7 +2871,7 @@ src/vendor/xgrammar/%.o: src/vendor/xgrammar/%.cc
 src/lib/pulsar_grammar.o: src/lib/pulsar_grammar.cpp src/lib/pulsar_grammar.h
 	$(CXX) $(GRAMMAR_CXXFLAGS) $(XGRAMMAR_INC) -c -o $@ $<
 
-tests/pulsar_test.o: tests/pulsar_test.cpp $(SERVER_SRCS) $(SERVER_HDRS) src/pulsar.h $(LIB_HDRS) tests/sampler_host_ref.h
+tests/pulsar_test.o: tests/pulsar_test.cpp $(SERVER_SRCS) $(FAMILY_SERVERS_INC) $(SERVER_HDRS) src/pulsar.h $(LIB_HDRS) tests/sampler_host_ref.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Itests -c -o $@ tests/pulsar_test.cpp
 
 tests/pulsar_agent_test.o: tests/pulsar_agent_test.cpp $(AGENT_SRCS) src/agent/pulsar_agent_internal.h src/pulsar.h $(LIB_HDRS) src/vendor/linenoise.h
@@ -3133,7 +3156,7 @@ tests/qwen_deep_probe.o: tests/qwen_deep_probe.cpp tests/segment_file_io.h
 tests/qwen_deep_probe: tests/qwen_deep_probe.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 tests/qwen_chat_smoke.o: tests/qwen_chat_smoke.cpp
-	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -Isrc/lib -c -o $@ $<
 tests/qwen_chat_smoke: tests/qwen_chat_smoke.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 tests/loader_open.o: tests/loader_open.cpp
@@ -3203,13 +3226,13 @@ tests/scratch_poison_gate.o: tests/scratch_poison_gate.cpp tests/gate_entry.h te
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
 tests/scratch_poison_gate: tests/scratch_poison_gate.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-tests/mutant/family_qwen_s4_l307.cpp: src/engine/family_qwen_s4.cpp tests/scratch_poison_mutant.py
+tests/mutant/family_qwen_s4_l307.cpp: src/families/qwen/family_qwen_s4.cpp tests/scratch_poison_mutant.py
 	@mkdir -p tests/mutant
 	python3 tests/scratch_poison_mutant.py $< $@
 tests/mutant/family_qwen_s4_l307.o: tests/mutant/family_qwen_s4_l307.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ $<
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/families/qwen -c -o $@ $<
 tests/scratch_poison_gate_mutant: tests/scratch_poison_gate.o tests/mutant/family_qwen_s4_l307.o \
-                                  $(filter-out src/engine/family_qwen_s4.o,$(CORE_OBJS))
+                                  $(filter-out src/families/qwen/family_qwen_s4.o,$(CORE_OBJS))
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 # L317: the battery's moved legs, bitten.  tests/gates_runner linked against ONE mutated TU (tests/runner_mutants.py
 # writes the copy and refuses unless its site appears once) and run with the selection that must catch it -- PASS of
@@ -3232,7 +3255,7 @@ $(eval $(call RUNNER_MUTANT_RULES,adopt-rows,src/engine/checkpoint,cpp))
 $(eval $(call RUNNER_MUTANT_RULES,spec-emit,src/engine/session_spec,cpp))
 # ... and the L307 scratch-poison mutant in the runner: scratch-poison-gate on the hosted Qwen
 tests/gates_runner_mutant_scratch-poison: tests/gates_runner.o $(RUNNER_OBJS) $(RUNNER_LIBS) \
-                                          tests/mutant/family_qwen_s4_l307.o $(filter-out src/engine/family_qwen_s4.o,$(CORE_OBJS))
+                                          tests/mutant/family_qwen_s4_l307.o $(filter-out src/families/qwen/family_qwen_s4.o,$(CORE_OBJS))
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 # mutant -> the sub-gate (the moved leg) whose FAIL is the catch; the runner selection is runner_mutants.py's
 BATTERY_MUTANTS = chunk-resume:cuda-chunk-neutrality-gate row-sort:cuda-row-neutrality-gate-deep \
@@ -3356,7 +3379,7 @@ pulsar_test: tests/pulsar_test.o tests/sampler_host_ref.o src/lib/pulsar_help.o 
 
 # L267: the API parsers' requests dumped field by field (host-only; see tests/api_golden.cpp).
 # api-golden-gate compares them with the golden recorded before L267 moved the parse/render layers.
-tests/api_golden.o: tests/api_golden.cpp $(SERVER_SRCS) $(SERVER_HDRS) src/pulsar.h $(LIB_HDRS)
+tests/api_golden.o: tests/api_golden.cpp $(SERVER_SRCS) $(FAMILY_SERVERS_INC) $(SERVER_HDRS) src/pulsar.h $(LIB_HDRS)
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ tests/api_golden.cpp
 
 tests/api_golden: tests/api_golden.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS) $(GRAMMAR_OBJS)
@@ -3365,7 +3388,7 @@ tests/api_golden: tests/api_golden.o src/lib/pulsar_help.o src/lib/pulsar_kvtext
 # L303: constrained decoding's host cost at a family's real vocabulary (mask fill, accept, a round's masks) and
 # whether the template's own bytes, tokenized, stay inside the grammar.  No engine, no GPU: the checkpoint's
 # tokenizer.json.  A measurement tool, not a gate.
-tests/grammar_bench.o: tests/grammar_bench.cpp $(SERVER_SRCS) $(SERVER_HDRS) src/pulsar.h $(LIB_HDRS) src/lib/pulsar_grammar.h
+tests/grammar_bench.o: tests/grammar_bench.cpp $(SERVER_SRCS) $(FAMILY_SERVERS_INC) $(SERVER_HDRS) src/pulsar.h $(LIB_HDRS) src/lib/pulsar_grammar.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ tests/grammar_bench.cpp
 
 tests/grammar_bench: tests/grammar_bench.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS) $(GRAMMAR_OBJS)
@@ -3377,7 +3400,7 @@ api-golden-gate: tests/api_golden
 	diff -u tests/api-golden/golden.txt tests/api-golden/out.txt && echo "API-GOLDEN GATE PASS"
 
 # L267: the DeepSeek stream projections' bytes per protocol (host-only; see tests/sse_golden.cpp).
-tests/sse_golden.o: tests/sse_golden.cpp $(SERVER_SRCS) $(SERVER_HDRS) src/pulsar.h $(LIB_HDRS)
+tests/sse_golden.o: tests/sse_golden.cpp $(SERVER_SRCS) $(FAMILY_SERVERS_INC) $(SERVER_HDRS) src/pulsar.h $(LIB_HDRS)
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ tests/sse_golden.cpp
 
 tests/sse_golden: tests/sse_golden.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS) $(GRAMMAR_OBJS)
@@ -3552,3 +3575,6 @@ clean:
 # silent rather than fatal.  This line is what makes every rule above correct
 # after the first build; the hand-listed prerequisites are only the floor.
 -include $(PULSAR_DEPS)
+
+.PHONY: FORCE
+FORCE:

@@ -79,7 +79,7 @@ bool agent_session_file_write(const char *path, const agent_session_file *f, cha
     agent_put64(buf + 28, f->last_used);
     if (title_len) memcpy(buf + AGENT_SESSION_HEADER, f->title, title_len);
     for (uint32_t i = 0; i < n; i++)
-        agent_put32(buf + AGENT_SESSION_HEADER + title_len + (size_t)i * 4u, (uint32_t)f->tokens.v[i]);
+        agent_put32(buf + AGENT_SESSION_HEADER + title_len + (size_t)i * 4u, (uint32_t)f->tokens.v[i].raw());
     agent_put64(buf + bytes, agent_fnv(1469598103934665603ull, buf, bytes));
 
     const bool ok = agent_write_file_atomic(path, buf, bytes + 8u, 0600, err, err_len);
@@ -127,8 +127,8 @@ bool agent_session_file_read(const char *path, agent_session_file *f, char *err,
     memcpy(f->title, rest, title_len);
     f->title[title_len] = '\0';
     if (n) {
-        f->tokens.v = (int *)agent_xmalloc((size_t)n * sizeof(int));
-        for (uint32_t i = 0; i < n; i++) f->tokens.v[i] = (int)agent_get32(rest + title_len + (size_t)i * 4u);
+        f->tokens.v = (TokId *)agent_xmalloc((size_t)n * sizeof(TokId));
+        for (uint32_t i = 0; i < n; i++) f->tokens.v[i] = TokId{(int)agent_get32(rest + title_len + (size_t)i * 4u)};
         f->tokens.len = f->tokens.cap = (int)n;
     }
     free(rest);
@@ -156,14 +156,14 @@ bool agent_kv_open(agent_worker *w) {
  * matches, and sync rebuilds where it does not. */
 int agent_kv_load(agent_worker *w, const pulsar_tokens *tokens) {
     if (!w->kv || tokens->len <= 0) return 0;
-    size_t text_len = 0;
+    TextBytes text_len{0};
     char *text = pulsar_kvtext_render_tokens_text(w->engine, tokens, &text_len);
     if (!text) return 0;
     pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
     int n = 0;
     char err[384];
-    const int cached = pulsar_kvchain_restore(w->kv, w->engine, w->session, text, text_len, NULL, 0, 0, chain,
-                                              PULSAR_KVCHAIN_MAX, &n, err, sizeof(err));
+    const int cached = pulsar_kvchain_restore(w->kv, w->engine, w->session, text, text_len, NULL, 0, TokCount{0},
+                                              chain, PULSAR_KVCHAIN_MAX, &n, err, sizeof(err)).raw();
     if (!cached && err[0]) agent_trace(w, "kv restore refused: %s", err);
     free(text);
     return cached;
@@ -178,8 +178,8 @@ void agent_kv_persist(agent_worker *w, const char *what) {
     pulsar_kvchain_persist_result r;
     const pulsar_kvchain_writer inl = pulsar_kvchain_writer_inline(w->kv);   /* the agent persists and loads in one breath */
     /* a saved session is a history about to leave the process: its chain end gets a restore point (L347 I2) */
-    pulsar_kvchain_persist(w->kv, w->engine, w->session, 0, PULSAR_KVCHAIN_TAIL | PULSAR_KVCHAIN_RP, NULL, &inl,
-                           &r);
+    pulsar_kvchain_persist(w->kv, w->engine, w->session, TokCount{0}, PULSAR_KVCHAIN_TAIL | PULSAR_KVCHAIN_RP, NULL,
+                           &inl, &r);
     if (r.err[0]) {
         agent_buf b = {0};
         agent_buf_puts(&b, "pulsar-agent: ");
@@ -197,7 +197,7 @@ void agent_kv_persist(agent_worker *w, const char *what) {
         free(msg);
     }
     if (r.written)
-        agent_trace(w, "%s kv persisted chain to %d (%d new segments, %.1f MiB)", what, r.end, r.written,
+        agent_trace(w, "%s kv persisted chain to %d (%d new segments, %.1f MiB)", what, r.end.raw(), r.written,
                     (double)r.bytes / (1024.0 * 1024.0));
 }
 
@@ -210,7 +210,7 @@ void agent_kv_system_tip(agent_worker *w, char tip[41]) {
     if (!w->kv) return;
     pulsar_tokens sys = {0};
     agent_worker_build_system_tokens(w, &sys);
-    size_t text_len = 0;
+    TextBytes text_len{0};
     char *text = pulsar_kvtext_render_tokens_text(w->engine, &sys, &text_len);
     pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
     const int n = text ? pulsar_segstore_lookup(w->kv, text, text_len, NULL, chain, PULSAR_KVCHAIN_MAX) : 0;
@@ -277,7 +277,7 @@ void agent_turn_add_tool(agent_worker *w, const char *name, const char *content)
     w->turn[w->turn_len - 1].name = name ? xstrdup(name) : NULL;
 }
 
-bool agent_tokens_turn_open(const pulsar_turn_markers *m, const int *end, int n_end, const int *v, int n) {
+bool agent_tokens_turn_open(const pulsar_turn_markers *m, const TokId *end, int n_end, const TokId *v, int n) {
     for (int i = n - 1; i >= 0; i--) {
         const int role = pulsar_turn_marker_at(m, v, n, i);
         if (!role) continue;
@@ -572,11 +572,12 @@ bool agent_worker_save_session_now(agent_worker *w, char sha_out[41],
     if (agent_worker_sync_tokens(w, &w->transcript, false, err, err_len) != 0)
         return false;
     if (!w->session_title) {
-        size_t text_len = 0;
+        TextBytes text_len{0};
         char *text = pulsar_kvtext_render_tokens_text(w->engine, &w->transcript, &text_len);
         agent_turn_marks marks;
         agent_turn_marks_init(w->engine, &marks);
-        w->session_title = agent_session_title_from_text(&marks, text ? text : "", text ? text_len : 0, 0);
+        w->session_title = agent_session_title_from_text(&marks, text ? text : "", text ? (size_t)text_len.raw() : 0,
+                                                         0);
         free(text);
     }
     if (w->session_created_at == 0)

@@ -53,7 +53,7 @@ __global__ void scrub(uint4 *p, uint64_t n) {
 }
 
 pulsar_gpu_tensor *alloc(uint64_t bytes) {
-    pulsar_gpu_tensor *t = pulsar_gpu_tensor_alloc(bytes);
+    pulsar_gpu_tensor *t = pulsar_gpu_tensor_alloc(TensorBytes{bytes});
     if (!t) { fprintf(stderr, "alloc %llu failed\n", (unsigned long long)bytes); exit(2); }
     return t;
 }
@@ -83,7 +83,7 @@ Layer make_layer(uint32_t rows, uint32_t max_ctx) {
         L.norm[i] = alloc(w[i] * 2);                 /* the container stores the norms bf16 */
         { std::vector<uint16_t> b16(w[i]);
           for (uint32_t j = 0; j < w[i]; j++) b16[j] = (uint16_t)((uint32_t)(float)(10 + i) >> 16);
-          pulsar_gpu_tensor_write(L.norm[i], 0, b16.data(), (uint64_t)w[i] * 2); }
+          pulsar_gpu_tensor_write(L.norm[i], TensorBytes{0}, b16.data(), bytes_of<uint16_t>(w[i])); }
     }
     return L;
 }
@@ -124,7 +124,7 @@ double time_calls(Layer &L, std::vector<pulsar_qsa_seq> &seqs, const std::vector
     cudaEventCreate(&b);
     std::vector<double> us;
     for (int it = -3; it < iters; it++) {
-        scrub<<<1024, 256>>>((uint4 *)P(scrub_buf), pulsar_gpu_tensor_bytes(scrub_buf) / 16);
+        scrub<<<1024, 256>>>((uint4 *)P(scrub_buf), pulsar_gpu_tensor_bytes(scrub_buf).raw() / 16);
         cudaEventRecord(a, cudaStreamPerThread);
         if (!fwd(L, seqs, rs, rp)) { fprintf(stderr, "forward refused\n"); exit(1); }
         cudaEventRecord(b, cudaStreamPerThread);

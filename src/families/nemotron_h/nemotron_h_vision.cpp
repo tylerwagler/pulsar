@@ -21,7 +21,7 @@
  * (weight 0.988 .. 1.016, bias up to 0.0195): they trained.  So it is the one path; the arms differ by 25% relative
  * RMS (the fixture's case 0), which is why the choice is not a rounding detail. */
 #include "nemotron_h.h"
-#include "cuda/pulsar_cuda_qwen.h"   /* the rows front door (family-neutral) */
+#include "cuda/pulsar_cuda_rows.h"   /* the rows front door (family-neutral) */
 #include "lib/bpe_tokenizer.h"
 
 #include <math.h>
@@ -245,7 +245,7 @@ bool pulsar_nemotron_h_vision_run_create(const pulsar_model *m, pulsar_nemotron_
     }
     uint64_t total = 0;
     for (int b = 0; b < V_COUNT; b++) {
-        r->t[b] = pulsar_gpu_tensor_alloc(r->bytes[b]);
+        r->t[b] = pulsar_gpu_tensor_alloc(TensorBytes{r->bytes[b]});
         if (!r->t[b]) {
             fprintf(stderr, "pulsar: " NHV "the tower's scratch did not fit the device -- refusing\n");
             return false;
@@ -322,9 +322,11 @@ bool pulsar_nemotron_h_vision_encode(const pulsar_model *m, const pulsar_nemotro
     uint16_t *patch = dp<uint16_t>(r->t[V_PATCH]), *xn = dp<uint16_t>(r->t[V_XN]), *qkv = dp<uint16_t>(r->t[V_QKV]),
              *att = dp<uint16_t>(r->t[V_ATT]), *mlp = dp<uint16_t>(r->t[V_MLP]);
     /* the seed: the prefix rows, the positions, then + the patch embedding */
-    if (!pulsar_gpu_tensor_write(r->t[V_RES], 0, v->cls_rows.data(), (uint64_t)NC * D * 4u) ||
-        !pulsar_gpu_tensor_write(r->t[V_RES], (uint64_t)NC * D * 4u, pos.data(), (uint64_t)np * D * 4u) ||
-        !pulsar_gpu_tensor_write(r->t[V_PATCH], 0, img.patches.data(), (uint64_t)np * P * 2u))
+    if (!pulsar_gpu_tensor_write(r->t[V_RES], TensorBytes{0}, v->cls_rows.data(), bytes_of<float>((uint64_t)NC * D)) ||
+        !pulsar_gpu_tensor_write(r->t[V_RES], bytes_of<float>((uint64_t)NC * D), pos.data(),
+                                 bytes_of<float>((uint64_t)np * D)) ||
+        !pulsar_gpu_tensor_write(r->t[V_PATCH], TensorBytes{0}, img.patches.data(),
+                                 bytes_of<uint16_t>((uint64_t)np * P)))
         return vfail(err, errlen, "the image's rows did not reach the device");
     for (uint32_t r0 = 0; r0 < np; r0 += CHUNK) {
         const uint32_t k = np - r0 < CHUNK ? np - r0 : CHUNK;
@@ -338,7 +340,7 @@ bool pulsar_nemotron_h_vision_encode(const pulsar_model *m, const pulsar_nemotro
     if (!pulsar_vit_encode(m, dims, v->vit, PULSAR_ROWS_OUT_BF16, bufs, N, NULL, err, errlen)) return false;
     if (dbg) {   /* the tower's residual, the patches back in raster order */
         std::vector<float> all((size_t)N * D);
-        if (!pulsar_gpu_tensor_read(r->t[V_RES], 0, all.data(), all.size() * 4u))
+        if (!pulsar_gpu_tensor_read(r->t[V_RES], TensorBytes{0}, all.data(), bytes_of<float>(all.size())))
             return vfail(err, errlen, "the stage read failed");
         dbg->assign(all.begin(), all.begin() + (size_t)NC * D);
         dbg->resize(all.size());
@@ -366,7 +368,8 @@ bool pulsar_nemotron_h_vision_encode(const pulsar_model *m, const pulsar_nemotro
             return vfail(err, errlen, "the projector's mlp1 refused");
     }
     uint16_t *out = (uint16_t *)malloc((size_t)n_llm * LLM_WIDTH * 2u);
-    if (!out || !pulsar_gpu_tensor_read(r->t[V_QKV], 0, out, (uint64_t)n_llm * LLM_WIDTH * 2u)) {
+    if (!out || !pulsar_gpu_tensor_read(r->t[V_QKV], TensorBytes{0}, out,
+                                        bytes_of<uint16_t>((uint64_t)n_llm * LLM_WIDTH))) {
         free(out);
         return vfail(err, errlen, "the rows' read failed");
     }
@@ -413,9 +416,10 @@ bool is_sentinel(const pulsar_engine *e, int32_t id) { return image_id(e) >= 0 &
 /// @param start the index asked about
 /// @param[out] len the run's length
 /// @return true when ids[start] begins a run
-bool block_extent(const pulsar_engine *e, const int32_t *ids, int n, int start, int *len) {
-    const int32_t t = image_id(e);
-    if (t < 0 || !ids || start < 0 || start >= n || ids[start] != t || (start > 0 && ids[start - 1] == t)) return false;
+bool block_extent(const pulsar_engine *e, const TokId *ids, int n, int start, int *len) {
+    const TokId t{image_id(e)};
+    if (!t.is_token() || !ids || start < 0 || start >= n || ids[start] != t || (start > 0 && ids[start - 1] == t))
+        return false;
     int k = start;
     while (k < n && ids[k] == t) k++;
     *len = k - start;
@@ -497,7 +501,7 @@ bool expand(const pulsar_engine *e, const pulsar_image_ref *img, pulsar_tokens *
         return false;
     }
     const uint32_t n = wp * hp / (v->shape.merge * v->shape.merge);
-    for (uint32_t i = 0; i < n; i++) pulsar_tokens_push(out, v->image_id);
+    for (uint32_t i = 0; i < n; i++) pulsar_tokens_push(out, TokId{v->image_id});
     return true;
 }
 
@@ -517,7 +521,7 @@ uint32_t row_width(const pulsar_engine *) { return LLM_WIDTH; }
 /// @param err receives the reason on false
 /// @param errlen size of `err`
 /// @return false when no tower is bound, the tower refused, or the block's length is not the tower's
-bool block_rows(const pulsar_engine *e, const pulsar_image_ref *img, const int32_t *, int block_len,
+bool block_rows(const pulsar_engine *e, const pulsar_image_ref *img, const TokId *, int block_len,
                 const uint16_t *tower, int n_tower, uint16_t **tower_out, int *n_tower_out, uint16_t *out, char *err,
                 size_t errlen) {
     const pulsar_nemotron_h_vision *v = vision_of(e);

@@ -135,30 +135,35 @@ char *pulsar_kvtext_path_join(const char *dir, const char *name) {
 
 char *pulsar_kvtext_render_tokens_text(pulsar_engine *engine,
                                      const pulsar_tokens *tokens,
-                                     size_t *out_len) {
-    return pulsar_history_text(engine, tokens, out_len);
+                                     TextBytes *out_len) {
+    size_t len = 0;
+    char *text = pulsar_history_text(engine, tokens, &len);
+    if (out_len) *out_len = TextBytes{len};
+    return text;
 }
 
-bool pulsar_kvtext_byte_prefix_match(const char *text, size_t text_len,
-                                   const char *prefix, size_t prefix_len) {
+bool pulsar_kvtext_byte_prefix_match(const char *text, TextBytes text_len,
+                                   const char *prefix, TextBytes prefix_len) {
     return prefix_len <= text_len &&
-           (prefix_len == 0 || memcmp(text, prefix, prefix_len) == 0);
+           (prefix_len.raw() == 0 || memcmp(text, prefix, (size_t)prefix_len.raw()) == 0);
 }
 
-void pulsar_kvtext_tokens_copy_prefix(pulsar_tokens *dst, const pulsar_tokens *src, int n) {
+void pulsar_kvtext_tokens_copy_prefix(pulsar_tokens *dst, const pulsar_tokens *src, TokCount n) {
     dst->len = 0;
     if (!src) return;
-    if (n > src->len) n = src->len;
-    for (int i = 0; i < n; i++) pulsar_tokens_push(dst, src->v[i]);
+    int m = n.raw();
+    if (m > src->len) m = src->len;
+    for (int i = 0; i < m; i++) pulsar_tokens_push(dst, src->v[i]);
 }
 
 bool pulsar_kvtext_text_ends_with_live(pulsar_engine *engine, const char *text,
-                                     size_t text_len, const pulsar_tokens *tokens) {
-    const int eos = pulsar_token_eos(engine);
+                                     TextBytes text_len, const pulsar_tokens *tokens) {
+    const size_t len = (size_t)text_len.raw();
+    const TokId eos = pulsar_token_eos(engine);
     size_t eos_len = 0;
     char *eos_text = pulsar_token_text(engine, eos, &eos_len);
-    const bool text_eos = eos_len > 0 && text_len >= eos_len &&
-                          memcmp(text + text_len - eos_len, eos_text, eos_len) == 0;
+    const bool text_eos = eos_len > 0 && len >= eos_len &&
+                          memcmp(text + len - eos_len, eos_text, eos_len) == 0;
     free(eos_text);
     const bool live_eos = tokens && tokens->len > 0 && tokens->v[tokens->len - 1] == eos;
     return text_eos == live_eos;

@@ -15,7 +15,7 @@
  *  batched redraft fills in for pulsar_session_spec_redraft_commit.  Lives in its round (pulsar_spec_round::redraft). */
 typedef struct {
     bool     valid;         ///< round_end reached the drafting point with the drafter's features ready
-    int32_t  next_base;     ///< the carry: batch position 0 of the next round
+    TokId    next_base;     ///< the carry: batch position 0 of the next round
     uint32_t n_draft;       ///< the bank's depth at round_end (pulsar_spec_cur_depth), <= 16
     /** @var spec_redraft_req::top_p
      *  The request's top-p filter for sampled drafts. */
@@ -37,7 +37,7 @@ typedef struct {
     bool     have_conf;
     bool     copied;        ///< L288: the drafts are a copy chain (pulsar_spec_copy_chain), not the drafter's
     /// The chain as token ids: [0] = next_base, [1..keep] = the drafts in order.
-    int32_t  refined[17];
+    TokId    refined[17];
     /// conf[i]: draft i+1's confidence (valid when have_conf; negative = none).
     float    conf[16];
 } spec_redraft_req;
@@ -45,11 +45,11 @@ typedef struct {
 /** A speculation round in flight on one bank: its base row, drafts and the target's pre-verify snapshot, from
  *  round_begin to round_end; freed with its snapshot when the round ends. */
 typedef struct pulsar_spec_round {
-    int32_t base;           ///< the round's base token (verify row 0, at saved_len)
+    TokId base;             ///< the round's base token (verify row 0, at saved_len)
     uint32_t K;             ///< draft depth this round: tokens the drafter proposed
     uint32_t n_batch;       ///< rows the verify forward evaluates (K + the base row)
-    int saved_len;          ///< checkpoint length before the round, to trim back to on rejection
-    int32_t pend[16];       ///< the drafted token ids, in draft order
+    TokPos saved_len;       ///< the history's end before the round (its base row's position), the undo's cut
+    TokId pend[16];         ///< the drafted token ids, in draft order
     float pend_conf[16];    ///< confidence head's score per draft position
     bool copy;              ///< L288: the drafts are a copy chain (their verdict feeds the copy acceptance)
     /** The target's state snapshot taken before the verify (pulsar_spec_target_ops snapshot / restore /
@@ -153,7 +153,7 @@ void pulsar_spec_calibration_note(pulsar_engine *e, bool copy, const float *conf
 /// @param max the most drafts
 /// @param out [max] receives the drafts
 /// @return drafts written, 0 = none
-uint32_t pulsar_spec_copy_chain(pulsar_session *s, uint32_t bank, int32_t next_base, uint32_t max, int32_t *out);
+uint32_t pulsar_spec_copy_chain(pulsar_session *s, uint32_t bank, TokId next_base, uint32_t max, TokId *out);
 /** L308: an estimate unobserved for this many committed tokens is stale (Flare's 32-token horizon). */
 #define PULSAR_SPEC_COPY_REPROBE 32u
 /** L288 / L308: the confidences of a copy chain's first n drafts from the request's copy estimate `sp` (the one
@@ -188,7 +188,7 @@ void pulsar_spec_copy_age(pulsar_spec_carry_state *sp, uint32_t tokens);
 /// @param top_k request top-k
 /// @param top_p request top-p
 /// @param min_p request min-p
-void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, int next_base, float temperature, int top_k,
+void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, TokId next_base, float temperature, int top_k,
                                 float top_p, float min_p);
 /** Stamp a drafter's result record into the installed bank's pendings (the one way pendings are written). */
 /// @param s the session
@@ -224,11 +224,13 @@ static inline const pulsar_drafter_ops *spec_drafter(const pulsar_session *s) { 
 /// @param s the session
 /// @param bank the bank to install
 /// @return false = the family refused
-static inline bool spec_bank_restore(pulsar_session *s, uint32_t bank) { return s->engine->family->banks->restore(s, bank); }
+static inline bool spec_bank_restore(pulsar_session *s, BankId bank) {
+    return s->engine->family->banks->restore(s, bank);
+}
 /// Save the installed bank through the family's bank ops.
 /// @param s the session
 /// @param bank the bank
-static inline void spec_bank_save(pulsar_session *s, uint32_t bank) { s->engine->family->banks->save(s, bank); }
+static inline void spec_bank_save(pulsar_session *s, BankId bank) { s->engine->family->banks->save(s, bank); }
 
 /* ---- the implementations ---- */
 extern const pulsar_spec_target_ops k_ds4_spec_target;   ///< DeepSeek V4's verify hooks (spec_dspark.cpp)

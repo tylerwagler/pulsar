@@ -52,13 +52,13 @@ static double now_us() {
 }
 static void timed_save(pulsar_session *s, uint32_t b) {
     const double t0 = now_us();
-    pulsar_session_bank_state_save(s, b);
+    pulsar_session_bank_state_save(s, BankId{b});
     g_save_us += now_us() - t0;
     g_saves++;
 }
 static bool timed_restore(pulsar_session *s, uint32_t b) {
     const double t0 = now_us();
-    const bool ok = pulsar_session_bank_state_restore(s, b);
+    const bool ok = pulsar_session_bank_state_restore(s, BankId{b});
     g_restore_us += now_us() - t0;
     g_restores++;
     return ok;
@@ -103,10 +103,10 @@ int GATE_ENTRY(int argc, char **argv) {
         memset(&p, 0, sizeof(p));
         p.v = toks.v + k_prompt_off[b];
         p.len = p.cap = k_prompt_len[b];
-        if (pulsar_session_bank_repoint(s, (uint32_t)b) != 0) { fprintf(stderr, "repoint %d\n", b); return 1; }
+        if (pulsar_session_bank_repoint(s, BankId{b}) != 0) { fprintf(stderr, "repoint %d\n", b); return 1; }
         pulsar_session_invalidate(s);
         if (pulsar_session_sync(s, &p, err, sizeof(err)) != 0) { fprintf(stderr, "prefill %d: %s\n", b, err); return 1; }
-        pulsar_session_bank_state_save(s, (uint32_t)b);
+        pulsar_session_bank_state_save(s, BankId{b});
     }
     const int vocab = pulsar_engine_logits_width(e);
     float *logits = (float *)malloc((size_t)ROWS * (size_t)vocab * sizeof(float));
@@ -117,7 +117,7 @@ int GATE_ENTRY(int argc, char **argv) {
     uint64_t drafted = 0;
     double ph_us[3] = {0.0, 0.0, 0.0};   /* assemble, round_end, commit */
     pulsar_spec_step steps[NB];
-    int acc_b[NB][17];
+    TokId acc_b[NB][17];
     for (int t = 0; t < ticks; t++) {
         pulsar_multiseq_req reqs[ROWS];
         int first[NB];
@@ -126,7 +126,7 @@ int GATE_ENTRY(int argc, char **argv) {
         if (batch) {
             for (int b = 0; b < NB; b++) {
                 memset(&steps[b], 0, sizeof(steps[b]));
-                steps[b].bank = (uint32_t)b;
+                steps[b].bank = BankId{b};
                 steps[b].round = r[b];
                 steps[b].temperature = temp; steps[b].top_k = top_k;
                 steps[b].top_p = top_p; steps[b].min_p = min_p;
@@ -144,20 +144,21 @@ int GATE_ENTRY(int argc, char **argv) {
                     fprintf(stderr, "tick %d bank %d assemble status %d: %s\n", t, b, steps[b].status, steps[b].err);
                     return 1;
                 }
-                first[b] = steps[b].first_token;
+                first[b] = steps[b].first_token.raw();
                 row0[b] = steps[b].row0;
             }
         }
         for (int b = 0; !batch && b < NB; b++) {
             if (!timed_restore(s, (uint32_t)b)) { fprintf(stderr, "restore %d\n", b); return 1; }
-            first[b] = pulsar_session_spec_next_base(s, temp, top_k, top_p, min_p, &rngs[b]);
-            if (first[b] < 0 || pulsar_session_spec_round_begin(s, r[b], first[b], 64, 17, temp, top_k, top_p, min_p,
-                                                                err, sizeof(err)) != 0) {
+            first[b] = pulsar_session_spec_next_base(s, temp, top_k, top_p, min_p, &rngs[b]).raw();
+            if (first[b] < 0 ||
+                pulsar_session_spec_round_begin(s, r[b], TokId{first[b]}, 64, 17, temp, top_k, top_p, min_p,
+                                                err, sizeof(err)) != 0) {
                 fprintf(stderr, "tick %d bank %d begin: %s\n", t, b, err);
                 return 1;
             }
             row0[b] = rows;
-            rows += pulsar_spec_round_fill_reqs(r[b], (uint32_t)b, reqs + rows);
+            rows += pulsar_spec_round_fill_reqs(r[b], BankId{b}, reqs + rows);
             timed_save(s, (uint32_t)b);
         }
         ph_us[0] += now_us() - t0;
@@ -171,7 +172,7 @@ int GATE_ENTRY(int argc, char **argv) {
         t0 = now_us();
         if (batch) {
             for (int b = 0; b < NB; b++) {
-                steps[b].first_token = first[b];
+                steps[b].first_token = TokId{first[b]};
                 steps[b].row0 = row0[b];
                 steps[b].accepted = acc_b[b];
                 steps[b].accepted_cap = 17;
@@ -190,7 +191,7 @@ int GATE_ENTRY(int argc, char **argv) {
         }
         for (int b = 0; !batch && b < NB; b++) {
             if (!timed_restore(s, (uint32_t)b)) { fprintf(stderr, "restore %d\n", b); return 1; }
-            na_b[b] = pulsar_session_spec_round_end(s, r[b], first[b], temp, top_k, top_p, min_p, &rngs[b],
+            na_b[b] = pulsar_session_spec_round_end(s, r[b], TokId{first[b]}, temp, top_k, top_p, min_p, &rngs[b],
                                                     row0[b], acc_b[b], 17, err, sizeof(err));
             if (na_b[b] < 0) { fprintf(stderr, "tick %d bank %d end: %s\n", t, b, err); return 1; }
             timed_save(s, (uint32_t)b);
@@ -199,11 +200,14 @@ int GATE_ENTRY(int argc, char **argv) {
         printf("tick %d:", t);
         for (int b = 0; b < NB; b++) {
             printf(" [b%d", b);
-            for (int k = 0; k < na_b[b]; k++) { printf(" %d", acc_b[b][k]); hash[b] = fnv(hash[b], acc_b[b][k]); }
+            for (int k = 0; k < na_b[b]; k++) {
+                printf(" %d", acc_b[b][k].raw());
+                hash[b] = fnv(hash[b], acc_b[b][k].raw());
+            }
             printf("]");
         }
         printf("\n");
-        uint32_t banks[NB] = {0, 1, 2};
+        const BankId banks[NB] = {BankId{0}, BankId{1}, BankId{2}};
         uint64_t *rps[NB] = {&rngs[0], &rngs[1], &rngs[2]};
         if (pulsar_session_spec_redraft_batch(s, r, banks, rps, NB, err, sizeof(err)) != 0)
             fprintf(stderr, "tick %d redraft: %s (banks take a plain step)\n", t, err);
@@ -211,7 +215,7 @@ int GATE_ENTRY(int argc, char **argv) {
         if (batch) {
             for (int b = 0; b < NB; b++) {
                 memset(&steps[b], 0, sizeof(steps[b]));
-                steps[b].bank = (uint32_t)b;
+                steps[b].bank = BankId{b};
                 steps[b].round = r[b];
             }
             if (pulsar_session_spec_redraft_commit_batch(s, steps, NB) != 0) {

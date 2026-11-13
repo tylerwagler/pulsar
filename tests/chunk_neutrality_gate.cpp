@@ -148,16 +148,16 @@ static int segment_round_trip(pulsar_engine *e, pulsar_session **sp, const pulsa
     char dir[512];
     snprintf(dir, sizeof dir, "%s/chunk_neutrality_segs.XXXXXX", tmp && *tmp ? tmp : "/tmp");
     if (!mkdtemp(dir)) { snprintf(err, errlen, "mkdtemp %.200s failed", dir); return 1; }
-    const uint32_t model = pulsar_engine_kv_identity(e);
+    const pulsar_segstore_ident model = pulsar_engine_kv_identity(e);
     int rc = 1;
     pulsar_segstore *st = pulsar_segstore_open(dir, 0, model, NULL, NULL);
     if (!st) { snprintf(err, errlen, "segment store open failed"); goto out; }
     {
         pulsar_kvchain_persist_result r;
         const pulsar_kvchain_writer inl = pulsar_kvchain_writer_inline(st);
-        pulsar_kvchain_persist(st, e, *sp, 0, PULSAR_KVCHAIN_TAIL | PULSAR_KVCHAIN_RP, NULL, &inl, &r);
-        if (r.err[0] || r.end != deepest) {
-            snprintf(err, errlen, "the persist stored a chain to %d, not %d: %.180s", r.end, deepest, r.err);
+        pulsar_kvchain_persist(st, e, *sp, TokCount{0}, PULSAR_KVCHAIN_TAIL | PULSAR_KVCHAIN_RP, NULL, &inl, &r);
+        if (r.err[0] || r.end != TokPos{deepest}) {
+            snprintf(err, errlen, "the persist stored a chain to %d, not %d: %.180s", r.end.raw(), deepest, r.err);
             goto out;
         }
         n = r.written;
@@ -170,17 +170,17 @@ static int segment_round_trip(pulsar_engine *e, pulsar_session **sp, const pulsa
     if (!(st = pulsar_segstore_open(dir, 0, model, NULL, NULL))) { snprintf(err, errlen, "segment store reopen failed"); goto out; }
     if (pulsar_session_create(sp, e, GATE_CTX) != 0) { snprintf(err, errlen, "session create failed"); goto out; }
     {
-        size_t tl = 0;
+        TextBytes tl{0};
         char *full = pulsar_kvtext_render_tokens_text(e, prompt, &tl);
         pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
         int loaded = 0;
-        const int G = full ? pulsar_kvchain_restore(st, e, *sp, full, tl, NULL, 0, 0, chain, PULSAR_KVCHAIN_MAX, &loaded,
-                                                    err, errlen)
+        const int G = full ? pulsar_kvchain_restore(st, e, *sp, full, tl, NULL, 0, TokCount{0}, chain,
+                                                    PULSAR_KVCHAIN_MAX, &loaded, err, errlen).raw()
                            : 0;
         free(full);
         printf("  [segments]");
         for (int i = 0; i < loaded; i++)
-            printf(" [%u,%u)%s", chain[i].G_prev, chain[i].G, chain[i].rp_bytes ? "+restore point" : "");
+            printf(" [%d,%d)%s", chain[i].G_prev.raw(), chain[i].G.raw(), chain[i].rp_bytes ? "+restore point" : "");
         printf("\n");
         if (G != deepest || loaded != n) {
             if (!err[0]) snprintf(err, errlen, "the restore stood at %d (%d segments), persisted to %d", G, loaded,

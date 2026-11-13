@@ -55,7 +55,7 @@
 #include "gate_entry.h"
 #include "gate_util.h"
 #include "pulsar_engine_internal.h"   /* S1 forces the quench latch by its field; S2 reads the recurrent state */
-#include "family_qwen.h"              /* S2: the Qwen bank's state slices */
+#include "../src/families/qwen/family_qwen.h"              /* S2: the Qwen bank's state slices */
 
 #include <algorithm>
 #include <math.h>
@@ -100,7 +100,7 @@ static std::vector<std::vector<float>> run(pulsar_engine *e, const pulsar_tokens
     }
     if (ok) out.push_back(logits_of(s, W));
     for (int i = 0; ok && i < 4; i++) {
-        ok = pulsar_session_eval(s, kDecode[i], err, sizeof(err)) == 0;
+        ok = pulsar_session_eval(s, TokId{kDecode[i]}, err, sizeof(err)) == 0;
         if (ok) out.push_back(logits_of(s, W));
     }
     if (!ok) { fprintf(stderr, "qwen-chunk-neutrality: %s\n", err); out.clear(); }
@@ -113,8 +113,8 @@ static std::vector<std::vector<float>> run(pulsar_engine *e, const pulsar_tokens
 struct c5_hooks {
     std::vector<int> chunk_events;
 };
-static void c5_progress(void *ud, const char *event, int current, int) {
-    if (!strcmp(event, "prefill_chunk")) ((c5_hooks *)ud)->chunk_events.push_back(current);
+static void c5_progress(void *ud, const char *event, TokPos current, TokCount) {
+    if (!strcmp(event, "prefill_chunk")) ((c5_hooks *)ud)->chunk_events.push_back(current.raw());
 }
 static bool c5_cancel(void *ud) {
     const c5_hooks *h = (const c5_hooks *)ud;
@@ -122,7 +122,7 @@ static bool c5_cancel(void *ud) {
     return false;
 }
 
-#define TRACE(s, what) printf("    [%s] pos %d | bank_pos 0:%d 1:%d\n", what, pulsar_session_pos(s).raw(), pulsar_session_bank_pos(s, 0).raw(), pulsar_session_bank_pos(s, 1).raw())
+#define TRACE(s, what) printf("    [%s] pos %d | bank_pos 0:%d 1:%d\n", what, pulsar_session_pos(s).raw(), pulsar_session_bank_pos(s, BankId{0}).raw(), pulsar_session_bank_pos(s, BankId{1}).raw())
 static bool same(const std::vector<float> &a, const std::vector<float> &b, double *maxd) {
     *maxd = 0;
     if (a.size() != b.size() || a.empty()) { *maxd = 1e30; return false; }
@@ -149,7 +149,7 @@ static std::vector<float> reference(pulsar_engine *e, const pulsar_tokens *promp
     if (pulsar_session_create(&s, e, 4096) != 0) return out;
     if (pulsar_session_sync(s, prompt, err, sizeof(err)) == 0) {
         bool ok = true;
-        for (int i = 0; ok && i < n_extra; i++) ok = pulsar_session_eval(s, extra[i], err, sizeof(err)) == 0;
+        for (int i = 0; ok && i < n_extra; i++) ok = pulsar_session_eval(s, TokId{extra[i]}, err, sizeof(err)) == 0;
         if (ok) out = logits_of(s, W);
     }
     pulsar_session_free(s);
@@ -167,7 +167,7 @@ static std::vector<float> reference_ext(pulsar_engine *e, const pulsar_tokens *p
     char err[256] = "";
     if (pulsar_session_create(&s, e, 4096) != 0) return out;
     bool ok = pulsar_session_sync(s, prompt, err, sizeof(err)) == 0;
-    for (int i = 0; ok && i < n_extra; i++) ok = pulsar_session_eval(s, extra[i], err, sizeof(err)) == 0;
+    for (int i = 0; ok && i < n_extra; i++) ok = pulsar_session_eval(s, TokId{extra[i]}, err, sizeof(err)) == 0;
     if (ok && pulsar_session_sync(s, ext, err, sizeof(err)) == 0) out = logits_of(s, W);
     pulsar_session_free(s);
     return out;
@@ -229,14 +229,15 @@ static void part_chunks(pulsar_engine *e, int W, bool explicit_chunk) {
         pulsar_session *s = NULL;
         char err[256] = "";
         bool ok = pulsar_session_create(&s, e, 8192) == 0 && pulsar_session_sync(s, &P, err, sizeof(err)) == 0;
-        for (int i = 0; ok && i < decoded; i++) ok = pulsar_session_eval(s, kDecode[i], err, sizeof(err)) == 0;
+        for (int i = 0; ok && i < decoded; i++) ok = pulsar_session_eval(s, TokId{kDecode[i]}, err, sizeof(err)) == 0;
         const int G = ok ? pulsar_session_checkpoint_best(s, TokPos{k}).raw() : 0;
         CHECK(ok && G == N / (int)grid * (int)grid && G > 0, "C3 (%d decoded) sync(P) left a checkpoint at %d (want %d): %s",
               decoded, G, N / (int)grid * (int)grid, err);
         std::vector<std::vector<float>> got;
         if (ok && pulsar_session_sync(s, &Q, err, sizeof(err)) == 0) {
             got.push_back(logits_of(s, W));
-            for (int i = 0; i < 4 && pulsar_session_eval(s, kDecode[i], err, sizeof(err)) == 0; i++) got.push_back(logits_of(s, W));
+            for (int i = 0; i < 4 && pulsar_session_eval(s, TokId{kDecode[i]}, err, sizeof(err)) == 0; i++)
+                got.push_back(logits_of(s, W));
         }
         bool same = got.size() == 5 && qcold.size() == 5;
         double worst = 0;
@@ -287,7 +288,8 @@ static void part_chunks(pulsar_engine *e, int W, bool explicit_chunk) {
         std::vector<std::vector<float>> got;
         if (ok && pulsar_session_sync(b, &Q, err, sizeof(err)) == 0) {
             got.push_back(logits_of(b, W));
-            for (int i = 0; i < 4 && pulsar_session_eval(b, kDecode[i], err, sizeof(err)) == 0; i++) got.push_back(logits_of(b, W));
+            for (int i = 0; i < 4 && pulsar_session_eval(b, TokId{kDecode[i]}, err, sizeof(err)) == 0; i++)
+                got.push_back(logits_of(b, W));
         }
         bool same = got.size() == 5 && qcold.size() == 5;
         double worst = 0;
@@ -339,7 +341,7 @@ static void part_chunks(pulsar_engine *e, int W, bool explicit_chunk) {
             std::vector<std::vector<float>> got;
             if (rc2 == 0) {
                 got.push_back(logits_of(s, W));
-                for (int i = 0; i < 4 && pulsar_session_eval(s, kDecode[i], err, sizeof(err)) == 0; i++)
+                for (int i = 0; i < 4 && pulsar_session_eval(s, TokId{kDecode[i]}, err, sizeof(err)) == 0; i++)
                     got.push_back(logits_of(s, W));
             }
             bool same = got.size() == 5;
@@ -380,32 +382,35 @@ static void part_banks(pulsar_engine *e, int W) {
     CHECK(pulsar_session_bank_count(s) == 2, "bank_count %d", pulsar_session_bank_count(s));
 
     /* B1 */
-    CHECK(pulsar_session_bank_state_restore(s, 0), "restore bank 0 (fresh)");
+    CHECK(pulsar_session_bank_state_restore(s, BankId{0}), "restore bank 0 (fresh)");
     CHECK(pulsar_session_sync(s, &A, err, sizeof(err)) == 0, "bank 0 prefills A: %s", err);
     TRACE(s, "after sync A");
-    pulsar_session_bank_state_save(s, 0);
+    pulsar_session_bank_state_save(s, BankId{0});
     TRACE(s, "after save 0");
-    CHECK(pulsar_session_bank_state_restore(s, 1), "restore bank 1 (fresh)");
+    CHECK(pulsar_session_bank_state_restore(s, BankId{1}), "restore bank 1 (fresh)");
     TRACE(s, "after restore 1");
     CHECK(pulsar_session_sync(s, &B, err, sizeof(err)) == 0, "bank 1 prefills B: %s", err);
     TRACE(s, "after sync B");
-    pulsar_session_bank_state_save(s, 1);
-    CHECK(pulsar_session_bank_state_restore(s, 0), "restore bank 0");
+    pulsar_session_bank_state_save(s, BankId{1});
+    CHECK(pulsar_session_bank_state_restore(s, BankId{0}), "restore bank 0");
     TRACE(s, "after restore 0");
-    CHECK(pulsar_session_eval(s, ta, err, sizeof(err)) == 0, "bank 0 decodes: %s", err);
+    CHECK(pulsar_session_eval(s, TokId{ta}, err, sizeof(err)) == 0, "bank 0 decodes: %s", err);
     TRACE(s, "after eval ta");
     double d = 0;
     CHECK(same(logits_of(s, W), refA1, &d), "B1 bank 0 after bank 1's prefill == one-bank A + token (max |diff| %.3g)", d);
-    pulsar_session_bank_state_save(s, 0);
+    pulsar_session_bank_state_save(s, BankId{0});
 
     /* B4: the router's view */
-    CHECK(pulsar_session_bank_pos(s, 0).raw() == A.len + 1 && pulsar_session_bank_pos(s, 1).raw() == B.len,
-          "B4 bank_pos: bank 0 %d (want %d), bank 1 %d (want %d)", pulsar_session_bank_pos(s, 0).raw(), A.len + 1,
-          pulsar_session_bank_pos(s, 1).raw(), B.len);
+    CHECK(pulsar_session_bank_pos(s, BankId{0}).raw() == A.len + 1 && pulsar_session_bank_pos(s,
+                                                                                              BankId{1}).raw() == B.len,
+          "B4 bank_pos: bank 0 %d (want %d), bank 1 %d (want %d)", pulsar_session_bank_pos(s,
+                                                                                           BankId{0}).raw(), A.len + 1,
+          pulsar_session_bank_pos(s, BankId{1}).raw(), B.len);
 
     /* B2: bank 0 at A + ta (next token 11), bank 1 at B (next token tb) -- one batched step */
     {
-        pulsar_multiseq_req rows[2] = { {0u, TokPos{A.len + 1}, 11}, {1u, TokPos{B.len}, tb} };
+        pulsar_multiseq_req rows[2] = { {BankId{0}, TokPos{A.len + 1}, TokId{11}}, {BankId{1}, TokPos{B.len},
+                                                                                    TokId{tb}} };
         std::vector<float> out((size_t)2 * W);
         uint32_t n_out = 0;
         err[0] = '\0';
@@ -415,27 +420,28 @@ static void part_banks(pulsar_engine *e, int W) {
         CHECK(same(r0, refA2, &d), "B2 bank 0's batched row == one-bank A + ta + 11 (max |diff| %.3g)", d);
         CHECK(same(r1, refB1, &d), "B2 bank 1's batched row == one-bank B + tb (max |diff| %.3g)", d);
         /* the lane's bookkeeping: note what bank 0 was fed, via its restore */
-        CHECK(pulsar_session_bank_state_restore(s, 0), "restore bank 0 after the lane");
-        const int fed = 11;
+        CHECK(pulsar_session_bank_state_restore(s, BankId{0}), "restore bank 0 after the lane");
+        const TokId fed{11};
         pulsar_session_note_committed_tokens(s, &fed, 1);
-        CHECK(pulsar_session_bank_pos(s, 0).raw() == A.len + 2, "the committed token recorded (bank_pos %d)",
-              pulsar_session_bank_pos(s, 0).raw());
-        pulsar_session_bank_state_save(s, 0);
-        CHECK(pulsar_session_bank_state_restore(s, 1), "restore bank 1 after the lane");
-        pulsar_session_note_committed_tokens(s, &tb, 1);
-        pulsar_session_bank_state_save(s, 1);
+        CHECK(pulsar_session_bank_pos(s, BankId{0}).raw() == A.len + 2, "the committed token recorded (bank_pos %d)",
+              pulsar_session_bank_pos(s, BankId{0}).raw());
+        pulsar_session_bank_state_save(s, BankId{0});
+        CHECK(pulsar_session_bank_state_restore(s, BankId{1}), "restore bank 1 after the lane");
+        const TokId tb_id{tb};
+        pulsar_session_note_committed_tokens(s, &tb_id, 1);
+        pulsar_session_bank_state_save(s, BankId{1});
     }
 
     /* B3: invalidate bank 1's host view; bank 0 must decode on as if nothing happened */
     {
-        CHECK(pulsar_session_bank_state_restore(s, 1), "restore bank 1");
+        CHECK(pulsar_session_bank_state_restore(s, BankId{1}), "restore bank 1");
         pulsar_session_invalidate(s);
-        CHECK(pulsar_session_bank_state_restore(s, 0), "restore bank 0 after bank 1's invalidate");
+        CHECK(pulsar_session_bank_state_restore(s, BankId{0}), "restore bank 0 after bank 1's invalidate");
         pulsar_tokens A3 = {0};
         pulsar_tokens_copy(&A3, &A);
-        pulsar_tokens_push(&A3, ta);
-        pulsar_tokens_push(&A3, 11);
-        pulsar_tokens_push(&A3, 13);
+        pulsar_tokens_push(&A3, TokId{ta});
+        pulsar_tokens_push(&A3, TokId{11});
+        pulsar_tokens_push(&A3, TokId{13});
         /* sync of an EXTENSION of bank 0's history continues it (one new token) */
         err[0] = '\0';
         CHECK(pulsar_session_sync(s, &A3, err, sizeof(err)) == 0, "bank 0 continues by sync: %s", err);
@@ -449,8 +455,8 @@ static void part_banks(pulsar_engine *e, int W) {
 
     /* B5 (L270; the fork legs went with the bank fork, L264/L265) */
     {
-        const uint64_t t0 = pulsar_session_bank_touched_kv_bytes(s, 0).raw();
-        const uint64_t t1 = pulsar_session_bank_touched_kv_bytes(s, 1).raw();
+        const uint64_t t0 = pulsar_session_bank_touched_kv_bytes(s, BankId{0}).raw();
+        const uint64_t t1 = pulsar_session_bank_touched_kv_bytes(s, BankId{1}).raw();
         const uint64_t all = pulsar_session_touched_kv_bytes(s).raw();
         const uint64_t q = pulsar_session_quantum_growth_bytes_per_bank(s, KvRows{8}).raw();
         CHECK(t0 > 0 && t1 > 0 && all >= t0 + t1 && q > 0,
@@ -458,9 +464,9 @@ static void part_banks(pulsar_engine *e, int W) {
               (unsigned long long)t0, (unsigned long long)t1, (unsigned long long)all, (unsigned long long)q);
         /* the eviction contract (L284 #3: every family's): an idle bank's pages are released, and it then holds
          * none (bank_residency_gate grades the way back) */
-        const bool freed = pulsar_session_bank_free_physical(s, 1);
-        const uint64_t t1_after = pulsar_session_bank_touched_kv_bytes(s, 1).raw();
-        CHECK(freed && t1_after == 0 && pulsar_session_bank_is_evicted(s, 1),
+        const bool freed = pulsar_session_bank_free_physical(s, BankId{1});
+        const uint64_t t1_after = pulsar_session_bank_touched_kv_bytes(s, BankId{1}).raw();
+        CHECK(freed && t1_after == 0 && pulsar_session_bank_is_evicted(s, BankId{1}),
               "B5 a per-bank physical eviction released idle bank 1 (touched after: %llu B)",
               (unsigned long long)t1_after);
     }
@@ -486,10 +492,11 @@ static void part_banks(pulsar_engine *e, int W) {
             std::vector<pulsar_multiseq_req> q;
             bool ran = pulsar_session_create(&x, e, 4096) == 0;
             for (int b = 0; ran && b < nb; b++) {
-                ran = pulsar_session_bank_state_restore(x, (uint32_t)b) &&
+                ran = pulsar_session_bank_state_restore(x, BankId{b}) &&
                       pulsar_session_sync(x, runs[b].P, err, sizeof(err)) == 0;
-                if (ran) pulsar_session_bank_state_save(x, (uint32_t)b);
-                for (int i = 0; i < runs[b].nr; i++) q.push_back({(uint32_t)b, TokPos{runs[b].P->len + i}, runs[b].run[i]});
+                if (ran) pulsar_session_bank_state_save(x, BankId{b});
+                for (int i = 0; i < runs[b].nr; i++)
+                    q.push_back({BankId{b}, TokPos{runs[b].P->len + i}, TokId{runs[b].run[i]}});
             }
             const uint32_t nr = (uint32_t)q.size();
             CHECK(nr <= pulsar_engine_fused_heads_max(e), "B6 %d banks' runs (%u rows) fit the verify width %u", nb,
@@ -526,7 +533,7 @@ static std::vector<float> verify_alone(pulsar_engine *e, const pulsar_tokens *P,
     if (pulsar_session_create(&x, e, 4096) != 0) return rows;
     if (pulsar_session_sync(x, P, err, sizeof(err)) == 0) {
         std::vector<pulsar_multiseq_req> q((size_t)nr);
-        for (int i = 0; i < nr; i++) q[(size_t)i] = {0u, TokPos{P->len + i}, run[i]};
+        for (int i = 0; i < nr; i++) q[(size_t)i] = {BankId{0}, TokPos{P->len + i}, TokId{run[i]}};
         rows.resize((size_t)nr * W);
         uint32_t got = 0;
         if (pulsar_session_decode_mixed(x, q.data(), (uint32_t)nr, rows.data(), nr * W, &got, PULSAR_MSEQ_HEAD_ALL_ROWS,
@@ -543,23 +550,24 @@ static std::vector<float> verify_alone(pulsar_engine *e, const pulsar_tokens *P,
  * `run` (nr of them, 0 = none) and bank 1's chunk chunk[0, m) at pre->len, its last row headed.  The step's
  * logits rows; the session stays open in *keep (NULL = freed). */
 static std::vector<float> fused_step(pulsar_engine *e, const pulsar_tokens *A, const int *run, int nr,
-                                     const pulsar_tokens *pre, const int *chunk, int m, int W, pulsar_session **keep) {
+                                     const pulsar_tokens *pre, const TokId *chunk, int m, int W,
+                                     pulsar_session **keep) {
     std::vector<float> out;
     pulsar_engine_set_bank_pool(2);
     pulsar_session *x = NULL;
     char err[256] = "";
     /* the prompt's bank first, so a verifying bank is the installed one (the server's shape) */
     bool ok = pulsar_session_create(&x, e, 4096) == 0;
-    ok = ok && pulsar_session_bank_state_restore(x, 1) && pulsar_session_sync(x, pre, err, sizeof(err)) == 0;
-    if (ok) pulsar_session_bank_state_save(x, 1);
+    ok = ok && pulsar_session_bank_state_restore(x, BankId{1}) && pulsar_session_sync(x, pre, err, sizeof(err)) == 0;
+    if (ok) pulsar_session_bank_state_save(x, BankId{1});
     if (ok && nr > 0) {
-        ok = pulsar_session_bank_state_restore(x, 0) && pulsar_session_sync(x, A, err, sizeof(err)) == 0;
-        if (ok) pulsar_session_bank_state_save(x, 0);
+        ok = pulsar_session_bank_state_restore(x, BankId{0}) && pulsar_session_sync(x, A, err, sizeof(err)) == 0;
+        if (ok) pulsar_session_bank_state_save(x, BankId{0});
     }
     if (ok) {
         std::vector<pulsar_multiseq_req> q;
-        for (int i = 0; i < nr; i++) q.push_back({0u, TokPos{A->len + i}, run[i]});
-        for (int j = 0; j < m; j++) q.push_back({1u, TokPos{pre->len + j}, chunk[j]});
+        for (int i = 0; i < nr; i++) q.push_back({BankId{0}, TokPos{A->len + i}, TokId{run[i]}});
+        for (int j = 0; j < m; j++) q.push_back({BankId{1}, TokPos{pre->len + j}, chunk[j]});
         pulsar_fused_shape sh;
         memset(&sh, 0, sizeof sh);
         sh.n_dec = (uint32_t)nr;
@@ -612,7 +620,7 @@ static void part_fused(pulsar_engine *e, int W) {
         pulsar_tokens pre = L, whole = L;
         pre.len = pre_len;
         whole.len = pre_len + m;
-        const int *chunk = L.v + pre_len;
+        const TokId *chunk = L.v + pre_len;
         pulsar_session *x = NULL;
         const std::vector<float> got = fused_step(e, &A, runA, 3, &pre, chunk, m, W, &x);
         CHECK(got.size() == (size_t)4 * W, "F fused step: 3 verify rows + a %d-row chunk, 4 rows headed", m);
@@ -630,7 +638,7 @@ static void part_fused(pulsar_engine *e, int W) {
                       pulsar_session_sync(c, &whole, err, sizeof(err)) == 0;
             if (ok) cl.push_back(logits_of(c, W));
             for (int i = 0; ok && i < 4; i++) {
-                ok = pulsar_session_eval(c, kDecode[i], err, sizeof(err)) == 0;
+                ok = pulsar_session_eval(c, TokId{kDecode[i]}, err, sizeof(err)) == 0;
                 if (ok) cl.push_back(logits_of(c, W));
             }
             if (!ok) fprintf(stderr, "session-contract: F classic run: %s\n", err);
@@ -644,7 +652,7 @@ static void part_fused(pulsar_engine *e, int W) {
         bool steps = cl.size() == 5;
         double worst = 0;
         for (int i = 0; steps && i < 4; i++) {
-            const pulsar_multiseq_req r1 = {1u, TokPos{whole.len + i}, kDecode[i]};
+            const pulsar_multiseq_req r1 = {BankId{1}, TokPos{whole.len + i}, TokId{kDecode[i]}};
             std::vector<float> lg((size_t)W);
             uint32_t n_out = 0;
             char err[256] = "";
@@ -682,7 +690,7 @@ static std::vector<std::vector<float>> classic(pulsar_engine *e, const pulsar_to
     }
     if (ok) out.push_back(logits_of(c, W));
     for (int i = 0; ok && i < 4; i++) {
-        ok = pulsar_session_eval(c, kDecode[i], err, sizeof(err)) == 0;
+        ok = pulsar_session_eval(c, TokId{kDecode[i]}, err, sizeof(err)) == 0;
         if (ok) out.push_back(logits_of(c, W));
     }
     if (!ok) { fprintf(stderr, "session-contract: classic run: %s\n", err); out.clear(); }
@@ -745,14 +753,17 @@ static void part_fused_runs(pulsar_engine *e, int W) {
         pulsar_session *x = NULL;
         char err[256] = "";
         bool ok = pulsar_session_create(&x, e, 4096) == 0;
-        ok = ok && pulsar_session_bank_state_restore(x, 2) && pulsar_session_sync(x, &D, err, sizeof(err)) == 0 &&
-             pulsar_session_eval(x, kDecode[0], err, sizeof(err)) == 0 && pulsar_session_eval(x, kDecode[1], err, sizeof(err)) == 0;
-        if (ok) { pulsar_session_invalidate(x); pulsar_session_bank_state_save(x, 2); }
-        ok = ok && pulsar_session_bank_state_restore(x, 1) && pulsar_session_sync(x, &pre, err, sizeof(err)) == 0;
-        if (ok) pulsar_session_bank_state_save(x, 1);
+        ok = ok && pulsar_session_bank_state_restore(x, BankId{2}) && pulsar_session_sync(x, &D, err,
+                                                                                          sizeof(err)) == 0 &&
+             pulsar_session_eval(x, TokId{kDecode[0]}, err, sizeof(err)) == 0 &&
+             pulsar_session_eval(x, TokId{kDecode[1]}, err, sizeof(err)) == 0;
+        if (ok) { pulsar_session_invalidate(x); pulsar_session_bank_state_save(x, BankId{2}); }
+        ok = ok && pulsar_session_bank_state_restore(x, BankId{1}) && pulsar_session_sync(x, &pre, err,
+                                                                                          sizeof(err)) == 0;
+        if (ok) pulsar_session_bank_state_save(x, BankId{1});
         if (ok && verify) {
-            ok = pulsar_session_bank_state_restore(x, 0) && pulsar_session_sync(x, &A, err, sizeof(err)) == 0;
-            if (ok) pulsar_session_bank_state_save(x, 0);
+            ok = pulsar_session_bank_state_restore(x, BankId{0}) && pulsar_session_sync(x, &A, err, sizeof(err)) == 0;
+            if (ok) pulsar_session_bank_state_save(x, BankId{0});
         }
         if (!ok) { fprintf(stderr, "session-contract: F5 setup: %s\n", err); if (x) pulsar_session_free(x); x = NULL; }
         return x;
@@ -761,10 +772,12 @@ static void part_fused_runs(pulsar_engine *e, int W) {
      * The step's logits rows, verify first, then the runs in order. */
     auto step = [&](pulsar_session *x, int nr, const int order[2]) {
         std::vector<pulsar_multiseq_req> q;
-        for (int i = 0; i < nr; i++) q.push_back({0u, TokPos{A.len + i}, runA[i]});
+        for (int i = 0; i < nr; i++) q.push_back({BankId{0}, TokPos{A.len + i}, TokId{runA[i]}});
         for (int r = 0; r < 2; r++) {
-            if (order[r] == 1) for (int j = 0; j < m1; j++) q.push_back({1u, TokPos{pre_len + j}, L.v[pre_len + j]});
-            else for (int j = 0; j < m2; j++) q.push_back({2u, TokPos{j}, L2.v[j]});
+            if (order[r] == 1)
+                for (int j = 0; j < m1; j++) q.push_back({BankId{1}, TokPos{pre_len + j}, L.v[pre_len + j]});
+            else
+                for (int j = 0; j < m2; j++) q.push_back({BankId{2}, TokPos{j}, L2.v[j]});
         }
         pulsar_fused_shape sh;
         memset(&sh, 0, sizeof sh);
@@ -813,7 +826,7 @@ static void part_fused_runs(pulsar_engine *e, int W) {
                 bool steps = true;
                 double worst = 0;
                 for (int i = 0; steps && i < 4; i++) {
-                    const pulsar_multiseq_req r = {(uint32_t)b, TokPos{T + i}, kDecode[i]};
+                    const pulsar_multiseq_req r = {BankId{b}, TokPos{T + i}, TokId{kDecode[i]}};
                     std::vector<float> lg((size_t)W);
                     uint32_t n_out = 0;
                     char err[256] = "";
@@ -830,7 +843,7 @@ static void part_fused_runs(pulsar_engine *e, int W) {
         } else {
             /* F8: the record, then a divergent sync of bank 2 from the checkpoint the record left */
             char err[256] = "";
-            bool ok = pulsar_session_bank_state_restore(x, 2) &&
+            bool ok = pulsar_session_bank_state_restore(x, BankId{2}) &&
                       pulsar_session_note_prefilled(x, L2.v, m2, ord[0] == 2 ? 0 : 1) == 0;
             double d = 0;
             CHECK(ok && pulsar_session_pos(x).raw() == m2 && same(logits_of(x, W), cl2[0], &d),
@@ -841,33 +854,33 @@ static void part_fused_runs(pulsar_engine *e, int W) {
                   pulsar_session_checkpoint_best(x, TokPos{m2}).raw());
             /* the conversation decodes on past the record (the classic eval) -- so the divergent sync below cannot
              * continue the history and must resume from the checkpoint */
-            for (int i = 0; ok && i < 2; i++) ok = pulsar_session_eval(x, kDecode[i], err, sizeof(err)) == 0;
+            for (int i = 0; ok && i < 2; i++) ok = pulsar_session_eval(x, TokId{kDecode[i]}, err, sizeof(err)) == 0;
             CHECK(ok && same(logits_of(x, W), cl2[2], &d), "F8 bank 2 evaluates on from the record == its classic run "
                   "(max |diff| %.3g) %s", d, ok ? "" : err);
-            if (ok) pulsar_session_bank_state_save(x, 2);
-            ok = pulsar_session_bank_state_restore(x, 1) &&
+            if (ok) pulsar_session_bank_state_save(x, BankId{2});
+            ok = pulsar_session_bank_state_restore(x, BankId{1}) &&
                  pulsar_session_note_prefilled(x, L.v + pre_len, m1, ord[0] == 1 ? 0 : 1) == 0;
             CHECK(ok && pulsar_session_pos(x).raw() == pre_len + m1 && same(logits_of(x, W), cl1[0], &d),
                   "F8 bank 1's record: %d tokens, its headed row as the next-token logits (max |diff| %.3g)",
                   pulsar_session_pos(x).raw(), d);
-            if (ok) pulsar_session_bank_state_save(x, 1);
+            if (ok) pulsar_session_bank_state_save(x, BankId{1});
             /* bank 1 continues by sync (an extension of a history it prefilled whole) */
             pulsar_tokens w1 = L;
             w1.len = pre_len + m1 + 6;
-            ok = pulsar_session_bank_state_restore(x, 1) && pulsar_session_sync(x, &w1, err, sizeof(err)) == 0;
+            ok = pulsar_session_bank_state_restore(x, BankId{1}) && pulsar_session_sync(x, &w1, err, sizeof(err)) == 0;
             const std::vector<float> ref1 = reference(e, &w1, NULL, 0, W);
             pulsar_engine_set_bank_pool(3);
             CHECK(ok && same(logits_of(x, W), ref1, &d), "F8 bank 1's sync past the record == its prompt cold (max "
                   "|diff| %.3g) %s", d, ok ? "" : err);
-            if (ok) pulsar_session_bank_state_save(x, 1);
+            if (ok) pulsar_session_bank_state_save(x, BankId{1});
             /* bank 2: the chunk's tokens then a different tail -- resumes from the checkpoint at m2 */
             pulsar_tokens Q = {0};
             pulsar_tokens_copy(&Q, &c2);
             for (int i = 0; i < 40; i++) pulsar_tokens_push(&Q, D.v[100 + i]);
-            ok = pulsar_session_bank_state_restore(x, 2) && pulsar_session_sync(x, &Q, err, sizeof(err)) == 0;
+            ok = pulsar_session_bank_state_restore(x, BankId{2}) && pulsar_session_sync(x, &Q, err, sizeof(err)) == 0;
             std::vector<float> got_q = ok ? logits_of(x, W) : std::vector<float>();
             const int kq[2] = {kDecode[2], kDecode[3]};
-            for (int i = 0; ok && i < 2; i++) ok = pulsar_session_eval(x, kq[i], err, sizeof(err)) == 0;
+            for (int i = 0; ok && i < 2; i++) ok = pulsar_session_eval(x, TokId{kq[i]}, err, sizeof(err)) == 0;
             std::vector<float> got_q2 = ok ? logits_of(x, W) : std::vector<float>();
             const std::vector<float> refQ = reference(e, &Q, NULL, 0, W), refQ2 = reference(e, &Q, kq, 2, W);
             pulsar_engine_set_bank_pool(3);
@@ -908,7 +921,7 @@ static uint64_t spec_drafted(pulsar_engine *e) {
 static bool spec_generate(pulsar_session *s, int n, char *err, size_t errlen) {
     uint64_t rng = 7;
     for (int got = 0; got < n;) {
-        int buf[17];
+        TokId buf[17];
         const int k = pulsar_session_generate_speculative(s, 0.0f, 0, 1.0f, 0.0f, &rng, n - got, buf, 17, err,
                                                           errlen);
         if (k <= 0) return k == 0;
@@ -930,7 +943,7 @@ static void part_spec_lookahead(pulsar_engine *e) {
     char err[256] = "";
     CHECK(pulsar_session_create(&s, e, 4096) == 0 && s, "S1 a 2-bank session");
     if (s) {
-        CHECK(pulsar_session_bank_state_restore(s, 0) && pulsar_session_sync(s, &A, err, sizeof(err)) == 0,
+        CHECK(pulsar_session_bank_state_restore(s, BankId{0}) && pulsar_session_sync(s, &A, err, sizeof(err)) == 0,
               "S1 bank 0 prefills A: %s", err);
         uint64_t d0 = spec_drafted(e);
         CHECK(spec_generate(s, 24, err, sizeof(err)) && spec_drafted(e) > d0,
@@ -940,11 +953,11 @@ static void part_spec_lookahead(pulsar_engine *e) {
         CHECK(spec_generate(s, 8, err, sizeof(err)) && spec_drafted(e) == d0,
               "S1 a latched bank decodes plain (%llu draft tokens): %s", (unsigned long long)(spec_drafted(e) - d0),
               err);
-        pulsar_session_bank_state_save(s, 0);
-        CHECK(pulsar_session_bank_state_restore(s, 1) && pulsar_session_sync(s, &B, err, sizeof(err)) == 0,
+        pulsar_session_bank_state_save(s, BankId{0});
+        CHECK(pulsar_session_bank_state_restore(s, BankId{1}) && pulsar_session_sync(s, &B, err, sizeof(err)) == 0,
               "S1 bank 1 prefills B: %s", err);
-        pulsar_session_bank_state_save(s, 1);
-        CHECK(pulsar_session_bank_state_restore(s, 0) && s->spec.spec_quenched,
+        pulsar_session_bank_state_save(s, BankId{1});
+        CHECK(pulsar_session_bank_state_restore(s, BankId{0}) && s->spec.spec_quenched,
               "S1 bank 0's shadow carries the latch across the switch");
         /* the next request on bank 0: its history and a new turn */
         pulsar_tokens next = {0};
@@ -978,14 +991,14 @@ static std::vector<uint8_t> declared_bank_state(pulsar_session *s, uint32_t b, i
     if (!ss) return out;
     /* L339: the bank's state is its tensors with its pending delta rows applied (state_kinds.h THE FOLD) -- a reader
      * outside a trunk step flushes first */
-    if (!pulsar_state_fold_flush(s->states, b) || !pulsar_gpu_synchronize()) return out;
+    if (!pulsar_state_fold_flush(s->states, BankId{b}) || !pulsar_gpu_synchronize()) return out;
     const pulsar_state_plan *p = ss->plan;
     bool ok = true;
     auto grab = [&](const pulsar_gpu_tensor *t, uint64_t off, uint64_t n) {
         if (!ok || !t) return;
         const size_t at = out.size();
         out.resize(at + n);
-        ok = pulsar_gpu_tensor_read(t, off, out.data() + at, n) != 0;
+        ok = pulsar_gpu_tensor_read(t, TensorBytes{off}, out.data() + at, TensorBytes{n}) != 0;
     };
     for (uint32_t k = 0; ok && k < p->n_trunk; k++) {
         for (uint32_t id = 0; id < p->n_decl; id++) {
@@ -995,7 +1008,7 @@ static std::vector<uint8_t> declared_bank_state(pulsar_session *s, uint32_t b, i
                 const uint64_t bb = pulsar_state_decl_bank_bytes(d);
                 grab(pulsar_state_tensor(ss, k, id), b * bb, bb);
             } else if (d->tokens == 1u) {   /* the row the token at pos wrote (a one-token pool: the KV) */
-                grab(pulsar_state_pool(ss, k, id, b), (uint64_t)pos / d->tokens * d->bytes, d->bytes);
+                grab(pulsar_state_pool(ss, k, id, BankId{b}), (uint64_t)pos / d->tokens * d->bytes, d->bytes);
             }
         }
     }
@@ -1010,12 +1023,12 @@ static bool spec_lane_round(pulsar_session *s, const uint32_t *banks, const int 
                             pulsar_spec_round **rounds, int *na, int W, char *err, size_t errlen) {
     const uint32_t width = pulsar_engine_fused_heads_max(s->engine);
     pulsar_spec_step st[4];
-    static int acc[4][PULSAR_SPEC_LOGITS_ROWS + 1];
+    static TokId acc[4][PULSAR_SPEC_LOGITS_ROWS + 1];
     if (n > 4) return false;
     std::vector<pulsar_multiseq_req> reqs(width);
     for (int i = 0; i < n; i++) {
         memset(&st[i], 0, sizeof st[i]);
-        st[i].bank = banks[i];
+        st[i].bank = BankId{banks[i]};
         st[i].round = rounds[i];
         st[i].top_p = 1.0f;
         st[i].rng = &rngs[i];
@@ -1042,13 +1055,13 @@ static bool spec_lane_round(pulsar_session *s, const uint32_t *banks, const int 
     if (rc != 0 || got != rows) return false;
     for (int i = 0; i < n; i++) {
         const uint32_t row0 = st[i].row0;
-        const int first = st[i].first_token;
+        const int first = st[i].first_token.raw();
         memset(&st[i], 0, sizeof st[i]);
-        st[i].bank = banks[i];
+        st[i].bank = BankId{banks[i]};
         st[i].round = rounds[i];
         st[i].top_p = 1.0f;
         st[i].rng = &rngs[i];
-        st[i].first_token = first;
+        st[i].first_token = TokId{first};
         st[i].row0 = row0;
         st[i].accepted = acc[i];
         st[i].accepted_cap = (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
@@ -1070,13 +1083,13 @@ static bool spec_lane_round(pulsar_session *s, const uint32_t *banks, const int 
 /* `bank`'s logits as it stands, then after each of kDecode decoded plain */
 static std::vector<std::vector<float>> decode_after(pulsar_session *s, uint32_t bank, int W, char *err, size_t errlen) {
     std::vector<std::vector<float>> out;
-    if (!pulsar_session_bank_state_restore(s, bank)) return out;
+    if (!pulsar_session_bank_state_restore(s, BankId{bank})) return out;
     out.push_back(logits_of(s, W));
     for (int t = 0; t < 4; t++) {
-        if (pulsar_session_eval(s, kDecode[t], err, errlen) != 0) { out.clear(); break; }
+        if (pulsar_session_eval(s, TokId{kDecode[t]}, err, errlen) != 0) { out.clear(); break; }
         out.push_back(logits_of(s, W));
     }
-    pulsar_session_bank_state_save(s, bank);
+    pulsar_session_bank_state_save(s, BankId{bank});
     return out;
 }
 
@@ -1098,11 +1111,11 @@ static pulsar_session *s2_session(pulsar_engine *e, const pulsar_tokens *const *
     pulsar_session *s = NULL;
     if (pulsar_session_create(&s, e, 4096) != 0 || !s) return NULL;
     for (uint32_t b = 0; b < pool; b++) {
-        if (!pulsar_session_bank_state_restore(s, b) || pulsar_session_sync(s, prompts[b], err, errlen) != 0) {
+        if (!pulsar_session_bank_state_restore(s, BankId{b}) || pulsar_session_sync(s, prompts[b], err, errlen) != 0) {
             pulsar_session_free(s);
             return NULL;
         }
-        pulsar_session_bank_state_save(s, b);
+        pulsar_session_bank_state_save(s, BankId{b});
     }
     return s;
 }
@@ -1125,8 +1138,8 @@ static void part_spec_zero_draft(pulsar_engine *e, int W) {
     if (ok) {
         const std::vector<float> l = logits_of(t, W);
         x = l.empty() ? -1 : (int)(std::max_element(l.begin(), l.end()) - l.begin());
-        ok = x >= 0 && pulsar_session_eval(t, x, err, sizeof(err)) == 0;
-        pulsar_session_bank_state_save(t, 0);
+        ok = x >= 0 && pulsar_session_eval(t, TokId{x}, err, sizeof(err)) == 0;
+        pulsar_session_bank_state_save(t, BankId{0});
     }
     const std::vector<uint8_t> plain_state = ok ? declared_bank_state(t, 0, A.len) : std::vector<uint8_t>();
     const std::vector<std::vector<float>> plain =
@@ -1168,17 +1181,18 @@ static void part_spec_zero_draft(pulsar_engine *e, int W) {
         const int kall[1] = {-1};
         int na[2] = {0, 0};
         bool ran = s && spec_lane_round(s, b1, kall, 1, &rngs[1], &r[1], na, W, err, sizeof(err));
-        uint32_t banks_r[1] = {1};
+        const BankId banks_r[1] = {BankId{1}};
         uint64_t *rp[1] = {&rngs[1]};
         ran = ran && pulsar_session_spec_redraft_batch(s, &r[1], banks_r, rp, 1, err, sizeof(err)) == 0;
         pulsar_spec_step cs;
         memset(&cs, 0, sizeof cs);
-        cs.bank = 1;
+        cs.bank = BankId{1};
         cs.round = r[1];
         ran = ran && pulsar_session_spec_redraft_commit_batch(s, &cs, 1) == 0 && cs.status == PULSAR_SPEC_STEP_OK;
         float conf[16];
-        int32_t pbase, ptok[16];
-        const uint32_t pend = ran ? pulsar_session_bank_pendings(s, 1, &pbase, ptok, conf) : 0u;
+        TokId pbase;
+        TokId ptok[16];
+        const uint32_t pend = ran ? pulsar_session_bank_pendings(s, BankId{1}, &pbase, ptok, conf) : 0u;
         CHECK(ran && pend > 0, "S2 (beside) bank 1 holds %u drafts for the shared round: %s", pend, err);
         const uint32_t banks[2] = {0, 1};
         const int k[2] = {0, -1};

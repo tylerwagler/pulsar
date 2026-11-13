@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """L307: the scratch-poison gate's mutant (make scratch-poison-gate-mutant).
 
-Writes a copy of src/engine/family_qwen_s4.cpp whose trunk step (pulsar_qwen_s4_embed) clears its MoE non-finite flag -- a word of the MOE op's
+Writes a copy of src/families/qwen/family_qwen_s4.cpp whose trunk step (pulsar_qwen_s4_embed) clears its MoE non-finite flag -- a word of the MOE op's
 scratch arena, read back at the step's end -- on each arena's FIRST step only.  Unpoisoned, nothing ever sets the flag, so the
 stale word is still the clear one and every step passes: the defect is invisible.  Poisoned, the word holds the pattern
 at the step's end and the step refuses.  The gate must FAIL on this build with its premise (the unpoisoned runs agree)
@@ -14,16 +14,19 @@ import sys
 SITE = ("    /* the MoE non-finite flag starts every step clear (read at pulsar_qwen_s4_step_end) */\n"
         "    pulsar_gpu_tensor *moe_sc = st->st->scratch[PULSAR_QWEN_OP_MOE];\n"
         "    static const uint32_t zero = 0;   /* L289: an enqueued write reads it later */\n"
-        "    if (!moe_sc || !pulsar_gpu_tensor_write_async(moe_sc, moe_layout(st->shape, st->st->max_rows).nf, &zero, "
-        "sizeof(zero)))\n"
+        "    if (!moe_sc || !pulsar_gpu_tensor_write_async(moe_sc, "
+        "TensorBytes{moe_layout(st->shape, st->st->max_rows).nf},\n"
+        "                                                  &zero, TensorBytes{sizeof(zero)}))\n"
         "        return fail(\"could not clear the MoE non-finite flag\");\n")
 MUTANT = ("    /* the MoE non-finite flag starts every step clear (read at pulsar_qwen_s4_step_end) */\n"
           "    pulsar_gpu_tensor *moe_sc = st->st->scratch[PULSAR_QWEN_OP_MOE];\n"
           "    static const uint32_t zero = 0;   /* L289: an enqueued write reads it later */\n"
           "    static const void *l307_mutant_cleared = NULL;   /* L307 MUTANT: each arena cleared on its first step only */\n"
           "    if (!moe_sc || (dptr(moe_sc) != l307_mutant_cleared &&\n"
-          "                    !pulsar_gpu_tensor_write_async(moe_sc, moe_layout(st->shape, st->st->max_rows).nf, &zero,\n"
-          "                                                   sizeof(zero))))\n"
+          "                    !pulsar_gpu_tensor_write_async(moe_sc,\n"
+          "                                                   "
+          "TensorBytes{moe_layout(st->shape, st->st->max_rows).nf},\n"
+          "                                                   &zero, TensorBytes{sizeof(zero)})))\n"
           "        return fail(\"could not clear the MoE non-finite flag\");\n"
           "    l307_mutant_cleared = dptr(moe_sc);\n")
 

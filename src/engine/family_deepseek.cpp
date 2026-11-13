@@ -110,11 +110,13 @@ static uint64_t ds4_trained_context(const pulsar_engine *) {
 /// @return true when the bank's state is the view's
 static bool ds4_sync_state_agrees(pulsar_session *s) {
     const pulsar_gpu_graph *g = s->graph;
-    const uint32_t bank = gpu_graph_cur_bank(g);
-    if (s->mseq_dirty || g->ms_comp_state_stale[bank]) return false;
+    const BankId bank = gpu_graph_cur_bank(g);
+    if (s->mseq_dirty || g->ms_comp_state_stale[pulsar_bank_index(bank)]) return false;
+    const TokCount len = s->hist_end().before();
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++)
         if (gpu_graph_layer_is_kv_source(il) &&
-            gpu_graph_n_comp(g, bank, il) > (uint32_t)s->checkpoint.len / pulsar_layer_compress_ratio(il))
+            gpu_graph_n_comp(g, bank, il) >
+                pulsar_comp_rows_held(len, TokPerRow{pulsar_layer_compress_ratio(il)}))
             return false;
     return true;
 }
@@ -126,7 +128,7 @@ static bool ds4_sync_state_agrees(pulsar_session *s) {
 /// @return false when the graph reset fails
 static bool ds4_sync_reset_bank(pulsar_session *s) {
     if (!gpu_graph_reset_prefill_state(s->graph)) return false;
-    gpu_graph_engram_forget(s->graph, gpu_graph_cur_bank(s->graph));
+    gpu_graph_engram_forget(s->graph, pulsar_bank_index(gpu_graph_cur_bank(s->graph)));
     s->mseq_dirty = false;
     return true;
 }
@@ -151,7 +153,7 @@ static bool ds4_prefill_chunk(pulsar_session *s, const pulsar_tokens *prompt, ui
     }
     if (last) s->dev.live_valid = true;
     if (last) s->dev.host_stale = true;   /* L302: the head wrote the live row on the device */
-    s->prefill_frontier = (int)(pos0 + rows);
+    s->prefill_frontier = pulsar_ckpt_pos(pos0 + rows);
     return true;
 }
 
@@ -162,9 +164,9 @@ static bool ds4_prefill_chunk(pulsar_session *s, const pulsar_tokens *prompt, ui
 /// @param prompt the prompt
 /// @param start first position to prefill
 /// @return pulsar_prefill_loop's
-static int ds4_sync_prefill(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start) {
-    if ((int)start < s->checkpoint.len) s->trim_history((int)start);
-    s->prefill_frontier = (int)start;
+static int ds4_sync_prefill(pulsar_session *s, const pulsar_tokens *prompt, TokPos start) {
+    if (start < s->hist_end()) s->trim_history(start);
+    s->prefill_frontier = start;
     const pulsar_vision_request vreq = { s->sync_images, s->sync_n_images, s->engine };
     pulsar_gpu_graph *g = s->graph;
     const pulsar_vision_request *prev = g->vision_req;
@@ -201,9 +203,9 @@ static const pulsar_sync_ops k_ds4_sync = {
 /// @return 0 decoded; 1 + err on a failure
 static int ds4_eval_row(pulsar_session *s, int token, char *err, size_t errlen) {
     pulsar_engine *e = s->engine;
-    int ms_tok[1] = { token };
+    const TokId ms_tok[1] = { TokId{token} };
     int32_t ms_pos[1] = { (int32_t)s->checkpoint.len };
-    int32_t ms_bank[1] = { (int32_t)(s->graph->banks.n_banks ? s->graph->banks.cur_bank : 0u) };
+    const BankId ms_bank[1] = { gpu_graph_cur_bank(s->graph) };
     /* rc: 0 = recoverable pre-arm reject, 1 = success, else fatal mid-sweep */
     if (gpu_graph_decode_multiseq_batch(s->graph, &e->model, &e->weights, ms_tok, ms_pos, ms_bank, 1u, NULL,
                                         NULL, 0u, /*capture_cur=*/true, NULL) == 1 &&
@@ -248,7 +250,7 @@ static int ds4_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *reqs, 
  * compressor group empty, its checkpoints and the drafter's window rows gone (rewind(0)) -- so any lane may start it
  * at position 0 and no next conversation can restore this one's rows. */
 /// @param s the session
-static void ds4_invalidate(pulsar_session *s) { s->rewind(0); }
+static void ds4_invalidate(pulsar_session *s) { s->rewind(TokPos{0}); }
 /// pulsar_family_session_ops::decode_fused: pulsar_session::decode_fused.
 /// @param s the session
 /// @param reqs requests
@@ -289,7 +291,7 @@ static bool ds4_is_image_sentinel(const pulsar_engine *, int32_t id) { return id
 /// @param start where to look
 /// @param[out] len the block's length
 /// @return true when a block starts at start
-static bool ds4_image_block_extent(const pulsar_engine *, const int32_t *ids, int n, int start, int *len) {
+static bool ds4_image_block_extent(const pulsar_engine *, const TokId *ids, int n, int start, int *len) {
     return vision_span_extent(ids, n, (int)PULSAR_N_VOCAB, start, len) != 0;
 }
 /* L268: the rest of DeepSeek's image front -- its placeholder token, one image's sentinel block (vision.cpp), and its
@@ -319,7 +321,7 @@ static uint32_t ds4_image_row_width(const pulsar_engine *) { return (uint32_t)PU
 /// @param err message buffer
 /// @param errlen its size
 /// @return vision_ds4_block_rows's
-static bool ds4_image_block_rows(const pulsar_engine *e, const pulsar_image_ref *img, const int32_t *, int block_len,
+static bool ds4_image_block_rows(const pulsar_engine *e, const pulsar_image_ref *img, const TokId *, int block_len,
                                  const uint16_t *tower, int n_tower, uint16_t **tower_out, int *n_tower_out,
                                  uint16_t *out, char *err, size_t errlen) {
     return vision_ds4_block_rows(&e->vision_weights, &e->model, img, block_len, tower, n_tower, tower_out,

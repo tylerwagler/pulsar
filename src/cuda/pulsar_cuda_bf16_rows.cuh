@@ -27,7 +27,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "pulsar_cuda_qwen.h"   /* pulsar_ffn_act: the rows front door's neutral activation enum */
+#include "pulsar_cuda_rows.h"   /* pulsar_ffn_act: the rows front door's neutral activation enum */
 
 /** The rows one launch of the M-independent rows kernel takes (wider decode calls run blocks of it). */
 #define PULSAR_BF16_ROWS_DECODE_MAX 16

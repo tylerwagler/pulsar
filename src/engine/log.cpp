@@ -5,6 +5,18 @@
 /* Fatal-exit and colorized logging. Split out of util.cpp in the C++ port:
  * everything here is about reporting, nothing about compute. */
 
+/* L272: every family's loader has one failure policy.  A refusal is said where it is found and counted
+ * here (moved from family.cpp, L335: model_layout.cpp's refusals reach host-only tools); the stage that found it finishes (so one load reports every problem it can see), and the family's
+ * load fails at its next stage boundary -- pulsar_engine_open returns an error, the process never exits on
+ * a bad artifact.  Loads run one at a time (engine open is not concurrent). */
+/// Refusals counted since the last reset (pulsar_load_refuse); single-threaded, loads are serial.
+static uint32_t g_load_refusals;
+void pulsar_load_refuse(void) { g_load_refusals++; }
+uint32_t pulsar_load_refusals(void) { return g_load_refusals; }
+void pulsar_load_refusals_reset(void) { g_load_refusals = 0; }
+
+
+
 void pulsar_die(const char *msg) {
     fprintf(stderr, "pulsar: %s\n", msg);
     exit(1);

@@ -213,6 +213,15 @@ bool request_exceeds_context(const request *r, int ctx_size) {
 
 
 
+/// The context-overflow message in the request's protocol wording (pulsar_server_internal.h).
+void context_length_message(char *out, size_t n, const request *r, int n_prompt_tokens, int ctx_size) {
+    if (r && r->api == API_ANTHROPIC)
+        snprintf(out, n, "prompt is too long: %d tokens > %d maximum", n_prompt_tokens, ctx_size);
+    else
+        snprintf(out, n, "Prompt has %d tokens, but the configured context size is %d tokens", n_prompt_tokens,
+                 ctx_size);
+}
+
 /// Send the 400 context_length_exceeded error in the request's protocol shape (Anthropic's envelope or OpenAI's,
 /// with n_prompt_tokens and n_ctx).
 /// @param fd               the client socket
@@ -226,9 +235,7 @@ bool http_error_context_length_exceeded(int fd,
                                                int ctx_size) {
     buf b = {0};
     char msg[160];
-    snprintf(msg, sizeof(msg),
-             "Prompt has %d tokens, but the configured context size is %d tokens",
-             n_prompt_tokens, ctx_size);
+    context_length_message(msg, sizeof(msg), r, n_prompt_tokens, ctx_size);
 
     if (r && r->api == API_ANTHROPIC) {
         buf_puts(&b, "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":");

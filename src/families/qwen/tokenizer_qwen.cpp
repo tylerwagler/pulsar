@@ -3,11 +3,12 @@
 /* tokenizer_qwen.cpp -- the Qwen4-exp family's tokenizer table (family.h pulsar_family_tokenizer, L272 P2).
  *
  * A Qwen engine tokenizes with src/lib/bpe_tokenizer -- the shared engine in its HF configuration, byte-exact
- * with HF on the checkpoint's own tokenizer.json (make qwen-chat-gate) -- and renders its chat with src/lib/qwen_chat (HF's template, byte for
+ * with HF on the checkpoint's own tokenizer.json (make qwen-chat-gate) -- and renders its chat with src/families/qwen/qwen_chat (HF's template, byte for
  * byte) -- whole for the server, head and turn by turn for the CLI REPL and the agent (L284 P14).  Until L272
- * these bodies were branches on e->qwen_tok inside every public entry of tokenizer.cpp. */
-#include "pulsar_engine_internal.h"
-#include "lib/qwen_chat.h"
+ * these bodies were branches on pulsar_qwen_of(e)->tok inside every public entry of tokenizer.cpp. */
+#include "engine/pulsar_engine_internal.h"
+#include "family_qwen.h"
+#include "qwen_chat.h"
 #include "lib/bpe_tokenizer.h"
 
 #include <string.h>
@@ -29,12 +30,12 @@ static bool qwen_encode_into(const pulsar_engine *e, const char *text, const pul
     std::vector<int> ids;
     char err[256] = "";
     const size_t len = text ? strlen(text) : 0;
-    if (!bpe_tokenizer_encode(e->qwen_tok, text ? text : "", len, spans, n_spans, &ids, err, sizeof(err))) {
+    if (!bpe_tokenizer_encode(pulsar_qwen_of(e)->tok, text ? text : "", len, spans, n_spans, &ids, err, sizeof(err))) {
         fprintf(stderr, "pulsar: qwen tokenizer refused %zu bytes: %s\n", len, err);
         if (why && whylen) snprintf(why, whylen, "%s", err);
         return false;
     }
-    for (int id : ids) pulsar_tokens_push(out, id);
+    for (int id : ids) pulsar_tokens_push(out, TokId{id});
     return true;
 }
 
@@ -165,7 +166,7 @@ static bool qwen_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {
 /// @param token an id
 /// @return true for any generation_config stop id
 static bool qwen_tok_is_stop(pulsar_engine *e, int token) {
-    for (int id : bpe_tokenizer_stop_ids(e->qwen_tok)) if (id == token) return true;
+    for (int id : bpe_tokenizer_stop_ids(pulsar_qwen_of(e)->tok)) if (id == token) return true;
     return false;
 }
 
@@ -176,7 +177,7 @@ static bool qwen_tok_is_stop(pulsar_engine *e, int token) {
 /// @param e the engine
 /// @return the first stop id; -1 (said once) when the tokenizer has none
 static int qwen_tok_eos(pulsar_engine *e) {
-    const std::vector<int> &stop = bpe_tokenizer_stop_ids(e->qwen_tok);
+    const std::vector<int> &stop = bpe_tokenizer_stop_ids(pulsar_qwen_of(e)->tok);
     if (!stop.empty()) return stop.front();
     if (pulsar_refusal_first("qwen eos"))
         fprintf(stderr, "pulsar: %s: the tokenizer has no stop id -- refusing the eos\n", PULSAR_QWEN_ARCH);
@@ -189,7 +190,7 @@ static int qwen_tok_eos(pulsar_engine *e) {
 /// @return its bytes, malloc'd, NUL-terminated (empty out of range)
 static char *qwen_tok_token_text(pulsar_engine *e, int token, size_t *len) {
     size_t n = 0;
-    const char *b = bpe_tokenizer_token_bytes(e->qwen_tok, token, &n);
+    const char *b = bpe_tokenizer_token_bytes(pulsar_qwen_of(e)->tok, token, &n);
     if (!b) n = 0;   /* out of range, e.g. the padded logits rows past the table: no text */
     char *out = (char *)xmalloc(n + 1);
     if (n) memcpy(out, b, n);
@@ -200,7 +201,7 @@ static char *qwen_tok_token_text(pulsar_engine *e, int token, size_t *len) {
 
 /// @param e the engine
 /// @return the `</think>` id, or -1
-static int qwen_tok_think_close(pulsar_engine *e) { return bpe_tokenizer_added_id(e->qwen_tok, "</think>"); }
+static int qwen_tok_think_close(pulsar_engine *e) { return bpe_tokenizer_added_id(pulsar_qwen_of(e)->tok, "</think>"); }
 
 /* L272 B5: Qwen's template spells a turn as <|im_start|> plus the role word, which the checkpoint's BPE
  * holds as one token (Qwen3.8-Flash-Next: "user", "assistant").  A tokenizer that splits either word
@@ -209,16 +210,16 @@ static int qwen_tok_think_close(pulsar_engine *e) { return bpe_tokenizer_added_i
 /// @param[out] out the user / assistant markers
 /// @return false when the tokenizer splits a role word
 static bool qwen_tok_turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
-    const int start = bpe_tokenizer_added_id(e->qwen_tok, "<|im_start|>");
+    const int start = bpe_tokenizer_added_id(pulsar_qwen_of(e)->tok, "<|im_start|>");
     pulsar_tokens user = {0}, assistant = {0};
     qwen_tok_encode_text(e, "user", &user);
     qwen_tok_encode_text(e, "assistant", &assistant);
     const bool ok = start >= 0 && user.len == 1 && assistant.len == 1;
     if (ok) {
-        out->user[0] = start;
+        out->user[0] = TokId{start};
         out->user[1] = user.v[0];
         out->n_user = 2;
-        out->assistant[0] = start;
+        out->assistant[0] = TokId{start};
         out->assistant[1] = assistant.v[0];
         out->n_assistant = 2;
         /* L351: qwen_chat renders a tool message as a user turn opened by <tool_response> */
@@ -244,12 +245,12 @@ static bool qwen_tok_turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
 /// @param tokens the ids
 static void qwen_tok_dump(pulsar_engine *e, FILE *fp, const pulsar_tokens *tokens) {
     fprintf(fp, "[");
-    for (int i = 0; i < tokens->len; i++) fprintf(fp, "%s%d", i ? ", " : "", tokens->v[i]);
+    for (int i = 0; i < tokens->len; i++) fprintf(fp, "%s%d", i ? ", " : "", tokens->v[i].raw());
     fprintf(fp, "]\n");
     for (int i = 0; i < tokens->len; i++) {
         size_t n = 0;
-        char *piece = qwen_tok_token_text(e, tokens->v[i], &n);
-        fprintf(fp, "%6d  ", tokens->v[i]);
+        char *piece = qwen_tok_token_text(e, tokens->v[i].raw(), &n);
+        fprintf(fp, "%6d  ", tokens->v[i].raw());
         pulsar_dump_piece_quoted(fp, piece, n);
         fputc('\n', fp);
         free(piece);
@@ -259,7 +260,20 @@ static void qwen_tok_dump(pulsar_engine *e, FILE *fp, const pulsar_tokens *token
 /* the checkpoint's table (L272 B3: Qwen never loads e->vocab) */
 /// @param e the engine
 /// @return ids in the tokenizer's table
-static int qwen_tok_n_tokens(pulsar_engine *e) { return bpe_tokenizer_n_tokens(e->qwen_tok); }
+static int qwen_tok_n_tokens(pulsar_engine *e) { return bpe_tokenizer_n_tokens(pulsar_qwen_of(e)->tok); }
+
+/* L334 P3: the family's ids leave the tokenizer here, typed (its internals stay raw). */
+/** pulsar_family_tokenizer::is_stop, typed.  @param e the engine  @param t the token  @return qwen_tok_is_stop's */
+static bool qwen_tok_is_stop_op(pulsar_engine *e, TokId t) { return qwen_tok_is_stop(e, t.raw()); }
+/** pulsar_family_tokenizer::eos, typed.  @param e the engine  @return qwen_tok_eos's (-1 enters as none()) */
+static TokId qwen_tok_eos_op(pulsar_engine *e) { return TokId{qwen_tok_eos(e)}; }
+/** pulsar_family_tokenizer::token_text, typed.  @param e the engine  @param t the token  @param len its length
+ *  @return qwen_tok_token_text's */
+static char *qwen_tok_token_text_op(pulsar_engine *e, TokId t, size_t *len) {
+    return qwen_tok_token_text(e, t.raw(), len);
+}
+/** pulsar_family_tokenizer::think_close, typed.  @param e the engine  @return qwen_tok_think_close's (-1: none()) */
+static TokId qwen_tok_think_close_op(pulsar_engine *e) { return TokId{qwen_tok_think_close(e)}; }
 
 const pulsar_family_tokenizer k_qwen_tokenizer = {
     /* .encode_text              = */ qwen_tok_encode_text,
@@ -267,10 +281,10 @@ const pulsar_family_tokenizer k_qwen_tokenizer = {
     /* .chat_open                = */ qwen_chat_open,
     /* .chat_turn                = */ qwen_chat_turn,
     /* .chat_end_assistant       = */ qwen_chat_end_assistant,
-    /* .is_stop                  = */ qwen_tok_is_stop,
-    /* .eos                      = */ qwen_tok_eos,
-    /* .token_text               = */ qwen_tok_token_text,
-    /* .think_close              = */ qwen_tok_think_close,
+    /* .is_stop                  = */ qwen_tok_is_stop_op,
+    /* .eos                      = */ qwen_tok_eos_op,
+    /* .token_text               = */ qwen_tok_token_text_op,
+    /* .think_close              = */ qwen_tok_think_close_op,
     /* .turn_markers             = */ qwen_tok_turn_markers,
     /* .dump                     = */ qwen_tok_dump,
     /* .n_tokens                 = */ qwen_tok_n_tokens,

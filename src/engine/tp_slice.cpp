@@ -28,7 +28,7 @@
  * and make tp-plan-gate diffs it against tests/tp-plan-golden/. */
 #include "pulsar_engine_internal.h"
 #include "exl3_trellis.h"
-#include "cuda/pulsar_cuda_qwen.h"
+#include "cuda/pulsar_cuda_rows.h"
 
 #include <unordered_map>
 #include <vector>
@@ -297,8 +297,8 @@ static bool run_built(pulsar_tp_plan *p, const pulsar_tp_slice *s, const char *h
         fprintf(g_tp_record, "built %s %s bytes %zu fnv %016llx\n", how, nm, b.size(), (unsigned long long)fnv(b.data(), b.size()));
         return true;
     }
-    pulsar_gpu_tensor *g = pulsar_gpu_tensor_alloc(b.size());
-    if (!g || !pulsar_gpu_tensor_write(g, 0, b.data(), b.size())) {
+    pulsar_gpu_tensor *g = pulsar_gpu_tensor_alloc(TensorBytes{b.size()});
+    if (!g || !pulsar_gpu_tensor_write(g, TensorBytes{0}, b.data(), TensorBytes{b.size()})) {
         pulsar_gpu_tensor_free(g);
         return false;
     }

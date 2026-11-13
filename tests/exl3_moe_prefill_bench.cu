@@ -4,7 +4,7 @@
  * stacks of the real size), uniform top-k routing.  Prints ms per layer and the layer's tokens/s.  Also the
  * D2R-vs-decode-once comparison for one projection: the prefill arm (trellis decoded into the mma B
  * fragments) against decoding each routed expert ONCE into fp16 and a cuBLASLt GEMM per expert (the dense
- * prefill arm, qwen_exl3_dense_prefill_launch, per expert with its rows).  Not a gate.
+ * prefill arm, exl3_dense_prefill_launch, per expert with its rows).  Not a gate.
  *
  * usage: ./tests/exl3_moe_prefill_bench [v4|v41] [k2] [tokens ...]
  */
@@ -13,7 +13,7 @@
 #include "cuda/mmq/ds4_mmq.h"
 #include "cuda/mmq/ds4_exl3_dense.cuh"
 #include "cuda/mmq/exl3_moe.cuh"
-#include "cuda/pulsar_cuda_qwen.h"
+#include "cuda/pulsar_cuda_rows.h"
 #include "engine/exl3_trellis.h"
 
 #include <cuda_bf16.h>
@@ -198,7 +198,7 @@ int main(int argc, char **argv) {
         auto once = [&]() {
             int rc = 0;
             for (int e = 0; e < E; e++)
-                if (cnt[e]) rc |= qwen_exl3_dense_prefill_launch(G.arena + e * G.stride, k2, xb + (size_t)bounds[e] * H,
+                if (cnt[e]) rc |= exl3_dense_prefill_launch(G.arena + e * G.stride, k2, xb + (size_t)bounds[e] * H,
                                                                  y + (size_t)bounds[e] * MID, cnt[e], H, MID, G.trellis, st);
             return rc;
         };

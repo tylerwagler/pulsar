@@ -20,6 +20,14 @@
  * PASS: C == A and B == A in every record, byte for byte; the graphed lanes replayed in B (rule 5: the gate ran the
  * production lane) and B poisoned steps (A and C none).
  *
+ * L382: each run declares its graph keys as the server's warmup does (pulsar_gpu_seg_catalog_open on a fresh segment
+ * cache), so a key captures on its SECOND use and every later use replays.  Before, the script's keys were live ones,
+ * captured only at their 12th use, and the script's cycles (77 subset x width pairs, a draft pass keyed on its bank
+ * count and bound) bring at most one key there in ~50 ticks: on the GB10 Gemma pack one key, 1 capture and 2 replays
+ * (L369, 82d9dd14), on the RTX 6000 (sm_75) none -- 0 replays, a FAIL of the precondition with the engine capturing
+ * normally (graph-eager-gate and block-spec-gate replayed in the same engine).  The catalog closes before the session
+ * is freed, and a shape it failed to capture fails the run (the server refuses to start on one too).
+ *
  * Mutation-tested (make scratch-poison-gate-mutant): a build whose Qwen step clears its MoE non-finite flag only on its
  * first step -- an unpoisoned run never sees the difference (the flag stays clear), a poisoned run must FAIL.
  *
@@ -59,6 +67,7 @@ struct run_rec {
     std::vector<tick_rec> ticks;
     std::vector<int32_t> out[NB];
     uint64_t replays = 0, captures = 0, poisoned = 0, poison_bytes = 0;
+    uint64_t catalog_failed = 0;   /* declared shapes whose capture failed or refused (pulsar_gpu_seg_catalog_close) */
     bool ok = false;
     std::string err;
 };
@@ -95,13 +104,18 @@ run_rec run(pulsar_engine *e, const std::vector<pulsar_tokens> &P, int n, bool p
     char err[256] = "";
     /* poisoned from the banks' prefill on: every step of the run */
     const int was = pulsar_gpu_scratch_poison_set(poison ? 1 : 0);
+    /* L382: a fresh segment cache (a key carries its session's address, which a new session may reuse) whose keys
+     * are declared, as the warmup declares the server's: each captures on its second use, so the graphed lanes
+     * replay between the poisonings whatever the script's key repetition (see the header) */
+    pulsar_gpu_seg_reset();
+    pulsar_gpu_seg_catalog_open();
     uint64_t r0 = 0, c0 = 0, p0 = 0, pb0 = 0;
     pulsar_gpu_seg_counts(&r0, &c0);
     pulsar_gpu_scratch_poison_counts(&p0, &pb0);
     bool ok = pulsar_session_create(&s, e, 4096) == 0 && s;
     for (int b = 0; ok && b < NB; b++) {
-        ok = pulsar_session_bank_state_restore(s, (uint32_t)b) && pulsar_session_sync(s, &P[b], err, sizeof err) == 0;
-        if (ok) pulsar_session_bank_state_save(s, (uint32_t)b);
+        ok = pulsar_session_bank_state_restore(s, BankId{b}) && pulsar_session_sync(s, &P[b], err, sizeof err) == 0;
+        if (ok) pulsar_session_bank_state_save(s, BankId{b});
     }
     if (!ok) snprintf(err + strlen(err), sizeof err - strlen(err), " (the banks' prefill)");
     pulsar_spec_round *rd[NB];
@@ -109,7 +123,7 @@ run_rec run(pulsar_engine *e, const std::vector<pulsar_tokens> &P, int n, bool p
     bool done[NB] = {};
     for (int b = 0; b < NB; b++) rd[b] = pulsar_spec_round_new();
     std::vector<pulsar_multiseq_req> reqs(widest);
-    static int acc[NB][PULSAR_SPEC_LOGITS_ROWS + 1];
+    static TokId acc[NB][PULSAR_SPEC_LOGITS_ROWS + 1];
     for (uint32_t t = 0; ok && t < (uint32_t)(8 * n); t++) {
         bool any = false;
         for (int b = 0; b < NB; b++) any |= !done[b];
@@ -125,11 +139,11 @@ run_rec run(pulsar_engine *e, const std::vector<pulsar_tokens> &P, int n, bool p
         int m = 0;
         for (int b = 0; ok && b < NB; b++) {
             if (done[b] || !(mask >> b & 1u)) continue;
-            ok = pulsar_session_bank_state_restore(s, (uint32_t)b);
+            ok = pulsar_session_bank_state_restore(s, BankId{b});
             unquench(s);
-            pulsar_session_bank_state_save(s, (uint32_t)b);
+            pulsar_session_bank_state_save(s, BankId{b});
             memset(&st[m], 0, sizeof st[m]);
-            st[m].bank = (uint32_t)b;
+            st[m].bank = BankId{b};
             st[m].round = rd[b];
             st[m].temperature = 0.0f;
             st[m].top_p = 1.0f;
@@ -149,14 +163,14 @@ run_rec run(pulsar_engine *e, const std::vector<pulsar_tokens> &P, int n, bool p
         int live = 0;
         for (int i = 0; ok && i < m; i++) {
             if (st[i].status == PULSAR_SPEC_STEP_EOS) {
-                R.out[bank_of[i]].push_back(st[i].first_token);
+                R.out[bank_of[i]].push_back(st[i].first_token.raw());
                 done[bank_of[i]] = true;
             } else if (st[i].status == PULSAR_SPEC_STEP_OK) {
                 st[live] = st[i];
                 bank_of[live++] = bank_of[i];
             } else if (st[i].status != PULSAR_SPEC_STEP_SKIPPED) {
                 ok = false;
-                snprintf(err, sizeof err, "tick %u assemble bank %u: status %d %s", t, st[i].bank, st[i].status,
+                snprintf(err, sizeof err, "tick %u assemble bank %d: status %d %s", t, st[i].bank.raw(), st[i].status,
                          st[i].err);
             }
         }
@@ -164,9 +178,9 @@ run_rec run(pulsar_engine *e, const std::vector<pulsar_tokens> &P, int n, bool p
         m = live;
         T.rows = rows;
         for (uint32_t k = 0; k < rows; k++) {
-            T.req.push_back((int32_t)reqs[k].bank);
+            T.req.push_back(reqs[k].bank.raw());
             T.req.push_back(reqs[k].pos.raw());
-            T.req.push_back(reqs[k].token);
+            T.req.push_back(reqs[k].token.raw());
         }
         if (m == 0 || rows == 0) {
             R.ticks.push_back(T);
@@ -193,35 +207,38 @@ run_rec run(pulsar_engine *e, const std::vector<pulsar_tokens> &P, int n, bool p
         for (int i = 0; ok && i < m; i++) {
             ok = st[i].status == PULSAR_SPEC_STEP_OK;
             if (!ok) {
-                snprintf(err, sizeof err, "tick %u round_end bank %u: %s", t, st[i].bank, st[i].err);
+                snprintf(err, sizeof err, "tick %u round_end bank %d: %s", t, st[i].bank.raw(), st[i].err);
                 break;
             }
             const uint32_t b = bank_of[i];
             T.acc.push_back((int32_t)b);
             T.acc.push_back(st[i].n_accepted);
             for (int k = 0; k < st[i].n_accepted; k++) {
-                T.acc.push_back(acc[i][k]);
-                R.out[b].push_back(acc[i][k]);
+                T.acc.push_back(acc[i][k].raw());
+                R.out[b].push_back(acc[i][k].raw());
             }
             if ((int)R.out[b].size() >= n ||
-                (st[i].n_accepted && pulsar_token_is_stop(e, acc[i][st[i].n_accepted - 1])))
+                (st[i].n_accepted && pulsar_token_is_stop(e, TokId{acc[i][st[i].n_accepted - 1]})))
                 done[b] = true;
         }
         R.ticks.push_back(T);
         if (!ok) break;
         pulsar_spec_round *rr[NB];
         uint64_t *rp[NB];
+        BankId rb[NB];
         for (int i = 0; i < m; i++) {
             rr[i] = rd[bank_of[i]];
             rp[i] = &rngs[bank_of[i]];
+            rb[i] = BankId{bank_of[i]};
         }
-        ok = pulsar_session_spec_redraft_batch(s, rr, bank_of, rp, m, err, sizeof err) == 0 &&
+        ok = pulsar_session_spec_redraft_batch(s, rr, rb, rp, m, err, sizeof err) == 0 &&
              pulsar_session_spec_redraft_commit_batch(s, st, m) == 0;
         if (!ok) snprintf(err + strlen(err), sizeof err - strlen(err), " (tick %u: the redraft)", t);
     }
     uint64_t r1 = 0, c1 = 0, p1 = 0, pb1 = 0;
     pulsar_gpu_seg_counts(&r1, &c1);
     pulsar_gpu_scratch_poison_counts(&p1, &pb1);
+    R.catalog_failed = pulsar_gpu_seg_catalog_close();   /* before the session's free drops its keys */
     (void)pulsar_gpu_scratch_poison_set(was);
     R.replays = r1 - r0;
     R.captures = c1 - c0;
@@ -336,6 +353,10 @@ int GATE_ENTRY(int argc, char **argv) {
     CHECK(A.poisoned == 0 && C.poisoned == 0 && B.poisoned > 0,
           "only run B poisoned its steps (A %llu, B %llu, C %llu)", (unsigned long long)A.poisoned,
           (unsigned long long)B.poisoned, (unsigned long long)C.poisoned);
+    CHECK(A.catalog_failed == 0 && B.catalog_failed == 0 && C.catalog_failed == 0,
+          "every declared shape captured (failed or refused under capture: A %llu, B %llu, C %llu)",
+          (unsigned long long)A.catalog_failed, (unsigned long long)B.catalog_failed,
+          (unsigned long long)C.catalog_failed);
     CHECK(B.replays > 0, "run B replayed captured graphs between the poisonings (%llu replays)",
           (unsigned long long)B.replays);
     printf("every record against run A:\n");
