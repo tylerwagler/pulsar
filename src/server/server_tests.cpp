@@ -16753,6 +16753,14 @@ static_assert(TokId::none().raw() == -1 && TokId{-1}.is_none() && !TokId{0}.is_n
                   TokId{3} == TokId{3} && TokId{3} != TokId{4},
               "none(), the token test and an authority's bound");
 
+/* L334 P4: a bank id is its own identity -- no token id, step row, layer, count or int passes for it. */
+static_assert(!l334_passes<int, BankId> && !l334_passes<uint32_t, BankId> && !l334_passes<BankId, uint32_t> &&
+                  !l334_passes<TokId, BankId> && !l334_passes<BankId, TokId> && !l334_passes<StepRow, BankId> &&
+                  !l333_equates<BankId, TokId> && !l333_orders<BankId, BankId> && !l333_adds<BankId, int> &&
+                  !std::is_constructible_v<BankId, TokId> && std::is_constructible_v<BankId, uint32_t> &&
+                  BankId::none().is_none() && BankId{3}.below(16u) && !BankId{16}.below(16u),
+              "a bank equates with a bank only; a layer index or a step row is never one (fae579f0)");
+
 /* L334 P2b: the crossings compute what the open-coded expressions did (pos / ratio, row * ratio, len / ratio,
  * ceil(len / ratio), rows * ratio + ratio - 1, pos0 + (row - first) and its inverse), over a grid of values. */
 static void test_l334_p2b_crossings(void) {

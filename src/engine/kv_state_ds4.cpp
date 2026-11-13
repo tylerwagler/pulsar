@@ -157,9 +157,9 @@ static bool ds4_stands_at(void *state, TokPos G, char *why, size_t whylen) {
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const CompRows want = ds4_rows_at(G, il);
-        if (gpu_graph_n_comp(g, bank, il) != want) {
+        if (gpu_graph_n_comp(g, BankId{bank}, il) != want) {
             snprintf(why, whylen, "layer %u holds %d compressed rows, a frontier at %u holds %d", il,
-                     gpu_graph_n_comp(g, bank, il).raw(), pulsar_ckpt_raw(G), want.raw());
+                     gpu_graph_n_comp(g, BankId{bank}, il).raw(), pulsar_ckpt_raw(G), want.raw());
             return false;
         }
     }
@@ -172,7 +172,7 @@ static bool ds4_holds(void *state, TokPos G) {
     pulsar_gpu_graph *g = G_(state);
     const uint32_t bank = gpu_graph_cur_bank(g);
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++)
-        if (gpu_graph_layer_is_kv_source(il) && gpu_graph_n_comp(g, bank, il) < ds4_rows_at(G, il))
+        if (gpu_graph_layer_is_kv_source(il) && gpu_graph_n_comp(g, BankId{bank}, il) < ds4_rows_at(G, il))
             return false;
     return true;
 }
@@ -183,7 +183,7 @@ static bool ds4_holds(void *state, TokPos G) {
  *  @param G    the frontier, in tokens */
 static void ds4_set_frontier(pulsar_gpu_graph *g, uint32_t bank, TokPos G) {
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++)
-        if (gpu_graph_layer_is_kv_source(il)) gpu_graph_set_n_comp(g, bank, il, ds4_rows_at(G, il));
+        if (gpu_graph_layer_is_kv_source(il)) gpu_graph_set_n_comp(g, BankId{bank}, il, ds4_rows_at(G, il));
 }
 
 /// pulsar_kv_state_ops::prepare_restore.

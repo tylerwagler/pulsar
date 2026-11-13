@@ -115,7 +115,8 @@ static bool ds4_sync_state_agrees(pulsar_session *s) {
     const TokCount len = s->hist_end().before();
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++)
         if (gpu_graph_layer_is_kv_source(il) &&
-            gpu_graph_n_comp(g, bank, il) > pulsar_comp_rows_held(len, TokPerRow{pulsar_layer_compress_ratio(il)}))
+            gpu_graph_n_comp(g, BankId{bank}, il) >
+                pulsar_comp_rows_held(len, TokPerRow{pulsar_layer_compress_ratio(il)}))
             return false;
     return true;
 }

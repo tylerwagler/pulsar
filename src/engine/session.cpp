@@ -1630,7 +1630,8 @@ void pulsar_session::rewind(TokPos at) {
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const CompRows want = pulsar_comp_rows_held(pos.before(), TokPerRow{pulsar_layer_compress_ratio(il)});
-        if (gpu_graph_n_comp(s->graph, rw_bank, il) > want) gpu_graph_set_n_comp(s->graph, rw_bank, il, want);
+        if (gpu_graph_n_comp(s->graph, BankId{rw_bank}, il) > want)
+            gpu_graph_set_n_comp(s->graph, BankId{rw_bank}, il, want);
     }
     /* The VALUE half (L264).  The recurrent lanes and the raw window at pos are
      * re-established in exactly two cases: position 0, whose state is the

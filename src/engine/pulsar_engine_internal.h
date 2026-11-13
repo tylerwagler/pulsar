@@ -1995,17 +1995,18 @@ static inline uint32_t gpu_graph_cur_bank(const pulsar_gpu_graph *g) {
 /// @param bank  the bank, named by the caller
 /// @param il    the layer
 /// @return the row count, ms_n_comp[bank][il] (L334 P2b S8: CompRows; the array stays raw behind the two accessors)
-static inline CompRows gpu_graph_n_comp(const pulsar_gpu_graph *g, uint32_t bank, uint32_t il) {
-    return CompRows{(int)g->ms_n_comp[bank][il]};
+static inline CompRows gpu_graph_n_comp(const pulsar_gpu_graph *g, BankId bank, uint32_t il) {
+    return CompRows{(int)g->ms_n_comp[bank.raw()][il]};   /* L334 P4: the per-bank array stays raw behind it */
 }
 /** The one writer of a bank's compressed frontier: sets ms_n_comp and raises the
  * bank's resident high-water (ms_comp_hw) with it, so no write can move the
  * frontier past rows the accounting has not counted. */
 /// @param g     the graph
-/// @param bank  the bank
+/// @param bank_at the bank
 /// @param il    the layer
 /// @param rows_n the new compressed row count
-static inline void gpu_graph_set_n_comp(pulsar_gpu_graph *g, uint32_t bank, uint32_t il, CompRows rows_n) {
+static inline void gpu_graph_set_n_comp(pulsar_gpu_graph *g, BankId bank_at, uint32_t il, CompRows rows_n) {
+    const uint32_t bank = (uint32_t)bank_at.raw();   /* L334 P4: the per-bank arrays and the store stay raw */
     const uint32_t rows = (uint32_t)rows_n.raw();
     /* L264: rows below a checkpoint's frontier may be rewritten once the counter
      * drops under them, so the checkpoint goes with them -- here, where every
@@ -5601,18 +5602,18 @@ pulsar_gpu_tensor *gpu_graph_bank_index_comp_bases(pulsar_gpu_graph *g, uint32_t
 /// @param il the layer
 /// @param bank the bank
 /// @return the view (caller frees), or NULL
-pulsar_gpu_tensor *gpu_graph_bank_attn_comp_view(pulsar_gpu_graph *g, uint32_t il, uint32_t bank);
-pulsar_gpu_tensor *gpu_graph_bank_index_comp_view(pulsar_gpu_graph *g, uint32_t il, uint32_t bank);
-pulsar_gpu_tensor *gpu_graph_bank_attn_state_kv_view(pulsar_gpu_graph *g, uint32_t il, uint32_t bank);
-pulsar_gpu_tensor *gpu_graph_bank_attn_state_score_view(pulsar_gpu_graph *g, uint32_t il, uint32_t bank);
+pulsar_gpu_tensor *gpu_graph_bank_attn_comp_view(pulsar_gpu_graph *g, uint32_t il, BankId bank);
+pulsar_gpu_tensor *gpu_graph_bank_index_comp_view(pulsar_gpu_graph *g, uint32_t il, BankId bank);
+pulsar_gpu_tensor *gpu_graph_bank_attn_state_kv_view(pulsar_gpu_graph *g, uint32_t il, BankId bank);
+pulsar_gpu_tensor *gpu_graph_bank_attn_state_score_view(pulsar_gpu_graph *g, uint32_t il, BankId bank);
 /** V4 only (the profile owns an indexer compressor): the same two views for the
  * indexer's own state lane.  NULL where the profile keeps no such lane. */
 /// @param g the graph
 /// @param il the layer
 /// @param bank the bank
 /// @return the view (caller frees), or NULL
-pulsar_gpu_tensor *gpu_graph_bank_index_state_kv_view(pulsar_gpu_graph *g, uint32_t il, uint32_t bank);
-pulsar_gpu_tensor *gpu_graph_bank_index_state_score_view(pulsar_gpu_graph *g, uint32_t il, uint32_t bank);
+pulsar_gpu_tensor *gpu_graph_bank_index_state_kv_view(pulsar_gpu_graph *g, uint32_t il, BankId bank);
+pulsar_gpu_tensor *gpu_graph_bank_index_state_score_view(pulsar_gpu_graph *g, uint32_t il, BankId bank);
 /** Host state hand-off for the fields that still have scalar twins.
  *
  * ⚠ THE COMPRESSED FRONTIER NO LONGER RIDES THIS. Stage 1b deleted

@@ -443,4 +443,19 @@ static_assert(sizeof(TokId) == sizeof(int32_t) && std::is_trivial<TokId>::value 
                   std::is_standard_layout<TokId>::value,
               "a token id is as cheap as the int32 it replaces (memset / calloc-safe; arrays of it upload as int32)");
 
+/* ---- L334 phase 4: bank ids -------------------------------------------------------------------------------------
+ * A bank is one conversation's KV / state slot in a session's pool.  Its id sat as uint32_t beside a layer index
+ * (gpu_graph_n_comp(g, bank, il) vs the views' (g, il, bank)), a checkpoint slot, a decl id, a step row and the
+ * server's slot index (fae579f0: slot i == bank i taken for granted, and a slots[] bound taken from the bank count).
+ * An id like TokId: == / != only, none() = -1 (no bank installed), below(n) against an authority's count (the pool,
+ * PULSAR_MSEQ_MAX); is_token() reads "a real bank" here. */
+/** Tag of BankId (never instantiated). */
+struct pulsar_bank_tag;
+/** A bank id in a session's pool (L334 P4). */
+typedef pulsar_id<pulsar_bank_tag, int32_t> BankId;
+
+static_assert(sizeof(BankId) == sizeof(int32_t) && std::is_trivial<BankId>::value &&
+                  std::is_standard_layout<BankId>::value,
+              "a bank id is as cheap as the int32 it replaces (arrays of it upload as int32)");
+
 #endif

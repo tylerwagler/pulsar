@@ -575,8 +575,10 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             return 1;
         }
         /* the leader sends one only with CAP_REWIND */
-        if (c->type == PULSAR_TP_FRAME_REWIND) slot->s->engine->family->banks->rewind(slot->s, pulsar_tp_command_pos(c));
-        else                                   pulsar_session_family_invalidate(slot->s);
+        if (c->type == PULSAR_TP_FRAME_REWIND)
+            slot->s->engine->family->banks->rewind(slot->s, pulsar_tp_command_pos(c));
+        else
+            pulsar_session_family_invalidate(slot->s);
         return 1;
     }
 

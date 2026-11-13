@@ -768,8 +768,8 @@ static bool compressor_state_reset_layer(pulsar_gpu_graph *g, uint32_t il, uint3
          * ratio-4 source, and leaving it unreset would carry a stale slot into
          * the next bank that uses this one. */
         if (g->banks.n_banks) {
-            pulsar_gpu_tensor *ik = gpu_graph_bank_index_state_kv_view(g, il, bank);
-            pulsar_gpu_tensor *is = gpu_graph_bank_index_state_score_view(g, il, bank);
+            pulsar_gpu_tensor *ik = gpu_graph_bank_index_state_kv_view(g, il, BankId{bank});
+            pulsar_gpu_tensor *is = gpu_graph_bank_index_state_score_view(g, il, BankId{bank});
             if (!ik && !is) return true;   /* V4.1: this profile keeps no such lane */
             const bool iok = ik && is &&
                              gpu_tensor_fill_f32(ik, 0.0f, pulsar_gpu_tensor_bytes(ik) / sizeof(float)) &&
@@ -1034,10 +1034,10 @@ static pulsar_gpu_tensor *bank_split_view(pulsar_gpu_graph *g,
     return pulsar_gpu_tensor_view(bank_slab, 0, lane_bytes[il]);
 }
 
-pulsar_gpu_tensor *gpu_graph_bank_attn_comp_view(pulsar_gpu_graph *g, uint32_t il, uint32_t bank) {
-    return bank_split_view(g, g->banks.n_banks ? g->banks.comp[il][bank] : NULL,
+pulsar_gpu_tensor *gpu_graph_bank_attn_comp_view(pulsar_gpu_graph *g, uint32_t il, BankId bank) {
+    return bank_split_view(g, g->banks.n_banks ? g->banks.comp[il][bank.raw()] : NULL,
                            g->banks.comp_bank_bytes,
-                           g->layer_attn_comp_cache[il], il, bank);
+                           g->layer_attn_comp_cache[il], il, (uint32_t)bank.raw());
 }
 
 /// Bank `bank`'s index comp pool at layer il.
@@ -1045,10 +1045,10 @@ pulsar_gpu_tensor *gpu_graph_bank_attn_comp_view(pulsar_gpu_graph *g, uint32_t i
 /// @param il the layer
 /// @param bank the bank
 /// @return a fresh view (the caller frees it), or NULL
-pulsar_gpu_tensor *gpu_graph_bank_index_comp_view(pulsar_gpu_graph *g, uint32_t il, uint32_t bank) {
-    return bank_split_view(g, g->banks.n_banks ? g->banks.index[il][bank] : NULL,
+pulsar_gpu_tensor *gpu_graph_bank_index_comp_view(pulsar_gpu_graph *g, uint32_t il, BankId bank) {
+    return bank_split_view(g, g->banks.n_banks ? g->banks.index[il][bank.raw()] : NULL,
                            g->banks.index_bank_bytes,
-                           g->layer_index_comp_cache[il], il, bank);
+                           g->layer_index_comp_cache[il], il, (uint32_t)bank.raw());
 }
 
 /// Bank `bank`'s attention compressor state lane (kv) at layer il.
@@ -1056,9 +1056,9 @@ pulsar_gpu_tensor *gpu_graph_bank_index_comp_view(pulsar_gpu_graph *g, uint32_t 
 /// @param il the layer
 /// @param bank the bank
 /// @return a fresh view (the caller frees it), or NULL
-pulsar_gpu_tensor *gpu_graph_bank_attn_state_kv_view(pulsar_gpu_graph *g, uint32_t il, uint32_t bank) {
+pulsar_gpu_tensor *gpu_graph_bank_attn_state_kv_view(pulsar_gpu_graph *g, uint32_t il, BankId bank) {
     return bank_lane_view(g, g->banks.askv[il], g->banks.astate_bank_bytes,
-                          g->layer_attn_state_kv[il], il, bank);
+                          g->layer_attn_state_kv[il], il, (uint32_t)bank.raw());
 }
 
 /// Bank `bank`'s attention compressor state lane (score) at layer il.
@@ -1066,12 +1066,12 @@ pulsar_gpu_tensor *gpu_graph_bank_attn_state_kv_view(pulsar_gpu_graph *g, uint32
 /// @param il the layer
 /// @param bank the bank
 /// @return a fresh view (the caller frees it), or NULL
-pulsar_gpu_tensor *gpu_graph_bank_attn_state_score_view(pulsar_gpu_graph *g, uint32_t il, uint32_t bank) {
+pulsar_gpu_tensor *gpu_graph_bank_attn_state_score_view(pulsar_gpu_graph *g, uint32_t il, BankId bank) {
     return bank_lane_view(g, g->banks.assc[il], g->banks.astate_bank_bytes,
-                          g->layer_attn_state_score[il], il, bank);
+                          g->layer_attn_state_score[il], il, (uint32_t)bank.raw());
 }
 
-pulsar_gpu_tensor *gpu_graph_bank_index_state_kv_view(pulsar_gpu_graph *g, uint32_t il, uint32_t bank) {
+pulsar_gpu_tensor *gpu_graph_bank_index_state_kv_view(pulsar_gpu_graph *g, uint32_t il, BankId bank) {
     /* No lane at all on a profile whose indexer keeps none: bank_lane_view hands
      * back NULL, so a caller can tell "this model has no such lane" from "the
      * bank is wrong".
@@ -1085,7 +1085,7 @@ pulsar_gpu_tensor *gpu_graph_bank_index_state_kv_view(pulsar_gpu_graph *g, uint3
      * NULL too. */
     if (!g || il >= PULSAR_N_LAYER) return NULL;
     return bank_lane_view(g, g->banks.iskv[il], g->banks.istate_bank_bytes,
-                          g->layer_index_state_kv[il], il, bank);
+                          g->layer_index_state_kv[il], il, (uint32_t)bank.raw());
 }
 
 /// Bank `bank`'s indexer compressor state lane (score) at layer il; NULL on a profile with none.
@@ -1093,10 +1093,10 @@ pulsar_gpu_tensor *gpu_graph_bank_index_state_kv_view(pulsar_gpu_graph *g, uint3
 /// @param il the layer
 /// @param bank the bank
 /// @return a fresh view (the caller frees it), or NULL
-pulsar_gpu_tensor *gpu_graph_bank_index_state_score_view(pulsar_gpu_graph *g, uint32_t il, uint32_t bank) {
+pulsar_gpu_tensor *gpu_graph_bank_index_state_score_view(pulsar_gpu_graph *g, uint32_t il, BankId bank) {
     if (!g || il >= PULSAR_N_LAYER) return NULL;
     return bank_lane_view(g, g->banks.issc[il], g->banks.istate_bank_bytes,
-                          g->layer_index_state_score[il], il, bank);
+                          g->layer_index_state_score[il], il, (uint32_t)bank.raw());
 }
 
 void gpu_graph_bank_counters_capture(pulsar_gpu_graph *g, uint32_t bank) {
