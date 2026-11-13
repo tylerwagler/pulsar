@@ -1361,7 +1361,7 @@ int pulsar_session_bank_repoint(pulsar_session *s, BankId bank_id) {
         fprintf(stderr, "pulsar: %s\n", err);
         return 1;
     }
-    if (!tp_mirror_sent(tp, "bank repoint", pulsar_tp_send_bank_repoint(tp, s->tp_session_id, bank),
+    if (!tp_mirror_sent(tp, "bank repoint", pulsar_tp_send_bank_repoint(tp, s->tp_session_id, bank_id),
                         NULL, 0)) return 1;
     return tp_mirror_bank_verdict(s, tp, "bank repoint", ops->repoint(s, bank), 1);
 }
@@ -1381,7 +1381,7 @@ void pulsar_session_bank_state_save(pulsar_session *s, BankId bank_id) {
         return;
     }
     if (!tp_mirror_sent(tp, "bank state save",
-                        pulsar_tp_send_bank_state_save(tp, s->tp_session_id, bank), NULL, 0)) return;
+                        pulsar_tp_send_bank_state_save(tp, s->tp_session_id, bank_id), NULL, 0)) return;
     local();
 }
 bool pulsar_session_bank_state_restore(pulsar_session *s, BankId bank_id) {
@@ -1399,7 +1399,7 @@ bool pulsar_session_bank_state_restore(pulsar_session *s, BankId bank_id) {
         return false;
     }
     if (!tp_mirror_sent(tp, "bank state restore",
-                        pulsar_tp_send_bank_state_restore(tp, s->tp_session_id, bank),
+                        pulsar_tp_send_bank_state_restore(tp, s->tp_session_id, bank_id),
                         NULL, 0)) return false;
     const int own = local() ? 0 : 1;
     return tp_mirror_bank_verdict(s, tp, "bank state restore", own, 1) == 0;
@@ -1422,8 +1422,8 @@ static bool tp_mirror_bank_physical(pulsar_session *s, int freeing, uint32_t ban
         fprintf(stderr, "pulsar: %s\n", err);
         return false;
     }
-    const int sent = freeing ? pulsar_tp_send_bank_free_physical(tp, s->tp_session_id, bank)
-                             : pulsar_tp_send_bank_alloc_physical(tp, s->tp_session_id, bank);
+    const int sent = freeing ? pulsar_tp_send_bank_free_physical(tp, s->tp_session_id, BankId{bank})
+                             : pulsar_tp_send_bank_alloc_physical(tp, s->tp_session_id, BankId{bank});
     if (!tp_mirror_sent(tp, operation, sent, NULL, 0)) return false;
     const int own = (freeing ? ops->free_physical(s, bank) : ops->alloc_physical(s, bank)) ? 0 : 1;
     return tp_mirror_bank_verdict(s, tp, operation, own, 1) == 0;

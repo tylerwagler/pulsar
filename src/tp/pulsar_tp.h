@@ -803,19 +803,19 @@ int pulsar_tp_send_note_prefilled(pulsar_tp *tp, uint64_t session_id,
 /// @param session_id the session
 /// @param bank       the bank
 /// @return 1 when sent to every peer, 0 on failure
-int pulsar_tp_send_bank_state_save(pulsar_tp *tp, uint64_t session_id, uint32_t bank);
+int pulsar_tp_send_bank_state_save(pulsar_tp *tp, uint64_t session_id, BankId bank);
 /// Mirror a bank state restore (a verdict the ranks must agree on).
 /// @param tp         the transport (leader)
 /// @param session_id the session
 /// @param bank       the bank
 /// @return 1 when sent to every peer, 0 on failure
-int pulsar_tp_send_bank_state_restore(pulsar_tp *tp, uint64_t session_id, uint32_t bank);
+int pulsar_tp_send_bank_state_restore(pulsar_tp *tp, uint64_t session_id, BankId bank);
 /// Mirror a bank repoint (a verdict the ranks must agree on).
 /// @param tp         the transport (leader)
 /// @param session_id the session
 /// @param bank       the bank
 /// @return 1 when sent to every peer, 0 on failure
-int pulsar_tp_send_bank_repoint(pulsar_tp *tp, uint64_t session_id, uint32_t bank);
+int pulsar_tp_send_bank_repoint(pulsar_tp *tp, uint64_t session_id, BankId bank);
 /// Mirror a note-committed of `tokens` (void on the worker).
 /// @param tp         the transport (leader)
 /// @param session_id the session
@@ -898,13 +898,13 @@ int pulsar_tp_send_spec_steps(pulsar_tp *tp, uint32_t frame_type, const pulsar_t
 /// @param session_id the session
 /// @param bank       the bank
 /// @return 1 when sent to every peer, 0 on failure
-int pulsar_tp_send_bank_free_physical(pulsar_tp *tp, uint64_t session_id, uint32_t bank);
+int pulsar_tp_send_bank_free_physical(pulsar_tp *tp, uint64_t session_id, BankId bank);
 /// Mirror the re-backing of a bank's physical memory (a verdict).
 /// @param tp         the transport (leader)
 /// @param session_id the session
 /// @param bank       the bank
 /// @return 1 when sent to every peer, 0 on failure
-int pulsar_tp_send_bank_alloc_physical(pulsar_tp *tp, uint64_t session_id, uint32_t bank);
+int pulsar_tp_send_bank_alloc_physical(pulsar_tp *tp, uint64_t session_id, BankId bank);
 /* Increment 7: sync with images (n_images > 0; use pulsar_tp_send_sync otherwise). */
 /// Mirror a sync that carries images.
 /// @param tp         the transport (leader)
@@ -1346,6 +1346,17 @@ static inline TokPos pulsar_tp_command_pos(const pulsar_tp_command *c) {
         abort();
     }
     return TokPos{c->value};
+}
+/** The bank a BANK_STATE_SAVE / _RESTORE / BANK_REPOINT / BANK_FREE_PHYSICAL / _ALLOC_PHYSICAL frame carries (L334 P4).
+ *  @param c the command (one of those; fatal otherwise)  @return the bank */
+static inline BankId pulsar_tp_command_bank(const pulsar_tp_command *c) {
+    if (c->type != PULSAR_TP_FRAME_BANK_STATE_SAVE && c->type != PULSAR_TP_FRAME_BANK_STATE_RESTORE &&
+        c->type != PULSAR_TP_FRAME_BANK_REPOINT && c->type != PULSAR_TP_FRAME_BANK_FREE_PHYSICAL &&
+        c->type != PULSAR_TP_FRAME_BANK_ALLOC_PHYSICAL) {
+        fprintf(stderr, "pulsar: tp: frame type %d carries no bank in its value -- refusing\n", (int)c->type);
+        abort();
+    }
+    return BankId{c->value};
 }
 
 /// Worker: block for the leader's next command (no deadline between commands).
