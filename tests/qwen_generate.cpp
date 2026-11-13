@@ -98,7 +98,7 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    int32_t *ids = (int32_t *)xmalloc(sizeof(int32_t) * (size_t)cap);
+    TokId *ids = (TokId *)xmalloc(sizeof(TokId) * (size_t)cap);   /* the file's int32 ids, copied as bytes */
     memcpy(ids, tb, tn);
     free(tb);
     float *row = (float *)xmalloc(sizeof(float) * (size_t)W);
@@ -137,7 +137,7 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "qwen-generate: sync at %d: %s\n", P + i, err);
                     break;
                 }
-            } else if (i > 0 && pulsar_session_eval(sess, TokId{ids[P + i - 1]}, err, sizeof(err)) != 0) {
+            } else if (i > 0 && pulsar_session_eval(sess, ids[P + i - 1], err, sizeof(err)) != 0) {
                 fprintf(stderr, "qwen-generate: eval at %d: %s\n", P + i, err);
                 break;
             }
@@ -147,7 +147,7 @@ int main(int argc, char **argv) {
             for (int j = 1; j < W; j++) if (row[j] > mx) { mx = row[j]; am = j; }
             double se = 0.0;
             for (int j = 0; j < W; j++) se += exp((double)row[j] - mx);
-            const int truth = ids[P + i];
+            const int truth = ids[P + i].raw();
             nll += -((double)row[truth] - mx - log(se));
             top1 += am == truth;
             scored++;
@@ -188,7 +188,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "\nqwen-generate: sync at %d tokens: %s\n", T, err);
                 break;
             }
-        } else if (pulsar_session_eval(sess, TokId{ids[T - 1]}, err, sizeof(err)) != 0) {
+        } else if (pulsar_session_eval(sess, ids[T - 1], err, sizeof(err)) != 0) {
             fprintf(stderr, "\nqwen-generate: eval at %d tokens: %s\n", T, err);
             break;
         }
@@ -225,7 +225,7 @@ int main(int argc, char **argv) {
          * <|im_end|> and what looks like degenerate repetition is the harness refusing to let the
          * model stop -- the model's natural continuation of a finished turn IS another terminator. */
         const bool stop = (am == 248046 /* <|im_end|> */ || am == 248044 /* <|endoftext|> */);
-        ids[T++] = am;
+        ids[T++] = TokId{am};
         generated++;
         printf(" %d", am);
         fflush(stdout);
@@ -253,7 +253,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "qwen-generate: SPEC re-sync: %s\n", err);
             return 1;
         }
-        int *out = (int *)malloc((size_t)n_predict * sizeof(int));
+        TokId *out = (TokId *)malloc((size_t)n_predict * sizeof(TokId));
         /* QWEN_SPEC_TEMP > 0: sampled speculation (top-k 20, top-p 0.95, the served chat defaults) under the stream
          * seeded QWEN_SPEC_SEED (default 1).  L288 sdet: a token's draw is a function of (seed, index) whichever
          * lane makes it, so the sampled spec run must BE the plain sampled run under the same seed -- drawn first
@@ -297,7 +297,7 @@ int main(int argc, char **argv) {
         while (n < generated) {
             float conf[16];
             TokId pbase;
-            int32_t ptok[16];
+            TokId ptok[16];
             const uint32_t n_pend = trace ? pulsar_session_bank_pendings(sess, BankId{0}, &pbase, ptok, conf) : 0u;
             const int k = pulsar_session_generate_speculative(sess, temp, top_k, top_p, 0.0f, &rng, generated - n,
                                                               out + n, generated - n, err, sizeof(err));
@@ -313,23 +313,23 @@ int main(int argc, char **argv) {
             }
             n += k;
             rounds++;
-            if (pulsar_token_is_stop(e, TokId{out[n - 1]})) break;
+            if (pulsar_token_is_stop(e, out[n - 1])) break;
         }
         const double dt = now_s() - t0;
         if (trace) fclose(trace);
         printf("qwen-generate: SPEC %d rounds, %.2f tokens a round\n", rounds, rounds ? (double)n / rounds : 0.0);
         if (temp > 0.0f) {
             uint64_t h = 1469598103934665603ull;
-            for (int i = 0; i < n; i++) { h ^= (uint64_t)(uint32_t)out[i]; h *= 1099511628211ull; }
+            for (int i = 0; i < n; i++) { h ^= (uint64_t)(uint32_t)out[i].raw(); h *= 1099511628211ull; }
             int same = 0;
-            while (same < n && same < n_plain && out[same] == plain[same]) same++;
+            while (same < n && same < n_plain && out[same] == TokId{plain[same]}) same++;
             printf("qwen-generate: SPEC sampled at temperature %.2f seed %llu: %d tokens in %.3f s = %.2f tok/s (%.1f "
                    "ms/token after the first); fnv %016llx; identical to the plain sampled run for %d of %d\n",
                    (double)temp, (unsigned long long)seed, n, dt, n > 1 ? (n - 1) / dt : 0.0,
                    n > 1 ? 1e3 * dt / (n - 1) : 0.0, (unsigned long long)h, same, n_plain);
             if (same < n_plain || n != n_plain) {
                 printf("qwen-generate: SPEC sampled diverges at token %d: plain %d, spec %d\n", same,
-                       same < n_plain ? plain[same] : -1, same < n ? out[same] : -1);
+                       same < n_plain ? plain[same] : -1, same < n ? out[same].raw() : -1);
                 free(plain);
                 free(out);
                 return 3;
@@ -342,7 +342,8 @@ int main(int argc, char **argv) {
                    "greedy for %d of %d\n", n, dt, n > 1 ? (n - 1) / dt : 0.0, n > 1 ? 1e3 * dt / (n - 1) : 0.0, same,
                    n < generated ? n : generated);
             if (same < (n < generated ? n : generated)) {
-                printf("qwen-generate: SPEC diverges at token %d: greedy %d, spec %d\n", same, ids[n_tok + same], out[same]);
+                printf("qwen-generate: SPEC diverges at token %d: greedy %d, spec %d\n", same, ids[n_tok + same].raw(),
+                       out[same].raw());
                 free(out);
                 return 3;
             }
@@ -368,7 +369,7 @@ int main(int argc, char **argv) {
         float *lg = (float *)malloc((size_t)W * sizeof(float));
         int same = 0;
         for (int i = 0; i + 1 < generated; i++) {
-            const pulsar_multiseq_req rq = {BankId{0}, TokPos{n_tok + i}, TokId{ids[n_tok + i]}};
+            const pulsar_multiseq_req rq = {BankId{0}, TokPos{n_tok + i}, ids[n_tok + i]};
             if (pulsar_session_decode_multiseq(sess, &rq, 1, lg, W, err, sizeof(err)) != 0) {
                 fprintf(stderr, "qwen-generate: BATCH step %d failed: %s\n", i, err);
                 free(lg);
@@ -376,7 +377,7 @@ int main(int argc, char **argv) {
             }
             int best = 0;
             for (int v = 1; v < W; v++) if (lg[v] > lg[best]) best = v;
-            if (best != ids[n_tok + i + 1]) break;
+            if (best != ids[n_tok + i + 1].raw()) break;
             same++;
         }
         printf("qwen-generate: BATCH decode identical to greedy for %d of %d steps\n", same, generated - 1);

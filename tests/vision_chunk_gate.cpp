@@ -76,8 +76,8 @@ static bool read_images(const char *path, std::vector<std::vector<uint8_t>> *out
 static bool build_prompt(pulsar_engine *e, int pre, int total, pulsar_image_ref *img, pulsar_tokens *out,
                          int *block_len, char *err, size_t errlen) {
     pulsar_tokens raw = {};
-    for (int i = 0; i < pre; i++) pulsar_tokens_push(&raw, 100 + i % 7);
-    pulsar_tokens_push(&raw, e->family->vision->placeholder_id(e));
+    for (int i = 0; i < pre; i++) pulsar_tokens_push(&raw, TokId{100 + i % 7});
+    pulsar_tokens_push(&raw, TokId{e->family->vision->placeholder_id(e)});
     bool ok = pulsar_expand_image_placeholders(e, &raw, 0, img, 1, out, err, errlen) == 1;
     pulsar_tokens_free(&raw);
     if (ok && !(img->start_pos == pre &&
@@ -87,7 +87,7 @@ static bool build_prompt(pulsar_engine *e, int pre, int total, pulsar_image_ref 
     }
     if (!ok) return false;
     const int end = total > 0 ? total : (int)((out->len + VCG_GRID - 1u) / VCG_GRID * VCG_GRID) + 3;
-    for (int i = out->len; i < end; i++) pulsar_tokens_push(out, 200 + i % 5);
+    for (int i = out->len; i < end; i++) pulsar_tokens_push(out, TokId{200 + i % 5});
     return out->len == end;
 }
 

@@ -35,7 +35,7 @@ static bool qwen_encode_into(const pulsar_engine *e, const char *text, const pul
         if (why && whylen) snprintf(why, whylen, "%s", err);
         return false;
     }
-    for (int id : ids) pulsar_tokens_push(out, id);
+    for (int id : ids) pulsar_tokens_push(out, TokId{id});
     return true;
 }
 
@@ -216,10 +216,10 @@ static bool qwen_tok_turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
     qwen_tok_encode_text(e, "assistant", &assistant);
     const bool ok = start >= 0 && user.len == 1 && assistant.len == 1;
     if (ok) {
-        out->user[0] = start;
+        out->user[0] = TokId{start};
         out->user[1] = user.v[0];
         out->n_user = 2;
-        out->assistant[0] = start;
+        out->assistant[0] = TokId{start};
         out->assistant[1] = assistant.v[0];
         out->n_assistant = 2;
         /* L351: qwen_chat renders a tool message as a user turn opened by <tool_response> */
@@ -245,12 +245,12 @@ static bool qwen_tok_turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
 /// @param tokens the ids
 static void qwen_tok_dump(pulsar_engine *e, FILE *fp, const pulsar_tokens *tokens) {
     fprintf(fp, "[");
-    for (int i = 0; i < tokens->len; i++) fprintf(fp, "%s%d", i ? ", " : "", tokens->v[i]);
+    for (int i = 0; i < tokens->len; i++) fprintf(fp, "%s%d", i ? ", " : "", tokens->v[i].raw());
     fprintf(fp, "]\n");
     for (int i = 0; i < tokens->len; i++) {
         size_t n = 0;
-        char *piece = qwen_tok_token_text(e, tokens->v[i], &n);
-        fprintf(fp, "%6d  ", tokens->v[i]);
+        char *piece = qwen_tok_token_text(e, tokens->v[i].raw(), &n);
+        fprintf(fp, "%6d  ", tokens->v[i].raw());
         pulsar_dump_piece_quoted(fp, piece, n);
         fputc('\n', fp);
         free(piece);

@@ -153,7 +153,7 @@ struct pulsar_driver_step {
     pulsar_step_mode mode;
     /// rows the step carries, <= pulsar_driver_state::max_rows
     uint32_t n_rows;
-    const int32_t *tokens;                ///< [n_rows] host token ids
+    const TokId *tokens;                  ///< [n_rows] host token ids
     const int32_t *pos;                   ///< [n_rows] host positions
     const int32_t *bank;                  ///< [n_rows] host bank ids
     /** L268: the family's per-row rope positions (pulsar_driver_ops::rope), or NULL = text positions */
@@ -232,7 +232,7 @@ typedef struct pulsar_driver_ops {
      *  every row whose next token is now known gets its drafter row (PREFILL: one bank's run; DECODE: one row a bank).
      *  `eval`: the session's single-row eval (a family's diagnostics may head it).  NULL = no drafter lane; a family
      *  that drafts with its MTP modules sets the chained-MTP lane's (spec_mtp.h pulsar_mtp_absorb). */
-    bool (*absorb)(pulsar_session *s, pulsar_step_mode mode, const int32_t *tokens, const int32_t *pos,
+    bool (*absorb)(pulsar_session *s, pulsar_step_mode mode, const TokId *tokens, const int32_t *pos,
                    const int32_t *bank, uint32_t n, uint32_t row0, bool eval);
     /** L296 N9: the family's MTP module declaration (spec_mtp.h), or NULL = none.  When it declares modules the
      *  driver builds the chained-MTP drafter's lane (pulsar_driver_state::mtp) before the declared state. */
@@ -262,7 +262,7 @@ typedef struct pulsar_driver_ops {
     /** Optional (L329 b2): the family's prompt rows come from a disk-resident row table (Qwen's PLE) -- queue the
      *  rows the tokens prompt[from, to) will gather on the table pool's background class, tagged `tag`
      *  (pulsar_engram_read_ahead); returns the rows queued.  NULL = the family's prefill reads no disk table. */
-    uint32_t (*read_ahead)(const pulsar_engine *e, uint64_t tag, const int32_t *prompt, uint32_t from, uint32_t to);
+    uint32_t (*read_ahead)(const pulsar_engine *e, uint64_t tag, const TokId *prompt, uint32_t from, uint32_t to);
     /** Present with read_ahead: the pool its rows go through (the core cancels a tag's rows and reads the counters). */
     struct pulsar_engram_io *(*read_ahead_pool)(const pulsar_engine *e);
     /** Optional (L338 P2): the engine carries a runtime adapter (a LoRA the family applies on the rows of the banks

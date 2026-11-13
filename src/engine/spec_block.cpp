@@ -1539,7 +1539,7 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
             if (q->copied) continue;
             q->keep = 0;
             q->have_conf = true;
-            q->refined[0] = q->next_base.raw();
+            q->refined[0] = q->next_base;
             const uint32_t P = pulsar_ckpt_raw(ss->bank_pos[banks[i]]);   /* the chain's room is raw */
             if (P == 0 || q->n_draft == 0 || (uint64_t)P + 1u >= ss->ctx) continue;   /* no context, or no room */
             if (q->temperature > 0.0f && !rngs[i]) {
@@ -1626,8 +1626,8 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
                 for (uint32_t c = 0; c < TK; c++) sum += expf(rw[c] - mx);
                 uint32_t pick = 0;
                 if (q->temperature <= 0.0f) {
-                    q->refined[j] = l->chain_ids[(size_t)b * SL + j - 1];
-                    while (pick < TK && cand[(j - 1) * TK + pick] != q->refined[j]) pick++;
+                    q->refined[j] = TokId{l->chain_ids[(size_t)b * SL + j - 1]};   /* the device walk's int32 */
+                    while (pick < TK && cand[(j - 1) * TK + pick] != q->refined[j].raw()) pick++;
                 } else {
                     const int dt = drawn[(size_t)chain_of[b] * SL + j - 1];   /* THE sampler's draw over the slot's candidates */
                     if (dt < 0) {
@@ -1636,7 +1636,7 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
                                                   : "a draft slot's candidates have no distribution");
                         return false;
                     }
-                    q->refined[j] = dt;
+                    q->refined[j] = TokId{dt};
                     while (pick < TK && cand[(j - 1) * TK + pick] != dt) pick++;
                 }
                 if (pick == TK) {
@@ -1684,7 +1684,7 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
 /// @param banks [n] their banks
 /// @param n rows (<= PULSAR_DRIVER_HEADS_MAX)
 /// @return false = refused (said)
-bool block_absorb_banked(pulsar_session *s, const uint32_t *rows, const uint32_t *banks, const int32_t *, uint32_t n) {
+bool block_absorb_banked(pulsar_session *s, const uint32_t *rows, const uint32_t *banks, const TokId *, uint32_t n) {
     const pulsar_state_set *ss = s->states;
     if (!LANE(s)) return fail("an absorb with no block lane");
     int32_t pos[PULSAR_DRIVER_HEADS_MAX], bank[PULSAR_DRIVER_HEADS_MAX];
@@ -1844,7 +1844,7 @@ const pulsar_drafter_ops PULSAR_BLOCK_DRAFTER_OPS = {
     /* .warm          = */ block_warm,   /* L306: its draft pass's bank counts x bounds, at the warmup */
 };
 
-bool pulsar_drafter_lane_absorb(pulsar_session *s, pulsar_step_mode mode, const int32_t *tokens, const int32_t *pos,
+bool pulsar_drafter_lane_absorb(pulsar_session *s, pulsar_step_mode mode, const TokId *tokens, const int32_t *pos,
                                 const int32_t *bank, uint32_t n, uint32_t row0, bool eval) {
     if (s->driver && s->driver->mtp) return pulsar_mtp_absorb(s, mode, tokens, pos, bank, n, row0, eval);
     if (!LANE(s)) return true;

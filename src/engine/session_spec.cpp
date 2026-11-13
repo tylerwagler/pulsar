@@ -70,13 +70,13 @@ uint32_t pulsar_spec_cur_depth(const pulsar_session *s) {
  * alone (pulsar_spec_keep_picked, L301) at the copy acceptance the engine has measured.  The verify is unchanged, so
  * every emitted token is still the target's.  A backward scan of the history: O(history) a round, no index to keep in
  * step with a history that rewinds and resyncs. */
-uint32_t pulsar_spec_copy_chain(pulsar_session *s, uint32_t bank, TokId next_base, uint32_t max, int32_t *out) {
+uint32_t pulsar_spec_copy_chain(pulsar_session *s, uint32_t bank, TokId next_base, uint32_t max, TokId *out) {
     const uint32_t m = PULSAR_SPEC_COPY_MATCH;
     const pulsar_tokens *h = pulsar_bank_history(s, bank);
     if (!h || max == 0u || (uint32_t)h->len + 1u < 2u * m) return 0;
-    const int32_t *v = h->v;
+    const TokId *v = h->v;
     const uint32_t L = (uint32_t)h->len + 1u;   /* the history, then next_base at index L - 1 */
-    auto at = [&](uint32_t i) -> int32_t { return i + 1u < L ? v[i] : next_base.raw(); };   /* the history is raw */
+    auto at = [&](uint32_t i) -> TokId { return i + 1u < L ? v[i] : next_base; };
     const uint32_t need = max < m ? max : m;
     uint32_t best = 0, best_at = 0;
     /* an earlier copy starts at i <= L - m - 1 (L - m is the tail itself); latest first */
@@ -172,11 +172,11 @@ void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, TokId ne
     bool reprobe = false;
     const uint32_t admit = pulsar_spec_copy_price(&s->spec, pulsar_spec_tau(s->engine), cap, q->conf, &reprobe);
     if (admit == 0u) return;   /* before the history scan: a quenched request pays nothing for it */
-    int32_t cp[16];
+    TokId cp[16];
     const uint32_t n_cp = pulsar_spec_copy_chain(s, pulsar_bank_index(pulsar_session_live_bank(s)), next_base, cap, cp);
     if (n_cp == 0) return;
     q->keep = n_cp < admit ? n_cp : admit;
-    q->refined[0] = q->next_base.raw();
+    q->refined[0] = q->next_base;
     for (uint32_t k = 0; k < q->keep; k++) q->refined[k + 1] = cp[k];
     pulsar_spec_keep_picked(s, 1u, &q, 1u);
     if (q->keep == 0) return;   /* no copy draft is worth its row: the drafter drafts */
@@ -229,7 +229,7 @@ static void spec_round_undo(pulsar_session *s, pulsar_spec_round *r) {
 /// @param row the committed verify row
 /// @param next the token after it
 /// @return false when seed_defer is full (PULSAR_SPEC_LOGITS_ROWS + 1 rows)
-static bool spec_absorb_defer(pulsar_session *s, uint32_t row, int32_t next) {
+static bool spec_absorb_defer(pulsar_session *s, uint32_t row, TokId next) {
     if (s->seed_defer.n >= PULSAR_SPEC_LOGITS_ROWS + 1) return false;
     s->seed_defer.src_row[s->seed_defer.n] = row;
     s->seed_defer.bank[s->seed_defer.n] = pulsar_bank_index(pulsar_session_live_bank(s));
@@ -246,14 +246,14 @@ static bool spec_absorb_defer(pulsar_session *s, uint32_t row, int32_t next) {
 /// @param next [n] the token after each row
 /// @param n rows
 /// @return false = the drafter refused (or seed_defer is full)
-static bool spec_absorb_rows(pulsar_session *s, uint32_t row0, const int32_t *next, uint32_t n) {
+static bool spec_absorb_rows(pulsar_session *s, uint32_t row0, const TokId *next, uint32_t n) {
     bool ok = true;
     if (s->seed_defer.active) {
         for (uint32_t m = 0; ok && m < n; m++) ok = spec_absorb_defer(s, row0 + m, next[m]);
         return ok;
     }
     if (spec_drafter(s)->absorb) {
-        for (uint32_t m = 0; ok && m < n; m++) ok = spec_drafter(s)->absorb(s, row0 + m, next[m]);
+        for (uint32_t m = 0; ok && m < n; m++) ok = spec_drafter(s)->absorb(s, row0 + m, next[m].raw());
         return ok;
     }
     uint32_t rows[PULSAR_SPEC_LOGITS_ROWS + 1], banks[PULSAR_SPEC_LOGITS_ROWS + 1];
@@ -566,11 +566,11 @@ static bool spec_walk_rounds(pulsar_session *s, const spec_walk_round *w, uint32
             q.min_p = w[i].min_p;
             q.key = pulsar_sample_key(w[i].rng, j + 1u);   /* row j draws the token j + 1 places past the base */
             q.flags = greedy ? PULSAR_GPU_SAMPLE_GREEDY : 0u;
-            q.probe = j < r->K ? r->pend[j] : -1;
+            q.probe = j < r->K ? r->pend[j].raw() : -1;   /* the device sampler's int32 */
             rows[m] = w[i].row0 + j;
             masks[m] = w[i].masks && j < w[i].mask_rows ? w[i].masks + (size_t)j * words : NULL;
             if (j < r->K) {
-                run.pend[j] = r->pend[j];
+                run.pend[j] = r->pend[j].raw();   /* the device walk's int32 */
                 run.greedy_rows |= greedy ? 1u << j : 0u;
             }
             m++;
@@ -649,7 +649,7 @@ static int spec_round_begin(pulsar_session *s, int first_token,
     uint32_t &K = r->K;
     uint32_t &n_batch = r->n_batch;
     TokPos &saved_len = r->saved_len;
-    int32_t (&pend)[16] = r->pend;
+    TokId (&pend)[16] = r->pend;
     float (&pend_conf)[16] = r->pend_conf;
     (void)pend_conf; (void)n_batch;
     /* Pending drafts continue from the greedy base we predicted last step; if
@@ -703,8 +703,8 @@ static int spec_round_begin(pulsar_session *s, int first_token,
     }
 
     saved_len = s->hist_end();
-    token_vec_push(&s->checkpoint, first_token);
-    for (uint32_t i = 0; i < K; i++) token_vec_push(&s->checkpoint, (int)pend[i]);
+    token_vec_push(&s->checkpoint, TokId{first_token});
+    for (uint32_t i = 0; i < K; i++) token_vec_push(&s->checkpoint, pend[i]);
     return 0;
 }
 
@@ -748,8 +748,8 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                           int round_banks,
                           bool defer_redraft,
                           double t0,
-                          const int32_t *forced_truth,
-                          int *accepted, int accepted_cap,
+                          const TokId *forced_truth,
+                          TokId *accepted, int accepted_cap,
                           char *err, size_t errlen) {
     pulsar_engine *e = s->engine;
     static int dspark_stats_env = -1;
@@ -758,7 +758,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
     const uint32_t K = r->K;
     const uint32_t n_batch = r->n_batch;
     const TokPos saved_len = r->saved_len;
-    int32_t (&pend)[16] = r->pend;
+    TokId (&pend)[16] = r->pend;
     float (&pend_conf)[16] = r->pend_conf;
     (void)pend_conf; (void)t0; (void)dspark_stats;
     /* L155: the round hands back every position it commits, so accepted[] must hold the base and all K drafts it
@@ -792,7 +792,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
          * production. */
         commit_rc = 0;
         while ((uint32_t)commit_rc < K && pend[commit_rc] == forced_truth[commit_rc]) commit_rc++;
-        carry_tok = (int)forced_truth[commit_rc];
+        carry_tok = forced_truth[commit_rc].raw();
     } else {
         /* the device walk's verdict: a refused row ends the round -- unless it is a full accept's carry row and the
          * stop clamp below cuts the round before it (that carry is never emitted; the host walk drew it from the
@@ -965,9 +965,9 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
     if (ok_state) {
         PULSAR_NVTX("spec: absorb");
         s->hist_set_end(saved_len + TokCount{1 + commit});
-        int32_t next[PULSAR_SPEC_LOGITS_ROWS + 1];
+        TokId next[PULSAR_SPEC_LOGITS_ROWS + 1];
         uint32_t n_abs = 0;
-        for (int m = 0; m <= commit && m < (int)n_batch; m++) next[n_abs++] = m < commit ? pend[m] : (int32_t)carry_tok;
+        for (int m = 0; m <= commit && m < (int)n_batch; m++) next[n_abs++] = m < commit ? pend[m] : TokId{carry_tok};
         ok_state = spec_absorb_rows(s, row0, next, n_abs);
     }
     if (spec_target(s)->release) spec_target(s)->release(s, r);
@@ -978,11 +978,11 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
     }
 
     /* Emit first_token + accepted drafts. */
-    accepted[n_accept++] = first_token;
+    accepted[n_accept++] = TokId{first_token};
     bool hit_eos = pulsar_token_is_stop(e, TokId{first_token});
     for (int i = 0; i < commit && n_accept < accepted_cap && !hit_eos; i++) {
-        accepted[n_accept++] = (int)pend[i];
-        if (pulsar_token_is_stop(e, TokId{pend[i]})) hit_eos = true;
+        accepted[n_accept++] = pend[i];
+        if (pulsar_token_is_stop(e, pend[i])) hit_eos = true;
     }
     /* the stream steps past every token the round emitted: the carry sits at the next index, and the next
      * chain's drafts past it (L288 sdet; a teacher-forced end draws nothing and leaves the stream alone) */
@@ -1061,7 +1061,7 @@ static int spec_single_round(pulsar_session *s, int first_token,
                              float temperature, int top_k,
                              float top_p, float min_p,
                              uint64_t *rng,
-                             int *accepted, int accepted_cap,
+                             TokId *accepted, int accepted_cap,
                              char *err, size_t errlen) {
     pulsar_engine *e = s->engine;
     const double t0 = now_sec();
@@ -1151,7 +1151,7 @@ static int spec_base_draw(pulsar_session *s, float temperature, int top_k, float
 int pulsar_session::generate_speculative(float temperature, int top_k,
                                      float top_p, float min_p, uint64_t *rng,
                                      int max_tokens,
-                                     int *accepted, int accepted_cap,
+                                     TokId *accepted, int accepted_cap,
                                      char *err, size_t errlen) {
     auto *s = this;
     if (!s || max_tokens <= 0 || accepted_cap <= 0 || !accepted) return 0;
@@ -1188,7 +1188,7 @@ int pulsar_session::generate_speculative(float temperature, int top_k,
     if (pulsar_token_is_stop(s->engine, TokId{first})) {
         /* never forward EOS through the target (matches the old caller loops,
          * which broke before eval) */
-        accepted[0] = first;
+        accepted[0] = TokId{first};
         if (rng) pulsar_sample_advance(rng, 1u);
         return 1;
     }
@@ -1197,7 +1197,7 @@ int pulsar_session::generate_speculative(float temperature, int top_k,
      * already correctly distributed, so this is a pure speed decision. */
     if (!spec_drafter(s) || s->spec.spec_quenched) {
         if (pulsar_session_family_eval(s, first, err, errlen) != 0) return -1;
-        accepted[0] = first;
+        accepted[0] = TokId{first};
         if (rng) pulsar_sample_advance(rng, 1u);
         return 1;
     }
@@ -1210,7 +1210,7 @@ int pulsar_session::generate_speculative(float temperature, int top_k,
 
 int pulsar_session::eval_speculative_block(int first_token,
                                         int max_tokens,
-                                        int *accepted, int accepted_cap,
+                                        TokId *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
     auto *s = this;
     if (!s || max_tokens <= 0 || accepted_cap <= 0 || !accepted) return 0;
@@ -1224,7 +1224,7 @@ int pulsar_session::eval_speculative_block(int first_token,
     }
     if (!spec_drafter(s) || s->spec.spec_quenched) {
         if (pulsar_session_family_eval(s, first_token, err, errlen) != 0) return -1;
-        accepted[0] = first_token;
+        accepted[0] = TokId{first_token};
         return 1;
     }
     /* The fused loop -- one batched forward/step plus transactional no-replay
@@ -1325,8 +1325,8 @@ static int spec_round_end_walked(pulsar_session *s, pulsar_spec_round *r,
                                  float min_p, uint32_t greedy_rows,
                                  const uint32_t *masks, uint32_t mask_rows, uint64_t *rng,
                                  const pulsar_gpu_spec_walk_out *wv, uint32_t row0, int round_banks,
-                                 const int32_t *forced_truth,
-                                 int *accepted, int accepted_cap,
+                                 const TokId *forced_truth,
+                                 TokId *accepted, int accepted_cap,
                                  char *err, size_t errlen) {
     return spec_round_end(s, r, first_token,
                           temperature, top_k, top_p, min_p, greedy_rows, masks, mask_rows, rng,
@@ -1358,7 +1358,7 @@ int pulsar_session_spec_round_end_local(pulsar_session *s, pulsar_spec_round *r,
                                float min_p, uint32_t greedy_rows,
                                const uint32_t *masks, uint32_t mask_rows, uint64_t *rng,
                                uint32_t row0,
-                               int *accepted, int accepted_cap,
+                               TokId *accepted, int accepted_cap,
                                char *err, size_t errlen) {
     if (spec_no_drafter(s, "spec round end", err, errlen)) return -1;   /* no round can have begun */
     if (temperature > 0.0f && !rng) {
@@ -1383,8 +1383,8 @@ int pulsar_session_spec_round_end_forced(pulsar_session *s, pulsar_spec_round *r
                                       float temperature, int top_k, float top_p,
                                       float min_p, uint64_t *rng,
                                       uint32_t row0,
-                                      const int32_t *truth,
-                                      int *accepted, int accepted_cap,
+                                      const TokId *truth,
+                                      TokId *accepted, int accepted_cap,
                                       char *err, size_t errlen) {
     const int first_token = first_token_id.raw();   /* L334 P3: the round's body is raw (its fields: S2 next) */
     if (spec_no_drafter(s, "spec round_end_forced", err, errlen)) return -1;   /* no round can have begun */
@@ -1679,13 +1679,13 @@ int pulsar_spec_steps_verdict(pulsar_spec_phase phase, const pulsar_spec_step *s
         } else if (phase == PULSAR_SPEC_PHASE_ROUND_END) {
             h = spec_fp(h, (uint32_t)st->pos_after.raw());
             h = spec_fp(h, (uint32_t)st->n_accepted);
-            for (int t = 0; t < st->n_accepted; t++) h = spec_fp(h, (uint32_t)st->accepted[t]);
+            for (int t = 0; t < st->n_accepted; t++) h = spec_fp(h, (uint32_t)st->accepted[t].raw());
         }
     }
     return (int)(h & 0x3fffffffu) + 1;
 }
 
-int pulsar_session_spec_redraft_peek(const pulsar_spec_round *r, int32_t ids[17], float conf[16],
+int pulsar_session_spec_redraft_peek(const pulsar_spec_round *r, TokId ids[17], float conf[16],
                                      uint32_t *n_draft, uint32_t *keep, int *sampled) {
     if (!r || !r->redraft.valid || !r->redraft.done) return 0;
     const spec_redraft_req *q = &r->redraft;
@@ -1697,7 +1697,7 @@ int pulsar_session_spec_redraft_peek(const pulsar_spec_round *r, int32_t ids[17]
     return 1;
 }
 
-uint32_t pulsar_session_bank_pendings(const pulsar_session *s, BankId bank_id, TokId *base, int32_t tok[16],
+uint32_t pulsar_session_bank_pendings(const pulsar_session *s, BankId bank_id, TokId *base, TokId tok[16],
                                       float conf[16]) {
     const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */
     /* L108 P2: the live session's pending count may still be an

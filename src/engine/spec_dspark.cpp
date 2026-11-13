@@ -45,7 +45,7 @@ int gpu_graph_spec_dump_active(void) {
 /// @param refined_ids [n_draft + 1] the chain (carry, then drafts), written after the header
 /// @param n_draft drafts in the step
 static void dspark_dump_step(pulsar_gpu_graph *g, int pos, int first_token,
-                             const int32_t *refined_ids, int n_draft) {
+                             const TokId *refined_ids, int n_draft) {
     /* Read once (no-hot-path-flags): this is called every spec step, and both
      * switches are fixed at start.  The common case is "not dumping", which
      * must cost a single cached load, not two getenv lookups. */
@@ -335,7 +335,7 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
             return -1;
         }
     /* rows */
-    int32_t draft_ids[PULSAR_DSPARK_DRAFT_ROWS_MAX];
+    TokId draft_ids[PULSAR_DSPARK_DRAFT_ROWS_MAX];
     uint32_t row_bank[PULSAR_DSPARK_DRAFT_ROWS_MAX];
     uint32_t bank_n_raw[PULSAR_MSEQ_MAX][3];
     uint32_t bank_n_draft[PULSAR_MSEQ_MAX];
@@ -354,14 +354,14 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
         }
         for (uint32_t k = 0; k < q->n_draft; k++) {
             /* the noise-token forward: row 0 the carry, the rest DSpark's noise id */
-            draft_ids[n_rows] = k == 0 ? q->next_base.raw() : PULSAR_DSPARK_NOISE_TOKEN_ID;
+            draft_ids[n_rows] = k == 0 ? q->next_base : TokId{PULSAR_DSPARK_NOISE_TOKEN_ID};
             row_bank[n_rows] = banks ? banks[j] : 0u;
             n_rows++;
         }
         if (j < n_g) { if (q->n_draft > max_draft_g) max_draft_g = q->n_draft; }
         else         { if (q->n_draft > max_draft_s) max_draft_s = q->n_draft; }
-        q->refined[0] = q->next_base.raw();
-        for (int k = 1; k < 17; k++) q->refined[k] = 0;
+        q->refined[0] = q->next_base;
+        for (int k = 1; k < 17; k++) q->refined[k] = TokId{0};
         for (int k = 0; k < 16; k++) q->conf[k] = -1.0f;
         q->have_conf = false;
         q->keep = q->n_draft;
@@ -394,9 +394,9 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
     memset(meta, 0, sizeof(meta));
     for (int j = 0; j < n_sel; j++) meta[j] = base_row[j];
     /* seed the chain feed: ids[j][0] = next_base */
-    int32_t ids_seed[PULSAR_DSPARK_BANKS_MAX * 17];
+    TokId ids_seed[PULSAR_DSPARK_BANKS_MAX * 17];
     memset(ids_seed, 0, sizeof(ids_seed));
-    for (int j = 0; j < n_sel; j++) ids_seed[j * 17] = qs[j]->next_base.raw();
+    for (int j = 0; j < n_sel; j++) ids_seed[j * 17] = qs[j]->next_base;
     if (!pulsar_gpu_tensor_write(g->dspark_bank_meta, 0, meta, sizeof(meta)) ||
         !pulsar_gpu_tensor_write(g->dspark_refined_ids, 0, ids_seed,
                                  (uint64_t)n_sel * 17 * sizeof(int32_t))) {
@@ -442,7 +442,7 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
                     vocab_size, s->engine->logits_width());
             ok = false;
         }
-        int32_t prev[PULSAR_DSPARK_BANKS_MAX];
+        TokId prev[PULSAR_DSPARK_BANKS_MAX];
         for (uint32_t pos = 0; ok && pos < max_draft_s; pos++) {
             for (int j = n_g; j < n_sel; j++) prev[j - n_g] = qs[j]->refined[pos];
             ok = pulsar_gpu_tensor_write(prev_s, 0, prev, (uint64_t)n_s * sizeof(int32_t)) &&
@@ -477,7 +477,7 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
                     ok = false;
                     break;
                 }
-                qs[who[k]]->refined[pos + 1] = out[k].token;   /* the chain continues SAMPLED */
+                qs[who[k]]->refined[pos + 1] = TokId{out[k].token};   /* the chain continues SAMPLED */
             }
         }
         pulsar_gpu_tensor_free(refined_s);
@@ -491,7 +491,7 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
     }
     /* greedy ids come back in one read */
     if (n_g > 0 && !defer) {
-        int32_t ids_all[PULSAR_DSPARK_BANKS_MAX * 17];
+        TokId ids_all[PULSAR_DSPARK_BANKS_MAX * 17];
         if (!pulsar_gpu_tensor_read(g->dspark_refined_ids, 0, ids_all, (uint64_t)n_sel * 17 * sizeof(int32_t))) {
             snprintf(err, errlen, "dspark draft: ids readback failed");
             return -1;
@@ -507,7 +507,7 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
      * conf[k] is scored without the draft it judges (the stop is a stopping time) -- then the stop rule */
     const float tau = pulsar_spec_tau(e);
     if (tau > 0.0f) {
-        int32_t toks[PULSAR_DSPARK_DRAFT_ROWS_MAX];
+        TokId toks[PULSAR_DSPARK_DRAFT_ROWS_MAX];
         float confs[PULSAR_DSPARK_DRAFT_ROWS_MAX];
         for (int j = 0; j < n_sel; j++)
             for (uint32_t k = 0; k < qs[j]->n_draft; k++) toks[base_row[j] + k] = qs[j]->refined[k];
@@ -599,7 +599,7 @@ static void dspark_harvest(pulsar_session *s) {
     pulsar_gpu_graph *g = s->graph;
     const uint32_t n_draft = s->spec.dspark_chain_n;
     if (n_draft == 0 || n_draft > 16u) return;
-    int32_t ids[17];
+    TokId ids[17];
     float conf[16];
     const bool have_conf = s->spec.dspark_chain_conf;
     if (!g->dspark_refined_ids ||
@@ -862,7 +862,7 @@ const pulsar_spec_target_ops k_ds4_spec_target = {
 /// @param banks [n] their banks
 /// @param n rows
 /// @return false = refused
-static bool dspark_absorb_banked(pulsar_session *s, const uint32_t *rows, const uint32_t *banks, const int32_t *,
+static bool dspark_absorb_banked(pulsar_session *s, const uint32_t *rows, const uint32_t *banks, const TokId *,
                                  uint32_t n) {
     pulsar_engine *e = s->engine;
     return gpu_graph_dspark_seed_rows_banked(s->graph, &e->dspark_model, &e->dspark_weights, rows, banks, n);

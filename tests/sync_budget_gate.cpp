@@ -72,7 +72,7 @@ static void run(pulsar_engine *e, int NB, float temp, int rounds_max, bool repor
     for (int b = 0; b < NB; b++) { rd[b] = pulsar_spec_round_new(); rngs[b] = 0x1302u + (uint64_t)b; }
     const uint32_t width = pulsar_engine_fused_heads_max(e);
     std::vector<pulsar_multiseq_req> reqs(width);
-    static int acc[32][PULSAR_SPEC_LOGITS_ROWS + 1];
+    static TokId acc[32][PULSAR_SPEC_LOGITS_ROWS + 1];
     uint64_t sum[PH_COUNT] = {}, worst[PH_COUNT] = {}, d2h_bytes = 0;
     int rounds = 0, rows_total = 0;
     std::vector<bool> done(NB, false);   /* a bank whose stream ended (its base token is EOS, or the context) */

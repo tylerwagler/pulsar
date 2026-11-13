@@ -950,7 +950,7 @@ int gpu_graph_decode_multiseq_batch(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
         const pulsar_weights     *weights,
-        const int             *tokens,
+        const TokId           *tokens,
         const int32_t         *pos,
         const int32_t         *bank,
         uint32_t               n_active,
@@ -1005,7 +1005,7 @@ int gpu_graph_decode_multiseq_batch(
      * write we do not make. */
     /* inc 3: heap the row-indexed token copy (was [PULSAR_MSEQ_MAX]) so a K-row
      * prefill chunk fits. n_active <= prefill_cap. */
-    int *cur_tokens = (int *)xmalloc((size_t)n_active * sizeof(int));
+    TokId *cur_tokens = (TokId *)xmalloc((size_t)n_active * sizeof(TokId));
     memcpy(cur_tokens, tokens, (size_t)n_active * sizeof(cur_tokens[0]));
     token_vec cur;
     memset(&cur, 0, sizeof(cur));

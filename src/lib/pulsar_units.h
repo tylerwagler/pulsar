@@ -443,6 +443,22 @@ static_assert(sizeof(TokId) == sizeof(int32_t) && std::is_trivial<TokId>::value 
                   std::is_standard_layout<TokId>::value,
               "a token id is as cheap as the int32 it replaces (memset / calloc-safe; arrays of it upload as int32)");
 
+/** L334 P3b: an id array as the int32 array a kernel launch on host memory or a wire struct reads -- the ONE crossing
+ *  of a TokId array into raw ids (TokId is exactly an int32: same size, trivial, standard layout).  Byte copies
+ *  (uploads, memcpy, fwrite, digests) take the TokId array as it is and need no crossing.
+ *  @param ids the id array */
+/// @return the same memory as int32 ids
+inline const int32_t *pulsar_tok_ids_raw(const TokId *ids) { return reinterpret_cast<const int32_t *>(ids); }
+/** The writable form of pulsar_tok_ids_raw (a wire struct or kernel output filled in place).
+ *  @param ids the id array */
+/// @return the same memory as int32 ids
+inline int32_t *pulsar_tok_ids_raw(TokId *ids) { return reinterpret_cast<int32_t *>(ids); }
+/** The reverse crossing: raw int32 ids (a received wire frame, a kernel's host output) viewed as TokIds, in place --
+ *  no copy (a sync's prompt can be a million ids).
+ *  @param raw the int32 ids */
+/// @return the same memory as token ids
+inline const TokId *pulsar_tok_ids_of(const int32_t *raw) { return reinterpret_cast<const TokId *>(raw); }
+
 /* ---- L334 phase 4: bank ids -------------------------------------------------------------------------------------
  * A bank is one conversation's KV / state slot in a session's pool.  Its id sat as uint32_t beside a layer index
  * (gpu_graph_n_comp(g, bank, il) vs the views' (g, il, bank)), a checkpoint slot, a decl id, a step row and the

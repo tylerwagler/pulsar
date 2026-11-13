@@ -73,12 +73,12 @@ static int spec_run(pulsar_session *s, int n, int *toks, int *rounds, int *n_rou
     int got = 0;
     *n_rounds = 0;
     while (got < n) {
-        int buf[17];
+        TokId buf[17];
         const int k = pulsar_session_generate_speculative(s, 0.0f, 0, 1.0f, 0.0f, &rng, n - got, buf, 17, err,
                                                           errlen);
         if (k <= 0) return 1;
         rounds[(*n_rounds)++] = k;
-        for (int i = 0; i < k && got < n; i++) toks[got++] = buf[i];
+        for (int i = 0; i < k && got < n; i++) toks[got++] = buf[i].raw();
     }
     return 0;
 }
@@ -142,7 +142,7 @@ int GATE_ENTRY(int argc, char **argv) {
         if (spec_run(A, N_PRE, pt, pr, &pn, err, sizeof err) != 0) { say(false, "A speculate: %s", err); goto done; }
     }
     for (int i = P; i < T0; i++)
-        if (pulsar_session_eval(A, TokId{base.v[i]}, err, sizeof err) != 0) {
+        if (pulsar_session_eval(A, base.v[i], err, sizeof err) != 0) {
             say(false, "A eval: %s", err);
             goto done;
         }
@@ -158,7 +158,7 @@ int GATE_ENTRY(int argc, char **argv) {
 
     /* A decodes on from its live state -- the reference */
     for (int i = 0; i < N_CHECK; i++) {
-        if (pulsar_session_eval(A, TokId{base.v[T0 + i]}, err, sizeof err) != 0) {
+        if (pulsar_session_eval(A, base.v[T0 + i], err, sizeof err) != 0) {
             say(false, "A eval: %s", err);
             goto done;
         }
@@ -173,7 +173,7 @@ int GATE_ENTRY(int argc, char **argv) {
         "2. FRONTIER: loaded at pos %d, logits byte-identical to the saved session's", pulsar_session_pos(B).raw());
     int first_diff = -1;
     for (int i = 0; i < N_CHECK && first_diff < 0; i++) {
-        if (pulsar_session_eval(B, TokId{base.v[T0 + i]}, err, sizeof err) != 0) {
+        if (pulsar_session_eval(B, base.v[T0 + i], err, sizeof err) != 0) {
             say(false, "B eval: %s", err);
             goto done;
         }

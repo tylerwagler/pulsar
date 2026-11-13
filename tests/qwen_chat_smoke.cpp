@@ -77,14 +77,14 @@ int main(int argc, char **argv) {
     int n_new = 0;
     const double t1 = now_s();
     for (int i = 0; i < max_new; i++) {
-        if (i > 0 && pulsar_session_eval(sess, TokId{prompt.v[prompt.len - 1]}, err, sizeof(err)) != 0) {
+        if (i > 0 && pulsar_session_eval(sess, prompt.v[prompt.len - 1], err, sizeof(err)) != 0) {
             fprintf(stderr, "qwen-chat-smoke: eval: %s\n", err);
             return 1;
         }
         if (pulsar_session_copy_logits(sess, row.data(), W) != W) { fprintf(stderr, "qwen-chat-smoke: copy_logits\n"); return 1; }
         int am = 0;
         for (int j = 1; j < W; j++) if (row[j] > row[am]) am = j;
-        pulsar_tokens_push(&prompt, am);
+        pulsar_tokens_push(&prompt, TokId{am});
         n_new++;
         if (pulsar_token_is_stop(e, TokId{am})) { stop_reason = "stop token"; break; }
         size_t n = 0;

@@ -1143,7 +1143,7 @@ static void qwen_ngram_init(const void *, void *state) {
 /// @param tokens the kept tokens
 /// @param keep their count
 /// @return pulsar_qwen_s4_ngram_replay's
-static bool qwen_ngram_replay(const void *e, void *state, const int32_t *tokens, uint32_t keep) {
+static bool qwen_ngram_replay(const void *e, void *state, const TokId *tokens, uint32_t keep) {
     return pulsar_qwen_s4_ngram_replay(pulsar_qwen_of((const pulsar_engine *)e)->weights, (int32_t *)state, tokens, keep);
 }
 
@@ -1455,7 +1455,7 @@ struct qwen_mtp_pick {
 /// @param decode_rows PREFILL rows taken as decode rows (the absorb)
 /// @return false (printed) on a refusal or failed step
 static bool qwen_mtp_forward(pulsar_session *s, pulsar_step_mode mode, const pulsar_gpu_tensor *cond,
-                             const int32_t *tokens, const int32_t *pos, const int32_t *bank, uint32_t n_rows,
+                             const TokId *tokens, const int32_t *pos, const int32_t *bank, uint32_t n_rows,
                              uint32_t head_row0, uint32_t head_n, float *logits_out, qwen_mtp_pick *pick,
                              bool decode_rows) {
     pulsar_engine *e = s->engine;
@@ -1614,7 +1614,7 @@ static bool qwen_mtp_stage_restore(pulsar_session *s, uint32_t bank) {
 /// @param ids the tokens now known
 /// @param n their count
 /// @param chain_start reset the prefetch context to the bank's n-gram state first
-static void qwen_mtp_prefetch(pulsar_session *s, uint32_t bank, const int32_t *ids, uint32_t n, bool chain_start) {
+static void qwen_mtp_prefetch(pulsar_session *s, uint32_t bank, const TokId *ids, uint32_t n, bool chain_start) {
     int32_t *ctx = qwen_st(s)->mtp_pctx + 2u * bank;
     if (chain_start) {
         const int32_t *ngram = (const int32_t *)pulsar_state_host(s->states, PULSAR_QWEN_STATE_NGRAM, BankId{bank});
@@ -1684,7 +1684,7 @@ const pulsar_drafter_ops PULSAR_QWEN_MTP_DRAFTER =
 /// @param from first token
 /// @param to one past the last
 /// @return rows queued
-static uint32_t qwen_read_ahead(const pulsar_engine *e, uint64_t tag, const int32_t *prompt, uint32_t from, uint32_t to) {
+static uint32_t qwen_read_ahead(const pulsar_engine *e, uint64_t tag, const TokId *prompt, uint32_t from, uint32_t to) {
     return pulsar_qwen_s4_ple_read_ahead(pulsar_qwen_of(e)->weights, tag, prompt, from, to);
 }
 /// pulsar_driver_ops::read_ahead_pool.

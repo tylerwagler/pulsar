@@ -33,10 +33,10 @@ MUTANTS = {
         "--only=cuda-chunk-neutrality-gate",
         "    const int rc = ops->prefill(s, prompt, pulsar_ckpt_pos(start));\n",
         "    /* L317 MUTANT: a resume prefills its first token as another id */\n"
-        "    const int l317_t = start > 0u && (int)start < prompt->len ? prompt->v[start] : -1;\n"
-        "    if (l317_t >= 0) prompt->v[start] = l317_t == 1000 ? 1001 : 1000;\n"
+        "    const int l317_t = start > 0u && (int)start < prompt->len ? prompt->v[start].raw() : -1;\n"
+        "    if (l317_t >= 0) prompt->v[start] = TokId{l317_t == 1000 ? 1001 : 1000};\n"
         "    const int rc = ops->prefill(s, prompt, pulsar_ckpt_pos(start));\n"
-        "    if (l317_t >= 0) prompt->v[start] = l317_t;\n"),
+        "    if (l317_t >= 0) prompt->v[start] = TokId{l317_t};\n"),
     "row-sort": (
         "src/cuda/pulsar_cuda_attention.cu",
         "--only=cuda-row-neutrality-gate,cuda-row-neutrality-gate-deep,cuda-row-neutrality-gate-deeper",
@@ -58,8 +58,8 @@ MUTANTS = {
     "spec-emit": (
         "src/engine/session_spec.cpp",
         "--only=block-spec-gate",
-        "        accepted[n_accept++] = (int)pend[i];\n",
-        "        accepted[n_accept++] = i == 1 ? (int)pend[0] : (int)pend[i];   /* L317 MUTANT: the first draft twice */\n"),
+        "        accepted[n_accept++] = pend[i];\n",
+        "        accepted[n_accept++] = i == 1 ? pend[0] : pend[i];   /* L317 MUTANT: the first draft twice */\n"),
 }
 
 

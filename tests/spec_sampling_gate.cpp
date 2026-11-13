@@ -197,7 +197,7 @@ static int sampled_plain_batch(pulsar_session *s, const start_state *snap,
         /* every bank's row drawn in one device launch, each at its own stream's key (L302) */
         uint32_t qrow[SAMPLED_BANKS_PLAIN];
         pulsar_row_draw d[SAMPLED_BANKS_PLAIN];
-        int drawn[SAMPLED_BANKS_PLAIN];
+        TokId drawn[SAMPLED_BANKS_PLAIN];
         for (uint32_t q = 0; q < m; q++) {
             qrow[q] = q;
             d[q] = pulsar_row_draw{temp, 0, top_p, min_p, &rng[who[q]], false, NULL};
@@ -208,7 +208,7 @@ static int sampled_plain_batch(pulsar_session *s, const start_state *snap,
         }
         for (uint32_t q = 0; q < m; q++) {
             const int b = who[q];
-            const int tok = drawn[q];
+            const int tok = drawn[q].raw();
             seq[t0 + b][got[b]++] = tok;
             reqs[b].pos += TokCount{1}; reqs[b].token = TokId{tok};
             if (pulsar_token_is_stop(e, TokId{tok}) || got[b] >= DEPTH) live[b] = 0;
@@ -293,12 +293,12 @@ static int sampled_spec_batch(pulsar_session *s, const start_state *snap,
             if (!pulsar_session_bank_state_restore(s, BankId{b})) {
                 snprintf(err, errlen, "bank %d restore failed", b); return -1;
             }
-            int accepted[17];
+            TokId accepted[17];
             const int na = pulsar_session_spec_round_end(s, r[b], TokId{first[b]}, temp, 0, top_p, min_p,
                                                          &rng[b], row0[b], accepted, 17,
                                                          err, errlen);
             if (na < 0) return -1;
-            for (int i = 0; i < na && got[b] < DEPTH; i++) seq[t0 + b][got[b]++] = accepted[i];
+            for (int i = 0; i < na && got[b] < DEPTH; i++) seq[t0 + b][got[b]++] = accepted[i].raw();
             if (got[b] >= DEPTH || (got[b] > 0 && pulsar_token_is_stop(e, TokId{seq[t0 + b][got[b] - 1]}))) live[b] = 0;
             pulsar_session_bank_state_save(s, BankId{b});
             if (live[b]) { cont_r[nc] = r[b]; cont_b[nc] = (uint32_t)b; cont_rng[nc] = &rng[b]; nc++; }
@@ -396,13 +396,13 @@ static void spec_report(const char *tag, spec_snap a, spec_snap b) {
 static int gate_step_batched(pulsar_session *s, float temperature, int top_k,
                              float top_p, float min_p, uint64_t *rng,
                              char *err, size_t errlen) {
-    int toks[2];
+    TokId toks[2];
     int k = pulsar_session_generate_speculative(s, temperature, top_k, top_p, min_p,
                                                 rng, /*max_tokens=*/1,
                                                 toks, (int)(sizeof(toks)/sizeof(toks[0])),
                                                 err, errlen);
     if (k <= 0) return -1;
-    return toks[0];
+    return toks[0].raw();
 }
 
 int GATE_ENTRY(int argc, char **argv) {
@@ -618,7 +618,7 @@ int GATE_ENTRY(int argc, char **argv) {
             int *n = rep == 0 ? &ngot : &ngot2;
             rng = 7;
             while (*n < nref) {
-                int toks[17];
+                TokId toks[17];
                 int k = pulsar_session_generate_speculative(session, 0.0f, 0, 1.0f, 0.0f, &rng,
                                                          nref - *n, toks, 17,
                                                          err, sizeof(err));
@@ -627,7 +627,7 @@ int GATE_ENTRY(int argc, char **argv) {
                     printf("  [round returned k=%d with budget %d -> %d token(s) "
                            "generated but DROPPED from the output]\n",
                            k, nref - *n, k - (nref - *n));
-                for (int i = 0; i < k && *n < nref; i++) dst[(*n)++] = toks[i];
+                for (int i = 0; i < k && *n < nref; i++) dst[(*n)++] = toks[i].raw();
             }
             /* Does the session's COMMITTED history contain tokens the spec path
              * never returned (ghost commit), or vice versa? Either way the

@@ -49,7 +49,7 @@ static bool is_sentinel(const pulsar_family_vision *v, const pulsar_engine *e, i
 /// @param start where to look
 /// @param[out] len the block's length (0 when none)
 /// @return true when a non-empty block starts at start
-static bool block_extent(const pulsar_family_vision *v, const pulsar_engine *e, const int32_t *ids, int n, int start,
+static bool block_extent(const pulsar_family_vision *v, const pulsar_engine *e, const TokId *ids, int n, int start,
                          int *len) {
     *len = 0;
     return v && v->block_extent(e, ids, n, start, len) && *len > 0;
@@ -59,11 +59,11 @@ bool pulsar_image_is_sentinel(const pulsar_engine *e, int32_t id) {
     return is_sentinel(e && e->family ? e->family->vision : NULL, e, id);
 }
 
-bool pulsar_image_block_extent(const pulsar_engine *e, const int32_t *ids, int n, int start, int *len) {
+bool pulsar_image_block_extent(const pulsar_engine *e, const TokId *ids, int n, int start, int *len) {
     return block_extent(e && e->family ? e->family->vision : NULL, e, ids, n, start, len);
 }
 
-bool pulsar_image_identity_build(const pulsar_family_vision *v, const pulsar_engine *e, const int32_t *ids, int n,
+bool pulsar_image_identity_build(const pulsar_family_vision *v, const pulsar_engine *e, const TokId *ids, int n,
                                  const pulsar_image_ref *images, int n_images, uint32_t limit,
                                  pulsar_image_identity *out) {
     out->n = 0;
@@ -156,11 +156,11 @@ void pulsar_image_rope3(const pulsar_image_identity *id, uint32_t row, uint32_t 
     out[0] = out[1] = out[2] = p;
 }
 
-int pulsar_image_persist_end(const pulsar_family_vision *v, const pulsar_engine *e, const int32_t *ids, int n,
+int pulsar_image_persist_end(const pulsar_family_vision *v, const pulsar_engine *e, const TokId *ids, int n,
                              const pulsar_image_identity *id) {
     uint32_t k = 0;   /* the next record the walk expects */
     for (int i = 0; i < n; i++) {
-        if (!is_sentinel(v, e, ids[i])) continue;
+        if (!is_sentinel(v, e, ids[i].raw())) continue;
         int len = 0;
         if (!block_extent(v, e, ids, n, i, &len)) return -1;   /* a malformed block: persist nothing */
         /* a block the identity records (in order, at this place) may be persisted; the first one it does not --

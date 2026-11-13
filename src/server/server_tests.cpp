@@ -2418,7 +2418,7 @@ static void test_l344_thinking_budget_close_row(void) {
     TEST_ASSERT(think_close_row(0, true, 5000, close, NULL, 0, 0) == -1);
     TEST_ASSERT(think_close_row(100, false, 100, close, NULL, 0, 0) == -1);
     /* a round with the base unsent (off 1): toks = base + 3 drafts, rows 0..3 */
-    const int r1[] = {5, 6, 7, 8};
+    const TokId r1[] = {TokId{5}, TokId{6}, TokId{7}, TokId{8}};
     TEST_ASSERT(think_close_row(100, true, 96, close, r1, 4, 1) == 3);   /* 96 + base + 3 drafts = 100 at row 3 */
     TEST_ASSERT(think_close_row(100, true, 98, close, r1, 4, 1) == 1);
     TEST_ASSERT(think_close_row(100, true, 99, close, r1, 4, 1) == 0);   /* the base is the budget's last */
@@ -2427,7 +2427,7 @@ static void test_l344_thinking_budget_close_row(void) {
     TEST_ASSERT(think_close_row(100, true, 98, close, r1 + 1, 3, 0) == 2);
     TEST_ASSERT(think_close_row(100, true, 100, close, r1 + 1, 3, 0) == 0);
     /* a draft closes the block before the budget row: nothing forced past it */
-    const int r2[] = {5, close.raw(), 7, 8};
+    const TokId r2[] = {TokId{5}, TokId{close.raw()}, TokId{7}, TokId{8}};
     TEST_ASSERT(think_close_row(100, true, 97, close, r2, 4, 1) == -1);
     TEST_ASSERT(think_close_row(100, true, 99, close, r2, 4, 1) == 0);   /* ...but a row before it still is */
 
@@ -4345,8 +4345,8 @@ static void test_l303_round_masks_match_plain(void) {
         const std::string head = "ok</think>\n\n<tool_call>\n<func";
         TEST_ASSERT(l303_feed(&srv, &g, head) == head.size());
         const std::string round = refuse ? "tion=sx>\n" : "tion=search>\n<param";   /* base + drafts */
-        std::vector<int> toks;
-        for (char c : round) toks.push_back((uint8_t)c);
+        std::vector<TokId> toks;
+        for (char c : round) toks.push_back(TokId{(uint8_t)c});
         const uint32_t *masks = NULL;
         const int rows = gen_constrain_round(&srv, &g, toks.data(), (int)toks.size(), false, &masks);
         TEST_ASSERT(rows == (int)toks.size() && masks);
@@ -4355,12 +4355,12 @@ static void test_l303_round_masks_match_plain(void) {
         TEST_ASSERT(l303_allows(&srv, &g, 't') && !l303_allows(&srv, &g, 'x'));
         /* step by step, as the plain lane decodes the same tokens */
         size_t i = 0;
-        TEST_ASSERT(gen_constrain_accept(&srv, &g, toks[0]));
+        TEST_ASSERT(gen_constrain_accept(&srv, &g, toks[0].raw()));
         for (; i < (size_t)rows; i++) {
             TEST_ASSERT(gen_constrain_mask(&srv, &g, row.data()));
             TEST_ASSERT(!memcmp(row.data(), masks + i * W, W * sizeof(uint32_t)));
             if (i + 1 == (size_t)rows) break;
-            const int t = toks[i + 1];
+            const int t = toks[i + 1].raw();
             if (!((row[(uint32_t)t >> 5] >> ((uint32_t)t & 31u)) & 1u)) break;   /* the walk stops here */
             TEST_ASSERT(gen_constrain_accept(&srv, &g, t));
         }
@@ -4394,23 +4394,23 @@ static void test_l309_draft_prefix(void) {
         TEST_ASSERT(l303_begin(&srv, &j, &g));
         const std::string head = "ok</think>\n\n<tool_call>\n<func";
         TEST_ASSERT(l303_feed(&srv, &g, head) == head.size());
-        std::vector<int32_t> toks;
-        for (char c : std::string(pc.round)) toks.push_back((uint8_t)c);
-        if (pc.stop_at >= 0) toks[(size_t)pc.stop_at + 1u] = v.stop;
+        std::vector<TokId> toks;
+        for (char c : std::string(pc.round)) toks.push_back(TokId{(uint8_t)c});
+        if (pc.stop_at >= 0) toks[(size_t)pc.stop_at + 1u] = TokId{v.stop};
         const int n = (int)toks.size() - 1;
-        const int got = gen_constrain_draft_prefix(&srv, &g, TokId{toks[0]}, toks.data() + 1, n);
+        const int got = gen_constrain_draft_prefix(&srv, &g, toks[0], toks.data() + 1, n);
         if (got != pc.want) fprintf(stderr, "l309 \"%s\": prefix %d, want %d\n", pc.round, got, pc.want);
         TEST_ASSERT(got == pc.want);
         /* the gate is back: the next draw's mask still takes the base, and the round's masks agree with the cut */
         TEST_ASSERT(l303_allows(&srv, &g, 't') && !l303_allows(&srv, &g, 'x'));
         if (pc.stop_at < 0) {
-            std::vector<int> rt(toks.begin(), toks.end());
+            std::vector<TokId> rt(toks.begin(), toks.end());
             const uint32_t *masks = NULL;
             const int rows = gen_constrain_round(&srv, &g, rt.data(), (int)rt.size(), false, &masks);
             TEST_ASSERT(rows == (int)rt.size() && masks);
             int walk = 0;   /* the drafts the masked walk can accept: row i takes draft i */
-            while (walk < n && ((masks[(size_t)walk * W + ((uint32_t)rt[(size_t)walk + 1u] >> 5)] >>
-                                 ((uint32_t)rt[(size_t)walk + 1u] & 31u)) & 1u))
+            while (walk < n && ((masks[(size_t)walk * W + ((uint32_t)rt[(size_t)walk + 1u].raw() >> 5)] >>
+                                 ((uint32_t)rt[(size_t)walk + 1u].raw() & 31u)) & 1u))
                 walk++;
             TEST_ASSERT(walk == got);
         }
@@ -4419,7 +4419,7 @@ static void test_l309_draft_prefix(void) {
     /* no gate: the chain whole */
     gen_state g;
     memset(&g, 0, sizeof g);
-    const int32_t d[3] = {'a', 'b', 'c'};
+    const TokId d[3] = {TokId{'a'}, TokId{'b'}, TokId{'c'}};
     TEST_ASSERT(gen_constrain_draft_prefix(&srv, &g, TokId{'z'}, d, 3) == 3);
     l303_server_free(&srv);
 }
@@ -5862,17 +5862,18 @@ static void test_live_tail_joins_before_a_committed_stop(void) {
         const int stops[] = {-1, im_end, endoftext};
         for (int stop : stops) {
             pulsar_tokens live = {0}, tail_t = {0}, joined = {0};
-            for (int t : sampled) pulsar_tokens_push(&live, t);
-            if (stop >= 0) pulsar_tokens_push(&live, stop);
-            for (int t : tail_toks) pulsar_tokens_push(&tail_t, t);
+            for (int t : sampled) pulsar_tokens_push(&live, TokId{t});
+            if (stop >= 0) pulsar_tokens_push(&live, TokId{stop});
+            for (int t : tail_toks) pulsar_tokens_push(&tail_t, TokId{t});
             join_live_history_and_tail(&live, stop >= 0, &tail_t, &joined);
-            TEST_ASSERT(joined.len == (int)want.size() && std::equal(want.begin(), want.end(), joined.v));
+            TEST_ASSERT(joined.len == (int)want.size() &&
+                        std::equal(want.begin(), want.end(), joined.v, [](int w, TokId t) { return t == TokId{w}; }));
             if (stop == im_end) {
                 /* the pre-L290 join: the history after the committed stop doubles the close */
                 pulsar_tokens doubled = {0};
                 join_live_history_and_tail(&live, false, &tail_t, &doubled);
-                TEST_ASSERT(doubled.len == (int)want.size() + 1 && doubled.v[sampled.size()] == im_end &&
-                            doubled.v[sampled.size() + 1] == im_end);
+                TEST_ASSERT(doubled.len == (int)want.size() + 1 && doubled.v[sampled.size()] == TokId{im_end} &&
+                            doubled.v[sampled.size() + 1] == TokId{im_end});
                 pulsar_tokens_free(&doubled);
             }
             pulsar_tokens_free(&live);
@@ -7681,69 +7682,69 @@ static void test_tool_marker_state_ignores_orphan_end(void) {
 
 
 static void test_kv_cache_chat_anchor_uses_last_user_before_assistant(void) {
-    const int user = 9001;
+    const TokId user{9001};
     const int assistant = 9002;
-    const pulsar_turn_markers m = {{user, 0}, 1, {assistant, 0}, 1};
+    const pulsar_turn_markers m = {{user, TokId{0}}, 1, {TokId{assistant}, TokId{0}}, 1};
     kv_disk_cache kc = {0};
     kc.opt = kv_cache_default_options();
     kc.opt.min_tokens = 4;
 
     pulsar_tokens codex = {0};
-    pulsar_tokens_push(&codex, 1);     /* BOS / system */
-    pulsar_tokens_push(&codex, 2);
-    pulsar_tokens_push(&codex, user);  /* environment_context item */
-    pulsar_tokens_push(&codex, 3);
-    pulsar_tokens_push(&codex, 4);
-    pulsar_tokens_push(&codex, user);  /* actual task starts here */
-    pulsar_tokens_push(&codex, 5);
-    pulsar_tokens_push(&codex, assistant);
+    pulsar_tokens_push(&codex, TokId{1});     /* BOS / system */
+    pulsar_tokens_push(&codex, TokId{2});
+    pulsar_tokens_push(&codex, TokId{user});  /* environment_context item */
+    pulsar_tokens_push(&codex, TokId{3});
+    pulsar_tokens_push(&codex, TokId{4});
+    pulsar_tokens_push(&codex, TokId{user});  /* actual task starts here */
+    pulsar_tokens_push(&codex, TokId{5});
+    pulsar_tokens_push(&codex, TokId{assistant});
     TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &codex, &m) == 5);
 
     pulsar_tokens claude = {0};
-    pulsar_tokens_push(&claude, 1);
-    pulsar_tokens_push(&claude, 2);
-    pulsar_tokens_push(&claude, 3);
-    pulsar_tokens_push(&claude, 4);
-    pulsar_tokens_push(&claude, user); /* system reminder and task share a turn */
-    pulsar_tokens_push(&claude, 5);
-    pulsar_tokens_push(&claude, assistant);
+    pulsar_tokens_push(&claude, TokId{1});
+    pulsar_tokens_push(&claude, TokId{2});
+    pulsar_tokens_push(&claude, TokId{3});
+    pulsar_tokens_push(&claude, TokId{4});
+    pulsar_tokens_push(&claude, TokId{user}); /* system reminder and task share a turn */
+    pulsar_tokens_push(&claude, TokId{5});
+    pulsar_tokens_push(&claude, TokId{assistant});
     TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &claude, &m) == 4);
     /* L353: the persist's preamble is the FIRST user marker, the routing anchor stays the last: Claude Code's two-message
      * first turn (typed text in the first) and Codex's (environment first) */
     TEST_ASSERT(kv_cache_preamble_pos(&kc, &claude, &m) == 4);
     TEST_ASSERT(kv_cache_preamble_pos(&kc, &codex, &m) == -1);   /* its first marker, 2, is below min_tokens (4) */
     pulsar_tokens two = {0};
-    for (int t : {1, 2, 3, 4, 5, 6}) pulsar_tokens_push(&two, t);
-    pulsar_tokens_push(&two, user);        /* 6: reminders + the typed text */
-    pulsar_tokens_push(&two, 7);
-    pulsar_tokens_push(&two, user);        /* 8: the environment block */
-    pulsar_tokens_push(&two, 8);
-    pulsar_tokens_push(&two, assistant);
+    for (int t : {1, 2, 3, 4, 5, 6}) pulsar_tokens_push(&two, TokId{t});
+    pulsar_tokens_push(&two, TokId{user});        /* 6: reminders + the typed text */
+    pulsar_tokens_push(&two, TokId{7});
+    pulsar_tokens_push(&two, TokId{user});        /* 8: the environment block */
+    pulsar_tokens_push(&two, TokId{8});
+    pulsar_tokens_push(&two, TokId{assistant});
     TEST_ASSERT(kv_cache_preamble_pos(&kc, &two, &m) == 6);
     TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &two, &m) == 8);
     pulsar_tokens early = {0};
-    for (int t : {1, 2, 3, 4, 5}) pulsar_tokens_push(&early, t);
-    pulsar_tokens_push(&early, assistant); /* no user turn before the assistant's */
-    pulsar_tokens_push(&early, user);
+    for (int t : {1, 2, 3, 4, 5}) pulsar_tokens_push(&early, TokId{t});
+    pulsar_tokens_push(&early, TokId{assistant}); /* no user turn before the assistant's */
+    pulsar_tokens_push(&early, TokId{user});
     TEST_ASSERT(kv_cache_preamble_pos(&kc, &early, &m) == -1);
     pulsar_tokens_free(&two);
     pulsar_tokens_free(&early);
 
     /* L272 B5: Qwen's markers are two tokens, <|im_start|> plus the role word; the
      * anchor is the position of the marker's first token */
-    const int start = 151644, u = 872, a = 77091;
+    const TokId start{151644}, u{872}, a{77091};
     const pulsar_turn_markers q = {{start, u}, 2, {start, a}, 2};
     pulsar_tokens qwen = {0};
-    pulsar_tokens_push(&qwen, start);  /* 0 <|im_start|>system */
-    pulsar_tokens_push(&qwen, 8948);
-    pulsar_tokens_push(&qwen, 2);      /* 2 the system prompt */
-    pulsar_tokens_push(&qwen, 3);
-    pulsar_tokens_push(&qwen, start);  /* 4 <|im_start|>user: the task */
-    pulsar_tokens_push(&qwen, u);
-    pulsar_tokens_push(&qwen, u);      /* 6 the word "user" inside the message: not a marker */
-    pulsar_tokens_push(&qwen, 5);
-    pulsar_tokens_push(&qwen, start);  /* 8 <|im_start|>assistant */
-    pulsar_tokens_push(&qwen, a);
+    pulsar_tokens_push(&qwen, TokId{start});  /* 0 <|im_start|>system */
+    pulsar_tokens_push(&qwen, TokId{8948});
+    pulsar_tokens_push(&qwen, TokId{2});      /* 2 the system prompt */
+    pulsar_tokens_push(&qwen, TokId{3});
+    pulsar_tokens_push(&qwen, TokId{start});  /* 4 <|im_start|>user: the task */
+    pulsar_tokens_push(&qwen, TokId{u});
+    pulsar_tokens_push(&qwen, TokId{u});      /* 6 the word "user" inside the message: not a marker */
+    pulsar_tokens_push(&qwen, TokId{5});
+    pulsar_tokens_push(&qwen, TokId{start});  /* 8 <|im_start|>assistant */
+    pulsar_tokens_push(&qwen, TokId{a});
     TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &qwen, &q) == 4);
     /* a one-token marker table does not match Qwen's two-token turns */
     TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &qwen, &m) == -1);
@@ -7912,30 +7913,30 @@ static void test_l318_resume_picks_the_deepest(void) {
 }
 
 static void test_kv_cache_chat_anchor_ignores_multiturn_tail(void) {
-    const int user = 9001;
+    const TokId user{9001};
     const int assistant = 9002;
-    const pulsar_turn_markers m = {{user, 0}, 1, {assistant, 0}, 1};
+    const pulsar_turn_markers m = {{user, TokId{0}}, 1, {TokId{assistant}, TokId{0}}, 1};
     kv_disk_cache kc = {0};
     kc.opt = kv_cache_default_options();
     kc.opt.min_tokens = 2;
 
     pulsar_tokens prompt = {0};
-    pulsar_tokens_push(&prompt, 1);
-    pulsar_tokens_push(&prompt, 2);
-    pulsar_tokens_push(&prompt, user);      /* first task */
-    pulsar_tokens_push(&prompt, 3);
-    pulsar_tokens_push(&prompt, assistant); /* stop scanning here */
-    pulsar_tokens_push(&prompt, 4);
-    pulsar_tokens_push(&prompt, user);      /* later turn: not a cold anchor */
-    pulsar_tokens_push(&prompt, 5);
-    pulsar_tokens_push(&prompt, assistant);
+    pulsar_tokens_push(&prompt, TokId{1});
+    pulsar_tokens_push(&prompt, TokId{2});
+    pulsar_tokens_push(&prompt, TokId{user});      /* first task */
+    pulsar_tokens_push(&prompt, TokId{3});
+    pulsar_tokens_push(&prompt, TokId{assistant}); /* stop scanning here */
+    pulsar_tokens_push(&prompt, TokId{4});
+    pulsar_tokens_push(&prompt, TokId{user});      /* later turn: not a cold anchor */
+    pulsar_tokens_push(&prompt, TokId{5});
+    pulsar_tokens_push(&prompt, TokId{assistant});
     TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, &m) == 2);
 
     kc.opt.min_tokens = 3;
     TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, &m) == -1);
     /* unknown markers (the tokenizer does not spell them): no anchor */
-    const pulsar_turn_markers none = {{0, 0}, 0, {0, 0}, 0};
-    const pulsar_turn_markers no_assistant = {{user, 0}, 1, {0, 0}, 0};
+    const pulsar_turn_markers none = {};
+    const pulsar_turn_markers no_assistant = {{user, TokId{0}}, 1, {TokId{0}, TokId{0}}, 0};
     kc.opt.min_tokens = 2;
     TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, &none) == -1);
     TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, &no_assistant) == -1);
@@ -9539,10 +9540,10 @@ static void test_l354_http_framing(void) {
 #include <sys/resource.h>
 
 /* L353 no. 11's vocabulary: a token is its own text. */
-static char *l353_tok_text(void *ud, int tok, size_t *len) {
+static char *l353_tok_text(void *ud, TokId tok, size_t *len) {
     const char *const *v = (const char *const *)ud;
-    *len = strlen(v[tok]);
-    return strdup(v[tok]);
+    *len = strlen(v[tok.raw()]);
+    return strdup(v[tok.raw()]);
 }
 
 /* L353 nos. 8, 10, 11, 19. */
@@ -9550,7 +9551,8 @@ static void test_l353_routing_fixes(void) {
     /* 11: a seam is a mismatch the cursors realign after; a real divergence isn't one */
     const char *const vocab[] = {"ab", "a", "b", "c"};
     pulsar_prefix_match m;
-    const int live[] = {0, 3}, seam[] = {1, 2, 3}, diverge[] = {1, 3};
+    const TokId live[] = {TokId{0}, TokId{3}}, seam[] = {TokId{1}, TokId{2}, TokId{3}}, diverge[] = {TokId{1},
+        TokId{3}};
     pulsar_tokens_prefix_match_with(l353_tok_text, (void *)vocab, live, 2, seam, 3, &m);
     TEST_ASSERT(m.seamed && m.live_cut.raw() == 2 && m.prompt_cut.raw() == 3);
     pulsar_tokens_prefix_match_with(l353_tok_text, (void *)vocab, live, 2, diverge, 2, &m);
@@ -9858,7 +9860,7 @@ static void test_l372_judge_ends_a_gone_clients_request(void) {
         pthread_cond_init(&jb.cv, NULL);
         jb.fd = sv[0];
         pulsar_tokens prompt = {0};
-        pulsar_tokens_push(&prompt, 1);
+        pulsar_tokens_push(&prompt, TokId{1});
         jb.prompts.push_back(prompt);
         J->head = J->tail = &jb;
         TEST_ASSERT(server_judge_queued(&s));
@@ -9967,7 +9969,8 @@ static void test_l372_abandoned_decode_is_not_a_turn(void) {
  * to: the preamble's (the first user marker) and the conversation key's (the first assistant marker), which every
  * turn of one conversation shares and two conversations behind one system prompt do not. */
 static void test_l378_token_hash_and_conversation_key(void) {
-    const int v[6] = {1, 2, 3, 4, 5, 6}, w[6] = {1, 2, 3, 9, 9, 9};
+    const TokId v[6] = {TokId{1}, TokId{2}, TokId{3}, TokId{4}, TokId{5}, TokId{6}}, w[6] = {TokId{1}, TokId{2},
+        TokId{3}, TokId{9}, TokId{9}, TokId{9}};
     TEST_ASSERT(server_kv_token_hash(v, 0) == UINT64_C(0xcbf29ce484222325) && server_kv_token_hash(NULL, 0) ==
                                                                                  server_kv_token_hash(v, -1));
     TEST_ASSERT(server_kv_token_hash(v, 3) == UINT64_C(0xfd1f0f4381eb0395));
@@ -9977,15 +9980,16 @@ static void test_l378_token_hash_and_conversation_key(void) {
 
     pulsar_turn_markers m;
     memset(&m, 0, sizeof m);
-    m.user[0] = 900;
+    m.user[0] = TokId{900};
     m.n_user = 1;
-    m.assistant[0] = 901;
+    m.assistant[0] = TokId{901};
     m.n_assistant = 1;
     /* system 10 11 12 | user 20 21 | assistant: turn 1 ends at its generation header, turn 2 carries the reply and
      * the next user turn; another conversation asks something else behind the same system prompt */
-    int t1[] = {10, 11, 12, 900, 20, 21, 901};
-    int t2[] = {10, 11, 12, 900, 20, 21, 901, 30, 31, 900, 40, 901};
-    int o1[] = {10, 11, 12, 900, 50, 51, 52, 901};
+    TokId t1[] = {TokId{10}, TokId{11}, TokId{12}, TokId{900}, TokId{20}, TokId{21}, TokId{901}};
+    TokId t2[] = {TokId{10}, TokId{11}, TokId{12}, TokId{900}, TokId{20}, TokId{21}, TokId{901}, TokId{30}, TokId{31},
+        TokId{900}, TokId{40}, TokId{901}};
+    TokId o1[] = {TokId{10}, TokId{11}, TokId{12}, TokId{900}, TokId{50}, TokId{51}, TokId{52}, TokId{901}};
     const pulsar_tokens p1 = {t1, 7, 7}, p2 = {t2, 12, 12}, q1 = {o1, 8, 8};
     TEST_ASSERT(server_prompt_preamble_end(&p1, &m) == 3 && server_prompt_preamble_end(&p2, &m) == 3);
     TEST_ASSERT(server_prompt_conv_end(&p1, &m) == 6 && server_prompt_conv_end(&p2, &m) == 6 &&
@@ -10000,7 +10004,7 @@ static void test_l378_token_hash_and_conversation_key(void) {
     TEST_ASSERT(server_prompt_preamble_end(&p1, &none) == -1 && server_prompt_conv_end(&p1, &none) == 7);
     TEST_ASSERT(server_prompt_preamble_end(NULL, &m) == -1 && server_prompt_conv_end(NULL, &m) == 0);
     /* an assistant turn before any user turn: no preamble; the key ends at that turn */
-    int a0[] = {10, 901, 11, 900, 12};
+    TokId a0[] = {TokId{10}, TokId{901}, TokId{11}, TokId{900}, TokId{12}};
     const pulsar_tokens pa = {a0, 5, 5};
     TEST_ASSERT(server_prompt_preamble_end(&pa, &m) == -1 && server_prompt_conv_end(&pa, &m) == 1);
     /* the disk tier's preamble rule is this position held to its min_tokens */
@@ -10078,7 +10082,7 @@ static void test_l378_kv_req_line_format(void) {
     pthread_mutex_init(&s.mu, NULL);
     job j;
     memset(&j, 0, sizeof j);
-    int toks[] = {10, 11, 12};
+    TokId toks[] = {TokId{10}, TokId{11}, TokId{12}};
     j.req.prompt = {toks, 3, 3};
     j.req.kind = REQ_COMPLETION;
     snprintf(j.req.hints.session, sizeof j.req.hints.session, "a-session-id-longer-than-sixteen-chars");
@@ -10574,7 +10578,7 @@ static void test_l372_judge_bank_floor_and_release(void) {
         pthread_cond_init(&jb.cv, NULL);
         jb.fd = sv[0];
         pulsar_tokens prompt = {0};
-        pulsar_tokens_push(&prompt, 1);
+        pulsar_tokens_push(&prompt, TokId{1});
         jb.prompts.push_back(prompt);
         J->head = J->tail = &jb;
         /* a judge request running or queued: the bank is its own */
@@ -11754,18 +11758,18 @@ static void test_l273_image_cold_cut(void) {
 }
 
 static void test_l275_route_turn_anchor(void) {
-    const int user = 9001, assistant = 9002;
-    const pulsar_turn_markers m = {{user, 0}, 1, {assistant, 0}, 1};
+    const TokId user{9001}, assistant{9002};
+    const pulsar_turn_markers m = {{user, TokId{0}}, 1, {assistant, TokId{0}}, 1};
     pulsar_tokens bank = {0};
-    pulsar_tokens_push(&bank, 1);          /* 0 bos */
-    pulsar_tokens_push(&bank, 2);          /* 1 system prompt */
-    pulsar_tokens_push(&bank, user);       /* 2 first task */
-    pulsar_tokens_push(&bank, 3);          /* 3 */
-    pulsar_tokens_push(&bank, assistant);  /* 4 the reply */
-    pulsar_tokens_push(&bank, 4);          /* 5 */
-    pulsar_tokens_push(&bank, user);       /* 6 the tool result / next task */
-    pulsar_tokens_push(&bank, 5);          /* 7 */
-    pulsar_tokens_push(&bank, assistant);  /* 8 the generation prompt */
+    pulsar_tokens_push(&bank, TokId{1});          /* 0 bos */
+    pulsar_tokens_push(&bank, TokId{2});          /* 1 system prompt */
+    pulsar_tokens_push(&bank, TokId{user});       /* 2 first task */
+    pulsar_tokens_push(&bank, TokId{3});          /* 3 */
+    pulsar_tokens_push(&bank, TokId{assistant});  /* 4 the reply */
+    pulsar_tokens_push(&bank, TokId{4});          /* 5 */
+    pulsar_tokens_push(&bank, TokId{user});       /* 6 the tool result / next task */
+    pulsar_tokens_push(&bank, TokId{5});          /* 7 */
+    pulsar_tokens_push(&bank, TokId{assistant});  /* 8 the generation prompt */
     /* the last user marker the bank prefilled, with an exchange before it */
     TEST_ASSERT(server_route_turn_anchor(&bank, bank.len, &m) == 6);
     /* prefilled stops before the second marker: the only user marker has no
@@ -11775,8 +11779,8 @@ static void test_l275_route_turn_anchor(void) {
     /* a prefilled count past the history is clamped to it */
     TEST_ASSERT(server_route_turn_anchor(&bank, bank.len + 10, &m) == 6);
     /* unknown markers (the tokenizer does not spell them, L272 B5): no anchor */
-    const pulsar_turn_markers none = {{0, 0}, 0, {0, 0}, 0};
-    const pulsar_turn_markers no_user = {{0, 0}, 0, {assistant, 0}, 1};
+    const pulsar_turn_markers none = {};
+    const pulsar_turn_markers no_user = {{TokId{0}, TokId{0}}, 0, {assistant, TokId{0}}, 1};
     TEST_ASSERT(server_route_turn_anchor(&bank, bank.len, &none) == -1);
     TEST_ASSERT(server_route_turn_anchor(&bank, bank.len, &no_user) == -1);
     TEST_ASSERT(server_route_turn_anchor(&bank, bank.len, NULL) == -1);
@@ -11784,18 +11788,18 @@ static void test_l275_route_turn_anchor(void) {
     pulsar_tokens_free(&bank);
 
     /* Qwen's two-token markers (L272 B5): the same shape rendered by its template */
-    const int start = 151644, u = 872, a = 77091;
+    const TokId start{151644}, u{872}, a{77091};
     const pulsar_turn_markers q = {{start, u}, 2, {start, a}, 2};
     pulsar_tokens qb = {0};
-    pulsar_tokens_push(&qb, start);  pulsar_tokens_push(&qb, 8948);  /* 0 <|im_start|>system */
-    pulsar_tokens_push(&qb, 2);                                     /* 2 */
-    pulsar_tokens_push(&qb, start);  pulsar_tokens_push(&qb, u);     /* 3 <|im_start|>user */
-    pulsar_tokens_push(&qb, 3);                                     /* 5 */
-    pulsar_tokens_push(&qb, start);  pulsar_tokens_push(&qb, a);     /* 6 <|im_start|>assistant */
-    pulsar_tokens_push(&qb, 4);                                     /* 8 */
-    pulsar_tokens_push(&qb, start);  pulsar_tokens_push(&qb, u);     /* 9 <|im_start|>user */
-    pulsar_tokens_push(&qb, u);                                     /* 11 the word "user" in the message */
-    pulsar_tokens_push(&qb, start);  pulsar_tokens_push(&qb, a);     /* 12 <|im_start|>assistant */
+    pulsar_tokens_push(&qb, TokId{start});  pulsar_tokens_push(&qb, TokId{8948});  /* 0 <|im_start|>system */
+    pulsar_tokens_push(&qb, TokId{2});                                     /* 2 */
+    pulsar_tokens_push(&qb, TokId{start});  pulsar_tokens_push(&qb, TokId{u});     /* 3 <|im_start|>user */
+    pulsar_tokens_push(&qb, TokId{3});                                     /* 5 */
+    pulsar_tokens_push(&qb, TokId{start});  pulsar_tokens_push(&qb, TokId{a});     /* 6 <|im_start|>assistant */
+    pulsar_tokens_push(&qb, TokId{4});                                     /* 8 */
+    pulsar_tokens_push(&qb, TokId{start});  pulsar_tokens_push(&qb, TokId{u});     /* 9 <|im_start|>user */
+    pulsar_tokens_push(&qb, TokId{u});                                     /* 11 the word "user" in the message */
+    pulsar_tokens_push(&qb, TokId{start});  pulsar_tokens_push(&qb, TokId{a});     /* 12 <|im_start|>assistant */
     TEST_ASSERT(server_route_turn_anchor(&qb, qb.len, &q) == 9);
     /* the marker's second token is past what the bank prefilled: no marker there */
     TEST_ASSERT(server_route_turn_anchor(&qb, 10, &q) == -1);
@@ -11818,17 +11822,17 @@ static void test_l275_route_turn_anchor(void) {
  * re-renders that turn "<think></think>answer" (truncate_history_thinking), so it matches the bank through the header
  * and "<think>" only.  A first-turn bank: no last-turn anchor, and before this every such turn took a fresh bank. */
 static void test_l311_route_header_anchor(void) {
-    const int start = 151644, u = 872, a = 77091, nl = 198, think = 151667, think_end = 151668;
+    const TokId start{151644}, u{872}, a{77091}, nl{198}, think{151667}, think_end{151668};
     const pulsar_turn_markers q = {{start, u}, 2, {start, a}, 2};
     pulsar_tokens b = {0};
-    pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, 8948);   /* 0 <|im_start|>system */
-    for (int i = 0; i < 300; i++) pulsar_tokens_push(&b, 1000 + i); /* 2 .. 301 the system prompt + tools */
+    pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, TokId{8948});   /* 0 <|im_start|>system */
+    for (int i = 0; i < 300; i++) pulsar_tokens_push(&b, TokId{1000 + i}); /* 2 .. 301 the system prompt + tools */
     pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, u);      /* 302 <|im_start|>user */
-    for (int i = 0; i < 40; i++) pulsar_tokens_push(&b, 2000 + i);  /* 304 .. 343 the task */
+    for (int i = 0; i < 40; i++) pulsar_tokens_push(&b, TokId{2000 + i});  /* 304 .. 343 the task */
     pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, a);      /* 344 <|im_start|>assistant: the header */
     pulsar_tokens_push(&b, nl);     pulsar_tokens_push(&b, think);  pulsar_tokens_push(&b, nl);   /* 346 .. 348 */
     const int prefilled = b.len;                                    /* 349: the prompt the bank prefilled */
-    for (int i = 0; i < 200; i++) pulsar_tokens_push(&b, 3000 + i); /* the reasoning, decoded */
+    for (int i = 0; i < 200; i++) pulsar_tokens_push(&b, TokId{3000 + i}); /* the reasoning, decoded */
     pulsar_tokens_push(&b, think_end);
     TEST_ASSERT(server_route_header_anchor(&b, prefilled, &q) == 345);
     TEST_ASSERT(server_route_turn_anchor(&b, prefilled, &q) == -1);   /* a first-turn bank has no last-turn anchor */
@@ -11842,7 +11846,7 @@ static void test_l311_route_header_anchor(void) {
     TEST_ASSERT(!server_route_in_place(320, 256, b.len, prefilled, 157, 345));
     /* the header's second token past what the bank prefilled: the marker before it */
     TEST_ASSERT(server_route_header_anchor(&b, 345, &q) == -1);
-    const pulsar_turn_markers none = {{0, 0}, 0, {0, 0}, 0};
+    const pulsar_turn_markers none = {};
     TEST_ASSERT(server_route_header_anchor(&b, prefilled, &none) == -1 && server_route_header_anchor(NULL, 9, &q) == -1);
     pulsar_tokens_free(&b);
 }
@@ -11854,12 +11858,12 @@ static void test_l311_route_header_anchor(void) {
  * last turn, the endpoint the first reply after it, and the next user turn continues in place. */
 static void test_l351_tool_turns(void) {
     const int start = 151644, u = 872, a = 77091, nl = 198, tr = 151665;
-    pulsar_turn_markers q = {{start, u}, 2, {start, a}, 2};
-    q.tool[0] = nl;
-    q.tool[1] = tr;
+    pulsar_turn_markers q = {{TokId{start}, TokId{u}}, 2, {TokId{start}, TokId{a}}, 2};
+    q.tool[0] = TokId{nl};
+    q.tool[1] = TokId{tr};
     q.n_tool = 2;
     pulsar_tokens b = {0};
-    auto push = [&](std::initializer_list<int> ids) { for (int id : ids) pulsar_tokens_push(&b, id); };
+    auto push = [&](std::initializer_list<int> ids) { for (int id : ids) pulsar_tokens_push(&b, TokId{id}); };
     push({start, 8948, 9});                 /* 0 system */
     push({start, u, nl, 11, 12});           /* 3 user: the client's message */
     push({start, a, nl, 20, 21, 22});       /* 8 assistant: reply 1 (a tool call) */
@@ -11883,7 +11887,8 @@ static void test_l351_tool_turns(void) {
     pulsar_tokens b2 = {0};
     for (int i = 0; i < b.len; i++) pulsar_tokens_push(&b2, b.v[i]);
     const int u2 = b2.len;                                           /* 37 the client's next message */
-    for (int id : {start, u, nl, 70, start, a, nl, 80, start, u, nl, tr, 90, start, a, nl, 95, 96}) pulsar_tokens_push(&b2, id);
+    for (int id : {start, u, nl, 70, start, a, nl, 80, start, u, nl, tr, 90, start, a, nl, 95, 96})
+        pulsar_tokens_push(&b2, TokId{id});
     TEST_ASSERT(server_route_turn_anchor(&b2, b2.len, &q) == u2);
     TEST_ASSERT(server_route_turn_anchor(&b2, b2.len, &plain) == u2 + 8);   /* L322 rule's old answer: the tool result */
     /* the endpoint: the first reply after the client's last turn -- the same in every request of the turn */
@@ -12062,32 +12067,32 @@ static void test_l326_responses_tool_search_in_place(void) {
 }
 
 static void test_l322_route_side_call(void) {
-    const int start = 151644, end = 151645, u = 872, a = 77091, nl = 198, think = 151667, think_end = 151668;
+    const TokId start{151644}, end{151645}, u{872}, a{77091}, nl{198}, think{151667}, think_end{151668};
     const pulsar_turn_markers q = {{start, u}, 2, {start, a}, 2};
     pulsar_tokens b = {0};
-    pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, 8948);   /* 0 <|im_start|>system */
-    for (int i = 0; i < 300; i++) pulsar_tokens_push(&b, 1000 + i); /* 2 .. 301 the system prompt + tools */
+    pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, TokId{8948});   /* 0 <|im_start|>system */
+    for (int i = 0; i < 300; i++) pulsar_tokens_push(&b, TokId{1000 + i}); /* 2 .. 301 the system prompt + tools */
     pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, u);      /* 302 <|im_start|>user: the task */
-    for (int i = 0; i < 40; i++) pulsar_tokens_push(&b, 2000 + i);
+    for (int i = 0; i < 40; i++) pulsar_tokens_push(&b, TokId{2000 + i});
     pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, a);      /* 344 turn N-1's header ... */
-    for (int i = 0; i < 100; i++) pulsar_tokens_push(&b, 3000 + i); /* ... and its reply */
+    for (int i = 0; i < 100; i++) pulsar_tokens_push(&b, TokId{3000 + i}); /* ... and its reply */
     pulsar_tokens_push(&b, end);    pulsar_tokens_push(&b, nl);
     const int user_n = b.len;                                       /* 448 <|im_start|>user: turn N */
     pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, u);
-    for (int i = 0; i < 60; i++) pulsar_tokens_push(&b, 4000 + i);
+    for (int i = 0; i < 60; i++) pulsar_tokens_push(&b, TokId{4000 + i});
     pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, a);      /* turn N's header ... */
     pulsar_tokens_push(&b, nl);     pulsar_tokens_push(&b, think);
-    for (int i = 0; i < 200; i++) pulsar_tokens_push(&b, 5000 + i); /* ... its reply, terminal-checkpointed */
+    for (int i = 0; i < 200; i++) pulsar_tokens_push(&b, TokId{5000 + i}); /* ... its reply, terminal-checkpointed */
     pulsar_tokens_push(&b, think_end);
     const int turn_end = b.len;                                     /* the side call's match: all of it */
     pulsar_tokens_push(&b, end);    pulsar_tokens_push(&b, nl);
     const int side_user = b.len;                                    /* the side call's <|im_start|>user */
     pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, u);
-    for (int i = 0; i < 330; i++) pulsar_tokens_push(&b, 6000 + i); /* "SUGGESTION MODE ..." */
+    for (int i = 0; i < 330; i++) pulsar_tokens_push(&b, TokId{6000 + i}); /* "SUGGESTION MODE ..." */
     const int side_header = b.len;
     pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, a);
     pulsar_tokens_push(&b, nl);     pulsar_tokens_push(&b, think);
-    for (int i = 0; i < 250; i++) pulsar_tokens_push(&b, 7000 + i); /* its reply, terminal-checkpointed */
+    for (int i = 0; i < 250; i++) pulsar_tokens_push(&b, TokId{7000 + i}); /* its reply, terminal-checkpointed */
     const int prefilled = b.len, frontier = b.len;
     TEST_ASSERT(server_route_turn_anchor(&b, prefilled, &q) == side_user);
     TEST_ASSERT(server_route_header_anchor(&b, prefilled, &q) == side_header + 1);
@@ -12113,7 +12118,7 @@ static void test_l322_route_side_call(void) {
     for (int i = 0; i < 349; i++) pulsar_tokens_push(&fb, b.v[i]);   /* system, task, turn N-1's header + 3 */
     TEST_ASSERT(server_route_turn_anchor(&fb, fb.len, &q) == -1);
     TEST_ASSERT(server_route_anchor(&fb, fb.len, &q) == 345);
-    const pulsar_turn_markers none = {{0, 0}, 0, {0, 0}, 0};
+    const pulsar_turn_markers none = {};
     TEST_ASSERT(server_route_anchor(&b, prefilled, &none) == -1 && server_route_anchor(NULL, 9, &q) == -1);
     pulsar_tokens_free(&fb);
     pulsar_tokens_free(&b);
@@ -13263,7 +13268,7 @@ static void test_l380_terminal_grace_and_yield(void) {
     sl->turn_ended_at = 100.2;
     TEST_ASSERT(!sl->terminal_pending && s.slot_interrupted_turn(sl) == NULL);
     pulsar_tokens turn = {0};
-    for (int i = 0; i < 700; i++) pulsar_tokens_push(&turn, 1000 + i);
+    for (int i = 0; i < 700; i++) pulsar_tokens_push(&turn, TokId{1000 + i});
     s.slot_terminal_rearm(sl, &turn, true);
     TEST_ASSERT(turn.len == 0 && turn.v == NULL);
     TEST_ASSERT(sl->terminal_pending && sl->terminal_short_first && sl->provisioned);
@@ -13294,7 +13299,8 @@ static void test_l380_terminal_grace_and_yield(void) {
     live_tool_state_free(&sl->anthropic_live);
 
     /* the bank's tokens must be a prefix of the kept turn for the continuation to be built from it */
-    int a3[] = {1, 2, 3}, a4[] = {1, 2, 3, 4}, b3[] = {1, 9, 3};
+    TokId a3[] = {TokId{1}, TokId{2}, TokId{3}}, a4[] = {TokId{1}, TokId{2}, TokId{3}, TokId{4}}, b3[] = {TokId{1},
+        TokId{9}, TokId{3}};
     const pulsar_tokens p3 = {a3, 3, 3}, p4 = {a4, 4, 4}, q3 = {b3, 3, 3}, none = {NULL, 0, 0};
     TEST_ASSERT(server_tokens_prefix_of(&p3, &p4) && server_tokens_prefix_of(&p4, &p4) && server_tokens_prefix_of(&none, &p3));
     TEST_ASSERT(!server_tokens_prefix_of(&p4, &p3) && !server_tokens_prefix_of(&q3, &p4));
@@ -13646,7 +13652,8 @@ static void test_l380_batch_frontier(void) {
     TEST_ASSERT(s.slot_common_prefix(&sl, &any) == 0);
     s.pool_banks = 0;
     /* a slot's history is the engine's tokens, then the batch's commits: its length and its compares read both */
-    int bv[4] = {1, 2, 3, 4}, tv[2] = {5, 6}, wv[6] = {1, 2, 3, 4, 5, 7};
+    TokId bv[4] = {TokId{1}, TokId{2}, TokId{3}, TokId{4}}, tv[2] = {TokId{5}, TokId{6}}, wv[6] = {TokId{1}, TokId{2},
+        TokId{3}, TokId{4}, TokId{5}, TokId{7}};
     pulsar_tokens b = {bv, 4, 4}, t = {tv, 2, 2}, w = {wv, 6, 6}, t0 = {0};
     const slot_tokens two = {&b, &t}, flat = {&w, NULL}, entry = {&b, NULL}, fresh = {&b, &t0}, none = {NULL, NULL};
     TEST_ASSERT(slot_tokens_len(two) == 6 && slot_tokens_len(entry) == 4 && slot_tokens_len(fresh) == 4 &&
@@ -13654,7 +13661,7 @@ static void test_l380_batch_frontier(void) {
     TEST_ASSERT(slot_tokens_common(two, flat) == 5 && slot_tokens_common(flat, two) == 5);   /* parts inside the tail */
     TEST_ASSERT(slot_tokens_common(two, entry) == 4 && slot_tokens_common(two, two) == 6);
     TEST_ASSERT(slot_tokens_common(two, none) == 0 && slot_tokens_common(none, flat) == 0);
-    wv[1] = 9;   /* parts inside the base */
+    wv[1] = TokId{9};   /* parts inside the base */
     TEST_ASSERT(slot_tokens_common(two, flat) == 1);
     pthread_mutex_destroy(&s.tool_mu);
 }
@@ -17026,7 +17033,10 @@ static void test_l353_image_keys(void) {
 static const char *const l334_vocab[] = {"<ctl>", "X", "a", "b", "c", "d", "ab", "abc", "bc", "cd", "bcd", "Y", "Z"};
 enum { L334_CTL, L334_X, L334_A, L334_B, L334_C, L334_D, L334_AB, L334_ABC, L334_BC, L334_CD, L334_BCD, L334_Y,
        L334_Z };
-static char *l334_text(void *, int token, size_t *len) {
+/** A toy vocabulary entry as the id it is.  @param i the entry  @return its id */
+static TokId l334_id(int i) { return TokId{i}; }
+static char *l334_text(void *, TokId id, size_t *len) {
+    const int token = id.raw();   /* the toy vocabulary's index */
     const char *t = token == L334_CTL ? "" : l334_vocab[token];
     *len = strlen(t);
     return server_xstrdup(t);
@@ -17038,8 +17048,8 @@ static char *l334_text(void *, int token, size_t *len) {
 static void test_l334_prompt_held_across_a_seam(void) {
     /* live X|a|b|cd|Y (bytes 1,2,3,5,6), the request X|abc|d|Y|Z (bytes 1,4,5,6,7): the bytes agree through Y, the
      * ids only on X -- a re-spelled stretch "abcd" that costs 3 live tokens and 2 prompt ones */
-    const int live[] = {L334_X, L334_A, L334_B, L334_CD, L334_Y};
-    const int prompt[] = {L334_X, L334_ABC, L334_D, L334_Y, L334_Z};
+    const TokId live[] = {l334_id(L334_X), l334_id(L334_A), l334_id(L334_B), l334_id(L334_CD), l334_id(L334_Y)};
+    const TokId prompt[] = {l334_id(L334_X), l334_id(L334_ABC), l334_id(L334_D), l334_id(L334_Y), l334_id(L334_Z)};
     pulsar_prefix_match m;
     pulsar_tokens_prefix_match_with(l334_text, NULL, live, 5, prompt, 5, &m);
     TEST_ASSERT(m.seamed && m.live_cut == TokCount{5} && m.prompt_cut == PromptToks{4});
@@ -17062,16 +17072,16 @@ static void test_l334_prompt_held_across_a_seam(void) {
     }
     /* a stretch whose request tokens end before G's byte: live X|abc|d (bytes 1,4,5), the request X|a|b|cd (1,2,3,5);
      * at live 2 (byte 4) the request's X a b lie wholly inside it, "cd" does not (no shared boundary below but X) */
-    const int live2[] = {L334_X, L334_ABC, L334_D};
-    const int prompt2[] = {L334_X, L334_A, L334_B, L334_CD};
+    const TokId live2[] = {l334_id(L334_X), l334_id(L334_ABC), l334_id(L334_D)};
+    const TokId prompt2[] = {l334_id(L334_X), l334_id(L334_A), l334_id(L334_B), l334_id(L334_CD)};
     TEST_ASSERT(pulsar_tokens_prompt_held_with(l334_text, NULL, live2, TokPos{2}, prompt2, 4) == PromptToks{3});
     TEST_ASSERT(pulsar_tokens_prompt_held_with(l334_text, NULL, live2, TokPos{3}, prompt2, 4) == PromptToks{4});
     /* no seam: the identity */
     TEST_ASSERT(pulsar_tokens_prompt_held_with(l334_text, NULL, prompt, TokPos{3}, prompt, 5) == PromptToks{3});
     /* a control token is matched by id only, never by bytes: live X|a|bc (bytes 1,2,4) holds the request's X and
      * "ab", and the count stops at the request's control token whatever bytes follow */
-    const int live3[] = {L334_X, L334_A, L334_BC, L334_Y};
-    const int prompt3[] = {L334_X, L334_AB, L334_CTL, L334_Y};
+    const TokId live3[] = {l334_id(L334_X), l334_id(L334_A), l334_id(L334_BC), l334_id(L334_Y)};
+    const TokId prompt3[] = {l334_id(L334_X), l334_id(L334_AB), l334_id(L334_CTL), l334_id(L334_Y)};
     TEST_ASSERT(pulsar_tokens_prompt_held_with(l334_text, NULL, live3, TokPos{3}, prompt3, 4) == PromptToks{2});
 }
 

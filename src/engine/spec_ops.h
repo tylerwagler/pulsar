@@ -105,7 +105,7 @@ typedef struct pulsar_drafter_ops {
     bool (*absorb)(struct pulsar_session *s, uint32_t row, int32_t next);
     /** Every deferred row in one pass, no bank switch: rows[i] of banks[i], followed by next[i]. */
     bool (*absorb_banked)(struct pulsar_session *s, const uint32_t *rows, const uint32_t *banks,
-                          const int32_t *next, uint32_t n);
+                          const TokId *next, uint32_t n);
     /** Draft the installed bank's next chain after `next_base`: up to the session's depth, cut by the stop
      *  rule, each draft with a confidence (or -1), sampled drafts (temperature > 0) drawn from the
      *  request-filtered proposal q at the draft's own key -- draft j at pulsar_sample_key(*rng, j), the key the

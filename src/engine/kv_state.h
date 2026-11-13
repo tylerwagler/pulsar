@@ -173,7 +173,7 @@ typedef struct pulsar_ckpt_record {
     /** host: the T token ids the record's state is the prefill of -- the match authority at a resume (a history
      *  rewound inside T's last compressor group and re-prefilled with other ids keeps the record's rows, not its
      *  tokens) */
-    int32_t *tokens;
+    TokId *tokens;
     /// capacity of `tokens` in ids (grown to T on capture)
     uint32_t tokens_cap;
     /** L350: host, owned: the image blocks merged into the record's state below T -- the match authority beside
@@ -381,7 +381,7 @@ static inline uint32_t pulsar_ckpt_records_for(uint32_t n_banks) {
 /// @param img    L350: the image blocks merged into the state (copied, trimmed to T), or NULL for a text history
 /// @return true when captured
 bool pulsar_ckpt_record_capture(pulsar_ckpt_store *st, BankId bank, pulsar_ckpt_record_kind kind, TokPos T,
-                                const int *tokens, const float *logits, uint32_t width,
+                                const TokId *tokens, const float *logits, uint32_t width,
                                 const struct pulsar_image_identity *img);
 /** The deepest of `bank`'s records whose ids are tokens[0, T) (of `len`) with T <= limit and -- when T == prompt_len,
  *  a resume AT T -- that holds the logits that resume reads.  NULL when none.  L350: and whose images are the
@@ -395,7 +395,7 @@ bool pulsar_ckpt_record_capture(pulsar_ckpt_store *st, BankId bank, pulsar_ckpt_
 /// @param prompt_len the prompt's length in tokens (a record at it must keep logits)
 /// @param want       L350: the request's image blocks over the whole prompt, or NULL (text records only)
 /// @return the record (the store's; borrowed), or NULL
-const pulsar_ckpt_record *pulsar_ckpt_record_best(const pulsar_ckpt_store *st, BankId bank, const int *tokens,
+const pulsar_ckpt_record *pulsar_ckpt_record_best(const pulsar_ckpt_store *st, BankId bank, const TokId *tokens,
                                                   TokCount len, TokPos limit, TokCount prompt_len,
                                                   const struct pulsar_image_identity *want);
 /** `bank`'s record of `kind`, NULL when none. */

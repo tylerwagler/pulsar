@@ -606,7 +606,7 @@ int pulsar_session::copy_out_segment(uint32_t G_prev, uint32_t G, uint8_t *dst, 
         0u,
     };
     for (uint32_t i = 0; i < SEGMENT_U32_FIELDS; i++) o.u32(header[i]);
-    for (uint32_t p = G_prev; p < G; p++) o.u32((uint32_t)s->checkpoint.v[p]);
+    for (uint32_t p = G_prev; p < G; p++) o.u32((uint32_t)s->checkpoint.v[p].raw());
     o.u32(n_img);
     for (uint32_t i = 0; i < n_img; i++) {   /* L281: the span's image records */
         uint32_t rec[SEGMENT_IMAGE_U32];
@@ -864,7 +864,8 @@ pulsar_segment_status pulsar_session::load_segment(const uint8_t *seg, uint64_t 
     /* Commit: the history, the frontier, then the restore point's checkpoint (after the frontier write, which could
      * otherwise drop it).  The lanes and window describe no position yet -- stale until the last segment restores
      * its checkpoint. */
-    for (uint32_t p = 0; p < G - G_prev; p++) token_vec_push(&s->checkpoint, (int)payload_get_u32(v.toks + 4u * p));
+    for (uint32_t p = 0; p < G - G_prev; p++)
+        token_vec_push(&s->checkpoint, TokId{(int)payload_get_u32(v.toks + 4u * p)});
     for (uint32_t i = 0; i < v.n_img; i++) s->live_images.b[s->live_images.n++] = v.imgs[i];   /* L281 */
     st->ops->set_frontier_stale(st->state, pulsar_ckpt_pos(G));
     if (last) pulsar_ckpt_commit(st, bank, at.slot, TokPos{(int)G});
@@ -1114,7 +1115,8 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
     };
     int rc = 0;
     for (uint32_t i = 0; rc == 0 && i < KVP_U32_FIELDS; i++) rc = payload_write_u32(&io, header[i], err, errlen);
-    for (uint32_t i = 0; rc == 0 && i < p.T; i++) rc = payload_write_u32(&io, (uint32_t)s->checkpoint.v[i], err, errlen);
+    for (uint32_t i = 0; rc == 0 && i < p.T; i++)
+        rc = payload_write_u32(&io, (uint32_t)s->checkpoint.v[i].raw(), err, errlen);
     if (rc == 0) rc = payload_write_images(&io, s->live_images.b, s->live_images.n, err, errlen);
     uint32_t spec_rec[KVP_SPEC_U32];
     kvp_spec_pack(&s->spec, spec_rec);
@@ -1196,7 +1198,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     for (uint32_t i = 0; i < T; i++) {
         uint32_t t = 0;
         if (payload_read_u32(&io, &t, &remaining, err, errlen) != 0) return drop();
-        token_vec_push(&toks, (int)t);
+        token_vec_push(&toks, TokId{(int)t});
     }
     uint32_t n_img = 0;
     if (payload_read_u32(&io, &n_img, &remaining, err, errlen) != 0) return drop();

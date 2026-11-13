@@ -69,7 +69,7 @@ bool encode_into(const pulsar_engine *e, const char *text, size_t len, const pul
         if (why && whylen) snprintf(why, whylen, "%s", err);
         return false;
     }
-    for (int id : ids) pulsar_tokens_push(out, id);
+    for (int id : ids) pulsar_tokens_push(out, TokId{id});
     return true;
 }
 
@@ -249,10 +249,10 @@ bool turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
                     model.v[0] != system.v[0] && user.v[0] != system.v[0];
     pulsar_tokens_free(&system);
     if (ok) {
-        out->user[0] = start;
+        out->user[0] = TokId{start};
         out->user[1] = user.v[0];
         out->n_user = 2;
-        out->assistant[0] = start;
+        out->assistant[0] = TokId{start};
         out->assistant[1] = model.v[0];
         out->n_assistant = 2;
     } else {
@@ -274,12 +274,12 @@ bool turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
  *  @param tokens  the ids to print */
 void dump(pulsar_engine *e, FILE *fp, const pulsar_tokens *tokens) {
     fprintf(fp, "[");
-    for (int i = 0; i < tokens->len; i++) fprintf(fp, "%s%d", i ? ", " : "", tokens->v[i]);
+    for (int i = 0; i < tokens->len; i++) fprintf(fp, "%s%d", i ? ", " : "", tokens->v[i].raw());
     fprintf(fp, "]\n");
     for (int i = 0; i < tokens->len; i++) {
         size_t n = 0;
-        char *piece = token_text(e, tokens->v[i], &n);
-        fprintf(fp, "%6d  ", tokens->v[i]);
+        char *piece = token_text(e, tokens->v[i].raw(), &n);
+        fprintf(fp, "%6d  ", tokens->v[i].raw());
         pulsar_dump_piece_quoted(fp, piece, n);
         fputc('\n', fp);
         free(piece);
@@ -314,7 +314,7 @@ static bool opens_reasoning(pulsar_engine *e, const pulsar_tokens *tokens, pulsa
     std::string text;
     for (int i = from; tokens && i < tokens->len; i++) {
         size_t n = 0;
-        char *t = pulsar_token_text(e, TokId{tokens->v[i]}, &n);
+        char *t = pulsar_token_text(e, tokens->v[i], &n);
         text.append(t, n);
         free(t);
     }

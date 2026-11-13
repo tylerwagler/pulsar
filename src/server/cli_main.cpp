@@ -94,7 +94,7 @@ static bool server_warmup_generation(pulsar_engine *engine, pulsar_session *sess
     int emitted = 0;
     if (ok) {
         uint64_t rng = 0x5eed5eed5eed5eedULL;
-        int toks[17];
+        TokId toks[17];
         while (emitted < 12) {
             /* whichever drafter runs behind the round API (L272 B12: Qwen's MTP warmed with argmax before) */
             if (pulsar_engine_has_spec_rounds(engine)) {
@@ -107,7 +107,7 @@ static bool server_warmup_generation(pulsar_engine *engine, pulsar_session *sess
                  * a rejected step (bad args / dirty multiseq state), not eos. */
                 if (n <= 0) { ok = false; break; }
                 emitted += n;
-                if (pulsar_token_is_stop(engine, TokId{toks[n - 1]})) break;
+                if (pulsar_token_is_stop(engine, toks[n - 1])) break;
             } else {
                 const TokId tok = pulsar_session_argmax(session);
                 if (pulsar_token_is_stop(engine, tok)) break;

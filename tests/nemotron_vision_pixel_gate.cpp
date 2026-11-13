@@ -194,9 +194,9 @@ int main(int argc, char **argv) {
         e.family_state = w;
         pulsar_image_ref img = {first_png.data(), first_png.size(), -1};
         pulsar_tokens prompt = {0}, out = {0};
-        pulsar_tokens_push(&prompt, 10);
-        pulsar_tokens_push(&prompt, 18);   /* the renderer's <image> */
-        pulsar_tokens_push(&prompt, 11);
+        pulsar_tokens_push(&prompt, TokId{10});
+        pulsar_tokens_push(&prompt, TokId{18});   /* the renderer's <image> */
+        pulsar_tokens_push(&prompt, TokId{11});
         char err[256] = "";
         const bool refused = !pulsar_image_expand(&e, &prompt, 0, &img, 1, &out, err, sizeof err);
         CHECK(refused && strstr(err, "no vision tower"), "a tower-less engine did not refuse the image by name: %s",
@@ -211,7 +211,7 @@ int main(int argc, char **argv) {
         err[0] = 0;
         const bool ok = pulsar_image_expand(&e, &prompt, 0, &img, 1, &out, err, sizeof err);
         int run = 0;
-        for (int i = 0; i < out.len; i++) run += out.v[i] == 18;
+        for (int i = 0; i < out.len; i++) run += out.v[i] == TokId{18};
         int len = 0;
         CHECK(ok && img.start_pos == 1 && run == (int)first_tok && out.len == 2 + run &&
                   pulsar_image_block_extent(&e, out.v, out.len, 1, &len) && len == run,

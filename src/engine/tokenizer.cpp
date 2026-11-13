@@ -85,10 +85,10 @@ static bool table_get(const str_i32_table *t, const char *ptr, uint64_t len, int
 
 
 /** Append a token, growing the vector by doubling (from 64).  @param tv the vector  @param token the token id */
-void token_vec_push(token_vec *tv, int token) {
+void token_vec_push(token_vec *tv, TokId token) {
     if (tv->len == tv->cap) {
         tv->cap = tv->cap ? tv->cap * 2 : 64;
-        tv->v = (int *)xrealloc(tv->v, (size_t)tv->cap * sizeof(tv->v[0]));
+        tv->v = (TokId *)xrealloc(tv->v, (size_t)tv->cap * sizeof(tv->v[0]));
     }
     tv->v[tv->len++] = token;
 }
@@ -103,7 +103,7 @@ void token_vec_free(token_vec *tv) {
 
 
 
-void pulsar_tokens_push(pulsar_tokens *tv, int token) {
+void pulsar_tokens_push(pulsar_tokens *tv, TokId token) {
     token_vec_push(tv, token);
 }
 
@@ -124,7 +124,7 @@ void pulsar_tokens_copy(pulsar_tokens *dst, const pulsar_tokens *src) {
     if (src->len <= 0) return;
     if (dst->cap < src->len) {
         while (dst->cap < src->len) dst->cap = dst->cap ? dst->cap * 2 : 16;
-        dst->v = (int *)xrealloc(dst->v, (size_t)dst->cap * sizeof(dst->v[0]));
+        dst->v = (TokId *)xrealloc(dst->v, (size_t)dst->cap * sizeof(dst->v[0]));
     }
     memcpy(dst->v, src->v, (size_t)src->len * sizeof(dst->v[0]));
     dst->len = src->len;
@@ -345,11 +345,11 @@ void pulsar_vocab::bpe_emit_piece(pulsar_str raw_piece, token_vec *out) const {
         const char *ptr = encoded + sym[i].off;
         int token = -1;
         if (table_get(&vocab->token_to_id, ptr, sym[i].len, &token)) {
-            token_vec_push(out, token);
+            token_vec_push(out, TokId{token});
         } else {
             for (uint64_t j = 0; j < sym[i].len; j++) {
                 if (table_get(&vocab->token_to_id, ptr + j, 1, &token)) {
-                    token_vec_push(out, token);
+                    token_vec_push(out, TokId{token});
                 }
             }
         }
@@ -686,14 +686,14 @@ static bool chat_tmpl_marker(const pulsar_vocab *v, int id) {
  *  @return the run's first index (0 when no marker) */
 static int chat_tmpl_run_start(const pulsar_vocab *v, const pulsar_tokens *t) {
     for (int i = t->len - 1; i >= 0; i--)
-        if (chat_tmpl_marker(v, t->v[i])) return i + 1;
+        if (chat_tmpl_marker(v, t->v[i].raw())) return i + 1;
     return 0;
 }
 
 /** The last marker's id.  @param v the vocab  @param t the tokens  @return the id, -1 when none */
 static int chat_tmpl_last_marker(const pulsar_vocab *v, const pulsar_tokens *t) {
     for (int i = t->len - 1; i >= 0; i--)
-        if (chat_tmpl_marker(v, t->v[i])) return t->v[i];
+        if (chat_tmpl_marker(v, t->v[i].raw())) return t->v[i].raw();
     return -1;
 }
 
@@ -705,7 +705,7 @@ static int chat_tmpl_last_marker(const pulsar_vocab *v, const pulsar_tokens *t) 
 /// @return true once a user or assistant marker is present
 static bool chat_tmpl_saw_turn(const pulsar_vocab *v, const pulsar_tokens *t) {
     for (int i = 0; i < t->len; i++)
-        if (t->v[i] == v->user_id || t->v[i] == v->assistant_id) return true;
+        if (t->v[i] == TokId{v->user_id} || t->v[i] == TokId{v->assistant_id}) return true;
     return false;
 }
 
@@ -717,7 +717,7 @@ static char *chat_tmpl_run_text(const pulsar_vocab *v, const pulsar_tokens *t,
     size_t n = 0;
     for (int i = start; i < t->len; i++) {
         size_t l = 0;
-        char *p = vocab_token_text(v, t->v[i], &l);
+        char *p = vocab_token_text(v, t->v[i].raw(), &l);
         n += l;
         free(p);
     }
@@ -725,7 +725,7 @@ static char *chat_tmpl_run_text(const pulsar_vocab *v, const pulsar_tokens *t,
     size_t at = 0;
     for (int i = start; i < t->len; i++) {
         size_t l = 0;
-        char *p = vocab_token_text(v, t->v[i], &l);
+        char *p = vocab_token_text(v, t->v[i].raw(), &l);
         memcpy(out + at, p, l);
         at += l;
         free(p);
@@ -737,7 +737,7 @@ static char *chat_tmpl_run_text(const pulsar_vocab *v, const pulsar_tokens *t,
 
 /** Append a marker id.  @param t the tokens  @param id the marker */
 static void chat_tmpl_push_marker(pulsar_tokens *t, int id) {
-    token_vec_push((token_vec *)t, id);
+    token_vec_push((token_vec *)t, TokId{id});
 }
 
 /** Push the System MARKER (V4.1's template only).
@@ -953,7 +953,7 @@ void pulsar_vocab::tokenize_rendered_chat_vocab(const char *text,
         size_t len = 0;
         if (vocab->special_token_at(p, &token, &len)) {
             vocab->tokenize_span(span, (size_t)(p - span), out);
-            token_vec_push(out, token);
+            token_vec_push(out, TokId{token});
             p += len;
             span = p;
             continue;
@@ -1002,7 +1002,7 @@ void pulsar_vocab::tokenize_rendered_chat_spans_vocab(const char *text,
         /* spans[si], when there is one, is the next client range: off < its lo here */
         if (vocab->special_token_at(p, &token, &len) && !(si < n_spans && off + len > spans[si].lo)) {
             vocab->tokenize_span(span, (size_t)(p - span), out);
-            token_vec_push(out, token);
+            token_vec_push(out, TokId{token});
             p += len;
             span = p;
             continue;
@@ -1345,12 +1345,12 @@ void dump_tokens_fp(FILE *fp, const pulsar_vocab *vocab, const token_vec *tokens
     fprintf(fp, "[");
     for (int i = 0; i < tokens->len; i++) {
         if (i) fprintf(fp, ", ");
-        fprintf(fp, "%d", tokens->v[i]);
+        fprintf(fp, "%d", tokens->v[i].raw());
     }
     fprintf(fp, "]\n");
 
     for (int i = 0; i < tokens->len; i++) {
-        int id = tokens->v[i];
+        int id = tokens->v[i].raw();
         if (id >= 0 && id < vocab->n_vocab) {
             size_t n = 0;
             char *piece = vocab_token_text(vocab, id, &n);
@@ -1460,7 +1460,7 @@ bool pulsar_chat_turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
     return t && t->turn_markers(e, out);
 }
 
-int pulsar_turn_marker_at(const pulsar_turn_markers *m, const int *v, int n, int i) {
+int pulsar_turn_marker_at(const pulsar_turn_markers *m, const TokId *v, int n, int i) {
     if (!m || !v || i < 0) return 0;
     if (m->n_user > 0 && i + m->n_user <= n && v[i] == m->user[0] &&
         (m->n_user < 2 || v[i + 1] == m->user[1])) {
@@ -1479,7 +1479,7 @@ int pulsar_turn_marker_at(const pulsar_turn_markers *m, const int *v, int n, int
     return 0;
 }
 
-int pulsar_turn_endpoint(const pulsar_turn_markers *m, const int *v, int n) {
+int pulsar_turn_endpoint(const pulsar_turn_markers *m, const TokId *v, int n) {
     if (!m || !v || n < 2) return -1;
     /* where the client's own last turn hands over to the model: the first assistant marker after its last USER turn
      * (a tool result is not one).  An agent loop's later requests in that turn (tool results, the model again) all
@@ -1623,9 +1623,9 @@ static int ds4_tok_think_close(pulsar_engine *e) { return e->vocab.think_end_id;
 /** pulsar_family_tokenizer::turn_markers: one special token each, and the tool-result suffix.  @param e the engine
  *  @param out receives the markers  @return true, always */
 static bool ds4_tok_turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
-    out->user[0] = e->vocab.user_id;
+    out->user[0] = TokId{e->vocab.user_id};
     out->n_user = 1;
-    out->assistant[0] = e->vocab.assistant_id;
+    out->assistant[0] = TokId{e->vocab.assistant_id};
     out->n_assistant = 1;
     pulsar_turn_markers_add_tool(e, "<｜User｜><tool_result", "_result", out);
     return true;

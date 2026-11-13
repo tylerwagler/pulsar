@@ -559,7 +559,7 @@ void parse(const enc_ctx *c, int fd, const pyjson_value &o) {
     buf_printf(&b, ",\"finish_reason\":\"%s\"", st.finished ? "stop" : "length");
     if (return_ids) {
         buf_puts(&b, ",\"ids\":[");
-        for (int i = 0; i < ids.len; i++) buf_printf(&b, i ? ",%d" : "%d", ids.v[i]);
+        for (int i = 0; i < ids.len; i++) buf_printf(&b, i ? ",%d" : "%d", ids.v[i].raw());
         buf_putc(&b, ']');
     }
     buf_printf(&b, ",\"image\":{\"width\":%u,\"height\":%u},\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,"

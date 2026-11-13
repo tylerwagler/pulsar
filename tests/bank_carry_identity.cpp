@@ -117,7 +117,7 @@ int GATE_ENTRY(int argc, char **argv) {
     uint64_t drafted = 0;
     double ph_us[3] = {0.0, 0.0, 0.0};   /* assemble, round_end, commit */
     pulsar_spec_step steps[NB];
-    int acc_b[NB][17];
+    TokId acc_b[NB][17];
     for (int t = 0; t < ticks; t++) {
         pulsar_multiseq_req reqs[ROWS];
         int first[NB];
@@ -200,7 +200,10 @@ int GATE_ENTRY(int argc, char **argv) {
         printf("tick %d:", t);
         for (int b = 0; b < NB; b++) {
             printf(" [b%d", b);
-            for (int k = 0; k < na_b[b]; k++) { printf(" %d", acc_b[b][k]); hash[b] = fnv(hash[b], acc_b[b][k]); }
+            for (int k = 0; k < na_b[b]; k++) {
+                printf(" %d", acc_b[b][k].raw());
+                hash[b] = fnv(hash[b], acc_b[b][k].raw());
+            }
             printf("]");
         }
         printf("\n");

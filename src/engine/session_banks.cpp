@@ -268,7 +268,7 @@ const pulsar_tokens *pulsar_bank_history_as(pulsar_session *s, uint32_t bank, pu
  * is a prefill's (pulsar_kv_state_ops::noted_at); and the finishing chunk's headed row becomes the session's
  * next-token logits.  The family's state already moved with the step; a record that disagrees with it refuses
  * before anything changes. */
-int pulsar_session::note_prefilled(const int *toks, int n, int head) {
+int pulsar_session::note_prefilled(const TokId *toks, int n, int head) {
     auto *s = this;
     if (!toks || n <= 0) return 1;
     if (head >= 0 && (!s->fused_valid || (uint32_t)head >= s->fused_heads)) {

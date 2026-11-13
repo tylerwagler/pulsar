@@ -116,9 +116,9 @@ static double ring_rel(const ring *a, const ring *ref) {
 /* the 4 decode rows */
 static void decode_rows(pulsar_multiseq_req *rq) {
     for (int j = 0; j < 3; j++) {
-        rq[j].bank = BankId{0}; rq[j].pos = TokPos{C0A + j}; rq[j].token = TokId{g_toks.v[OFF_A + C0A + j]};
+        rq[j].bank = BankId{0}; rq[j].pos = TokPos{C0A + j}; rq[j].token = g_toks.v[OFF_A + C0A + j];
     }
-    rq[3].bank = BankId{1}; rq[3].pos = TokPos{C0B}; rq[3].token = TokId{g_toks.v[OFF_B + C0B]};
+    rq[3].bank = BankId{1}; rq[3].pos = TokPos{C0B}; rq[3].token = g_toks.v[OFF_B + C0B];
 }
 
 static bool populate_decoders(pulsar_session *s) {
@@ -229,10 +229,10 @@ static bool fused(int K, int order, float *lg, uint32_t *nr, ring *r2, ring *r3)
     decode_rows(rq);
     const int at2 = order == 0 ? 4 : 4 + K3, at3 = order == 0 ? 4 + K : 4;
     for (int j = 0; j < K; j++) {
-        rq[at2 + j].bank = BankId{2}; rq[at2 + j].pos = TokPos{j}; rq[at2 + j].token = TokId{g_toks.v[j]};
+        rq[at2 + j].bank = BankId{2}; rq[at2 + j].pos = TokPos{j}; rq[at2 + j].token = g_toks.v[j];
     }
     for (int j = 0; j < K3; j++) {
-        rq[at3 + j].bank = BankId{3}; rq[at3 + j].pos = TokPos{j}; rq[at3 + j].token = TokId{g_toks.v[OFF_3 + j]};
+        rq[at3 + j].bank = BankId{3}; rq[at3 + j].pos = TokPos{j}; rq[at3 + j].token = g_toks.v[OFF_3 + j];
     }
     pulsar_fused_shape sh;
     memset(&sh, 0, sizeof sh);
@@ -272,7 +272,7 @@ static bool fused_long(float *lg, uint32_t *nr, ring *r2) {
     pulsar_multiseq_req *rq = (pulsar_multiseq_req *)malloc(n * sizeof(*rq));
     decode_rows(rq);
     for (int j = 0; j < KL; j++) {
-        rq[4 + j].bank = BankId{2}; rq[4 + j].pos = TokPos{L_PRE + j}; rq[4 + j].token = TokId{g_toks.v[L_PRE + j]};
+        rq[4 + j].bank = BankId{2}; rq[4 + j].pos = TokPos{L_PRE + j}; rq[4 + j].token = g_toks.v[L_PRE + j];
     }
     pulsar_fused_shape sh;
     memset(&sh, 0, sizeof sh);
@@ -299,7 +299,7 @@ static bool prompt_only_long(float *lg1) {
               populate_decoders(s);
     pulsar_multiseq_req *rq = (pulsar_multiseq_req *)malloc(KL * sizeof(*rq));
     for (int j = 0; j < KL; j++) {
-        rq[j].bank = BankId{2}; rq[j].pos = TokPos{L_PRE + j}; rq[j].token = TokId{g_toks.v[L_PRE + j]};
+        rq[j].bank = BankId{2}; rq[j].pos = TokPos{L_PRE + j}; rq[j].token = g_toks.v[L_PRE + j];
     }
     char e[256];
     uint32_t nr = 0;

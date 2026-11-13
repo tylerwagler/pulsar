@@ -86,11 +86,15 @@ static void drafter_at_depth(pulsar_engine *e, uint32_t depth) {
 static pulsar_tokens toks(const std::vector<int32_t> &v, size_t lo, size_t hi) {
     pulsar_tokens t;
     memset(&t, 0, sizeof(t));
-    for (size_t i = lo; i < hi && i < v.size(); i++) pulsar_tokens_push(&t, v[i]);
+    for (size_t i = lo; i < hi && i < v.size(); i++) pulsar_tokens_push(&t, TokId{v[i]});
     return t;
 }
 
-static std::vector<int32_t> vec(const pulsar_tokens &t) { return std::vector<int32_t>(t.v, t.v + t.len); }
+static std::vector<int32_t> vec(const pulsar_tokens &t) {
+    std::vector<int32_t> out;
+    for (int i = 0; i < t.len; i++) out.push_back(t.v[i].raw());   /* the gate compares raw ids */
+    return out;
+}
 
 static std::vector<float> logits_of(pulsar_session *s, int W) {
     std::vector<float> v((size_t)W);
@@ -116,7 +120,7 @@ static void force_pendings(pulsar_session *s, const std::vector<int32_t> &ref, s
     for (; k < K && at + 1 + k < ref.size(); k++) {
         int32_t t = ref[at + 1 + k];
         if (k == bad) t = t == 1000 ? 1001 : 1000;   /* an ordinary id the stream does not have here */
-        sp.pend[k] = t;
+        sp.pend[k] = TokId{t};
         sp.pend_conf[k] = 1.0f;
     }
     sp.dspark_chain_unharvested = false;
@@ -169,7 +173,7 @@ static stream run(pulsar_engine *e, const pulsar_tokens &prompt, int n, bool spe
             const uint32_t bad = (lcg >> 20) % (K + 1u);   /* K: the whole chain is the stream's */
             force_pendings(s, *force, r.out.size(), K, bad);
         }
-        int buf[17];
+        TokId buf[17];
         const float t = !spec && pos_greedy(greedy_run, r.out.size()) ? 0.0f : temp;   /* a plain step: one token */
         const int k = pulsar_session_generate_speculative(s, t, 0, 1.0f, 0.0f, &rng, n - (int)r.out.size(), buf, 17,
                                                           err, sizeof(err));
@@ -177,8 +181,8 @@ static stream run(pulsar_engine *e, const pulsar_tokens &prompt, int n, bool spe
             ok = k == 0;
             break;
         }
-        for (int i = 0; i < k; i++) r.out.push_back(buf[i]);
-        if (pulsar_token_is_stop(e, TokId{buf[k - 1]})) break;
+        for (int i = 0; i < k; i++) r.out.push_back(buf[i].raw());
+        if (pulsar_token_is_stop(e, buf[k - 1])) break;
     }
     if (!ok) fprintf(stderr, "stream (%s): %s\n", spec ? "spec" : "plain", err);
     r.drafts = drafted(e, &r.rounds, &r.accepted) - d0;
@@ -249,7 +253,7 @@ static void batched_lane(pulsar_engine *e, const std::vector<pulsar_tokens> &P, 
     const uint64_t d0 = drafted(e, NULL, NULL);
     const uint32_t width = pulsar_engine_fused_heads_max(e);
     std::vector<pulsar_multiseq_req> reqs(width);
-    static int acc[NB][PULSAR_SPEC_LOGITS_ROWS + 1];
+    static TokId acc[NB][PULSAR_SPEC_LOGITS_ROWS + 1];
     int ticks = 0, crossing = 0;
     while (ok && ticks++ < 4 * n) {
         pulsar_spec_step st[NB];
@@ -323,9 +327,9 @@ static void batched_lane(pulsar_engine *e, const std::vector<pulsar_tokens> &P, 
             ok = st[i].status == PULSAR_SPEC_STEP_OK;
             if (!ok) { snprintf(err, sizeof err, "round_end bank %d: %s", st[i].bank.raw(), st[i].err); break; }
             const uint32_t b = bank_of[i];
-            for (int k = 0; k < st[i].n_accepted; k++) got[b].push_back(acc[i][k]);
+            for (int k = 0; k < st[i].n_accepted; k++) got[b].push_back(acc[i][k].raw());
             if ((int)got[b].size() >= n ||
-                (st[i].n_accepted && pulsar_token_is_stop(e, TokId{acc[i][st[i].n_accepted - 1]})))
+                (st[i].n_accepted && pulsar_token_is_stop(e, acc[i][st[i].n_accepted - 1])))
                 done[b] = true;
         }
         if (!ok) break;
@@ -525,7 +529,7 @@ static int exact(pulsar_engine *e, int n, const char *only) {
         memset(&full, 0, sizeof(full));
         for (int k = 0; k < P[i].len; k++) pulsar_tokens_push(&full, P[i].v[k]);
         for (int32_t t : sp.out)
-            if (!pulsar_token_is_stop(e, TokId{t})) pulsar_tokens_push(&full, t);
+            if (!pulsar_token_is_stop(e, TokId{t})) pulsar_tokens_push(&full, TokId{t});
         for (int k = 0; k < P[3].len; k++) pulsar_tokens_push(&full, P[3].v[k]);   /* the next turn's text */
         char err[256] = "";
         bool ok = wa && sp.ok && pulsar_session_sync(wa, &full, err, sizeof(err)) == 0;

@@ -304,8 +304,8 @@ static void engram_ring_put(pulsar_gpu_graph *g, uint32_t bank, uint32_t pos, in
     g->engram.ring_pos[i] = pos;
 }
 
-bool gpu_graph_engram_stage(pulsar_gpu_graph *g, const int *tok, const int32_t *pos, const int32_t *bank,
-                            uint32_t n, const int *hist, uint32_t hist_len) {
+bool gpu_graph_engram_stage(pulsar_gpu_graph *g, const TokId *tok, const int32_t *pos, const int32_t *bank,
+                            uint32_t n, const TokId *hist, uint32_t hist_len) {
     const pulsar_engram_model *em = g->engram.model;
     if (!em) return true;
     engram_drain(g);   /* a step that failed before its Engram layer left its gathers in flight */
@@ -317,16 +317,16 @@ bool gpu_graph_engram_stage(pulsar_gpu_graph *g, const int *tok, const int32_t *
             return engram_refuse("the step's history is out of range");
         const uint32_t p0 = (uint32_t)pos[0];
         for (uint32_t q = p0 > PULSAR_ENGRAM_MAX_NGRAM - 1u ? p0 - (PULSAR_ENGRAM_MAX_NGRAM - 1u) : 0u; q < p0; q++)
-            engram_ring_put(g, b, q, hist[q]);
+            engram_ring_put(g, b, q, hist[q].raw());   /* the n-gram hash's ring holds raw ids */
     }
     for (uint32_t r = 0; r < n; r++) {
         const uint32_t b = bank ? (uint32_t)bank[r] : cur;
         if (b >= g->engram.n_banks || pos[r] < 0) return engram_refuse("a row's bank or position is out of range");
         const uint32_t p = (uint32_t)pos[r];
-        if (tok[r] < 0 || (uint32_t)tok[r] >= em->layout.n_vocab)
+        if (!tok[r].below(em->layout.n_vocab))
             return engram_refuse("a token outside the text vocabulary reached the n-gram hash (image spans are not "
                                  "an Engram input on this layout)");
-        engram_ring_put(g, b, p, tok[r]);
+        engram_ring_put(g, b, p, tok[r].raw());
         /* the n-gram ending at p: oldest first, as much as the sequence has (pulsar_engram_hash_pos pads the rest) */
         int32_t win[PULSAR_ENGRAM_MAX_NGRAM];
         const uint32_t back = p < PULSAR_ENGRAM_MAX_NGRAM - 1u ? p : PULSAR_ENGRAM_MAX_NGRAM - 1u;

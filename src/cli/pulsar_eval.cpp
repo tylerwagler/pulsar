@@ -4303,8 +4303,8 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
     pulsar_tokens think_close_tokens = {0};
     /* the tokenizer's ONE think-close id (L272 B11: re-tokenizing the text gave BPE pieces on Qwen) */
     if (generation_in_think) {
-        const int close_id = pulsar_token_think_close(engine).raw();   /* pushed into the raw close run */
-        if (close_id < 0) {
+        const TokId close_id = pulsar_token_think_close(engine);
+        if (!close_id.is_token()) {
             fprintf(stderr, "pulsar-eval: the tokenizer has no </think> token to force a close with\n");
             free(raw.v);
             free(question);
@@ -4402,19 +4402,19 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
          * tokens were spent before the visible answer could start. */
         if (generation_in_think && think_close_tokens.len > 0) {
             if (forced_close_pos >= 0) {
-                token = think_close_tokens.v[forced_close_pos++];
+                token = think_close_tokens.v[forced_close_pos++].raw();   /* the loop's raw token */
                 if (forced_close_pos >= think_close_tokens.len) forced_close_pos = -1;
             } else if (remaining_budget <= cfg->hard_limit_reply_budget) {
                 close_kind = EVAL_THINK_CLOSE_HARD;
-                token = think_close_tokens.v[0];
+                token = think_close_tokens.v[0].raw();
                 forced_close_pos = think_close_tokens.len > 1 ? 1 : -1;
             } else if (remaining_budget <= cfg->soft_limit_reply_budget &&
                        think_close_tokens.len == 1) {
-                close_rank = token_rank_in_top(session, think_close_tokens.v[0],
+                close_rank = token_rank_in_top(session, think_close_tokens.v[0].raw(),
                                                cfg->soft_limit_think_close_rank);
                 if (close_rank > 0) {
                     close_kind = EVAL_THINK_CLOSE_SOFT;
-                    token = think_close_tokens.v[0];
+                    token = think_close_tokens.v[0].raw();
                 }
             }
         }

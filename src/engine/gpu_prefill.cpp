@@ -88,7 +88,7 @@ bool gpu_graph_upload_prompt_tokens(
 
     int32_t *tokens = (int32_t *)xmalloc((size_t)n_tokens * sizeof(tokens[0]));
     for (uint32_t i = 0; i < n_tokens; i++) {
-        tokens[i] = prompt->v[pos0 + i];
+        tokens[i] = prompt->v[pos0 + i].raw();
         /* L188: the embed kernel clamps a negative id to 0 -- refuse it here.
          *
          * L216: an image block's slots carry `vocab_size + role` sentinel ids,
@@ -836,7 +836,7 @@ static bool ds4_write_vision_rows(void *ud, const uint16_t *rows, uint32_t n_row
     return gpu_graph_write_vision_span((pulsar_gpu_tensor *)ud, rows, n_rows, row0, n_tokens);
 }
 
-bool gpu_graph_merge_image_spans(pulsar_gpu_tensor *out_hc, const int32_t *ids, int n_ids,
+bool gpu_graph_merge_image_spans(pulsar_gpu_tensor *out_hc, const TokId *ids, int n_ids,
                                  const pulsar_vision_request *vr, uint32_t pos0, uint32_t n_tokens) {
     if (!vr || vr->n_images <= 0) return true;      /* text-only: nothing to do */
     if (!out_hc || !vr->engine) return false;
@@ -860,7 +860,7 @@ bool gpu_graph_merge_image_spans(pulsar_gpu_tensor *out_hc, const int32_t *ids, 
  * matches no sentinel and leaves vision_visible_tokens at 0.  That is what keeps
  * the text prefill bit-identical: the attention entries then receive NULL
  * pointers and the kernel runs its pre-L216 plan literally. */
-bool gpu_graph_upload_vision_visible(pulsar_gpu_graph *g, const int32_t *ids,
+bool gpu_graph_upload_vision_visible(pulsar_gpu_graph *g, const TokId *ids,
                                      int n_ids, uint32_t start, uint32_t n_tokens) {
     if (!g || !g->vision_visible) return false;
     g->vision_visible_tokens = 0;
@@ -869,10 +869,10 @@ bool gpu_graph_upload_vision_visible(pulsar_gpu_graph *g, const int32_t *ids,
         n_tokens > (uint32_t)n_ids - start || n_tokens > g->prefill_cap) {
         return false;
     }
-    const int32_t *chunk = ids + start;
+    const TokId *chunk = ids + start;
     int has_span = 0;
     for (uint32_t i = 0; i < n_tokens; i++) {
-        if (chunk[i] >= (int32_t)PULSAR_N_VOCAB) { has_span = 1; break; }
+        if (chunk[i].raw() >= (int32_t)PULSAR_N_VOCAB) { has_span = 1; break; }
     }
     if (!has_span) return true;   /* this chunk owns no sentinel: NULL path */
 

@@ -409,7 +409,7 @@ static pulsar_ckpt_record *ckpt_record_pick(pulsar_ckpt_store *st) {
 }
 
 bool pulsar_ckpt_record_capture(pulsar_ckpt_store *st, BankId bank, pulsar_ckpt_record_kind kind, TokPos T_at,
-                                const int *tokens, const float *logits, uint32_t width,
+                                const TokId *tokens, const float *logits, uint32_t width,
                                 const struct pulsar_image_identity *img) {
     const uint32_t b = (uint32_t)bank.raw();   /* raw inside; none() is out of range there, as before */
     const uint32_t T = (uint32_t)T_at.before().raw();   /* L334 P2b: the store keeps raw uint32 inside (0 = empty slot / free record); typed at its API */
@@ -463,7 +463,7 @@ bool pulsar_ckpt_record_capture(pulsar_ckpt_store *st, BankId bank, pulsar_ckpt_
     }
     if (r->tokens_cap < T) {
         free(r->tokens);
-        r->tokens = (int32_t *)xmalloc((size_t)T * sizeof(int32_t));
+        r->tokens = (TokId *)xmalloc((size_t)T * sizeof(TokId));
         r->tokens_cap = T;
     }
     if (!ckpt_out(st, ckpt_rec_place(st, r), true, T)) {
@@ -471,7 +471,7 @@ bool pulsar_ckpt_record_capture(pulsar_ckpt_store *st, BankId bank, pulsar_ckpt_
         return false;
     }
     if (logits) memcpy(r->logits, logits, (size_t)width * sizeof(float));
-    for (uint32_t i = 0; i < T; i++) r->tokens[i] = (int32_t)tokens[i];
+    for (uint32_t i = 0; i < T; i++) r->tokens[i] = tokens[i];
     /* L350: the images the state holds below T -- the match authority beside the ids */
     if (img && img->n > 0) {
         if (!r->img) r->img = (pulsar_image_identity *)xmalloc(sizeof(pulsar_image_identity));
@@ -500,11 +500,11 @@ const pulsar_ckpt_record *pulsar_ckpt_record_of(const pulsar_ckpt_store *st, Ban
 /// @param len    ids in `tokens`
 /// @param want   the request's image blocks over the prompt, or NULL (then only a record holding no image)
 /// @return true when the record is live, its T ids are the prompt's first T and its images are the request's
-static bool ckpt_record_matches(const pulsar_ckpt_record *r, const int *tokens, uint32_t len,
+static bool ckpt_record_matches(const pulsar_ckpt_record *r, const TokId *tokens, uint32_t len,
                                 const pulsar_image_identity *want) {
     if (r->T == 0u || !tokens || len < r->T) return false;
     for (uint32_t i = 0; i < r->T; i++)
-        if ((int32_t)tokens[i] != r->tokens[i]) return false;
+        if (tokens[i] != r->tokens[i]) return false;
     const uint32_t held = r->img ? r->img->n : 0u;
     if (!want) return held == 0u;
     /* a block of the request straddling T would resume with its merged rows cut */
@@ -516,7 +516,7 @@ static bool ckpt_record_matches(const pulsar_ckpt_record *r, const int *tokens, 
     return held == 0u || pulsar_image_identity_equal(r->img, &below);
 }
 
-const pulsar_ckpt_record *pulsar_ckpt_record_best(const pulsar_ckpt_store *st, BankId bank, const int *tokens,
+const pulsar_ckpt_record *pulsar_ckpt_record_best(const pulsar_ckpt_store *st, BankId bank, const TokId *tokens,
                                                   TokCount len_n, TokPos limit_at, TokCount prompt_n,
                                                   const struct pulsar_image_identity *want) {
     /* L334 P2b: the store keeps raw uint32 inside (0 = empty slot / free record); typed at its API */
@@ -644,10 +644,10 @@ bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, BankId dst, BankId src, TokPos T_a
             }
             if (w->tokens_cap < T) {
                 free(w->tokens);
-                w->tokens = (int32_t *)xmalloc((size_t)T * sizeof(int32_t));
+                w->tokens = (TokId *)xmalloc((size_t)T * sizeof(TokId));
                 w->tokens_cap = T;
             }
-            memcpy(w->tokens, r->tokens, (size_t)T * sizeof(int32_t));
+            memcpy(w->tokens, r->tokens, (size_t)T * sizeof(TokId));
             /* L354: the record says which images it merged: r's, not whatever w last held */
             if (r->img && r->img->n > 0) {
                 if (!w->img) w->img = (pulsar_image_identity *)xmalloc(sizeof(pulsar_image_identity));

@@ -169,7 +169,7 @@ static void plan_a(void) {
     /* a SNAPSHOT commit: a verify of two runs (bank 0 rows [0, 3) at 40, bank 1 rows [3, 8) at 100) */
     const uint32_t run_first[3] = {0, 3, 8};
     const int32_t bank[8] = {0, 0, 0, 1, 1, 1, 1, 1}, pos[8] = {40, 41, 42, 100, 101, 102, 103, 104};
-    const int32_t tok[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    const TokId tok[8] = {TokId{1}, TokId{2}, TokId{3}, TokId{4}, TokId{5}, TokId{6}, TokId{7}, TokId{8}};
     pulsar_state_verify_begin(ss, 2, run_first, bank, pos);
     ok = pulsar_state_verify_capture(ss);
     for (uint32_t r = 0; ok && r < 8; r++)   /* what the op writes: the state after each row, at its step row */
@@ -202,9 +202,9 @@ static bool delta_commit(void *, BankId bank, const void *rows, uint32_t keep) {
     return true;
 }
 /* host state: the last two tokens (oldest first) -- what an n-gram context is */
-static bool host_replay(const void *, void *state, const int32_t *tokens, uint32_t keep) {
+static bool host_replay(const void *, void *state, const TokId *tokens, uint32_t keep) {
     int32_t *c = (int32_t *)state;
-    for (uint32_t i = 0; i < keep; i++) { c[0] = c[1]; c[1] = tokens[i]; }
+    for (uint32_t i = 0; i < keep; i++) { c[0] = c[1]; c[1] = tokens[i].raw(); }
     return true;
 }
 static void host_init(const void *, void *state) { ((int32_t *)state)[0] = ((int32_t *)state)[1] = -1; }
@@ -258,7 +258,8 @@ static void plan_b(void) {
 
     /* one verify: bank 1, rows [0, 6) at positions 9 .. 14 (the open block at 9 is [8, 12); keep 4 ends at 13) */
     const uint32_t run_first[2] = {0, 6};
-    const int32_t bank[6] = {1, 1, 1, 1, 1, 1}, pos[6] = {9, 10, 11, 12, 13, 14}, tok[6] = {70, 71, 72, 73, 74, 75};
+    const int32_t bank[6] = {1, 1, 1, 1, 1, 1}, pos[6] = {9, 10, 11, 12, 13, 14};
+    const TokId tok[6] = {TokId{70}, TokId{71}, TokId{72}, TokId{73}, TokId{74}, TokId{75}};
     const uint64_t blk = 4 * STAGE_ROW;
     int32_t *h = (int32_t *)pulsar_state_host(ss, B_HOST, BankId{1});
     h[0] = 50;

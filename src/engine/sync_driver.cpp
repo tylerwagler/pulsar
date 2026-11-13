@@ -66,9 +66,9 @@ bool pulsar_session_seam_stitch(pulsar_session *s, const pulsar_tokens *prompt, 
     pulsar_tokens *st = &out->tokens;
     free(st->v);
     st->cap = pulsar_prefix_match_stitched_len(&m, PromptToks{prompt->len}).raw();
-    st->v = (int *)xmalloc((size_t)st->cap * sizeof(int));
-    memcpy(st->v, s->checkpoint.v, (size_t)live_n * sizeof(int));
-    memcpy(st->v + live_n, prompt->v + prompt_n, (size_t)(prompt->len - prompt_n) * sizeof(int));
+    st->v = (TokId *)xmalloc((size_t)st->cap * sizeof(TokId));
+    memcpy(st->v, s->checkpoint.v, (size_t)live_n * sizeof(TokId));
+    memcpy(st->v + live_n, prompt->v + prompt_n, (size_t)(prompt->len - prompt_n) * sizeof(TokId));
     st->len = st->cap;
     out->live_cut = m.live_cut;
     out->prompt_cut = m.prompt_cut;

@@ -56,7 +56,7 @@ static inline bool gate_prefill_suffix_classic(pulsar_session *s, const pulsar_t
  * across banks), classic-sync the prompt, capture the bank's frontier
  * counters, and hand back the next token (argmax) through *argtok when asked.
  * The session does not take ownership of v. */
-static inline bool gate_populate_bank(pulsar_session *s, uint32_t bank, const int *v, int len,
+static inline bool gate_populate_bank(pulsar_session *s, uint32_t bank, const TokId *v, int len,
                                       int *argtok, const char *what) {
     pulsar_gpu_graph *g = s->graph;
     char err[256];
@@ -65,7 +65,7 @@ static inline bool gate_populate_bank(pulsar_session *s, uint32_t bank, const in
         return false;
     }
     pulsar_session_invalidate(s);
-    pulsar_tokens p = { .v = (int *)v, .len = len, .cap = len };
+    pulsar_tokens p = { .v = (TokId *)v, .len = len, .cap = len };
     if (pulsar_session_sync(s, &p, err, sizeof err) != 0) {
         fprintf(stderr, "%s: bank %u sync failed: %s\n", what, bank, err);
         return false;

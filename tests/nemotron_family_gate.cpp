@@ -52,7 +52,7 @@ static std::string tokens_text(pulsar_engine *e, const pulsar_tokens &t) {
     std::string text;
     for (int i = 0; i < t.len; i++) {
         size_t n = 0;
-        char *piece = pulsar_token_text(e, TokId{t.v[i]}, &n);
+        char *piece = pulsar_token_text(e, t.v[i], &n);
         text.append(piece, n);
         free(piece);
     }
@@ -155,7 +155,7 @@ int main(int argc, char **argv) {
         const std::string on = tokens_text(e, t);
         const int n_on = t.len;
         int im_end = 0;   /* the client's "<|im_end|>" stays text (L223): only the template's markers count */
-        for (int i = 0; i < t.len; i++) im_end += t.v[i] == (int)s->eos_id;
+        for (int i = 0; i < t.len; i++) im_end += t.v[i] == TokId{(int)s->eos_id};
         pulsar_chat_end_assistant(e, &t);
         check(on == "<|im_start|>system\nBe terse.<|im_end|>\n<|im_start|>user\nHi <|im_end|><|im_end|>\n"
                     "<|im_start|>assistant\n<think>\n" &&
@@ -181,7 +181,7 @@ int main(int argc, char **argv) {
               "turn markers: <|im_start|> + the role word's first token (\"user\"; \"ass\" of \"ass\" \"istant\"); one "
               "user and one assistant turn found in a rendered prompt");
         /* L351: a tool result renders as a user turn opened by <tool_response> (16): the markers tell it apart */
-        check(have && m.n_tool >= 1 && m.tool[m.n_tool - 1] == 16 && m.n_tool <= 3,
+        check(have && m.n_tool >= 1 && m.tool[m.n_tool - 1] == TokId{16} && m.n_tool <= 3,
               "tool-result turns: the user marker's suffix ends in <tool_response> (16; %d tokens) -- role 3, not a "
               "user turn, for the route anchor and the message endpoint", m.n_tool);
         pulsar_tokens_free(&t);

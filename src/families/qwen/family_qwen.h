@@ -658,7 +658,7 @@ uint64_t pulsar_qwen_s4_draft_top_ws_bytes(void);
 /// @param[in,out] ctx the n-gram context, oldest first; advanced over `tokens`
 /// @param tokens the tokens the later step embeds
 /// @param n their count
-void pulsar_qwen_s4_ple_prefetch(const pulsar_qwen_weights *w, int32_t ctx[2], const int32_t *tokens, uint32_t n);
+void pulsar_qwen_s4_ple_prefetch(const pulsar_qwen_weights *w, int32_t ctx[2], const TokId *tokens, uint32_t n);
 /** L329 (b2): the family's pulsar_driver_ops::read_ahead -- the PLE rows of prompt[from, to) (the n-gram context the
  *  prompt's own two tokens before `from`) queued on the pool's background class under `tag`.  0 when the read-ahead
  *  is off (PULSAR_PLE_READ_AHEAD=0) or a token is outside the vocabulary (the embed refuses it by name). */
@@ -668,7 +668,7 @@ void pulsar_qwen_s4_ple_prefetch(const pulsar_qwen_weights *w, int32_t ctx[2], c
 /// @param from first token to read ahead
 /// @param to one past the last
 /// @return rows queued (0 when off or refused)
-uint32_t pulsar_qwen_s4_ple_read_ahead(const pulsar_qwen_weights *w, uint64_t tag, const int32_t *prompt, uint32_t from,
+uint32_t pulsar_qwen_s4_ple_read_ahead(const pulsar_qwen_weights *w, uint64_t tag, const TokId *prompt, uint32_t from,
                                        uint32_t to);
 /** L329 (b2): the PLE rows' pread pool (pulsar_driver_ops::read_ahead_pool). */
 /// @param w the weights
@@ -681,7 +681,7 @@ pulsar_engram_io *pulsar_qwen_s4_ple_pool(const pulsar_qwen_weights *w);
 /// @param tokens the kept tokens
 /// @param keep their count (<= PULSAR_QWEN_SPEC_ROWS)
 /// @return false (printed) with no row file or past the verify width
-bool pulsar_qwen_s4_ngram_replay(const pulsar_qwen_weights *w, int32_t ctx[2], const int32_t *tokens, uint32_t keep);
+bool pulsar_qwen_s4_ngram_replay(const pulsar_qwen_weights *w, int32_t ctx[2], const TokId *tokens, uint32_t keep);
 
 /* S2's op, landed on the integration branch in family_qwen_s4.cpp (see the note
  * there); moves to family_qwen_s2.cpp when S2 rebases. */

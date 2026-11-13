@@ -123,7 +123,7 @@ run_rec run(pulsar_engine *e, const std::vector<pulsar_tokens> &P, int n, bool p
     bool done[NB] = {};
     for (int b = 0; b < NB; b++) rd[b] = pulsar_spec_round_new();
     std::vector<pulsar_multiseq_req> reqs(widest);
-    static int acc[NB][PULSAR_SPEC_LOGITS_ROWS + 1];
+    static TokId acc[NB][PULSAR_SPEC_LOGITS_ROWS + 1];
     for (uint32_t t = 0; ok && t < (uint32_t)(8 * n); t++) {
         bool any = false;
         for (int b = 0; b < NB; b++) any |= !done[b];
@@ -214,8 +214,8 @@ run_rec run(pulsar_engine *e, const std::vector<pulsar_tokens> &P, int n, bool p
             T.acc.push_back((int32_t)b);
             T.acc.push_back(st[i].n_accepted);
             for (int k = 0; k < st[i].n_accepted; k++) {
-                T.acc.push_back(acc[i][k]);
-                R.out[b].push_back(acc[i][k]);
+                T.acc.push_back(acc[i][k].raw());
+                R.out[b].push_back(acc[i][k].raw());
             }
             if ((int)R.out[b].size() >= n ||
                 (st[i].n_accepted && pulsar_token_is_stop(e, TokId{acc[i][st[i].n_accepted - 1]})))

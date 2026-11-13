@@ -38,18 +38,18 @@ static bool agent_worker_should_compact(agent_worker *w) {
 /// @brief The single special token `rendered` tokenizes to (see above).
 /// @param engine   the loaded engine
 /// @param rendered the special token's text
-/// @return its id, or -1 when it is not exactly one token
-static int agent_special_token_id(pulsar_engine *engine, const char *rendered) {
+/// @return its id, or none() when it is not exactly one token
+static TokId agent_special_token_id(pulsar_engine *engine, const char *rendered) {
     pulsar_tokens t = {0};
     const bool encoded = pulsar_tokenize_rendered_chat(engine, rendered, &t);
-    int id = encoded && t.len == 1 ? t.v[0] : -1;
+    const TokId id = encoded && t.len == 1 ? t.v[0] : TokId::none();
     pulsar_tokens_free(&t);
     return id;
 }
 
 
 
-int agent_compact_tail_cut(const pulsar_turn_markers *m, const int *v, int target, int bottom) {
+int agent_compact_tail_cut(const pulsar_turn_markers *m, const TokId *v, int target, int bottom) {
     for (int i = target; m && i < bottom; i++) {
         if (pulsar_turn_marker_at(m, v, bottom, i) == 1) return i;
     }
@@ -217,7 +217,7 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
     agent_buf summary = {0};
     char eval_err[160] = {0};
     TokId think_end_id = pulsar_token_think_close(w->engine);
-    TokId dsml_id = TokId{agent_special_token_id(w->engine, "｜DSML｜")};
+    TokId dsml_id = agent_special_token_id(w->engine, "｜DSML｜");
     double t0 = agent_now_sec();
     for (int i = 0; i < summary_max; i++) {
         if (worker_should_interrupt(w)) {
@@ -360,7 +360,7 @@ int worker_accept_generated_token(agent_worker *w,
     if (pulsar_session_eval(w->session, TokId{token}, err, err_len) != 0)
         return 1;
 
-    pulsar_tokens_push(&w->transcript, token);
+    pulsar_tokens_push(&w->transcript, TokId{token});
 
     size_t text_len = 0;
     char *text = pulsar_token_text(w->engine, TokId{token}, &text_len);
@@ -400,7 +400,7 @@ int worker_force_generated_text(agent_worker *w,
         return 1;
     }
     for (int i = 0; i < tokens.len && *generated < max_tokens; i++) {
-        if (worker_accept_generated_token(w, tokens.v[i], generated, t0,
+        if (worker_accept_generated_token(w, tokens.v[i].raw(), generated, t0,
                                           stream, err, err_len) != 0) {
             pulsar_tokens_free(&tokens);
             return 1;

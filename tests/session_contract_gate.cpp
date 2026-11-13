@@ -421,13 +421,14 @@ static void part_banks(pulsar_engine *e, int W) {
         CHECK(same(r1, refB1, &d), "B2 bank 1's batched row == one-bank B + tb (max |diff| %.3g)", d);
         /* the lane's bookkeeping: note what bank 0 was fed, via its restore */
         CHECK(pulsar_session_bank_state_restore(s, BankId{0}), "restore bank 0 after the lane");
-        const int fed = 11;
+        const TokId fed{11};
         pulsar_session_note_committed_tokens(s, &fed, 1);
         CHECK(pulsar_session_bank_pos(s, BankId{0}).raw() == A.len + 2, "the committed token recorded (bank_pos %d)",
               pulsar_session_bank_pos(s, BankId{0}).raw());
         pulsar_session_bank_state_save(s, BankId{0});
         CHECK(pulsar_session_bank_state_restore(s, BankId{1}), "restore bank 1 after the lane");
-        pulsar_session_note_committed_tokens(s, &tb, 1);
+        const TokId tb_id{tb};
+        pulsar_session_note_committed_tokens(s, &tb_id, 1);
         pulsar_session_bank_state_save(s, BankId{1});
     }
 
@@ -438,9 +439,9 @@ static void part_banks(pulsar_engine *e, int W) {
         CHECK(pulsar_session_bank_state_restore(s, BankId{0}), "restore bank 0 after bank 1's invalidate");
         pulsar_tokens A3 = {0};
         pulsar_tokens_copy(&A3, &A);
-        pulsar_tokens_push(&A3, ta);
-        pulsar_tokens_push(&A3, 11);
-        pulsar_tokens_push(&A3, 13);
+        pulsar_tokens_push(&A3, TokId{ta});
+        pulsar_tokens_push(&A3, TokId{11});
+        pulsar_tokens_push(&A3, TokId{13});
         /* sync of an EXTENSION of bank 0's history continues it (one new token) */
         err[0] = '\0';
         CHECK(pulsar_session_sync(s, &A3, err, sizeof(err)) == 0, "bank 0 continues by sync: %s", err);
@@ -549,7 +550,8 @@ static std::vector<float> verify_alone(pulsar_engine *e, const pulsar_tokens *P,
  * `run` (nr of them, 0 = none) and bank 1's chunk chunk[0, m) at pre->len, its last row headed.  The step's
  * logits rows; the session stays open in *keep (NULL = freed). */
 static std::vector<float> fused_step(pulsar_engine *e, const pulsar_tokens *A, const int *run, int nr,
-                                     const pulsar_tokens *pre, const int *chunk, int m, int W, pulsar_session **keep) {
+                                     const pulsar_tokens *pre, const TokId *chunk, int m, int W,
+                                     pulsar_session **keep) {
     std::vector<float> out;
     pulsar_engine_set_bank_pool(2);
     pulsar_session *x = NULL;
@@ -565,7 +567,7 @@ static std::vector<float> fused_step(pulsar_engine *e, const pulsar_tokens *A, c
     if (ok) {
         std::vector<pulsar_multiseq_req> q;
         for (int i = 0; i < nr; i++) q.push_back({BankId{0}, TokPos{A->len + i}, TokId{run[i]}});
-        for (int j = 0; j < m; j++) q.push_back({BankId{1}, TokPos{pre->len + j}, TokId{chunk[j]}});
+        for (int j = 0; j < m; j++) q.push_back({BankId{1}, TokPos{pre->len + j}, chunk[j]});
         pulsar_fused_shape sh;
         memset(&sh, 0, sizeof sh);
         sh.n_dec = (uint32_t)nr;
@@ -618,7 +620,7 @@ static void part_fused(pulsar_engine *e, int W) {
         pulsar_tokens pre = L, whole = L;
         pre.len = pre_len;
         whole.len = pre_len + m;
-        const int *chunk = L.v + pre_len;
+        const TokId *chunk = L.v + pre_len;
         pulsar_session *x = NULL;
         const std::vector<float> got = fused_step(e, &A, runA, 3, &pre, chunk, m, W, &x);
         CHECK(got.size() == (size_t)4 * W, "F fused step: 3 verify rows + a %d-row chunk, 4 rows headed", m);
@@ -773,9 +775,9 @@ static void part_fused_runs(pulsar_engine *e, int W) {
         for (int i = 0; i < nr; i++) q.push_back({BankId{0}, TokPos{A.len + i}, TokId{runA[i]}});
         for (int r = 0; r < 2; r++) {
             if (order[r] == 1)
-                for (int j = 0; j < m1; j++) q.push_back({BankId{1}, TokPos{pre_len + j}, TokId{L.v[pre_len + j]}});
+                for (int j = 0; j < m1; j++) q.push_back({BankId{1}, TokPos{pre_len + j}, L.v[pre_len + j]});
             else
-                for (int j = 0; j < m2; j++) q.push_back({BankId{2}, TokPos{j}, TokId{L2.v[j]}});
+                for (int j = 0; j < m2; j++) q.push_back({BankId{2}, TokPos{j}, L2.v[j]});
         }
         pulsar_fused_shape sh;
         memset(&sh, 0, sizeof sh);
@@ -919,7 +921,7 @@ static uint64_t spec_drafted(pulsar_engine *e) {
 static bool spec_generate(pulsar_session *s, int n, char *err, size_t errlen) {
     uint64_t rng = 7;
     for (int got = 0; got < n;) {
-        int buf[17];
+        TokId buf[17];
         const int k = pulsar_session_generate_speculative(s, 0.0f, 0, 1.0f, 0.0f, &rng, n - got, buf, 17, err,
                                                           errlen);
         if (k <= 0) return k == 0;
@@ -1021,7 +1023,7 @@ static bool spec_lane_round(pulsar_session *s, const uint32_t *banks, const int 
                             pulsar_spec_round **rounds, int *na, int W, char *err, size_t errlen) {
     const uint32_t width = pulsar_engine_fused_heads_max(s->engine);
     pulsar_spec_step st[4];
-    static int acc[4][PULSAR_SPEC_LOGITS_ROWS + 1];
+    static TokId acc[4][PULSAR_SPEC_LOGITS_ROWS + 1];
     if (n > 4) return false;
     std::vector<pulsar_multiseq_req> reqs(width);
     for (int i = 0; i < n; i++) {
@@ -1189,7 +1191,7 @@ static void part_spec_zero_draft(pulsar_engine *e, int W) {
         ran = ran && pulsar_session_spec_redraft_commit_batch(s, &cs, 1) == 0 && cs.status == PULSAR_SPEC_STEP_OK;
         float conf[16];
         TokId pbase;
-        int32_t ptok[16];
+        TokId ptok[16];
         const uint32_t pend = ran ? pulsar_session_bank_pendings(s, BankId{1}, &pbase, ptok, conf) : 0u;
         CHECK(ran && pend > 0, "S2 (beside) bank 1 holds %u drafts for the shared round: %s", pend, err);
         const uint32_t banks[2] = {0, 1};

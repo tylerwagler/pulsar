@@ -413,7 +413,7 @@ bool gpu_graph_dspark_draft_forward(
         const pulsar_model         *dspark_model,
         const pulsar_dspark_weights *w,
         pulsar_gpu_tensor         *base_logits_out,
-        const int32_t            draft_ids[],
+        const TokId              draft_ids[],
         uint32_t                n_draft) {
     /* L150: the single-bank forward is the banked one at n_banks == 1 -- the
      * scalar-position code path, byte-identical to before. */
@@ -441,7 +441,7 @@ bool gpu_graph_dspark_draft_forward_banks(
         const pulsar_model         *dspark_model,
         const pulsar_dspark_weights *w,
         pulsar_gpu_tensor         *base_logits_out,
-        const int32_t            draft_ids[],
+        const TokId              draft_ids[],
         uint32_t                n_draft,
         uint32_t                n_banks,
         const uint32_t          *row_bank,
@@ -535,8 +535,9 @@ bool gpu_graph_dspark_draft_forward_banks(
     /* L335: the embed kernel does not clamp (an id past the vocabulary is an image slot's sentinel there): a draft id
      * outside the vocabulary refuses here, by name. */
     for (uint32_t i = 0; i < n_draft; i++) {
-        if (draft_ids[i] < 0 || draft_ids[i] >= (int32_t)PULSAR_N_VOCAB) {
-            fprintf(stderr, "pulsar: dspark draft token %d at row %u is not a vocab id -- refusing\n", draft_ids[i], i);
+        if (!draft_ids[i].below(PULSAR_N_VOCAB)) {
+            fprintf(stderr, "pulsar: dspark draft token %d at row %u is not a vocab id -- refusing\n",
+                    draft_ids[i].raw(), i);
             return false;
         }
     }

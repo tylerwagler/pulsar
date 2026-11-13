@@ -299,6 +299,8 @@ int main(int argc, char **argv) {
                 printf("    encode failed: %s\n", err);
                 findings++;
             }
+            std::vector<TokId> round_ids;   /* the round entry takes ids */
+            for (int t : ids) round_ids.push_back(TokId{t});
             const uint32_t W = gen_constrain_words(&srv);
             std::vector<uint32_t> row(W);
             stats fill, accept, round, allowed_frac;
@@ -327,7 +329,7 @@ int main(int argc, char **argv) {
                     const int nt = (int)std::min(ids.size() - i, (size_t)K + 1);
                     const uint32_t *masks = NULL;
                     a = now_us();
-                    const int rows = gen_constrain_round(&srv, &g, ids.data() + i, nt, false, &masks);
+                    const int rows = gen_constrain_round(&srv, &g, round_ids.data() + i, nt, false, &masks);
                     round.add(now_us() - a);
                     if (rows < 0) {
                         printf("    round failed: %s\n", g.err);

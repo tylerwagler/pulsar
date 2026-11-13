@@ -2065,10 +2065,10 @@ const char *const kv_resume_why_names[PULSAR_RESUME_WHYS] = {"-", "continues", "
 const char *const server_503_cause_names[SERVER_503_CAUSES] = {"admission", "image_busy", "parse_busy", "connections",
                                                                "shutdown", "systemone"};
 
-uint64_t server_kv_token_hash(const int *v, int n) {
+uint64_t server_kv_token_hash(const TokId *v, int n) {
     uint64_t h = UINT64_C(0xcbf29ce484222325);
     for (int i = 0; i < n; i++) {
-        const uint32_t id = (uint32_t)v[i];
+        const uint32_t id = (uint32_t)v[i].raw();
         for (int b = 0; b < 4; b++) {
             h ^= (id >> (8 * b)) & 0xffu;
             h *= UINT64_C(0x100000001b3);
@@ -2518,12 +2518,12 @@ size_t gen_think_mask_words(const server *s) {
 /// @param n             how many
 /// @param off           1 when toks[0] is the base (row 0 follows it), else 0
 /// @return the row to force, or -1 (no budget, block closed, or the budget not reached within the round)
-int think_close_row(int budget, bool open, int think_tokens, TokId close, const int *toks, int n, int off) {
+int think_close_row(int budget, bool open, int think_tokens, TokId close, const TokId *toks, int n, int off) {
     if (budget <= 0 || !open) return -1;
     const int rows = n - off + 1;
     for (int i = 0; i < rows; i++) {
         const int pre = i + off;   /* the round's tokens before row i */
-        if (pre > 0 && TokId{toks[pre - 1]} == close) return -1;
+        if (pre > 0 && toks[pre - 1] == close) return -1;
         if (think_tokens + pre >= budget) return i;
     }
     return -1;
@@ -2536,7 +2536,7 @@ int think_close_row(int budget, bool open, int think_tokens, TokId close, const 
 /// @param n     how many
 /// @param off   1 when toks[0] is the base, else 0
 /// @return the row to force, or -1
-int gen_think_close_row(server *s, const gen_state *g, const int *toks, int n, int off) {
+int gen_think_close_row(server *s, const gen_state *g, const TokId *toks, int n, int off) {
     const int budget = g->j->req.think_budget;
     if (budget <= 0) return -1;
     return think_close_row(budget, g->thinking.inside && !g->think_closed, g->think_tokens,
@@ -4094,7 +4094,7 @@ static void lane_emit_and_draw(server *s, session_slot **dec, const int *live_id
         g->batch_feed_pos += TokCount{1};
         sl->committed_pos = g->batch_feed_pos;
         sl->tokens_emitted++;   /* L118: classic-loop accounting parity */
-        pulsar_tokens_push(&g->batch_pending, committed);
+        pulsar_tokens_push(&g->batch_pending, TokId{committed});
         if (g->first_token_t == 0.0) g->first_token_t = server_now_sec();
         /* Route THIS slot's stream writes through its own deferral queue
          * (the worker-thread-local writer is shared across slots). */
@@ -4114,20 +4114,20 @@ static void lane_emit_and_draw(server *s, session_slot **dec, const int *live_id
         who[nd++] = g;
     }
     if (nd == 0) return;
-    int tok[PULSAR_SESSION_POOL_CAP];
+    TokId tok[PULSAR_SESSION_POOL_CAP];
     if (pulsar_session_draw_rows(pool, rows, d, nd, tok) != 0)
-        for (uint32_t k = 0; k < nd; k++) tok[k] = PULSAR_SAMPLE_REFUSED;
+        for (uint32_t k = 0; k < nd; k++) tok[k] = TokId{PULSAR_SAMPLE_REFUSED};
     for (uint32_t k = 0; k < nd; k++) {
         gen_state *g = who[k];
-        g->batch_feed_token = TokId{tok[k]};
-        if (tok[k] < 0) {
+        g->batch_feed_token = tok[k];
+        if (!tok[k].is_token()) {
             snprintf(g->err, sizeof g->err, "sampler refused a degenerate logits row (L188)");
             g->finish = "error"; g->batch_feed_valid = false; g->phase = GEN_FINISH;
             continue;
         }
         /* This bank's row IS the target distribution at batch_feed_pos, and
          * it is overwritten by the next step's sweep. */
-        logprob_capture_row(&g->logprobs, pool, rows[k], tok[k]);
+        logprob_capture_row(&g->logprobs, pool, rows[k], tok[k].raw());
     }
 }
 
@@ -4481,7 +4481,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
      * because the batched round_end finishes every bank before any emits. */
     pulsar_spec_step steps[PULSAR_SESSION_POOL_CAP];
     int step_slot[PULSAR_SESSION_POOL_CAP];
-    int accepted[PULSAR_SESSION_POOL_CAP][PULSAR_SPEC_LOGITS_ROWS + 1];
+    TokId accepted[PULSAR_SESSION_POOL_CAP][PULSAR_SPEC_LOGITS_ROWS + 1];
 
     int emitted_total = 0;
     const bool fuse_on = s->fusion_enabled();
@@ -4586,7 +4586,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             if (!ag || ag->phase != GEN_DECODE) continue;
             float conf[16];
             TokId pbase;
-            int32_t ptok[16];
+            TokId ptok[16];
             uint32_t np = pulsar_session_bank_pendings(pool, dec[i]->bank, &pbase, ptok, conf);
             /* L309: a chain under a grammar ends before its first draft the grammar refuses */
             if (np > 0 && ag->gate) {
@@ -4985,9 +4985,9 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
              * its rows' (reqs, laid by the assemble); a base streamed before the forward is in g->text already. */
             gen_resolve_sampling(&g->j->req, &st->temperature, &st->top_k, &st->top_p, &st->min_p);
             {
-                int toks[PULSAR_SPEC_LOGITS_ROWS];
+                TokId toks[PULSAR_SPEC_LOGITS_ROWS];
                 int nt = 0;
-                for (int i = base_sent[q] ? 1 : 0; i < row_nb[q]; i++) toks[nt++] = reqs[row0s[q] + (uint32_t)i].token.raw();
+                for (int i = base_sent[q] ? 1 : 0; i < row_nb[q]; i++) toks[nt++] = reqs[row0s[q] + (uint32_t)i].token;
                 st->greedy_rows = gen_spec_greedy_rows(s, g, toks, nt, base_sent[q]);
                 /* L303: each verify row's mask -- the gate walked through the round's tokens and back */
                 const int mr = gen_constrain_round(s, g, toks, nt, base_sent[q], &st->masks);
@@ -5068,7 +5068,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             for (int t = t0; !stopped && t < na; t++) {
                 if (g->first_token_t == 0.0) g->first_token_t = server_now_sec();
                 done = t + 1;
-                if (s->gen_emit_token(sl, st->accepted[t])) { stopped = true; break; }
+                if (s->gen_emit_token(sl, st->accepted[t].raw())) { stopped = true; break; }
             }
             if (stopped) g->phase = GEN_FINISH;
             /* L264 S4: decode creates no grid checkpoints, so there is nothing
@@ -5533,7 +5533,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
         for (int j = 0; j < kthis; j++) {
             reqs[m + j].bank = pf->bank;
             reqs[m + j].pos = TokPos{pos_now + j};
-            reqs[m + j].token = TokId{pp->v[pos_now + j]};
+            reqs[m + j].token = pp->v[pos_now + j];
         }
         const int nrows = m + kthis;
         if (nrows == 0) break;

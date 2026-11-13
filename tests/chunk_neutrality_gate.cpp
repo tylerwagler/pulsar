@@ -236,7 +236,7 @@ static int run_schedule(pulsar_engine *e, const pulsar_tokens *toks, int first, 
             if (pulsar_session_sync(s, &p, err, errlen) != 0) goto done;
         }
         for (int i = 0; i < evals; i++) {
-            if (pulsar_session_eval(s, TokId{toks->v[first + i]}, err, errlen) != 0) goto done;
+            if (pulsar_session_eval(s, toks->v[first + i], err, errlen) != 0) goto done;
         }
         if (keep && pulsar_session_save_snapshot(s, keep, err, errlen) != 0) goto done;
     }
@@ -279,7 +279,7 @@ static int run_schedule(pulsar_engine *e, const pulsar_tokens *toks, int first, 
         goto done;
     }
     if (pulsar_session_copy_logits(s, frontier, width) != width) { snprintf(err, errlen, "frontier logits read failed"); goto done; }
-    if (pulsar_session_eval(s, TokId{toks->v[GATE_N]}, err, errlen) != 0) goto done;
+    if (pulsar_session_eval(s, toks->v[GATE_N], err, errlen) != 0) goto done;
     if (pulsar_session_copy_logits(s, decoded, width) != width) { snprintf(err, errlen, "decode logits read failed"); goto done; }
     rc = 0;
 done:

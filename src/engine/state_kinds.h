@@ -105,7 +105,7 @@ typedef struct pulsar_state_decl {
     bool (*commit)(void *state, BankId bank, const void *rows, uint32_t keep);
     /** REPLAY: advance a bank's host state `state` (restored to its bytes before the step) over the kept tokens.
      *  `e` is the engine (const pulsar_engine *).  false = refused (said). */
-    bool (*replay)(const void *e, void *state, const int32_t *tokens, uint32_t keep);
+    bool (*replay)(const void *e, void *state, const TokId *tokens, uint32_t keep);
     /** A host decl's fresh bank (NULL = zero). */
     void (*init)(const void *e, void *state);
 } pulsar_state_decl;
@@ -334,7 +334,7 @@ bool pulsar_state_verify_capture(pulsar_state_set *ss);
 /// @param tokens the run's token ids
 /// @param keep   rows of the run to keep, 1 .. the run's rows
 /// @return true when committed
-bool pulsar_state_commit(pulsar_state_set *ss, BankId bank, const int32_t *tokens, uint32_t keep);
+bool pulsar_state_commit(pulsar_state_set *ss, BankId bank, const TokId *tokens, uint32_t keep);
 
 /** L270: the demand-paged bytes `rows` positions take in one bank (every slot's pools): the declared families' one
  *  conversion of rows to bytes, each pool rounding its own ceil(rows / tokens-per-row) (L333). */

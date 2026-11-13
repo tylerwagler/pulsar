@@ -1967,13 +1967,13 @@ uint32_t gen_spec_greedy_rows_text(const gen_state *g, const char *const *pieces
 }
 
 /* gen_spec_greedy_rows_text over the round's token ids (the engine's texts and stop set). */
-uint32_t gen_spec_greedy_rows(server *s, const gen_state *g, const int *toks, int n, bool base_emitted) {
+uint32_t gen_spec_greedy_rows(server *s, const gen_state *g, const TokId *toks, int n, bool base_emitted) {
     if (!gen_tool_override_varies(g)) return 0u;
     char *pieces[PULSAR_SPEC_LOGITS_ROWS + 1] = {};
     size_t lens[PULSAR_SPEC_LOGITS_ROWS + 1] = {};
     if (n > (int)PULSAR_SPEC_LOGITS_ROWS + 1) pulsar_die("gen_spec_greedy_rows: more tokens than a round's rows");
     for (int i = 0; i < n; i++) {
-        const TokId t{toks[i]};
+        const TokId t = toks[i];
         pieces[i] = pulsar_token_is_stop(s->engine, t) ? NULL : pulsar_token_text(s->engine, t, &lens[i]);
     }
     const uint32_t bits = gen_spec_greedy_rows_text(g, pieces, lens, n, base_emitted);
@@ -2482,7 +2482,7 @@ static bool terminal_slot_applies(const session_slot *sl) {
 /// @return the end a terminal checkpoint syncs it to: its length, a trailing stop excluded (the next render re-spells
 ///         the stop, L290's join)
 static int terminal_turn_end(pulsar_engine *e, const pulsar_tokens *h) {
-    return pulsar_token_is_stop(e, TokId{h->v[h->len - 1]}) ? h->len - 1 : h->len;
+    return pulsar_token_is_stop(e, h->v[h->len - 1]) ? h->len - 1 : h->len;
 }
 
 bool server::slot_turn_reply(session_slot *sl, bool wants, bool called) {

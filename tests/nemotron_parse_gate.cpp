@@ -123,10 +123,10 @@ int main(int argc, char **argv) {
             continue;
         }
         parsed++;
-        check(st.finished == (ids.len > 0 && ids.v[ids.len - 1] == (int)w->shape.eos), "%s: finished = %d",
+        check(st.finished == (ids.len > 0 && ids.v[ids.len - 1] == TokId{(int)w->shape.eos}), "%s: finished = %d",
               stems[i].c_str(), (int)st.finished);
         size_t k = 0;
-        while (k < (size_t)ids.len && k < R.size() && ids.v[k] == R[k]) k++;
+        while (k < (size_t)ids.len && k < R.size() && ids.v[k] == TokId{R[k]}) k++;
         const bool eq = k == R.size() && k == (size_t)ids.len;
         same += eq;
         same_text += text && ref_txt[i] == text;

@@ -105,7 +105,7 @@ static void tower_cache_put(uint64_t key, size_t src_len, uint16_t *data, int ro
     g_tower_cache_bytes += bytes;
 }
 
-bool pulsar_image_block_rows(const pulsar_engine *e, const pulsar_image_ref *img, const int32_t *ids, int block_len,
+bool pulsar_image_block_rows(const pulsar_engine *e, const pulsar_image_ref *img, const TokId *ids, int block_len,
                              uint16_t *out, bool *cache_hit, char *err, size_t errlen) {
     const pulsar_family_vision *v = front_of(e);
     if (cache_hit) *cache_hit = false;
@@ -158,7 +158,7 @@ const pulsar_image_identity *pulsar_session_bank_images(const pulsar_session *s,
     return NULL;
 }
 
-bool pulsar_image_merge_chunk(const pulsar_engine *e, const int32_t *ids, int n_ids, const pulsar_image_ref *images,
+bool pulsar_image_merge_chunk(const pulsar_engine *e, const TokId *ids, int n_ids, const pulsar_image_ref *images,
                               int n_images, uint32_t pos0, uint32_t n_tokens, pulsar_image_row_writer write,
                               void *ud) {
     if (n_images <= 0) return true;   /* text: nothing to do */
@@ -196,7 +196,7 @@ bool pulsar_image_merge_chunk(const pulsar_engine *e, const int32_t *ids, int n_
     return true;
 }
 
-bool pulsar_image_spans_fit(const pulsar_engine *e, const int32_t *ids, int n, const pulsar_image_ref *images,
+bool pulsar_image_spans_fit(const pulsar_engine *e, const TokId *ids, int n, const pulsar_image_ref *images,
                             int n_images, uint32_t chunk_cap, int *end_out, char *err, size_t errlen) {
     int end = 0;
     for (int i = 0; i < n_images; i++) {
@@ -233,8 +233,8 @@ bool pulsar_image_expand(const pulsar_engine *e, const pulsar_tokens *prompt, in
         snprintf(err, errlen, "this model has no vision tower bound; it cannot accept images");
         return false;
     }
-    const int placeholder = v->placeholder_id(e);
-    if (placeholder < 0) {
+    const TokId placeholder{v->placeholder_id(e)};
+    if (!placeholder.is_token()) {
         snprintf(err, errlen, "the tokenizer has no image placeholder token (\"%s\")", v->placeholder_text);
         return false;
     }
@@ -285,11 +285,12 @@ bool pulsar_image_refuse_orphans(const pulsar_engine *e, const pulsar_tokens *pr
      * PLACEHOLDER is refused too: it is a renderer artifact the expansion must have replaced. */
     const pulsar_family_vision *v = front_of(e);
     if (!v) return true;
-    const int placeholder = v->placeholder_id(e);
+    const TokId placeholder{v->placeholder_id(e)};
     for (int i = 0; i < prompt->len; i++) {
-        if (pulsar_image_is_sentinel(e, prompt->v[i]) || (placeholder >= 0 && prompt->v[i] == placeholder)) {
+        const TokId t = prompt->v[i];
+        if (pulsar_image_is_sentinel(e, t.raw()) || (placeholder.is_token() && t == placeholder)) {
             snprintf(err, errlen, "prompt token %d is image sentinel id %d, but the request carries no images", i,
-                     prompt->v[i]);
+                     prompt->v[i].raw());
             return false;
         }
     }

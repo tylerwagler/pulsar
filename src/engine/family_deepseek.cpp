@@ -203,7 +203,7 @@ static const pulsar_sync_ops k_ds4_sync = {
 /// @return 0 decoded; 1 + err on a failure
 static int ds4_eval_row(pulsar_session *s, int token, char *err, size_t errlen) {
     pulsar_engine *e = s->engine;
-    int ms_tok[1] = { token };
+    const TokId ms_tok[1] = { TokId{token} };
     int32_t ms_pos[1] = { (int32_t)s->checkpoint.len };
     int32_t ms_bank[1] = { (int32_t)(s->graph->banks.n_banks ? s->graph->banks.cur_bank : 0u) };
     /* rc: 0 = recoverable pre-arm reject, 1 = success, else fatal mid-sweep */
@@ -291,7 +291,7 @@ static bool ds4_is_image_sentinel(const pulsar_engine *, int32_t id) { return id
 /// @param start where to look
 /// @param[out] len the block's length
 /// @return true when a block starts at start
-static bool ds4_image_block_extent(const pulsar_engine *, const int32_t *ids, int n, int start, int *len) {
+static bool ds4_image_block_extent(const pulsar_engine *, const TokId *ids, int n, int start, int *len) {
     return vision_span_extent(ids, n, (int)PULSAR_N_VOCAB, start, len) != 0;
 }
 /* L268: the rest of DeepSeek's image front -- its placeholder token, one image's sentinel block (vision.cpp), and its
@@ -321,7 +321,7 @@ static uint32_t ds4_image_row_width(const pulsar_engine *) { return (uint32_t)PU
 /// @param err message buffer
 /// @param errlen its size
 /// @return vision_ds4_block_rows's
-static bool ds4_image_block_rows(const pulsar_engine *e, const pulsar_image_ref *img, const int32_t *, int block_len,
+static bool ds4_image_block_rows(const pulsar_engine *e, const pulsar_image_ref *img, const TokId *, int block_len,
                                  const uint16_t *tower, int n_tower, uint16_t **tower_out, int *n_tower_out,
                                  uint16_t *out, char *err, size_t errlen) {
     return vision_ds4_block_rows(&e->vision_weights, &e->model, img, block_len, tower, n_tower, tower_out,

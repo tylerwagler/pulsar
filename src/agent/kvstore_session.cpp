@@ -79,7 +79,7 @@ bool agent_session_file_write(const char *path, const agent_session_file *f, cha
     agent_put64(buf + 28, f->last_used);
     if (title_len) memcpy(buf + AGENT_SESSION_HEADER, f->title, title_len);
     for (uint32_t i = 0; i < n; i++)
-        agent_put32(buf + AGENT_SESSION_HEADER + title_len + (size_t)i * 4u, (uint32_t)f->tokens.v[i]);
+        agent_put32(buf + AGENT_SESSION_HEADER + title_len + (size_t)i * 4u, (uint32_t)f->tokens.v[i].raw());
     agent_put64(buf + bytes, agent_fnv(1469598103934665603ull, buf, bytes));
 
     const bool ok = agent_write_file_atomic(path, buf, bytes + 8u, 0600, err, err_len);
@@ -127,8 +127,8 @@ bool agent_session_file_read(const char *path, agent_session_file *f, char *err,
     memcpy(f->title, rest, title_len);
     f->title[title_len] = '\0';
     if (n) {
-        f->tokens.v = (int *)agent_xmalloc((size_t)n * sizeof(int));
-        for (uint32_t i = 0; i < n; i++) f->tokens.v[i] = (int)agent_get32(rest + title_len + (size_t)i * 4u);
+        f->tokens.v = (TokId *)agent_xmalloc((size_t)n * sizeof(TokId));
+        for (uint32_t i = 0; i < n; i++) f->tokens.v[i] = TokId{(int)agent_get32(rest + title_len + (size_t)i * 4u)};
         f->tokens.len = f->tokens.cap = (int)n;
     }
     free(rest);
@@ -277,7 +277,7 @@ void agent_turn_add_tool(agent_worker *w, const char *name, const char *content)
     w->turn[w->turn_len - 1].name = name ? xstrdup(name) : NULL;
 }
 
-bool agent_tokens_turn_open(const pulsar_turn_markers *m, const int *end, int n_end, const int *v, int n) {
+bool agent_tokens_turn_open(const pulsar_turn_markers *m, const TokId *end, int n_end, const TokId *v, int n) {
     for (int i = n - 1; i >= 0; i--) {
         const int role = pulsar_turn_marker_at(m, v, n, i);
         if (!role) continue;

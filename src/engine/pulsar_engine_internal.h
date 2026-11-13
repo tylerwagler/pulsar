@@ -1919,8 +1919,8 @@ typedef struct {
 /// @param hist      the sequence the rows continue (may be NULL)
 /// @param hist_len  entries in `hist`
 /// @return true (also with no Engram), false = refused, reason printed.
-bool gpu_graph_engram_stage(pulsar_gpu_graph *g, const int *tok, const int32_t *pos, const int32_t *bank,
-                            uint32_t n, const int *hist, uint32_t hist_len);
+bool gpu_graph_engram_stage(pulsar_gpu_graph *g, const TokId *tok, const int32_t *pos, const int32_t *bank,
+                            uint32_t n, const TokId *hist, uint32_t hist_len);
 /** The Engram layer's op at the top of block `layer` (before the drafter anchor
  * capture, as the reference): wait its gather, rows -> MX slot -> `wkv` -> gate
  * + gated add on g->batch_cur_hc.  A block with no Engram is a no-op. */
@@ -2436,7 +2436,7 @@ typedef struct pulsar_spec_carry_state {
      * position's hidden, pending verification in THIS step's single batched
      * forward (EAGLE pipeline inversion). 0 pending = next step is a plain
      * n=1 forward. Invalidated on rewind/invalidate. */
-    int32_t pend[16];
+    TokId pend[16];
     /** L108 P2: a device-chained greedy draft was LAUNCHED but its ids/conf
      * have not been read back yet.  The read happens lazily ("harvest") at
      * the next consumer -- round assembly, the bank conf peek, or a bank
@@ -2623,7 +2623,7 @@ bool pulsar_image_is_sentinel(const pulsar_engine *e, int32_t id);
 /// @param start  where the block should begin
 /// @param len    out: the block's length in tokens (0 when none)
 /// @return true when a block of length > 0 begins there; false on a family without images.
-bool pulsar_image_block_extent(const pulsar_engine *e, const int32_t *ids, int n, int start, int *len);
+bool pulsar_image_block_extent(const pulsar_engine *e, const TokId *ids, int n, int start, int *len);
 /** The records of `images` (in prompt order, each naming its block in `ids` by the geometry `v` -- the family's,
  *  e->family->vision; `e` is the hook's argument) whose blocks end at or below `limit`.  false = an image names no
  *  block, blocks out of order, or more than PULSAR_IMAGE_BLOCKS_MAX (said). */
@@ -2636,7 +2636,7 @@ bool pulsar_image_block_extent(const pulsar_engine *e, const int32_t *ids, int n
 /// @param limit     only blocks ending at or below this position are recorded
 /// @param out       receives the records
 /// @return false (said) on a bad image list.
-bool pulsar_image_identity_build(const pulsar_family_vision *v, const pulsar_engine *e, const int32_t *ids, int n,
+bool pulsar_image_identity_build(const pulsar_family_vision *v, const pulsar_engine *e, const TokId *ids, int n,
                                  const pulsar_image_ref *images, int n_images, uint32_t limit,
                                  pulsar_image_identity *out);
 /** Keep the records of the blocks that end at or below `pos` (a rewind's survivors). */
@@ -2677,7 +2677,7 @@ void pulsar_image_rope3(const pulsar_image_identity *id, uint32_t row, uint32_t 
 /// @param n    entries in `ids`
 /// @param id   the image records the history's KV holds
 /// @return the tokens a disk chain may hold, or -1.
-int pulsar_image_persist_end(const pulsar_family_vision *v, const pulsar_engine *e, const int32_t *ids, int n,
+int pulsar_image_persist_end(const pulsar_family_vision *v, const pulsar_engine *e, const TokId *ids, int n,
                              const pulsar_image_identity *id);
 
 /* ---- L268: the image path every family shares (image_front.cpp) ---- */
@@ -2708,7 +2708,7 @@ bool pulsar_image_expand(const pulsar_engine *e, const pulsar_tokens *prompt, in
 /// @param err        failure message buffer
 /// @param errlen     its size
 /// @return false + `err` when a block is missing or wider than a chunk.
-bool pulsar_image_spans_fit(const pulsar_engine *e, const int32_t *ids, int n, const pulsar_image_ref *images,
+bool pulsar_image_spans_fit(const pulsar_engine *e, const TokId *ids, int n, const pulsar_image_ref *images,
                             int n_images, uint32_t chunk_cap, int *end_out, char *err, size_t errlen);
 /** false + `err` when a prompt with no images carries a sentinel or placeholder id. */
 /// @param e       the engine
@@ -2728,7 +2728,7 @@ bool pulsar_image_refuse_orphans(const pulsar_engine *e, const pulsar_tokens *pr
 /// @param err        failure message buffer
 /// @param errlen     its size
 /// @return false + `err` on a failure.
-bool pulsar_image_block_rows(const pulsar_engine *e, const pulsar_image_ref *img, const int32_t *ids, int block_len,
+bool pulsar_image_block_rows(const pulsar_engine *e, const pulsar_image_ref *img, const TokId *ids, int block_len,
                              uint16_t *out, bool *cache_hit, char *err, size_t errlen);
 /** Write `n_rows` rows of `width` bf16 into a [token][stream][width] carrier at chunk row `row0` (of `n_tokens`),
  *  each replicated into every one of `n_streams` streams -- the hyper-connection expansion both families' models do
@@ -2765,7 +2765,7 @@ typedef bool (*pulsar_image_row_writer)(void *ud, const uint16_t *rows, uint32_t
 /// @param write     the family's row writer
 /// @param ud        passed to `write`
 /// @return true when every block in the chunk was written.
-bool pulsar_image_merge_chunk(const pulsar_engine *e, const int32_t *ids, int n_ids, const pulsar_image_ref *images,
+bool pulsar_image_merge_chunk(const pulsar_engine *e, const TokId *ids, int n_ids, const pulsar_image_ref *images,
                               int n_images, uint32_t pos0, uint32_t n_tokens, pulsar_image_row_writer write,
                               void *ud);
 /** The reuse licence for an image request against a session's live history (L226, L261, L281). */
@@ -2949,7 +2949,7 @@ int pulsar_session_spec_round_end_local(pulsar_session *s, pulsar_spec_round *r,
                                         float temperature, int top_k, float top_p,
                                         float min_p, uint32_t greedy_rows,
                                         const uint32_t *masks, uint32_t mask_rows, uint64_t *rng, uint32_t row0,
-                                        int *accepted, int accepted_cap, char *err, size_t errlen);
+                                        TokId *accepted, int accepted_cap, char *err, size_t errlen);
 /// Abort a begun round whose forward failed: drop its frontier snapshot and unverified rows.
 /// @param s  the session
 /// @param r  the round
@@ -3070,7 +3070,7 @@ struct pulsar_session {
         uint32_t n;                                      ///< rows
         uint32_t src_row[PULSAR_SPEC_LOGITS_ROWS + 1];   ///< each row's source row
         uint32_t bank[PULSAR_SPEC_LOGITS_ROWS + 1];      ///< each row's bank
-        int32_t next_tok[PULSAR_SPEC_LOGITS_ROWS + 1];   ///< the token after each row (a drafter that pairs rows with their successor, L272 P1)
+        TokId next_tok[PULSAR_SPEC_LOGITS_ROWS + 1];     ///< the token after each row (a drafter that pairs rows with their successor, L272 P1)
     } seed_defer;                                        ///< the drafter seed deferred to the next launch
     pulsar_gpu_graph *graph;  ///< L272 P6: the DeepSeek family's device state (KV, scratch, bank views), owned by its create / destroy; NULL on any other family
     /** L295 F4: the core row-step driver's buffers (step_driver.h) -- the base of the family's own session state
@@ -3314,7 +3314,7 @@ struct pulsar_session {
     /// @param n       draws, 1 .. PULSAR_GPU_SAMPLE_ROWS_MAX
     /// @param tokens  receives n tokens (PULSAR_SAMPLE_REFUSED for a degenerate row)
     /// @return 0, or 1 when nothing was drawn.
-    int draw_step_rows(const uint32_t *rows, const pulsar_row_draw *d, uint32_t n, int *tokens);
+    int draw_step_rows(const uint32_t *rows, const pulsar_row_draw *d, uint32_t n, TokId *tokens);
     /** Logprobs of a row of the last batched step (pulsar_session_step_row_logprobs). */
     /// @param row          headed row of the last batched step, < dev.step_n
     /// @param token        the token to score (< 0: none)
@@ -3407,7 +3407,7 @@ struct pulsar_session {
     /// @param n     their count (> 0)
     /// @param head  index of the headed run of the last fused step that finishes the prompt, or -1 on an intermediate chunk
     /// @return 0, or 1 (refused, said).
-    int note_prefilled(const int *toks, int n, int head);
+    int note_prefilled(const TokId *toks, int n, int head);
     /** Generate with the drafter: propose a block, verify it against the target
      * in one pass, and commit the accepted prefix.
      * @param temperature   sampling temperature; 0 selects argmax
@@ -3424,7 +3424,7 @@ struct pulsar_session {
      * @return tokens committed. */
     int generate_speculative(float temperature, int top_k, float top_p, float min_p,
                              uint64_t *rng, int max_tokens,
-                             int *accepted, int accepted_cap, char *err, size_t errlen);
+                             TokId *accepted, int accepted_cap, char *err, size_t errlen);
     /** Speculative generation seeded with a known `first_token` -- the forced-
      * continuation form, where the caller has already chosen the opening token.
      * @param first_token   the opening token, committed as-is
@@ -3436,7 +3436,7 @@ struct pulsar_session {
      * @param errlen        its size
      * @return tokens committed. */
     int eval_speculative_block(int first_token, int max_tokens,
-                               int *accepted, int accepted_cap, char *err, size_t errlen);
+                               TokId *accepted, int accepted_cap, char *err, size_t errlen);
     /** Undo back to `pos` tokens: trim the checkpoint, drop speculative state,
      * and clamp every compressing layer's frontier to pos/ratio.
      *
@@ -4634,7 +4634,7 @@ void pulsar_bank_carry_save_view(pulsar_session *s, uint32_t bank);
 /// @param token the token id
 /// @param len   receives the text's length in bytes
 /// @return a malloc'd copy of the token's text (the caller frees it), or NULL (no tokenizer: pulsar_token_text)
-char *pulsar_engine_token_text_fn(void *ud, int token, size_t *len);
+char *pulsar_engine_token_text_fn(void *ud, TokId token, size_t *len);
 /** Bring `bank`'s saved view back into the host view, all or nothing.  false = nothing valid was saved, or the
  *  bank's live row did not restore (said) -- either way the host view is untouched, and the family decides what a
  *  bank with no carry means. */
@@ -4795,7 +4795,7 @@ void pulsar_session_family_invalidate(pulsar_session *s);
 /// @param s     the session
 /// @param toks  the committed tokens
 /// @param n     their count (<= 0: nothing)
-void pulsar_session_note_committed(pulsar_session *s, const int *toks, int n);
+void pulsar_session_note_committed(pulsar_session *s, const TokId *toks, int n);
 
 /** THE cut rule (prefill_loop.cpp, L284): a walk's chunk ends, as a pure function of the chunk's start, the
  *  prompt's end and these fixed inputs.  In order: snap to the absolute grid of `grid_cap` (at most `chunk_cap`
@@ -4908,7 +4908,7 @@ struct pulsar_read_ahead_mark {
 /// @param[out] drop the record is stale: cancel its queued rows first
 /// @param[out] next the record to keep once [from, to) is queued
 /// @return true when [*from, *to) is to be queued
-bool pulsar_read_ahead_plan(const pulsar_read_ahead_mark *mark, const int *prompt, uint32_t len, uint32_t run_end,
+bool pulsar_read_ahead_plan(const pulsar_read_ahead_mark *mark, const TokId *prompt, uint32_t len, uint32_t run_end,
                             uint32_t window, uint32_t *from, uint32_t *to, bool *drop, pulsar_read_ahead_mark *next);
 /** L329 (b2): may a read-ahead be queued with MemAvailable at `mem_available` bytes (0 = unreadable: fail closed)?
  *  Only above PULSAR_READ_AHEAD_MEM_HEADROOM plus the pool's whole unread cap at a page a row (~9 GiB).  Pure
@@ -5295,7 +5295,7 @@ bool vision_ds4_expand(const pulsar_image_ref *img, pulsar_tokens *out, char *er
 /// @param start_pos where to look
 /// @param[out] len_out the block's length
 /// @return 1, or 0 when no block starts there
-int vision_span_extent(const int32_t *ids, int n, int n_vocab, int start_pos, int *len_out);
+int vision_span_extent(const TokId *ids, int n, int n_vocab, int start_pos, int *len_out);
 /** The reference's get_image_visible(): per-token visible counts to the
  * left/right within each [IMAGE_START, IMAGE_END] span.  Pure integer function
  * of the token ids, so it is graded directly against the reference by
@@ -5307,7 +5307,7 @@ int vision_span_extent(const int32_t *ids, int n, int n_vocab, int start_pos, in
 /// @param max_image_tokens the widest span
 /// @param[out] left [n] visible tokens to the left
 /// @param[out] right [n] visible tokens to the right
-void vision_image_visible(const int32_t *ids, int n, int n_vocab, int max_image_tokens,
+void vision_image_visible(const TokId *ids, int n, int n_vocab, int max_image_tokens,
                           int32_t *left, int32_t *right);
 /** The reference's `width = min(seqlen, window_size + max_image_tokens)`: the
  * column count of the matrix vision_window_topk_visible() writes. */
@@ -5695,7 +5695,7 @@ int gpu_graph_decode_multiseq_batch(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
         const pulsar_weights     *weights,
-        const int             *tokens,
+        const TokId           *tokens,
         const int32_t         *pos,
         const int32_t         *bank,
         uint32_t               n_active,
@@ -5863,7 +5863,7 @@ bool gpu_graph_dspark_draft_forward(
         const pulsar_model         *dspark_model,
         const pulsar_dspark_weights *w,
         pulsar_gpu_tensor         *base_logits_out,
-        const int32_t            draft_ids[],
+        const TokId              draft_ids[],
         uint32_t                n_draft);
 /** L150: the same forward over the rows of n_banks banks at once (contract at
  * the definition); n_banks == 1 with NULL arrays == the single-bank forward. */
@@ -5887,7 +5887,7 @@ bool gpu_graph_dspark_draft_forward_banks(
         const pulsar_model         *dspark_model,
         const pulsar_dspark_weights *w,
         pulsar_gpu_tensor         *base_logits_out,
-        const int32_t            draft_ids[],
+        const TokId              draft_ids[],
         uint32_t                n_rows,
         uint32_t                n_banks,
         const uint32_t          *row_bank,
@@ -6051,7 +6051,7 @@ bool gpu_graph_write_vision_span(pulsar_gpu_tensor *out_hc, const uint16_t *rows
 /// @param pos0 the chunk's first position
 /// @param n_tokens its rows
 /// @return false on any refusal; true (a no-op) when vr is NULL
-bool gpu_graph_merge_image_spans(pulsar_gpu_tensor *out_hc, const int32_t *ids, int n_ids,
+bool gpu_graph_merge_image_spans(pulsar_gpu_tensor *out_hc, const TokId *ids, int n_ids,
                                  const pulsar_vision_request *vr, uint32_t pos0, uint32_t n_tokens);
 /** Compute THIS chunk's image-span visibility and upload it to
  * g->vision_visible, once per chunk, before any layer's attention runs.  A
@@ -6067,7 +6067,7 @@ bool gpu_graph_merge_image_spans(pulsar_gpu_tensor *out_hc, const int32_t *ids, 
 /// @param start the chunk's first position
 /// @param n_tokens its rows
 /// @return false when a span cannot be addressed in one pass
-bool gpu_graph_upload_vision_visible(pulsar_gpu_graph *g, const int32_t *ids,
+bool gpu_graph_upload_vision_visible(pulsar_gpu_graph *g, const TokId *ids,
                                      int n_ids, uint32_t start, uint32_t n_tokens);
 
 bool gpu_graph_warmup_prefill_kernels(
@@ -6186,7 +6186,7 @@ bool gpu_graph_compressor_state_reset(pulsar_gpu_graph *g, uint32_t bank);
 uint32_t gpu_graph_raw_cap_for_context(int ctx_size, uint32_t prefill_cap);
 uint32_t gpu_graph_prefill_cap_for_prompt(int prompt_len,
                                                    uint32_t prefill_chunk);
-void token_vec_push(token_vec *tv, int token);
+void token_vec_push(token_vec *tv, TokId token);
 void token_vec_free(token_vec *tv);
 void dump_tokens_fp(FILE *fp, const pulsar_vocab *vocab, const token_vec *tokens);
 /** The bytes `token` decodes to -- the GPT-2 byte alphabet reversed, literal

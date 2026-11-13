@@ -177,7 +177,7 @@ bool forward(pulsar_engine *e, const pulsar_tokens *in, uint32_t n, uint32_t row
         return (const uint16_t *)pulsar_weight_device_ptr(m, t, what);
     };
     /* the ids, and each row's input and position */
-    std::vector<int32_t> ids(rows);
+    std::vector<TokId> ids(rows);
     std::vector<uint32_t> row_seq(rows), row_pos(rows);
     std::vector<pulsar_gqa_seq> seqs(n);   /* no pool: a block run from position 0 stores nothing */
     for (uint32_t i = 0, o = 0; i < n; i++)
@@ -320,7 +320,7 @@ bool render(pulsar_engine *e, pulsar_encode_role role, const char *text, const c
         if (err) snprintf(err, errlen, "%s: the tokenizer refused the input: %s", ARCH, why);
         return false;
     }
-    for (int id : ids) pulsar_tokens_push(out, id);
+    for (int id : ids) pulsar_tokens_push(out, TokId{id});
     return true;
 }
 

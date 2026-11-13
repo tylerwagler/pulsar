@@ -60,7 +60,7 @@ typedef struct {
      *  arms, the verify's row kind (the absorb of every bank's kept rows); without it a PREFILL step is one bank's
      *  prompt rows at the prompt arms (a sync chunk's lockstep). */
     bool decode_rows;
-    const int32_t *tokens;      ///< [n] the token after each conditioning row's: the module's input token
+    const TokId *tokens;        ///< [n] the token after each conditioning row's: the module's input token
     const int32_t *pos;         ///< [n] the position the row writes (its conditioning row's)
     const int32_t *bank;        ///< [n]
     /// Rows in the step (the length of tokens / pos / bank).
@@ -102,7 +102,7 @@ typedef struct pulsar_mtp_ops {
     /** Optional, a hint: ids the next verify of `bank` will embed, in order, as the chain drafts them -- the first
      *  call of a chain (`chain_start`) the carry (and a copy chain's drafts), then each draft (Qwen: the PLE rows'
      *  page-cache prefetch, its n-gram context advanced along the chain). */
-    void (*prefetch)(pulsar_session *s, uint32_t bank, const int32_t *ids, uint32_t n, bool chain_start);
+    void (*prefetch)(pulsar_session *s, uint32_t bank, const TokId *ids, uint32_t n, bool chain_start);
     /** A module row's bytes are the same whatever rows share its step (every op of the module step at an
      *  M-independent arm), so the drafter slot a speculative stream leaves is the plain stream's byte for byte
      *  (tests/mtp_spec_gate M3 holds the family to it; false = graded there, not asserted -- it moves drafts only,
@@ -138,7 +138,7 @@ struct pulsar_mtp_lane {
     pulsar_gpu_tensor *cond;    ///< [max_rows] the conditioning rows a module step reads
     TokPos *pend_pos;           ///< [n_banks] the parked row's position; none() = no parked row
     bool *stage_dirty;          ///< [n_banks] a chain wrote draft rows into the saved stage (stage_save)
-    int32_t vtok[PULSAR_DRIVER_HEADS_MAX];   ///< the last verify step's tokens, by step row (pulsar_mtp_note_verify)
+    TokId vtok[PULSAR_DRIVER_HEADS_MAX];     ///< the last verify step's tokens, by step row (pulsar_mtp_note_verify)
     /// Valid entries of vtok (<= PULSAR_DRIVER_HEADS_MAX).
     uint32_t n_vtok;
     pulsar_mtp_probe *probe;    ///< NULL = off
@@ -150,7 +150,7 @@ struct pulsar_mtp_lane {
 /// @param l the lane
 /// @param tokens [n] the verify step's tokens, by step row
 /// @param n rows (only the first PULSAR_DRIVER_HEADS_MAX are kept)
-static inline void pulsar_mtp_note_verify(pulsar_mtp_lane *l, const int32_t *tokens, uint32_t n) {
+static inline void pulsar_mtp_note_verify(pulsar_mtp_lane *l, const TokId *tokens, uint32_t n) {
     l->n_vtok = n < PULSAR_DRIVER_HEADS_MAX ? n : PULSAR_DRIVER_HEADS_MAX;
     for (uint32_t r = 0; r < l->n_vtok; r++) l->vtok[r] = tokens[r];
 }
@@ -177,7 +177,7 @@ void pulsar_mtp_lane_free(pulsar_mtp_lane *l);
 /// @param row0 the step row of the first
 /// @param eval the single-row eval (unused here)
 /// @return false = refused or failed (said); true with no lane
-bool pulsar_mtp_absorb(pulsar_session *s, pulsar_step_mode mode, const int32_t *tokens, const int32_t *pos,
+bool pulsar_mtp_absorb(pulsar_session *s, pulsar_step_mode mode, const TokId *tokens, const int32_t *pos,
                        const int32_t *bank, uint32_t n, uint32_t row0, bool eval);
 
 /** The plan's drafter hooks (pulsar_state_plan::drafter_at / drafter_frontier; ud = the driver state). */
@@ -202,7 +202,7 @@ bool pulsar_mtp_drafter_frontier(void *ud, BankId bank, TokPos T, char *why, siz
 /// @param next [n] the token after each
 /// @param n rows
 /// @return false = refused or failed (said)
-bool pulsar_mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const uint32_t *banks, const int32_t *next,
+bool pulsar_mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const uint32_t *banks, const TokId *next,
                               uint32_t n);
 /// pulsar_drafter_ops::draft for the installed bank.
 /// @param s the session

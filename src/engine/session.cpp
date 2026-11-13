@@ -1482,8 +1482,8 @@ int pulsar_session::common_prefix(const pulsar_tokens *prompt) {
  * ids) only match by ID: a boundary mismatch involving one stops the walk
  * conservatively — role markers must never byte-alias into content. */
 void pulsar_tokens_prefix_match_with(pulsar_token_text_fn text, void *ud,
-                                     const int *a, int a_len,
-                                     const int *b, int b_len,
+                                     const TokId *a, int a_len,
+                                     const TokId *b, int b_len,
                                      pulsar_prefix_match *out) {
     out->live_cut = TokCount{0};
     out->prompt_cut = PromptToks{0};
@@ -1537,13 +1537,13 @@ done:
 }
 
 /* The engine's vocabulary for the seam walks. */
-char *pulsar_engine_token_text_fn(void *ud, int token, size_t *len) {
-    return pulsar_token_text((pulsar_engine *)ud, TokId{token}, len);
+char *pulsar_engine_token_text_fn(void *ud, TokId token, size_t *len) {
+    return pulsar_token_text((pulsar_engine *)ud, token, len);
 }
 
 void pulsar_tokens_prefix_match(pulsar_engine *e,
-                                const int *a, int a_len,
-                                const int *b, int b_len,
+                                const TokId *a, int a_len,
+                                const TokId *b, int b_len,
                                 pulsar_prefix_match *out) {
     if (!e) {
         out->live_cut = TokCount{0};
@@ -1558,8 +1558,8 @@ void pulsar_tokens_prefix_match(pulsar_engine *e,
  * `at` -- the prompt-side position when `at` is one.  Past it (a re-spelled stretch the walk did not close before
  * `at`) the request's tokens are counted while each is byte-equal to the live bytes that follow and ends at or before
  * `at`'s byte; a control token (no text) or a differing byte stops the count. */
-PromptToks pulsar_tokens_prompt_held_with(pulsar_token_text_fn text, void *ud, const int *live, TokPos at,
-                                          const int *prompt, int prompt_len) {
+PromptToks pulsar_tokens_prompt_held_with(pulsar_token_text_fn text, void *ud, const TokId *live, TokPos at,
+                                          const TokId *prompt, int prompt_len) {
     pulsar_prefix_match m;
     pulsar_tokens_prefix_match_with(text, ud, live, at.raw(), prompt, prompt_len, &m);
     if (TokPos::after(m.live_cut) == at) return m.prompt_cut;

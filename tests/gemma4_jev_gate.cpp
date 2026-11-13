@@ -50,7 +50,7 @@ static std::vector<std::vector<int32_t>> read_cases(const char *path) {
 static pulsar_tokens toks(const std::vector<int32_t> &ids) {
     pulsar_tokens t;
     memset(&t, 0, sizeof(t));
-    for (int32_t x : ids) pulsar_tokens_push(&t, x);
+    for (int32_t x : ids) pulsar_tokens_push(&t, TokId{x});
     return t;
 }
 

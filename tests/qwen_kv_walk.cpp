@@ -116,13 +116,15 @@ int main(int argc, char **argv) {
         const int P = w.depth - w.window;
         char err[256] = "";
         const double t0 = now_s();
-        pulsar_tokens pre = {ids.data(), P, P};
+        std::vector<TokId> tids;   /* the window's ids, entered as ids */
+        for (int32_t t : ids) tids.push_back(TokId{t});
+        pulsar_tokens pre = {tids.data(), P, P};
         if (pulsar_session_sync(s, &pre, err, sizeof(err)) != 0) { fprintf(stderr, "qwen-kv-walk: sync: %s\n", err); return 1; }
         const double t1 = now_s();
         double kl_sum = 0.0, dnll_sum = 0.0;
         int agree = 0;
         for (int i = 0; i < w.window; i++) {
-            if (i > 0 && pulsar_session_eval(s, TokId{ids[(size_t)P + i - 1]}, err, sizeof(err)) != 0) {
+            if (i > 0 && pulsar_session_eval(s, tids[(size_t)P + i - 1], err, sizeof(err)) != 0) {
                 fprintf(stderr, "qwen-kv-walk: eval at %d: %s\n", P + i, err);
                 return 1;
             }

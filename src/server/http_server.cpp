@@ -476,7 +476,7 @@ bool server::send_version(int fd) {
         PULSAR_VERSION_STR,
         model_id_json_body(server_served_model_id(s)).c_str(),
         model_id_json_body(server_served_model_name(s)).c_str(),
-        pulsar_session_ctx(s->sess));
+        pulsar_session_ctx(s->sess).raw());   /* L334: a TokCount through varargs was UB; .raw() */
     bool ok = http_response(fd, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;

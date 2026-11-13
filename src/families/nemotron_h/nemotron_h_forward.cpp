@@ -806,7 +806,7 @@ bool plan_attention(const nh_step *st, uint32_t *bound_out) {
 bool mtp_stage(const nh_step *st, uint32_t il) {
     nh_state *q = st->st;
     for (uint32_t r = 0; r < st->n_rows; r++)
-        if (st->tokens[r] < 0 || (uint32_t)st->tokens[r] >= st->w->shape.n_vocab)
+        if (!st->tokens[r].below(st->w->shape.n_vocab))
             return fail("a token id outside the vocabulary");
     const uint64_t off = (uint64_t)q->n_attn * q->attn_desc_max;
     return build_tables(st) && plan_call(st, il, q->n_attn, attn_bound(st), off, q->attn_desc_max) &&
@@ -827,7 +827,7 @@ bool stage(const pulsar_driver_step *st0, uint64_t *graph_key) {
     const pulsar_nemotron_h_shape &s = st->w->shape;
     *graph_key = 0;
     for (uint32_t r = 0; r < st->n_rows; r++)
-        if (st->tokens[r] < 0 || (uint32_t)st->tokens[r] >= s.n_vocab) return fail("a token id outside the vocabulary");
+        if (!st->tokens[r].below(s.n_vocab)) return fail("a token id outside the vocabulary");
     uint32_t bound = 0;
     if (!build_tables(st) || !plan_attention(st, &bound)) return false;
     /* the key's fields, packed without overlap: the "NH" tag in bits 48..63, the bound in bits 1..32, bit 0 set (a

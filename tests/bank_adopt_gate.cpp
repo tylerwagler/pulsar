@@ -173,7 +173,7 @@ int GATE_ENTRY(int argc, char **argv) {
         pulsar_tokens a = {0}, b = {0};
         for (int i = 16; i < E && k < 0; i++) {
             size_t n = 0;
-            char *t = pulsar_token_text(e, TokId{P.v[i]}, &n);
+            char *t = pulsar_token_text(e, P.v[i], &n);
             bool word = t && n >= 3;
             for (size_t c = 0; word && c < n; c++) word = (t[c] >= 'a' && t[c] <= 'z') || (t[c] >= 'A' && t[c] <= 'Z');
             if (word) {

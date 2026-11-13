@@ -823,7 +823,7 @@ bool pulsar_qwen_s4_embed(const pulsar_qwen_step *st) {
     const pulsar_qwen_shape *s = st->shape;
     const uint32_t n = st->n_rows;
     for (uint32_t r = 0; r < n; r++)
-        if (st->tokens[r] < 0 || (uint32_t)st->tokens[r] >= s->n_vocab) return fail("a token id outside the vocabulary");
+        if (!st->tokens[r].below(s->n_vocab)) return fail("a token id outside the vocabulary");
     /* the MoE non-finite flag starts every step clear (read at pulsar_qwen_s4_step_end) */
     pulsar_gpu_tensor *moe_sc = st->st->scratch[PULSAR_QWEN_OP_MOE];
     static const uint32_t zero = 0;   /* L289: an enqueued write reads it later */
@@ -855,7 +855,8 @@ bool pulsar_qwen_s4_embed(const pulsar_qwen_step *st) {
         /* oldest first */
         int32_t *ctx_b = (int32_t *)pulsar_state_host(st->states, PULSAR_QWEN_STATE_NGRAM, BankId{st->bank[r]});
         pulsar_qwen_ngram_ctx ctx = {{ctx_b[0], ctx_b[1]}};
-        pulsar_qwen_ngram_rows(&io->layout, &ctx, &st->tokens[r], 1, io->ids + (size_t)r * PULSAR_QWEN_NGRAM_COLS);
+        pulsar_qwen_ngram_rows(&io->layout, &ctx, pulsar_tok_ids_raw(&st->tokens[r]), 1,
+                               io->ids + (size_t)r * PULSAR_QWEN_NGRAM_COLS);   /* the n-gram hash reads raw ids */
         ctx_b[0] = ctx.prev[0];
         ctx_b[1] = ctx.prev[1];
     }
@@ -864,33 +865,33 @@ bool pulsar_qwen_s4_embed(const pulsar_qwen_step *st) {
     return io->pending != NULL || fail("the PLE gather did not start");
 }
 
-void pulsar_qwen_s4_ple_prefetch(const pulsar_qwen_weights *w, int32_t ctx[2], const int32_t *tokens, uint32_t n) {
+void pulsar_qwen_s4_ple_prefetch(const pulsar_qwen_weights *w, int32_t ctx[2], const TokId *tokens, uint32_t n) {
     pulsar_qwen_ple_io *io = w->ple_io;
     if (!io || n == 0 || n > PULSAR_QWEN_SPEC_ROWS) return;
     for (uint32_t r = 0; r < n; r++)
-        if (tokens[r] < 0 || (uint32_t)tokens[r] >= io->layout.vocab) return;   /* the embed refuses it by name */
+        if (!tokens[r].below(io->layout.vocab)) return;   /* the embed refuses it by name */
     uint64_t ids[PULSAR_QWEN_SPEC_ROWS * PULSAR_QWEN_NGRAM_COLS];
     pulsar_qwen_ngram_ctx c = {{ctx[0], ctx[1]}};
-    pulsar_qwen_ngram_rows(&io->layout, &c, tokens, (int)n, ids);
+    pulsar_qwen_ngram_rows(&io->layout, &c, pulsar_tok_ids_raw(tokens), (int)n, ids);   /* the hash reads raw ids */
     ctx[0] = c.prev[0];
     ctx[1] = c.prev[1];
     pulsar_engram_prefetch(io->io, &io->table, ids, n * PULSAR_QWEN_NGRAM_COLS);
 }
 
-uint32_t pulsar_qwen_s4_ple_read_ahead(const pulsar_qwen_weights *w, uint64_t tag, const int32_t *prompt, uint32_t from,
+uint32_t pulsar_qwen_s4_ple_read_ahead(const pulsar_qwen_weights *w, uint64_t tag, const TokId *prompt, uint32_t from,
                                        uint32_t to) {
     pulsar_qwen_ple_io *io = w ? w->ple_io : NULL;
     if (!io || !io->ahead || !prompt || to <= from) return 0;
     /* the n-gram reaches two tokens back: the context at `from` is the prompt's own (EOS before its start) */
     for (uint32_t i = from >= 2u ? from - 2u : 0u; i < to; i++)
-        if (prompt[i] < 0 || (uint32_t)prompt[i] >= io->layout.vocab) return 0;   /* the embed refuses it by name */
+        if (!prompt[i].below(io->layout.vocab)) return 0;   /* the embed refuses it by name */
     pulsar_qwen_ngram_ctx c;
     pulsar_qwen_ngram_ctx_init(&io->layout, &c);
-    if (from >= 2u) c.prev[0] = prompt[from - 2u];
-    if (from >= 1u) c.prev[1] = prompt[from - 1u];
+    if (from >= 2u) c.prev[0] = prompt[from - 2u].raw();
+    if (from >= 1u) c.prev[1] = prompt[from - 1u].raw();
     const uint32_t n = to - from;
     std::vector<uint64_t> ids((size_t)n * PULSAR_QWEN_NGRAM_COLS);
-    pulsar_qwen_ngram_rows(&io->layout, &c, prompt + from, n, ids.data());
+    pulsar_qwen_ngram_rows(&io->layout, &c, pulsar_tok_ids_raw(prompt + from), n, ids.data());
     return pulsar_engram_read_ahead(io->io, &io->table, ids.data(), n * PULSAR_QWEN_NGRAM_COLS, tag);
 }
 
@@ -1333,7 +1334,7 @@ bool pulsar_qwen_s4_mtp_combine(const pulsar_qwen_step *st, const void *h) {
     const uint32_t n = st->n_rows;
     if (!M.present || !st->st->mtp) return fail("the MTP combine without the MTP layer");
     for (uint32_t r = 0; r < n; r++)
-        if (st->tokens[r] < 0 || (uint32_t)st->tokens[r] >= s->n_vocab) return fail("a token id outside the vocabulary");
+        if (!st->tokens[r].below(s->n_vocab)) return fail("a token id outside the vocabulary");
     pulsar_gpu_tensor *moe_sc = st->st->scratch[PULSAR_QWEN_OP_MOE];
     static const uint32_t zero = 0;   /* L289: an enqueued write reads it later */
     if (!moe_sc || !pulsar_gpu_tensor_write_async(moe_sc, moe_layout(st->shape, st->st->max_rows).nf, &zero, sizeof(zero)))
@@ -1385,13 +1386,13 @@ bool pulsar_qwen_s4_draft_top_read(const pulsar_qwen_state *q, const pulsar_qwen
 
 /* L295 F3: the n-gram context's verify commit (the declared state's REPLAY, family_qwen.cpp): a bank's context before
  * the step, advanced over the kept tokens as the embed advanced it over every row. */
-bool pulsar_qwen_s4_ngram_replay(const pulsar_qwen_weights *w, int32_t ctx[2], const int32_t *tokens, uint32_t keep) {
+bool pulsar_qwen_s4_ngram_replay(const pulsar_qwen_weights *w, int32_t ctx[2], const TokId *tokens, uint32_t keep) {
     pulsar_qwen_ple_io *io = w->ple_io;
     if (!io) return fail("no PLE row file is open");
     if (keep > PULSAR_QWEN_SPEC_ROWS) return fail("an n-gram replay past the verify width");
     pulsar_qwen_ngram_ctx c = {{ctx[0], ctx[1]}};
     uint64_t ids[PULSAR_QWEN_SPEC_ROWS * PULSAR_QWEN_NGRAM_COLS];
-    pulsar_qwen_ngram_rows(&io->layout, &c, tokens, (int)keep, ids);
+    pulsar_qwen_ngram_rows(&io->layout, &c, pulsar_tok_ids_raw(tokens), (int)keep, ids);   /* the hash reads raw ids */
     ctx[0] = c.prev[0];
     ctx[1] = c.prev[1];
     return true;

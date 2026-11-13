@@ -791,7 +791,8 @@ const uint32_t *gen_constrain_base_mask(server *s, gen_state *g) {
 /// @return whether token `t` is allowed
 static bool mask_bit(const uint32_t *row, int t) { return (row[(uint32_t)t >> 5] >> ((uint32_t)t & 31u)) & 1u; }
 
-int gen_constrain_round(server *s, gen_state *g, const int *toks, int n, bool base_emitted, const uint32_t **masks) {
+int gen_constrain_round(server *s, gen_state *g, const TokId *toks, int n, bool base_emitted,
+                        const uint32_t **masks) {
     constrain_gate *gt = g->gate;
     *masks = NULL;
     if (!gt) return 0;
@@ -806,8 +807,9 @@ int gen_constrain_round(server *s, gen_state *g, const int *toks, int n, bool ba
     int fed = 0;
     bool any_live = false, ok = true, walking = true;
     if (!base_emitted) {
-        const std::string &b = (*s->token_bytes)[(size_t)toks[0]];
-        walking = gate_feed(gt, toks[0], b.data(), b.size());
+        const int t0 = toks[0].raw();   /* the gate's matcher takes the raw id */
+        const std::string &b = (*s->token_bytes)[(size_t)t0];
+        walking = gate_feed(gt, t0, b.data(), b.size());
         fed += walking;
     }
     for (int i = 0; ok && i < rows; i++) {
@@ -820,7 +822,7 @@ int gen_constrain_round(server *s, gen_state *g, const int *toks, int n, bool ba
             memset(row, 0xff, (size_t)W * sizeof(uint32_t));
         }
         if (!ok || !walking || i == rows - 1) continue;
-        const int t = toks[off + i];
+        const int t = toks[off + i].raw();
         /* the walk never reads past a draft its row refuses; a stop ends the round (it clamps there) */
         if ((live && !mask_bit(row, t)) || pulsar_grammar_compiler_is_stop(s->grammar, t)) {
             walking = false;
@@ -848,7 +850,7 @@ int gen_constrain_round(server *s, gen_state *g, const int *toks, int n, bool ba
  * matcher to take each token instead of filling a mask per row: the pick needs only where the chain stops.  Copy
  * chains are where it bites (a quote of the history runs straight past the grammar), and a drafter's chain is cut
  * by the same rule. */
-int gen_constrain_draft_prefix(server *s, gen_state *g, TokId base_id, const int32_t *drafts, int n) {
+int gen_constrain_draft_prefix(server *s, gen_state *g, TokId base_id, const TokId *drafts, int n) {
     constrain_gate *gt = g->gate;
     if (n <= 0) return 0;
     const int V = (int)s->token_bytes->size();
@@ -860,8 +862,8 @@ int gen_constrain_draft_prefix(server *s, gen_state *g, TokId base_id, const int
     if (gate_feed(gt, base, bb.data(), bb.size())) {
         fed++;
         for (; keep < n; keep++) {
-            const int t = drafts[keep];
-            if (t < 0 || t >= V) break;
+            if (!drafts[keep].below((uint32_t)V)) break;
+            const int t = drafts[keep].raw();   /* the gate's matcher takes the raw id */
             /* the walk ends at a stop (the round clamps there): nothing after it is ever committed */
             if (pulsar_grammar_compiler_is_stop(s->grammar, t)) {
                 keep++;

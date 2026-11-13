@@ -160,7 +160,7 @@ bool pulsar_kvtext_text_ends_with_live(pulsar_engine *engine, const char *text,
     const bool text_eos = eos_len > 0 && text_len >= eos_len &&
                           memcmp(text + text_len - eos_len, eos_text, eos_len) == 0;
     free(eos_text);
-    const bool live_eos = tokens && tokens->len > 0 && TokId{tokens->v[tokens->len - 1]} == eos;
+    const bool live_eos = tokens && tokens->len > 0 && tokens->v[tokens->len - 1] == eos;
     return text_eos == live_eos;
 }
 

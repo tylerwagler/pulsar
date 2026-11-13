@@ -117,7 +117,7 @@ int GATE_ENTRY(int argc, char **argv) {
 
     pulsar_engine_set_bank_pool(2);
     pulsar_session *s = NULL;
-    int *toks = NULL;
+    TokId *toks = NULL;
     char err[256] = "";
     if (pulsar_session_create(&s, e, ctx) != 0 || !s || pulsar_session_bank_count(s) != 2 ||
         gate_state_slots(s) == 0) {
@@ -132,7 +132,7 @@ int GATE_ENTRY(int argc, char **argv) {
     CHECK(step_price >= (uint64_t)step_mib << 20, "K0 an increment of %d tokens grows a bank's pools by %.1f MiB "
           "(want >= %d MiB, 4x the %u MiB tolerance floor at least)", step, step_price / MIB, step_mib, TOL_FLOOR_MIB);
 
-    toks = (int *)malloc((size_t)peak * sizeof(int));
+    toks = (TokId *)malloc((size_t)peak * sizeof(TokId));
     bool ok = toks != NULL && pulsar_session_bank_state_restore(s, BankId{0});
     for (int i = 0; ok && i < peak; i++) toks[i] = base.v[i % base.len];
     pulsar_tokens p;

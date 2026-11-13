@@ -299,9 +299,9 @@ static bool qwen_image_is_sentinel(const pulsar_engine *e, int32_t id) {
 /// @param start where to look
 /// @param[out] len the run of pads at start
 /// @return true when ids[start] is a pad
-static bool qwen_image_block_extent(const pulsar_engine *e, const int32_t *ids, int n, int start, int *len) {
-    const int32_t pad = qwen_pad_id(e);
-    if (pad < 0 || !ids || start < 0 || start >= n || ids[start] != pad || (start > 0 && ids[start - 1] == pad))
+static bool qwen_image_block_extent(const pulsar_engine *e, const TokId *ids, int n, int start, int *len) {
+    const TokId pad{qwen_pad_id(e)};
+    if (!pad.is_token() || !ids || start < 0 || start >= n || ids[start] != pad || (start > 0 && ids[start - 1] == pad))
         return false;
     int k = start;
     while (k < n && ids[k] == pad) k++;
@@ -388,7 +388,7 @@ static bool qwen_image_expand(const pulsar_engine *e, const pulsar_image_ref *im
         snprintf(err, errlen, "an image could not be decoded (PNG or JPEG, at most %llu pixels) or is not one the vision tower accepts", PULSAR_VISION_MAX_DECODED_PIXELS);
         return false;
     }
-    for (uint32_t i = 0; i < h * w; i++) pulsar_tokens_push(out, qwen_pad_id(e));
+    for (uint32_t i = 0; i < h * w; i++) pulsar_tokens_push(out, TokId{qwen_pad_id(e)});
     return true;
 }
 
@@ -408,7 +408,7 @@ static uint32_t qwen_image_row_width(const pulsar_engine *) { return PULSAR_QWEN
 /// @param err message buffer
 /// @param errlen its size
 /// @return false + err on a failed encode or a row count that is not the block's
-static bool qwen_image_block_rows(const pulsar_engine *e, const pulsar_image_ref *img, const int32_t *, int block_len,
+static bool qwen_image_block_rows(const pulsar_engine *e, const pulsar_image_ref *img, const TokId *, int block_len,
                                   const uint16_t *tower, int n_tower, uint16_t **tower_out, int *n_tower_out,
                                   uint16_t *out, char *err, size_t errlen) {
     if (!tower) {

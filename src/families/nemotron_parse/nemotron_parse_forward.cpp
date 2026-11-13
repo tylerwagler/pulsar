@@ -521,7 +521,7 @@ int parse(pulsar_engine *e, const uint8_t *image, size_t len, const pulsar_parse
     pthread_mutex_unlock(&r->mu);
     const double t3 = now_ms();
     if (!ok) return -1;
-    for (int id : seq) pulsar_tokens_push(ids_out, id);
+    for (int id : seq) pulsar_tokens_push(ids_out, TokId{id});
     const std::string t = pulsar_nemotron_parse_decode(w->vocab, seq.data(), seq.size());
     *text = (char *)xmalloc(t.size() + 1);
     memcpy(*text, t.data(), t.size());

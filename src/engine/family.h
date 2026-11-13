@@ -115,7 +115,7 @@ typedef struct pulsar_family_vision {
      *  artifact has none) */
     bool (*is_sentinel)(const pulsar_engine *e, int32_t id);
     /** true and *len = the block's length when `ids[start..]` begins an image block */
-    bool (*block_extent)(const pulsar_engine *e, const int32_t *ids, int n, int start, int *len);
+    bool (*block_extent)(const pulsar_engine *e, const TokId *ids, int n, int start, int *len);
     /** The text a chat renderer writes where one image goes; it carries the placeholder token once. */
     const char *placeholder_text;
     /** The placeholder token the expansion replaces, one per image, or -1 when the tokenizer has none. */
@@ -129,7 +129,7 @@ typedef struct pulsar_family_vision {
     /** The `block_len` rows image `img` puts at its block `ids[0..block_len)`, into `out`.  `tower` is the image's
      *  tower output (n_tower rows, position-independent) when the core's cache holds it; NULL = run the tower and
      *  hand its output to the core through *tower_out / *n_tower_out (malloc'd; the core caches and frees it). */
-    bool (*block_rows)(const pulsar_engine *e, const pulsar_image_ref *img, const int32_t *ids, int block_len,
+    bool (*block_rows)(const pulsar_engine *e, const pulsar_image_ref *img, const TokId *ids, int block_len,
                        const uint16_t *tower, int n_tower, uint16_t **tower_out, int *n_tower_out, uint16_t *out,
                        char *err, size_t errlen);
     /** Optional (NULL = blocks have no 2D layout): the block's grid in rows, *h x *w = its length -- what

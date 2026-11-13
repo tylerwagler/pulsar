@@ -262,7 +262,7 @@ static void driver_graph_announce(const char *arch, bool verify, const char *wha
 /// @param logits_out receives heads.n x the logits width floats when non-NULL
 /// @param n_verify   the PREFILL step's leading verify rows (0 = none)
 /// @return false (said) when the step was refused or failed
-static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const int32_t *tokens, const int32_t *pos,
+static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const TokId *tokens, const int32_t *pos,
                            const int32_t *bank, uint32_t n_rows, const pulsar_driver_heads &heads, float *logits_out,
                            uint32_t n_verify = 0) {
     pulsar_engine *e = s->engine;
@@ -569,7 +569,8 @@ void pulsar_driver_prefill_shape(pulsar_session *s, pulsar_prefill_shape *out) {
 int pulsar_driver_eval_row(pulsar_session *s, int token, char *err, size_t errlen) {
     const pulsar_driver_ops *ops = DOPS(s->engine);
     const BankId live = s->states->live_bank;
-    const int32_t tok = token, pos = s->checkpoint.len, bank = live.raw();
+    const TokId tok{token};
+    const int32_t pos = s->checkpoint.len, bank = live.raw();
     const pulsar_driver_heads one = pulsar_driver_heads_span(StepRow{0}, StepRows{1});
     if (!driver_forward(s, PULSAR_STEP_DECODE, &tok, &pos, &bank, 1, one, NULL) ||
         !s->live_from_rows(s->driver->logits, 0)) {
@@ -622,7 +623,8 @@ int pulsar_driver_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *
         if (err) snprintf(err, errlen, "%s: batched decode of %u rows refused (bad args)", ARCH(e), n);
         return 1;
     }
-    int32_t tok[PULSAR_DRIVER_HEADS_MAX], pos[PULSAR_DRIVER_HEADS_MAX], bank[PULSAR_DRIVER_HEADS_MAX];
+    TokId tok[PULSAR_DRIVER_HEADS_MAX];
+    int32_t pos[PULSAR_DRIVER_HEADS_MAX], bank[PULSAR_DRIVER_HEADS_MAX];
     for (uint32_t i = 0; i < n; i++) {
         /* One row per bank, at that bank's next position: a recurrent state advances exactly one token per row. */
         if (!reqs[i].bank.below(ss->n_banks) || reqs[i].pos != ss->bank_pos[pulsar_bank_index(reqs[i].bank)]) {
@@ -637,7 +639,7 @@ int pulsar_driver_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *
                 return 1;
             }
         }
-        tok[i] = reqs[i].token.raw();
+        tok[i] = reqs[i].token;
         pos[i] = reqs[i].pos.raw();
         bank[i] = reqs[i].bank.raw();
     }
@@ -672,7 +674,7 @@ int pulsar_driver_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *
 /// @param err    receives the refusal when non-NULL
 /// @param errlen bytes of `err`
 /// @return true when every row is its run's next position
-static bool driver_verify_rows(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n, int32_t *tok,
+static bool driver_verify_rows(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n, TokId *tok,
                                int32_t *pos, int32_t *bk, char *err, size_t errlen) {
     const pulsar_state_set *ss = s->states;
     for (uint32_t i = 0; i < n; i++) {
@@ -685,7 +687,7 @@ static bool driver_verify_rows(pulsar_session *s, const pulsar_multiseq_req *req
             return false;
         }
         if (run_start && driver_bank_stale(s, b, "verify", err, errlen)) return false;
-        tok[i] = reqs[i].token.raw();
+        tok[i] = reqs[i].token;
         pos[i] = reqs[i].pos.raw();
         bk[i] = (int32_t)b;
     }
@@ -724,7 +726,8 @@ int pulsar_driver_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *req
                               "verify capture)", ARCH(e), n_rows, PULSAR_DRIVER_HEADS_MAX);
             return 1;
         }
-        int32_t tok[PULSAR_DRIVER_HEADS_MAX], pos[PULSAR_DRIVER_HEADS_MAX], bk[PULSAR_DRIVER_HEADS_MAX];
+        TokId tok[PULSAR_DRIVER_HEADS_MAX];
+        int32_t pos[PULSAR_DRIVER_HEADS_MAX], bk[PULSAR_DRIVER_HEADS_MAX];
         if (!driver_verify_rows(s, reqs, n_rows, tok, pos, bk, err, errlen)) return 1;
         if (!driver_forward(s, PULSAR_STEP_PREFILL, tok, pos, bk, n_rows,
                                    pulsar_driver_heads_span(StepRow{0}, StepRows{(int)n_rows}), logits, n_rows)) {
@@ -792,7 +795,8 @@ int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *req
                           PULSAR_DRIVER_HEADS_MAX, heads, e->family->session->fused_heads_max, logits_cap);
         return 1;
     }
-    std::vector<int32_t> tok(n_rows), pos(n_rows), bk(n_rows);
+    std::vector<TokId> tok(n_rows);
+    std::vector<int32_t> pos(n_rows), bk(n_rows);
     if (!driver_verify_rows(s, reqs, n_dec, tok.data(), pos.data(), bk.data(), err, errlen)) return 1;
     /* the prompt runs: each on a bank no other row of the step is on, consecutive positions, text rows */
     uint32_t first[PULSAR_FUSED_PF_MAX + 1];
@@ -816,7 +820,7 @@ int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *req
                               why);
             return 1;
         }
-        tok[i] = reqs[i].token.raw();
+        tok[i] = reqs[i].token;
         pos[i] = reqs[i].pos.raw();
         bk[i] = (int32_t)b;
     }
@@ -924,7 +928,8 @@ static bool driver_verify_single(pulsar_session *s, pulsar_spec_round *r, char *
 static bool driver_spec_commit(pulsar_session *s, pulsar_spec_round *r, uint32_t commit, uint32_t) {
     pulsar_state_set *ss = s->states;
     pulsar_multiseq_req reqs[PULSAR_DRIVER_HEADS_MAX];
-    int32_t tok[PULSAR_DRIVER_HEADS_MAX], pos[PULSAR_DRIVER_HEADS_MAX], bank[PULSAR_DRIVER_HEADS_MAX];
+    TokId tok[PULSAR_DRIVER_HEADS_MAX];
+    int32_t pos[PULSAR_DRIVER_HEADS_MAX], bank[PULSAR_DRIVER_HEADS_MAX];
     if (r->n_batch > PULSAR_DRIVER_HEADS_MAX) return false;
     pulsar_spec_round_fill_reqs(r, ss->live_bank, reqs);
     if (!driver_verify_rows(s, reqs, r->n_batch, tok, pos, bank, NULL, 0)) return false;

@@ -244,7 +244,7 @@ static void draw_req(const pulsar_row_draw *d, pulsar_gpu_sample_req *q) {
 /// @param tokens [n] receives the tokens (negative = refused row)
 /// @return 0, or 1 refused (bad n, a sampled draw with no stream, a failed launch)
 static int session_draw(pulsar_session *s, const pulsar_gpu_tensor *rows, const uint32_t *row_index,
-                        const pulsar_row_draw *d, uint32_t n, int *tokens) {
+                        const pulsar_row_draw *d, uint32_t n, TokId *tokens) {
     pulsar_gpu_sample_req reqs[PULSAR_GPU_SAMPLE_ROWS_MAX];
     pulsar_gpu_sample_out out[PULSAR_GPU_SAMPLE_ROWS_MAX];
     const uint32_t *masks[PULSAR_GPU_SAMPLE_ROWS_MAX];
@@ -256,7 +256,7 @@ static int session_draw(pulsar_session *s, const pulsar_gpu_tensor *rows, const 
     }
     if (!s->draw_rows(rows, row_index, n, reqs, masks, out)) return 1;
     for (uint32_t k = 0; k < n; k++) {
-        tokens[k] = out[k].token;
+        tokens[k] = TokId{out[k].token};   /* the device sampler's int32 */
         if (out[k].token >= 0 && d[k].rng) pulsar_sample_advance(d[k].rng, 1u);
     }
     return 0;
@@ -264,9 +264,9 @@ static int session_draw(pulsar_session *s, const pulsar_gpu_tensor *rows, const 
 
 int pulsar_session::draw(const pulsar_row_draw *d) {
     const uint32_t zero = 0;
-    int tok = PULSAR_SAMPLE_REFUSED;
+    TokId tok = TokId{PULSAR_SAMPLE_REFUSED};
     const pulsar_gpu_tensor *live = live_dev();
-    return live && session_draw(this, live, &zero, d, 1, &tok) == 0 ? tok : PULSAR_SAMPLE_REFUSED;
+    return live && session_draw(this, live, &zero, d, 1, &tok) == 0 ? tok.raw() : PULSAR_SAMPLE_REFUSED;
 }
 
 int pulsar_session::sample(float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
@@ -289,7 +289,7 @@ int pulsar_session::argmax_excluding(int excluded_id) {
     return draw(&d);
 }
 
-int pulsar_session::draw_step_rows(const uint32_t *rows, const pulsar_row_draw *d, uint32_t n, int *tokens) {
+int pulsar_session::draw_step_rows(const uint32_t *rows, const pulsar_row_draw *d, uint32_t n, TokId *tokens) {
     for (uint32_t k = 0; k < n; k++)
         if (!dev.step_rows || rows[k] >= dev.step_n) {
             fprintf(stderr, "pulsar: session: a draw of row %u of a step that headed %u -- refusing\n", rows[k],

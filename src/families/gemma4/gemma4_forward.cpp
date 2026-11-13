@@ -774,7 +774,7 @@ bool stage(const pulsar_driver_step *st0, uint64_t *graph_key) {
     g4_state *q = st->st;
     *graph_key = 0;
     for (uint32_t r = 0; r < st->n_rows; r++)
-        if (st->tokens[r] < 0 || (uint32_t)st->tokens[r] >= st->w->shape.n_vocab) return fail("a token id outside the vocabulary");
+        if (!st->tokens[r].below(st->w->shape.n_vocab)) return fail("a token id outside the vocabulary");
     if (!build_tables(st)) return false;
     const uint32_t bound = attn_bound(st);
     const uint64_t stride = a256(pulsar_gqa_desc_bytes(st->n_rows));

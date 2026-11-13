@@ -57,7 +57,8 @@ int GATE_ENTRY(int argc, char **argv) {
     if (story.len > 400) story.len = 400;   /* the story's first 400 tokens: the prompt */
     if (ok) ok = pulsar_session_sync(s, &story, err, sizeof err) == 0;
     uint64_t rng = 0;
-    int toks[17], emitted = 0;
+    TokId toks[17];
+    int emitted = 0;
     for (int i = 0; ok && i < 4; i++) {
         s->spec.spec_quenched = false;
         const int n = pulsar_session_generate_speculative(s, 0.0f, 0, 1.0f, 0.0f, &rng, 16, toks, 17, err, sizeof err);

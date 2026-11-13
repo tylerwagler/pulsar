@@ -362,7 +362,7 @@ static bool commit_fail(const pulsar_state_set *ss, const char *what) {
     return false;
 }
 
-bool pulsar_state_commit(pulsar_state_set *ss, BankId bank, const int32_t *tokens, uint32_t keep) {
+bool pulsar_state_commit(pulsar_state_set *ss, BankId bank, const TokId *tokens, uint32_t keep) {
     const pulsar_state_plan *p = ss->plan;
     uint32_t run = ss->n_runs;
     for (uint32_t k = 0; k < ss->n_runs; k++)

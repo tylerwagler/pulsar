@@ -69,7 +69,7 @@ static std::vector<int32_t> read_ids(const char *path) {
 static pulsar_tokens toks(const std::vector<int32_t> &ids, size_t lo, size_t hi) {
     pulsar_tokens t;
     memset(&t, 0, sizeof(t));
-    for (size_t i = lo; i < hi && i < ids.size(); i++) pulsar_tokens_push(&t, ids[i]);
+    for (size_t i = lo; i < hi && i < ids.size(); i++) pulsar_tokens_push(&t, TokId{ids[i]});
     return t;
 }
 

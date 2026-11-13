@@ -280,7 +280,7 @@ int main(int argc, char **argv) {
         err[0] = 0;
         check(pulsar_engine_encode(e, &empty, 1, o, err, sizeof err) != 0 && err[0], "an empty input: %s", err);
         pulsar_tokens big = {};
-        for (uint32_t i = 0; i <= cap; i++) pulsar_tokens_push(&big, toks[0].v[i % (uint32_t)toks[0].len]);
+        for (uint32_t i = 0; i <= cap; i++) pulsar_tokens_push(&big, TokId{toks[0].v[i % (uint32_t)toks[0].len]});
         err[0] = 0;
         check(pulsar_engine_encode(e, &big, 1, o, err, sizeof err) != 0 && err[0], "%u tokens: %s", cap + 1, err);
         pulsar_tokens_free(&big);

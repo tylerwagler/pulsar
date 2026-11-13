@@ -268,7 +268,7 @@ static bool check_stale_classic_fails_loud(void) {
         if (rc != 0) printf("STALE-GUARD: eval after multiseq fails loud OK (%s)\n", err);
 
         err[0] = '\0';
-        int acc[4];
+        TokId acc[4];
         const int rcs = pulsar_session_eval_speculative_block(s, TokId{last[0]}, 4, acc,
                                                               4, err, sizeof(err));
         CHECK(rcs <= 0,

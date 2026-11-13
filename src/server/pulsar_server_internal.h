@@ -1111,7 +1111,7 @@ typedef struct {
 #define KV_REQ_LINE_MAX 1024
 /** FNV-1a 64 over the first `n` token ids (each as 4 little-endian bytes): the ONE hash of the `kv req:` line's
  *  pre, conv and evict_conv.  @param v the tokens  @param n how many (<= 0: the empty hash)  @return the hash */
-uint64_t server_kv_token_hash(const int *v, int n);
+uint64_t server_kv_token_hash(const TokId *v, int n);
 /** @param prompt the prompt's tokens (NULL: -1)
  *  @param m the template's turn markers
  *  @return the position of the first user marker with no assistant marker before it -- the end of the shared
@@ -3668,7 +3668,7 @@ struct server {
     /** Write a formatted event line into the trace for request `id`. */
     /// @param id   the request's trace id (0: ignored)
     /// @param fmt  printf format, then its arguments
-    void trace_event(uint64_t id, const char *fmt, ...);
+    void trace_event(uint64_t id, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
     /** Record how the prompt was resolved: what the caches supplied, what the
      * tool replay matched, and which file was used. This is the record that
      * explains a cold prefill after the fact. */
@@ -4704,7 +4704,7 @@ void buf_putc(buf *b, char c);
  *  past DOT_GRAPH_MAX_NODES and is not drawn.
  *  \hidecallergraph */
 void buf_puts(buf *b, const char *s);
-void buf_printf(buf *b, const char *fmt, ...);
+void buf_printf(buf *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 char *buf_take(buf *b);
 /** L354: say so at startup when a server with no authentication binds past loopback.  @param host the bind address */
 void server_warn_if_exposed(const char *host);
@@ -4814,11 +4814,11 @@ bool request_tokenize_rendered(pulsar_engine *e, struct request *r, char *err, s
 void request_free(request *r);
 bool parse_thinking_control_value(const char **p, bool *thinking_enabled, int *budget_tokens);
 /** L344: the draw at which the budget closes the block, pure (server_sched.cpp). */
-int think_close_row(int budget, bool open, int think_tokens, TokId close, const int *toks, int n, int off);
+int think_close_row(int budget, bool open, int think_tokens, TokId close, const TokId *toks, int n, int off);
 /** L344: lay the forced-close mask rows, pure (server_sched.cpp). */
 void think_masks_lay(uint32_t *out, size_t W, int row, int rows, TokId close, const uint32_t *gram, int gram_rows);
 /** L344: the draw at which the thinking budget closes the reasoning block (server_sched.cpp). */
-int gen_think_close_row(server *s, const gen_state *g, const int *toks, int n, int off);
+int gen_think_close_row(server *s, const gen_state *g, const TokId *toks, int n, int off);
 /** L344: mask rows forcing the close token at one row (server_sched.cpp). */
 const uint32_t *gen_think_masks(server *s, gen_state *g, int row, int rows, const uint32_t *gram, int gram_rows);
 /** L344: uint32_t words in one sampler mask row. */
@@ -5401,7 +5401,7 @@ bool gen_constrain_accept(struct server *s, struct gen_state *g, int token);
 /// @param base_emitted  the base was already emitted (toks are the drafts)
 /// @param masks  receives the rows (the gate's buffer)
 /// @return rows written, 0, or -1
-int gen_constrain_round(struct server *s, struct gen_state *g, const int *toks, int n, bool base_emitted,
+int gen_constrain_round(struct server *s, struct gen_state *g, const TokId *toks, int n, bool base_emitted,
                         const uint32_t **masks);
 /** L309: how many of a pending chain's `n` drafts (after the not yet emitted `base`) can be accepted under the
  *  grammar: the gate goes through the base and the drafts, as gen_constrain_round's walk does, and back; the first
@@ -5413,7 +5413,7 @@ int gen_constrain_round(struct server *s, struct gen_state *g, const int *toks, 
 /// @param drafts  the pending drafts
 /// @param n  how many
 /// @return the acceptable prefix length, or -1
-int gen_constrain_draft_prefix(struct server *s, struct gen_state *g, TokId base_id, const int32_t *drafts, int n);
+int gen_constrain_draft_prefix(struct server *s, struct gen_state *g, TokId base_id, const TokId *drafts, int n);
 /** The base draw's mask for a speculative round's assemble (live only; the gate's buffer, valid until the next
  *  call).  NULL + g->err on failure. */
 /// @param s  the server
@@ -5968,7 +5968,7 @@ void gen_resolve_sampling(const request *req, float *temperature,
 /// @param n  how many
 /// @param base_emitted  the base was already emitted
 /// @return the greedy-row bit set
-uint32_t gen_spec_greedy_rows(server *s, const gen_state *g, const int *toks, int n, bool base_emitted);
+uint32_t gen_spec_greedy_rows(server *s, const gen_state *g, const TokId *toks, int n, bool base_emitted);
 /** The same over the tokens' texts (NULL = a stop token): the probe itself, engine-free (server tests). */
 /// @param g  the request's generation state
 /// @param pieces  each token's text (NULL = a stop token)

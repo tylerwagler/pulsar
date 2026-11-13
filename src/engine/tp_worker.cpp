@@ -48,9 +48,9 @@ struct pulsar_tp_worker_slot {
     pulsar_spec_round **rounds;
     /// entries of `rounds` (grown to cover the highest bank named)
     uint32_t n_rounds;
-    /// scratch for the accept walk's output, [accepted_cap] ints; owned, its contents unread
-    int *accepted;          /* the accept walk's output, unread here */
-    /// capacity of `accepted` in ints
+    /// scratch for the accept walk's output, [accepted_cap] ids; owned, its contents unread
+    TokId *accepted;        /* the accept walk's output, unread here */
+    /// capacity of `accepted` in ids
     int accepted_cap;
 };
 
@@ -107,18 +107,24 @@ static pulsar_spec_round *worker_round(pulsar_tp_worker_slot *slot, int bank) {
     return slot->rounds[bank];
 }
 
-/** The slot's accept-walk scratch, grown to at least `cap` ints (and at least 1).
+/** The slot's accept-walk scratch, grown to at least `cap` ids (and at least 1).
  *  @param slot the session's slot
- *  @param cap  ints wanted
+ *  @param cap  ids wanted
  *  @return the scratch (owned by the slot) */
-static int *worker_accepted(pulsar_tp_worker_slot *slot, int cap) {
+static TokId *worker_accepted(pulsar_tp_worker_slot *slot, int cap) {
     if (cap < 1) cap = 1;
     if (cap > slot->accepted_cap) {
-        slot->accepted = (int *)xrealloc(slot->accepted, (size_t)cap * sizeof(int));
+        slot->accepted = (TokId *)xrealloc(slot->accepted, (size_t)cap * sizeof(TokId));
         slot->accepted_cap = cap;
     }
     return slot->accepted;
 }
+
+/** A frame's token ids (the wire's int32) viewed as ids in place -- the TP edge on the receiving side, borrowed as
+ *  before P3b (no copy).
+ *  @param raw the frame's ids
+ *  @return the same memory as token ids */
+static const TokId *worker_tok_ids(const int *raw) { return pulsar_tok_ids_of(raw); }
 
 bool pulsar_engine_is_tp_worker(const pulsar_engine *e) {
     return e && e->tp && pulsar_tp_rank(e->tp) != 0;
@@ -451,8 +457,8 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
          * same bytes at the same start positions the leader's did. */
         int rc = 1;
         if (!worker_refused(e, c, "sync", &slot, ferr, sizeof(ferr))) {
-            pulsar_tokens borrowed;
-            borrowed.v = c->tokens;
+            pulsar_tokens borrowed;   /* the frame's ids, borrowed in place (no copy) */
+            borrowed.v = const_cast<TokId *>(worker_tok_ids(c->tokens));
             borrowed.len = (int)c->n_tokens;
             borrowed.cap = (int)c->n_tokens;
             rc = pulsar_session_family_sync(slot->s, &borrowed, c->n_images ? c->images : NULL, (int)c->n_images, ferr,
@@ -615,13 +621,15 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             pulsar_tp_mirror_fail_void(tp, "note committed tokens", ferr);
             return 1;
         }
-        pulsar_session_note_committed(slot->s, c->tokens, (int)c->n_tokens);
+    {
+        pulsar_session_note_committed(slot->s, worker_tok_ids(c->tokens), (int)c->n_tokens);
         return 1;
+    }
 
     case PULSAR_TP_FRAME_NOTE_PREFILLED: {
         int status = -1;
         if (!worker_refused(e, c, "note prefilled", &slot, ferr, sizeof(ferr))) {
-            status = slot->s->note_prefilled(c->tokens, (int)c->n_tokens, c->value) != 0 ? 1 : 0;
+            status = slot->s->note_prefilled(worker_tok_ids(c->tokens), (int)c->n_tokens, c->value) != 0 ? 1 : 0;
         } else {
             fprintf(stderr, "pulsar: tp worker: note prefilled refused: %s\n", ferr);
         }
@@ -680,7 +688,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
                 fprintf(stderr, "pulsar: tp worker: %s\n", ferr);
             } else {
                 uint64_t rng = c->spec.rng;
-                int *acc = worker_accepted(slot, c->spec.i2);
+                TokId *acc = worker_accepted(slot, c->spec.i2);
                 const int na = pulsar_session_spec_round_end_local(slot->s, r, c->spec.i0,
                                                                    c->spec.temperature, c->spec.top_k, c->spec.top_p,
                                                                    c->spec.min_p, 0u, NULL, 0u, &rng, (uint32_t)c->spec.i3,
@@ -764,7 +772,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             uint64_t rngs[PULSAR_TP_SPEC_STEPS_MAX];
             int cap_total = 0;
             for (int i = 0; i < n; i++) cap_total += c->spec_steps[i].i2 > 0 ? c->spec_steps[i].i2 : 0;
-            int *acc = worker_accepted(slot, cap_total);
+            TokId *acc = worker_accepted(slot, cap_total);
             int ok = 1;
             for (int i = 0, off = 0; i < n; i++) {
                 const pulsar_tp_spec_command *r = &c->spec_steps[i];
@@ -822,7 +830,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         int status = -1;
         if (!worker_refused(e, c, "generate_speculative", &slot, ferr, sizeof(ferr))) {
             uint64_t rng = c->spec.rng;
-            int *acc = worker_accepted(slot, c->spec.i2);
+            TokId *acc = worker_accepted(slot, c->spec.i2);
             const int n = slot->s->generate_speculative(c->spec.temperature, c->spec.top_k, c->spec.top_p, c->spec.min_p,
                                                         &rng, c->spec.i0, acc, c->spec.i2, ferr, sizeof(ferr));
             status = n + 1;

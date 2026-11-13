@@ -561,7 +561,7 @@ static void test_agent_session_file_round_trip(void) {
     }
     char path[512];
     snprintf(path, sizeof path, "%s/s.session", dir);
-    int ids[] = { 0, 128803, 17, 128804, 42 };
+    TokId ids[] = {TokId{0}, TokId{128803}, TokId{17}, TokId{128804}, TokId{42}};
     agent_session_file want;
     memset(&want, 0, sizeof(want));
     want.title = (char *)"a title";
@@ -915,11 +915,13 @@ static void test_agent_write_and_edit_are_atomic(void) {
 static void test_agent_turn_open_is_the_transcripts(void) {
     pulsar_turn_markers m;
     memset(&m, 0, sizeof(m));
-    m.user[0] = 10, m.user[1] = 11, m.n_user = 2;
-    m.assistant[0] = 10, m.assistant[1] = 12, m.n_assistant = 2;
-    const int end[2] = {13, 14};
+    m.user[0] = TokId{10}, m.user[1] = TokId{11}, m.n_user = 2;
+    m.assistant[0] = TokId{10}, m.assistant[1] = TokId{12}, m.n_assistant = 2;
+    const TokId end[2] = {TokId{13}, TokId{14}};
     const auto open = [&](std::initializer_list<int> v) {
-        return agent_tokens_turn_open(&m, end, 2, v.begin(), (int)v.size());
+        std::vector<TokId> ids;
+        for (int t : v) ids.push_back(TokId{t});
+        return agent_tokens_turn_open(&m, end, 2, ids.data(), (int)ids.size());
     };
     AGENT_TEST_ASSERT(!open({}));
     AGENT_TEST_ASSERT(!open({1, 2, 3}));                                         /* the head alone */
@@ -939,14 +941,15 @@ static void test_agent_turn_open_is_the_transcripts(void) {
     }
     char path[512];
     snprintf(path, sizeof path, "%s/s.session", dir);
-    int ids[] = {1, 10, 11, 5, 13, 14, 10, 12, 6, 7};
+    TokId ids[] = {TokId{1}, TokId{10}, TokId{11}, TokId{5}, TokId{13}, TokId{14}, TokId{10}, TokId{12}, TokId{6},
+        TokId{7}};
     for (int leg = 0; leg < 2; leg++) {   /* open, then closed: each reloads as it was saved */
         agent_session_file f;
         memset(&f, 0, sizeof(f));
         f.title = (char *)"t";
         f.tokens.v = ids;
         f.tokens.len = f.tokens.cap = leg ? 8 : 10;
-        if (leg) ids[6] = 13, ids[7] = 14;
+        if (leg) ids[6] = TokId{13}, ids[7] = TokId{14};
         char err[160] = {0};
         AGENT_TEST_ASSERT(agent_session_file_write(path, &f, err, sizeof err));
         agent_session_file got;
@@ -964,11 +967,13 @@ static void test_agent_turn_open_is_the_transcripts(void) {
 static void test_agent_compact_tail_starts_at_a_user_turn(void) {
     pulsar_turn_markers m;
     memset(&m, 0, sizeof(m));
-    m.user[0] = 10, m.user[1] = 11, m.n_user = 2;
-    m.assistant[0] = 10, m.assistant[1] = 12, m.n_assistant = 2;
-    m.tool[0] = 20, m.tool[1] = 21, m.n_tool = 2;
+    m.user[0] = TokId{10}, m.user[1] = TokId{11}, m.n_user = 2;
+    m.assistant[0] = TokId{10}, m.assistant[1] = TokId{12}, m.n_assistant = 2;
+    m.tool[0] = TokId{20}, m.tool[1] = TokId{21}, m.n_tool = 2;
     /*              0  1   2   3  4   5   6   7  8   9  10  11  12 13  14  15  16 17  18  19  20 */
-    const int v[] = {1, 10, 11, 5, 13, 10, 12, 6, 13, 10, 11, 20, 21, 7, 13, 10, 12, 8, 13, 10, 11, 9, 13};
+    const TokId v[] = {TokId{1}, TokId{10}, TokId{11}, TokId{5}, TokId{13}, TokId{10}, TokId{12}, TokId{6}, TokId{13},
+        TokId{10}, TokId{11}, TokId{20}, TokId{21}, TokId{7}, TokId{13}, TokId{10}, TokId{12}, TokId{8}, TokId{13},
+        TokId{10}, TokId{11}, TokId{9}, TokId{13}};
     const int n = (int)(sizeof v / sizeof v[0]);
     AGENT_TEST_ASSERT(agent_compact_tail_cut(&m, v, 0, n) == 1);     /* the first user turn */
     AGENT_TEST_ASSERT(agent_compact_tail_cut(&m, v, 2, n) == 19);    /* not the assistant turn, not the tool result */
@@ -982,11 +987,12 @@ static void test_agent_compact_tail_starts_at_a_user_turn(void) {
      * tokens of "<tool_result" (the engine's ds4_tok_turn_markers) -- before L373 it had no tool suffix, and a tail
      * could start at a tool result */
     memset(&m, 0, sizeof(m));
-    m.user[0] = 30, m.n_user = 1;
-    m.assistant[0] = 31, m.n_assistant = 1;
-    m.tool[0] = 40, m.tool[1] = 41, m.tool[2] = 42, m.n_tool = 3;
+    m.user[0] = TokId{30}, m.n_user = 1;
+    m.assistant[0] = TokId{31}, m.n_assistant = 1;
+    m.tool[0] = TokId{40}, m.tool[1] = TokId{41}, m.tool[2] = TokId{42}, m.n_tool = 3;
     /*              0   1  2   3  4   5   6   7   8  9  10  11  12  13 */
-    const int d[] = {1, 30, 5, 31, 6, 30, 40, 41, 42, 7, 31, 8, 30, 9};
+    const TokId d[] = {TokId{1}, TokId{30}, TokId{5}, TokId{31}, TokId{6}, TokId{30}, TokId{40}, TokId{41}, TokId{42},
+        TokId{7}, TokId{31}, TokId{8}, TokId{30}, TokId{9}};
     const int dn = (int)(sizeof d / sizeof d[0]);
     AGENT_TEST_ASSERT(agent_compact_tail_cut(&m, d, 0, dn) == 1);     /* the first user turn */
     AGENT_TEST_ASSERT(agent_compact_tail_cut(&m, d, 2, dn) == 12);    /* not the tool result at 5 */

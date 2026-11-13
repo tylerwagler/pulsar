@@ -86,7 +86,7 @@ typedef struct {
  * borrowed view built by pointing `v` at someone else's buffer and setting
  * len == cap -- see the prefix helpers -- in which case it must NOT be freed. */
 typedef struct {
-    int *v;    ///< token ids, `cap` slots allocated, `len` in use
+    TokId *v;  ///< token ids, `cap` slots allocated, `len` in use (L334 P3b: ids, not ints)
     int len;   ///< number of valid tokens
     int cap;   ///< allocated capacity in tokens
 } pulsar_tokens;
@@ -710,7 +710,8 @@ bool pulsar_log_is_tty(FILE *fp);
  *  @param fp the stream
  *  @param type the line's kind
  *  @param fmt printf format, then its arguments */
-void pulsar_log(FILE *fp, pulsar_log_type type, const char *fmt, ...);
+void pulsar_log(FILE *fp, pulsar_log_type type, const char *fmt, ...)
+    __attribute__((format(printf, 3, 4)));   /* L334: a typed value through varargs is caught */
 /** Collect an importance matrix (per-channel activation statistics for quantization) over a prompt dataset and
  *  write it to `output_path`; the family must support it (refused by name otherwise).
  *  @param e the engine
@@ -741,7 +742,7 @@ int pulsar_dump_text_tokenization(const char *model_path, const char *text, FILE
 /** Append one token, growing `v` as needed.
  *  @param tv an owned vector (not a borrowed view)
  *  @param token the id */
-void pulsar_tokens_push(pulsar_tokens *tv, int token);
+void pulsar_tokens_push(pulsar_tokens *tv, TokId token);
 /** Free `v` and zero the vector (reusable empty afterwards).
  *  @param tv an owned vector */
 void pulsar_tokens_free(pulsar_tokens *tv);
@@ -944,17 +945,17 @@ bool pulsar_token_is_stop(pulsar_engine *e, TokId token);
  * `out` zeroed (no marker matches anywhere), when the loaded tokenizer does not spell them -- said
  * once, never a marker that matches at the wrong place. */
 typedef struct {
-    int user[2];       ///< the user-turn marker, n_user tokens
+    TokId user[2];     ///< the user-turn marker, n_user tokens
     /** Tokens in `user` (1 or 2; 0 when the tokenizer does not spell the marker). */
     int n_user;
-    int assistant[2];  ///< the assistant-turn marker, n_assistant tokens
+    TokId assistant[2];///< the assistant-turn marker, n_assistant tokens
     /** Tokens in `assistant` (1 or 2; 0 when the tokenizer does not spell the marker). */
     int n_assistant;
     /** L351: the tokens that follow a user marker when that turn is a TOOL RESULT (Qwen's and Nemotron's templates
      *  render a tool message as a user turn: "<|im_start|>user\n<tool_response>"; DeepSeek's as a user turn that opens
      *  `<tool_result`, L373), n_tool of them -- so the anchors can tell the client's own turns from an agent loop's
      *  tool results. */
-    int tool[3];
+    TokId tool[3];
     /** Tokens in `tool` (0: the template has no such turn, or the tokenizer does not spell it). */
     int n_tool;
 } pulsar_turn_markers;
@@ -971,7 +972,7 @@ bool pulsar_chat_turn_markers(pulsar_engine *e, pulsar_turn_markers *out);
  *  @param n their count
  *  @param i the index to test
  *  @return 1, 2, 3 or 0 */
-int pulsar_turn_marker_at(const pulsar_turn_markers *m, const int *v, int n, int i);
+int pulsar_turn_marker_at(const pulsar_turn_markers *m, const TokId *v, int n, int i);
 /** L311 / L351: a prompt's MESSAGE ENDPOINT -- the first assistant marker after its last user turn (a tool result,
  * role 3, is not one), else its last marker.  An agent loop's requests within one turn all name the same endpoint,
  * the point its next user turn branches from when the template re-renders that turn.  Pure host code.
@@ -979,7 +980,7 @@ int pulsar_turn_marker_at(const pulsar_turn_markers *m, const int *v, int n, int
  *  @param v the tokens
  *  @param n their count
  *  @return the endpoint's position, or -1 when no marker sits past position 0 */
-int pulsar_turn_endpoint(const pulsar_turn_markers *m, const int *v, int n);
+int pulsar_turn_endpoint(const pulsar_turn_markers *m, const TokId *v, int n);
 /** The ONE token that closes a reasoning block -- "</think>" as the loaded tokenizer spells it
  * (DeepSeek's special, Qwen's added token); -1 when it has none.  A front end that forces the
  * close feeds this id, never the text re-tokenized (L272 B11: BPE pieces on Qwen). */
@@ -1250,7 +1251,7 @@ static inline TokCount pulsar_prefix_match_stitched_len(const pulsar_prefix_matc
 
 /** A token's text for the seam walks: a malloc'd copy the caller frees (NULL = none), its length in *len
  *  (pulsar_token_text's contract; 0 bytes = a control/special token, matched by id only). */
-typedef char *(*pulsar_token_text_fn)(void *ud, int token, size_t *len);
+typedef char *(*pulsar_token_text_fn)(void *ud, TokId token, size_t *len);
 
 /** The byte-level prefix match (above) of `live` against `prompt`, with the engine's token texts.
  *  @param e the engine; NULL gives an empty match
@@ -1260,8 +1261,8 @@ typedef char *(*pulsar_token_text_fn)(void *ud, int token, size_t *len);
  *  @param prompt_len their count
  *  @param out receives the match */
 void pulsar_tokens_prefix_match(pulsar_engine *e,
-                                const int *live, int live_len,
-                                const int *prompt, int prompt_len,
+                                const TokId *live, int live_len,
+                                const TokId *prompt, int prompt_len,
                                 pulsar_prefix_match *out);
 /** pulsar_tokens_prefix_match over any vocabulary's text (`text`, `ud`): the walk itself, which the engine's entry
  *  runs with its tokenizer's text. */
@@ -1273,8 +1274,8 @@ void pulsar_tokens_prefix_match(pulsar_engine *e,
  *  @param prompt_len their count
  *  @param out receives the match */
 void pulsar_tokens_prefix_match_with(pulsar_token_text_fn text, void *ud,
-                                     const int *live, int live_len,
-                                     const int *prompt, int prompt_len,
+                                     const TokId *live, int live_len,
+                                     const TokId *prompt, int prompt_len,
                                      pulsar_prefix_match *out);
 /** L334: the prompt tokens the live history up to `at` holds -- the conversion from live to prompt side below the
  *  cut, the one authority for "how many of the request's tokens does a state at live position `at` serve".  The
@@ -1290,8 +1291,8 @@ void pulsar_tokens_prefix_match_with(pulsar_token_text_fn text, void *ud,
  *  @param prompt the request's tokens
  *  @param prompt_len their count */
 /** @return the prompt tokens held */
-PromptToks pulsar_tokens_prompt_held_with(pulsar_token_text_fn text, void *ud, const int *live, TokPos at,
-                                          const int *prompt, int prompt_len);
+PromptToks pulsar_tokens_prompt_held_with(pulsar_token_text_fn text, void *ud, const TokId *live, TokPos at,
+                                          const TokId *prompt, int prompt_len);
 /** pulsar_tokens_prefix_match of the INSTALLED bank's history against `prompt`.
  *  @param s the session; NULL gives an empty match
  *  @param prompt the request
@@ -1359,7 +1360,7 @@ TokId pulsar_session_draw(pulsar_session *s, const pulsar_row_draw *d);
  *  @param n the count
  *  @param tokens receives n tokens */
 int pulsar_session_draw_rows(pulsar_session *s, const uint32_t *rows, const pulsar_row_draw *d, uint32_t n,
-                             int *tokens);
+                             TokId *tokens);
 /** The last batched step's headed row `row` becomes `bank`'s next-token row (a mixed step's finished prompt run: the
  * bank's restore installs it).  On the device.  @return 0, or 1. */
 /** @param s the session
@@ -1714,7 +1715,7 @@ int pulsar_session_bank_spec_depth(pulsar_session *s, BankId bank);
  *  @param tok receives the drafts
  *  @param conf receives their confidences
  *  @return the pending count */
-uint32_t pulsar_session_bank_pendings(const pulsar_session *s, BankId bank, TokId *base, int32_t tok[16],
+uint32_t pulsar_session_bank_pendings(const pulsar_session *s, BankId bank, TokId *base, TokId tok[16],
                                       float conf[16]);
 /** The carry-or-sample base draw (the head of generate_speculative). Never
  * returns EOS handling -- the caller checks and short-circuits like
@@ -1786,7 +1787,7 @@ int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                                float temperature, int top_k, float top_p,
                                float min_p, uint64_t *rng,
                                uint32_t row0,
-                               int *accepted, int accepted_cap,
+                               TokId *accepted, int accepted_cap,
                                char *err, size_t errlen);
 /** Gate-facing (L182): pulsar_session_spec_round_end with the acceptance walk
  * replaced by TEACHER FORCING.  Draft i is accepted iff it equals truth[i]; the
@@ -1817,8 +1818,8 @@ int pulsar_session_spec_round_end_forced(pulsar_session *s, pulsar_spec_round *r
                                       float temperature, int top_k, float top_p,
                                       float min_p, uint64_t *rng,
                                       uint32_t row0,
-                                      const int32_t *truth,
-                                      int *accepted, int accepted_cap,
+                                      const TokId *truth,
+                                      TokId *accepted, int accepted_cap,
                                       char *err, size_t errlen);
 /** Abort a begun round whose forward failed: drop its frontier snapshot and its unverified rows.
  *  @param s the session
@@ -1893,7 +1894,7 @@ typedef struct {
     /** assemble: round_begin's cap; round_end: capacity of `accepted`, tokens. */
     int accepted_cap;        /* assemble: round_begin's cap; round_end: accepted[] capacity */
     /** round_end: receives this bank's accepted tokens (caller-owned, accepted_cap slots). */
-    int *accepted;           /* round_end: this bank's accepted tokens */
+    TokId *accepted;         /* round_end: this bank's accepted tokens */
     /* round_end (L296): bit i set = verify row i -- the token after the base and drafts 0..i-1; row K is a full
      * accept's carry -- draws greedy whatever `temperature` says.  The caller's sampling authority evaluated at
      * each position of the round (the server's tool-call override: a call's structure greedy, its payload sampled),
@@ -1977,7 +1978,7 @@ int pulsar_session_spec_redraft_commit_batch(pulsar_session *s, pulsar_spec_step
  *  @param keep receives the kept count; may be NULL
  *  @param sampled receives 1 for sampled drafts; may be NULL
  *  @return 1 or 0 */
-int pulsar_session_spec_redraft_peek(const pulsar_spec_round *r, int32_t ids[17], float conf[16],
+int pulsar_session_spec_redraft_peek(const pulsar_spec_round *r, TokId ids[17], float conf[16],
                                      uint32_t *n_draft, uint32_t *keep, int *sampled);
 /** L264/L265: the resume grid of the loaded model (tokens): a resume starts at a multiple of it
  *  and a prefill leaves its checkpoints on it -- the server plans its fused chunks on it. */
@@ -2065,7 +2066,7 @@ bool pulsar_session_bank_comp_stale(pulsar_session *s, BankId bank);
 /** @param s the session
  *  @param toks the committed tokens, in order
  *  @param n their count */
-void pulsar_session_note_committed_tokens(pulsar_session *s, const int *toks, int n);
+void pulsar_session_note_committed_tokens(pulsar_session *s, const TokId *toks, int n);
 /** L260 fusion: record a prompt chunk that a fused step (pulsar_session_decode_fused)
  * prefilled for the INSTALLED bank -- what a classic sync of the same tokens leaves
  * behind: the tokens join the checkpoint, the prefill frontier moves to its new
@@ -2081,7 +2082,7 @@ void pulsar_session_note_committed_tokens(pulsar_session *s, const int *toks, in
  *  @param n their count
  *  @param head the headed run's index, or -1
  *  @return 0, or 1 on a refusal */
-int pulsar_session_note_prefilled(pulsar_session *s, const int *toks, int n, int head);
+int pulsar_session_note_prefilled(pulsar_session *s, const TokId *toks, int n, int head);
 /** One speculative round (or a plain step when the drafter is quenched or absent); returns the tokens emitted.
  *  A round -- here, in the round API and in the batched phases -- stops at the family's whole stop set
  *  (pulsar_token_is_stop): nothing is committed past a stop (L284: the callers' single eos id is gone). */
@@ -2100,7 +2101,7 @@ int pulsar_session_note_prefilled(pulsar_session *s, const int *toks, int n, int
 int pulsar_session_generate_speculative(pulsar_session *s, float temperature, int top_k,
                                      float top_p, float min_p, uint64_t *rng,
                                      int max_tokens,
-                                     int *accepted, int accepted_cap,
+                                     TokId *accepted, int accepted_cap,
                                      char *err, size_t errlen);
 /** Greedy speculative block: evaluate `first_token`, then one draft/verify round (a plain eval without a drafter
  *  or when quenched); the caller supplies the base token.
@@ -2115,7 +2116,7 @@ int pulsar_session_generate_speculative(pulsar_session *s, float temperature, in
  *          this entry for) */
 int pulsar_session_eval_speculative_block(pulsar_session *s, TokId first_token,
                                         int max_tokens,
-                                        int *accepted, int accepted_cap,
+                                        TokId *accepted, int accepted_cap,
                                         char *err, size_t errlen);
 /** Forget the installed bank's history: no valid checkpoint, stale logits, no image records, no pending drafts or
  *  read-ahead; the next sync prefills from scratch (mirrored on a TP group).

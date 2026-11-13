@@ -134,7 +134,9 @@ int main(int argc, char **argv) {
         }
 
         std::vector<int32_t> left(c.n, 0), right(c.n, 0);
-        vision_image_visible(c.ids.data(), (int)c.n, n_vocab, max_img, left.data(), right.data());
+        std::vector<TokId> ids;   /* the reference's ids, entered as ids */
+        for (int32_t t : c.ids) ids.push_back(TokId{t});
+        vision_image_visible(ids.data(), (int)c.n, n_vocab, max_img, left.data(), right.data());
         bad += cmp_vec(left, c.left, "left", c.name);
         bad += cmp_vec(right, c.right, "right", c.name);
 

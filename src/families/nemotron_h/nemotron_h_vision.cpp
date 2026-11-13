@@ -413,9 +413,10 @@ bool is_sentinel(const pulsar_engine *e, int32_t id) { return image_id(e) >= 0 &
 /// @param start the index asked about
 /// @param[out] len the run's length
 /// @return true when ids[start] begins a run
-bool block_extent(const pulsar_engine *e, const int32_t *ids, int n, int start, int *len) {
-    const int32_t t = image_id(e);
-    if (t < 0 || !ids || start < 0 || start >= n || ids[start] != t || (start > 0 && ids[start - 1] == t)) return false;
+bool block_extent(const pulsar_engine *e, const TokId *ids, int n, int start, int *len) {
+    const TokId t{image_id(e)};
+    if (!t.is_token() || !ids || start < 0 || start >= n || ids[start] != t || (start > 0 && ids[start - 1] == t))
+        return false;
     int k = start;
     while (k < n && ids[k] == t) k++;
     *len = k - start;
@@ -497,7 +498,7 @@ bool expand(const pulsar_engine *e, const pulsar_image_ref *img, pulsar_tokens *
         return false;
     }
     const uint32_t n = wp * hp / (v->shape.merge * v->shape.merge);
-    for (uint32_t i = 0; i < n; i++) pulsar_tokens_push(out, v->image_id);
+    for (uint32_t i = 0; i < n; i++) pulsar_tokens_push(out, TokId{v->image_id});
     return true;
 }
 
@@ -517,7 +518,7 @@ uint32_t row_width(const pulsar_engine *) { return LLM_WIDTH; }
 /// @param err receives the reason on false
 /// @param errlen size of `err`
 /// @return false when no tower is bound, the tower refused, or the block's length is not the tower's
-bool block_rows(const pulsar_engine *e, const pulsar_image_ref *img, const int32_t *, int block_len,
+bool block_rows(const pulsar_engine *e, const pulsar_image_ref *img, const TokId *, int block_len,
                 const uint16_t *tower, int n_tower, uint16_t **tower_out, int *n_tower_out, uint16_t *out, char *err,
                 size_t errlen) {
     const pulsar_nemotron_h_vision *v = vision_of(e);

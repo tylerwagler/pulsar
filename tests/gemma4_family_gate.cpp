@@ -135,7 +135,7 @@ int main(int argc, char **argv) {
               pulsar_token_is_stop(e, TokId{50}) &&
               !pulsar_token_is_stop(e, TokId{2}) && pulsar_token_think_close(e) == TokId{101} &&
               pulsar_chat_turn_markers(e, &tm) &&
-              tm.n_user == 2 && tm.user[0] == 105 && tm.n_assistant == 2 && tm.assistant[0] == 105,
+              tm.n_user == 2 && tm.user[0] == TokId{105} && tm.n_assistant == 2 && tm.assistant[0] == TokId{105},
           "the tokenizer table: %d ids, \"Hello world\" -> %d tokens, stops <eos> <turn|> <|tool_response>, think close "
           "<channel|>, turn markers <|turn> + the role word", pulsar_engine_vocab_size(e), hello.len);
     pulsar_tokens_free(&hello);

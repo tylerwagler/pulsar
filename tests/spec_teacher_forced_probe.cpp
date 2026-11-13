@@ -134,7 +134,7 @@ int GATE_ENTRY(int argc, char **argv) {
              * harvest first: the chain may still be in flight */
             pulsar_session_spec_chain_harvest(s);
             const bool have_q = s->spec.n_pend > 0u;
-            const int draft0 = have_q ? (int)s->spec.pend[0] : -1;
+            const int draft0 = have_q ? s->spec.pend[0].raw() : -1;
             if (!have_q && n_rounds >= 3 && n_meas == 0) {
                 /* the first round has nothing pending by construction; from
                  * the second on a missing draft is a broken redraft, not data */
@@ -144,11 +144,12 @@ int GATE_ENTRY(int argc, char **argv) {
             }
             int first;
             if (n_rounds == 0) {
-                first = toks.v[pos];
+                first = toks.v[pos].raw();
             } else {
                 first = pulsar_session_spec_next_base(s, temperature, top_k, top_p, min_p, rngp).raw();
-                if (first != toks.v[pos]) {
-                    fprintf(stderr, "forced carry lost: next_base=%d truth=%d at pos %d\n", first, toks.v[pos], pos);
+                if (first != toks.v[pos].raw()) {
+                    fprintf(stderr, "forced carry lost: next_base=%d truth=%d at pos %d\n", first, toks.v[pos].raw(),
+                            pos);
                     goto done;
                 }
             }
@@ -180,15 +181,17 @@ int GATE_ENTRY(int argc, char **argv) {
                 const uint32_t row0 = 0;
                 const pulsar_row_draw dp = {temperature, top_k, top_p, min_p, &at, false, NULL};
                 const pulsar_row_draw dm = {temperature, top_k, top_p, min_p, NULL, true, NULL};
-                int tp = -1, tm = -1;
-                if (pulsar_session_draw_rows(s, &row0, &dp, 1, &tp) != 0 || pulsar_session_draw_rows(s, &row0, &dm, 1, &tm) != 0 ||
-                    tp < 0 || tm < 0) {
+                TokId tp_id = TokId::none(), tm_id = TokId::none();
+                const bool drew = pulsar_session_draw_rows(s, &row0, &dp, 1, &tp_id) == 0 &&
+                                  pulsar_session_draw_rows(s, &row0, &dm, 1, &tm_id) == 0;
+                const int tp = tp_id.raw(), tm = tm_id.raw();
+                if (!drew || tp < 0 || tm < 0) {
                     fprintf(stderr, "the target row's draws failed at %d\n", pos);
                     goto done;
                 }
                 accept += tp == draft0;
                 mode_hit += tm == draft0;
-                truth_hit += (draft0 == toks.v[pos + 1]);
+                truth_hit += (draft0 == toks.v[pos + 1].raw());
                 n_meas++;
                 if (n_meas % 250 == 0)
                     printf("  %5d positions: draft==target draw=%.4f  draft==p argmax=%.4f  draft==truth=%.4f\n",
@@ -197,14 +200,15 @@ int GATE_ENTRY(int argc, char **argv) {
             /* forced end: the corpus decides acceptance and the carry */
             if (!pulsar_session_bank_state_restore(s, BankId{bank0})) { fprintf(stderr,
                                                                                 "bank restore failed\n"); goto done; }
-            int accepted[17];
+            TokId accepted[17];
             const int na = pulsar_session_spec_round_end_forced(s, r, TokId{first}, temperature, top_k, top_p, min_p,
                                                                 rngp, 0u, toks.v + pos + 1, accepted, 17,
                                                                 err, sizeof err);
             if (na < 0) { fprintf(stderr, "round_end_forced at %d: %s\n", pos, err); goto done; }
             for (int i = 0; i < na; i++) {
                 if (accepted[i] != toks.v[pos + i]) {
-                    fprintf(stderr, "forced round committed %d at pos %d, truth %d\n", accepted[i], pos + i, toks.v[pos + i]);
+                    fprintf(stderr, "forced round committed %d at pos %d, truth %d\n", accepted[i].raw(), pos + i,
+                            toks.v[pos + i].raw());
                     goto done;
                 }
             }
