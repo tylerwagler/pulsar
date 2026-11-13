@@ -481,6 +481,15 @@ inline uint32_t pulsar_bank_index(BankId b) {
     return (uint32_t)b.raw();
 }
 
+/** L334 P4 S5: a bank array as the int32 array a kernel launch on host memory or a wire struct reads -- the named
+ *  crossing (BankId is exactly an int32).  Byte copies (uploads, memcpy) take BankId arrays as they are.
+ *  @param banks the bank array */
+/// @return the same memory as int32 bank ids
+inline const int32_t *pulsar_bank_ids_raw(const BankId *banks) { return reinterpret_cast<const int32_t *>(banks); }
+/** The reverse, in place: raw int32 bank ids viewed as BankIds.  @param raw the int32 ids */
+/// @return the same memory as bank ids
+inline const BankId *pulsar_bank_ids_of(const int32_t *raw) { return reinterpret_cast<const BankId *>(raw); }
+
 static_assert(sizeof(BankId) == sizeof(int32_t) && std::is_trivial<BankId>::value &&
                   std::is_standard_layout<BankId>::value,
               "a bank id is as cheap as the int32 it replaces (arrays of it upload as int32)");

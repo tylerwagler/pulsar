@@ -94,11 +94,11 @@ static int ds4_batch_step(pulsar_session *s, const pulsar_multiseq_req *reqs, ui
                           const char *what, char *err, size_t errlen) {
     pulsar_engine *e = s->engine;
     int32_t *pos = (int32_t *)xmalloc((size_t)n_rows * sizeof(*pos));
-    int32_t *bank = (int32_t *)xmalloc((size_t)n_rows * sizeof(*bank));
+    BankId *bank = (BankId *)xmalloc((size_t)n_rows * sizeof(*bank));
     TokId *tokens = (TokId *)xmalloc((size_t)n_rows * sizeof(*tokens));
     for (uint32_t k = 0; k < n_rows; k++) {
         pos[k]    = reqs[k].pos.raw();   /* L334: the device rows stay raw */
-        bank[k]   = reqs[k].bank.raw();   /* the step's int32 bank array */
+        bank[k]   = reqs[k].bank;
         tokens[k] = reqs[k].token;
     }
     uint32_t headed = 0;

@@ -1181,7 +1181,7 @@ static void part_spec_zero_draft(pulsar_engine *e, int W) {
         const int kall[1] = {-1};
         int na[2] = {0, 0};
         bool ran = s && spec_lane_round(s, b1, kall, 1, &rngs[1], &r[1], na, W, err, sizeof(err));
-        uint32_t banks_r[1] = {1};
+        const BankId banks_r[1] = {BankId{1}};
         uint64_t *rp[1] = {&rngs[1]};
         ran = ran && pulsar_session_spec_redraft_batch(s, &r[1], banks_r, rp, 1, err, sizeof(err)) == 0;
         pulsar_spec_step cs;

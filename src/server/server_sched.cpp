@@ -5129,7 +5129,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
         double draft_t1 = draft_t0;
         {
             pulsar_spec_round *live_rounds[PULSAR_SPEC_LOGITS_ROWS];
-            uint32_t live_banks[PULSAR_SPEC_LOGITS_ROWS];
+            BankId live_banks[PULSAR_SPEC_LOGITS_ROWS];
             uint64_t *live_rngs[PULSAR_SPEC_LOGITS_ROWS];
             session_slot *live_slots[PULSAR_SPEC_LOGITS_ROWS];
             int nl = 0;
@@ -5137,7 +5137,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 session_slot *sl = dec[live_idx[q]];
                 if (!rounds[live_idx[q]] || !sl->gen || sl->gen->phase != GEN_DECODE) continue;
                 live_rounds[nl] = rounds[live_idx[q]];
-                live_banks[nl] = pulsar_bank_index(sl->bank);   /* the redraft's raw bank array */
+                live_banks[nl] = BankId{pulsar_bank_index(sl->bank)};   /* fatal on none(), as before */
                 live_rngs[nl] = &sl->gen->rng;
                 live_slots[nl] = sl;
                 nl++;
@@ -5154,7 +5154,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
              * commit, save per bank). */
             for (int q = 0; q < nl; q++) {
                 memset(&steps[q], 0, sizeof(steps[q]));
-                steps[q].bank = BankId{live_banks[q]};
+                steps[q].bank = live_banks[q];
                 steps[q].round = live_rounds[q];
             }
             if (nl > 0) (void)pulsar_session_spec_redraft_commit_batch(pool, steps, nl);
@@ -5165,8 +5165,8 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                      * and the slot decoding on (L190 D1). */
                     gen_state *g = live_slots[q]->gen;
                     snprintf(g->err, sizeof g->err,
-                             "bank %u state restore failed before redraft commit",
-                             (unsigned)live_banks[q]);
+                             "bank %d state restore failed before redraft commit",
+                             live_banks[q].raw());
                     g->finish = "error";
                     g->phase = GEN_FINISH;
                 }

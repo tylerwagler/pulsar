@@ -739,7 +739,9 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
                 rngs[i] = &states[i];
                 if (!rounds[i]) ok = 0;
             }
-            const int rc = ok ? pulsar_session_spec_redraft_batch_local(slot->s, rounds, c->spec_banks, rngs, (int)n,
+            /* the wire's uint32 bank ids viewed as BankIds (the same bytes): the named crossing */
+            const BankId *banks = pulsar_bank_ids_of(reinterpret_cast<const int32_t *>(c->spec_banks));
+            const int rc = ok ? pulsar_session_spec_redraft_batch_local(slot->s, rounds, banks, rngs, (int)n,
                                                                         ferr, sizeof(ferr)) : -1;
             free(rounds); free(states); free(rngs);
             status = rc == 0 ? 0 : 1;

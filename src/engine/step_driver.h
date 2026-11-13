@@ -155,7 +155,7 @@ struct pulsar_driver_step {
     uint32_t n_rows;
     const TokId *tokens;                  ///< [n_rows] host token ids
     const int32_t *pos;                   ///< [n_rows] host positions
-    const int32_t *bank;                  ///< [n_rows] host bank ids
+    const BankId *bank;                   ///< [n_rows] host bank ids
     /** L268: the family's per-row rope positions (pulsar_driver_ops::rope), or NULL = text positions */
     const uint32_t *rope;
     /** L251 MTP: rows [0, n_dec) are a VERIFY (PREFILL mode, <= PULSAR_DRIVER_HEADS_MAX rows): the ops write their
@@ -233,12 +233,12 @@ typedef struct pulsar_driver_ops {
      *  `eval`: the session's single-row eval (a family's diagnostics may head it).  NULL = no drafter lane; a family
      *  that drafts with its MTP modules sets the chained-MTP lane's (spec_mtp.h pulsar_mtp_absorb). */
     bool (*absorb)(pulsar_session *s, pulsar_step_mode mode, const TokId *tokens, const int32_t *pos,
-                   const int32_t *bank, uint32_t n, uint32_t row0, bool eval);
+                   const BankId *bank, uint32_t n, uint32_t row0, bool eval);
     /** L296 N9: the family's MTP module declaration (spec_mtp.h), or NULL = none.  When it declares modules the
      *  driver builds the chained-MTP drafter's lane (pulsar_driver_state::mtp) before the declared state. */
     const struct pulsar_mtp_ops *mtp;
     /** Optional (L268): the step's multi-axis rope positions into *out, or NULL = text positions. */
-    const uint32_t *(*rope)(const pulsar_session *s, const int32_t *pos, const int32_t *bank, uint32_t n,
+    const uint32_t *(*rope)(const pulsar_session *s, const int32_t *pos, const BankId *bank, uint32_t n,
                             std::vector<uint32_t> *out);
     /** Optional (L268): a sync chunk's image rows into the step's slots (pulsar_image_merge_chunk's writer).  NULL =
      *  the family serves no images (a sync with images is refused). */

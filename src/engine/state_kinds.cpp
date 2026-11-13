@@ -266,7 +266,7 @@ void *pulsar_state_capture_rows(const pulsar_state_set *ss, uint32_t slot, uint3
     return (uint8_t *)dptr(ss->cap_rows[id]) + pulsar_state_capture_offset(ss, slot, id);
 }
 
-void pulsar_state_verify_begin(pulsar_state_set *ss, uint32_t n_runs, const uint32_t *run_first, const int32_t *bank,
+void pulsar_state_verify_begin(pulsar_state_set *ss, uint32_t n_runs, const uint32_t *run_first, const BankId *bank,
                                const int32_t *pos) {
     const pulsar_state_plan *p = ss->plan;
     ss->n_runs = n_runs;
@@ -277,7 +277,7 @@ void pulsar_state_verify_begin(pulsar_state_set *ss, uint32_t n_runs, const uint
         for (uint32_t id = 0; id < p->n_decl; id++)
             if (ss->cap_host[id])
                 memcpy(ss->cap_host[id] + (size_t)k * p->decl[id].bytes,
-                       pulsar_state_host(ss, id, BankId{ss->run_bank[k]}), p->decl[id].bytes);
+                       pulsar_state_host(ss, id, ss->run_bank[k]), p->decl[id].bytes);
     }
 }
 
@@ -291,7 +291,7 @@ bool pulsar_state_verify_capture(pulsar_state_set *ss) {
             const uint64_t o = ss->ord[k][id];
             for (uint32_t r = 0; ok && r < ss->n_runs; r++)
                 ok = pulsar_gpu_tensor_copy_async(ss->cap_runs[id], (o * ss->verify_rows + r) * blk, ss->t[k][id],
-                                                  (uint64_t)ss->run_bank[r] * blk, blk) != 0;
+                                                  (uint64_t)pulsar_bank_index(ss->run_bank[r]) * blk, blk) != 0;
         }
     }
     if (!ok) fprintf(stderr, "pulsar: %s: the verify capture of a staged block failed\n", p->name);
@@ -346,11 +346,11 @@ bool pulsar_state_step_begin(pulsar_state_set *ss, bool verify) {
     return true;
 }
 
-void pulsar_state_step_end(pulsar_state_set *ss, const int32_t *bank, uint32_t n_rows, bool ok) {
+void pulsar_state_step_end(pulsar_state_set *ss, const BankId *bank, uint32_t n_rows, bool ok) {
     if (!ss->fold_host || !ok) return;
     /* every trunk step runs every recurrent layer on each of its banks: their pending rows are in their state now */
     for (uint32_t r = 0; r < n_rows; r++)
-        if (bank[r] >= 0 && (uint32_t)bank[r] < ss->n_banks) ss->fold_host[2 + 2 * bank[r]] = 0;
+        if (bank[r].below(ss->n_banks)) ss->fold_host[2 + 2 * pulsar_bank_index(bank[r])] = 0;
 }
 
 /** Print a commit refusal under the plan's name.
@@ -366,7 +366,7 @@ bool pulsar_state_commit(pulsar_state_set *ss, BankId bank, const TokId *tokens,
     const pulsar_state_plan *p = ss->plan;
     uint32_t run = ss->n_runs;
     for (uint32_t k = 0; k < ss->n_runs; k++)
-        if (BankId{ss->run_bank[k]} == bank) run = k;
+        if (ss->run_bank[k] == bank) run = k;
     if (run == ss->n_runs) return commit_fail(ss, "a commit names a bank the last verify step did not carry");
     const uint32_t b = pulsar_bank_index(bank);
     const uint32_t f = ss->run_first[run], R = ss->run_first[run + 1] - f;

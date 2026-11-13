@@ -317,7 +317,7 @@ static inline uint64_t dspark_map_size(const pulsar_engine *e, const pulsar_tens
 /// @param err receives the reason on failure
 /// @param errlen its size
 /// @return 0, or -1
-static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, const uint32_t *banks,
+static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, const BankId *banks,
                               uint64_t *const *rngs, int n_sel, bool defer, char *err, size_t errlen) {
     PULSAR_NVTX("redraft group");
     pulsar_engine *e = s->engine;
@@ -343,19 +343,20 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
     uint32_t n_rows = 0, max_draft_g = 0, max_draft_s = 0;
     for (int j = 0; j < n_sel; j++) {
         spec_redraft_req *q = qs[j];
-        if ((banks && banks[j] >= g->banks.n_banks) || n_rows + q->n_draft > PULSAR_DSPARK_DRAFT_ROWS_MAX) {
+        if ((banks && !banks[j].below(g->banks.n_banks)) || n_rows + q->n_draft > PULSAR_DSPARK_DRAFT_ROWS_MAX) {
             snprintf(err, errlen, "dspark draft: rows exceed the drafter budget");
             return -1;
         }
         base_row[j] = (int32_t)n_rows;
         if (banks) {
-            for (uint32_t li = 0; li < 3; li++) bank_n_raw[banks[j]][li] = g->ms_dspark_n_raw[banks[j]][li];
-            bank_n_draft[banks[j]] = q->n_draft;
+            const uint32_t b = pulsar_bank_index(banks[j]);   /* in the pool: checked above */
+            for (uint32_t li = 0; li < 3; li++) bank_n_raw[b][li] = g->ms_dspark_n_raw[b][li];
+            bank_n_draft[b] = q->n_draft;
         }
         for (uint32_t k = 0; k < q->n_draft; k++) {
             /* the noise-token forward: row 0 the carry, the rest DSpark's noise id */
             draft_ids[n_rows] = k == 0 ? q->next_base : TokId{PULSAR_DSPARK_NOISE_TOKEN_ID};
-            row_bank[n_rows] = banks ? banks[j] : 0u;
+            row_bank[n_rows] = banks ? pulsar_bank_index(banks[j]) : 0u;   /* the forward's row map is raw */
             n_rows++;
         }
         if (j < n_g) { if (q->n_draft > max_draft_g) max_draft_g = q->n_draft; }
@@ -728,7 +729,7 @@ static int dspark_prime(pulsar_session *s, char *err, size_t errlen) {
 /// @param errlen its size
 /// @return 0, or -1
 static int dspark_draft_batch(pulsar_session *s, pulsar_spec_round **rounds,
-                                      const uint32_t *banks, uint64_t **rngs, int n,
+                                      const BankId *banks, uint64_t **rngs, int n,
                                       char *err, size_t errlen) {
     pulsar_gpu_graph *g = s->graph;
     if (!rounds || !banks || !rngs || n <= 0) return 0;
@@ -752,7 +753,7 @@ static int dspark_draft_batch(pulsar_session *s, pulsar_spec_round **rounds,
     /* greedy rounds first, then sampled, so each group is contiguous in rows
      * and in the bank arrays */
     spec_redraft_req *qs[PULSAR_MSEQ_MAX];
-    uint32_t bk[PULSAR_MSEQ_MAX];
+    BankId bk[PULSAR_MSEQ_MAX];
     uint64_t *rg[PULSAR_MSEQ_MAX];
     int n_sel = 0;
     for (int pass = 0; pass < 2; pass++)
@@ -862,7 +863,7 @@ const pulsar_spec_target_ops k_ds4_spec_target = {
 /// @param banks [n] their banks
 /// @param n rows
 /// @return false = refused
-static bool dspark_absorb_banked(pulsar_session *s, const uint32_t *rows, const uint32_t *banks, const TokId *,
+static bool dspark_absorb_banked(pulsar_session *s, const uint32_t *rows, const BankId *banks, const TokId *,
                                  uint32_t n) {
     pulsar_engine *e = s->engine;
     return gpu_graph_dspark_seed_rows_banked(s->graph, &e->dspark_model, &e->dspark_weights, rows, banks, n);

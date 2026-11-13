@@ -1386,19 +1386,19 @@ static void qwen_dump(const pulsar_driver_step *st, uint32_t il) {
 /// @param n rows
 /// @param[out] out storage, [n][6]
 /// @return out's data, or NULL for text positions
-static const uint32_t *qwen_rope_table(const pulsar_session *s, const int32_t *pos, const int32_t *bank, uint32_t n,
+static const uint32_t *qwen_rope_table(const pulsar_session *s, const int32_t *pos, const BankId *bank, uint32_t n,
                                        std::vector<uint32_t> *out) {
-    bool any = false;
+    bool any = false;   /* the step's banks are in the pool: the driver's forward checked them first */
     for (uint32_t r = 0; r < n && !any; r++) {
         const pulsar_image_identity *id =
-            pulsar_session_bank_images(s, (uint32_t)bank[r], pulsar_bank_index(s->states->live_bank));
+            pulsar_session_bank_images(s, pulsar_bank_index(bank[r]), pulsar_bank_index(s->states->live_bank));
         for (uint32_t i = 0; id && i < id->n && !any; i++) any = id->b[i].grid_h && id->b[i].grid_w;
     }
     if (!any) return NULL;
     out->resize((size_t)n * 6u);
     for (uint32_t r = 0; r < n; r++) {
         const pulsar_image_identity *id =
-            pulsar_session_bank_images(s, (uint32_t)bank[r], pulsar_bank_index(s->states->live_bank));
+            pulsar_session_bank_images(s, pulsar_bank_index(bank[r]), pulsar_bank_index(s->states->live_bank));
         const uint32_t p = (uint32_t)pos[r], back = PULSAR_QSA_BLOCK - 1u;
         pulsar_image_rope3(id, p, &(*out)[(size_t)r * 6u]);
         pulsar_image_rope3(id, p >= back ? p - back : 0u, &(*out)[(size_t)r * 6u + 3u]);
@@ -1455,7 +1455,7 @@ struct qwen_mtp_pick {
 /// @param decode_rows PREFILL rows taken as decode rows (the absorb)
 /// @return false (printed) on a refusal or failed step
 static bool qwen_mtp_forward(pulsar_session *s, pulsar_step_mode mode, const pulsar_gpu_tensor *cond,
-                             const TokId *tokens, const int32_t *pos, const int32_t *bank, uint32_t n_rows,
+                             const TokId *tokens, const int32_t *pos, const BankId *bank, uint32_t n_rows,
                              uint32_t head_row0, uint32_t head_n, float *logits_out, qwen_mtp_pick *pick,
                              bool decode_rows) {
     pulsar_engine *e = s->engine;

@@ -59,7 +59,7 @@ bool step(pulsar_session *s, const pulsar_mtp_step &m) {
     if (l->ops->forward(s, &m)) return true;
     fprintf(stderr, "pulsar: %s: the MTP step failed; its banks' drafter state is dropped\n", ARCH(s));
     for (uint32_t r = 0; r < m.n; r++)
-        if ((uint32_t)m.bank[r] < l->n_banks) l->pend_pos[m.bank[r]] = TokPos::none();
+        if (m.bank[r].below(l->n_banks)) l->pend_pos[pulsar_bank_index(m.bank[r])] = TokPos::none();
     return false;
 }
 
@@ -74,7 +74,7 @@ bool step(pulsar_session *s, const pulsar_mtp_step &m) {
 /// @param cond the conditioning rows, row i at i * cond_bytes
 /// @return the step; the arrays are borrowed, not copied
 pulsar_mtp_step step_of(uint32_t module, pulsar_step_mode mode, bool decode_rows, const TokId *tok,
-                        const int32_t *pos, const int32_t *bank, uint32_t n, const pulsar_gpu_tensor *cond) {
+                        const int32_t *pos, const BankId *bank, uint32_t n, const pulsar_gpu_tensor *cond) {
     pulsar_mtp_step m{};
     m.module = module;
     m.mode = mode;
@@ -173,14 +173,15 @@ bool pulsar_mtp_drafter_frontier(void *ud, BankId bank, TokPos T_at, char *why, 
  * -- each bank's parked row pairs with the token this step fed, and this step's row is parked.  Module 0 runs: the
  * lockstep row is a chain's first step. */
 bool pulsar_mtp_absorb(pulsar_session *s, pulsar_step_mode mode, const TokId *tokens, const int32_t *pos,
-                       const int32_t *bank, uint32_t n, uint32_t row0, bool) {
+                       const BankId *bank, uint32_t n, uint32_t row0, bool) {
     pulsar_mtp_lane *l = LANE(s);
     if (!l) return true;
     const pulsar_mtp_ops *ops = l->ops;
     pulsar_gpu_tensor *pend = pend_tensor(s);
     const uint64_t cb = l->cond_bytes;
     std::vector<TokId> mt(n + 1u);
-    std::vector<int32_t> mp(n + 1u), mb(n + 1u);
+    std::vector<int32_t> mp(n + 1u);
+    std::vector<BankId> mb(n + 1u);
     uint32_t k = 0;
     if (!pend) {
         fprintf(stderr, "pulsar: %s: the MTP lane has no pending rows -- refusing the step\n", ARCH(s));
@@ -188,21 +189,21 @@ bool pulsar_mtp_absorb(pulsar_session *s, pulsar_step_mode mode, const TokId *to
     }
     bool ok = true;
     if (mode == PULSAR_STEP_PREFILL) {
-        const uint32_t b = (uint32_t)bank[0];
+        const uint32_t b = (uint32_t)bank[0].raw();   /* the driver's forward checked the step's banks */
         if (parked_before(l, b, TokPos{pos[0]})) {
             ok = pulsar_gpu_tensor_copy_async(l->cond, 0, pend, (uint64_t)b * cb, cb) != 0;
-            mt[k] = tokens[0]; mp[k] = pos[0] - 1; mb[k] = (int32_t)b; k++;
+            mt[k] = tokens[0]; mp[k] = pos[0] - 1; mb[k] = bank[0]; k++;
         }
         if (ok && n > 1) ok = ops->trunk_rows(s, row0, n - 1u, l->cond, (uint64_t)k * cb);
-        for (uint32_t i = 0; i + 1u < n; i++) { mt[k] = tokens[i + 1]; mp[k] = pos[i]; mb[k] = (int32_t)b; k++; }
+        for (uint32_t i = 0; i + 1u < n; i++) { mt[k] = tokens[i + 1]; mp[k] = pos[i]; mb[k] = bank[0]; k++; }
         if (ok) ok = ops->trunk_rows(s, row0 + n - 1u, 1u, pend, (uint64_t)b * cb);
         if (ok) l->pend_pos[b] = TokPos{pos[n - 1]};
     } else {
         for (uint32_t j = 0; ok && j < n; j++) {
-            const uint32_t b = (uint32_t)bank[j];
+            const uint32_t b = (uint32_t)bank[j].raw();   /* the driver's forward checked the step's banks */
             if (parked_before(l, b, TokPos{pos[j]})) {
                 ok = pulsar_gpu_tensor_copy_async(l->cond, (uint64_t)k * cb, pend, (uint64_t)b * cb, cb) != 0;
-                mt[k] = tokens[j]; mp[k] = pos[j] - 1; mb[k] = (int32_t)b; k++;
+                mt[k] = tokens[j]; mp[k] = pos[j] - 1; mb[k] = bank[j]; k++;
             }
             if (ok) ok = ops->trunk_rows(s, row0 + j, 1u, pend, (uint64_t)b * cb);
             if (ok) l->pend_pos[b] = TokPos{pos[j]};
@@ -229,7 +230,7 @@ bool pulsar_mtp_absorb(pulsar_session *s, pulsar_step_mode mode, const TokId *to
  * every bank's stage back to what its chain saved, the kept rows' module rows (trunk row i, next[i]) of EVERY bank in
  * one step (L288: one run a bank, decode rows) -- after the lockstep row of a bank whose parked row no chain consumed
  * -- and each bank's last kept row parked for its next draft.  At most one row a kept row: the verify width. */
-bool pulsar_mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const uint32_t *banks, const TokId *next,
+bool pulsar_mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const BankId *banks, const TokId *next,
                               uint32_t n) {
     pulsar_mtp_lane *l = LANE(s);
     pulsar_state_set *ss = s->states;
@@ -241,13 +242,14 @@ bool pulsar_mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const uin
     const uint64_t cb = l->cond_bytes;
     pulsar_gpu_tensor *pend = pend_tensor(s);
     TokId tok[PULSAR_DRIVER_HEADS_MAX];
-    int32_t pos[PULSAR_DRIVER_HEADS_MAX], bank[PULSAR_DRIVER_HEADS_MAX];
+    int32_t pos[PULSAR_DRIVER_HEADS_MAX];
+    BankId bank[PULSAR_DRIVER_HEADS_MAX];
     uint32_t m = 0;   /* the step's rows */
     bool ok = n <= PULSAR_DRIVER_HEADS_MAX && pend;
     for (uint32_t i = 0; ok && i < n;) {
-        const uint32_t b = banks[i];
+        const uint32_t b = (uint32_t)banks[i].raw();   /* refused below when outside the pool (none() included) */
         uint32_t j = i + 1;
-        while (j < n && banks[j] == b) j++;
+        while (j < n && banks[j] == banks[i]) j++;
         const uint32_t k = j - i;
         for (uint32_t r = i + 1; ok && r < j; r++) ok = rows[r] == rows[i] + (r - i);
         if (!ok || b >= ss->n_banks || ss->bank_pos[b] < TokPos::after(TokCount{(int)k})) {
@@ -270,21 +272,21 @@ bool pulsar_mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const uin
             ok = pulsar_gpu_tensor_copy_async(l->cond, (uint64_t)m * cb, pend, (uint64_t)b * cb, cb) != 0;
             tok[m] = l->vtok[rows[i]];
             pos[m] = (kept.pos0 - TokCount{1}).raw();
-            bank[m++] = (int32_t)b;
+            bank[m++] = banks[i];
         }
         if (ok && k > 1) ok = ops->trunk_rows(s, rows[i], k - 1u, l->cond, (uint64_t)m * cb);
         for (uint32_t r = 0; r + 1 < k; r++, m++) {
             tok[m] = next[i + r];
             pos[m] = kept.pos_of(kept.first + StepRows{(int)r}).raw();
-            bank[m] = (int32_t)b;
+            bank[m] = banks[i];
         }
         i = j;
     }
     if (ok && m > 0) ok = step(s, step_of(0u, PULSAR_STEP_PREFILL, true, tok, pos, bank, m, l->cond));
     for (uint32_t i = 0; i < n;) {
-        const uint32_t b = banks[i];
+        const uint32_t b = (uint32_t)banks[i].raw();   /* read below only inside the pool (none() included) */
         uint32_t j = i + 1;
-        while (j < n && banks[j] == b) j++;
+        while (j < n && banks[j] == banks[i]) j++;
         bool parked = ok && b < ss->n_banks && ss->bank_pos[b] >= TokPos::after(TokCount{(int)(j - i)});
         if (parked) parked = ops->trunk_rows(s, rows[j - 1], 1u, pend, (uint64_t)b * cb);
         if (b < ss->n_banks) l->pend_pos[b] = parked ? ss->bank_pos[b] - TokCount{1} : TokPos::none();
@@ -312,7 +314,7 @@ bool pulsar_mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const uin
 /// @param err receives the reason
 /// @param errlen its size
 /// @return false = failed
-static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rngs,
+static bool mtp_draft_chains(pulsar_session *s, const BankId *banks, uint64_t *const *rngs,
                              spec_redraft_req *const *reqs, uint32_t n, char *err, size_t errlen) {
     pulsar_engine *e = s->engine;
     pulsar_mtp_lane *l = LANE(s);
@@ -339,7 +341,7 @@ static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t 
     for (uint32_t i = 0; i < n; i++) {
         spec_redraft_req *q = reqs[i];
         chain &ch = c[i];
-        ch.b = banks[i];
+        ch.b = pulsar_bank_index(banks[i]);   /* the callers checked it in the pool */
         ch.p = pulsar_ckpt_raw(ss->bank_pos[ch.b]);   /* the chain's arithmetic is raw */
         ch.sampled = q->temperature > 0.0f;
         ch.live = false;
@@ -420,7 +422,8 @@ static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t 
         return true;
     };
     TokId tok[PULSAR_DRIVER_HEADS_MAX];
-    int32_t pos[PULSAR_DRIVER_HEADS_MAX], bank[PULSAR_DRIVER_HEADS_MAX];
+    int32_t pos[PULSAR_DRIVER_HEADS_MAX];
+    BankId bank[PULSAR_DRIVER_HEADS_MAX];
     pulsar_gpu_tensor *out = ops->out_rows(s);
     bool ok = out != NULL;
     for (uint32_t j = 1; ok; j++) {
@@ -436,7 +439,7 @@ static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t 
                         : pulsar_gpu_tensor_copy_async(l->cond, (uint64_t)m * cb, out, (uint64_t)ch.row * cb, cb) != 0;
             tok[m] = reqs[i]->refined[j - 1];
             pos[m] = (int32_t)(ch.p + j) - 2;
-            bank[m] = (int32_t)ch.b;
+            bank[m] = banks[i];
             ch.row = m++;
         }
         if (!ok || m == 0) break;
@@ -517,7 +520,7 @@ uint32_t pulsar_mtp_draft(pulsar_session *s, TokId next_base, float temperature,
     pulsar_spec_draft_req_init(s, &rec, next_base, temperature, top_k, top_p, min_p);
     char err[200];
     spec_redraft_req *req = &rec;
-    const uint32_t b = pulsar_bank_index(s->states->live_bank);   /* the chains' bank array is raw */
+    const BankId b = BankId{pulsar_bank_index(s->states->live_bank)};   /* fatal on none(), before the chains */
     if (!mtp_draft_chains(s, &b, &rng, &req, 1, err, sizeof err)) {
         /* L306 (the block drafter's rule, block_draft): the round refuses, as the batched lane's does
          * (pulsar_mtp_draft_batch) -- no plain round */
@@ -531,9 +534,9 @@ uint32_t pulsar_mtp_draft(pulsar_session *s, TokId next_base, float temperature,
 
 /* The batched lane's draft: every bank's chain in lockstep (mtp_draft_chains), PULSAR_DRIVER_HEADS_MAX banks at a
  * time. */
-int pulsar_mtp_draft_batch(pulsar_session *s, pulsar_spec_round **rounds, const uint32_t *banks, uint64_t **rngs, int n,
+int pulsar_mtp_draft_batch(pulsar_session *s, pulsar_spec_round **rounds, const BankId *banks, uint64_t **rngs, int n,
                            char *err, size_t errlen) {
-    uint32_t b[PULSAR_DRIVER_HEADS_MAX];
+    BankId b[PULSAR_DRIVER_HEADS_MAX];
     uint64_t *r[PULSAR_DRIVER_HEADS_MAX];
     spec_redraft_req *q[PULSAR_DRIVER_HEADS_MAX];
     uint32_t m = 0;
@@ -541,8 +544,8 @@ int pulsar_mtp_draft_batch(pulsar_session *s, pulsar_spec_round **rounds, const 
         if (i < n) {
             spec_redraft_req *rq = &rounds[i]->redraft;
             if (!rq->valid || rq->n_draft == 0) continue;
-            if (banks[i] >= s->states->n_banks) {
-                snprintf(err, errlen, "%s: the draft's bank %u is outside the pool", ARCH(s), banks[i]);
+            if (!banks[i].below(s->states->n_banks)) {
+                snprintf(err, errlen, "%s: the draft's bank %d is outside the pool", ARCH(s), banks[i].raw());
                 return -1;
             }
             b[m] = banks[i];

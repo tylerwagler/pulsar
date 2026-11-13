@@ -4616,7 +4616,7 @@ static void test_live_row_valid(void) {
  *        leave the view, which is then no position's.
  *   L155 an end whose accepted[] cannot hold the base and every draft the round verified refuses before it commits.
  *   O37  a refused banked absorb at a batch round's end fails each bank that had rows and invalidates its view. */
-static bool test_absorb_banked_refuses(pulsar_session *, const uint32_t *, const uint32_t *, const TokId *, uint32_t) {
+static bool test_absorb_banked_refuses(pulsar_session *, const uint32_t *, const BankId *, const TokId *, uint32_t) {
     return false;
 }
 static void test_spec_round_refusals(void) {
@@ -4702,7 +4702,7 @@ static void test_spec_round_refusals(void) {
     st[0].err[0] = st[1].err[0] = '\0';
     s->seed_defer.active = true;
     s->seed_defer.n = 2;
-    s->seed_defer.bank[0] = s->seed_defer.bank[1] = 1u;
+    s->seed_defer.bank[0] = s->seed_defer.bank[1] = BankId{1};
     pulsar_spec_absorb_deferred(s, st, 2);
     TEST_ASSERT(st[1].status == PULSAR_SPEC_STEP_FAILED && strstr(st[1].err, "absorb") != NULL &&
                 !s->bank_carry[1].checkpoint_valid);

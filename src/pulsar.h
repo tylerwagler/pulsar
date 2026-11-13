@@ -1850,7 +1850,7 @@ void pulsar_session_spec_arm_capture(pulsar_session *s, uint32_t n_rows);
  *  @param errlen bytes at err
  *  @return 0 or -1 */
 int pulsar_session_spec_redraft_batch(pulsar_session *s, pulsar_spec_round **rounds,
-                                      const uint32_t *banks, uint64_t **rngs, int n,
+                                      const BankId *banks, uint64_t **rngs, int n,
                                       char *err, size_t errlen);
 /** Stamp the installed bank's shadow with the draft pulsar_session_spec_redraft_batch left in `r`.
  *  @param s the session

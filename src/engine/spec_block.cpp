@@ -1034,7 +1034,7 @@ FILE *dump_open(const char *name) {
 /// @param pos [n] positions
 /// @param bank [n] banks
 /// @param n rows
-void dump_ctx(pulsar_block_lane *l, uint32_t row0, const int32_t *pos, const int32_t *bank, uint32_t n) {
+void dump_ctx(pulsar_block_lane *l, uint32_t row0, const int32_t *pos, const BankId *bank, uint32_t n) {
     if (!dump_dir() || n == 0) return;
     std::vector<uint16_t> taps((size_t)n * l->tap_width);
     if (!pulsar_gpu_tensor_read(l->taps, (uint64_t)row0 * l->tap_width * 2u, taps.data(), taps.size() * 2u)) return;
@@ -1119,7 +1119,7 @@ pulsar_gqa_seq ring_of(const pulsar_session *s, const pulsar_block_drafter *d, u
 /// @param n rows
 /// @param prompt the prompt arms
 /// @return false = refused (said)
-bool absorb_rows(pulsar_session *s, uint32_t row0, const int32_t *pos, const int32_t *bank, uint32_t n, bool prompt) {
+bool absorb_rows(pulsar_session *s, uint32_t row0, const int32_t *pos, const BankId *bank, uint32_t n, bool prompt) {
     pulsar_block_lane *l = LANE(s);
     const pulsar_block_drafter *d = l->d;
     const pulsar_state_set *ss = s->states;
@@ -1153,8 +1153,8 @@ bool absorb_rows(pulsar_session *s, uint32_t row0, const int32_t *pos, const int
         for (uint32_t i = 0; i < m; i++) {
             const uint32_t r = p0 + i;
             if (i == 0 || bank[r] != bank[r - 1]) {
-                if ((uint32_t)bank[r] >= ss->n_banks) return fail("an absorbed row's bank is outside the pool");
-                l->seq_bank[ns++] = (uint32_t)bank[r];
+                if (!bank[r].below(ss->n_banks)) return fail("an absorbed row's bank is outside the pool");
+                l->seq_bank[ns++] = pulsar_bank_index(bank[r]);
             }
             l->row_seq[i] = ns - 1u;
             l->row_pos[i] = (uint32_t)pos[r];
@@ -1182,8 +1182,9 @@ bool absorb_rows(pulsar_session *s, uint32_t row0, const int32_t *pos, const int
         for (uint32_t i = 0; anchor && i < m; i++) {
             const uint32_t r = p0 + i;
             if (i + 1u < m && bank[r + 1] == bank[r]) continue;
-            if (!pulsar_gpu_tensor_copy_async(anchor, (uint64_t)bank[r] * E * 2u, l->arena, A.cn + (uint64_t)i * E * 2u,
-                                              (uint64_t)E * 2u))
+            /* in the pool: its run's first row was checked above */
+            if (!pulsar_gpu_tensor_copy_async(anchor, (uint64_t)pulsar_bank_index(bank[r]) * E * 2u, l->arena,
+                                              A.cn + (uint64_t)i * E * 2u, (uint64_t)E * 2u))
                 return fail("the anchor copy failed");
         }
     }
@@ -1207,7 +1208,7 @@ bool absorb_rows(pulsar_session *s, uint32_t row0, const int32_t *pos, const int
 /// @param carry [nb] each bank's carry token, in [0, vocab)
 /// @param nb banks, 1 .. kDraftRows / block
 /// @return false = refused (said)
-bool draft_pass(pulsar_session *s, const uint32_t *banks, const uint32_t *pos, const int32_t *carry, uint32_t nb) {
+bool draft_pass(pulsar_session *s, const BankId *banks, const uint32_t *pos, const int32_t *carry, uint32_t nb) {
     pulsar_block_lane *l = LANE(s);
     const pulsar_block_drafter *d = l->d;
     const pulsar_state_set *ss = s->states;
@@ -1246,7 +1247,7 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const uint32_t *pos, c
         ok = ok && anchor && pulsar_gpu_tensor_write_async(l->arena, D.valid, l->h_valid, nb) != 0;
         for (uint32_t i = 0; ok && i < nb; i++)
             ok = pulsar_gpu_tensor_copy_async(l->arena, D.anchor + (uint64_t)i * E * 2u, anchor,
-                                              (uint64_t)banks[i] * E * 2u, (uint64_t)E * 2u) != 0;
+                                              (uint64_t)pulsar_bank_index(banks[i]) * E * 2u, (uint64_t)E * 2u) != 0;
     } else {      /* the selector's anchors: the carries */
         ok = ok && pulsar_gpu_tensor_write_async(l->arena, D.anchor_ids, l->h_anchor, (uint64_t)nb * 4u) != 0;
     }
@@ -1255,7 +1256,7 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const uint32_t *pos, c
         const pulsar_block_layer &L = d->layer[li];
         G[li] = gqa_decl(d, li, (const uint16_t *)wp(s, L.q_norm, "drafter q_norm"),
                          (const uint16_t *)wp(s, L.k_norm, "drafter k_norm"), true);
-        for (uint32_t i = 0; i < nb; i++) l->seqs[i] = ring_of(s, d, li, banks[i]);
+        for (uint32_t i = 0; i < nb; i++) l->seqs[i] = ring_of(s, d, li, pulsar_bank_index(banks[i]));
         ok = G[li].q_norm_w && G[li].k_norm_w &&
              pulsar_gqa_plan(&G[li], l->seqs.data(), nb, l->row_seq.data(), l->row_pos.data(), R, bound,
                              l->h_desc + (uint64_t)li * D.desc_stride, D.desc_stride, &l->call[li]) == 0;
@@ -1488,7 +1489,7 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const uint32_t *pos, c
             passes--;
             int32_t bk[kDraftRows], P[kDraftRows];
             for (uint32_t i = 0; i < nb; i++) {
-                bk[i] = (int32_t)banks[i];
+                bk[i] = banks[i].raw();
                 P[i] = (int32_t)pos[i];
             }
             const uint32_t hdr[4] = {nb, B, E, K};
@@ -1519,7 +1520,7 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const uint32_t *pos, c
 /// @param err receives the reason on failure
 /// @param errlen its size
 /// @return false = refused
-bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rngs, spec_redraft_req *const *reqs,
+bool draft_chains(pulsar_session *s, const BankId *banks, uint64_t *const *rngs, spec_redraft_req *const *reqs,
                   uint32_t n, char *err, size_t errlen) {
     pulsar_block_lane *l = LANE(s);
     if (!l) {
@@ -1529,7 +1530,8 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
     const pulsar_block_drafter *d = l->d;
     const pulsar_state_set *ss = s->states;
     const uint32_t B = d->block, per = kDraftRows / B, V = d->vocab;
-    uint32_t pb[kDraftRows], pi[kDraftRows], pp[kDraftRows];
+    BankId pb[kDraftRows];
+    uint32_t pi[kDraftRows], pp[kDraftRows];
     int32_t pc[kDraftRows];
     std::vector<spec_redraft_req *> chains;   /* the records this call drafted (the stop rule and the pick below) */
     for (uint32_t i0 = 0; i0 < n;) {
@@ -1540,7 +1542,8 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
             q->keep = 0;
             q->have_conf = true;
             q->refined[0] = q->next_base;
-            const uint32_t P = pulsar_ckpt_raw(ss->bank_pos[banks[i]]);   /* the chain's room is raw */
+            /* the chain's room is raw; the bank is in the pool (the callers checked it) */
+            const uint32_t P = pulsar_ckpt_raw(ss->bank_pos[pulsar_bank_index(banks[i])]);
             if (P == 0 || q->n_draft == 0 || (uint64_t)P + 1u >= ss->ctx) continue;   /* no context, or no room */
             if (q->temperature > 0.0f && !rngs[i]) {
                 snprintf(err, errlen, "sampled speculation needs the request's rng");
@@ -1585,7 +1588,7 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
                 spec_redraft_req *q = reqs[pi[b]];
                 chain_of[b] = UINT32_MAX;
                 if (q->temperature <= 0.0f) continue;
-                const uint32_t P = pulsar_ckpt_raw(ss->bank_pos[pb[b]]);
+                const uint32_t P = pulsar_ckpt_raw(ss->bank_pos[pulsar_bank_index(pb[b])]);
                 uint32_t K = std::min(q->n_draft, B - 1u);
                 if ((uint64_t)P + 1u + K > ss->ctx) K = (uint32_t)(ss->ctx - P - 1u);
                 if (nc == PULSAR_GPU_CHAINS_MAX || SL > PULSAR_GPU_CHAIN_SLOTS_MAX) {
@@ -1610,7 +1613,7 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
         }
         for (uint32_t b = 0; b < nb; b++) {
             spec_redraft_req *q = reqs[pi[b]];
-            const uint32_t P = pulsar_ckpt_raw(ss->bank_pos[pb[b]]);
+            const uint32_t P = pulsar_ckpt_raw(ss->bank_pos[pulsar_bank_index(pb[b])]);
             uint32_t K = std::min(q->n_draft, B - 1u);
             if ((uint64_t)P + 1u + K > ss->ctx) K = (uint32_t)(ss->ctx - P - 1u);
             /* the walk over the head's scores: slot s's row is scores[s][prev] (slot 0: the start row) -- greedy the
@@ -1684,17 +1687,18 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
 /// @param banks [n] their banks
 /// @param n rows (<= PULSAR_DRIVER_HEADS_MAX)
 /// @return false = refused (said)
-bool block_absorb_banked(pulsar_session *s, const uint32_t *rows, const uint32_t *banks, const TokId *, uint32_t n) {
+bool block_absorb_banked(pulsar_session *s, const uint32_t *rows, const BankId *banks, const TokId *, uint32_t n) {
     const pulsar_state_set *ss = s->states;
     if (!LANE(s)) return fail("an absorb with no block lane");
-    int32_t pos[PULSAR_DRIVER_HEADS_MAX], bank[PULSAR_DRIVER_HEADS_MAX];
+    int32_t pos[PULSAR_DRIVER_HEADS_MAX];
+    BankId bank[PULSAR_DRIVER_HEADS_MAX];
     if (n == 0) return true;
     if (n > PULSAR_DRIVER_HEADS_MAX) return fail("an absorb wider than the verify");
     /* one call a bank's run of consecutive step rows (the taps are addressed by the step row) */
     for (uint32_t i = 0; i < n;) {
-        const uint32_t b = banks[i];
+        const uint32_t b = (uint32_t)banks[i].raw();   /* refused below when outside the pool (none() included) */
         uint32_t j = i + 1;
-        while (j < n && banks[j] == b) j++;
+        while (j < n && banks[j] == banks[i]) j++;
         bool run = b < ss->n_banks && ss->bank_pos[b] >= TokPos::after(TokCount{(int)(j - i)});
         for (uint32_t r = i + 1; run && r < j; r++) run = rows[r] == rows[r - 1] + 1u;
         if (!run) return fail("a bank's absorbed rows are not one run of its kept rows");
@@ -1704,7 +1708,7 @@ bool block_absorb_banked(pulsar_session *s, const uint32_t *rows, const uint32_t
                                    StepRows{(int)(j - i)}};
         for (uint32_t r = i; r < j; r++) {
             pos[r] = kept.pos_of(StepRow{(int)rows[r]}).raw();
-            bank[r] = (int32_t)b;
+            bank[r] = banks[i];
         }
         if (!absorb_rows(s, rows[i], pos + i, bank + i, j - i, false)) return false;
         i = j;
@@ -1728,7 +1732,7 @@ uint32_t block_draft(pulsar_session *s, TokId next_base, float temperature, int 
     pulsar_spec_draft_req_init(s, &rec, next_base, temperature, top_k, top_p, min_p);
     char err[200];
     spec_redraft_req *req = &rec;
-    const uint32_t b = pulsar_bank_index(s->states->live_bank);   /* the chains' bank array is raw */
+    const BankId b = BankId{pulsar_bank_index(s->states->live_bank)};   /* fatal on none(), before the chains */
     if (!draft_chains(s, &b, &rng, &req, 1, err, sizeof err)) {
         /* L306: the round refuses, as the batched lane's does (block_draft_batch) -- no plain round */
         fprintf(stderr, "pulsar: block drafter: %s -- the round refuses\n", err);
@@ -1748,16 +1752,16 @@ uint32_t block_draft(pulsar_session *s, TokId next_base, float temperature, int 
 /// @param err receives the reason
 /// @param errlen its size
 /// @return 0, or -1 refused
-int block_draft_batch(pulsar_session *s, pulsar_spec_round **rounds, const uint32_t *banks, uint64_t **rngs, int n,
+int block_draft_batch(pulsar_session *s, pulsar_spec_round **rounds, const BankId *banks, uint64_t **rngs, int n,
                       char *err, size_t errlen) {
-    std::vector<uint32_t> b;
+    std::vector<BankId> b;
     std::vector<uint64_t *> r;
     std::vector<spec_redraft_req *> q;
     for (int i = 0; i < n; i++) {
         spec_redraft_req *rq = &rounds[i]->redraft;
         if (!rq->valid || rq->n_draft == 0) continue;
-        if (banks[i] >= s->states->n_banks) {
-            snprintf(err, errlen, "the draft's bank %u is outside the pool", banks[i]);
+        if (!banks[i].below(s->states->n_banks)) {
+            snprintf(err, errlen, "the draft's bank %d is outside the pool", banks[i].raw());
             return -1;
         }
         b.push_back(banks[i]);
@@ -1797,14 +1801,15 @@ int block_warm(pulsar_session *s, char *err, size_t errlen) {
     pulsar_gpu_seg_stats a, b;
     pulsar_gpu_seg_stats_get(&a);
     const double t0 = now_sec();
-    uint32_t banks[kDraftRows], pos[kDraftRows], shapes = 0, n_bounds = 0;
+    BankId banks[kDraftRows];
+    uint32_t pos[kDraftRows], shapes = 0, n_bounds = 0;
     int32_t carry[kDraftRows];
     for (uint32_t bound = 256u; bound <= top; bound *= 2u, n_bounds++) {
         /* a pass's last row P + block - 1 lands in [bound / 2, bound) (in [0, 256) for the first) */
         const uint32_t P = (uint32_t)std::min<uint64_t>((uint64_t)bound - B, (uint64_t)ss->ctx - 2u);
         for (uint32_t nb = 1; nb <= per; nb++, shapes++) {
             for (uint32_t i = 0; i < nb; i++) {
-                banks[i] = bank;
+                banks[i] = ss->live_bank;
                 pos[i] = P;
                 carry[i] = 0;
             }
@@ -1845,7 +1850,7 @@ const pulsar_drafter_ops PULSAR_BLOCK_DRAFTER_OPS = {
 };
 
 bool pulsar_drafter_lane_absorb(pulsar_session *s, pulsar_step_mode mode, const TokId *tokens, const int32_t *pos,
-                                const int32_t *bank, uint32_t n, uint32_t row0, bool eval) {
+                                const BankId *bank, uint32_t n, uint32_t row0, bool eval) {
     if (s->driver && s->driver->mtp) return pulsar_mtp_absorb(s, mode, tokens, pos, bank, n, row0, eval);
     if (!LANE(s)) return true;
     /* PREFILL: one bank's prompt run (the prompt arms); DECODE: one row a bank (the decode arms) */

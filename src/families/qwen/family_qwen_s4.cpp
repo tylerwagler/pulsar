@@ -853,7 +853,7 @@ bool pulsar_qwen_s4_embed(const pulsar_qwen_step *st) {
     }
     for (uint32_t r = 0; r < n; r++) {
         /* oldest first */
-        int32_t *ctx_b = (int32_t *)pulsar_state_host(st->states, PULSAR_QWEN_STATE_NGRAM, BankId{st->bank[r]});
+        int32_t *ctx_b = (int32_t *)pulsar_state_host(st->states, PULSAR_QWEN_STATE_NGRAM, st->bank[r]);
         pulsar_qwen_ngram_ctx ctx = {{ctx_b[0], ctx_b[1]}};
         pulsar_qwen_ngram_rows(&io->layout, &ctx, pulsar_tok_ids_raw(&st->tokens[r]), 1,
                                io->ids + (size_t)r * PULSAR_QWEN_NGRAM_COLS);   /* the n-gram hash reads raw ids */
@@ -948,7 +948,7 @@ bool pulsar_qwen_s4_ple(const pulsar_qwen_step *st, uint32_t il) {
         const uint32_t e = decode ? q + 1u : (st->n_runs ? st->run_first[q + 1] : n);
         seq_first[q] = (int32_t)f;
         seq_rows[q] = (int32_t)(e - f);
-        seq_bank[q] = st->bank[f];
+        seq_bank[q] = st->bank[f].raw();   /* the uploaded map is int32 */
         for (uint32_t r = f; r < e; r++) { row_seq[r] = (int32_t)q; row_j[r] = (int32_t)(r - f); }
     }
     /* L289: enqueued behind layer 0, not waited for -- the host goes on queueing the step */
@@ -1616,9 +1616,10 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, uint32_t il) {
         /* row_seq / row_pos are HOST arrays -- pulsar_gpu_qsa_forward walks them on
          * the host to build its row list.  The step already carries them as `bank` /
          * `pos`.  (The GDN call's row_slot is the opposite: a DEVICE pointer.  Passing
-         * the device row_bank here segfaulted the host walk, 18:56.) */
+         * the device row_bank here segfaulted the host walk, 18:56.)  Its bank array is raw: the named crossing. */
+        const uint32_t *row_bank = reinterpret_cast<const uint32_t *>(pulsar_bank_ids_raw(st->bank + r0));
         const bool done = sq && sk && sv && si &&
-                          pulsar_gpu_qsa_forward(&layer, seqs, nb, (const uint32_t *)st->bank + r0,
+                          pulsar_gpu_qsa_forward(&layer, seqs, nb, row_bank,
                                                  (const uint32_t *)st->pos + r0, m, &io, ws_view) == 1;
         for (pulsar_gpu_tensor *t : {sq, sk, sv, si}) pulsar_gpu_tensor_free(t);
         return done;

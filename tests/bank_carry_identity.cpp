@@ -207,7 +207,7 @@ int GATE_ENTRY(int argc, char **argv) {
             printf("]");
         }
         printf("\n");
-        uint32_t banks[NB] = {0, 1, 2};
+        const BankId banks[NB] = {BankId{0}, BankId{1}, BankId{2}};
         uint64_t *rps[NB] = {&rngs[0], &rngs[1], &rngs[2]};
         if (pulsar_session_spec_redraft_batch(s, r, banks, rps, NB, err, sizeof(err)) != 0)
             fprintf(stderr, "tick %d redraft: %s (banks take a plain step)\n", t, err);

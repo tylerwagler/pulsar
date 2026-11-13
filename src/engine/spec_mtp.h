@@ -62,7 +62,7 @@ typedef struct {
     bool decode_rows;
     const TokId *tokens;        ///< [n] the token after each conditioning row's: the module's input token
     const int32_t *pos;         ///< [n] the position the row writes (its conditioning row's)
-    const int32_t *bank;        ///< [n]
+    const BankId *bank;        ///< [n]
     /// Rows in the step (the length of tokens / pos / bank).
     uint32_t n;
     const pulsar_gpu_tensor *cond;   ///< the conditioning rows: row i at i * cond_bytes (the lane's)
@@ -178,7 +178,7 @@ void pulsar_mtp_lane_free(pulsar_mtp_lane *l);
 /// @param eval the single-row eval (unused here)
 /// @return false = refused or failed (said); true with no lane
 bool pulsar_mtp_absorb(pulsar_session *s, pulsar_step_mode mode, const TokId *tokens, const int32_t *pos,
-                       const int32_t *bank, uint32_t n, uint32_t row0, bool eval);
+                       const BankId *bank, uint32_t n, uint32_t row0, bool eval);
 
 /** The plan's drafter hooks (pulsar_state_plan::drafter_at / drafter_frontier; ud = the driver state). */
 /// @param ud the driver state
@@ -202,7 +202,7 @@ bool pulsar_mtp_drafter_frontier(void *ud, BankId bank, TokPos T, char *why, siz
 /// @param next [n] the token after each
 /// @param n rows
 /// @return false = refused or failed (said)
-bool pulsar_mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const uint32_t *banks, const TokId *next,
+bool pulsar_mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const BankId *banks, const TokId *next,
                               uint32_t n);
 /// pulsar_drafter_ops::draft for the installed bank.
 /// @param s the session
@@ -224,7 +224,7 @@ uint32_t pulsar_mtp_draft(pulsar_session *s, TokId next_base, float temperature,
 /// @param err receives the reason
 /// @param errlen its size
 /// @return 0, or -1 refused
-int pulsar_mtp_draft_batch(pulsar_session *s, pulsar_spec_round **rounds, const uint32_t *banks, uint64_t **rngs,
+int pulsar_mtp_draft_batch(pulsar_session *s, pulsar_spec_round **rounds, const BankId *banks, uint64_t **rngs,
                            int n, char *err, size_t errlen);
 
 /** A family's MTP drafter: its numbers (spec_ops.h pulsar_drafter_ops), the lane's functions. */

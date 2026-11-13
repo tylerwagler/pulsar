@@ -431,7 +431,7 @@ struct nh_state : pulsar_driver_state {
     /// Host [max_rows + 1]: each sequence's first row, then n_rows
     uint32_t *seq_first;      /* host [max_rows + 1] */
     /// Host [max_rows]: each sequence's bank
-    int32_t *seq_bank;        /* host [max_rows] */
+    BankId *seq_bank;         /* host [max_rows] */
     /// Host [max_rows]: each row's sequence (F1's)
     uint32_t *row_seq;        /* host [max_rows]: F1's */
     /// Host [max_rows]: each row's position (F1's)
@@ -533,7 +533,7 @@ pulsar_driver_state *create(pulsar_session *s, uint32_t n_banks) {
     st->h = pulsar_gpu_tensor_alloc(R * sh.n_embd * 2u);
     st->xn = pulsar_gpu_tensor_alloc(R * sh.n_embd * 2u);
     st->seq_first = (uint32_t *)xmalloc((R + 1u) * sizeof(uint32_t));
-    st->seq_bank = (int32_t *)xmalloc(R * sizeof(int32_t));
+    st->seq_bank = (BankId *)xmalloc(R * sizeof(BankId));
     st->row_seq = (uint32_t *)xmalloc(R * sizeof(uint32_t));
     st->row_pos = (uint32_t *)xmalloc(R * sizeof(uint32_t));
     st->tab_a = (int32_t *)xmalloc(2u * (R + 1u) * sizeof(int32_t));
@@ -697,13 +697,13 @@ bool build_tables(const nh_step *st) {
     q->max_run_a = q->max_run_b = 0;
     for (uint32_t k = 0; k <= na; k++) q->tab_a[k] = (int32_t)q->seq_first[k];
     for (uint32_t k = 0; k < na; k++) {
-        q->tab_a[na + 1 + k] = q->seq_bank[k];
+        q->tab_a[na + 1 + k] = q->seq_bank[k].raw();   /* the uploaded table is int32 */
         const uint32_t m = q->seq_first[k + 1] - q->seq_first[k];
         if (m > q->max_run_a) q->max_run_a = m;
     }
     for (uint32_t k = 0; k <= nb; k++) q->tab_b[k] = (int32_t)(q->seq_first[na + k] - q->rows_cap);
     for (uint32_t k = 0; k < nb; k++) {
-        q->tab_b[nb + 1 + k] = q->seq_bank[na + k];
+        q->tab_b[nb + 1 + k] = q->seq_bank[na + k].raw();
         const uint32_t m = q->seq_first[na + k + 1] - q->seq_first[na + k];
         if (m > q->max_run_b) q->max_run_b = m;
     }
@@ -767,7 +767,7 @@ bool plan_call(const nh_step *st, uint32_t il, uint32_t k, uint32_t bound, uint6
     const pulsar_gqa_layer G1 = gqa_decl(st->w->shape);
     const uint64_t tb = pulsar_gqa_kv_token_bytes(&G1);
     for (uint32_t j = 0; j < q->n_seq; j++) {
-        pulsar_gpu_tensor *pool = pulsar_state_pool(st->states, il, PULSAR_NEMOTRON_H_STATE_KV, BankId{q->seq_bank[j]});
+        pulsar_gpu_tensor *pool = pulsar_state_pool(st->states, il, PULSAR_NEMOTRON_H_STATE_KV, q->seq_bank[j]);
         if (!pool) return failf("an attention layer's pool is evicted", il);
         pulsar_gqa_seq &sq = q->seqs[j];
         sq.kv = dptr(pool);

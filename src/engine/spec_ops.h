@@ -104,7 +104,7 @@ typedef struct pulsar_drafter_ops {
      *  round's rows together (absorb_banked), in the single lane too. */
     bool (*absorb)(struct pulsar_session *s, uint32_t row, int32_t next);
     /** Every deferred row in one pass, no bank switch: rows[i] of banks[i], followed by next[i]. */
-    bool (*absorb_banked)(struct pulsar_session *s, const uint32_t *rows, const uint32_t *banks,
+    bool (*absorb_banked)(struct pulsar_session *s, const uint32_t *rows, const BankId *banks,
                           const TokId *next, uint32_t n);
     /** Draft the installed bank's next chain after `next_base`: up to the session's depth, cut by the stop
      *  rule, each draft with a confidence (or -1), sampled drafts (temperature > 0) drawn from the
@@ -120,7 +120,7 @@ typedef struct pulsar_drafter_ops {
     void (*harvest)(struct pulsar_session *s);
     /** N banks' drafts in one pass, no bank switch, each result into rounds[i]->redraft; byte-exact with
      *  `draft` for each bank.  0, or -1 with `err` on a device failure. */
-    int (*draft_batch)(struct pulsar_session *s, struct pulsar_spec_round **rounds, const uint32_t *banks,
+    int (*draft_batch)(struct pulsar_session *s, struct pulsar_spec_round **rounds, const BankId *banks,
                        uint64_t **rngs, int n, char *err, size_t errlen);
     /** Optional (L306).  The drafter's own graph catalog at the startup warmup: run every shape its captured draft
      *  pass takes live (bank counts x attention bounds) twice on the installed bank, writing no state, inside the

@@ -1919,7 +1919,7 @@ typedef struct {
 /// @param hist      the sequence the rows continue (may be NULL)
 /// @param hist_len  entries in `hist`
 /// @return true (also with no Engram), false = refused, reason printed.
-bool gpu_graph_engram_stage(pulsar_gpu_graph *g, const TokId *tok, const int32_t *pos, const int32_t *bank,
+bool gpu_graph_engram_stage(pulsar_gpu_graph *g, const TokId *tok, const int32_t *pos, const BankId *bank,
                             uint32_t n, const TokId *hist, uint32_t hist_len);
 /** The Engram layer's op at the top of block `layer` (before the drafter anchor
  * capture, as the reference): wait its gather, rows -> MX slot -> `wkv` -> gate
@@ -2989,7 +2989,7 @@ int pulsar_session_verify_profile(pulsar_session *s, uint32_t rows_max, double *
 /// @param errlen  its size
 /// @return 0, or -1 with `err` on a device failure.
 int pulsar_session_spec_redraft_batch_local(pulsar_session *s, pulsar_spec_round **rounds,
-                                            const uint32_t *banks, uint64_t **rngs, int n,
+                                            const BankId *banks, uint64_t **rngs, int n,
                                             char *err, size_t errlen);
 /// Stamp the installed bank's shadow with its round's batched redraft (pulsar_session_spec_redraft_commit).
 /// @param s  the session
@@ -3069,7 +3069,7 @@ struct pulsar_session {
         bool active;                                     ///< a seed is deferred
         uint32_t n;                                      ///< rows
         uint32_t src_row[PULSAR_SPEC_LOGITS_ROWS + 1];   ///< each row's source row
-        uint32_t bank[PULSAR_SPEC_LOGITS_ROWS + 1];      ///< each row's bank
+        BankId bank[PULSAR_SPEC_LOGITS_ROWS + 1];        ///< each row's bank
         TokId next_tok[PULSAR_SPEC_LOGITS_ROWS + 1];     ///< the token after each row (a drafter that pairs rows with their successor, L272 P1)
     } seed_defer;                                        ///< the drafter seed deferred to the next launch
     pulsar_gpu_graph *graph;  ///< L272 P6: the DeepSeek family's device state (KV, scratch, bank views), owned by its create / destroy; NULL on any other family
@@ -5697,7 +5697,7 @@ int gpu_graph_decode_multiseq_batch(
         const pulsar_weights     *weights,
         const TokId           *tokens,
         const int32_t         *pos,
-        const int32_t         *bank,
+        const BankId          *bank,
         uint32_t               n_active,
         float                 *logits,
         uint32_t              *out_n_rows,
@@ -5854,7 +5854,7 @@ bool gpu_graph_dspark_seed_rows_banked(
         const pulsar_model         *dspark_model,
         const pulsar_dspark_weights *w,
         const uint32_t            *src_rows,
-        const uint32_t            *row_bank,
+        const BankId              *row_bank,
         uint32_t                 n_rows);
 bool gpu_graph_dspark_draft_forward(
         pulsar_gpu_graph          *g,

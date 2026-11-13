@@ -293,7 +293,7 @@ bool gpu_graph_dspark_seed_rows_banked(
         const pulsar_model         *dspark_model,
         const pulsar_dspark_weights *w,
         const uint32_t            *src_rows,
-        const uint32_t            *row_bank,
+        const BankId              *row_bank,
         uint32_t                 n_rows) {
     PULSAR_NVTX("drafter seed (banked)");
     if (n_rows == 0) return true;
@@ -320,7 +320,7 @@ bool gpu_graph_dspark_seed_rows_banked(
         int32_t meta[7 * PULSAR_DSPARK_DRAFT_ROWS_MAX] = {0};
         uint32_t chunk_added[PULSAR_MSEQ_MAX] = {0};
         for (uint32_t t = 0; t < m; t++) {
-            const uint32_t b = row_bank[c0 + t];
+            const uint32_t b = (uint32_t)row_bank[c0 + t].raw();   /* refused below when outside the pool */
             if (b >= g->banks.n_banks) return false;
             const uint32_t k = added[b] + chunk_added[b]++;
             for (uint32_t li = 0; li < 3; li++)

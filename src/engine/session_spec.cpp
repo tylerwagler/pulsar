@@ -232,7 +232,8 @@ static void spec_round_undo(pulsar_session *s, pulsar_spec_round *r) {
 static bool spec_absorb_defer(pulsar_session *s, uint32_t row, TokId next) {
     if (s->seed_defer.n >= PULSAR_SPEC_LOGITS_ROWS + 1) return false;
     s->seed_defer.src_row[s->seed_defer.n] = row;
-    s->seed_defer.bank[s->seed_defer.n] = pulsar_bank_index(pulsar_session_live_bank(s));
+    /* fatal on none() */
+    s->seed_defer.bank[s->seed_defer.n] = BankId{pulsar_bank_index(pulsar_session_live_bank(s))};
     s->seed_defer.next_tok[s->seed_defer.n] = next;
     s->seed_defer.n++;
     return true;
@@ -256,8 +257,9 @@ static bool spec_absorb_rows(pulsar_session *s, uint32_t row0, const TokId *next
         for (uint32_t m = 0; ok && m < n; m++) ok = spec_drafter(s)->absorb(s, row0 + m, next[m].raw());
         return ok;
     }
-    uint32_t rows[PULSAR_SPEC_LOGITS_ROWS + 1], banks[PULSAR_SPEC_LOGITS_ROWS + 1];
-    const uint32_t bank = pulsar_bank_index(pulsar_session_live_bank(s));   /* the drafter's banks[] are raw */
+    uint32_t rows[PULSAR_SPEC_LOGITS_ROWS + 1];
+    BankId banks[PULSAR_SPEC_LOGITS_ROWS + 1];
+    const BankId bank = BankId{pulsar_bank_index(pulsar_session_live_bank(s))};   /* fatal on none() */
     for (uint32_t m = 0; m < n; m++) { rows[m] = row0 + m; banks[m] = bank; }
     return spec_drafter(s)->absorb_banked(s, rows, banks, next, n);
 }
@@ -1423,7 +1425,7 @@ int pulsar_session_spec_round_end_forced(pulsar_session *s, pulsar_spec_round *r
 
 /* L150: every live round drafts in ONE drafter pass over all the banks, no bank switch. */
 int pulsar_session_spec_redraft_batch_local(pulsar_session *s, pulsar_spec_round **rounds,
-                                      const uint32_t *banks, uint64_t **rngs, int n,
+                                      const BankId *banks, uint64_t **rngs, int n,
                                       char *err, size_t errlen) {
     if (!rounds || !banks || !rngs || n <= 0) return 0;
     if (spec_no_drafter(s, "redraft batch", err, errlen)) return -1;
@@ -1566,7 +1568,7 @@ void pulsar_spec_absorb_deferred(pulsar_session *s, pulsar_spec_step *steps, int
         for (int i = 0; i < n; i++) {
             pulsar_spec_step *st = &steps[i];
             bool had = false;
-            for (uint32_t k = 0; k < s->seed_defer.n && !had; k++) had = BankId{s->seed_defer.bank[k]} == st->bank;
+            for (uint32_t k = 0; k < s->seed_defer.n && !had; k++) had = s->seed_defer.bank[k] == st->bank;
             if (!had) continue;
             pulsar_bank_view_invalidate(s, pulsar_bank_index(st->bank));
             if (st->status != PULSAR_SPEC_STEP_OK) continue;

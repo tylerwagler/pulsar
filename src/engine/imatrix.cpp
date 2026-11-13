@@ -332,7 +332,7 @@ static void dspark_bulk_dump_close(void) {
 /// @param bank [n_rows] its banks
 /// @param n_dec the decode rows ahead of the prefill runs
 /// @param n_rows the step's rows
-static void dspark_bulk_drain_runs(pulsar_gpu_graph *g, const int32_t *pos, const int32_t *bank,
+static void dspark_bulk_drain_runs(pulsar_gpu_graph *g, const int32_t *pos, const BankId *bank,
                                    uint32_t n_dec, uint32_t n_rows) {
     if (!g->dspark_bulk_h[0] || !g->banks.dspark_prompt[0] || g->banks.n_banks == 0) return;
     const uint32_t win = PULSAR_DSPARK_DRAFT_WINDOW;
@@ -341,7 +341,7 @@ static void dspark_bulk_drain_runs(pulsar_gpu_graph *g, const int32_t *pos, cons
     for (uint32_t r0 = n_dec; r0 < n_rows;) {
         uint32_t r1 = r0 + 1;
         while (r1 < n_rows && bank[r1] == bank[r0]) r1++;
-        const uint32_t b = (uint32_t)bank[r0];
+        const uint32_t b = pulsar_bank_index(bank[r0]);   /* in the pool: gpu_graph_multiseq_step_begin checked */
         const uint32_t start = (uint32_t)pos[r0], n = r1 - r0;
         const uint32_t take = n < win ? n : win;
         const uint32_t p0 = start + n - take;
@@ -952,7 +952,7 @@ int gpu_graph_decode_multiseq_batch(
         const pulsar_weights     *weights,
         const TokId           *tokens,
         const int32_t         *pos,
-        const int32_t         *bank,
+        const BankId          *bank,
         uint32_t               n_active,
         float                 *logits,
         uint32_t              *out_n_rows,
@@ -1046,7 +1046,9 @@ int gpu_graph_decode_multiseq_batch(
      * is armed, so a refusal (a history the ring does not hold) is the recoverable kind: the ring's writes are
      * position-tagged and the next step's gathers drain these. */
     if (!gpu_graph_engram_stage(g, tokens, pos, bank, n_active, NULL, 0)) return 0;
-    if (!gpu_graph_multiseq_step_begin(g, pos, bank, n_active, capture_cur, n_dec_declared)) return 0;
+    /* the graph's seq_id host mirror is int32: the named crossing */
+    if (!gpu_graph_multiseq_step_begin(g, pos, pulsar_bank_ids_raw(bank), n_active, capture_cur, n_dec_declared))
+        return 0;
     /* A fused step's prefill rows feed their banks' drafter prompt rings, as a
      * classic chunk does: arm the bulk anchor capture past the decode rows. */
     if (fused && g->dspark_bulk_h[0]) {

@@ -427,7 +427,7 @@ struct g4_state : pulsar_driver_state {
     /// Host [max_rows + 1]: each sequence's first row, then n_rows
     uint32_t *seq_first;
     /// Host [max_rows]: each sequence's bank
-    int32_t *seq_bank;
+    BankId *seq_bank;
     /// Host [max_rows]: each row's sequence (F1's)
     uint32_t *row_seq;
     /// Host [max_rows]: each row's position (F1's)
@@ -533,7 +533,7 @@ pulsar_driver_state *create(pulsar_session *s, uint32_t n_banks) {
     st->ones = pulsar_gpu_tensor_alloc((uint64_t)sh.head_dim * 2u);
     st->escale = pulsar_gpu_tensor_alloc(NL * sh.n_expert * 4u);
     st->seq_first = (uint32_t *)xmalloc((R + 1u) * sizeof(uint32_t));
-    st->seq_bank = (int32_t *)xmalloc(R * sizeof(int32_t));
+    st->seq_bank = (BankId *)xmalloc(R * sizeof(BankId));
     st->row_seq = (uint32_t *)xmalloc(R * sizeof(uint32_t));
     st->row_pos = (uint32_t *)xmalloc(R * sizeof(uint32_t));
     st->row_adapter = (uint8_t *)xcalloc(R, 1);
@@ -741,9 +741,9 @@ bool plan_call(const g4_step *st, uint32_t il, uint32_t bound, uint64_t off, uin
     if (!full && !ring) return failf("a window layer's ring is missing", il);
     for (uint32_t j = 0; j < q->n_seq; j++) {
         pulsar_gqa_seq &sq = q->seqs[j];
-        const uint32_t bank = (uint32_t)q->seq_bank[j];
+        const uint32_t bank = pulsar_bank_index(q->seq_bank[j]);   /* in the pool: the driver's forward checked */
         if (full) {
-            pulsar_gpu_tensor *pool = pulsar_state_pool(st->states, il, PULSAR_GEMMA4_STATE_KV_FULL, BankId{bank});
+            pulsar_gpu_tensor *pool = pulsar_state_pool(st->states, il, PULSAR_GEMMA4_STATE_KV_FULL, q->seq_bank[j]);
             if (!pool) return failf("a global layer's pool is evicted", il);
             sq.kv = dptr(pool);
             sq.bytes = pulsar_gpu_tensor_bytes(pool);
@@ -785,7 +785,8 @@ bool stage(const pulsar_driver_step *st0, uint64_t *graph_key) {
     /* L338 P2: the rows whose bank runs the runtime adapter (the LoRAs launch on them only) */
     q->step_adapter = false;
     for (uint32_t r = 0; r < st->n_rows; r++) {
-        q->row_adapter[r] = q->bank_adapter && q->bank_adapter[st->bank[r]] ? 1u : 0u;
+        /* in the pool: the driver's forward checked the step's banks */
+        q->row_adapter[r] = q->bank_adapter && q->bank_adapter[pulsar_bank_index(st->bank[r])] ? 1u : 0u;
         q->step_adapter |= q->row_adapter[r] != 0;
     }
     if (q->step_adapter && pulsar_gpu_tensor_write_async(q->scratch[ARENA_ROWS], rows_layout(q->max_rows).ad,

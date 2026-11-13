@@ -194,7 +194,7 @@ typedef struct pulsar_state_set {
     /// [n_runs + 1] step-row offsets of the last verify step's runs
     uint32_t run_first[PULSAR_STATE_VERIFY_ROWS + 1];
     /// [n_runs] the bank each run belongs to
-    int32_t run_bank[PULSAR_STATE_VERIFY_ROWS];
+    BankId run_bank[PULSAR_STATE_VERIFY_ROWS];
     /// [n_runs] each run's first position (tokens)
     int32_t run_pos0[PULSAR_STATE_VERIFY_ROWS];
     /* per bank */
@@ -303,7 +303,7 @@ bool pulsar_state_step_begin(pulsar_state_set *ss, bool verify);
 /// @param bank   [n_rows] the step's row banks
 /// @param n_rows the step's rows
 /// @param ok     the step completed
-void pulsar_state_step_end(pulsar_state_set *ss, const int32_t *bank, uint32_t n_rows, bool ok);
+void pulsar_state_step_end(pulsar_state_set *ss, const BankId *bank, uint32_t n_rows, bool ok);
 /** L339 apply bank `bank`'s pending DELTA rows now (the decls' commit hooks) -- before anything but a trunk step reads
  *  its state.  No-op without pending rows.  false = a commit hook refused (said). */
 /// @param ss   the set
@@ -319,7 +319,7 @@ bool pulsar_state_fold_flush(pulsar_state_set *ss, BankId bank);
 /// @param run_first [n_runs + 1] step-row offsets of the runs
 /// @param bank      per step row, the host bank id
 /// @param pos       per step row, the host position
-void pulsar_state_verify_begin(pulsar_state_set *ss, uint32_t n_runs, const uint32_t *run_first, const int32_t *bank,
+void pulsar_state_verify_begin(pulsar_state_set *ss, uint32_t n_runs, const uint32_t *run_first, const BankId *bank,
                                const int32_t *pos);
 /** Copy each verify run's STAGE blocks (its bank's open block, every trunk slot) into the capture, async on the
  *  step's stream; call after pulsar_state_verify_begin and before any op writes them.

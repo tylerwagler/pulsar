@@ -1763,7 +1763,8 @@ int pulsar_session_verify_profile(pulsar_session *s, uint32_t rows_max, double *
     if (!own) pulsar_tp_own_step_failed(tp, "verify_profile");
     return tp_mirror_bank_verdict(s, tp, "verify_profile", own ? 0 : 1, -1) == 0 ? 0 : -1;
 }
-int pulsar_session_spec_redraft_batch(pulsar_session *s, pulsar_spec_round **rounds, const uint32_t *banks, uint64_t **rngs, int n, char *err, size_t errlen) {
+int pulsar_session_spec_redraft_batch(pulsar_session *s, pulsar_spec_round **rounds, const BankId *banks,
+                                      uint64_t **rngs, int n, char *err, size_t errlen) {
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", -1);
     if (!s) return -1;
@@ -1776,7 +1777,9 @@ int pulsar_session_spec_redraft_batch(pulsar_session *s, pulsar_spec_round **rou
     for (int i = 0; i < n; i++) states[i] = rngs[i] ? *rngs[i] : 0;
     pulsar_tp_spec_command c = tp_spec_cmd(s, tp_spec_live_bank(s));
     c.count = (uint32_t)n;
-    const int sent = pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_SPEC_REDRAFT_BATCH, &c, banks, states);
+    /* the wire's bank ids are uint32 (the same bytes): the named crossing */
+    const int sent = pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_SPEC_REDRAFT_BATCH, &c,
+                                         reinterpret_cast<const uint32_t *>(pulsar_bank_ids_raw(banks)), states);
     free(states);
     if (!tp_mirror_sent(tp, "spec_redraft_batch", sent, err, errlen)) return -1;
     const int own = pulsar_session_spec_redraft_batch_local(s, rounds, banks, rngs, n, err, errlen);

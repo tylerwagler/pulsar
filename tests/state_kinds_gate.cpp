@@ -168,7 +168,8 @@ static void plan_a(void) {
 
     /* a SNAPSHOT commit: a verify of two runs (bank 0 rows [0, 3) at 40, bank 1 rows [3, 8) at 100) */
     const uint32_t run_first[3] = {0, 3, 8};
-    const int32_t bank[8] = {0, 0, 0, 1, 1, 1, 1, 1}, pos[8] = {40, 41, 42, 100, 101, 102, 103, 104};
+    const BankId bank[8] = {BankId{0}, BankId{0}, BankId{0}, BankId{1}, BankId{1}, BankId{1}, BankId{1}, BankId{1}};
+    const int32_t pos[8] = {40, 41, 42, 100, 101, 102, 103, 104};
     const TokId tok[8] = {TokId{1}, TokId{2}, TokId{3}, TokId{4}, TokId{5}, TokId{6}, TokId{7}, TokId{8}};
     pulsar_state_verify_begin(ss, 2, run_first, bank, pos);
     ok = pulsar_state_verify_capture(ss);
@@ -258,7 +259,8 @@ static void plan_b(void) {
 
     /* one verify: bank 1, rows [0, 6) at positions 9 .. 14 (the open block at 9 is [8, 12); keep 4 ends at 13) */
     const uint32_t run_first[2] = {0, 6};
-    const int32_t bank[6] = {1, 1, 1, 1, 1, 1}, pos[6] = {9, 10, 11, 12, 13, 14};
+    const BankId bank[6] = {BankId{1}, BankId{1}, BankId{1}, BankId{1}, BankId{1}, BankId{1}};
+    const int32_t pos[6] = {9, 10, 11, 12, 13, 14};
     const TokId tok[6] = {TokId{70}, TokId{71}, TokId{72}, TokId{73}, TokId{74}, TokId{75}};
     const uint64_t blk = 4 * STAGE_ROW;
     int32_t *h = (int32_t *)pulsar_state_host(ss, B_HOST, BankId{1});
@@ -300,7 +302,7 @@ static void plan_b(void) {
     check(ok && g_delta.calls == 0 && ss->fold_host[2 + 2 * 1] == 6 && h[0] == 0,
           "keep == R: DELTA still pends (the verify left the state); nothing else moves");
     /* the bank's next trunk step applies them in its own op: the step consumes them, no hook */
-    const int32_t one[1] = {1};
+    const BankId one[1] = {BankId{1}};
     ok = pulsar_state_step_begin(ss, false);
     pulsar_state_step_end(ss, one, 1, ok);
     check(ok && g_delta.calls == 0 && ss->fold_host[2 + 2 * 1] == 0, "a trunk step carrying the bank consumes its pending rows");
@@ -312,7 +314,8 @@ static void plan_b(void) {
     ok = ok && pulsar_state_commit(ss, BankId{1}, tok, 3);
     const uint32_t g1 = ss->cap_gen;
     const uint32_t rf0[2] = {0, 1};
-    const int32_t b0[1] = {0}, p0[1] = {5};
+    const BankId b0[1] = {BankId{0}};
+    const int32_t p0[1] = {5};
     pulsar_state_verify_begin(ss, 1, rf0, b0, p0);
     g_delta = {};
     ok = ok && pulsar_state_step_begin(ss, true);

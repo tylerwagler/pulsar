@@ -205,7 +205,7 @@ static int ds4_eval_row(pulsar_session *s, int token, char *err, size_t errlen) 
     pulsar_engine *e = s->engine;
     const TokId ms_tok[1] = { TokId{token} };
     int32_t ms_pos[1] = { (int32_t)s->checkpoint.len };
-    int32_t ms_bank[1] = { (int32_t)(s->graph->banks.n_banks ? s->graph->banks.cur_bank : 0u) };
+    const BankId ms_bank[1] = { gpu_graph_cur_bank(s->graph) };
     /* rc: 0 = recoverable pre-arm reject, 1 = success, else fatal mid-sweep */
     if (gpu_graph_decode_multiseq_batch(s->graph, &e->model, &e->weights, ms_tok, ms_pos, ms_bank, 1u, NULL,
                                         NULL, 0u, /*capture_cur=*/true, NULL) == 1 &&

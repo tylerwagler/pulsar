@@ -223,7 +223,7 @@ int GATE_ENTRY(int argc, char **argv) {
              * does.  The probe measures the drafter, not the controller. */
             spec_quench_reset(s);
             pulsar_session_bank_state_save(s, BankId{bank0});
-            pulsar_spec_round *rr = r; uint32_t bb = bank0;
+            pulsar_spec_round *rr = r; const BankId bb{bank0};
             if (pulsar_session_spec_redraft_batch(s, &rr, &bb, &rngp, 1, err, sizeof err) != 0) {
                 fprintf(stderr, "redraft at %d: %s\n", pos, err); goto done;
             }

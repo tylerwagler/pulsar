@@ -133,8 +133,9 @@ static void run(pulsar_engine *e, int NB, float temp, int rounds_max, bool repor
         if (!ok) break;
         pulsar_spec_round *rr[32];
         uint64_t *rp[32];
-        for (int i = 0; i < m; i++) { rr[i] = rd[bank_of[i]]; rp[i] = &rngs[bank_of[i]]; }
-        ok = pulsar_session_spec_redraft_batch(s, rr, bank_of, rp, m, err, sizeof(err)) == 0 &&
+        BankId rb[32];
+        for (int i = 0; i < m; i++) { rr[i] = rd[bank_of[i]]; rp[i] = &rngs[bank_of[i]]; rb[i] = BankId{bank_of[i]}; }
+        ok = pulsar_session_spec_redraft_batch(s, rr, rb, rp, m, err, sizeof(err)) == 0 &&
              pulsar_session_spec_redraft_commit_batch(s, st, m) == 0;
         pulsar_gpu_sync_stats_get(&c4);
         if (tick < 2) continue;   /* the first rounds warm the lane (graph captures, prime) */
