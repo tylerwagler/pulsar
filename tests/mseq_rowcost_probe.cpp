@@ -176,7 +176,7 @@ int main(int argc, char **argv) {
                     uint32_t w = 0;
                     for (int k = 0; k < B; k++) {
                         for (int j = 0; j < R; j++) {
-                            reqs[w].bank = (uint32_t)k;
+                            reqs[w].bank = BankId{k};
                             reqs[w].pos = TokPos{depth + it * R + j};
                             reqs[w].token = TokId{feed_tok[k]};
                             w++;

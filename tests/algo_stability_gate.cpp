@@ -82,7 +82,7 @@ static bool bank0_logits_at_width(int M, float *row0_out) {
     if (ok) {
         pulsar_multiseq_req reqs[GATE_MAX_N];
         for (int k = 0; k < M; k++) {
-            reqs[k].bank = (uint32_t)k;
+            reqs[k].bank = BankId{k};
             reqs[k].pos = TokPos{g_prompt_len[k]};      /* bank 0 ALWAYS at the same pos */
             reqs[k].token = TokId{argtok[k]};
         }

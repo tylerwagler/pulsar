@@ -384,7 +384,7 @@ static void worker_segment_reconcile(pulsar_engine *e, const char *keys, uint32_
  *  @param rows receives [c->n_items] requests */
 static void worker_rows(const pulsar_tp_command *c, pulsar_multiseq_req *rows) {
     for (uint32_t i = 0; i < c->n_items; i++) {
-        rows[i].bank  = (uint32_t)c->items[i].bank;
+        rows[i].bank  = BankId{c->items[i].bank};
         rows[i].pos   = TokPos{c->items[i].pos};   /* the wire's int32 */
         rows[i].token = TokId{c->items[i].token};
     }
@@ -770,7 +770,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
                 const pulsar_tp_spec_command *r = &c->spec_steps[i];
                 pulsar_spec_step *st = &steps[i];
                 memset(st, 0, sizeof(*st));
-                st->bank = (uint32_t)r->bank;
+                st->bank = BankId{r->bank};
                 st->round = worker_round(slot, r->bank);
                 st->temperature = r->temperature; st->top_k = r->top_k;
                 st->top_p = r->top_p; st->min_p = r->min_p;
@@ -810,7 +810,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             }
             for (int i = 0; i < n; i++)
                 if (steps[i].status == PULSAR_SPEC_STEP_FAILED || steps[i].status == PULSAR_SPEC_STEP_RESTORE_FAILED)
-                    fprintf(stderr, "pulsar: tp worker: %s bank %u: status %d %s\n", op, steps[i].bank,
+                    fprintf(stderr, "pulsar: tp worker: %s bank %d: status %d %s\n", op, steps[i].bank.raw(),
                             steps[i].status, steps[i].err);
         } else fprintf(stderr, "pulsar: tp worker: %s refused: %s\n", op, ferr);
         return worker_ack(e, c->session_id, status, err, errlen);

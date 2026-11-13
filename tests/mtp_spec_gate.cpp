@@ -237,8 +237,8 @@ static void batched_lane(pulsar_engine *e, const std::vector<pulsar_tokens> &P, 
     char err[256] = "";
     bool ok = pulsar_session_create(&s, e, 4096) == 0 && s;
     for (int b = 0; ok && b < NB; b++) {
-        ok = pulsar_session_bank_state_restore(s, (uint32_t)b) && pulsar_session_sync(s, &P[b], err, sizeof(err)) == 0;
-        if (ok) pulsar_session_bank_state_save(s, (uint32_t)b);
+        ok = pulsar_session_bank_state_restore(s, BankId{b}) && pulsar_session_sync(s, &P[b], err, sizeof(err)) == 0;
+        if (ok) pulsar_session_bank_state_save(s, BankId{b});
     }
     CHECK(ok, "%s four banks prefilled: %s", tag, err);
     std::vector<std::vector<int32_t>> got(NB);
@@ -258,15 +258,15 @@ static void batched_lane(pulsar_engine *e, const std::vector<pulsar_tokens> &P, 
         for (int b = 0; b < NB; b++) {
             if (done[b]) continue;
             /* the yield quench disarmed, as in run() */
-            ok = pulsar_session_bank_state_restore(s, (uint32_t)b);
+            ok = pulsar_session_bank_state_restore(s, BankId{b});
             s->spec.spec_quenched = false;
             s->spec.spec_quench_steps = 0;
             s->spec.spec_quench_debt = 0.0f;
             s->spec.spec_quench_ewma = 0.0f;
-            pulsar_session_bank_state_save(s, (uint32_t)b);
+            pulsar_session_bank_state_save(s, BankId{b});
             if (!ok) break;
             memset(&st[m], 0, sizeof st[m]);
-            st[m].bank = (uint32_t)b;
+            st[m].bank = BankId{b};
             st[m].round = rd[b];
             st[m].temperature = pos_greedy(greedy_run, got[b].size()) ? 0.0f : temp;   /* the base's position */
             st[m].top_p = 1.0f;
@@ -292,7 +292,8 @@ static void batched_lane(pulsar_engine *e, const std::vector<pulsar_tokens> &P, 
                 bank_of[live++] = bank_of[i];
             } else if (st[i].status != PULSAR_SPEC_STEP_SKIPPED) {
                 ok = false;
-                snprintf(err, sizeof err, "assemble bank %u: status %d %s", st[i].bank, (int)st[i].status, st[i].err);
+                snprintf(err, sizeof err, "assemble bank %d: status %d %s", st[i].bank.raw(), (int)st[i].status,
+                         st[i].err);
             }
         }
         if (!ok) break;
@@ -320,7 +321,7 @@ static void batched_lane(pulsar_engine *e, const std::vector<pulsar_tokens> &P, 
         ok = pulsar_session_spec_round_end_batch(s, st, m) == 0;
         for (int i = 0; ok && i < m; i++) {
             ok = st[i].status == PULSAR_SPEC_STEP_OK;
-            if (!ok) { snprintf(err, sizeof err, "round_end bank %u: %s", st[i].bank, st[i].err); break; }
+            if (!ok) { snprintf(err, sizeof err, "round_end bank %d: %s", st[i].bank.raw(), st[i].err); break; }
             const uint32_t b = bank_of[i];
             for (int k = 0; k < st[i].n_accepted; k++) got[b].push_back(acc[i][k]);
             if ((int)got[b].size() >= n ||

@@ -235,14 +235,15 @@ static void exact(pulsar_engine *e, const std::vector<int32_t> &ids, int W) {
             for (int b = 0; b < 4; b++) {
                 pulsar_tokens P = b % 2 ? toks(ids, lb0, lb0 + lb) : toks(ids, 0, la);
                 pos[b] = P.len;
-                CHECK(pulsar_session_bank_state_restore(s, (uint32_t)b) && pulsar_session_sync(s, &P, err, sizeof(err)) == 0,
+                CHECK(pulsar_session_bank_state_restore(s, BankId{b}) &&
+                          pulsar_session_sync(s, &P, err, sizeof(err)) == 0,
                       "X2 bank %d prefills %d tokens: %s", b, P.len, err);
-                pulsar_session_bank_state_save(s, (uint32_t)b);
+                pulsar_session_bank_state_save(s, BankId{b});
                 pulsar_tokens_free(&P);
             }
             for (int step = 0; step < 2; step++) {
                 pulsar_multiseq_req rows[4];
-                for (int b = 0; b < 4; b++) rows[b] = {(uint32_t)b, TokPos{pos[b] + step}, TokId{next[(b + step) % 4]}};
+                for (int b = 0; b < 4; b++) rows[b] = {BankId{b}, TokPos{pos[b] + step}, TokId{next[(b + step) % 4]}};
                 std::vector<float> out((size_t)4 * W);
                 err[0] = '\0';
                 const int rc = pulsar_session_decode_multiseq(s, rows, 4, out.data(), 4 * W, err, sizeof(err));
@@ -386,11 +387,13 @@ static void exact(pulsar_engine *e, const std::vector<int32_t> &ids, int W) {
         s = NULL;
         if (pulsar_session_create(&s, e, ctx) == 0 && s) {
             pulsar_tokens A = toks(ids, 0, 500), B = toks(ids, 600, 900);
-            bool ok = pulsar_session_bank_state_restore(s, 0) && pulsar_session_sync(s, &A, err, sizeof(err)) == 0;
-            pulsar_session_bank_state_save(s, 0);
-            ok = ok && pulsar_session_bank_state_restore(s, 1) && pulsar_session_sync(s, &B, err, sizeof(err)) == 0;
-            pulsar_session_bank_state_save(s, 1);
-            ok = ok && pulsar_session_bank_state_restore(s, 0) &&
+            bool ok = pulsar_session_bank_state_restore(s, BankId{0}) &&
+                pulsar_session_sync(s, &A, err, sizeof(err)) == 0;
+            pulsar_session_bank_state_save(s, BankId{0});
+            ok = ok && pulsar_session_bank_state_restore(s, BankId{1}) &&
+                pulsar_session_sync(s, &B, err, sizeof(err)) == 0;
+            pulsar_session_bank_state_save(s, BankId{1});
+            ok = ok && pulsar_session_bank_state_restore(s, BankId{0}) &&
                  pulsar_session_eval(s, TokId{ta}, err, sizeof(err)) == 0;
             double d = 0;
             CHECK(ok && same(logits_of(s, W), ref, &d), "X6 bank 0 after bank 1's prefill == one-bank A + token (max "
@@ -414,8 +417,8 @@ static bool decode_run(pulsar_engine *e, const std::vector<int32_t> &ids, int ba
     std::vector<int> pos((size_t)banks), next((size_t)banks);
     for (int b = 0; ok && b < banks; b++) {
         pulsar_tokens P = toks(ids, (size_t)b * 37u, (size_t)b * 37u + (size_t)prompt);
-        ok = (banks == 1 || pulsar_session_bank_state_restore(s, (uint32_t)b)) && pulsar_session_sync(s, &P, err, sizeof(err)) == 0;
-        if (ok && banks > 1) pulsar_session_bank_state_save(s, (uint32_t)b);
+        ok = (banks == 1 || pulsar_session_bank_state_restore(s, BankId{b})) && pulsar_session_sync(s, &P, err, sizeof(err)) == 0;
+        if (ok && banks > 1) pulsar_session_bank_state_save(s, BankId{b});
         pos[(size_t)b] = P.len;
         next[(size_t)b] = ok ? argmax(logits_of(s, W)) : 0;
         pulsar_tokens_free(&P);
@@ -426,7 +429,7 @@ static bool decode_run(pulsar_engine *e, const std::vector<int32_t> &ids, int ba
         if (step == warm) { (void)pulsar_gpu_synchronize(); t0 = gate_now_s(); }
         std::vector<pulsar_multiseq_req> rows((size_t)banks);
         for (int b = 0; b < banks; b++)
-            rows[(size_t)b] = {(uint32_t)b, TokPos{pos[(size_t)b] + step}, TokId{next[(size_t)b]}};
+            rows[(size_t)b] = {BankId{b}, TokPos{pos[(size_t)b] + step}, TokId{next[(size_t)b]}};
         ok = pulsar_session_decode_multiseq(s, rows.data(), (uint32_t)banks, lg.data(), banks * W, err, sizeof(err)) == 0;
         /* the next token in place (a per-row copy is a fresh 512 KiB allocation a step: page faults the timing
          * would charge to the engine); the rows kept only when the caller compares them */

@@ -446,7 +446,8 @@ void pulsar_session_set_endpoint_waive(pulsar_session *s, bool waive) {
     s->endpoint_plan = PULSAR_ENDPOINT_NONE;
 }
 pulsar_endpoint_plan pulsar_session_endpoint_plan(const pulsar_session *s) { return s ? s->endpoint_plan : PULSAR_ENDPOINT_NONE; }
-uint32_t pulsar_session_prompt_read_ahead(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt, int run_end) {
+uint32_t pulsar_session_prompt_read_ahead(pulsar_session *s, BankId bank_id, const pulsar_tokens *prompt, int run_end) {
+    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */
     return run_end >= 0 ? pulsar_session_read_ahead(s, bank, prompt, (uint32_t)run_end) : 0u;
 }
 bool pulsar_engine_read_ahead_stats(pulsar_engine *e, pulsar_read_ahead_stats *out) {
@@ -467,8 +468,10 @@ KvBytes pulsar_session_touched_kv_bytes(const pulsar_session *s) {
     for (int b = 0, n = ops->count(ms); b < n; b++) bytes += ops->touched_kv_bytes(ms, (uint32_t)b);
     return bytes;
 }
-bool pulsar_session_bank_is_evicted(const pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank residency", false); return s ? session_banks(s)->is_evicted(s, bank) : false; }
-KvBytes pulsar_session_bank_touched_kv_bytes(pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "the touched-KV count", KvBytes{}); return s ? session_banks(s)->touched_kv_bytes(s, bank) : KvBytes{}; }
+bool pulsar_session_bank_is_evicted(const pulsar_session *s, BankId bank_id) {
+    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */ PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank residency", false); return s ? session_banks(s)->is_evicted(s, bank) : false; }
+KvBytes pulsar_session_bank_touched_kv_bytes(pulsar_session *s, BankId bank_id) {
+    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */ PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "the touched-KV count", KvBytes{}); return s ? session_banks(s)->touched_kv_bytes(s, bank) : KvBytes{}; }
 KvBytes pulsar_session_quantum_growth_bytes_per_bank(pulsar_session *s, KvRows q) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "the bank growth price", KvBytes{}); return session_banks(s)->growth_bytes(s, q); }
 /* The bank wrappers are defined with the mirror below (increment 2). */
 
@@ -792,7 +795,7 @@ static pulsar_tp_batch_item *tp_mirror_rows(const pulsar_session *s, const pulsa
     pulsar_tp_batch_item *items = (pulsar_tp_batch_item *)xmalloc((size_t)n * sizeof(*items));
     for (uint32_t i = 0; i < n; i++) {
         items[i].session_id = s->tp_session_id;
-        items[i].bank       = (int32_t)reqs[i].bank;
+        items[i].bank       = reqs[i].bank.raw();   /* the wire's int32 */
         items[i].pos        = reqs[i].pos.raw();   /* the wire's int32 */
         items[i].token      = reqs[i].token.raw();   /* the wire's int32 */
         items[i].reserved   = 0;
@@ -1041,7 +1044,8 @@ TokId pulsar_session_draw(pulsar_session *s, const pulsar_row_draw *d) {
 int pulsar_session_draw_rows(pulsar_session *s, const uint32_t *rows, const pulsar_row_draw *d, uint32_t n, int *tokens) {
     return s && rows && d && tokens && n ? s->draw_step_rows(rows, d, n, tokens) : 1;
 }
-int pulsar_session_step_row_to_bank(pulsar_session *s, uint32_t row, uint32_t bank) {
+int pulsar_session_step_row_to_bank(pulsar_session *s, uint32_t row, BankId bank_id) {
+    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */
     return s && s->step_row_to_bank(row, bank) ? 0 : 1;
 }
 int pulsar_session_step_row_logprobs(pulsar_session *s, uint32_t row, TokId token, pulsar_token_score *chosen,
@@ -1256,7 +1260,8 @@ uint32_t pulsar_engine_decision_head(pulsar_engine *e, const float **w, const fl
     return slots;
 }
 
-bool pulsar_session_set_bank_adapter(pulsar_session *s, uint32_t bank, bool on) {
+bool pulsar_session_set_bank_adapter(pulsar_session *s, BankId bank_id, bool on) {
+    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */
     pulsar_driver_state *d = s ? s->driver : NULL;
     const int n = s && s->states ? (int)s->states->n_banks : 0;
     if (!d || !d->bank_adapter || (int)bank >= n) {
@@ -1276,7 +1281,8 @@ bool pulsar_session_set_bank_adapter(pulsar_session *s, uint32_t bank, bool on) 
     return true;
 }
 
-bool pulsar_session_bank_adapter(const pulsar_session *s, uint32_t bank) {
+bool pulsar_session_bank_adapter(const pulsar_session *s, BankId bank_id) {
+    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */
     const pulsar_driver_state *d = s ? s->driver : NULL;
     return d && d->bank_adapter && s->states && bank < s->states->n_banks && d->bank_adapter[bank];
 }
@@ -1340,12 +1346,13 @@ static int tp_mirror_bank_verdict_logits(pulsar_session *s, pulsar_tp *tp, const
     }
     return own;
 }
-int pulsar_session_bank_repoint(pulsar_session *s, uint32_t bank) {
+int pulsar_session_bank_repoint(pulsar_session *s, BankId bank_id) {
+    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank repoint", 1);
     if (!s) return 1;
     const pulsar_family_bank_ops *ops = session_banks(s);
-    if (!ops->repoint) return pulsar_session_bank_state_restore(s, bank) ? 0 : 1;   /* its repoint is a restore */
+    if (!ops->repoint) return pulsar_session_bank_state_restore(s, bank_id) ? 0 : 1;   /* its repoint is a restore */
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) return ops->repoint(s, bank);
     char err[256];
@@ -1358,7 +1365,8 @@ int pulsar_session_bank_repoint(pulsar_session *s, uint32_t bank) {
                         NULL, 0)) return 1;
     return tp_mirror_bank_verdict(s, tp, "bank repoint", ops->repoint(s, bank), 1);
 }
-void pulsar_session_bank_state_save(pulsar_session *s, uint32_t bank) {
+void pulsar_session_bank_state_save(pulsar_session *s, BankId bank_id) {
+    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank state save", (void)0);
     if (!s) return;
@@ -1376,7 +1384,8 @@ void pulsar_session_bank_state_save(pulsar_session *s, uint32_t bank) {
                         pulsar_tp_send_bank_state_save(tp, s->tp_session_id, bank), NULL, 0)) return;
     local();
 }
-bool pulsar_session_bank_state_restore(pulsar_session *s, uint32_t bank) {
+bool pulsar_session_bank_state_restore(pulsar_session *s, BankId bank_id) {
+    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank state restore", false);
     if (!s) return false;
@@ -1419,12 +1428,14 @@ static bool tp_mirror_bank_physical(pulsar_session *s, int freeing, uint32_t ban
     const int own = (freeing ? ops->free_physical(s, bank) : ops->alloc_physical(s, bank)) ? 0 : 1;
     return tp_mirror_bank_verdict(s, tp, operation, own, 1) == 0;
 }
-bool pulsar_session_bank_free_physical(pulsar_session *s, uint32_t bank) {
+bool pulsar_session_bank_free_physical(pulsar_session *s, BankId bank_id) {
+    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank residency", false);
     return s ? tp_mirror_bank_physical(s, 1, bank) : false;
 }
-bool pulsar_session_bank_alloc_physical(pulsar_session *s, uint32_t bank) {
+bool pulsar_session_bank_alloc_physical(pulsar_session *s, BankId bank_id) {
+    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank residency", false);
     return s ? tp_mirror_bank_physical(s, 0, bank) : false;
@@ -1438,7 +1449,8 @@ TokPos pulsar_bank_pos_of(uint32_t bank, uint32_t n_banks, const pulsar_tokens *
     }
     return history ? TokPos{history->len} : TokPos::none();
 }
-TokPos pulsar_session_bank_pos(pulsar_session *s, uint32_t bank) {
+TokPos pulsar_session_bank_pos(pulsar_session *s, BankId bank_id) {
+    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "per-bank state", TokPos::none());
     if (!s) return TokPos::none();
     return pulsar_bank_pos_of(bank, (uint32_t)session_banks(s)->count(s), pulsar_bank_history(s, bank));
@@ -1497,7 +1509,7 @@ bool pulsar_session_bank_continues(pulsar_session *s, uint32_t bank, TokCount le
     if (!st || !st->ops || len.raw() < 0) return false;
     return bank_prefill_frontier_as(s, bank, view) >= TokPos::after(len) &&
            (st->ops->split_invariant || (uint32_t)len.raw() % st->ops->resume_grid == 0u) &&
-           !pulsar_session_bank_comp_stale(s, bank);
+           !pulsar_session_bank_comp_stale(s, BankId{bank});
 }
 uint32_t pulsar_session_resume_grid(const pulsar_session *s) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(const_cast<pulsar_session *>(s));
@@ -1511,21 +1523,26 @@ bool pulsar_session_split_invariant(const pulsar_session *s) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(const_cast<pulsar_session *>(s));
     return st && st->ops && st->ops->split_invariant;
 }
-TokPos pulsar_session_bank_prefill_frontier(pulsar_session *s, uint32_t bank) {
+TokPos pulsar_session_bank_prefill_frontier(pulsar_session *s, BankId bank_id) {
+    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */
     return bank_prefill_frontier_as(s, bank, PULSAR_BANK_VIEW_CURRENT); }
-TokPos pulsar_session_bank_prompt_end(pulsar_session *s, uint32_t bank) {
+TokPos pulsar_session_bank_prompt_end(pulsar_session *s, BankId bank_id) {
+    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */
     const pulsar_ckpt_store *st = s ? pulsar_session_kv_store(s) : NULL;
     return st && st->ops ? pulsar_ckpt_end(st, bank) : TokPos::none();   /* none(): no prompt end (L334 hazard c) */
 }
-int pulsar_session_bank_spec_depth(pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", 0); return pulsar_spec_bank_depth(s, bank); }
-bool pulsar_session_bank_comp_stale(pulsar_session *s, uint32_t bank) {
+int pulsar_session_bank_spec_depth(pulsar_session *s, BankId bank_id) {
+    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */ PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", 0); return pulsar_spec_bank_depth(s, bank); }
+bool pulsar_session_bank_comp_stale(pulsar_session *s, BankId bank_id) {
+    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */
     const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
     return st && st->ops && st->ops->stale(st->state, bank);
 }
-const pulsar_tokens *pulsar_session_bank_tokens(pulsar_session *s, uint32_t bank) {
-    return pulsar_session_bank_tokens_as(s, bank, PULSAR_BANK_VIEW_CURRENT);
+const pulsar_tokens *pulsar_session_bank_tokens(pulsar_session *s, BankId bank_id) {
+    return pulsar_session_bank_tokens_as(s, bank_id, PULSAR_BANK_VIEW_CURRENT);
 }
-const pulsar_tokens *pulsar_session_bank_tokens_as(pulsar_session *s, uint32_t bank, pulsar_bank_view view) {
+const pulsar_tokens *pulsar_session_bank_tokens_as(pulsar_session *s, BankId bank_id, pulsar_bank_view view) {
+    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "per-bank state", NULL);
     return pulsar_bank_history_as(s, bank, view);
 }
@@ -1810,7 +1827,7 @@ static int tp_spec_steps_mirror(pulsar_session *s, pulsar_tp *tp, uint32_t frame
     for (int i = 0; i < n; i++) {
         const pulsar_spec_step *st = &steps[i];
         pulsar_tp_spec_command *r = &recs[i];
-        *r = tp_spec_cmd(s, (int)st->bank);
+        *r = tp_spec_cmd(s, st->bank.raw());
         r->temperature = st->temperature; r->top_k = st->top_k;
         r->top_p = st->top_p; r->min_p = st->min_p;
         r->rng = st->rng ? *st->rng : 0;
@@ -2012,13 +2029,14 @@ TokPos pulsar_session_checkpoint_best(pulsar_session *s, TokPos limit) {
     const TokPos best = st && st->ops ? pulsar_ckpt_best(st, pulsar_session_live_bank(s), limit) : TokPos::none();
     return best.is_none() ? TokPos{0} : best;   /* 0: resume from the start (the contract above), not none() */
 }
-pulsar_bank_resume pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt,
+pulsar_bank_resume pulsar_session_bank_resume_at(pulsar_session *s, BankId bank_id, const pulsar_tokens *prompt,
                                                  const pulsar_image_ref *images, int n_images) {
-    return pulsar_session_bank_resume_at_as(s, bank, PULSAR_BANK_VIEW_CURRENT, prompt, images, n_images);
+    return pulsar_session_bank_resume_at_as(s, bank_id, PULSAR_BANK_VIEW_CURRENT, prompt, images, n_images);
 }
-pulsar_bank_resume pulsar_session_bank_resume_at_as(pulsar_session *s, uint32_t bank, pulsar_bank_view view,
+pulsar_bank_resume pulsar_session_bank_resume_at_as(pulsar_session *s, BankId bank_id, pulsar_bank_view view,
                                                     const pulsar_tokens *prompt, const pulsar_image_ref *images,
                                                     int n_images) {
+    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */
     const pulsar_bank_resume none = {TokPos{0}, PromptToks{0}, PULSAR_RESUME_WHY_NONE};
     if (!s || !prompt || prompt->len <= 0) return none;
     const pulsar_tokens *t = pulsar_bank_history_as(s, bank, view);
@@ -2118,30 +2136,34 @@ static TokPos bank_adopt_point(pulsar_session *s, uint32_t src, const pulsar_tok
     return T;
 }
 
-pulsar_bank_resume pulsar_session_bank_adopt_score(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt) {
+pulsar_bank_resume pulsar_session_bank_adopt_score(pulsar_session *s, BankId src_id, const pulsar_tokens *prompt) {
+    const uint32_t src = (uint32_t)src_id.raw();   /* L334 P4: raw inside (typed at the API) */
     const pulsar_bank_resume none = {TokPos{0}, PromptToks{0}, PULSAR_RESUME_WHY_NONE};
     if (!s || !prompt || src >= (uint32_t)pulsar_session_bank_count(s) || src == pulsar_session_live_bank(s))
         return none;
     /* a pair does not mirror the adopt (pulsar_session_bank_adopt refuses it) */
     if (tp_mirror_target(s)) return none;
     /* L375 O46: nor does a bank adopt across the runtime adapter (pulsar_ckpt_adopt refuses it) */
-    if (pulsar_session_bank_adapter(s, src) != pulsar_session_bank_adapter(s, pulsar_session_live_bank(s))) return none;
+    if (pulsar_session_bank_adapter(s, src_id) != pulsar_session_bank_adapter(s, BankId{pulsar_session_live_bank(s)}))
+        return none;
     const pulsar_ckpt_record *r = NULL;
     TokCount len{0};
     const TokPos T = bank_adopt_point(s, src, prompt, &r, &len);
     /* L334: T is on src's history; the depth an adopt is ranked by is what src's tokens to T hold of the request */
-    return {T, pulsar_session_bank_prompt_held(s, src, prompt, T), PULSAR_RESUME_WHY_NONE};
+    return {T, pulsar_session_bank_prompt_held(s, src_id, prompt, T), PULSAR_RESUME_WHY_NONE};
 }
 
-PromptToks pulsar_session_bank_prompt_held(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt, TokPos at) {
+PromptToks pulsar_session_bank_prompt_held(pulsar_session *s, BankId bank_id, const pulsar_tokens *prompt, TokPos at) {
+    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */
     if (!s || !prompt || at.is_none() || at <= TokPos{0}) return PromptToks{0};
     const pulsar_tokens *h = pulsar_bank_history(s, bank);
     if (!h || at > TokPos{h->len}) return PromptToks{0};
     return pulsar_tokens_prompt_held_with(pulsar_engine_token_text_fn, s->engine, h->v, at, prompt->v, prompt->len);
 }
 
-pulsar_bank_adopt_result pulsar_session_bank_adopt(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt,
+pulsar_bank_adopt_result pulsar_session_bank_adopt(pulsar_session *s, BankId src_id, const pulsar_tokens *prompt,
                                                    char *err, size_t errlen) {
+    const uint32_t src = (uint32_t)src_id.raw();   /* L334 P4: raw inside (typed at the API) */
     PULSAR_NVTX_FN();
     const pulsar_bank_adopt_result refused = {PULSAR_ADOPT_REFUSED, TokPos::none()};
     const pulsar_bank_adopt_result none = {PULSAR_ADOPT_NONE, TokPos{0}};

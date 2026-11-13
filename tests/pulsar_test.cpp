@@ -2303,13 +2303,13 @@ static void test_l334_bank_pos_and_adopt_result(void) {
     TEST_ASSERT(pulsar_bank_pos_of(1, 4, NULL).is_none());     /* no history: never populated / invalidated */
     TEST_ASSERT(pulsar_bank_pos_of(1, 4, &empty) == TokPos{0});
     TEST_ASSERT(pulsar_bank_pos_of(3, 4, &seven) == TokPos{7});
-    TEST_ASSERT(pulsar_session_bank_pos(NULL, 0).is_none());
+    TEST_ASSERT(pulsar_session_bank_pos(NULL, BankId{0}).is_none());
     char err[160] = "";
-    const pulsar_bank_adopt_result r = pulsar_session_bank_adopt(NULL, 1, &seven, err, sizeof err);
+    const pulsar_bank_adopt_result r = pulsar_session_bank_adopt(NULL, BankId{1}, &seven, err, sizeof err);
     TEST_ASSERT(r.status == PULSAR_ADOPT_REFUSED && r.at.is_none() && strstr(err, "no session") != NULL);
     pulsar_session *none_s = NULL;
     err[0] = '\0';
-    const pulsar_bank_adopt_result q = pulsar_session_bank_adopt(none_s, 1, NULL, err, sizeof err);
+    const pulsar_bank_adopt_result q = pulsar_session_bank_adopt(none_s, BankId{1}, NULL, err, sizeof err);
     TEST_ASSERT(q.status == PULSAR_ADOPT_REFUSED && q.at.is_none() && err[0] != '\0');
 }
 
@@ -4078,14 +4078,14 @@ static void test_driver_context_bound(void) {
     s->ctx_size = 8;
 
     char err[256] = "";
-    pulsar_multiseq_req at_ctx = { 0u, TokPos{8}, TokId{1} };
+    pulsar_multiseq_req at_ctx = { BankId{0}, TokPos{8}, TokId{1} };
     TEST_ASSERT(pulsar_driver_decode_multiseq(s, &at_ctx, 1u, NULL, 0, err, sizeof err) == -1 && err[0]);
     TEST_ASSERT(bank_pos == TokPos{8});                       /* nothing moved */
     for (int i = 0; i < 8; i++) token_vec_push(&s->checkpoint, 1);
     err[0] = '\0';
     TEST_ASSERT(pulsar_driver_eval_row(s, 1, err, sizeof err) == 1 && err[0] && bank_pos == TokPos{8});
     bank_pos = TokPos{7};                                     /* a verify of [7, 8]: its second row is past the pool */
-    const pulsar_multiseq_req run[2] = { { 0u, TokPos{7}, TokId{1} }, { 0u, TokPos{8}, TokId{1} } };
+    const pulsar_multiseq_req run[2] = { { BankId{0}, TokPos{7}, TokId{1} }, { BankId{0}, TokPos{8}, TokId{1} } };
     uint32_t headed = 9u;
     err[0] = '\0';
     TEST_ASSERT(pulsar_driver_decode_mixed(s, run, 2u, NULL, 0, &headed, PULSAR_MSEQ_HEAD_ALL_ROWS, err, sizeof err) == -1 &&
@@ -4238,8 +4238,8 @@ static void test_multiseq_step_view(void) {
     s->engine = e;
     for (int t : {5, 6, 7, 8}) token_vec_push(&s->checkpoint, t);
     const uint32_t live = 1u;
-    const pulsar_multiseq_req others[2] = { {0u, TokPos{10}, TokId{1}}, {2u, TokPos{20}, TokId{2}} };
-    const pulsar_multiseq_req with_live[2] = { {0u, TokPos{10}, TokId{1}}, {1u, TokPos{4}, TokId{2}} };
+    const pulsar_multiseq_req others[2] = { {BankId{0}, TokPos{10}, TokId{1}}, {BankId{2}, TokPos{20}, TokId{2}} };
+    const pulsar_multiseq_req with_live[2] = { {BankId{0}, TokPos{10}, TokId{1}}, {BankId{1}, TokPos{4}, TokId{2}} };
     auto arm = [&]() {
         s->checkpoint_valid = true;
         s->mseq_dirty = false;
@@ -4369,9 +4369,9 @@ static void test_batch_history(void) {
     fs->prefill_frontier = TokPos{600};
 
     /* the engine's two views of the installed bank, and of one that is not */
-    TEST_ASSERT(pulsar_bank_history(fs, 1) == NULL && pulsar_session_bank_tokens(fs, 1) == NULL);
+    TEST_ASSERT(pulsar_bank_history(fs, 1) == NULL && pulsar_session_bank_tokens(fs, BankId{1}) == NULL);
     TEST_ASSERT(pulsar_bank_history_as(fs, 1, PULSAR_BANK_VIEW_SAVED) == &fs->bank_carry[1].checkpoint);
-    TEST_ASSERT(pulsar_session_bank_tokens_as(fs, 1, PULSAR_BANK_VIEW_SAVED) == &fs->bank_carry[1].checkpoint);
+    TEST_ASSERT(pulsar_session_bank_tokens_as(fs, BankId{1}, PULSAR_BANK_VIEW_SAVED) == &fs->bank_carry[1].checkpoint);
     TEST_ASSERT(pulsar_bank_history(fs, 0) == &fs->bank_carry[0].checkpoint &&
                 pulsar_bank_history_as(fs, 0, PULSAR_BANK_VIEW_SAVED) == &fs->bank_carry[0].checkpoint);
     TEST_ASSERT(bops.prefill_frontier(fs, 1, PULSAR_BANK_VIEW_CURRENT) == TokPos{0} &&
@@ -4383,18 +4383,20 @@ static void test_batch_history(void) {
     /* a valid live view is the current read, whatever the carry says (the generic contract: not the carry) */
     fs->checkpoint_valid = true;
     fs->checkpoint.len = 10;
-    TEST_ASSERT(pulsar_bank_history(fs, 1) == &fs->checkpoint && pulsar_session_bank_pos(fs, 1) == TokPos{10});
+    TEST_ASSERT(pulsar_bank_history(fs, 1) == &fs->checkpoint && pulsar_session_bank_pos(fs, BankId{1}) == TokPos{10});
     fs->checkpoint.len = 600;
     fs->checkpoint_valid = false;
     {
         pulsar_tokens pr = {resend.data(), (int)resend.size(), (int)resend.size()};
-        TEST_ASSERT(pulsar_session_bank_resume_at(fs, 1, &pr, NULL, 0).served == PromptToks{0});
-        const pulsar_bank_resume sv = pulsar_session_bank_resume_at_as(fs, 1, PULSAR_BANK_VIEW_SAVED, &pr, NULL, 0);
+        TEST_ASSERT(pulsar_session_bank_resume_at(fs, BankId{1}, &pr, NULL, 0).served == PromptToks{0});
+        const pulsar_bank_resume sv = pulsar_session_bank_resume_at_as(fs, BankId{1}, PULSAR_BANK_VIEW_SAVED, &pr,
+                                                                       NULL, 0);
         TEST_ASSERT(sv.served == PromptToks{600} && sv.at == TokPos{600} && sv.why == PULSAR_RESUME_CONTINUES);
         /* not continued (decode rows in the history at entry): the grid checkpoint within the saved prefill */
         fs->bank_carry[1].prefill_frontier = TokPos{520};
         st->pos[1][0] = 512u;
-        const pulsar_bank_resume gp = pulsar_session_bank_resume_at_as(fs, 1, PULSAR_BANK_VIEW_SAVED, &pr, NULL, 0);
+        const pulsar_bank_resume gp = pulsar_session_bank_resume_at_as(fs, BankId{1}, PULSAR_BANK_VIEW_SAVED, &pr,
+                                                                       NULL, 0);
         TEST_ASSERT(gp.served == PromptToks{512} && gp.at == TokPos{512} && gp.why == PULSAR_RESUME_POINT);
         st->pos[1][0] = 0u;
         fs->bank_carry[1].prefill_frontier = TokPos{600};
@@ -4413,7 +4415,7 @@ static void test_batch_history(void) {
     s.slot_trivial_common_tokens = 64;
     s.prefix_wait_ms = 1000;
     for (int i = 0; i < 4; i++) {
-        s.slots[i].bank = (uint32_t)i;
+        s.slots[i].bank = BankId{i};
         s.slots[i].provisioned = true;
         s.slots[i].ctx_size = 4096;
     }
@@ -4642,8 +4644,8 @@ static void test_spec_round_refusals(void) {
     TEST_ASSERT(pulsar_session_spec_round_end_forced(s, r, TokId{4}, 0.0f, 0, 1.0f, 0.0f, NULL, 0u, truth, acc, 17, err,
                                                      sizeof err) == -1 && strstr(err, "no drafter") != NULL);
     pulsar_spec_step st[2] = {};
-    st[0].bank = 0;
-    st[1].bank = 1;
+    st[0].bank = BankId{0};
+    st[1].bank = BankId{1};
     st[0].round = st[1].round = r;
     uint32_t rows = 7;
     pulsar_session_spec_assemble_batch_local(s, st, 2, 16u, NULL, &rows);   /* no bank op is reached: fam.banks is NULL */
@@ -4750,7 +4752,7 @@ static void test_qwen_eos(void) {
 static void test_api_err_null(void) {
     pulsar_tokens prompt = {0};
     TEST_ASSERT(pulsar_session_restore_checkpoint(NULL, TokPos{0}, NULL, 64) == 1);
-    TEST_ASSERT(pulsar_session_bank_adopt(NULL, 1u, &prompt, NULL, 64).status == PULSAR_ADOPT_REFUSED);
+    TEST_ASSERT(pulsar_session_bank_adopt(NULL, BankId{1}, &prompt, NULL, 64).status == PULSAR_ADOPT_REFUSED);
     TEST_ASSERT(pulsar_session_copy_out_segment(NULL, TokPos{0}, TokPos{0}, NULL, NULL, 0, NULL, 64) == 1);
     TokPos G = TokPos{7};
     TEST_ASSERT(pulsar_session_load_segment(NULL, NULL, 0, false, NULL, 0, &G, NULL, NULL, 64) ==
@@ -5975,7 +5977,7 @@ static void test_read_ahead(void) {
     fs->prefill_cap = W;
     TEST_ASSERT(fs->prefill_ahead == NULL);   /* the default: unlicensed */
     TEST_ASSERT(pulsar_session_read_ahead(fs, 0, fs->prefill_ahead, W) == 0 && g_fake_ahead_calls == 0);
-    TEST_ASSERT(pulsar_session_prompt_read_ahead(fs, 0, NULL, (int)W) == 0 && g_fake_ahead_calls == 0);
+    TEST_ASSERT(pulsar_session_prompt_read_ahead(fs, BankId{0}, NULL, (int)W) == 0 && g_fake_ahead_calls == 0);
     pulsar_tokens served = {p.data(), (int)LEN, (int)LEN};
     pulsar_session_set_prefill_ahead(fs, &served);
     const uint32_t got = pulsar_session_read_ahead(fs, 0, fs->prefill_ahead, W);

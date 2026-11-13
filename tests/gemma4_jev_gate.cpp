@@ -71,7 +71,7 @@ static pulsar_session *fresh(pulsar_engine *e, int ctx, bool adapter) {
     pulsar_engine_set_bank_pool(1);
     pulsar_session *s = NULL;
     if (pulsar_session_create(&s, e, ctx) != 0 || !s) return NULL;
-    if (adapter && !pulsar_session_set_bank_adapter(s, 0, true)) { pulsar_session_free(s); return NULL; }
+    if (adapter && !pulsar_session_set_bank_adapter(s, BankId{0}, true)) { pulsar_session_free(s); return NULL; }
     return s;
 }
 
@@ -116,7 +116,8 @@ int GATE_ENTRY(int argc, char **argv) {
     if (!plain) {
         pulsar_session *s = fresh(e, ctx, false);
         std::vector<float> h = s ? run(s, cases[0], E) : std::vector<float>();
-        CHECK(s && !h.empty() && !pulsar_session_set_bank_adapter(s, 0, true) && !pulsar_session_bank_adapter(s, 0),
+        CHECK(s && !h.empty() && !pulsar_session_set_bank_adapter(s, BankId{0}, true)
+              && !pulsar_session_bank_adapter(s, BankId{0}),
               "J1 a bank holding %zu tokens refuses the switch", cases[0].size());
         if (s) pulsar_session_free(s);
     }
@@ -124,7 +125,7 @@ int GATE_ENTRY(int argc, char **argv) {
     std::vector<std::vector<float>> hid;
     {
         pulsar_session *s = fresh(e, ctx, !plain);
-        if (!plain) CHECK(s && pulsar_session_bank_adapter(s, 0), "J1 an empty bank takes the switch");
+        if (!plain) CHECK(s && pulsar_session_bank_adapter(s, BankId{0}), "J1 an empty bank takes the switch");
         const double t0 = gate_now_s();
         for (size_t i = 0; s && i < cases.size(); i++) hid.push_back(run(s, cases[i], E));
         const double dt = gate_now_s() - t0;

@@ -9703,7 +9703,7 @@ static void test_l372_predecode_failure_ends_the_job(void) {
         j.fd = sv[0];
         session_slot *sl = &s.slots[1];
         sl->provisioned = true;
-        sl->bank = 1;
+        sl->bank = BankId{1};
         sl->preempted = true;
         sl->active_job = &j;
         gen_state *g = (gen_state *)server_xmalloc(sizeof(*g));   /* the slot's own: generate_job_end frees it */
@@ -9736,7 +9736,7 @@ static void test_l372_failed_readmission_marks_the_bank_spilled(void) {
     pthread_mutex_init(&s.mu, NULL);
     s.pool_banks = 2;
     s.n_slots = 2;
-    s.live_bank = -1;   /* nothing installed: the switch below saves no outgoing bank */
+    s.live_bank = BankId::none();   /* nothing installed: the switch below saves no outgoing bank */
     int dummy = 0;
     gen_state g;
     memset(&g, 0, sizeof g);
@@ -9744,7 +9744,7 @@ static void test_l372_failed_readmission_marks_the_bank_spilled(void) {
     g.phase = GEN_DECODE;
     session_slot *v = &s.slots[1];
     v->provisioned = true;
-    v->bank = 1;
+    v->bank = BankId{1};
     v->active_job = (job *)&dummy;
     v->gen = &g;
     v->preempted = true;
@@ -9753,7 +9753,7 @@ static void test_l372_failed_readmission_marks_the_bank_spilled(void) {
     TEST_ASSERT(!v->preempted && v->preempt_path == NULL && v->spilled);
     TEST_ASSERT(g.phase == GEN_FINISH && !strcmp(g.finish, "error") && strstr(g.err, "could not be reloaded") != NULL);
     /* the install is the spilled bank's now: it re-backs (here: refuses) instead of handing out the carry */
-    TEST_ASSERT(!s.bank_switch(1) && v->spilled && s.m_restore_failures == 1);
+    TEST_ASSERT(!s.bank_switch(BankId{1}) && v->spilled && s.m_restore_failures == 1);
     TEST_ASSERT(!s.worker_readmit_preempted());   /* nothing parked any more */
     pthread_mutex_destroy(&s.mu);
 }
@@ -9827,7 +9827,7 @@ static void test_l372_empty_banks_are_not_spill_victims(void) {
     s.n_slots = 3;
     for (int i = 0; i < 3; i++) {
         s.slots[i].provisioned = true;
-        s.slots[i].bank = (uint32_t)i;
+        s.slots[i].bank = BankId{i};
         s.slots[i].last_serviced_us = (uint64_t)(10 * (i + 1));
     }
     int order[PULSAR_SESSION_POOL_CAP];
@@ -9844,9 +9844,9 @@ static void test_l372_judge_ends_a_gone_clients_request(void) {
     server s;
     memset(&s, 0, sizeof s);
     pthread_mutex_init(&s.mu, NULL);
-    s.live_bank = -1;   /* nothing installed: the step saves no outgoing bank */
+    s.live_bank = BankId::none();   /* nothing installed: the step saves no outgoing bank */
     server_judge *J = new server_judge();
-    J->bank = 1;
+    J->bank = BankId{1};
     s.judge = J;
     for (const bool gone : {true, false}) {
         int sv[2];
@@ -9896,7 +9896,7 @@ static void test_l372_abandoned_prefill_drops_stale_bindings(void) {
         j.fd = sv[0];
         session_slot *sl = &s.slots[1];
         sl->provisioned = true;
-        sl->bank = 1;
+        sl->bank = BankId{1};
         sl->active_job = &j;
         sl->responses_live.valid = sl->anthropic_live.valid = true;
         sl->responses_live.live_tokens = sl->anthropic_live.live_tokens = 100;
@@ -9928,12 +9928,12 @@ static void test_l372_bank_install_failure_keeps_the_first_error(void) {
     gen_state g;
     memset(&g, 0, sizeof g);
     g.phase = GEN_DECODE;
-    gen_bank_install_failed(&g, 3u);
+    gen_bank_install_failed(&g, BankId{3});
     TEST_ASSERT(g.phase == GEN_FINISH && !strcmp(g.finish, "error") && strstr(g.err, "bank 3 state restore failed") != NULL);
     memset(&g, 0, sizeof g);
     g.phase = GEN_DECODE;
     snprintf(g.err, sizeof g.err, "the pair's step failed");
-    gen_bank_install_failed(&g, 3u);
+    gen_bank_install_failed(&g, BankId{3});
     TEST_ASSERT(g.phase == GEN_FINISH && !strcmp(g.finish, "error") && !strcmp(g.err, "the pair's step failed"));
 }
 
@@ -10308,7 +10308,7 @@ static void l379_banks(session_slot *slots, int n, const int *tokens, const bool
     const int min_tokens = kv_cache_default_options().min_tokens;
     for (int i = 0; i < n; i++) {
         slots[i].provisioned = true;
-        slots[i].bank = (uint32_t)i;
+        slots[i].bank = BankId{i};
         slots[i].kv_flags = ro[i] ? KV_HDR_READ_ONLY : 0u;
         slots[i].last_serviced_us = served[i];
         scratch[i] = server_slot_is_scratch(&slots[i], tokens[i], min_tokens);
@@ -10455,7 +10455,7 @@ static void test_l379_scratch_banks_go_first(void) {
         s.n_slots = 3;
         for (int i = 0; i < 3; i++) {
             s.slots[i].provisioned = true;
-            s.slots[i].bank = (uint32_t)i;
+            s.slots[i].bank = BankId{i};
             s.slots[i].last_serviced_us = (uint64_t)(100 * (i + 1));   /* slot 0 is the LRU */
         }
         bool gdom[PULSAR_SESSION_POOL_CAP] = {false}, gscr[PULSAR_SESSION_POOL_CAP] = {false};
@@ -10554,10 +10554,10 @@ static void test_l372_judge_bank_floor_and_release(void) {
     server s;
     memset(&s, 0, sizeof s);
     pthread_mutex_init(&s.mu, NULL);
-    s.live_bank = -1;
+    s.live_bank = BankId::none();
     TEST_ASSERT(!server_judge_releasable(&s) && !server_judge_release(&s) && !server_judge_holds_kv(&s));   /* no judge */
     server_judge *J = new server_judge();
-    J->bank = 1;
+    J->bank = BankId{1};
     s.judge = J;
     TEST_ASSERT(server_judge_releasable(&s));
     TEST_ASSERT(!server_judge_release(&s) && !J->released);   /* nothing resident: nothing freed, nothing to re-back */
@@ -10589,10 +10589,10 @@ static void test_l372_judge_bank_floor_and_release(void) {
         TEST_ASSERT(server_judge_step(&s));
         (void)server_mem_floor_init(0, KvBytes{0});
         TEST_ASSERT(jb.done && jb.busy && !jb.started && jb.err.find("not enough memory") != std::string::npos);
-        TEST_ASSERT(!server_judge_queued(&s) && !J->released && s.live_bank == -1);
+        TEST_ASSERT(!server_judge_queued(&s) && !J->released && s.live_bank == BankId::none());
         TEST_ASSERT(s.floor_admits_chunk(1024, err, sizeof err));   /* the real floor admits a chunk here */
         /* the budget's half prices the bank's growth by the session: a host-only server has none to hold */
-        TEST_ASSERT(s.budget_admits_growth(1u, 1024, err, sizeof err));
+        TEST_ASSERT(s.budget_admits_growth(BankId{1}, 1024, err, sizeof err));
         pulsar_tokens_free(&jb.prompts[0]);
         pthread_cond_destroy(&jb.cv);
         pthread_mutex_destroy(&jb.mu);
@@ -11642,7 +11642,7 @@ static void test_hint_compaction_marks_dead(void) {
     s->n_slots = 4;
     for (int i = 0; i < 4; i++) {
         s->slots[i].provisioned = true;
-        s->slots[i].bank = (uint32_t)i;
+        s->slots[i].bank = BankId{i};
         s->slots[i].last_serviced_us = 100 + (uint64_t)i;
     }
     snprintf(s->slots[1].hint_session, PULSAR_HINT_ID_MAX, "sess-a");
@@ -12691,7 +12691,7 @@ static void test_l282_done_slot_is_released(void) {
     pthread_cond_init(&j.cv, NULL);
     session_slot *sl = &s.slots[1];
     sl->provisioned = true;
-    sl->bank = 1;
+    sl->bank = BankId{1};
     sl->state = SLOT_PREFILLING;
     sl->active_job = &j;
     sl->gen = (gen_state *)calloc(1, sizeof(gen_state));
@@ -12700,7 +12700,7 @@ static void test_l282_done_slot_is_released(void) {
     s.worker_service_slot(sl);
     TEST_ASSERT(sl->gen == NULL && sl->active_job == NULL && sl->state == SLOT_IDLE);
     TEST_ASSERT(j.done && s.n_generating == 0);
-    TEST_ASSERT(sl->bank == 1);   /* the bank stays the slot's: a quantum's save after an abandon reads it */
+    TEST_ASSERT(sl->bank == BankId{1});   /* the bank stays the slot's: a quantum's save after an abandon reads it */
     pthread_cond_destroy(&j.cv);
     pthread_mutex_destroy(&j.mu);
 }
@@ -12718,7 +12718,7 @@ static void test_l179_deep_guard_blocks_two_deep_decoders(void) {
         slots[i].provisioned = true;
         slots[i].active_job = (struct job *)&slots;
         slots[i].state = SLOT_DECODING;
-        slots[i].bank = (uint32_t)i;
+        slots[i].bank = BankId{i};
     }
     int n_dec = -1;
     long deep = -1;
@@ -12830,27 +12830,27 @@ static void test_refusal_evictable(void) {
 static void test_l179_park_live_bank_only_when_not_in_quantum(void) {
     session_slot slots[4];
     memset(slots, 0, sizeof slots);
-    for (int i = 0; i < 4; i++) slots[i].bank = (uint32_t)i;
+    for (int i = 0; i < 4; i++) slots[i].bank = BankId{i};
     session_slot *dec[2] = {&slots[0], &slots[1]};
     const session_slot *pf = &slots[2];
     const int pool = 4;
     /* live bank is a decoder: no park */
-    TEST_ASSERT(!park_live_bank_needed(0, pool, dec, 2, NULL));
-    TEST_ASSERT(!park_live_bank_needed(1, pool, dec, 2, pf));
+    TEST_ASSERT(!park_live_bank_needed(BankId{0}, pool, dec, 2, NULL));
+    TEST_ASSERT(!park_live_bank_needed(BankId{1}, pool, dec, 2, pf));
     /* live bank is the fused prefill slot: no park */
-    TEST_ASSERT(!park_live_bank_needed(2, pool, dec, 2, pf));
+    TEST_ASSERT(!park_live_bank_needed(BankId{2}, pool, dec, 2, pf));
     /* live bank is in neither: park */
-    TEST_ASSERT(park_live_bank_needed(2, pool, dec, 2, NULL));
-    TEST_ASSERT(park_live_bank_needed(3, pool, dec, 2, pf));
-    TEST_ASSERT(park_live_bank_needed(0, pool, dec, 0, NULL));
+    TEST_ASSERT(park_live_bank_needed(BankId{2}, pool, dec, 2, NULL));
+    TEST_ASSERT(park_live_bank_needed(BankId{3}, pool, dec, 2, pf));
+    TEST_ASSERT(park_live_bank_needed(BankId{0}, pool, dec, 0, NULL));
     /* no live bank / out of pool: nothing to park */
-    TEST_ASSERT(!park_live_bank_needed(-1, pool, dec, 2, pf));
-    TEST_ASSERT(!park_live_bank_needed(pool, pool, dec, 2, pf));
-    TEST_ASSERT(!park_live_bank_needed(3, 0, dec, 0, NULL));
+    TEST_ASSERT(!park_live_bank_needed(BankId::none(), pool, dec, 2, pf));
+    TEST_ASSERT(!park_live_bank_needed(BankId{pool}, pool, dec, 2, pf));
+    TEST_ASSERT(!park_live_bank_needed(BankId{3}, 0, dec, 0, NULL));
     /* a NULL entry in dec is skipped, not dereferenced */
     session_slot *holey[2] = {NULL, &slots[3]};
-    TEST_ASSERT(park_live_bank_needed(2, pool, holey, 2, NULL));
-    TEST_ASSERT(!park_live_bank_needed(3, pool, holey, 2, NULL));
+    TEST_ASSERT(park_live_bank_needed(BankId{2}, pool, holey, 2, NULL));
+    TEST_ASSERT(!park_live_bank_needed(BankId{3}, pool, holey, 2, NULL));
 }
 
 /* L179 branch 2 -- server_worker_main's lane select (w_decode_lane). Invariant:
@@ -13195,7 +13195,7 @@ static void test_l380_terminal_grace_and_yield(void) {
     s.n_slots = 3;
     for (int i = 0; i < 3; i++) {
         s.slots[i].provisioned = true;
-        s.slots[i].bank = (uint32_t)i;
+        s.slots[i].bank = BankId{i};
     }
     /* the worker's wait: none pending sleeps untimed (< 0); else the earliest pending slot's deadline */
     TEST_ASSERT(s.terminal_wait_s(100.0) < 0.0);
@@ -13552,7 +13552,7 @@ static void test_l380_batch_frontier(void) {
     memset(&g, 0, sizeof g);
     s.n_slots = 2;
     session_slot &sl = s.slots[1];
-    sl.bank = 1u;
+    sl.bank = BankId{1};
     sl.gen = &g;
     g.phase = GEN_DECODE;
     g.batch_active = true;
@@ -14654,7 +14654,7 @@ static void test_l323_bank_dominated(void) {
     s.n_slots = 4;
     for (int i = 0; i < 4; i++) {
         s.slots[i].provisioned = true;
-        s.slots[i].bank = (uint32_t)i;
+        s.slots[i].bank = BankId{i};
         s.slots[i].last_serviced_us = slots[i].last_serviced_us;
     }
     s.slots[0].last_serviced_us = 70;   /* L328: bank 0 is a candidate like any bank -- here not the LRU one */
@@ -14686,7 +14686,7 @@ static void test_l179_guard_victim_skips_live_spilled(void) {
     static const uint64_t us[5] = {1, 40, 30, 20, 10};   /* bank 0 the oldest */
     for (int i = 0; i < 5; i++) {
         s.slots[i].provisioned = true;
-        s.slots[i].bank = (uint32_t)i;
+        s.slots[i].bank = BankId{i};
         s.slots[i].last_serviced_us = us[i];
     }
     session_slot *dec[2] = {&s.slots[4], &s.slots[3]};
@@ -15247,7 +15247,7 @@ static void test_l179_evict_reset_leaves_a_reusable_hole(void) {
     memset(&fake_job, 0, sizeof fake_job);
     memset(&fake_gen, 0, sizeof fake_gen);
     sl.provisioned = true;
-    sl.bank = 5;
+    sl.bank = BankId{5};
     sl.committed_pos = TokPos{4096};
     sl.active_job = &fake_job;
     sl.gen = &fake_gen;
@@ -15269,14 +15269,14 @@ static void test_l179_evict_reset_leaves_a_reusable_hole(void) {
     TEST_ASSERT(sl.prefill_counted == 0);
     TEST_ASSERT(sl.last_serviced_us == 0);
     /* the caller's facts survive the reset */
-    TEST_ASSERT(sl.bank == 5);
+    TEST_ASSERT(sl.bank == BankId{5});
     TEST_ASSERT(sl.spilled);
     /* an already-empty slot resets to the same hole and reports ctx 0 */
     session_slot empty;
     memset(&empty, 0, sizeof empty);
-    empty.bank = 2;
+    empty.bank = BankId{2};
     TEST_ASSERT(evict_reset_slot_fields(&empty) == 0);
-    TEST_ASSERT(!empty.provisioned && empty.state == SLOT_EVICTED && empty.bank == 2);
+    TEST_ASSERT(!empty.provisioned && empty.state == SLOT_EVICTED && empty.bank == BankId{2});
 }
 
 /* L179 branch 10 -- the fused mixed quantum's head cap (mixed_head_cap).
@@ -16873,7 +16873,7 @@ static void test_l334_none_fails_closed(void) {
  * continuation's resume is its kept prefix -- one currency with the tokens it serves; a prefix past the live history
  * fails closed. */
 static void test_l334_server_positions(void) {
-    TEST_ASSERT(pulsar_session_bank_pos(NULL, 0).is_none() && server_bank_pos(NULL, 0) == TokPos{0});
+    TEST_ASSERT(pulsar_session_bank_pos(NULL, BankId{0}).is_none() && server_bank_pos(NULL, BankId{0}) == TokPos{0});
     TEST_ASSERT(server_live_continuation_start(TokCount{0}, TokPos{0}) == TokPos{0});
     TEST_ASSERT(server_live_continuation_start(TokCount{389}, TokPos{390}) == TokPos{389});   /* a dropped stop */
     TEST_ASSERT(server_live_continuation_start(TokCount{390}, TokPos{390}) == TokPos{390});

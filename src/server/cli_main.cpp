@@ -1340,7 +1340,7 @@ int main(int argc, char **argv) {
                    cfg.engine.prefill_chunk, PULSAR_SESSION_POOL_CAP + 1);
         return 1;
     }
-    s.live_bank = 0;
+    s.live_bank = BankId{0};
     /* L118 (everything is a batch): the three-way scheduler, its
      * spec_max_live crossover knob (PULSAR_SERVER_SPEC_MAX_LIVE), and the
      * PULSAR_CLASSIC_DECODE A/B hatch are DELETED — decode runs through the
@@ -1392,7 +1392,7 @@ int main(int argc, char **argv) {
     }
     s.n_slots = 1;
     s.kv_budget_bytes = kv_budget_final;
-    for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) s.slots[i].bank = (uint32_t)i;
+    for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) s.slots[i].bank = BankId{i}; /* slot i holds bank i */
     if (s.pool_banks > 0) {
         /* Even-split per-bank ledger charge: the whole pool's admitted cost
          * spread across its banks (conservative — demand-paged reality is
@@ -1767,7 +1767,7 @@ int main(int argc, char **argv) {
         if (s.pool_banks > 0 && !s.bank_switch(sl->bank)) {
             server_log(PULSAR_LOG_DEFAULT,
                        "pulsar-server: slot %d bank %d could not be installed at shutdown; "
-                       "skipping its KV persist", i, sl->bank);
+                       "skipping its KV persist", i, sl->bank.raw());
             continue;
         }
         const pulsar_tokens *tokens = pulsar_session_tokens(s.sess);

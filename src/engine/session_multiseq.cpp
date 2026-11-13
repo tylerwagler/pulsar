@@ -63,7 +63,7 @@
 void pulsar_multiseq_step_stale(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows, uint32_t live,
                                 bool landed) {
     bool live_moved = !landed;   /* a failed sweep: no bank's state is known */
-    for (uint32_t k = 0; !live_moved && k < n_rows; k++) live_moved = reqs[k].bank == live;
+    for (uint32_t k = 0; !live_moved && k < n_rows; k++) live_moved = reqs[k].bank == BankId{live};
     if (live_moved) s->checkpoint_valid = false;
     s->mseq_dirty = true;
     s->spec.spec_carry_valid = false;
@@ -98,7 +98,7 @@ static int ds4_batch_step(pulsar_session *s, const pulsar_multiseq_req *reqs, ui
     int *tokens = (int *)xmalloc((size_t)n_rows * sizeof(*tokens));
     for (uint32_t k = 0; k < n_rows; k++) {
         pos[k]    = reqs[k].pos.raw();   /* L334: the device rows stay raw */
-        bank[k]   = (int32_t)reqs[k].bank;
+        bank[k]   = reqs[k].bank.raw();   /* the step's int32 bank array */
         tokens[k] = reqs[k].token.raw();
     }
     uint32_t headed = 0;

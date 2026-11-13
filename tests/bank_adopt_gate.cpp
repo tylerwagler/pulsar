@@ -43,8 +43,8 @@ static void say(bool ok, const char *fmt, ...) {
 }
 
 static bool install(pulsar_session *s, int *live, uint32_t b) {
-    if (*live >= 0) pulsar_session_bank_state_save(s, (uint32_t)*live);
-    if (!pulsar_session_bank_state_restore(s, b)) return false;
+    if (*live >= 0) pulsar_session_bank_state_save(s, BankId{(uint32_t)*live});
+    if (!pulsar_session_bank_state_restore(s, BankId{b})) return false;
     *live = (int)b;
     return true;
 }
@@ -70,7 +70,7 @@ static void shape(pulsar_engine *e, pulsar_session *s, int *live, const char *na
     /* bank 1 adopts */
     bool ok = install(s, live, 1);
     if (ok) pulsar_session_invalidate(s);
-    const pulsar_bank_adopt_result ad = ok ? pulsar_session_bank_adopt(s, src, Q, err, sizeof err)
+    const pulsar_bank_adopt_result ad = ok ? pulsar_session_bank_adopt(s, BankId{src}, Q, err, sizeof err)
                                            : pulsar_bank_adopt_result{PULSAR_ADOPT_REFUSED, TokPos::none()};
     const int rs = ad.status != PULSAR_ADOPT_REFUSED ? pulsar_session_sync(s, Q, err, sizeof err) : 1;
     const int origin = pulsar_session_resume_origin(s).raw();

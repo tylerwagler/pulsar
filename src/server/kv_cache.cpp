@@ -908,8 +908,8 @@ int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chai
     if (!kv_persist_writes(why, sl->kv_flags, &what_probe)) {
         s->count_metric(&s->m_persist_read_only);
         if (kv_persist_writes(why, 0u, &what_probe) && (what_probe & PULSAR_KVCHAIN_RP))   /* a loss: said */
-            server_log(PULSAR_LOG_KVCACHE, "pulsar-server: kv cache persist reason=%s: bank %u's history is read-only "
-                       "(X-Pulsar-KV) -- nothing written", reason, sl->bank);
+            server_log(PULSAR_LOG_KVCACHE, "pulsar-server: kv cache persist reason=%s: bank %d's history is read-only "
+                       "(X-Pulsar-KV) -- nothing written", reason, sl->bank.raw());
         if (by_rule) *by_rule = KV_PERSIST_RULE_READ_ONLY;
         return 0;
     }

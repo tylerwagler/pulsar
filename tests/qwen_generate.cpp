@@ -298,7 +298,7 @@ int main(int argc, char **argv) {
             float conf[16];
             TokId pbase;
             int32_t ptok[16];
-            const uint32_t n_pend = trace ? pulsar_session_bank_pendings(sess, 0u, &pbase, ptok, conf) : 0u;
+            const uint32_t n_pend = trace ? pulsar_session_bank_pendings(sess, BankId{0}, &pbase, ptok, conf) : 0u;
             const int k = pulsar_session_generate_speculative(sess, temp, top_k, top_p, 0.0f, &rng, generated - n,
                                                               out + n, generated - n, err, sizeof(err));
             if (k < 0) {
@@ -368,7 +368,7 @@ int main(int argc, char **argv) {
         float *lg = (float *)malloc((size_t)W * sizeof(float));
         int same = 0;
         for (int i = 0; i + 1 < generated; i++) {
-            const pulsar_multiseq_req rq = {0u, TokPos{n_tok + i}, TokId{ids[n_tok + i]}};
+            const pulsar_multiseq_req rq = {BankId{0}, TokPos{n_tok + i}, TokId{ids[n_tok + i]}};
             if (pulsar_session_decode_multiseq(sess, &rq, 1, lg, W, err, sizeof(err)) != 0) {
                 fprintf(stderr, "qwen-generate: BATCH step %d failed: %s\n", i, err);
                 free(lg);

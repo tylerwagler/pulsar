@@ -129,30 +129,30 @@ int GATE_ENTRY(int argc, char **argv) {
     }
     bool ok = true;
     for (uint32_t b : {1u, 2u}) {
-        ok = ok && pulsar_session_bank_state_restore(s, b) && pulsar_session_sync(s, &P, err, sizeof(err)) == 0;
-        if (ok) pulsar_session_bank_state_save(s, b);
+        ok = ok && pulsar_session_bank_state_restore(s, BankId{b}) && pulsar_session_sync(s, &P, err, sizeof(err)) == 0;
+        if (ok) pulsar_session_bank_state_save(s, BankId{b});
     }
     CHECK(ok, "banks 1 and 2 prefilled G: %s", err);
 
     /* the spill: bank 1 installed, its chain persisted, its carry saved, bank 0 installed */
     FILE *seg = tmpfile(), *rp = tmpfile();   /* L347: the restore point at G apart */
     const uint64_t seg_bytes = ok ? pulsar_session_segment_bytes(s, TokPos{0}, TokPos{G}, NULL) : 0;
-    ok = ok && seg && rp && pulsar_session_bank_state_restore(s, 1) &&
+    ok = ok && seg && rp && pulsar_session_bank_state_restore(s, BankId{1}) &&
          pulsar_session_checkpoint_best(s, TokPos{G}).raw() == G &&
          gate_save_segment(s, seg, TokPos{0}, TokPos{G}, err, sizeof(err)) == 0 &&
          gate_save_restore_point(s, rp, TokPos{G}, err, sizeof(err)) == 0;
     const uint64_t rp_bytes = ok ? pulsar_session_restore_point_bytes(s, TokPos{G}) : 0;
-    if (ok) pulsar_session_bank_state_save(s, 1);
-    ok = ok && pulsar_session_bank_state_restore(s, 0);
+    if (ok) pulsar_session_bank_state_save(s, BankId{1});
+    ok = ok && pulsar_session_bank_state_restore(s, BankId{0});
     CHECK(ok, "bank 1 persisted as [0, %d) (%.1f MiB): %s", G, seg_bytes / 1048576.0, err);
 
     /* R1 */
-    const uint64_t t1 = pulsar_session_bank_touched_kv_bytes(s, 1).raw();
+    const uint64_t t1 = pulsar_session_bank_touched_kv_bytes(s, BankId{1}).raw();
     const uint64_t all0 = pulsar_session_touched_kv_bytes(s).raw();
-    CHECK(!pulsar_session_bank_free_physical(s, 0) && !pulsar_session_bank_is_evicted(s, 0),
+    CHECK(!pulsar_session_bank_free_physical(s, BankId{0}) && !pulsar_session_bank_is_evicted(s, BankId{0}),
           "R1 free_physical refuses the live bank 0 and frees nothing");
     const long long ma0 = mem_available_kb();
-    const bool freed = ok && pulsar_session_bank_free_physical(s, 1);
+    const bool freed = ok && pulsar_session_bank_free_physical(s, BankId{1});
     /* GB10 returns a cudaFree'd managed range to the kernel ASYNCHRONOUSLY and slowly (measured 2026-10-07: +0 at
      * once, +50 MiB at 5 s, +223 MiB of 227.5 at 30 s): watch MemAvailable for up to 60 s */
     long long ma1 = mem_available_kb();
@@ -162,36 +162,38 @@ int GATE_ENTRY(int argc, char **argv) {
         const long long m = mem_available_kb();
         if (m > ma1) ma1 = m;
     }
-    const uint64_t t1_after = pulsar_session_bank_touched_kv_bytes(s, 1).raw();
+    const uint64_t t1_after = pulsar_session_bank_touched_kv_bytes(s, BankId{1}).raw();
     const uint64_t all1 = pulsar_session_touched_kv_bytes(s).raw();
-    CHECK(freed && pulsar_session_bank_is_evicted(s, 1) && t1_after == 0 && all0 - all1 == t1 && t1 > 0,
+    CHECK(freed && pulsar_session_bank_is_evicted(s, BankId{1}) && t1_after == 0 && all0 - all1 == t1 && t1 > 0,
           "R1 bank 1 freed: evicted, touched %.1f -> %.1f MiB, session %.1f -> %.1f MiB", t1 / 1048576.0,
           t1_after / 1048576.0, all0 / 1048576.0, all1 / 1048576.0);
     const double rise_mib = (double)(ma1 - ma0) / 1024.0;
     CHECK(ma0 >= 0 && rise_mib >= 0.75 * (double)t1 / 1048576.0,
           "R1 MemAvailable rose %.1f MiB within %.2f s (bank 1's touched KV %.1f MiB)", rise_mib, waited_ms / 1000.0,
           t1 / 1048576.0);
-    CHECK(!pulsar_session_bank_is_evicted(s, 2), "R1 bank 2 untouched by bank 1's eviction");
+    CHECK(!pulsar_session_bank_is_evicted(s, BankId{2}), "R1 bank 2 untouched by bank 1's eviction");
 
     /* R2: the restore -- re-back, install, load the chain */
-    const bool backed = freed && pulsar_session_bank_alloc_physical(s, 1) && pulsar_session_bank_alloc_physical(s, 1);
-    CHECK(backed && !pulsar_session_bank_is_evicted(s, 1), "R2 alloc_physical re-backs bank 1 (and again: idempotent)");
+    const bool backed = freed && pulsar_session_bank_alloc_physical(s, BankId{1}) &&
+                        pulsar_session_bank_alloc_physical(s, BankId{1});
+    CHECK(backed && !pulsar_session_bank_is_evicted(s, BankId{1}),
+          "R2 alloc_physical re-backs bank 1 (and again: idempotent)");
     TokPos g{0};
     if (seg) rewind(seg);
     if (rp) rewind(rp);
-    const bool loaded = backed && pulsar_session_bank_state_restore(s, 1) &&
+    const bool loaded = backed && pulsar_session_bank_state_restore(s, BankId{1}) &&
                         gate_load_segment(s, seg, seg_bytes, true, rp, rp_bytes, &g, err,
                                                     sizeof(err)) == 0;
-    CHECK(loaded && g.raw() == G && pulsar_session_bank_touched_kv_bytes(s, 1).raw() == t1,
+    CHECK(loaded && g.raw() == G && pulsar_session_bank_touched_kv_bytes(s, BankId{1}).raw() == t1,
           "R2 the chain loaded bank 1 back to %d (touched %.1f MiB): %s", g.raw(),
-          pulsar_session_bank_touched_kv_bytes(s, 1).raw() / 1048576.0, err);
+          pulsar_session_bank_touched_kv_bytes(s, BankId{1}).raw() / 1048576.0, err);
 
     /* R3 */
     std::vector<int> toks1, toks2;
     const std::vector<std::vector<float>> got = loaded ? continue_greedy(s, &Q, 16, W, &toks1)
                                                        : std::vector<std::vector<float>>();
-    pulsar_session_bank_state_save(s, 1);
-    const std::vector<std::vector<float>> ref = pulsar_session_bank_state_restore(s, 2)
+    pulsar_session_bank_state_save(s, BankId{1});
+    const std::vector<std::vector<float>> ref = pulsar_session_bank_state_restore(s, BankId{2})
                                                     ? continue_greedy(s, &Q, 16, W, &toks2)
                                                     : std::vector<std::vector<float>>();
     bool same = got.size() == 17 && ref.size() == 17;

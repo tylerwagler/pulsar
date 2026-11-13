@@ -114,8 +114,8 @@ run_rec run(pulsar_engine *e, const std::vector<pulsar_tokens> &P, int n, bool p
     pulsar_gpu_scratch_poison_counts(&p0, &pb0);
     bool ok = pulsar_session_create(&s, e, 4096) == 0 && s;
     for (int b = 0; ok && b < NB; b++) {
-        ok = pulsar_session_bank_state_restore(s, (uint32_t)b) && pulsar_session_sync(s, &P[b], err, sizeof err) == 0;
-        if (ok) pulsar_session_bank_state_save(s, (uint32_t)b);
+        ok = pulsar_session_bank_state_restore(s, BankId{b}) && pulsar_session_sync(s, &P[b], err, sizeof err) == 0;
+        if (ok) pulsar_session_bank_state_save(s, BankId{b});
     }
     if (!ok) snprintf(err + strlen(err), sizeof err - strlen(err), " (the banks' prefill)");
     pulsar_spec_round *rd[NB];
@@ -139,11 +139,11 @@ run_rec run(pulsar_engine *e, const std::vector<pulsar_tokens> &P, int n, bool p
         int m = 0;
         for (int b = 0; ok && b < NB; b++) {
             if (done[b] || !(mask >> b & 1u)) continue;
-            ok = pulsar_session_bank_state_restore(s, (uint32_t)b);
+            ok = pulsar_session_bank_state_restore(s, BankId{b});
             unquench(s);
-            pulsar_session_bank_state_save(s, (uint32_t)b);
+            pulsar_session_bank_state_save(s, BankId{b});
             memset(&st[m], 0, sizeof st[m]);
-            st[m].bank = (uint32_t)b;
+            st[m].bank = BankId{b};
             st[m].round = rd[b];
             st[m].temperature = 0.0f;
             st[m].top_p = 1.0f;
@@ -170,7 +170,7 @@ run_rec run(pulsar_engine *e, const std::vector<pulsar_tokens> &P, int n, bool p
                 bank_of[live++] = bank_of[i];
             } else if (st[i].status != PULSAR_SPEC_STEP_SKIPPED) {
                 ok = false;
-                snprintf(err, sizeof err, "tick %u assemble bank %u: status %d %s", t, st[i].bank, st[i].status,
+                snprintf(err, sizeof err, "tick %u assemble bank %d: status %d %s", t, st[i].bank.raw(), st[i].status,
                          st[i].err);
             }
         }
@@ -178,7 +178,7 @@ run_rec run(pulsar_engine *e, const std::vector<pulsar_tokens> &P, int n, bool p
         m = live;
         T.rows = rows;
         for (uint32_t k = 0; k < rows; k++) {
-            T.req.push_back((int32_t)reqs[k].bank);
+            T.req.push_back(reqs[k].bank.raw());
             T.req.push_back(reqs[k].pos.raw());
             T.req.push_back(reqs[k].token.raw());
         }
@@ -207,7 +207,7 @@ run_rec run(pulsar_engine *e, const std::vector<pulsar_tokens> &P, int n, bool p
         for (int i = 0; ok && i < m; i++) {
             ok = st[i].status == PULSAR_SPEC_STEP_OK;
             if (!ok) {
-                snprintf(err, sizeof err, "tick %u round_end bank %u: %s", t, st[i].bank, st[i].err);
+                snprintf(err, sizeof err, "tick %u round_end bank %d: %s", t, st[i].bank.raw(), st[i].err);
                 break;
             }
             const uint32_t b = bank_of[i];

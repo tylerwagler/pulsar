@@ -623,21 +623,21 @@ int pulsar_driver_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *
     int32_t tok[PULSAR_DRIVER_HEADS_MAX], pos[PULSAR_DRIVER_HEADS_MAX], bank[PULSAR_DRIVER_HEADS_MAX];
     for (uint32_t i = 0; i < n; i++) {
         /* One row per bank, at that bank's next position: a recurrent state advances exactly one token per row. */
-        if (reqs[i].bank >= ss->n_banks || reqs[i].pos != ss->bank_pos[reqs[i].bank]) {
-            if (err) snprintf(err, errlen, "%s: row %u (bank %u pos %d) is not its bank's next position", ARCH(e), i,
-                              reqs[i].bank, reqs[i].pos.raw());
+        if (!reqs[i].bank.below(ss->n_banks) || reqs[i].pos != ss->bank_pos[pulsar_bank_index(reqs[i].bank)]) {
+            if (err) snprintf(err, errlen, "%s: row %u (bank %d pos %d) is not its bank's next position", ARCH(e), i,
+                              reqs[i].bank.raw(), reqs[i].pos.raw());
             return 1;
         }
-        if (driver_bank_stale(s, reqs[i].bank, "decode", err, errlen)) return 1;
+        if (driver_bank_stale(s, pulsar_bank_index(reqs[i].bank), "decode", err, errlen)) return 1;
         for (uint32_t j = 0; j < i; j++) {
             if (reqs[j].bank == reqs[i].bank) {
-                if (err) snprintf(err, errlen, "%s: bank %u has two rows in one decode step", ARCH(e), reqs[i].bank);
+                if (err) snprintf(err, errlen, "%s: bank %d has two rows in one decode step", ARCH(e), reqs[i].bank.raw());
                 return 1;
             }
         }
         tok[i] = reqs[i].token.raw();
         pos[i] = reqs[i].pos.raw();
-        bank[i] = (int32_t)reqs[i].bank;
+        bank[i] = reqs[i].bank.raw();
     }
     const pulsar_driver_ops *ops = DOPS(e);
     const pulsar_driver_heads all = pulsar_driver_heads_span(StepRow{0}, StepRows{(int)n});
@@ -648,8 +648,9 @@ int pulsar_driver_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *
         return -1;
     }
     for (uint32_t i = 0; i < n; i++) {
-        pulsar_state_set_pos(ss, reqs[i].bank, ss->bank_pos[reqs[i].bank] + TokCount{1});
-        if (reqs[i].bank == ss->live_bank) {   /* the live bank moved past the host view */
+        const uint32_t b = pulsar_bank_index(reqs[i].bank);
+        pulsar_state_set_pos(ss, b, ss->bank_pos[b] + TokCount{1});
+        if (b == ss->live_bank) {   /* the live bank moved past the host view */
             s->checkpoint_valid = false;
             s->logits_stale = true;
         }
@@ -673,8 +674,8 @@ static bool driver_verify_rows(pulsar_session *s, const pulsar_multiseq_req *req
                                int32_t *pos, int32_t *bk, char *err, size_t errlen) {
     const pulsar_state_set *ss = s->states;
     for (uint32_t i = 0; i < n; i++) {
-        const uint32_t b = reqs[i].bank;
-        const bool run_start = i == 0 || reqs[i - 1].bank != b;
+        const uint32_t b = (uint32_t)reqs[i].bank.raw();   /* refused below when outside the pool (none() included) */
+        const bool run_start = i == 0 || reqs[i - 1].bank != reqs[i].bank;
         const TokPos want = run_start ? (b < ss->n_banks ? ss->bank_pos[b] : TokPos{0}) : reqs[i - 1].pos + TokCount{1};
         if (b >= ss->n_banks || reqs[i].pos != want) {
             if (err) snprintf(err, errlen, "%s: verify row %u (bank %u pos %d) is not its run's next position",
@@ -734,8 +735,8 @@ int pulsar_driver_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *req
     for (uint32_t i = 0; reqs && i < n_rows; i++)
         for (uint32_t j = 0; j < i; j++)
             if (reqs[j].bank == reqs[i].bank) {
-                if (err) snprintf(err, errlen, "%s: a fused prefill run (bank %u, %u+ rows) is not implemented; "
-                                  "prefill goes through sync", ARCH(e), reqs[i].bank, 2u);
+                if (err) snprintf(err, errlen, "%s: a fused prefill run (bank %d, %u+ rows) is not implemented; "
+                                  "prefill goes through sync", ARCH(e), reqs[i].bank.raw(), 2u);
                 return 1;
             }
     const int rc = pulsar_driver_decode_multiseq(s, reqs, n_rows, logits, logits_cap, err, errlen);
@@ -796,10 +797,10 @@ int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *req
     uint32_t n_pf = 0;
     const pulsar_family_vision *vis = e->family->vision;
     for (uint32_t i = n_dec; i < n_rows; i++) {
-        const uint32_t b = reqs[i].bank;
-        const bool starts = i == n_dec || b != reqs[i - 1].bank;
+        const uint32_t b = (uint32_t)reqs[i].bank.raw();   /* refused below when outside the pool (none() included) */
+        const bool starts = i == n_dec || reqs[i].bank != reqs[i - 1].bank;
         bool taken = false;
-        for (uint32_t j = 0; starts && j < i; j++) taken |= reqs[j].bank == b;
+        for (uint32_t j = 0; starts && j < i; j++) taken |= reqs[j].bank == reqs[i].bank;
         if (starts && n_pf < PULSAR_FUSED_PF_MAX) first[n_pf] = i;
         n_pf += starts ? 1u : 0u;
         const char *why = n_pf > shape->n_pf                                       ? "starts a run past the shape's"
@@ -825,7 +826,8 @@ int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *req
     /* each run at its bank's next position or from 0 (a run from 0 must not inherit a dead conversation's image
      * records: its rope would read them) */
     for (uint32_t r = 0; r < n_pf; r++) {
-        const uint32_t b = reqs[first[r]].bank, m = first[r + 1] - first[r];
+        /* refused below when outside the pool (none() included) */
+        const uint32_t b = (uint32_t)reqs[first[r]].bank.raw(), m = first[r + 1] - first[r];
         const int32_t p0 = reqs[first[r]].pos.raw();
         const pulsar_image_identity *img = b < ss->n_banks ? pulsar_session_bank_images(s, b, ss->live_bank) : NULL;
         const char *why = b >= ss->n_banks                            ? "is outside the pool"
@@ -845,7 +847,7 @@ int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *req
      * history is read before the step moves it */
     bool canonical[PULSAR_FUSED_PF_MAX];
     for (uint32_t r = 0; r < n_pf; r++) {
-        const uint32_t b = reqs[first[r]].bank;
+        const uint32_t b = pulsar_bank_index(reqs[first[r]].bank);
         if (reqs[first[r]].pos.raw() == 0 && !pulsar_state_reset_bank(ss, b)) {
             if (err) snprintf(err, errlen, "%s: fused step: bank %u could not be reset", ARCH(e), b);
             return -1;
@@ -866,7 +868,7 @@ int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *req
         return -1;
     }
     for (uint32_t r = 0; r < n_pf; r++) {
-        const uint32_t b = reqs[first[r]].bank;
+        const uint32_t b = pulsar_bank_index(reqs[first[r]].bank);
         const TokPos end = reqs[first[r]].pos + TokCount{(int)(first[r + 1] - first[r])};
         pulsar_state_set_pos(ss, b, end);
         if (canonical[r]) ss->prefill_pos[b] = end;
@@ -903,7 +905,7 @@ static bool driver_verify_single(pulsar_session *s, pulsar_spec_round *r, char *
     }
     /* the batched lane's verify (decode_mixed, every row headed) over this round's rows alone */
     pulsar_multiseq_req reqs[PULSAR_DRIVER_HEADS_MAX];
-    pulsar_spec_round_fill_reqs(r, s->states->live_bank, reqs);
+    pulsar_spec_round_fill_reqs(r, BankId{s->states->live_bank}, reqs);
     return s->engine->family->session->decode_mixed(s, reqs, R, NULL, 0, NULL, PULSAR_MSEQ_HEAD_ALL_ROWS, err,
                                                     errlen) == 0;
 }
@@ -921,7 +923,7 @@ static bool driver_spec_commit(pulsar_session *s, pulsar_spec_round *r, uint32_t
     pulsar_multiseq_req reqs[PULSAR_DRIVER_HEADS_MAX];
     int32_t tok[PULSAR_DRIVER_HEADS_MAX], pos[PULSAR_DRIVER_HEADS_MAX], bank[PULSAR_DRIVER_HEADS_MAX];
     if (r->n_batch > PULSAR_DRIVER_HEADS_MAX) return false;
-    pulsar_spec_round_fill_reqs(r, ss->live_bank, reqs);
+    pulsar_spec_round_fill_reqs(r, BankId{ss->live_bank}, reqs);
     if (!driver_verify_rows(s, reqs, r->n_batch, tok, pos, bank, NULL, 0)) return false;
     const uint32_t keep = 1u + commit;
     if (!pulsar_state_commit(ss, ss->live_bank, tok, keep)) return false;

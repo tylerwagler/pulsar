@@ -133,7 +133,7 @@ int GATE_ENTRY(int argc, char **argv) {
           "(want >= %d MiB, 4x the %u MiB tolerance floor at least)", step, step_price / MIB, step_mib, TOL_FLOOR_MIB);
 
     toks = (int *)malloc((size_t)peak * sizeof(int));
-    bool ok = toks != NULL && pulsar_session_bank_state_restore(s, 0);
+    bool ok = toks != NULL && pulsar_session_bank_state_restore(s, BankId{0});
     for (int i = 0; ok && i < peak; i++) toks[i] = base.v[i % base.len];
     pulsar_tokens p;
     memset(&p, 0, sizeof(p));
@@ -146,7 +146,7 @@ int GATE_ENTRY(int argc, char **argv) {
     double waited = 0;
     uint64_t free_prev = ok ? settled_free(&waited) : 0;
     uint64_t touched_prev = pulsar_session_touched_kv_bytes(s).raw();
-    uint64_t bank_prev = pulsar_session_bank_touched_kv_bytes(s, 0).raw();
+    uint64_t bank_prev = pulsar_session_bank_touched_kv_bytes(s, BankId{0}).raw();
     printf("kv-accounting: warm baseline: device free %.1f MiB (settled in %.1f s), touched %.1f MiB (bank 0 %.1f)\n",
            free_prev / MIB, waited, touched_prev / MIB, bank_prev / MIB);
     for (int i = 1; ok && i <= N_INC; i++) {
@@ -157,7 +157,7 @@ int GATE_ENTRY(int argc, char **argv) {
         if (!ok) break;
         const uint64_t free_now = settled_free(&waited);
         const uint64_t touched = pulsar_session_touched_kv_bytes(s).raw();
-        const uint64_t bank_now = pulsar_session_bank_touched_kv_bytes(s, 0).raw();
+        const uint64_t bank_now = pulsar_session_bank_touched_kv_bytes(s, BankId{0}).raw();
         const int64_t dphys = (int64_t)free_prev - (int64_t)free_now;
         const int64_t dtouched = (int64_t)touched - (int64_t)touched_prev;
         const int64_t dbank = (int64_t)bank_now - (int64_t)bank_prev;
@@ -174,19 +174,19 @@ int GATE_ENTRY(int argc, char **argv) {
 
     /* K2 */
     if (ok) {
-        pulsar_session_bank_state_save(s, 0);
-        ok = pulsar_session_bank_state_restore(s, 1);
+        pulsar_session_bank_state_save(s, BankId{0});
+        ok = pulsar_session_bank_state_restore(s, BankId{1});
         CHECK(ok, "K2 bank 1 installed (bank 0 idle)");
     }
     if (ok) {
-        const uint64_t t0 = pulsar_session_bank_touched_kv_bytes(s, 0).raw();
+        const uint64_t t0 = pulsar_session_bank_touched_kv_bytes(s, BankId{0}).raw();
         const uint64_t all0 = pulsar_session_touched_kv_bytes(s).raw();
         const uint64_t trunk = trunk_pool_bytes(s, (uint64_t)peak);
         const uint64_t f0 = settled_free(&waited);
-        const bool freed = pulsar_session_bank_free_physical(s, 0);
-        const uint64_t t0_after = pulsar_session_bank_touched_kv_bytes(s, 0).raw();
+        const bool freed = pulsar_session_bank_free_physical(s, BankId{0});
+        const uint64_t t0_after = pulsar_session_bank_touched_kv_bytes(s, BankId{0}).raw();
         const uint64_t all1 = pulsar_session_touched_kv_bytes(s).raw();
-        CHECK(freed && pulsar_session_bank_is_evicted(s, 0) && t0_after == 0 && all0 - all1 == t0 && t0 > 0,
+        CHECK(freed && pulsar_session_bank_is_evicted(s, BankId{0}) && t0_after == 0 && all0 - all1 == t0 && t0 > 0,
               "K2 bank 0 freed: evicted, its touched KV %.1f -> %.1f MiB, the session's %.1f -> %.1f MiB", t0 / MIB,
               t0_after / MIB, all0 / MIB, all1 / MIB);
         /* GB10 returns a freed managed range asynchronously: watch the device's free count for up to 60 s */

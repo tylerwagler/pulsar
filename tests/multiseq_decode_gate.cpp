@@ -136,7 +136,7 @@ static bool bank_load(pulsar_session *s, uint32_t bank, int k, const char *what)
     if (!g_snapshots)
         return gate_bank_sync(s, bank, g_toks.v + g_prompt_off[k], g_prompt_len[k], NULL, what);
     char err[256];
-    if (pulsar_session_bank_repoint(s, bank) != 0) {
+    if (pulsar_session_bank_repoint(s, BankId{bank}) != 0) {
         fprintf(stderr, "%s: bank %u repoint failed\n", what, bank);
         return false;
     }
@@ -145,7 +145,7 @@ static bool bank_load(pulsar_session *s, uint32_t bank, int k, const char *what)
         fprintf(stderr, "%s: bank %u load of prompt %d failed: %s\n", what, bank, k, err);
         return false;
     }
-    pulsar_session_bank_state_save(s, bank);
+    pulsar_session_bank_state_save(s, BankId{bank});
     return true;
 }
 
@@ -171,7 +171,7 @@ static bool multi_run(pulsar_session *s, int n, int steps, int **streams, double
     for (int j = 1; ok && j <= steps; j++) {
         pulsar_multiseq_req reqs[GATE_MAX_N];
         for (int k = 0; k < n; k++) {
-            reqs[k].bank = (uint32_t)k;
+            reqs[k].bank = BankId{k};
             reqs[k].pos = TokPos{g_prompt_len[k] + (j - 1)};
             reqs[k].token = TokId{streams[k][j - 1]};
         }
@@ -247,7 +247,7 @@ static bool check_stale_classic_fails_loud(void) {
     if (ok) {
         pulsar_multiseq_req reqs[2];
         for (int k = 0; k < 2; k++) {
-            reqs[k].bank = (uint32_t)k;
+            reqs[k].bank = BankId{k};
             reqs[k].pos = TokPos{g_prompt_len[k]};
             reqs[k].token = TokId{last[k]};
         }
@@ -333,11 +333,11 @@ static bool check_all_rows_head_mode(pulsar_session *s) {
          * modes -- the invariant under test is emission, not quality. */
         pulsar_multiseq_req reqs[4];
         for (int j = 0; j < 3; j++) {
-            reqs[j].bank = 0u;
+            reqs[j].bank = BankId{0};
             reqs[j].pos = TokPos{g_prompt_len[0] + j};
             reqs[j].token = TokId{g_first_tok[0]};
         }
-        reqs[3].bank = 1u;
+        reqs[3].bank = BankId{1};
         reqs[3].pos = TokPos{g_prompt_len[1]};
         reqs[3].token = TokId{g_first_tok[1]};
         uint32_t got = 0;

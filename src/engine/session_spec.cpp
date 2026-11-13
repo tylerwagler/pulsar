@@ -1288,9 +1288,9 @@ uint32_t pulsar_spec_round_n_rows(const pulsar_spec_round *r) {
     return r->n_batch;
 }
 
-uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, uint32_t bank, pulsar_multiseq_req *out) {
+uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, BankId bank_id, pulsar_multiseq_req *out) {
     for (uint32_t i = 0; i < r->n_batch; i++) {
-        out[i].bank = bank;
+        out[i].bank = bank_id;
         out[i].pos = r->saved_len + TokCount{(int)i};
         out[i].token = i == 0 ? r->base : TokId{r->pend[i - 1]};
     }
@@ -1505,7 +1505,7 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
         st->first_token = TokId::none();
         st->row0 = 0;
         st->n_rows = 0;
-        if (!spec_bank_restore(s, st->bank)) {
+        if (!spec_bank_restore(s, pulsar_bank_index(st->bank))) {
             st->status = PULSAR_SPEC_STEP_RESTORE_FAILED;
             continue;
         }
@@ -1544,7 +1544,7 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
                 rows += st->n_rows;
             }
         }
-        spec_bank_save(s, st->bank);
+        spec_bank_save(s, pulsar_bank_index(st->bank));
     }
     *n_rows_out = rows;
 }
@@ -1566,9 +1566,9 @@ void pulsar_spec_absorb_deferred(pulsar_session *s, pulsar_spec_step *steps, int
         for (int i = 0; i < n; i++) {
             pulsar_spec_step *st = &steps[i];
             bool had = false;
-            for (uint32_t k = 0; k < s->seed_defer.n && !had; k++) had = s->seed_defer.bank[k] == st->bank;
+            for (uint32_t k = 0; k < s->seed_defer.n && !had; k++) had = BankId{s->seed_defer.bank[k]} == st->bank;
             if (!had) continue;
-            pulsar_bank_view_invalidate(s, st->bank);
+            pulsar_bank_view_invalidate(s, pulsar_bank_index(st->bank));
             if (st->status != PULSAR_SPEC_STEP_OK) continue;
             st->status = PULSAR_SPEC_STEP_FAILED;
             st->round->redraft.valid = false;
@@ -1612,10 +1612,10 @@ void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_st
         st->pos_before = pulsar_spec_round_saved_len(st->round);
         st->pos_after = TokPos::none();   /* until the round ends */
         const bool begun = spec_round_begun(st->round);
-        if (!spec_bank_restore(s, st->bank)) {
+        if (!spec_bank_restore(s, pulsar_bank_index(st->bank))) {
             /* L375 O37: the bank cannot be installed to undo its round, so its saved view -- which still holds the
              * round's base and unverified drafts -- names no position */
-            if (begun) pulsar_bank_view_invalidate(s, st->bank);
+            if (begun) pulsar_bank_view_invalidate(s, pulsar_bank_index(st->bank));
             st->status = PULSAR_SPEC_STEP_RESTORE_FAILED;
             continue;
         }
@@ -1633,7 +1633,7 @@ void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_st
         if (na < 0) st->status = PULSAR_SPEC_STEP_FAILED;
         else st->n_accepted = na;
         st->pos_after = TokPos{s->pos()};
-        spec_bank_save(s, st->bank);
+        spec_bank_save(s, pulsar_bank_index(st->bank));
     }
     pulsar_spec_absorb_deferred(s, steps, n);
 }
@@ -1642,12 +1642,12 @@ void pulsar_session_spec_redraft_commit_batch_local(pulsar_session *s, pulsar_sp
     for (int i = 0; i < n; i++) {
         pulsar_spec_step *st = &steps[i];
         spec_step_reset(st);
-        if (!spec_bank_restore(s, st->bank)) {
+        if (!spec_bank_restore(s, pulsar_bank_index(st->bank))) {
             st->status = PULSAR_SPEC_STEP_RESTORE_FAILED;
             continue;
         }
         pulsar_session_spec_redraft_commit_local(s, st->round);
-        spec_bank_save(s, st->bank);
+        spec_bank_save(s, pulsar_bank_index(st->bank));
     }
 }
 
@@ -1670,7 +1670,7 @@ int pulsar_spec_steps_verdict(pulsar_spec_phase phase, const pulsar_spec_step *s
     h = spec_fp(h, n_rows);
     for (int i = 0; i < n; i++) {
         const pulsar_spec_step *st = &steps[i];
-        h = spec_fp(h, st->bank);
+        h = spec_fp(h, (uint32_t)st->bank.raw());
         h = spec_fp(h, (uint32_t)st->status);
         if (phase == PULSAR_SPEC_PHASE_ASSEMBLE) {
             h = spec_fp(h, (uint32_t)st->first_token.raw());
@@ -1697,8 +1697,9 @@ int pulsar_session_spec_redraft_peek(const pulsar_spec_round *r, int32_t ids[17]
     return 1;
 }
 
-uint32_t pulsar_session_bank_pendings(const pulsar_session *s, uint32_t bank, TokId *base, int32_t tok[16],
+uint32_t pulsar_session_bank_pendings(const pulsar_session *s, BankId bank_id, TokId *base, int32_t tok[16],
                                       float conf[16]) {
+    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */
     /* L108 P2: the live session's pending count may still be an
      * in-flight chain; complete it before peeking. Logically a lazy
      * read-completion, not observable-state mutation. */

@@ -2323,7 +2323,9 @@ typedef struct gen_state gen_state;
  */
 typedef struct session_slot {
     bool         provisioned;  ///< false until admitted; cleared on eviction (the slot is a reusable hole). Every reader that used to skip sess == NULL skips this.
-    uint32_t     bank;  ///< Tier-2: this slot's bank id in the shared pool (slot i -> bank i). 0 in classic (non-pooled) mode.
+    /** Tier-2: this slot's bank id in the shared pool (slot i -> bank i). 0 in classic (non-pooled) mode.  L334 P4:
+     *  typed; a bank finds its slot through server::slot_of_bank. */
+    BankId       bank;
     TokPos       committed_pos;  ///< Tier-2: this bank's committed KV frontier length (== pulsar_session_pos when this bank is the live one). Kept current at every op boundary so routing/metrics can read a non-live bank's position without a bank swap.
     struct job  *active_job;  ///< request bound to this slot, or NULL
     gen_state   *gen;  ///< resumable state for active_job
@@ -2639,6 +2641,24 @@ struct server {
      * published under mu for readers on client threads). */
     session_slot slots[PULSAR_SESSION_POOL_CAP];
     int          n_slots;  ///< provisioned slots (worker-owned; published under mu)
+    /** L334 P4: THE slot <-> bank crossing.  Slot i holds bank i by construction (cli_main sets slots[i].bank = i,
+     *  admission sets sl->bank = idx); every slots[] lookup by a bank goes through here, which checks the identity
+     *  (fae579f0 broke on it) and aborts when it does not hold.
+     *  @param b the bank (fatal on none())
+     *  @return the slot that holds bank `b` */
+    session_slot *slot_of_bank(BankId b) {
+        const uint32_t i = pulsar_bank_index(b);
+        if (i >= (uint32_t)PULSAR_SESSION_POOL_CAP || (slots[i].provisioned && slots[i].bank != b)) {
+            fprintf(stderr, "pulsar-server: bank %d has no slot of its own (slot i == bank i broken) -- refusing\n",
+                    b.raw());
+            abort();
+        }
+        return &slots[i];
+    }
+    /** const overload of slot_of_bank.
+     *  @param b the bank
+     *  @return the slot that holds bank `b` */
+    const session_slot *slot_of_bank(BankId b) const { return const_cast<server *>(this)->slot_of_bank(b); }
     /** Tier-2 bank-pool state (worker thread only). `pool_banks` > 0 means the
      * shared-pool flip is active: all live slots share server.sess and each
      * owns one bank; `live_bank` is the bank whose device views + host carry are
@@ -2647,7 +2667,7 @@ struct server {
      * knob and the classic decode lane are deleted — decode runs through the
      * batched quanta at every n >= 1. */
     int          pool_banks;  ///< banks in the shared pool; >0 means the pool flip is active
-    int          live_bank;   ///< bank whose device views + host carry are currently installed
+    BankId       live_bank;   ///< bank whose device views + host carry are installed (none(): nothing, L334 P4)
     /** plan-34 phase-2 inc 5: fused mixed-batch lane (PULSAR_MIXED_BATCH, default OFF,
      * read once at startup). When ON, the worker folds ONE prefilling slot's next
      * chunk (a K-row prefill run) into the decode quantum's first mixed step
@@ -3400,7 +3420,7 @@ struct server {
     /// @param err        receives the refusal (the numbers, and how many banks were spilled)
     /// @param errlen     its size
     /// @return true when the prefill may run; false = the budget still stands (the caller answers 503)
-    bool budget_admits_growth(uint32_t bank, int end_rows, char *err, size_t errlen);
+    bool budget_admits_growth(BankId bank, int end_rows, char *err, size_t errlen);
     /** The fused / mixed lanes' form: no remedy (banks would move under the step being assembled) and no refusal --
      *  short of the floor the prompt leaves the fused lane (gen->no_fuse) and its classic quantum decides. */
     /// @param sl the slot whose job this is (its gen_state; its bank installed by the caller unless said)
@@ -3695,20 +3715,20 @@ struct server {
     /// @param bank  the bank to install (out of range, or classic mode: a no-op)
     /// @param was   receives a guard-spilled bank's history when it installs empty (bank_unspill); may be NULL
     /// @return false when the bank is preempted or its state restore failed (the session then holds no valid bank)
-    bool bank_switch(int bank, spilled_history *was = nullptr);
+    bool bank_switch(BankId bank, spilled_history *was = nullptr);
     /** L330: install a guard-spilled bank EMPTY: re-back its physical and invalidate it, its history left on disk
      *  where the spill put it (into `was` when given).  A job bound to it restores that history a slice of segments
      *  a worker turn (gen_begin, GEN_RESTORE_SPILLED); the make-room eviction and the shutdown persist keep what the
      *  spill stored.  The caller saved the outgoing bank (bank_switch).  @return false when it cannot be re-backed. */
     /// @param bank  the spilled bank
     /// @param was   receives its history as spilled (may be NULL)
-    bool bank_unspill(int bank, spilled_history *was);
+    bool bank_unspill(BankId bank, spilled_history *was);
     /** L328 (2): the bank the pool parks on while bank `except`'s physical is freed (free_physical refuses the
      *  installed bank): bank 0 when it is resident and not `except`, else the lowest other resident bank
-     *  (server_park_pick over pulsar_session_bank_is_evicted); -1 when there is none -- the move is refused. */
+     *  (server_park_pick over pulsar_session_bank_is_evicted); none() when there is none -- the move is refused. */
     /// @param except  the bank whose physical is about to be freed
-    /// @return the bank to park on, or -1
-    int park_bank(int except);
+    /// @return the bank to park on, or none()
+    BankId park_bank(BankId except);
     /** L328 (3): an idle provisioned bank that holds nothing -- a fresh bank already provisioned (the one with the
      *  most resident pages); NULL when there is none. */
     /// @return the empty provisioned slot, or NULL (also off the bank pool)
@@ -5408,7 +5428,7 @@ bool gen_client_disconnected(int fd);
  *  error the job already carries is kept: the first cause is the one the client reads.
  *  @param g    the job's state; its err (when empty), finish and phase are set
  *  @param bank the bank, for the message */
-void gen_bank_install_failed(gen_state *g, uint32_t bank);
+void gen_bank_install_failed(gen_state *g, BankId bank);
 /** The context-overflow message in the request's protocol wording: Anthropic's "prompt is too long: N tokens > M
  *  maximum" (the text Claude Code matches to compact, L252 P5), else the OpenAI-side text.
  *  @param out             receives the message
@@ -5812,7 +5832,7 @@ inline int slot_tokens_common(const slot_tokens &a, const slot_tokens &b) {
  *  @param s the pool session
  *  @param bank the bank */
 /// @return the bank's position (0 for no history)
-inline TokPos server_bank_pos(pulsar_session *s, uint32_t bank) {
+inline TokPos server_bank_pos(pulsar_session *s, BankId bank) {
     const TokPos p = pulsar_session_bank_pos(s, bank);
     return p.is_none() ? TokPos{0} : p;
 }

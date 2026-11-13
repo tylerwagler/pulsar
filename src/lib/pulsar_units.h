@@ -454,6 +454,17 @@ struct pulsar_bank_tag;
 /** A bank id in a session's pool (L334 P4). */
 typedef pulsar_id<pulsar_bank_tag, int32_t> BankId;
 
+/** A bank as the index of a per-bank array (fatal on none(): indexing with "no bank" is always a bug).
+ *  @param b the bank */
+/// @return its index
+inline uint32_t pulsar_bank_index(BankId b) {
+    if (!b.is_token()) {
+        fprintf(stderr, "pulsar: bank %d is no bank -- refusing to index with it\n", b.raw());
+        abort();
+    }
+    return (uint32_t)b.raw();
+}
+
 static_assert(sizeof(BankId) == sizeof(int32_t) && std::is_trivial<BankId>::value &&
                   std::is_standard_layout<BankId>::value,
               "a bank id is as cheap as the int32 it replaces (arrays of it upload as int32)");
