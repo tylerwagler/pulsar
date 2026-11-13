@@ -4233,8 +4233,8 @@ int pulsar_tp_send_sync(pulsar_tp *tp, uint64_t session_id,
 }
 
 int pulsar_tp_send_eval(pulsar_tp *tp, uint64_t session_id,
-                        uint64_t seq, int token) {
-    pulsar_tp_eval_command msg = { session_id, seq, (int32_t)token, 0 };
+                        uint64_t seq, TokId token) {
+    pulsar_tp_eval_command msg = { session_id, seq, token.raw(), 0 };   /* the wire's int32 */
     return tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_EVAL, &msg, sizeof(msg));
 }
 
@@ -4280,8 +4280,8 @@ int pulsar_tp_recv_chunk_verdict(pulsar_tp *tp, uint64_t session_id, int *stop,
     return 1;
 }
 
-int pulsar_tp_send_rewind(pulsar_tp *tp, uint64_t session_id, int pos) {
-    pulsar_tp_value_command msg = { session_id, (int32_t)pos, 0 };
+int pulsar_tp_send_rewind(pulsar_tp *tp, uint64_t session_id, TokPos pos) {
+    pulsar_tp_value_command msg = { session_id, (int32_t)pos.raw(), 0 };   /* the wire's int32 */
     return tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_REWIND,
                          &msg, sizeof(msg));
 }

@@ -137,7 +137,7 @@ static int run_leader(pulsar_tp *tp) {
           std::strstr(err, "sync failed") != NULL,
           "the leader must read the worker's sync refusal as a failed ack: %s", err);
 
-    CHECK(pulsar_tp_send_eval(tp, SID, 4242, 99) != 0, "send_eval must report success as nonzero");
+    CHECK(pulsar_tp_send_eval(tp, SID, 4242, TokId{99}) != 0, "send_eval must report success as nonzero");
     err[0] = 0;
     CHECK(!pulsar_tp_wait_command_ack(tp, SID, "eval", err, sizeof(err)) &&
           std::strstr(err, "eval failed") != NULL,
@@ -228,7 +228,7 @@ static int run_leader(pulsar_tp *tp) {
 
     /* B. A void frame for an unknown session marks the worker's pair failed
      * silently; the next acked frame must carry that back AT ONCE. */
-    CHECK(pulsar_tp_send_rewind(tp, SID, 12) != 0, "send_rewind must report success as nonzero");
+    CHECK(pulsar_tp_send_rewind(tp, SID, TokPos{12}) != 0, "send_rewind must report success as nonzero");
     CHECK(pulsar_tp_send_sync(tp, SID, prompt.v, 4) != 0, "post-void sync send failed");
     err[0] = 0;
     CHECK(!pulsar_tp_wait_command_ack(tp, SID, "sync", err, sizeof(err)),

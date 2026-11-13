@@ -476,13 +476,13 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         if (!worker_refused(e, c, "sync check", &slot, ferr, sizeof(ferr))) {
             const int pos = slot->s->checkpoint.len;
             const uint64_t digest = pulsar_session_checkpoint_digest(slot->s);
-            if (pos == c->value && digest == c->seq) {
+            if (TokPos{pos} == pulsar_tp_command_pos(c) && digest == c->seq) {
                 status = 0;
             } else {
                 fprintf(stderr, "pulsar: tp worker: sync check: this rank's cached state differs "
                                 "from the leader's -- leader pos %d digest %016llx, this rank pos %d "
                                 "digest %016llx; refusing the sync (L250)\n",
-                        c->value, (unsigned long long)c->seq, pos, (unsigned long long)digest);
+                        pulsar_tp_command_pos(c).raw(), (unsigned long long)c->seq, pos, (unsigned long long)digest);
             }
         } else {
             fprintf(stderr, "pulsar: tp worker: sync check refused: %s\n", ferr);
@@ -500,7 +500,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
                          "the ranks are out of lockstep, refusing to decode",
                          (unsigned long long)c->seq, (unsigned long long)pos);
             } else {
-                rc = pulsar_session_family_eval(slot->s, c->value, ferr, sizeof(ferr));
+                rc = pulsar_session_family_eval(slot->s, pulsar_tp_command_token(c).raw(), ferr, sizeof(ferr));
             }
         }
         if (rc != 0) {
@@ -574,7 +574,8 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             pulsar_tp_mirror_fail_void(tp, op, ferr);
             return 1;
         }
-        if (c->type == PULSAR_TP_FRAME_REWIND) slot->s->engine->family->banks->rewind(slot->s, TokPos{c->value});   /* the leader sends one only with CAP_REWIND */
+        /* the leader sends one only with CAP_REWIND */
+        if (c->type == PULSAR_TP_FRAME_REWIND) slot->s->engine->family->banks->rewind(slot->s, pulsar_tp_command_pos(c));
         else                                   pulsar_session_family_invalidate(slot->s);
         return 1;
     }

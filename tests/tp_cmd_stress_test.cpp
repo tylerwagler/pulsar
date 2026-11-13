@@ -262,13 +262,13 @@ static int leader_step(pulsar_tp *tp, gen *g, char *err, size_t errlen) {
         const int s = pool_pick_live(g);
         if (s < 0) return 0;
         const uint64_t seq = ++g_seq[s];
-        if (!pulsar_tp_send_eval(tp, ID_BASE + s, seq, 2000 + s)) return 0;
+        if (!pulsar_tp_send_eval(tp, ID_BASE + s, seq, TokId{2000 + s})) return 0;
         return pulsar_tp_wait_command_ack(tp, ID_BASE + s, "eval", err, errlen);
     }
     if (op == 5) { /* rewind */
         const int s = pool_pick_live(g);
         if (s < 0) return 0;
-        if (!pulsar_tp_send_rewind(tp, ID_BASE + s, 1 + (int)(gen_next(g) % 100)))
+        if (!pulsar_tp_send_rewind(tp, ID_BASE + s, TokPos{1 + (int)(gen_next(g) % 100)}))
             return 0;
         return pulsar_tp_wait_command_ack(tp, ID_BASE + s, "rewind", err, errlen);
     }

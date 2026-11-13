@@ -24,6 +24,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include "pulsar.h"   /* pulsar_image_ref (SYNC_MM) */
 
 /// Wire magic of every control frame and the hello ("DS4T", as upstream).
@@ -736,16 +738,16 @@ int pulsar_tp_send_sync(pulsar_tp *tp, uint64_t session_id,
 /// @param tp         the transport (leader)
 /// @param session_id the session
 /// @param seq        the eval's sequence number
-/// @param token      the input token
+/// @param token      the input token (the frame's int32 on the wire)
 /// @return 1 when sent to every peer, 0 on failure
 int pulsar_tp_send_eval(pulsar_tp *tp, uint64_t session_id,
-                        uint64_t seq, int token);
+                        uint64_t seq, TokId token);
 /// Mirror a rewind to `pos`.
 /// @param tp         the transport (leader)
 /// @param session_id the session
 /// @param pos        the position to rewind to
 /// @return 1 when sent to every peer, 0 on failure
-int pulsar_tp_send_rewind(pulsar_tp *tp, uint64_t session_id, int pos);
+int pulsar_tp_send_rewind(pulsar_tp *tp, uint64_t session_id, TokPos pos);
 /// Mirror a session invalidate.
 /// @param tp         the transport (leader)
 /// @param session_id the session
@@ -1324,6 +1326,27 @@ typedef struct {
     /// Keys in `keys`.
     uint32_t n_keys;
 } pulsar_tp_command;
+
+/* L334 P3: the frame scalar `value` read by its meaning.  It is an EVAL's token, a REWIND's position, a SYNC_CHECK's
+ * cached position, a ctx size or a bank by frame type; a reader names the meaning it wants and the frame type is
+ * checked -- reading a REWIND's position as a token (or the reverse) is fatal, not silent. */
+/** The token an EVAL frame carries.  @param c the command (an EVAL; fatal otherwise)  @return the token */
+static inline TokId pulsar_tp_command_token(const pulsar_tp_command *c) {
+    if (c->type != PULSAR_TP_FRAME_EVAL) {
+        fprintf(stderr, "pulsar: tp: frame type %d carries no token in its value -- refusing\n", (int)c->type);
+        abort();
+    }
+    return TokId{c->value};
+}
+/** The position a REWIND or SYNC_CHECK frame carries.  @param c the command (fatal on another type)
+ *  @return the position */
+static inline TokPos pulsar_tp_command_pos(const pulsar_tp_command *c) {
+    if (c->type != PULSAR_TP_FRAME_REWIND && c->type != PULSAR_TP_FRAME_SYNC_CHECK) {
+        fprintf(stderr, "pulsar: tp: frame type %d carries no position in its value -- refusing\n", (int)c->type);
+        abort();
+    }
+    return TokPos{c->value};
+}
 
 /// Worker: block for the leader's next command (no deadline between commands).
 /// @param tp      the transport (worker)

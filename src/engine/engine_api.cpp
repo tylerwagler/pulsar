@@ -1088,7 +1088,7 @@ int pulsar_session_eval(pulsar_session *s, TokId token_id, char *err, size_t err
      * Without that check a rank that fell behind would decode the right token
      * at the wrong position and produce confident nonsense. */
     const uint64_t pos = (uint64_t)s->checkpoint.len;
-    if (!tp_mirror_sent(tp, "eval", pulsar_tp_send_eval(tp, s->tp_session_id, pos, token),
+    if (!tp_mirror_sent(tp, "eval", pulsar_tp_send_eval(tp, s->tp_session_id, pos, token_id),
                         err, errlen)) return 1;
     /* PIPELINED identity check (L241 4g-2): the previous eval's digest ack is
      * settled here, after this step's body -- it has been in the socket since
@@ -2241,7 +2241,7 @@ void pulsar_session_rewind(pulsar_session *s, TokPos pos) {
         return;
     }
     if (!tp_mirror_sent(tp, "rewind",
-                        pulsar_tp_send_rewind(tp, s->tp_session_id, pos.raw()), NULL, 0)) return;   /* the wire's int */
+                        pulsar_tp_send_rewind(tp, s->tp_session_id, pos), NULL, 0)) return;
     ops->rewind(s, pos);
 }
 TokPos pulsar_session_pos(pulsar_session *s) { return TokPos{s->pos()}; }

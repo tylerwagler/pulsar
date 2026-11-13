@@ -182,7 +182,7 @@ static void acks_ahead_phase(pulsar_tp *tp, uint8_t *base, int rank, const pulsa
     const uint64_t sid = 7171u;
     const uint64_t digest = agreed_digest(71u);
     if (rank == 0) {
-        CHECK(pulsar_tp_send_eval(tp, sid, 1, 21) == 1, "acks ahead: send_eval");
+        CHECK(pulsar_tp_send_eval(tp, sid, 1, TokId{21}) == 1, "acks ahead: send_eval");
         CHECK(pulsar_tp_defer_command_ack_digest(tp, sid, "eval at position 1", digest) == 1,
               "acks ahead: defer");
     } else {
@@ -205,7 +205,7 @@ static void lockstep_phase(pulsar_tp *tp, int rank) {
     char err[256];
     const uint64_t sid = 4242u;
     if (rank == 0) {
-        if (!pulsar_tp_send_eval(tp, sid, 77, 1234)) {
+        if (!pulsar_tp_send_eval(tp, sid, 77, TokId{1234})) {
             CHECK(0, "leader send_eval failed");
             return;
         }
@@ -447,10 +447,10 @@ static void deferred_phase(pulsar_tp *tp, int rank) {
         pulsar_tp_identity_stats(tp, &f0, &m0);
         /* a. eval, defer, eval, settle: the first step's ack is read after the
          * second step's frame went out. */
-        CHECK(pulsar_tp_send_eval(tp, sid, 1, 11) == 1, "deferred: send_eval #1");
+        CHECK(pulsar_tp_send_eval(tp, sid, 1, TokId{11}) == 1, "deferred: send_eval #1");
         CHECK(pulsar_tp_defer_command_ack_digest(tp, sid, "eval at position 1", digest) == 1,
               "deferred: defer #1");
-        CHECK(pulsar_tp_send_eval(tp, sid, 2, 12) == 1, "deferred: send_eval #2");
+        CHECK(pulsar_tp_send_eval(tp, sid, 2, TokId{12}) == 1, "deferred: send_eval #2");
         err[0] = 0;
         CHECK(pulsar_tp_settle_deferred_ack(tp, err, sizeof(err)) == 1,
               "deferred: settling an agreeing step must pass: %s", err);
@@ -468,7 +468,7 @@ static void deferred_phase(pulsar_tp *tp, int rank) {
         CHECK(frames - f0 == 2 && matched - m0 == 2, "deferred: tally %llu/%llu want 2/2",
               (unsigned long long)(matched - m0), (unsigned long long)(frames - f0));
         /* c. one deferral at a time. */
-        CHECK(pulsar_tp_send_eval(tp, sid, 3, 13) == 1, "deferred: send_eval #3");
+        CHECK(pulsar_tp_send_eval(tp, sid, 3, TokId{13}) == 1, "deferred: send_eval #3");
         CHECK(pulsar_tp_defer_command_ack_digest(tp, sid, "eval at position 3", digest) == 1,
               "deferred: defer #3");
         CHECK(pulsar_tp_defer_command_ack_digest(tp, sid, "eval at position 3", digest) == 0,
@@ -548,7 +548,7 @@ static void identity_phase(pulsar_tp *tp, int rank) {
         uint64_t frames = 0, matched = 0, f0 = 0, m0 = 0;
         pulsar_tp_identity_stats(tp, &f0, &m0);
         /* 1. Agreement. */
-        CHECK(pulsar_tp_send_eval(tp, sid, 5, 42) == 1, "identity: leader send_eval #1");
+        CHECK(pulsar_tp_send_eval(tp, sid, 5, TokId{42}) == 1, "identity: leader send_eval #1");
         err[0] = 0;
         CHECK(pulsar_tp_wait_command_ack_digest(tp, sid, "eval", digest, err, sizeof(err)) == 1,
               "identity: an equal digest must be accepted: %s", err);
@@ -596,7 +596,7 @@ static void identity_phase(pulsar_tp *tp, int rank) {
               (unsigned long long)(matched - m0), (unsigned long long)(frames - f0));
         CHECK(pulsar_tp_failed(tp), "identity: a verdict digest mismatch must mark the group failed");
         /* 2. A plain ack where a digest is due. */
-        CHECK(pulsar_tp_send_eval(tp, sid, 6, 43) == 1, "identity: leader send_eval #2");
+        CHECK(pulsar_tp_send_eval(tp, sid, 6, TokId{43}) == 1, "identity: leader send_eval #2");
         err[0] = 0;
         CHECK(pulsar_tp_wait_command_ack_digest(tp, sid, "eval", digest, err, sizeof(err)) == 0 &&
               std::strstr(err, "with no logits digest") != NULL,
@@ -612,7 +612,7 @@ static void identity_phase(pulsar_tp *tp, int rank) {
               std::strstr(err, "an unexpected logits digest") != NULL,
               "identity: a digest ack on a plain collect must refuse by name: %s", err);
         /* 4. Disagreement: the refusal names both digests and latches failed. */
-        CHECK(pulsar_tp_send_eval(tp, sid, 7, 44) == 1, "identity: leader send_eval #3");
+        CHECK(pulsar_tp_send_eval(tp, sid, 7, TokId{44}) == 1, "identity: leader send_eval #3");
         err[0] = 0;
         CHECK(pulsar_tp_wait_command_ack_digest(tp, sid, "eval", digest, err, sizeof(err)) == 0 &&
               std::strstr(err, "logits differ from the leader's on eval") != NULL,
@@ -623,7 +623,7 @@ static void identity_phase(pulsar_tp *tp, int rank) {
         CHECK(pulsar_tp_failed(tp), "identity: a disagreement must mark the group failed");
         /* 5. The drain reads an ack of either shape and keeps the stream aligned:
          * the next collect sees the next frame's ack, not a stale one. */
-        CHECK(pulsar_tp_send_eval(tp, sid, 8, 45) == 1, "identity: leader send_eval #4");
+        CHECK(pulsar_tp_send_eval(tp, sid, 8, TokId{45}) == 1, "identity: leader send_eval #4");
         pulsar_tp_drain_command_acks(tp);
         CHECK(pulsar_tp_send_sync(tp, sid, toks, 2) == 1, "identity: leader send_sync #2");
         err[0] = 0;
@@ -636,10 +636,10 @@ static void identity_phase(pulsar_tp *tp, int rank) {
          * step at position 9 disagrees, the leader has already shipped 10, and
          * the settle refuses naming the step whose logits differed; the drain
          * then reads 10's ack so nothing is left in the socket. */
-        CHECK(pulsar_tp_send_eval(tp, sid, 9, 46) == 1, "identity: leader send_eval #5");
+        CHECK(pulsar_tp_send_eval(tp, sid, 9, TokId{46}) == 1, "identity: leader send_eval #5");
         CHECK(pulsar_tp_defer_command_ack_digest(tp, sid, "eval at position 9", digest) == 1,
               "identity: defer the disagreeing step");
-        CHECK(pulsar_tp_send_eval(tp, sid, 10, 47) == 1, "identity: leader send_eval #6");
+        CHECK(pulsar_tp_send_eval(tp, sid, 10, TokId{47}) == 1, "identity: leader send_eval #6");
         err[0] = 0;
         CHECK(pulsar_tp_settle_deferred_ack(tp, err, sizeof(err)) == 0 &&
               std::strstr(err, "logits differ from the leader's on eval at position 9") != NULL,
