@@ -117,7 +117,7 @@ int main(int argc, char **argv) {
         std::vector<TokId> ids((size_t)n_tokens, TokId{100});
         for (int i = 0; i < span_len; i++) ids[(size_t)start_pos + i] = TokId{vocab + types[i]};
 
-        const uint64_t carrier_bytes = pulsar_gpu_tensor_bytes(sess->graph->batch_cur_hc);
+        const uint64_t carrier_bytes = pulsar_gpu_tensor_bytes(sess->graph->batch_cur_hc).raw();
         if ((uint64_t)n_tokens * per_row > carrier_bytes) {
             fprintf(stderr, "  FAIL case %u: prompt %d exceeds the carrier (%llu bytes)\n",
                     c, n_tokens, (unsigned long long)carrier_bytes);
@@ -133,8 +133,8 @@ int main(int argc, char **argv) {
         pulsar_vision_request vreq = { &img, 1, e };
 
         int bad = 0;
-        if (!pulsar_gpu_tensor_write(sess->graph->batch_cur_hc, 0, fill.data(),
-                                     (uint64_t)fill.size() * 2))
+        if (!pulsar_gpu_tensor_write(sess->graph->batch_cur_hc, TensorBytes{0}, fill.data(),
+                                     bytes_of<uint16_t>((uint64_t)fill.size())))
             { printf("FAIL case %u: carrier write failed\n", c); failures++; continue; }
 
         if (!gpu_graph_merge_image_spans(sess->graph->batch_cur_hc, ids.data(), n_tokens, &vreq, 0,
@@ -144,8 +144,8 @@ int main(int argc, char **argv) {
             continue;
         }
         if (!pulsar_gpu_end_commands() ||
-            !pulsar_gpu_tensor_read(sess->graph->batch_cur_hc, 0, back.data(),
-                                    (uint64_t)fill.size() * 2)) {
+            !pulsar_gpu_tensor_read(sess->graph->batch_cur_hc, TensorBytes{0}, back.data(),
+                                    bytes_of<uint16_t>((uint64_t)fill.size()))) {
             printf("  FAIL case %u: carrier read failed\n", c);
             failures++;
             continue;

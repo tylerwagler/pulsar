@@ -9087,8 +9087,8 @@ static void test_l347_i3a_no_room(void) {
  * the writes queued before it; a span out of range is refused.  Skipped, said, without a device. */
 static void test_l347_i3a_copy_out(void) {
     const uint64_t n = 3u << 20;
-    pulsar_gpu_tensor *t = pulsar_gpu_tensor_alloc(n);
-    uint8_t *host = (uint8_t *)pulsar_gpu_host_alloc(n);
+    pulsar_gpu_tensor *t = pulsar_gpu_tensor_alloc(TensorBytes{n});
+    uint8_t *host = (uint8_t *)pulsar_gpu_host_alloc(TensorBytes{n});
     if (!t || !host) {
         printf("  [skip] L347 I3a copy-out: no device memory or pinned host memory here\n");
         pulsar_gpu_tensor_free(t);
@@ -9097,13 +9097,15 @@ static void test_l347_i3a_copy_out(void) {
     }
     std::vector<uint8_t> src(n);
     for (uint64_t i = 0; i < n; i++) src[i] = (uint8_t)(i * 2654435761u >> 13);
-    TEST_ASSERT(pulsar_gpu_tensor_write_async(t, 0, src.data(), n) == 1);   /* queued: the fence must cover it */
+    TEST_ASSERT(pulsar_gpu_tensor_write_async(t, TensorBytes{0}, src.data(),
+                                              TensorBytes{n}) == 1);   /* queued: the fence must cover it */
     memset(host, 0xee, n);
-    const pulsar_gpu_copy_span spans[2] = { { t, 0, host + 10, 1000 }, { t, (2u << 20) + 3, host + 5000, 4097 } };
+    const pulsar_gpu_copy_span spans[2] = { { t, TensorBytes{0}, host + 10, TensorBytes{1000} },
+                                            { t, TensorBytes{(2u << 20) + 3}, host + 5000, TensorBytes{4097} } };
     TEST_ASSERT(pulsar_gpu_copy_out(spans, 2) == 1);
     TEST_ASSERT(!memcmp(host + 10, src.data(), 1000) && !memcmp(host + 5000, src.data() + (2u << 20) + 3, 4097));
     TEST_ASSERT(host[9] == 0xee && host[1010] == 0xee && host[5000 + 4097] == 0xee);
-    const pulsar_gpu_copy_span bad = { t, n - 10, host, 11 };
+    const pulsar_gpu_copy_span bad = { t, TensorBytes{n - 10}, host, TensorBytes{11} };
     TEST_ASSERT(pulsar_gpu_copy_out(&bad, 1) == 0);
     pulsar_gpu_tensor_free(t);
     pulsar_gpu_host_free(host);

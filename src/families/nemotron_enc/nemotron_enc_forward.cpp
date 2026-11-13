@@ -186,7 +186,7 @@ bool forward(pulsar_engine *e, const pulsar_tokens *in, uint32_t n, uint32_t row
             row_seq[o] = i;
             row_pos[o] = (uint32_t)t;
         }
-    if (!pulsar_gpu_tensor_write(r->sc->t[B_IDS], 0, ids.data(), (uint64_t)rows * 4u))
+    if (!pulsar_gpu_tensor_write(r->sc->t[B_IDS], TensorBytes{0}, ids.data(), bytes_of<TokId>(rows)))
         return fail(err, errlen, "the ids upload failed");
     pulsar_head_decl hd = {};
     hd.n_embd = E;
@@ -351,7 +351,8 @@ int encode(pulsar_engine *e, const pulsar_tokens *in, uint32_t n, float *out, ch
         {
             pulsar_group_gpu_phase ph;
             ok = forward(e, in + i0, i1 - i0, rows, err, errlen) &&
-                 (pulsar_gpu_tensor_read(r->sc->t[B_POOLED], 0, pooled.data(), (uint64_t)(i1 - i0) * E * 4u) ||
+                 (pulsar_gpu_tensor_read(r->sc->t[B_POOLED], TensorBytes{0}, pooled.data(),
+                                         bytes_of<float>((uint64_t)(i1 - i0) * E)) ||
                   fail(err, errlen, "the pooled rows' read failed"));
         }
         for (uint32_t i = i0; ok && i < i1; i++) {
@@ -419,8 +420,8 @@ bool pulsar_nemotron_enc_run_create(pulsar_engine *e) {
     A.rope_theta = s.rope_theta;
     A.block = 1;   /* every row of a run attends the whole run; nothing is stored */
     const std::vector<float> inv = yarn_inv_freq(s);
-    r->rope = pulsar_gpu_tensor_alloc(inv.size() * sizeof(float));
-    if (!r->rope || !pulsar_gpu_tensor_write(r->rope, 0, inv.data(), inv.size() * sizeof(float))) {
+    r->rope = pulsar_gpu_tensor_alloc(bytes_of<float>(inv.size()));
+    if (!r->rope || !pulsar_gpu_tensor_write(r->rope, TensorBytes{0}, inv.data(), bytes_of<float>(inv.size()))) {
         fprintf(stderr, "pulsar: %s: the rope table did not reach the device -- refusing\n", ARCH);
         return false;
     }
@@ -467,7 +468,7 @@ bool pulsar_nemotron_enc_run_create(pulsar_engine *e) {
     for (int b = 0; b < B_COUNT; b++) {
         if (need[b] > r->sc->bytes[b]) {
             pulsar_gpu_tensor_free(r->sc->t[b]);
-            r->sc->t[b] = pulsar_gpu_tensor_alloc(need[b]);
+            r->sc->t[b] = pulsar_gpu_tensor_alloc(TensorBytes{need[b]});
             r->sc->bytes[b] = r->sc->t[b] ? need[b] : 0;
             if (!r->sc->t[b]) {
                 fprintf(stderr, "pulsar: %s: the forward's scratch did not fit the device -- refusing\n", ARCH);

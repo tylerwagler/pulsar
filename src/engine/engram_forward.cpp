@@ -216,8 +216,8 @@ bool engram_upload(pulsar_weights *w, const pulsar_model *m) {
         const unsigned char *kp = (const unsigned char *)tensor_map_base(m, k) + k->abs_offset;
         /* the reference's `q_weight.float() * k_weight.float()` -- only ever used as the product */
         for (uint64_t i = 0; i < hd; i++) qk[i] = engram_elt_f32(q, qp, i) * engram_elt_f32(k, kp, i);
-        em->qk[l] = pulsar_gpu_tensor_alloc(hd * sizeof(float));
-        ok = em->qk[l] && pulsar_gpu_tensor_write(em->qk[l], 0, qk, hd * sizeof(float));
+        em->qk[l] = pulsar_gpu_tensor_alloc(bytes_of<float>(hd));
+        ok = em->qk[l] && pulsar_gpu_tensor_write(em->qk[l], TensorBytes{0}, qk, bytes_of<float>(hd));
     }
     free(qk);
     return ok || engram_refuse("could not upload the q*k gate weights");
@@ -250,9 +250,9 @@ bool gpu_graph_engram_alloc(pulsar_gpu_graph *g, const pulsar_weights *w, uint32
     g->engram.cap = cap;
     g->engram.n_banks = n_banks ? n_banks : 1u;
     const uint64_t rec = (uint64_t)PULSAR_ENGRAM_N_COLS * PULSAR_ENGRAM_ROW_BYTES;
-    g->engram.rows = pulsar_gpu_tensor_alloc((uint64_t)cap * rec);
-    g->engram.x_key = pulsar_gpu_tensor_alloc((uint64_t)cap * ENGRAM_IN * sizeof(float));
-    g->engram.kv = pulsar_gpu_tensor_alloc((uint64_t)cap * (PULSAR_N_HC + 1u) * PULSAR_N_EMBD * sizeof(float));
+    g->engram.rows = pulsar_gpu_tensor_alloc(TensorBytes{rec}.times(cap));
+    g->engram.x_key = pulsar_gpu_tensor_alloc(bytes_of<float>((uint64_t)cap * ENGRAM_IN));
+    g->engram.kv = pulsar_gpu_tensor_alloc(bytes_of<float>((uint64_t)cap * (PULSAR_N_HC + 1u) * PULSAR_N_EMBD));
     for (uint32_t l = 0; l < em->n_layers; l++) {
         g->engram.host_rows[l] = (unsigned char *)xmalloc((size_t)cap * rec);
         g->engram.ids[l] = (uint64_t *)xmalloc((size_t)cap * PULSAR_ENGRAM_N_COLS * sizeof(uint64_t));
@@ -379,8 +379,8 @@ bool gpu_graph_engram_apply(pulsar_gpu_graph *g, const pulsar_model *model, cons
         fprintf(stderr, "pulsar: engram: block %u runs rows -> MX slot -> wkv -> gate + add (first step %u rows)\n",
                 il, n_tokens);
     }
-    const uint64_t rec = (uint64_t)PULSAR_ENGRAM_N_COLS * PULSAR_ENGRAM_ROW_BYTES;
-    bool ok = pulsar_gpu_tensor_write(g->engram.rows, 0, g->engram.host_rows[l], (uint64_t)n_tokens * rec) != 0;
+    const TensorBytes rec = TensorBytes{PULSAR_ENGRAM_ROW_BYTES}.times(PULSAR_ENGRAM_N_COLS);
+    bool ok = pulsar_gpu_tensor_write(g->engram.rows, TensorBytes{0}, g->engram.host_rows[l], rec.times(n_tokens)) != 0;
     ok = ok && pulsar_gpu_engram_rows_emit(g->engram.x_key, g->engram.rows, n_tokens) != 0;
     ok = ok && pulsar_linear_slot(g->engram.kv, model, layer->engram_wkv, ENGRAM_IN, 0,
                                   (uint64_t)(PULSAR_N_HC + 1u) * PULSAR_N_EMBD, g->engram.x_key, n_tokens);

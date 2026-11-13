@@ -14,16 +14,19 @@ import sys
 SITE = ("    /* the MoE non-finite flag starts every step clear (read at pulsar_qwen_s4_step_end) */\n"
         "    pulsar_gpu_tensor *moe_sc = st->st->scratch[PULSAR_QWEN_OP_MOE];\n"
         "    static const uint32_t zero = 0;   /* L289: an enqueued write reads it later */\n"
-        "    if (!moe_sc || !pulsar_gpu_tensor_write_async(moe_sc, moe_layout(st->shape, st->st->max_rows).nf, &zero, "
-        "sizeof(zero)))\n"
+        "    if (!moe_sc || !pulsar_gpu_tensor_write_async(moe_sc, "
+        "TensorBytes{moe_layout(st->shape, st->st->max_rows).nf},\n"
+        "                                                  &zero, TensorBytes{sizeof(zero)}))\n"
         "        return fail(\"could not clear the MoE non-finite flag\");\n")
 MUTANT = ("    /* the MoE non-finite flag starts every step clear (read at pulsar_qwen_s4_step_end) */\n"
           "    pulsar_gpu_tensor *moe_sc = st->st->scratch[PULSAR_QWEN_OP_MOE];\n"
           "    static const uint32_t zero = 0;   /* L289: an enqueued write reads it later */\n"
           "    static const void *l307_mutant_cleared = NULL;   /* L307 MUTANT: each arena cleared on its first step only */\n"
           "    if (!moe_sc || (dptr(moe_sc) != l307_mutant_cleared &&\n"
-          "                    !pulsar_gpu_tensor_write_async(moe_sc, moe_layout(st->shape, st->st->max_rows).nf, &zero,\n"
-          "                                                   sizeof(zero))))\n"
+          "                    !pulsar_gpu_tensor_write_async(moe_sc,\n"
+          "                                                   "
+          "TensorBytes{moe_layout(st->shape, st->st->max_rows).nf},\n"
+          "                                                   &zero, TensorBytes{sizeof(zero)})))\n"
           "        return fail(\"could not clear the MoE non-finite flag\");\n"
           "    l307_mutant_cleared = dptr(moe_sc);\n")
 

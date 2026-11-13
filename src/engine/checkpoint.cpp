@@ -93,7 +93,7 @@ static bool ckpt_stage_fit(pulsar_ckpt_store *st, uint64_t need) {
     for (uint32_t k = 0; k < PULSAR_CKPT_STAGES; k++) {
         if (st->stage[k] && pulsar_gpu_lane_wait(st->lane, k) == 0) return false;
         pulsar_gpu_tensor_free(st->stage[k]);
-        st->stage[k] = pulsar_gpu_tensor_alloc(need);
+        st->stage[k] = pulsar_gpu_tensor_alloc(TensorBytes{need});
         if (!st->stage[k]) {
             fprintf(stderr, "pulsar: checkpoint staging buffer %u (%llu bytes, %s) allocation failed\n", k,
                     (unsigned long long)need, st->ops->name);
@@ -122,7 +122,7 @@ static bool ckpt_out(pulsar_ckpt_store *st, const ckpt_place &p, bool frontier, 
     const uint32_t done[2] = {p.ticket, k};
     return pulsar_gpu_lane_order(st->lane, k) != 0 &&
            st->ops->walk(st->state, 0, frontier, st->stage[k], 0, pulsar_ckpt_pos(G), NULL) &&
-           pulsar_gpu_lane_d2h(st->lane, st->stage[k], 0, p.host, p.bytes, done, 2u) != 0;
+           pulsar_gpu_lane_d2h(st->lane, st->stage[k], TensorBytes{0}, p.host, TensorBytes{p.bytes}, done, 2u) != 0;
 }
 
 /* `p` -> the installed bank's state at G.  Device tier: the walk from the slab.  Host tier: the session stream waits
@@ -141,7 +141,7 @@ static bool ckpt_in(pulsar_ckpt_store *st, const ckpt_place &p, bool frontier, u
     const uint32_t k = st->stage_next++ % PULSAR_CKPT_STAGES;
     *staged = k;
     return pulsar_gpu_lane_order(st->lane, k) != 0 &&
-           pulsar_gpu_lane_h2d(st->lane, st->stage[k], 0, p.host, p.bytes, p.ticket) != 0 &&
+           pulsar_gpu_lane_h2d(st->lane, st->stage[k], TensorBytes{0}, p.host, TensorBytes{p.bytes}, p.ticket) != 0 &&
            st->ops->walk(st->state, 1, frontier, st->stage[k], 0, pulsar_ckpt_pos(G), NULL);
 }
 
@@ -153,9 +153,11 @@ static bool ckpt_in(pulsar_ckpt_store *st, const ckpt_place &p, bool frontier, u
 /// @param staged the staging buffer ckpt_in used (host tier)
 /// @return false on a failed copy
 static bool ckpt_copy(pulsar_ckpt_store *st, const ckpt_place &dst, const ckpt_place &src, uint32_t staged) {
-    if (!st->host) return pulsar_gpu_tensor_copy_async(dst.slab, dst.off, src.slab, src.off, src.bytes) != 0;
+    if (!st->host) return pulsar_gpu_tensor_copy_async(dst.slab, TensorBytes{dst.off}, src.slab, TensorBytes{src.off},
+                                                       TensorBytes{src.bytes}) != 0;
     const uint32_t done[2] = {dst.ticket, staged};
-    return pulsar_gpu_lane_d2h(st->lane, st->stage[staged], 0, dst.host, src.bytes, done, 2u) != 0;
+    return pulsar_gpu_lane_d2h(st->lane, st->stage[staged], TensorBytes{0}, dst.host, TensorBytes{src.bytes}, done,
+                               2u) != 0;
 }
 
 int pulsar_ckpt_host_tier(void) {
@@ -207,7 +209,7 @@ bool pulsar_ckpt_alloc_tier(pulsar_ckpt_store *st, const pulsar_kv_state_ops *op
             return false;
         }
     }
-    const uint64_t slab_bytes = (uint64_t)ops->ckpt_slots * st->slot_bytes;
+    const TensorBytes slab_bytes = TensorBytes{st->slot_bytes}.times(ops->ckpt_slots);
     for (uint32_t b = 0; b < n_banks; b++) {
         const bool ok = st->host ? dry || (st->host_slab[b] = (uint8_t *)pulsar_gpu_host_alloc(slab_bytes)) != NULL
                                  : (st->slab[b] = pulsar_gpu_tensor_alloc(slab_bytes)) != NULL;
@@ -224,8 +226,8 @@ bool pulsar_ckpt_alloc_tier(pulsar_ckpt_store *st, const pulsar_kv_state_ops *op
     for (uint32_t i = 0; i < st->n_rec; i++) {
         pulsar_ckpt_record *r = &st->rec[i];
         r->T = 0u;
-        const bool ok = st->host ? dry || (r->host = (uint8_t *)pulsar_gpu_host_alloc(end)) != NULL
-                                 : (r->slab = pulsar_gpu_tensor_alloc(end)) != NULL;
+        const bool ok = st->host ? dry || (r->host = (uint8_t *)pulsar_gpu_host_alloc(TensorBytes{end})) != NULL
+                                 : (r->slab = pulsar_gpu_tensor_alloc(TensorBytes{end})) != NULL;
         if (!ok) {
             fprintf(stderr, "pulsar: record %u of %u (%llu bytes, %s, %s) allocation failed\n", i, st->n_rec,
                     (unsigned long long)end, ops->name, st->host ? "pinned host RAM" : "device");
@@ -433,11 +435,11 @@ bool pulsar_ckpt_record_capture(pulsar_ckpt_store *st, BankId bank, pulsar_ckpt_
         if (st->host) {   /* its last copy lands before its bytes go */
             ok = pulsar_gpu_lane_wait(st->lane, ckpt_ticket_rec(st, r)) != 0;
             pulsar_gpu_host_free(r->host);
-            r->host = ok ? (uint8_t *)pulsar_gpu_host_alloc(need) : NULL;
+            r->host = ok ? (uint8_t *)pulsar_gpu_host_alloc(TensorBytes{need}) : NULL;
             ok = r->host != NULL;
         } else {
             pulsar_gpu_tensor_free(r->slab);
-            r->slab = pulsar_gpu_tensor_alloc(need);
+            r->slab = pulsar_gpu_tensor_alloc(TensorBytes{need});
             ok = r->slab != NULL;
         }
         r->cap = ok ? need : 0u;
@@ -591,8 +593,8 @@ bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, BankId dst, BankId src, TokPos T_a
             const uint64_t rows = (uint64_t)pulsar_comp_rows_cover(TokCount{(int)T}, sp[i].tokens_per_row).raw();
             if (!sp[i].rows || !dp[i].rows) why = "a bank's physical is freed";
             else if (sp[i].tokens_per_row != dp[i].tokens_per_row || sp[i].row_bytes != dp[i].row_bytes ||
-                     rows * dp[i].row_bytes > pulsar_gpu_tensor_bytes(dp[i].rows) ||
-                     rows * sp[i].row_bytes > pulsar_gpu_tensor_bytes(sp[i].rows))
+                     TensorBytes{dp[i].row_bytes}.times(rows) > pulsar_gpu_tensor_bytes(dp[i].rows) ||
+                     TensorBytes{sp[i].row_bytes}.times(rows) > pulsar_gpu_tensor_bytes(sp[i].rows))
                 why = "a pool's rows do not fit";
         }
     }
@@ -610,7 +612,8 @@ bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, BankId dst, BankId src, TokPos T_a
                  : st->ops->prepare_restore(st->state, pulsar_ckpt_pos(T));
     for (uint32_t i = 0; ok && i < n; i++) {
         const uint64_t rows = (uint64_t)pulsar_comp_rows_cover(TokCount{(int)T}, sp[i].tokens_per_row).raw();
-        ok = pulsar_gpu_tensor_copy_async(dp[i].rows, 0, sp[i].rows, 0, rows * sp[i].row_bytes) != 0;
+        ok = pulsar_gpu_tensor_copy_async(dp[i].rows, TensorBytes{0}, sp[i].rows, TensorBytes{0},
+                                          TensorBytes{sp[i].row_bytes}.times(rows)) != 0;
     }
     uint32_t staged = 0;
     ok = ok && ckpt_in(st, from, r != NULL, T, &staged);
@@ -750,7 +753,7 @@ bool pulsar_ckpt_slot_get(const pulsar_ckpt_store *st, const pulsar_ckpt_slot_at
         memcpy(dst, at->host, st->slot_bytes);
         return true;
     }
-    const pulsar_gpu_copy_span span = {at->slab, at->off, dst, st->slot_bytes};
+    const pulsar_gpu_copy_span span = {at->slab, TensorBytes{at->off}, dst, TensorBytes{st->slot_bytes}};
     return pulsar_gpu_copy_out(&span, 1u) != 0;
 }
 
@@ -759,7 +762,7 @@ bool pulsar_ckpt_slot_put(const pulsar_ckpt_store *st, const pulsar_ckpt_slot_at
         memcpy(at->host, src, st->slot_bytes);
         return true;
     }
-    return pulsar_gpu_tensor_write(at->slab, at->off, src, st->slot_bytes) != 0;
+    return pulsar_gpu_tensor_write(at->slab, TensorBytes{at->off}, src, TensorBytes{st->slot_bytes}) != 0;
 }
 
 void pulsar_ckpt_commit(pulsar_ckpt_store *st, BankId bank, uint32_t slot, TokPos G) {

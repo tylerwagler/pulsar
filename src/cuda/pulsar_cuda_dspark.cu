@@ -278,7 +278,7 @@ static int dspark_markov_reduce_blocks(const pulsar_gpu_tensor *id_dev,
         grid_dim);
     if (!cuda_ok(cudaGetLastError(), "dspark markov reduce launch")) return 0;
     int32_t out;
-    if (!pulsar_gpu_tensor_read(out_dev, 0, &out, sizeof(out))) return 0;
+    if (!pulsar_gpu_tensor_read(out_dev, TensorBytes{0}, &out, TensorBytes{sizeof(out)})) return 0;
     *refined_id_dst = out;
     return 1;
 }
@@ -310,9 +310,9 @@ int pulsar_gpu_dspark_markov_step_model(
      * position, noise next to that path's per-position 517 KB qrow read. */
     static thread_local pulsar_gpu_tensor *staged_id = NULL;
     if (!staged_id && !pulsar_gpu_seg_grow("the dspark staged id", 0)) return 0;   /* the one rule for a grow */
-    if (!staged_id) staged_id = pulsar_gpu_tensor_alloc(sizeof(int32_t));
+    if (!staged_id) staged_id = pulsar_gpu_tensor_alloc(bytes_of<int32_t>(1));
     if (!staged_id) return 0;
-    if (!pulsar_gpu_tensor_write(staged_id, 0, &prev_token, sizeof(int32_t)))
+    if (!pulsar_gpu_tensor_write(staged_id, TensorBytes{0}, &prev_token, bytes_of<int32_t>(1)))
         return 0;
 
     /* Sized by the STORAGE width, not sizeof(float): a bf16 markov head is half
@@ -378,9 +378,9 @@ int pulsar_gpu_dspark_markov_step_model(
         pulsar_gpu_tensor_free(rb.id);
         pulsar_gpu_tensor_free(rb.val);
         pulsar_gpu_tensor_free(rb.out);
-        rb.id  = pulsar_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(int32_t));
-        rb.val = pulsar_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(float));
-        rb.out = pulsar_gpu_tensor_alloc(sizeof(int32_t));
+        rb.id  = pulsar_gpu_tensor_alloc(bytes_of<int32_t>(grid_dim));
+        rb.val = pulsar_gpu_tensor_alloc(bytes_of<float>(grid_dim));
+        rb.out = pulsar_gpu_tensor_alloc(bytes_of<int32_t>(1));
         rb.cap = (rb.id && rb.val && rb.out) ? grid_dim : 0;
     }
     if (!rb.id || !rb.val || !rb.out) return 0;
@@ -966,8 +966,8 @@ static int dspark_markov_banks_launch(
         pulsar_gpu_tensor_free(bb.id);
         pulsar_gpu_tensor_free(bb.val);
         const uint32_t cap = PULSAR_DSPARK_BANKS_MAX * grid_dim;
-        bb.id  = pulsar_gpu_tensor_alloc((uint64_t)cap * sizeof(int32_t));
-        bb.val = pulsar_gpu_tensor_alloc((uint64_t)cap * sizeof(float));
+        bb.id  = pulsar_gpu_tensor_alloc(bytes_of<int32_t>(cap));
+        bb.val = pulsar_gpu_tensor_alloc(bytes_of<float>(cap));
         bb.cap = (bb.id && bb.val) ? cap : 0;
     }
     if (!bb.id || !bb.val) return 0;

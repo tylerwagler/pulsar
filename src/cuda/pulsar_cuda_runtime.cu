@@ -1498,8 +1498,8 @@ void pulsar_gpu_cleanup(void) {
 static uint64_t g_tensor_alloc_bytes;
 
 /// @return the live owning tensor bytes (g_tensor_alloc_bytes)
-uint64_t pulsar_gpu_tensor_alloc_bytes_current(void) {
-    return __atomic_load_n(&g_tensor_alloc_bytes, __ATOMIC_RELAXED);
+TensorBytes pulsar_gpu_tensor_alloc_bytes_current(void) {
+    return TensorBytes{__atomic_load_n(&g_tensor_alloc_bytes, __ATOMIC_RELAXED)};
 }
 
 /* Dry-run allocation: between dry_begin and dry_end on this thread, the two
@@ -1524,9 +1524,9 @@ void pulsar_gpu_tensor_dry_begin(void) {
     g_dry.cursor = 4096;
 }
 
-void pulsar_gpu_tensor_dry_end(uint64_t *bytes, uint64_t *managed_bytes) {
-    if (bytes) *bytes = g_dry.bytes;
-    if (managed_bytes) *managed_bytes = g_dry.managed_bytes;
+void pulsar_gpu_tensor_dry_end(TensorBytes *bytes, TensorBytes *managed_bytes) {
+    if (bytes) *bytes = TensorBytes{g_dry.bytes};
+    if (managed_bytes) *managed_bytes = TensorBytes{g_dry.managed_bytes};
     g_dry.active = 0;
 }
 
@@ -1567,12 +1567,13 @@ pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_elt(uint64_t n_elems, uint32_t esz,
                 (int)fmt, esz);
         return NULL;
     }
-    pulsar_gpu_tensor *t = pulsar_gpu_tensor_alloc(n_elems * esz);
+    pulsar_gpu_tensor *t = pulsar_gpu_tensor_alloc(elt_bytes(n_elems, esz));
     if (t) { t->esz = esz; t->fmt = (uint32_t)fmt; }
     return t;
 }
 
-pulsar_gpu_tensor *pulsar_gpu_tensor_alloc(uint64_t bytes) {
+pulsar_gpu_tensor *pulsar_gpu_tensor_alloc(TensorBytes size) {
+    uint64_t bytes = size.raw();
     if (bytes == 0) bytes = 1;
     if (g_dry.active) return dry_alloc(bytes, 0);
     pulsar_gpu_tensor *t = (pulsar_gpu_tensor *)calloc(1, sizeof(*t));
@@ -1589,7 +1590,8 @@ pulsar_gpu_tensor *pulsar_gpu_tensor_alloc(uint64_t bytes) {
 
 
 
-pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_managed(uint64_t bytes) {
+pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_managed(TensorBytes size) {
+    uint64_t bytes = size.raw();
     if (bytes == 0) bytes = 1;
     if (g_dry.active) return dry_alloc(bytes, 1);
     pulsar_gpu_tensor *t = (pulsar_gpu_tensor *)calloc(1, sizeof(*t));
@@ -1648,7 +1650,8 @@ int pulsar_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t con
 
 
 
-pulsar_gpu_tensor *pulsar_gpu_tensor_view(const pulsar_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
+pulsar_gpu_tensor *pulsar_gpu_tensor_view(const pulsar_gpu_tensor *base, TensorBytes offset_b, TensorBytes bytes_b) {
+    const uint64_t offset = offset_b.raw(), bytes = bytes_b.raw();
     if (!base || offset > base->bytes || bytes > base->bytes - offset) return NULL;
     pulsar_gpu_tensor *t = (pulsar_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
@@ -1674,8 +1677,8 @@ void pulsar_gpu_tensor_free(pulsar_gpu_tensor *tensor) {
 
 
 
-uint64_t pulsar_gpu_tensor_bytes(const pulsar_gpu_tensor *tensor) {
-    return tensor ? tensor->bytes : 0;
+TensorBytes pulsar_gpu_tensor_bytes(const pulsar_gpu_tensor *tensor) {
+    return TensorBytes{tensor ? tensor->bytes : 0};
 }
 
 
@@ -1725,7 +1728,8 @@ void pulsar_gpu_sync_stats_get(pulsar_gpu_sync_stats *out) {
     out->h2d = __atomic_load_n(&g_sync_stats.h2d, __ATOMIC_RELAXED);
 }
 
-int pulsar_gpu_tensor_write(pulsar_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
+int pulsar_gpu_tensor_write(pulsar_gpu_tensor *tensor, TensorBytes offset_b, const void *data, TensorBytes bytes_b) {
+    const uint64_t offset = offset_b.raw(), bytes = bytes_b.raw();
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     if (tensor->dry) return 1;
     pulsar_cuda_sync_note(3, bytes);
@@ -1734,14 +1738,17 @@ int pulsar_gpu_tensor_write(pulsar_gpu_tensor *tensor, uint64_t offset, const vo
 
 
 
-int pulsar_gpu_tensor_write_async(pulsar_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
+int pulsar_gpu_tensor_write_async(pulsar_gpu_tensor *tensor, TensorBytes offset_b, const void *data,
+                                  TensorBytes bytes_b) {
+    const uint64_t offset = offset_b.raw(), bytes = bytes_b.raw();
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     if (tensor->dry || bytes == 0) return 1;
     return cuda_ok(cudaMemcpyAsync((char *)tensor->ptr + offset, data, (size_t)bytes, cudaMemcpyHostToDevice,
                                    cudaStreamPerThread), "tensor write async");
 }
 
-void *pulsar_gpu_host_alloc(uint64_t bytes) {
+void *pulsar_gpu_host_alloc(TensorBytes bytes_b) {
+    const uint64_t bytes = bytes_b.raw();
     void *p = NULL;
     if (bytes == 0 || !cuda_ok(cudaMallocHost(&p, (size_t)bytes), "pinned host alloc")) return NULL;
     return p;
@@ -1764,13 +1771,14 @@ int pulsar_gpu_copy_out(const pulsar_gpu_copy_span *spans, uint32_t n) {
     uint64_t total = 0;
     for (uint32_t i = 0; i < n; i++) {
         const pulsar_gpu_copy_span &c = spans[i];
-        if (!c.src || !c.dst || c.offset > c.src->bytes || c.bytes > c.src->bytes - c.offset) {
+        const uint64_t off = c.offset.raw(), bytes = c.bytes.raw();
+        if (!c.src || !c.dst || off > c.src->bytes || bytes > c.src->bytes - off) {
             fprintf(stderr, "pulsar: copy-out span %u out of range (offset %llu + %llu > %llu bytes)\n", i,
-                    (unsigned long long)c.offset, (unsigned long long)c.bytes,
+                    (unsigned long long)off, (unsigned long long)bytes,
                     (unsigned long long)(c.src ? c.src->bytes : 0));
             return 0;
         }
-        total += c.bytes;
+        total += bytes;
     }
     if (!t_copy_stream && !cuda_ok(cudaStreamCreateWithFlags(&t_copy_stream, cudaStreamNonBlocking), "copy stream"))
         return 0;
@@ -1783,8 +1791,8 @@ int pulsar_gpu_copy_out(const pulsar_gpu_copy_span *spans, uint32_t n) {
         return 0;
     for (uint32_t i = 0; i < n; i++) {
         const pulsar_gpu_copy_span &c = spans[i];
-        if (c.bytes == 0 || c.src->dry) continue;
-        if (!cuda_ok(cudaMemcpyAsync(c.dst, (const char *)c.src->ptr + c.offset, (size_t)c.bytes,
+        if (c.bytes.raw() == 0 || c.src->dry) continue;
+        if (!cuda_ok(cudaMemcpyAsync(c.dst, (const char *)c.src->ptr + c.offset.raw(), (size_t)c.bytes.raw(),
                                      cudaMemcpyDeviceToHost, t_copy_stream), "copy-out"))
             return 0;
     }
@@ -1943,8 +1951,9 @@ static bool lane_wait_copy(pulsar_gpu_lane *lane, uint32_t ticket) {
     return ok;
 }
 
-int pulsar_gpu_lane_d2h(pulsar_gpu_lane *lane, const pulsar_gpu_tensor *src, uint64_t offset, void *dst,
-                        uint64_t bytes, const uint32_t *done, uint32_t n_done) {
+int pulsar_gpu_lane_d2h(pulsar_gpu_lane *lane, const pulsar_gpu_tensor *src, TensorBytes offset_b, void *dst,
+                        TensorBytes bytes_b, const uint32_t *done, uint32_t n_done) {
+    const uint64_t offset = offset_b.raw(), bytes = bytes_b.raw();
     for (uint32_t i = 0; i < n_done; i++)
         if (!lane_ticket_ok(lane, done[i])) return 0;
     if (!lane || !src || !dst || offset > src->bytes || bytes > src->bytes - offset) {
@@ -1972,8 +1981,9 @@ int pulsar_gpu_lane_order(pulsar_gpu_lane *lane, uint32_t ticket) {
            cuda_ok(cudaStreamWaitEvent(cudaStreamPerThread, lane->ticket[ticket].ev, 0), "lane order");
 }
 
-int pulsar_gpu_lane_h2d(pulsar_gpu_lane *lane, pulsar_gpu_tensor *dst, uint64_t offset, const void *src,
-                        uint64_t bytes, uint32_t ticket) {
+int pulsar_gpu_lane_h2d(pulsar_gpu_lane *lane, pulsar_gpu_tensor *dst, TensorBytes offset_b, const void *src,
+                        TensorBytes bytes_b, uint32_t ticket) {
+    const uint64_t offset = offset_b.raw(), bytes = bytes_b.raw();
     if (!lane_ticket_ok(lane, ticket)) return 0;
     if (!dst || !src || offset > dst->bytes || bytes > dst->bytes - offset) {
         fprintf(stderr, "pulsar: copy lane: host -> device span out of range\n");
@@ -2018,16 +2028,18 @@ int pulsar_gpu_tensor_write_q_f32(pulsar_gpu_tensor *tensor, uint64_t off_elems,
     const uint64_t bytes = n * PULSAR_Q_ELT_SIZE;
     if (off > tensor->bytes || bytes > tensor->bytes - off) return 0;
     if (sizeof(pulsar_q_t) == sizeof(float))
-        return pulsar_gpu_tensor_write(tensor, off, src, bytes);
+        return pulsar_gpu_tensor_write(tensor, TensorBytes{off}, src, TensorBytes{bytes});
     pulsar_q_t *h = (pulsar_q_t *)malloc((size_t)bytes);
     if (!h) return 0;
     for (uint64_t i = 0; i < n; i++) h[i] = (pulsar_q_t)src[i];
-    const int rc = pulsar_gpu_tensor_write(tensor, off, h, bytes);
+    const int rc = pulsar_gpu_tensor_write(tensor, TensorBytes{off}, h, TensorBytes{bytes});
     free(h);
     return rc;
 }
 
-int pulsar_gpu_tensor_read(const pulsar_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
+int pulsar_gpu_tensor_read(const pulsar_gpu_tensor *tensor, TensorBytes offset_b, void *data,
+                           TensorBytes bytes_b) {
+    const uint64_t offset = offset_b.raw(), bytes = bytes_b.raw();
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     if (tensor->dry) return 1;
     pulsar_cuda_sync_note(2, bytes);
@@ -2037,7 +2049,8 @@ int pulsar_gpu_tensor_read(const pulsar_gpu_tensor *tensor, uint64_t offset, voi
 
 
 
-int pulsar_gpu_device_read(const void *device, void *host, uint64_t bytes) {
+int pulsar_gpu_device_read(const void *device, void *host, TensorBytes bytes_b) {
+    const uint64_t bytes = bytes_b.raw();
     if (!device || !host) return 0;
     pulsar_cuda_sync_note(2, bytes);
     return cuda_ok(cudaMemcpy(host, device, (size_t)bytes, cudaMemcpyDeviceToHost), "device read");
@@ -2046,9 +2059,10 @@ int pulsar_gpu_device_read(const void *device, void *host, uint64_t bytes) {
 
 
 
-int pulsar_gpu_tensor_copy(pulsar_gpu_tensor *dst, uint64_t dst_offset,
-                                     const pulsar_gpu_tensor *src, uint64_t src_offset,
-                                     uint64_t bytes) {
+int pulsar_gpu_tensor_copy(pulsar_gpu_tensor *dst, TensorBytes dst_off,
+                                     const pulsar_gpu_tensor *src, TensorBytes src_off,
+                                     TensorBytes bytes_b) {
+    const uint64_t dst_offset = dst_off.raw(), src_offset = src_off.raw(), bytes = bytes_b.raw();
     if (!dst || !src || dst_offset > dst->bytes || src_offset > src->bytes ||
         bytes > dst->bytes - dst_offset || bytes > src->bytes - src_offset) {
         return 0;
@@ -2074,9 +2088,10 @@ int pulsar_gpu_tensor_copy(pulsar_gpu_tensor *dst, uint64_t dst_offset,
  * NOT a drop-in for every call site: the ordering guarantee is per-stream, so
  * a destination handed to another stream, or to the allocator, still needs the
  * blocking version or an explicit sync. */
-int pulsar_gpu_tensor_copy_async(pulsar_gpu_tensor *dst, uint64_t dst_offset,
-                                 const pulsar_gpu_tensor *src, uint64_t src_offset,
-                                 uint64_t bytes) {
+int pulsar_gpu_tensor_copy_async(pulsar_gpu_tensor *dst, TensorBytes dst_off,
+                                 const pulsar_gpu_tensor *src, TensorBytes src_off,
+                                 TensorBytes bytes_b) {
+    const uint64_t dst_offset = dst_off.raw(), src_offset = src_off.raw(), bytes = bytes_b.raw();
     if (!dst || !src || dst_offset > dst->bytes || src_offset > src->bytes ||
         bytes > dst->bytes - dst_offset || bytes > src->bytes - src_offset) {
         return 0;
@@ -2125,21 +2140,22 @@ __global__ static void batched_copy_kernel(const pulsar_copy_desc *descs, uint32
 void *pulsar_gpu_batched_copy_prepare(
         pulsar_gpu_tensor **dst,
         pulsar_gpu_tensor **src,
-        const uint64_t *bytes,
+        const TensorBytes *bytes_b,
         uint32_t n) {
-    if (!dst || !src || !bytes || n == 0) return NULL;
+    if (!dst || !src || !bytes_b || n == 0) return NULL;
     pulsar_copy_desc *h = (pulsar_copy_desc *)malloc(n * sizeof(pulsar_copy_desc));
     if (!h) return NULL;
     for (uint32_t i = 0; i < n; i++) {
+        const uint64_t bytes = bytes_b[i].raw();
         if (!dst[i] || !src[i] || !dst[i]->ptr || !src[i]->ptr ||
-            bytes[i] == 0 || (bytes[i] & 15u) ||
-            bytes[i] > dst[i]->bytes || bytes[i] > src[i]->bytes) {
+            bytes == 0 || (bytes & 15u) ||
+            bytes > dst[i]->bytes || bytes > src[i]->bytes) {
             free(h);
             return NULL;
         }
         h[i].dst = dst[i]->ptr;
         h[i].src = src[i]->ptr;
-        h[i].bytes = bytes[i];
+        h[i].bytes = bytes;
     }
     pulsar_copy_desc *d = NULL;
     if (cudaMalloc(&d, n * sizeof(pulsar_copy_desc)) != cudaSuccess) { free(h); return NULL; }
@@ -2157,7 +2173,8 @@ void pulsar_gpu_batched_copy_free(void *handle) {
     if (handle) cudaFree(handle);
 }
 
-int pulsar_gpu_batched_copy_run(void *handle, uint32_t n_descs, uint64_t max_bytes) {
+int pulsar_gpu_batched_copy_run(void *handle, uint32_t n_descs, TensorBytes max_bytes_b) {
+    const uint64_t max_bytes = max_bytes_b.raw();
     if (!handle || n_descs == 0) return 0;
     uint32_t chunks = (uint32_t)(((max_bytes >> 4) + 255) / 256);
     if (chunks < 1u) chunks = 1u;

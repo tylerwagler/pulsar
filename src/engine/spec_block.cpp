@@ -930,8 +930,8 @@ pulsar_block_lane *pulsar_block_lane_create(pulsar_session *s, uint32_t n_banks,
     l->tap_width = (uint64_t)d->n_taps * d->hidden;
     l->al = absorb_of(d);
     l->dl = draft_of(d);
-    l->taps = pulsar_gpu_tensor_alloc((uint64_t)max_rows * l->tap_width * 2u);
-    l->arena = pulsar_gpu_tensor_alloc(std::max(l->al.total, l->dl.total));
+    l->taps = pulsar_gpu_tensor_alloc(bytes_of<uint16_t>((uint64_t)max_rows * l->tap_width));
+    l->arena = pulsar_gpu_tensor_alloc(TensorBytes{std::max(l->al.total, l->dl.total)});
     l->row_seq.resize(std::max(kAbsorbRows, kDraftRows));
     l->row_pos.resize(l->row_seq.size());
     l->seqs.resize(l->row_seq.size());
@@ -941,10 +941,10 @@ pulsar_block_lane *pulsar_block_lane_create(pulsar_session *s, uint32_t n_banks,
     l->cand_lp.resize(nbs * d->topk);
     l->chain_ids.resize(nbs);
     l->scores.resize(nbs * d->topk * d->topk);
-    l->h_tok = (int32_t *)pulsar_gpu_host_alloc((uint64_t)kDraftRows * 4u);
-    l->h_anchor = (int32_t *)pulsar_gpu_host_alloc((uint64_t)kDraftRows * 4u);
-    l->h_valid = (uint8_t *)pulsar_gpu_host_alloc(kDraftRows);
-    l->h_desc = (uint8_t *)pulsar_gpu_host_alloc((uint64_t)d->n_layer * l->dl.desc_stride);
+    l->h_tok = (int32_t *)pulsar_gpu_host_alloc(bytes_of<int32_t>(kDraftRows));
+    l->h_anchor = (int32_t *)pulsar_gpu_host_alloc(bytes_of<int32_t>(kDraftRows));
+    l->h_valid = (uint8_t *)pulsar_gpu_host_alloc(bytes_of<uint8_t>(kDraftRows));
+    l->h_desc = (uint8_t *)pulsar_gpu_host_alloc(TensorBytes{l->dl.desc_stride}.times(d->n_layer));
     if (!l->h_tok || !l->h_anchor || !l->h_valid || !l->h_desc ||
         (d->head_kind == PULSAR_BLOCK_HEAD_LILICORR && !head_weights(s, d, &l->head))) {
         pulsar_block_lane_free(l);
@@ -1037,7 +1037,8 @@ FILE *dump_open(const char *name) {
 void dump_ctx(pulsar_block_lane *l, uint32_t row0, const int32_t *pos, const BankId *bank, uint32_t n) {
     if (!dump_dir() || n == 0) return;
     std::vector<uint16_t> taps((size_t)n * l->tap_width);
-    if (!pulsar_gpu_tensor_read(l->taps, (uint64_t)row0 * l->tap_width * 2u, taps.data(), taps.size() * 2u)) return;
+    if (!pulsar_gpu_tensor_read(l->taps, bytes_of<uint16_t>((uint64_t)row0 * l->tap_width), taps.data(),
+                                bytes_of<uint16_t>(taps.size()))) return;
     FILE *f = dump_open("ctx.bin");
     if (!f) return;
     const uint32_t w = (uint32_t)l->tap_width;
@@ -1183,8 +1184,9 @@ bool absorb_rows(pulsar_session *s, uint32_t row0, const int32_t *pos, const Ban
             const uint32_t r = p0 + i;
             if (i + 1u < m && bank[r + 1] == bank[r]) continue;
             /* in the pool: its run's first row was checked above */
-            if (!pulsar_gpu_tensor_copy_async(anchor, (uint64_t)pulsar_bank_index(bank[r]) * E * 2u, l->arena,
-                                              A.cn + (uint64_t)i * E * 2u, (uint64_t)E * 2u))
+            const TensorBytes row = bytes_of<uint16_t>(E);   /* one bf16 anchor row */
+            if (!pulsar_gpu_tensor_copy_async(anchor, row.times(pulsar_bank_index(bank[r])), l->arena,
+                                              TensorBytes{A.cn} + row.times(i), row))
                 return fail("the anchor copy failed");
         }
     }
@@ -1239,17 +1241,21 @@ bool draft_pass(pulsar_session *s, const BankId *banks, const uint32_t *pos, con
     }
     uint32_t bound = 256u;   /* the attention's bound: a graph is recaptured once per doubling of the context */
     while (bound <= last) bound *= 2u;
-    bool ok = pulsar_gpu_tensor_write_async(l->arena, D.ids, l->h_tok, (uint64_t)R * 4u) != 0;
+    bool ok = pulsar_gpu_tensor_write_async(l->arena, TensorBytes{D.ids}, l->h_tok, bytes_of<int32_t>(R)) != 0;
     static const uint32_t nf_clear = 0u;   /* O59: the pass's non-finite flag starts clear */
-    ok = ok && pulsar_gpu_tensor_write_async(l->arena, D.nf, &nf_clear, sizeof(nf_clear)) != 0;
+    ok = ok && pulsar_gpu_tensor_write_async(l->arena, TensorBytes{D.nf}, &nf_clear,
+                                             TensorBytes{sizeof(nf_clear)}) != 0;
     if (lili) {   /* the candidate head's anchor rows (cn of each bank's last committed row) and their validity */
         pulsar_gpu_tensor *anchor = pulsar_state_tensor(ss, ss->plan->n_trunk, d->decl_anchor);
-        ok = ok && anchor && pulsar_gpu_tensor_write_async(l->arena, D.valid, l->h_valid, nb) != 0;
+        ok = ok && anchor && pulsar_gpu_tensor_write_async(l->arena, TensorBytes{D.valid}, l->h_valid,
+                                                           bytes_of<uint8_t>(nb)) != 0;
         for (uint32_t i = 0; ok && i < nb; i++)
-            ok = pulsar_gpu_tensor_copy_async(l->arena, D.anchor + (uint64_t)i * E * 2u, anchor,
-                                              (uint64_t)pulsar_bank_index(banks[i]) * E * 2u, (uint64_t)E * 2u) != 0;
+            ok = pulsar_gpu_tensor_copy_async(l->arena, TensorBytes{D.anchor} + bytes_of<uint16_t>(E).times(i), anchor,
+                                              bytes_of<uint16_t>(E).times(pulsar_bank_index(banks[i])),
+                                              bytes_of<uint16_t>(E)) != 0;
     } else {      /* the selector's anchors: the carries */
-        ok = ok && pulsar_gpu_tensor_write_async(l->arena, D.anchor_ids, l->h_anchor, (uint64_t)nb * 4u) != 0;
+        ok = ok && pulsar_gpu_tensor_write_async(l->arena, TensorBytes{D.anchor_ids}, l->h_anchor,
+                                                 bytes_of<int32_t>(nb)) != 0;
     }
     std::vector<pulsar_gqa_layer> G(d->n_layer);
     for (uint32_t li = 0; ok && li < d->n_layer; li++) {
@@ -1261,7 +1267,8 @@ bool draft_pass(pulsar_session *s, const BankId *banks, const uint32_t *pos, con
              pulsar_gqa_plan(&G[li], l->seqs.data(), nb, l->row_seq.data(), l->row_pos.data(), R, bound,
                              l->h_desc + (uint64_t)li * D.desc_stride, D.desc_stride, &l->call[li]) == 0;
     }
-    ok = ok && pulsar_gpu_tensor_write_async(l->arena, D.desc, l->h_desc, (uint64_t)d->n_layer * D.desc_stride) != 0;
+    ok = ok && pulsar_gpu_tensor_write_async(l->arena, TensorBytes{D.desc}, l->h_desc,
+                                             TensorBytes{D.desc_stride}.times(d->n_layer)) != 0;
     if (!ok) return fail("the draft pass's host half refused");
     /* ---- the launch half */
     uint16_t *h = (uint16_t *)(base + D.h), *x = (uint16_t *)(base + D.x), *cx = (uint16_t *)(base + D.cx),
@@ -1449,8 +1456,10 @@ bool draft_pass(pulsar_session *s, const BankId *banks, const uint32_t *pos, con
         /* L338 PLAIN: no chain head -- slot j's score row is its own log-probs whatever the slot before chose (the
          * row broadcast over every predecessor), its greedy walk the slots' top-1s; the table goes back to the device
          * for the sampled chains' draws (draw_chains reads it there) */
-        if (!pulsar_gpu_tensor_read(l->arena, D.cand_id, l->cand_id.data(), (uint64_t)nb * SL * K * 4u) ||
-            !pulsar_gpu_tensor_read(l->arena, D.cand_lp, l->cand_lp.data(), (uint64_t)nb * SL * K * 4u))
+        if (!pulsar_gpu_tensor_read(l->arena, TensorBytes{D.cand_id}, l->cand_id.data(),
+                                    bytes_of<int32_t>((uint64_t)nb * SL * K)) ||
+            !pulsar_gpu_tensor_read(l->arena, TensorBytes{D.cand_lp}, l->cand_lp.data(),
+                                    bytes_of<float>((uint64_t)nb * SL * K)))
             return fail("could not read the slots' candidates");
         for (uint32_t i = 0; i < nb; i++)
             for (uint32_t j = 0; j < SL; j++) {
@@ -1459,17 +1468,23 @@ bool draft_pass(pulsar_session *s, const BankId *banks, const uint32_t *pos, con
                 for (uint32_t pv = 0; pv < K; pv++)
                     memcpy(&l->scores[(row + pv) * K], &l->cand_lp[row], (size_t)K * 4u);
             }
-        if (!pulsar_gpu_tensor_write(l->arena, D.scores, l->scores.data(), (uint64_t)nb * SL * K * K * 4u))
+        if (!pulsar_gpu_tensor_write(l->arena, TensorBytes{D.scores}, l->scores.data(),
+                                     bytes_of<float>((uint64_t)nb * SL * K * K)))
             return fail("could not stage the slots' score tables");
-    } else if (!pulsar_gpu_tensor_read(l->arena, D.cand_id, l->cand_id.data(), (uint64_t)nb * SL * K * 4u) ||
-               !pulsar_gpu_tensor_read(l->arena, D.cand_lp, l->cand_lp.data(), (uint64_t)nb * SL * K * 4u) ||
-               !pulsar_gpu_tensor_read(l->arena, D.scores, l->scores.data(), (uint64_t)nb * SL * K * K * 4u) ||
-               !pulsar_gpu_tensor_read(l->arena, D.chain_ids, l->chain_ids.data(), (uint64_t)nb * SL * 4u)) {
+    } else if (!pulsar_gpu_tensor_read(l->arena, TensorBytes{D.cand_id}, l->cand_id.data(),
+                                       bytes_of<int32_t>((uint64_t)nb * SL * K)) ||
+               !pulsar_gpu_tensor_read(l->arena, TensorBytes{D.cand_lp}, l->cand_lp.data(),
+                                       bytes_of<float>((uint64_t)nb * SL * K)) ||
+               !pulsar_gpu_tensor_read(l->arena, TensorBytes{D.scores}, l->scores.data(),
+                                       bytes_of<float>((uint64_t)nb * SL * K * K)) ||
+               !pulsar_gpu_tensor_read(l->arena, TensorBytes{D.chain_ids}, l->chain_ids.data(),
+                                       bytes_of<int32_t>((uint64_t)nb * SL))) {
         return fail("could not read the head's chain");
     }
     if (pulsar_gqa_widens()) {   /* O59: the tensor-core arms widened bf16 operands to fp16 (sm_75): were all in range? */
         uint32_t nf = 0;
-        if (!pulsar_gpu_tensor_read(l->arena, D.nf, &nf, sizeof(nf))) return fail("could not read the pass's non-finite flag");
+        if (!pulsar_gpu_tensor_read(l->arena, TensorBytes{D.nf}, &nf,
+                                    TensorBytes{sizeof(nf)})) return fail("could not read the pass's non-finite flag");
         if (nf) {
             fprintf(stderr, "pulsar: block drafter: an attention operand (q / k / v) of drafter layer %u is outside "
                             "fp16's range, which this build's tensor-core arms widen bf16 to (code 0x%08x) -- "
@@ -1485,7 +1500,7 @@ bool draft_pass(pulsar_session *s, const BankId *banks, const uint32_t *pos, con
         }
         FILE *f = passes > 0 ? dump_open("draft.bin") : NULL;
         std::vector<uint16_t> o((size_t)R * E);
-        if (f && pulsar_gpu_tensor_read(l->arena, D.x, o.data(), o.size() * 2u)) {
+        if (f && pulsar_gpu_tensor_read(l->arena, TensorBytes{D.x}, o.data(), bytes_of<uint16_t>(o.size()))) {
             passes--;
             int32_t bk[kDraftRows], P[kDraftRows];
             for (uint32_t i = 0; i < nb; i++) {

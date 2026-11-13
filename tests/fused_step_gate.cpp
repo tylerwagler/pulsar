@@ -85,8 +85,8 @@ static bool ring_read(pulsar_gpu_graph *g, uint32_t bank, ring *r) {
     for (int i = 0; i < 3; i++) {
         r->h[i] = (float *)malloc(ring_floats() * sizeof(float));
         if (!g->banks.dspark_prompt[i] ||
-            !pulsar_gpu_tensor_read(g->banks.dspark_prompt[i], (uint64_t)bank * g->banks.dspark_prompt_bank_bytes,
-                                    r->h[i], ring_floats() * sizeof(float))) {
+            !pulsar_gpu_tensor_read(g->banks.dspark_prompt[i], g->banks.dspark_prompt_bank_bytes.times(bank),
+                                    r->h[i], bytes_of<float>(ring_floats()))) {
             fprintf(stderr, "drafter ring read failed: bank %u anchor layer %d\n", bank, i);
             return false;
         }

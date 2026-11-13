@@ -530,8 +530,8 @@ pulsar_driver_state *create(pulsar_session *s, uint32_t n_banks) {
     const pulsar_nemotron_h_shape &sh = W(e)->shape;
     nh_state *st = (nh_state *)xcalloc(1, sizeof(*st));
     const uint64_t R = s->prefill_cap;
-    st->h = pulsar_gpu_tensor_alloc(R * sh.n_embd * 2u);
-    st->xn = pulsar_gpu_tensor_alloc(R * sh.n_embd * 2u);
+    st->h = pulsar_gpu_tensor_alloc(bytes_of<uint16_t>(R * sh.n_embd));
+    st->xn = pulsar_gpu_tensor_alloc(bytes_of<uint16_t>(R * sh.n_embd));
     st->seq_first = (uint32_t *)xmalloc((R + 1u) * sizeof(uint32_t));
     st->seq_bank = (BankId *)xmalloc(R * sizeof(BankId));
     st->row_seq = (uint32_t *)xmalloc(R * sizeof(uint32_t));
@@ -553,12 +553,12 @@ pulsar_driver_state *create(pulsar_session *s, uint32_t n_banks) {
     st->attn_call = (pulsar_gqa_call *)xcalloc(n_calls ? n_calls : 1u, sizeof(pulsar_gqa_call));
     st->attn_off = (uint64_t *)xcalloc(n_calls ? n_calls : 1u, sizeof(uint64_t));
     st->attn_desc_host = (uint8_t *)xmalloc(n_calls ? n_calls * st->attn_desc_max : 1u);
-    st->attn_desc = n_calls ? pulsar_gpu_tensor_alloc(n_calls * st->attn_desc_max) : NULL;
+    st->attn_desc = n_calls ? pulsar_gpu_tensor_alloc(TensorBytes{n_calls * st->attn_desc_max}) : NULL;
     bool ok = st->h && st->xn && (!n_calls || st->attn_desc);
     if (ok && W(e)->drafting) {
-        st->mh = pulsar_gpu_tensor_alloc(R * sh.n_embd * 2u);
-        st->mo = pulsar_gpu_tensor_alloc(R * sh.n_embd * 2u);
-        st->mtop = pulsar_gpu_tensor_alloc(pulsar_draft_top_ws_bytes());
+        st->mh = pulsar_gpu_tensor_alloc(bytes_of<uint16_t>(R * sh.n_embd));
+        st->mo = pulsar_gpu_tensor_alloc(bytes_of<uint16_t>(R * sh.n_embd));
+        st->mtop = pulsar_gpu_tensor_alloc(TensorBytes{pulsar_draft_top_ws_bytes()});
         st->mtp = (nh_step *)xcalloc(1, sizeof(nh_step));
         st->mtp->w = W(e);
         st->mtp->st = st;
@@ -711,15 +711,17 @@ bool build_tables(const nh_step *st) {
     const rows_scratch L = rows_layout(q->max_rows);
     static const uint32_t zero = 0;   /* L289: an enqueued write reads it later */
     bool ok = rt != NULL;
-    ok = ok && pulsar_gpu_tensor_write_async(rt, L.ids, st->tokens, (uint64_t)n * 4u) != 0;
-    ok = ok && pulsar_gpu_tensor_write_async(rt, L.nf, &zero, sizeof(zero)) != 0;
+    ok = ok && pulsar_gpu_tensor_write_async(rt, TensorBytes{L.ids}, st->tokens, bytes_of<int32_t>(n)) != 0;
+    ok = ok && pulsar_gpu_tensor_write_async(rt, TensorBytes{L.nf}, &zero, TensorBytes{sizeof(zero)}) != 0;
     if (ok && na) {
-        ok = pulsar_gpu_tensor_write_async(rt, L.first_a, q->tab_a, (uint64_t)(na + 1u) * 4u) != 0 &&
-             pulsar_gpu_tensor_write_async(rt, L.slot_a, q->tab_a + na + 1, (uint64_t)na * 4u) != 0;
+        ok = pulsar_gpu_tensor_write_async(rt, TensorBytes{L.first_a}, q->tab_a,
+                                           bytes_of<int32_t>((uint64_t)(na + 1u))) != 0 &&
+             pulsar_gpu_tensor_write_async(rt, TensorBytes{L.slot_a}, q->tab_a + na + 1, bytes_of<int32_t>(na)) != 0;
     }
     if (ok && nb) {
-        ok = pulsar_gpu_tensor_write_async(rt, L.first_b, q->tab_b, (uint64_t)(nb + 1u) * 4u) != 0 &&
-             pulsar_gpu_tensor_write_async(rt, L.slot_b, q->tab_b + nb + 1, (uint64_t)nb * 4u) != 0;
+        ok = pulsar_gpu_tensor_write_async(rt, TensorBytes{L.first_b}, q->tab_b,
+                                           bytes_of<int32_t>((uint64_t)(nb + 1u))) != 0 &&
+             pulsar_gpu_tensor_write_async(rt, TensorBytes{L.slot_b}, q->tab_b + nb + 1, bytes_of<int32_t>(nb)) != 0;
     }
     return ok || fail("could not upload the step's tables");
 }
@@ -771,7 +773,7 @@ bool plan_call(const nh_step *st, uint32_t il, uint32_t k, uint32_t bound, uint6
         if (!pool) return failf("an attention layer's pool is evicted", il);
         pulsar_gqa_seq &sq = q->seqs[j];
         sq.kv = dptr(pool);
-        sq.bytes = pulsar_gpu_tensor_bytes(pool);
+        sq.bytes = pulsar_gpu_tensor_bytes(pool).raw();
         sq.cap = (uint32_t)(sq.bytes / tb);
     }
     q->attn_off[k] = off;
@@ -794,7 +796,8 @@ bool plan_attention(const nh_step *st, uint32_t *bound_out) {
         if (k != UINT32_MAX && !plan_call(st, il, k, bound, (uint64_t)k * stride, stride)) return false;
     }
     *bound_out = bound;
-    return pulsar_gpu_tensor_write_async(q->attn_desc, 0, q->attn_desc_host, (uint64_t)q->n_attn * stride) != 0 ||
+    return pulsar_gpu_tensor_write_async(q->attn_desc, TensorBytes{0}, q->attn_desc_host,
+                                         TensorBytes{stride}.times(q->n_attn)) != 0 ||
            fail("could not upload the attention descriptors");
 }
 
@@ -810,7 +813,8 @@ bool mtp_stage(const nh_step *st, uint32_t il) {
             return fail("a token id outside the vocabulary");
     const uint64_t off = (uint64_t)q->n_attn * q->attn_desc_max;
     return build_tables(st) && plan_call(st, il, q->n_attn, attn_bound(st), off, q->attn_desc_max) &&
-           (pulsar_gpu_tensor_write_async(q->attn_desc, off, q->attn_desc_host + off, q->attn_desc_max) != 0 ||
+           (pulsar_gpu_tensor_write_async(q->attn_desc, TensorBytes{off}, q->attn_desc_host + off,
+                                          TensorBytes{q->attn_desc_max}) != 0 ||
             fail("could not upload the MTP attention's descriptors"));
 }
 
@@ -900,7 +904,7 @@ void dump_rows(const nh_step *st, const char *name, pulsar_gpu_tensor *arena, ui
                uint32_t il) {
     if (!gpu_graph_debug_dump_enabled()) return;
     const uint64_t n = (uint64_t)st->n_rows * width;
-    pulsar_gpu_tensor *v = arena ? pulsar_gpu_tensor_view(arena, off, n * 2u) : NULL;
+    pulsar_gpu_tensor *v = arena ? pulsar_gpu_tensor_view(arena, TensorBytes{off}, bytes_of<uint16_t>(n)) : NULL;
     if (v) gpu_graph_debug_dump_hc_tensor(name, v, n, il, (uint32_t)st->pos[st->n_rows - 1]);
     pulsar_gpu_tensor_free(v);
 }
@@ -1304,7 +1308,8 @@ bool step_end(const pulsar_driver_step *st0, bool ok) {
     }
     const nh_step *st = S(st0);
     uint32_t nf = 0;
-    if (!pulsar_gpu_tensor_read(st->st->scratch[ARENA_ROWS], rows_layout(st->st->max_rows).nf, &nf, sizeof(nf)))
+    if (!pulsar_gpu_tensor_read(st->st->scratch[ARENA_ROWS], TensorBytes{rows_layout(st->st->max_rows).nf}, &nf,
+                                TensorBytes{sizeof(nf)}))
         return fail("could not read the MoE non-finite flag");
     if (nf & 0x800000u) {   /* O59: a build that widens the attention's bf16 operands to fp16 (sm_75) */
         fprintf(stderr, "pulsar: %s: an attention operand (q / k / v) of layer %u is outside fp16's range, which this "
@@ -1382,7 +1387,7 @@ bool mtp_trunk_rows(pulsar_session *s, uint32_t row0, uint32_t n, pulsar_gpu_ten
     const pulsar_nemotron_h_model *w = W(s->engine);
     const uint32_t E = w->shape.n_embd;
     const uint16_t *on = (const uint16_t *)pulsar_weight_device_ptr(&s->engine->model, w->output_norm, "nemotron_h norm_f");
-    if (!on || row0 + n > q->max_rows || off + (uint64_t)n * E * 2u > pulsar_gpu_tensor_bytes(dst))
+    if (!on || row0 + n > q->max_rows || off + (uint64_t)n * E * 2u > pulsar_gpu_tensor_bytes(dst).raw())
         return fail("the MTP conditioning rows are out of range");
     return pulsar_rows_rmsnorm_launch((const uint16_t *)dptr(q->h) + (size_t)row0 * E, E, n, E, on, w->shape.rms_eps,
                                       (uint16_t *)((uint8_t *)dptr(dst) + off), E, 0) == 0 ||
@@ -1483,14 +1488,16 @@ bool mtp_forward(pulsar_session *s, const pulsar_mtp_step *m) {
     ok = step_end(&st, ok);
     if (ok && m->pick) {
         pulsar_draft_top rec[PULSAR_DRIVER_HEADS_MAX];
-        ok = pulsar_gpu_tensor_read(q->mtop, 0, rec, m->head_n * sizeof rec[0]) != 0 || fail("could not read the pick");
+        ok = pulsar_gpu_tensor_read(q->mtop, TensorBytes{0}, rec, TensorBytes{sizeof(rec[0])}.times(m->head_n)) != 0 ||
+             fail("could not read the pick");
         for (uint32_t r = 0; ok && r < m->head_n; r++) {
             if (rec[r].nan || rec[r].index < 0 || (uint32_t)rec[r].index >= V) return fail("the MTP head's row holds a NaN");
             m->pick[r] = {rec[r].index, rec[r].conf};
         }
     }
     if (ok && m->head_n && m->logits)
-        ok = pulsar_gpu_tensor_read(q->logits, 0, m->logits, (uint64_t)m->head_n * V * sizeof(float)) != 0 ||
+        ok = pulsar_gpu_tensor_read(q->logits, TensorBytes{0}, m->logits,
+                                    bytes_of<float>((uint64_t)m->head_n * V)) != 0 ||
              fail("could not read the MTP logits");
     return ok;
 }

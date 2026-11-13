@@ -4572,7 +4572,7 @@ static void test_live_row_valid(void) {
     s->logits = (float *)xcalloc(8, sizeof(float));
     pulsar_gpu_tensor_dry_begin();
     const bool alloc = pulsar_session_dev_alloc(s, 2);
-    pulsar_gpu_tensor *rows = pulsar_gpu_tensor_alloc(2u * 8u * sizeof(float));
+    pulsar_gpu_tensor *rows = pulsar_gpu_tensor_alloc(bytes_of<float>(2u * 8u));
     pulsar_gpu_tensor_dry_end(NULL, NULL);
     TEST_ASSERT(alloc && rows);
     if (alloc && rows) {
@@ -5686,8 +5686,9 @@ static bool tier_walk(void *state, int dir, bool, pulsar_gpu_tensor *slab, uint6
         *bytes = ts->n;
         return true;
     }
-    return (dir == 0 ? pulsar_gpu_tensor_copy_async(slab, off, ts->t, 0, ts->n)
-                     : pulsar_gpu_tensor_copy_async(ts->t, 0, slab, off, ts->n)) != 0;
+    return (dir == 0 ? pulsar_gpu_tensor_copy_async(slab, TensorBytes{off}, ts->t, TensorBytes{0}, TensorBytes{ts->n})
+                     : pulsar_gpu_tensor_copy_async(ts->t, TensorBytes{0}, slab, TensorBytes{off},
+                                                    TensorBytes{ts->n})) != 0;
 }
 static TokPos tier_min_ckpt(void *) { return pulsar_ckpt_pos(128u); }
 static bool tier_noted(void *, TokPos, bool *capture, char *, size_t) {
@@ -5698,7 +5699,7 @@ static bool tier_noted(void *, TokPos, bool *capture, char *, size_t) {
 /// @param v  the byte every state byte becomes (queued on this thread's stream, as a step's writes are)
 static void tier_fill(ckpt_tier_state *ts, std::vector<uint8_t> &host, uint8_t v) {
     for (uint64_t i = 0; i < ts->n; i++) host[i] = (uint8_t)(v + i * 7u);
-    TEST_ASSERT(pulsar_gpu_tensor_write_async(ts->t, 0, host.data(), ts->n) == 1);
+    TEST_ASSERT(pulsar_gpu_tensor_write_async(ts->t, TensorBytes{0}, host.data(), TensorBytes{ts->n}) == 1);
 }
 /// @return true when every byte of `got` is the fill of `v`
 static bool tier_is(const uint8_t *got, uint64_t n, uint8_t v) {
@@ -5737,7 +5738,9 @@ static void test_ckpt_host_tier(void) {
             pulsar_ckpt_store *st = (pulsar_ckpt_store *)calloc(1, sizeof(pulsar_ckpt_store));
             pulsar_gpu_tensor_dry_begin();
             TEST_ASSERT(pulsar_ckpt_alloc_tier(st, &ops, &dry_state, nb, host != 0));
-            pulsar_gpu_tensor_dry_end(&price[host][nb - 1u], NULL);
+            TensorBytes priced{0};
+            pulsar_gpu_tensor_dry_end(&priced, NULL);
+            price[host][nb - 1u] = priced.raw();
             TEST_ASSERT(st->lane == NULL && pulsar_ckpt_host_bytes(st) == 0u);   /* a price pins nothing */
             pulsar_ckpt_release(st);
             free(st);
@@ -5749,7 +5752,7 @@ static void test_ckpt_host_tier(void) {
            (unsigned long long)price[0][0], (unsigned long long)price[0][1], (unsigned long long)price[1][0],
            (unsigned long long)price[1][1]);
     /* (2) + (3) */
-    ckpt_tier_state ts = {pulsar_gpu_tensor_alloc(32u << 20), 32u << 20};
+    ckpt_tier_state ts = {pulsar_gpu_tensor_alloc(TensorBytes{32u << 20}), 32u << 20};
     if (!ts.t || pulsar_ckpt_host_tier() < 0) {
         printf("  [skip] L347 I4 tiers on a device: no device here\n");
         pulsar_gpu_tensor_free(ts.t);
@@ -5794,7 +5797,8 @@ static void test_ckpt_host_tier(void) {
         /* a restore puts the state back (and drops what is above) */
         tier_fill(&ts, fill, 3);
         TEST_ASSERT(pulsar_ckpt_restore(st, BankId{0}, TokPos{256}) && !pulsar_ckpt_holds(st, BankId{0}, TokPos{384}));
-        TEST_ASSERT(pulsar_gpu_tensor_read(ts.t, 0, got.data(), n) == 1 && tier_is(got.data(), n, 1));
+        TEST_ASSERT(pulsar_gpu_tensor_read(ts.t, TensorBytes{0}, got.data(),
+                                           TensorBytes{n}) == 1 && tier_is(got.data(), n, 1));
         /* the same slot captured twice back to back: the newer bytes win (the reuse waits for the older copy) */
         tier_fill(&ts, fill, 4);
         TEST_ASSERT(pulsar_ckpt_landed(st, BankId{0}, TokPos{512}));
@@ -5811,7 +5815,8 @@ static void test_ckpt_host_tier(void) {
         pulsar_ckpt_commit(st, BankId{0}, at.slot, TokPos{768});
         tier_fill(&ts, fill, 8);
         TEST_ASSERT(pulsar_ckpt_restore(st, BankId{0}, TokPos{768}));
-        TEST_ASSERT(pulsar_gpu_tensor_read(ts.t, 0, got.data(), n) == 1 && tier_is(got.data(), n, 7));
+        TEST_ASSERT(pulsar_gpu_tensor_read(ts.t, TensorBytes{0}, got.data(),
+                                           TensorBytes{n}) == 1 && tier_is(got.data(), n, 7));
         /* a record: captured, the state overwritten, restored */
         TokId toks[800];
         for (int i = 0; i < 800; i++) toks[i] = TokId{i};
@@ -5821,7 +5826,8 @@ static void test_ckpt_host_tier(void) {
         tier_fill(&ts, fill, 10);
         const pulsar_ckpt_record *r = pulsar_ckpt_record_of(st, BankId{0}, PULSAR_CKPT_REC_ENDPOINT);
         TEST_ASSERT(r && pulsar_ckpt_record_restore(st, BankId{0}, r, NULL, 0));
-        TEST_ASSERT(pulsar_gpu_tensor_read(ts.t, 0, got.data(), n) == 1 && tier_is(got.data(), n, 9));
+        TEST_ASSERT(pulsar_gpu_tensor_read(ts.t, TensorBytes{0}, got.data(),
+                                           TensorBytes{n}) == 1 && tier_is(got.data(), n, 9));
         printf("  L347 I4 %s tier round trip OK (first capture %s when the next was queued)\n",
                host ? "host" : "device", in_flight == 1 ? "still in flight" : "already landed");
         pulsar_ckpt_release(st);
@@ -6133,8 +6139,8 @@ static void test_ckpt_records(void) {
      * adopts it: the copy takes another slot (it took the lent record's own, so none was made) and the next capture
      * evicts another record (it evicted the record bank 1 was just served from). */
     pulsar_gpu_tensor_dry_begin();
-    for (uint32_t b = 0; b < 3u; b++) fake_rows[b] = pulsar_gpu_tensor_alloc(600u * 16u);
-    for (uint32_t i = 0; i < st->n_rec; i++) st->rec[i].slab = pulsar_gpu_tensor_alloc(st->rec[i].cap);
+    for (uint32_t b = 0; b < 3u; b++) fake_rows[b] = pulsar_gpu_tensor_alloc(TensorBytes{600u * 16u});
+    for (uint32_t i = 0; i < st->n_rec; i++) st->rec[i].slab = pulsar_gpu_tensor_alloc(TensorBytes{st->rec[i].cap});
     pulsar_gpu_tensor_dry_end(NULL, NULL);
     ops.bank_pools = fake_bank_pools;
     /* the oldest */

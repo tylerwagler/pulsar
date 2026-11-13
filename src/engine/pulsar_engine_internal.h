@@ -1328,13 +1328,16 @@ private:
 typedef struct {
     uint32_t n_banks;   ///< pool size; 0 = disabled and the graph owns plain single-session tensors
     uint32_t cur_bank;  ///< bank the installed views currently address (0 when the pool is disabled)
-    uint64_t raw_bank_bytes;                     ///< one bank's raw ring: raw_cap * WINDOW row bytes
+    TensorBytes raw_bank_bytes;                  ///< one bank's raw ring: raw_cap * WINDOW row bytes
     /** CSA2 (L218): the compressed pool, the index-K pool and the compressor
      * state lane exist only at a kv SOURCE layer's index; every other layer
      * reads its source's through pulsar_layer_attn_layout(il)->kv_source. */
-    uint64_t comp_bank_bytes[PULSAR_MAX_LAYER];  ///< per kv source, one bank's compressed pool: layer_comp_cap * comp row bytes
-    uint64_t index_bank_bytes[PULSAR_MAX_LAYER]; ///< per kv source, one bank's index-K pool: layer_comp_cap * index row bytes
-    uint64_t astate_bank_bytes[PULSAR_MAX_LAYER];///< per ratio>1 kv source, one bank's compressor state lane (ratio rows x head_dim f32); 0 at ratio 1
+    /// per kv source, one bank's compressed pool: layer_comp_cap * comp row bytes
+    TensorBytes comp_bank_bytes[PULSAR_MAX_LAYER];
+    /// per kv source, one bank's index-K pool: layer_comp_cap * index row bytes
+    TensorBytes index_bank_bytes[PULSAR_MAX_LAYER];
+    /// per ratio>1 kv source, one bank's compressor state lane (ratio rows x head_dim f32); 0 at ratio 1
+    TensorBytes astate_bank_bytes[PULSAR_MAX_LAYER];
     /** V4 ONLY (`pulsar_shape::indexer_own_compressor`): 0731's indexer compresses
      * its OWN key, so it keeps a SECOND recurrent lane per bank at the indexer's
      * head dim.  Same two authorities as the attention lane, the indexer's width;
@@ -1342,7 +1345,7 @@ typedef struct {
      * latent and keeps none).  A banked V4 graph could not be built at all until
      * this lane existed -- handing every bank ONE lane would have had them share
      * the indexer's carry, which is a wrong answer rather than a crash (L218). */
-    uint64_t istate_bank_bytes[PULSAR_MAX_LAYER];
+    TensorBytes istate_bank_bytes[PULSAR_MAX_LAYER];
     pulsar_gpu_tensor *raw[PULSAR_MAX_LAYER];    ///< per layer, the bank-major raw KV ring slab
     /** Tier-2 task #55 (increment 2a): the ctx-scaled comp/index caches are now
      * ONE cudaMallocManaged allocation PER BANK (comp[il][bank]) instead of one
@@ -1381,8 +1384,8 @@ typedef struct {
     pulsar_gpu_tensor *spec_assc[PULSAR_MAX_LAYER];  ///< spec frontier snapshot, compressor state score
     pulsar_gpu_tensor *spec_iskv[PULSAR_MAX_LAYER];  ///< spec frontier snapshot, indexer compressor state KV; V4 only
     pulsar_gpu_tensor *spec_issc[PULSAR_MAX_LAYER];  ///< spec frontier snapshot, indexer compressor state score
-    uint64_t dspark_raw_bank_bytes;      ///< one bank's drafter raw ring: DRAFT_WINDOW * WINDOW row (528 B)
-    uint64_t dspark_prompt_bank_bytes;   ///< one bank's drafter prompt ring: DRAFT_WINDOW * n_embd * f32
+    TensorBytes dspark_raw_bank_bytes;   ///< one bank's drafter raw ring: DRAFT_WINDOW * WINDOW row (528 B)
+    TensorBytes dspark_prompt_bank_bytes;///< one bank's drafter prompt ring: DRAFT_WINDOW * n_embd * f32
     pulsar_gpu_tensor *dspark_raw[3];       ///< per draft layer, bank-major drafter raw ring; NULL without a pool or drafter
     pulsar_gpu_tensor *dspark_prompt[3];    ///< per draft layer, bank-major drafter prompt-hidden ring
     /** L260: each PARKED bank's spec-frontier batched-copy tables (the graph's spec_snap_copies /
@@ -1397,7 +1400,7 @@ typedef struct {
     /// Per bank: the parked tables' tensor count (the graph's spec_frontier_copy_n).
     uint32_t spec_frontier_copy_n[PULSAR_MSEQ_MAX];
     /// Per bank: the parked tables' largest single copy, in bytes (the graph's spec_frontier_copy_max_bytes).
-    uint64_t spec_frontier_copy_max_bytes[PULSAR_MSEQ_MAX];
+    TensorBytes spec_frontier_copy_max_bytes[PULSAR_MSEQ_MAX];
     /// Per bank: the parked spec_frontier_copy_init (0 unbuilt, 1 built).
     int spec_frontier_copy_init[PULSAR_MSEQ_MAX];
 } pulsar_bank_slabs;
@@ -1496,7 +1499,7 @@ typedef struct {
     void *spec_snap_copies;      ///< baked batched-copy handle, layer -> spec direction
     void *spec_restore_copies;   ///< baked batched-copy handle, spec -> layer direction
     uint32_t spec_frontier_copy_n;          ///< tensors in each copy set
-    uint64_t spec_frontier_copy_max_bytes;  ///< largest single copy, for staging
+    TensorBytes spec_frontier_copy_max_bytes;  ///< largest single copy, for staging
     int spec_frontier_copy_init;            ///< 0 unbuilt (a failed prepare leaves it 0 and the next snapshot retries), 1 built; see spec_frontier_copy_tables_init
     /** Shared multi-row logits slab (16 rows x n_vocab f32), written by every
      * batched multi-row output head: the DSpark draft/verify passes,
@@ -5408,7 +5411,7 @@ uint64_t gpu_graph_context_bytes_for_kv_policy(
         uint32_t  raw_cap,
         uint32_t  prefill_cap,
         uint64_t *kv_cache_bytes_out);
-pulsar_gpu_tensor *gpu_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes);
+pulsar_gpu_tensor *gpu_graph_alloc_kv_cache_tensor(bool managed, TensorBytes bytes);
 /** True when PULSAR_CUDA_GRAPH_DUMP_PREFIX is set (cached). Graph allocation
  * uses this to skip buffers that exist only to be dumped. */
 /// @return whether the dump prefix is set

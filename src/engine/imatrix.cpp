@@ -89,14 +89,14 @@ static bool imatrix_collect_layer_batch(
     if (!c || n_tokens == 0) return true;
     if (n_tokens > c->cap_tokens) return false;
 
-    const uint64_t norm_bytes = (uint64_t)n_tokens * PULSAR_N_EMBD * sizeof(float);
+    const TensorBytes norm_bytes = bytes_of<float>((uint64_t)n_tokens * PULSAR_N_EMBD);
     const uint64_t mid_elems = (uint64_t)n_tokens * PULSAR_N_EXPERT_USED * PULSAR_N_FF_EXP;
-    const uint64_t mid_bytes = mid_elems * sizeof(float);
-    const uint64_t sel_bytes = (uint64_t)n_tokens * PULSAR_N_EXPERT_USED * sizeof(int);
+    const TensorBytes mid_bytes = bytes_of<float>(mid_elems);
+    const TensorBytes sel_bytes = bytes_of<int>((uint64_t)n_tokens * PULSAR_N_EXPERT_USED);
     void *mid_dst = (void *)c->routed_mid_buf;
-    if (pulsar_gpu_tensor_read(g->batch_ffn_norm, 0, c->ffn_norm_buf, norm_bytes) == 0 ||
-        pulsar_gpu_tensor_read(g->batch_routed_mid, 0, mid_dst, mid_bytes) == 0 ||
-        pulsar_gpu_tensor_read(g->batch_router_selected, 0, c->selected_buf, sel_bytes) == 0)
+    if (pulsar_gpu_tensor_read(g->batch_ffn_norm, TensorBytes{0}, c->ffn_norm_buf, norm_bytes) == 0 ||
+        pulsar_gpu_tensor_read(g->batch_routed_mid, TensorBytes{0}, mid_dst, mid_bytes) == 0 ||
+        pulsar_gpu_tensor_read(g->batch_router_selected, TensorBytes{0}, c->selected_buf, sel_bytes) == 0)
     {
         return false;
     }
@@ -336,7 +336,7 @@ static void dspark_bulk_drain_runs(pulsar_gpu_graph *g, const int32_t *pos, cons
                                    uint32_t n_dec, uint32_t n_rows) {
     if (!g->dspark_bulk_h[0] || !g->banks.dspark_prompt[0] || g->banks.n_banks == 0) return;
     const uint32_t win = PULSAR_DSPARK_DRAFT_WINDOW;
-    const uint64_t row = (uint64_t)PULSAR_N_EMBD * sizeof(float);
+    const TensorBytes row = bytes_of<float>(PULSAR_N_EMBD);
     const uint32_t cur = pulsar_bank_index(gpu_graph_cur_bank(g));
     for (uint32_t r0 = n_dec; r0 < n_rows;) {
         uint32_t r1 = r0 + 1;
@@ -353,10 +353,9 @@ static void dspark_bulk_drain_runs(pulsar_gpu_graph *g, const int32_t *pos, cons
                 uint32_t run = win - slot;
                 if (run > take - done) run = take - done;
                 (void)pulsar_gpu_tensor_copy(g->banks.dspark_prompt[s2],
-                                             (uint64_t)b * g->banks.dspark_prompt_bank_bytes + (uint64_t)slot * row,
-                                             g->dspark_bulk_h[s2],
-                                             (uint64_t)(r0 - n_dec + (p - start)) * row,
-                                             (uint64_t)run * row);
+                                             g->banks.dspark_prompt_bank_bytes.times(b) + row.times(slot),
+                                             g->dspark_bulk_h[s2], row.times(r0 - n_dec + (p - start)),
+                                             row.times(run));
                 done += run;
             }
         }
@@ -400,10 +399,10 @@ static void dspark_bulk_drain(pulsar_gpu_graph *g, const token_vec *prompt,
                 uint32_t run = win - slot;
                 if (run > take - done) run = take - done;
                 (void)pulsar_gpu_tensor_copy(g->dspark_prompt_h[s2],
-                                          (uint64_t)slot * PULSAR_N_EMBD * sizeof(float),
+                                          bytes_of<float>((uint64_t)slot * PULSAR_N_EMBD),
                                           g->dspark_bulk_h[s2],
-                                          (uint64_t)(pos - start) * PULSAR_N_EMBD * sizeof(float),
-                                          (uint64_t)run * PULSAR_N_EMBD * sizeof(float));
+                                          bytes_of<float>((uint64_t)(pos - start) * PULSAR_N_EMBD),
+                                          bytes_of<float>((uint64_t)run * PULSAR_N_EMBD));
                 done += run;
             }
         }
@@ -435,8 +434,8 @@ static void dspark_bulk_drain(pulsar_gpu_graph *g, const token_vec *prompt,
     fwrite(hdr, sizeof(uint32_t), 2, f);
     fwrite(prompt->v + start, sizeof(int32_t), cap_n, f);
     for (int s = 0; s < 3; s++) {
-        if (!pulsar_gpu_tensor_read(g->dspark_bulk_h[s], 0, host,
-                                 (uint64_t)cap_n * PULSAR_N_EMBD * sizeof(float)))
+        if (!pulsar_gpu_tensor_read(g->dspark_bulk_h[s], TensorBytes{0}, host,
+                                 bytes_of<float>((uint64_t)cap_n * PULSAR_N_EMBD)))
             return;
         if (g->distill_top_ids) {
             /* plan-92 P1: in collection mode the hidden streams go to disk as
@@ -468,19 +467,19 @@ static void dspark_bulk_drain(pulsar_gpu_graph *g, const token_vec *prompt,
     if (g->distill_top_ids) {
         const uint32_t magic = 0x50445431u;
         int32_t inexact = 0;
-        (void)pulsar_gpu_tensor_read(g->distill_inexact, 0, &inexact, sizeof(inexact));
+        (void)pulsar_gpu_tensor_read(g->distill_inexact, TensorBytes{0}, &inexact, TensorBytes{sizeof(inexact)});
         fwrite(&magic, sizeof(magic), 1, f);
         fwrite(&inexact, sizeof(inexact), 1, f);
-        if (!pulsar_gpu_tensor_read(g->distill_top_ids, 0, host,
-                                 (uint64_t)cap_n * 64 * sizeof(int32_t)))
+        if (!pulsar_gpu_tensor_read(g->distill_top_ids, TensorBytes{0}, host,
+                                 bytes_of<int32_t>((uint64_t)cap_n * 64)))
             return;
         fwrite(host, sizeof(int32_t), (size_t)cap_n * 64, f);
-        if (!pulsar_gpu_tensor_read(g->distill_top_vals, 0, host,
-                                 (uint64_t)cap_n * 64 * sizeof(uint16_t)))
+        if (!pulsar_gpu_tensor_read(g->distill_top_vals, TensorBytes{0}, host,
+                                 bytes_of<uint16_t>((uint64_t)cap_n * 64)))
             return;
         fwrite(host, sizeof(uint16_t), (size_t)cap_n * 64, f);
-        if (!pulsar_gpu_tensor_read(g->distill_tail_lse, 0, host,
-                                 (uint64_t)cap_n * sizeof(uint16_t)))
+        if (!pulsar_gpu_tensor_read(g->distill_tail_lse, TensorBytes{0}, host,
+                                 bytes_of<uint16_t>(cap_n)))
             return;
         fwrite(host, sizeof(uint16_t), (size_t)cap_n, f);
     }
@@ -1145,17 +1144,18 @@ int gpu_graph_decode_multiseq_batch(
          * ascending with last_idx[r] >= r, so front-compaction never clobbers an
          * un-copied source. The extra synchronize is amortized over the prefill. */
         if (ok) ok = pulsar_gpu_end_commands() != 0; else (void)pulsar_gpu_synchronize();
-        const uint64_t hc_row_bytes = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD * PULSAR_HC_ELT_SIZE;   /* carrier */
-        const uint64_t pre_row_bytes = (uint64_t)PULSAR_N_HC * sizeof(float);
+        const TensorBytes hc_row_bytes = elt_bytes((uint64_t)PULSAR_N_HC * PULSAR_N_EMBD,
+                                                   PULSAR_HC_ELT_SIZE);   /* carrier */
+        const TensorBytes pre_row_bytes = bytes_of<float>(PULSAR_N_HC);
         for (uint32_t r = 0; ok && r < head_runs; r++) {
             if ((uint32_t)head_src[r] == r) continue;
             /* the row's pre moves with it: the head collapses row r with the
              * pre row r's last FFN handed on */
-            ok = pulsar_gpu_tensor_copy(g->batch_cur_hc, (uint64_t)r * hc_row_bytes,
-                                     g->batch_cur_hc, (uint64_t)head_src[r] * hc_row_bytes,
+            ok = pulsar_gpu_tensor_copy(g->batch_cur_hc, hc_row_bytes.times(r),
+                                     g->batch_cur_hc, hc_row_bytes.times(head_src[r]),
                                      hc_row_bytes) != 0 &&
-                 pulsar_gpu_tensor_copy(g->batch_hc_pre, (uint64_t)r * pre_row_bytes,
-                                     g->batch_hc_pre, (uint64_t)head_src[r] * pre_row_bytes,
+                 pulsar_gpu_tensor_copy(g->batch_hc_pre, pre_row_bytes.times(r),
+                                     g->batch_hc_pre, pre_row_bytes.times(head_src[r]),
                                      pre_row_bytes) != 0;
         }
         if (ok) ok = pulsar_gpu_begin_commands() != 0;
@@ -1186,11 +1186,12 @@ int gpu_graph_decode_multiseq_batch(
     /* L302: the rows stay in spec_logits (the session's step rows); a caller that wants them on the host passes
      * `logits` */
     if (logits)
-        ok = pulsar_gpu_tensor_read(g->spec_logits, 0, logits, (uint64_t)head_runs * PULSAR_N_VOCAB * sizeof(float)) != 0;
+        ok = pulsar_gpu_tensor_read(g->spec_logits, TensorBytes{0}, logits,
+                                    bytes_of<float>((uint64_t)head_runs * PULSAR_N_VOCAB)) != 0;
     if (ok && logits && fused && fused_heads > 0)
-        ok = pulsar_gpu_tensor_read(g->spec_logits, (uint64_t)fused->n_dec * PULSAR_N_VOCAB * sizeof(float),
+        ok = pulsar_gpu_tensor_read(g->spec_logits, bytes_of<float>((uint64_t)fused->n_dec * PULSAR_N_VOCAB),
                                     logits + (size_t)fused->n_dec * PULSAR_N_VOCAB,
-                                    (uint64_t)fused_heads * PULSAR_N_VOCAB * sizeof(float)) != 0;
+                                    bytes_of<float>((uint64_t)fused_heads * PULSAR_N_VOCAB)) != 0;
     /* The banks' KV/frontiers committed correctly (step_end passed); a
      * readback failure still leaves the caller without this step's logits,
      * which desynchronizes its sampling from the committed KV — treat as

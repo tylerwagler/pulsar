@@ -8,6 +8,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "lib/pulsar_units.h"   /* L334 P5: TensorBytes in the host API */
+
 /* =========================================================================
  * THE BACKEND SEAM.
  * =========================================================================
@@ -184,7 +186,7 @@ void pulsar_gpu_cleanup(void);
  * excluded).  Snapshot around a session create to measure its true resident
  * cost; the server ledger commits that actual. */
 /** @return live owned tensor bytes (cudaMalloc and managed), process-wide */
-uint64_t pulsar_gpu_tensor_alloc_bytes_current(void);
+TensorBytes pulsar_gpu_tensor_alloc_bytes_current(void);
 /** Dry-run allocation on the calling thread: after dry_begin, the two tensor
  * allocators return placeholders and total the requested bytes instead of
  * touching the device; every device operation on a placeholder is a no-op
@@ -197,13 +199,13 @@ void     pulsar_gpu_tensor_dry_begin(void);
 /** @brief End the calling thread's dry run.
  *  @param bytes         receives every byte requested during the run
  *  @param managed_bytes receives the cudaMallocManaged subset */
-void     pulsar_gpu_tensor_dry_end(uint64_t *bytes, uint64_t *managed_bytes);
+void     pulsar_gpu_tensor_dry_end(TensorBytes *bytes, TensorBytes *managed_bytes);
 /** @return nonzero while the calling thread is in a dry run */
 int      pulsar_gpu_tensor_dry_active(void);
 /** @brief Allocate an owned device tensor (cudaMalloc; f32 elements by default).
  *  @param bytes size in bytes (0 allocates 1)
  *  @return the tensor (free with pulsar_gpu_tensor_free), or NULL on failure; a placeholder during a dry run */
-pulsar_gpu_tensor *pulsar_gpu_tensor_alloc(uint64_t bytes);
+pulsar_gpu_tensor *pulsar_gpu_tensor_alloc(TensorBytes bytes);
 /* n_elems * esz bytes, with esz recorded on the tensor.  Use this for any
  * buffer whose elements are not f32; consumers then derive the type from
  * the tensor instead of being handed a flag that can disagree with it. */
@@ -238,20 +240,20 @@ pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_elt(uint64_t n_elems, uint32_t esz,
  *  (pulsar_gpu_should_use_managed_kv_cache).
  *  @param bytes size in bytes (0 allocates 1)
  *  @return the tensor, or NULL on failure */
-pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_managed(uint64_t bytes);
+pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_managed(TensorBytes bytes);
 /** @brief A non-owning view of [offset, offset + bytes) of `base`; it inherits the element size and format.
  *  Freeing the view (pulsar_gpu_tensor_free) frees only the handle; `base` must outlive it.
  *  @param base   the tensor viewed
  *  @param offset byte offset into base
  *  @param bytes  view size in bytes
  *  @return the view, or NULL when the range leaves `base` */
-pulsar_gpu_tensor *pulsar_gpu_tensor_view(const pulsar_gpu_tensor *base, uint64_t offset, uint64_t bytes);
+pulsar_gpu_tensor *pulsar_gpu_tensor_view(const pulsar_gpu_tensor *base, TensorBytes offset, TensorBytes bytes);
 /** @brief Free a tensor handle and, when it owns its memory, the memory.  NULL is a no-op.
  *  @param tensor the tensor or view */
 void pulsar_gpu_tensor_free(pulsar_gpu_tensor *tensor);
 /** @param tensor the tensor (may be NULL)
  *  @return its size in bytes; 0 for NULL */
-uint64_t pulsar_gpu_tensor_bytes(const pulsar_gpu_tensor *tensor);
+TensorBytes pulsar_gpu_tensor_bytes(const pulsar_gpu_tensor *tensor);
 /** Raw device pointer without a synchronize (for building device pointer tables). */
 /** @param tensor the tensor (may be NULL)
  *  @return its device pointer, or NULL; never for reading contents on the host */
@@ -268,7 +270,7 @@ int pulsar_gpu_tensor_fill_f32(pulsar_gpu_tensor *tensor, float value, uint64_t 
  *  @param data   host source
  *  @param bytes  byte count; the range must fit the tensor
  *  @return 1 on success, 0 on a bad range or copy failure */
-int pulsar_gpu_tensor_write(pulsar_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
+int pulsar_gpu_tensor_write(pulsar_gpu_tensor *tensor, TensorBytes offset, const void *data, TensorBytes bytes);
 /** L289: the same write ENQUEUED on the per-thread stream (cudaMemcpyAsync H2D): the host does not wait for the
  *  GPU work queued before it, so a write in the middle of a step does not drain the step.  From pageable memory
  *  the driver stages `data` before returning; from pinned memory (pulsar_gpu_host_alloc) the copy reads `data`
@@ -278,21 +280,22 @@ int pulsar_gpu_tensor_write(pulsar_gpu_tensor *tensor, uint64_t offset, const vo
  *  @param data   host source (see above for how long it must live)
  *  @param bytes  byte count; the range must fit the tensor
  *  @return 1 on success (enqueued), 0 on a bad range or enqueue failure */
-int pulsar_gpu_tensor_write_async(pulsar_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
+int pulsar_gpu_tensor_write_async(pulsar_gpu_tensor *tensor, TensorBytes offset, const void *data,
+                                  TensorBytes bytes);
 /** L289: page-locked host memory (cudaMallocHost) for buffers a step uploads with pulsar_gpu_tensor_write_async;
  *  NULL on failure.  pulsar_gpu_host_free(NULL) is a no-op. */
 /** @param bytes size in bytes; 0 returns NULL
  *  @return pinned host memory (free with pulsar_gpu_host_free), or NULL */
-void *pulsar_gpu_host_alloc(uint64_t bytes);
+void *pulsar_gpu_host_alloc(TensorBytes bytes);
 /** @brief Free memory from pulsar_gpu_host_alloc.
  *  @param p the buffer, or NULL */
 void pulsar_gpu_host_free(void *p);
 /** L347 I3a: one device -> host span of pulsar_gpu_copy_out. */
 typedef struct {
     const pulsar_gpu_tensor *src;   ///< the device tensor read
-    uint64_t offset;                ///< the span's byte offset in it
+    TensorBytes offset;             ///< the span's byte offset in it
     void *dst;                      ///< host destination (pinned for a true DMA; pageable works, staged by the driver)
-    uint64_t bytes;                 ///< the span's bytes; the range must fit `src`
+    TensorBytes bytes;              ///< the span's bytes; the range must fit `src`
 } pulsar_gpu_copy_span;
 /** L347 I3a: the disk KV cache's copy-out.  An event is recorded on the calling thread's stream (the work that wrote
  *  the spans: every kernel and copy queued on it before this call), the calling thread's COPY stream (a non-blocking
@@ -331,8 +334,8 @@ void pulsar_gpu_lane_destroy(pulsar_gpu_lane *lane);
  *  @param done   [n_done] tickets this copy now names
  *  @param n_done tickets in `done`
  *  @return 1 when queued, 0 on a bad range, a bad ticket or a CUDA error (said) */
-int pulsar_gpu_lane_d2h(pulsar_gpu_lane *lane, const pulsar_gpu_tensor *src, uint64_t offset, void *dst,
-                        uint64_t bytes, const uint32_t *done, uint32_t n_done);
+int pulsar_gpu_lane_d2h(pulsar_gpu_lane *lane, const pulsar_gpu_tensor *src, TensorBytes offset, void *dst,
+                        TensorBytes bytes, const uint32_t *done, uint32_t n_done);
 /** @brief Host -> device on the calling thread's stream, after the ticket's copy (pulsar_gpu_lane_order); the ticket
  *  then names this read too, so a host writer of `src` waits for it.  The host waits only while the ticket's own copy
  *  is still in flight.
@@ -343,8 +346,8 @@ int pulsar_gpu_lane_d2h(pulsar_gpu_lane *lane, const pulsar_gpu_tensor *src, uin
  *  @param bytes  bytes; the range must fit `dst`
  *  @param ticket the source's ticket
  *  @return 1 when queued, 0 on a bad range, a bad ticket or a CUDA error (said) */
-int pulsar_gpu_lane_h2d(pulsar_gpu_lane *lane, pulsar_gpu_tensor *dst, uint64_t offset, const void *src,
-                        uint64_t bytes, uint32_t ticket);
+int pulsar_gpu_lane_h2d(pulsar_gpu_lane *lane, pulsar_gpu_tensor *dst, TensorBytes offset, const void *src,
+                        TensorBytes bytes, uint32_t ticket);
 /** @brief Order the calling thread's stream after `ticket`: the host waits while the ticket's copy is still on the
  *  pump (a stream cannot wait for a copy not yet issued), the stream waits for the ticket's last read.
  *  @param lane   the lane
@@ -379,14 +382,14 @@ int pulsar_gpu_tensor_write_q_f32(pulsar_gpu_tensor *tensor, uint64_t off_elems,
  *  @param data   host destination
  *  @param bytes  byte count; the range must fit the tensor
  *  @return 1 on success, 0 on a bad range or copy failure */
-int pulsar_gpu_tensor_read(const pulsar_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
+int pulsar_gpu_tensor_read(const pulsar_gpu_tensor *tensor, TensorBytes offset, void *data, TensorBytes bytes);
 /** Copy `bytes` from a raw DEVICE pointer (a slice of a scratch tensor a kernel wrote) to the host, after the
  *  work queued before it -- the importance-matrix collection's observation (L284 P15).  1 on success. */
 /** @param device raw device source
  *  @param host   host destination
  *  @param bytes  byte count
  *  @return 1 on success, 0 on failure */
-int pulsar_gpu_device_read(const void *device, void *host, uint64_t bytes);
+int pulsar_gpu_device_read(const void *device, void *host, TensorBytes bytes);
 /** @brief Blocking device -> device copy.
  *  @param dst        destination tensor
  *  @param dst_offset byte offset into dst
@@ -394,9 +397,9 @@ int pulsar_gpu_device_read(const void *device, void *host, uint64_t bytes);
  *  @param src_offset byte offset into src
  *  @param bytes      byte count; both ranges must fit
  *  @return 1 on success, 0 on a bad range or copy failure */
-int pulsar_gpu_tensor_copy(pulsar_gpu_tensor *dst, uint64_t dst_offset,
-                          const pulsar_gpu_tensor *src, uint64_t src_offset,
-                          uint64_t bytes);
+int pulsar_gpu_tensor_copy(pulsar_gpu_tensor *dst, TensorBytes dst_offset,
+                          const pulsar_gpu_tensor *src, TensorBytes src_offset,
+                          TensorBytes bytes);
 /** Same copy on the per-thread stream, WITHOUT blocking the host. Only for
  * destinations consumed by a later kernel on that same stream -- stream order
  * covers those. Anything the host reads back, or that crosses streams, keeps
@@ -407,9 +410,9 @@ int pulsar_gpu_tensor_copy(pulsar_gpu_tensor *dst, uint64_t dst_offset,
  *  @param src_offset byte offset into src
  *  @param bytes      byte count; both ranges must fit
  *  @return 1 on success (enqueued), 0 on a bad range or enqueue failure */
-int pulsar_gpu_tensor_copy_async(pulsar_gpu_tensor *dst, uint64_t dst_offset,
-                                 const pulsar_gpu_tensor *src, uint64_t src_offset,
-                                 uint64_t bytes);
+int pulsar_gpu_tensor_copy_async(pulsar_gpu_tensor *dst, TensorBytes dst_offset,
+                                 const pulsar_gpu_tensor *src, TensorBytes src_offset,
+                                 TensorBytes bytes);
 
 /** Batched D2D copy: prepare a device-side descriptor table over fixed tensor
  * allocations once (whole-tensor copies, byte counts multiples of 16; returns
@@ -422,13 +425,13 @@ int pulsar_gpu_tensor_copy_async(pulsar_gpu_tensor *dst, uint64_t dst_offset,
  *  @param n     copies
  *  @return a device descriptor table (free with pulsar_gpu_batched_copy_free), or NULL */
 void *pulsar_gpu_batched_copy_prepare(pulsar_gpu_tensor **dst, pulsar_gpu_tensor **src,
-                                   const uint64_t *bytes, uint32_t n);
+                                   const TensorBytes *bytes, uint32_t n);
 /** @brief Replay the first n_descs copies of a prepared table in one launch on the per-thread stream.
  *  @param handle    from pulsar_gpu_batched_copy_prepare
  *  @param n_descs   copies to run (<= the prepared n)
  *  @param max_bytes the largest copy's byte count (grid sizing)
  *  @return 1 on success, 0 on a NULL handle, n_descs 0 or launch failure */
-int pulsar_gpu_batched_copy_run(void *handle, uint32_t n_descs, uint64_t max_bytes);
+int pulsar_gpu_batched_copy_run(void *handle, uint32_t n_descs, TensorBytes max_bytes);
 /** @brief Free a descriptor table.
  *  @param handle from pulsar_gpu_batched_copy_prepare, or NULL */
 void pulsar_gpu_batched_copy_free(void *handle);

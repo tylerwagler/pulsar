@@ -62,16 +62,16 @@ static bool ds4_walk(void *state, int dir, bool frontier, pulsar_gpu_tensor *sla
                      uint64_t *bytes_out) {
     pulsar_gpu_graph *g = G_(state);
     const uint32_t G = pulsar_ckpt_raw(G_at);   /* the raw ring's offsets are tokens */
-    const uint64_t raw_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_RING);
+    const TensorBytes raw_row{pulsar_kv_row_bytes(PULSAR_KV_ROW_RING)};
     const uint32_t W = g->raw_window;
-    uint64_t off = slot_off;
+    TensorBytes off{slot_off};
     bool ok = true;
     /* one device lane, whole */
     auto lane = [&](pulsar_gpu_tensor *t) {
         if (!t || !ok) return;
-        const uint64_t lb = pulsar_gpu_tensor_bytes(t);
-        if (dir == 0) ok = pulsar_gpu_tensor_copy_async(slab, off, t, 0, lb) != 0;
-        else if (dir > 0) ok = pulsar_gpu_tensor_copy_async(t, 0, slab, off, lb) != 0;
+        const TensorBytes lb = pulsar_gpu_tensor_bytes(t);
+        if (dir == 0) ok = pulsar_gpu_tensor_copy_async(slab, off, t, TensorBytes{0}, lb) != 0;
+        else if (dir > 0) ok = pulsar_gpu_tensor_copy_async(t, TensorBytes{0}, slab, off, lb) != 0;
         off += lb;
     };
     /* The window's positions [G - n, G): the first one's slot in the ring, and how many run before the wrap. */
@@ -80,17 +80,17 @@ static bool ds4_walk(void *state, int dir, bool frontier, pulsar_gpu_tensor *sla
     const uint32_t run = (g->raw_cap - first) < n ? (g->raw_cap - first) : n;
     for (uint32_t il = 0; il < PULSAR_N_LAYER && ok; il++) {
         pulsar_gpu_tensor *raw = g->layer_raw_cache[il];
-        const uint64_t at = off + (uint64_t)skip * raw_row;
+        const TensorBytes at = off + raw_row.times(skip);
         if (dir == 0 && n) {
-            ok = pulsar_gpu_tensor_copy_async(slab, at, raw, (uint64_t)first * raw_row, (uint64_t)run * raw_row) != 0 &&
-                 (run == n || pulsar_gpu_tensor_copy_async(slab, at + (uint64_t)run * raw_row, raw, 0,
-                                                           (uint64_t)(n - run) * raw_row) != 0);
+            ok = pulsar_gpu_tensor_copy_async(slab, at, raw, raw_row.times(first), raw_row.times(run)) != 0 &&
+                 (run == n || pulsar_gpu_tensor_copy_async(slab, at + raw_row.times(run), raw, TensorBytes{0},
+                                                           raw_row.times(n - run)) != 0);
         } else if (dir > 0 && n) {
-            ok = pulsar_gpu_tensor_copy_async(raw, (uint64_t)first * raw_row, slab, at, (uint64_t)run * raw_row) != 0 &&
-                 (run == n || pulsar_gpu_tensor_copy_async(raw, 0, slab, at + (uint64_t)run * raw_row,
-                                                           (uint64_t)(n - run) * raw_row) != 0);
+            ok = pulsar_gpu_tensor_copy_async(raw, raw_row.times(first), slab, at, raw_row.times(run)) != 0 &&
+                 (run == n || pulsar_gpu_tensor_copy_async(raw, TensorBytes{0}, slab, at + raw_row.times(run),
+                                                           raw_row.times(n - run)) != 0);
         }
-        off += (uint64_t)W * raw_row;
+        off += raw_row.times(W);
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (!frontier && (ratio <= 1u || pulsar_compress_coff(ratio) == 1u)) continue;
@@ -110,27 +110,27 @@ static bool ds4_walk(void *state, int dir, bool frontier, pulsar_gpu_tensor *sla
         }
         uint32_t c[5] = { g->dspark_n_raw[0], g->dspark_n_raw[1], g->dspark_n_raw[2], g->dspark_prompt_n,
                           g->dspark_prompt_lo };
-        if (ok && dir == 0) ok = pulsar_gpu_tensor_write(slab, off, c, sizeof(c)) != 0;
+        if (ok && dir == 0) ok = pulsar_gpu_tensor_write(slab, off, c, TensorBytes{sizeof(c)}) != 0;
         else if (ok && dir > 0) {
-            ok = pulsar_gpu_tensor_read(slab, off, c, sizeof(c)) != 0;
+            ok = pulsar_gpu_tensor_read(slab, off, c, TensorBytes{sizeof(c)}) != 0;
             for (int i = 0; ok && i < 3; i++) g->dspark_n_raw[i] = c[i];
             if (ok) { g->dspark_prompt_n = c[3]; g->dspark_prompt_lo = c[4]; }
         }
-        off += sizeof(c);
+        off += TensorBytes{sizeof(c)};
     }
     /* L289: the frontier's Engram history ring (host), the bank's PULSAR_ENGRAM_RING tagged ids */
     if (frontier && g->engram.model) {
         const uint32_t bank = pulsar_bank_index(gpu_graph_cur_bank(g));
         int32_t *tok = g->engram.ring_tok + (size_t)bank * PULSAR_ENGRAM_RING;
         uint32_t *pos = g->engram.ring_pos + (size_t)bank * PULSAR_ENGRAM_RING;
-        const uint64_t tb = PULSAR_ENGRAM_RING * sizeof(int32_t), pb = PULSAR_ENGRAM_RING * sizeof(uint32_t);
+        const TensorBytes tb = bytes_of<int32_t>(PULSAR_ENGRAM_RING), pb = bytes_of<uint32_t>(PULSAR_ENGRAM_RING);
         if (ok && dir == 0)
             ok = pulsar_gpu_tensor_write(slab, off, tok, tb) != 0 && pulsar_gpu_tensor_write(slab, off + tb, pos, pb) != 0;
         else if (ok && dir > 0)
             ok = pulsar_gpu_tensor_read(slab, off, tok, tb) != 0 && pulsar_gpu_tensor_read(slab, off + tb, pos, pb) != 0;
         off += tb + pb;
     }
-    if (bytes_out) *bytes_out = off - slot_off;
+    if (bytes_out) *bytes_out = (off - TensorBytes{slot_off}).raw();
     return ok;
 }
 

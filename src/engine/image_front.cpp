@@ -141,13 +141,14 @@ bool pulsar_image_write_stream_rows(pulsar_gpu_tensor *carrier, const uint16_t *
     if (!carrier || !rows || n_rows == 0 || width == 0 || n_streams == 0) return false;
     if (row0 > n_tokens || n_rows > n_tokens - row0) return false;
     const size_t per_row = (size_t)n_streams * width * sizeof(uint16_t);
-    if (pulsar_gpu_tensor_bytes(carrier) < (uint64_t)n_tokens * per_row) return false;
+    const TensorBytes row_bytes = bytes_of<uint16_t>((size_t)n_streams * width);
+    if (pulsar_gpu_tensor_bytes(carrier) < row_bytes.times(n_tokens)) return false;
     uint16_t *stage = (uint16_t *)malloc((size_t)n_rows * per_row);
     if (!stage) return false;
     for (uint32_t r = 0; r < n_rows; r++)
         for (uint32_t h = 0; h < n_streams; h++)
             memcpy(stage + ((size_t)r * n_streams + h) * width, rows + (size_t)r * width, (size_t)width * sizeof(uint16_t));
-    const bool ok = pulsar_gpu_tensor_write(carrier, (uint64_t)row0 * per_row, stage, (uint64_t)n_rows * per_row) != 0;
+    const bool ok = pulsar_gpu_tensor_write(carrier, row_bytes.times(row0), stage, row_bytes.times(n_rows)) != 0;
     free(stage);
     return ok;
 }

@@ -42,11 +42,11 @@ static void check(bool ok, const char *fmt, ...) {
 
 static std::vector<uint8_t> rd(pulsar_gpu_tensor *t, uint64_t off, uint64_t n) {
     std::vector<uint8_t> v(n);
-    if (!pulsar_gpu_tensor_read(t, off, v.data(), n)) v.clear();
+    if (!pulsar_gpu_tensor_read(t, TensorBytes{off}, v.data(), TensorBytes{n})) v.clear();
     return v;
 }
 static bool wr(pulsar_gpu_tensor *t, uint64_t off, const std::vector<uint8_t> &v) {
-    return pulsar_gpu_tensor_write(t, off, v.data(), v.size()) != 0;
+    return pulsar_gpu_tensor_write(t, TensorBytes{off}, v.data(), TensorBytes{v.size()}) != 0;
 }
 static std::vector<uint8_t> pattern(uint64_t n, uint32_t seed) {
     std::vector<uint8_t> v(n);
@@ -98,12 +98,15 @@ static void plan_a(void) {
     pulsar_gpu_tensor_dry_begin();
     pulsar_state_set *d = pulsar_state_create(NULL, &p, NULL, banks, ctx, PULSAR_STATE_VERIFY_ROWS);
     if (d) pulsar_state_destroy(d);
-    pulsar_gpu_tensor_dry_end(&dry, &managed);
-    const uint64_t before = pulsar_gpu_tensor_alloc_bytes_current();
+    TensorBytes dry_b{0}, managed_b{0};
+    pulsar_gpu_tensor_dry_end(&dry_b, &managed_b);
+    dry = dry_b.raw();
+    managed = managed_b.raw();
+    const uint64_t before = pulsar_gpu_tensor_alloc_bytes_current().raw();
     pulsar_state_set *ss = pulsar_state_create(NULL, &p, NULL, banks, ctx, PULSAR_STATE_VERIFY_ROWS);
     check(ss != NULL, "the declaration builds (%u banks x %u tokens)", banks, ctx);
     if (!ss) return;
-    const uint64_t got = pulsar_gpu_tensor_alloc_bytes_current() - before;
+    const uint64_t got = pulsar_gpu_tensor_alloc_bytes_current().raw() - before;
     check(dry > 0 && got == dry, "allocated %llu B == the dry price %llu B", (unsigned long long)got,
           (unsigned long long)dry);
     check(managed == (uint64_t)banks * 7 * ctx * KV_ROW, "demand-paged %llu B == banks x 7 global layers x ctx x 4 KiB",
@@ -130,7 +133,7 @@ static void plan_a(void) {
         ok = wr(pulsar_state_tensor(ss, k, A_SCONV), SCONV_BYTES, pattern(SCONV_BYTES, 2 * k));
         if (ok && k % 6 != 5) ok = wr(pulsar_state_tensor(ss, k, A_KV_WINDOW), ring, pattern(ring, 2 * k + 1));
     }
-    pulsar_gpu_tensor *slab = pulsar_gpu_tensor_alloc(ss->ckpt.slot_bytes);
+    pulsar_gpu_tensor *slab = pulsar_gpu_tensor_alloc(TensorBytes{ss->ckpt.slot_bytes});
     uint64_t walked = 0;
     ok = ok && slab && ss->ops.walk(ss, 0, false, slab, 0, pulsar_ckpt_pos(128u), &walked) && pulsar_gpu_synchronize();
     check(ok && walked == slot, "the walk copies %llu B (the slot's)", (unsigned long long)walked);
@@ -254,7 +257,8 @@ static void plan_b(void) {
           "free_physical leaves a drafter slot's pool resident");
     check(pulsar_state_bank_alloc(ss, BankId{1}), "and alloc_physical re-backs the trunk's");
     check(ss->cap_rows[B_DELTA] && ss->cap_rows[B_STAGE] && ss->cap_runs[B_STAGE] && ss->cap_host[B_HOST] &&
-          !ss->cap_rows[B_TRAIL] && pulsar_gpu_tensor_bytes(ss->cap_runs[B_STAGE]) >= 1ull * 16 * 4 * STAGE_ROW,
+          !ss->cap_rows[B_TRAIL] &&
+          pulsar_gpu_tensor_bytes(ss->cap_runs[B_STAGE]) >= TensorBytes{1ull * 16 * 4 * STAGE_ROW},
           "captures for the trunk's decls only (the drafter slot's stage is not captured)");
 
     /* one verify: bank 1, rows [0, 6) at positions 9 .. 14 (the open block at 9 is [8, 12); keep 4 ends at 13) */
@@ -287,7 +291,7 @@ static void plan_b(void) {
               ss->fold_host[2 + 2 * 1] == 4 && ss->fold_host[0] == (int32_t)gen * VR,
           "DELTA (L339): the commit launches nothing; bank 1's 4 kept rows are pending in the verify's generation %u", gen);
     check(pulsar_state_capture_offset(ss, 2, B_DELTA) == 2ull * VR * DELTA_UPD &&
-              pulsar_gpu_tensor_bytes(ss->cap_rows[B_DELTA]) >= 2ull * 2 * VR * DELTA_UPD,
+              pulsar_gpu_tensor_bytes(ss->cap_rows[B_DELTA]) >= TensorBytes{2ull * 2 * VR * DELTA_UPD},
           "DELTA: two generations a slot ([slot][gen][verify rows])");
     ok = pulsar_state_fold_flush(ss, BankId{1}) && pulsar_gpu_synchronize();
     const uint8_t *upd = (const uint8_t *)pulsar_gpu_tensor_device_ptr(ss->cap_rows[B_DELTA]);
@@ -333,7 +337,7 @@ static void plan_b(void) {
     /* the walk: out flushes the live bank, in drops its rows; a reset drops them */
     uint64_t wb = 0;
     (void)ss->ops.walk(ss, -1, false, NULL, 0, pulsar_ckpt_pos(0u), &wb);
-    pulsar_gpu_tensor *slab = pulsar_gpu_tensor_alloc(wb);
+    pulsar_gpu_tensor *slab = pulsar_gpu_tensor_alloc(TensorBytes{wb});
     ss->live_bank = BankId{0};
     g_delta = {};
     ok = ok && slab && ss->ops.walk(ss, 0, false, slab, 0, pulsar_ckpt_pos(0u), NULL) && pulsar_gpu_synchronize();

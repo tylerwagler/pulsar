@@ -156,7 +156,7 @@ uint64_t gpu_graph_context_bytes_for_kv_policy(
 /// @param managed allocate managed (oversubscribable) memory
 /// @param bytes size
 /// @return the tensor, or NULL
-pulsar_gpu_tensor *gpu_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes) {
+pulsar_gpu_tensor *gpu_graph_alloc_kv_cache_tensor(bool managed, TensorBytes bytes) {
     return managed ? pulsar_gpu_tensor_alloc_managed(bytes) : pulsar_gpu_tensor_alloc(bytes);
 }
 

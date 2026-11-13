@@ -50,7 +50,7 @@ static void fill_rand(pulsar_gpu_tensor *t, uint64_t n_floats, uint32_t seed) {
         s = s * 1664525u + 1013904223u;
         h[i] = ((float)(s >> 8) / 16777216.0f - 0.5f) * 2.0f;
     }
-    pulsar_gpu_tensor_write(t, 0, h.data(), n_floats * sizeof(float));
+    pulsar_gpu_tensor_write(t, TensorBytes{0}, h.data(), bytes_of<float>(n_floats));
 }
 
 typedef struct {
@@ -105,7 +105,7 @@ static double time_launches(launch_fn fn, void *ctx, uint32_t M, int reps) {
 
 static bool read_out(const pulsar_gpu_tensor *t, std::vector<float> &h, uint64_t n) {
     h.resize(n);
-    return pulsar_gpu_tensor_read(t, 0, h.data(), n * sizeof(float)) != 0;
+    return pulsar_gpu_tensor_read(t, TensorBytes{0}, h.data(), bytes_of<float>(n)) != 0;
 }
 
 static double max_abs_diff(const std::vector<float> &a, const std::vector<float> &b, uint64_t n) {
@@ -173,8 +173,8 @@ int main(int argc, char **argv) {
         memset(&c, 0, sizeof c);
         c.e = e; c.w = w; c.in_dim = w->dim[0]; c.out_dim = w->dim[1];
         const int K = (int)c.in_dim, N = (int)c.out_dim;
-        c.x = pulsar_gpu_tensor_alloc((uint64_t)MMAX * c.in_dim * sizeof(float));
-        c.out = pulsar_gpu_tensor_alloc((uint64_t)MMAX * c.out_dim * sizeof(float));
+        c.x = pulsar_gpu_tensor_alloc(bytes_of<float>((uint64_t)MMAX * c.in_dim));
+        c.out = pulsar_gpu_tensor_alloc(bytes_of<float>((uint64_t)MMAX * c.out_dim));
         if (!c.x || !c.out) { fprintf(stderr, "alloc failed for %s\n", shapes[si].name); return 1; }
         fill_rand(c.x, (uint64_t)MMAX * c.in_dim, 7u + (uint32_t)si);
         /* L158: arm the E4M3 slot and let one unarmed 16-row call quantise into
@@ -309,8 +309,10 @@ int main(int argc, char **argv) {
             for (size_t si2 = 0; si2 < sizeof(shifts) / sizeof(shifts[0]); si2++) {
                 const uint32_t sft = shifts[si2];
                 const uint64_t inb = c.in_dim * sizeof(float), outb = c.out_dim * sizeof(float);
-                pulsar_gpu_tensor *xw = pulsar_gpu_tensor_view(c.x, (uint64_t)sft * inb, (uint64_t)(MMAX - sft) * inb);
-                pulsar_gpu_tensor *ow = pulsar_gpu_tensor_view(c.out, (uint64_t)sft * outb, (uint64_t)(MMAX - sft) * outb);
+                pulsar_gpu_tensor *xw = pulsar_gpu_tensor_view(c.x, TensorBytes{(uint64_t)sft * inb},
+                                                               TensorBytes{(uint64_t)(MMAX - sft) * inb});
+                pulsar_gpu_tensor *ow = pulsar_gpu_tensor_view(c.out, TensorBytes{(uint64_t)sft * outb},
+                                                               TensorBytes{(uint64_t)(MMAX - sft) * outb});
                 if (!xw || !ow) { pulsar_gpu_tensor_free(xw); pulsar_gpu_tensor_free(ow); rc = 1; break; }
                 ctx_t cw = c; cw.x = xw; cw.out = ow;
                 const bool okw = engine_launch(&cw, MMAX - sft) && pulsar_gpu_end_commands() && ft_sync() == 0 &&

@@ -181,8 +181,8 @@ static int payload_write_images(payload_io *io, const pulsar_image_block *b, uin
 static int payload_write_tensor_span(payload_io *io, const pulsar_gpu_tensor *tensor,
                                      uint64_t offset, uint64_t bytes,
                                      uint8_t *buf, size_t cap, char *err, size_t errlen) {
-    if (!tensor || offset > pulsar_gpu_tensor_bytes(tensor) ||
-        bytes > pulsar_gpu_tensor_bytes(tensor) - offset)
+    const uint64_t have = pulsar_gpu_tensor_bytes(tensor).raw();
+    if (!tensor || offset > have || bytes > have - offset)
     {
         /* Name the numbers: a bare "smaller than the payload" says nothing about
          * WHICH span overran, and this is the refusal a checkpoint hits when a
@@ -191,14 +191,14 @@ static int payload_write_tensor_span(payload_io *io, const pulsar_gpu_tensor *te
         snprintf(msg, sizeof(msg),
                  "session tensor is smaller than the payload (offset %llu + %llu > %llu bytes)",
                  (unsigned long long)offset, (unsigned long long)bytes,
-                 (unsigned long long)(tensor ? pulsar_gpu_tensor_bytes(tensor) : 0));
+                 (unsigned long long)have);
         payload_set_err(err, errlen, msg);
         return 1;
     }
     uint64_t done = 0;
     while (done < bytes) {
         const size_t n = bytes - done > (uint64_t)cap ? cap : (size_t)(bytes - done);
-        if (pulsar_gpu_tensor_read(tensor, offset + done, buf, n) == 0) {
+        if (pulsar_gpu_tensor_read(tensor, TensorBytes{offset + done}, buf, TensorBytes{n}) == 0) {
             payload_set_err(err, errlen, "failed to read accelerator session tensor");
             return 1;
         }
@@ -225,14 +225,14 @@ static int payload_read_tensor_span(payload_io *io, pulsar_gpu_tensor *tensor,
                                     uint64_t offset, uint64_t bytes,
                                     uint8_t *buf, size_t cap, uint64_t *remaining,
                                     char *err, size_t errlen) {
-    if (!tensor || offset > pulsar_gpu_tensor_bytes(tensor) ||
-        bytes > pulsar_gpu_tensor_bytes(tensor) - offset)
+    const uint64_t have = pulsar_gpu_tensor_bytes(tensor).raw();
+    if (!tensor || offset > have || bytes > have - offset)
     {
         char msg[192];
         snprintf(msg, sizeof(msg),
                  "session tensor is smaller than the payload (offset %llu + %llu > %llu bytes)",
                  (unsigned long long)offset, (unsigned long long)bytes,
-                 (unsigned long long)(tensor ? pulsar_gpu_tensor_bytes(tensor) : 0));
+                 (unsigned long long)have);
         payload_set_err(err, errlen, msg);
         return 1;
     }
@@ -240,7 +240,7 @@ static int payload_read_tensor_span(payload_io *io, pulsar_gpu_tensor *tensor,
     while (done < bytes) {
         const size_t n = bytes - done > (uint64_t)cap ? cap : (size_t)(bytes - done);
         if (payload_read_bytes(io, buf, n, remaining, err, errlen) != 0) return 1;
-        if (pulsar_gpu_tensor_write(tensor, offset + done, buf, n) == 0) {
+        if (pulsar_gpu_tensor_write(tensor, TensorBytes{offset + done}, buf, TensorBytes{n}) == 0) {
             payload_set_err(err, errlen, "failed to restore accelerator session tensor");
             return 1;
         }
@@ -626,7 +626,8 @@ int pulsar_session::copy_out_segment(uint32_t G_prev, uint32_t G, uint8_t *dst, 
             return 1;
         }
         const uint64_t span = pool_bytes(pools[i], sp.n);
-        spans[n_spans++] = { pools[i].rows, pool_offset(pools[i], sp.first), o.take(span), span };
+        spans[n_spans++] = { pools[i].rows, TensorBytes{pool_offset(pools[i], sp.first)}, o.take(span),
+                             TensorBytes{span} };
     }
     uint8_t *dg = o.take(PULSAR_KVDIGEST_BYTES);
     if (!o.ok || o.at != bytes) {
@@ -839,7 +840,8 @@ pulsar_segment_status pulsar_session::load_segment(const uint8_t *seg, uint64_t 
         }
         const uint64_t span = pool_bytes(pools[i], sp.n);
         const uint8_t *src = in.take(span);
-        if (!src || pulsar_gpu_tensor_write(pools[i].rows, pool_offset(pools[i], sp.first), src, span) == 0) {
+        if (!src || pulsar_gpu_tensor_write(pools[i].rows, TensorBytes{pool_offset(pools[i], sp.first)}, src,
+                                            TensorBytes{span}) == 0) {
             payload_set_err(err, errlen, "load segment: restoring a pool's rows failed");
             return fail(src ? PULSAR_SEGMENT_TRANSIENT : PULSAR_SEGMENT_BAD_ROWS);
         }
@@ -1097,7 +1099,7 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
      * -- and DeepSeek's window head below its first raw_window positions -- is written too, so the same state
      * always saves the same bytes) */
     const uint64_t fb = kvp_frontier_bytes(st);
-    pulsar_gpu_tensor *front = pulsar_gpu_tensor_alloc(fb);
+    pulsar_gpu_tensor *front = pulsar_gpu_tensor_alloc(TensorBytes{fb});
     if (!front || pulsar_gpu_tensor_fill_f32(front, 0.0f, fb / sizeof(float)) == 0 ||
         !st->ops->walk(st->state, 0, true, front, 0, pulsar_ckpt_pos(p.T), NULL) || pulsar_gpu_synchronize() == 0) {
         pulsar_gpu_tensor_free(front);
@@ -1241,7 +1243,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         return fail();
     }
     const uint64_t fb = kvp_frontier_bytes(st);
-    front = pulsar_gpu_tensor_alloc(fb);
+    front = pulsar_gpu_tensor_alloc(TensorBytes{fb});
     if (!front) {
         payload_set_err(err, errlen, "session payload: staging the frontier's state failed");
         return fail();

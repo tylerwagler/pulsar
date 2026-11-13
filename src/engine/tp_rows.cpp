@@ -124,14 +124,14 @@ bool pulsar_tp_allreduce_rows(const pulsar_tp_rows *g, uint32_t il, uint32_t n_t
         }
         heap = true;
     }
-    bool ok = pulsar_gpu_tensor_read(t, 0, out, bytes) != 0 &&
+    bool ok = pulsar_gpu_tensor_read(t, TensorBytes{0}, out, TensorBytes{bytes}) != 0 &&
               pulsar_tp_row_lane_check(g->tp) != 0;   /* stream drained: every row-lane exchange done */
     if (ok) {
         ok = pulsar_tp_allreduce_sum(g->tp, il, ++*g->seq,
                                      out, in, bytes) != 0;
     }
     if (ok) {
-        ok = pulsar_gpu_tensor_write(t, 0, out, bytes) != 0;
+        ok = pulsar_gpu_tensor_write(t, TensorBytes{0}, out, TensorBytes{bytes}) != 0;
     }
     if (heap) {
         free(out);
@@ -188,16 +188,16 @@ bool pulsar_tp_vocab_gather(const pulsar_tp_vocab *g, uint32_t n_rows, const pul
         uint8_t *slab = (uint8_t *)g->slab_dev;
         const uint64_t vf = L.vec_bytes / sizeof(float);
         const uint32_t msgs = (uint32_t)(((uint64_t)n_rows * stride + vf - 1u) / vf);
-        pulsar_gpu_tensor *own = pulsar_gpu_tensor_view(g->vocab_own, 0,
-                                                        (uint64_t)n_rows * (hi - lo) * sizeof(float));
+        pulsar_gpu_tensor *own = pulsar_gpu_tensor_view(g->vocab_own, TensorBytes{0},
+                                                        bytes_of<float>((uint64_t)n_rows * (hi - lo)));
         bool ok = own && head(lo, hi - lo, own) &&
                   pulsar_gpu_tp_scatter_cols(out, own, n_rows, hi - lo, n_vocab, lo) != 0;
         pulsar_gpu_tensor_free(own);
         for (uint32_t m0 = 0; ok && m0 < msgs; m0 += PULSAR_TP_BATCH_MAX_ROWS) {
             const uint32_t m = msgs - m0 < PULSAR_TP_BATCH_MAX_ROWS ? msgs - m0 : PULSAR_TP_BATCH_MAX_ROWS;
             uint64_t first = 0, exch = 0;
-            pulsar_gpu_tensor *chunk = pulsar_gpu_tensor_view(g->vocab_own, (uint64_t)m0 * L.vec_bytes,
-                                                              (uint64_t)m * L.vec_bytes);
+            pulsar_gpu_tensor *chunk = pulsar_gpu_tensor_view(g->vocab_own, TensorBytes{L.vec_bytes}.times(m0),
+                                                              TensorBytes{L.vec_bytes}.times(m));
             ok = chunk && pulsar_tp_row_lane_begin(g->tp, m, &first, &exch) != 0 &&
                  pulsar_gpu_tp_stage_publish(chunk, NULL, slab, L.out_off, L.vec_bytes, first, L.n_slots, m,
                                              slab + L.desc_off, exch, g->ticket) != 0 &&
@@ -212,7 +212,7 @@ bool pulsar_tp_vocab_gather(const pulsar_tp_vocab *g, uint32_t n_rows, const pul
     }
     const uint64_t slice_bytes = (uint64_t)n_rows * stride * sizeof(float);
     const uint64_t full_bytes  = (uint64_t)n_rows * n_vocab * sizeof(float);
-    pulsar_gpu_tensor *slice = pulsar_gpu_tensor_view(out, 0, slice_bytes);
+    pulsar_gpu_tensor *slice = pulsar_gpu_tensor_view(out, TensorBytes{0}, TensorBytes{slice_bytes});
     if (!slice) {
         fprintf(stderr, "pulsar: tp vocab slice view refused (rows=%u stride=%u)\n",
                 n_rows, stride);
@@ -235,8 +235,8 @@ bool pulsar_tp_vocab_gather(const pulsar_tp_vocab *g, uint32_t n_rows, const pul
      * after the first on any rank whose range is shorter than the stride (every
      * uneven split), and the tail zero-fill then overwrote the next row's head.
      * n=2 over 129280 is even, which is why the pair never showed it. */
-    const uint64_t packed_bytes = (uint64_t)n_rows * (hi - lo) * sizeof(float);
-    if (ok) ok = pulsar_gpu_tensor_read(slice, 0, scratch, packed_bytes) != 0;
+    const TensorBytes packed_bytes = bytes_of<float>((uint64_t)n_rows * (hi - lo));
+    if (ok) ok = pulsar_gpu_tensor_read(slice, TensorBytes{0}, scratch, packed_bytes) != 0;
     if (ok) {
         for (uint32_t r = 0; r < n_rows; r++) {
             memcpy(own + (uint64_t)r * stride,
@@ -251,7 +251,7 @@ bool pulsar_tp_vocab_gather(const pulsar_tp_vocab *g, uint32_t n_rows, const pul
                                        ++*g->seq, full, own, scratch,
                                        n_rows, n_vocab, 1u) != 0;
     }
-    if (ok) ok = pulsar_gpu_tensor_write(out, 0, full, full_bytes) != 0;
+    if (ok) ok = pulsar_gpu_tensor_write(out, TensorBytes{0}, full, TensorBytes{full_bytes}) != 0;
     pulsar_gpu_tensor_free(slice);
     free(own);
     free(scratch);

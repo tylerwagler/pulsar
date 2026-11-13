@@ -1233,17 +1233,18 @@ static pulsar_driver_state *qwen_create(pulsar_session *s, uint32_t n_banks) {
     pulsar_qwen_state *st = (pulsar_qwen_state *)xcalloc(1, sizeof(*st));
     st->mtp = mtp;
     const uint64_t rows = s->prefill_cap, nb = n_banks;
-    st->streams = pulsar_gpu_tensor_alloc(rows * pulsar_qwen_hc_dim(sh) * PULSAR_QWEN_STREAM_ELT_SIZE);
-    st->x       = pulsar_gpu_tensor_alloc(rows * sh->n_embd * PULSAR_QWEN_X_ELT_SIZE);
-    st->y       = pulsar_gpu_tensor_alloc(rows * sh->n_embd * PULSAR_QWEN_Y_ELT_SIZE);
+    st->streams = pulsar_gpu_tensor_alloc(elt_bytes(rows * pulsar_qwen_hc_dim(sh), PULSAR_QWEN_STREAM_ELT_SIZE));
+    st->x       = pulsar_gpu_tensor_alloc(elt_bytes(rows * sh->n_embd, PULSAR_QWEN_X_ELT_SIZE));
+    st->y       = pulsar_gpu_tensor_alloc(elt_bytes(rows * sh->n_embd, PULSAR_QWEN_Y_ELT_SIZE));
     bool ok = st->streams && st->x && st->y;
     if (ok && mtp) {
-        const uint64_t hc = pulsar_qwen_hc_dim(sh) * PULSAR_QWEN_STREAM_ELT_SIZE;
-        st->mtp_streams = pulsar_gpu_tensor_alloc(rows * hc);
-        st->mtp_tok     = pulsar_gpu_tensor_alloc(rows * sizeof(int32_t));
-        st->mtp_ws      = pulsar_gpu_tensor_alloc(pulsar_qwen_s4_mtp_combine_ws_bytes());
-        st->mtp_top     = pulsar_gpu_tensor_alloc(pulsar_qwen_s4_draft_top_ws_bytes());
-        st->mtp_stage   = pulsar_gpu_tensor_alloc(nb * pulsar_qwen_index_tail_bytes(sh));   /* per bank */
+        const TensorBytes hc = elt_bytes(pulsar_qwen_hc_dim(sh), PULSAR_QWEN_STREAM_ELT_SIZE);
+        st->mtp_streams = pulsar_gpu_tensor_alloc(hc.times(rows));
+        st->mtp_tok     = pulsar_gpu_tensor_alloc(bytes_of<int32_t>(rows));
+        st->mtp_ws      = pulsar_gpu_tensor_alloc(TensorBytes{pulsar_qwen_s4_mtp_combine_ws_bytes()});
+        st->mtp_top     = pulsar_gpu_tensor_alloc(TensorBytes{pulsar_qwen_s4_draft_top_ws_bytes()});
+        /* per bank */
+        st->mtp_stage   = pulsar_gpu_tensor_alloc(TensorBytes{pulsar_qwen_index_tail_bytes(sh)}.times(nb));
         ok = st->mtp_streams && st->mtp_tok && st->mtp_ws && st->mtp_top && st->mtp_stage;
         st->mtp_pctx = (int32_t *)xcalloc(2u * n_banks, sizeof(int32_t));
     }
@@ -1502,8 +1503,8 @@ static bool qwen_mtp_forward(pulsar_session *s, pulsar_step_mode mode, const pul
     st.mixer = &pulsar_qwen_of(e)->weights->mtp.mixer;
     st.draft_head = true;                               /* the drafter's head: n_draft logits a row */
     /* L289: enqueued, not waited for -- the step's uploads never drain the stream */
-    bool ok = pulsar_gpu_tensor_write_async(q->row_pos, 0, pos, (uint64_t)n_rows * sizeof(int32_t)) != 0 &&
-              pulsar_gpu_tensor_write_async(q->row_bank, 0, bank, (uint64_t)n_rows * sizeof(int32_t)) != 0;
+    bool ok = pulsar_gpu_tensor_write_async(q->row_pos, TensorBytes{0}, pos, bytes_of<int32_t>(n_rows)) != 0 &&
+              pulsar_gpu_tensor_write_async(q->row_bank, TensorBytes{0}, bank, bytes_of<int32_t>(n_rows)) != 0;
     if (ok) ok = pulsar_gpu_begin_commands() != 0;
     if (ok) ok = pulsar_qwen_s4_mtp_combine(&st, pulsar_gpu_tensor_device_ptr(cond));
     if (ok) ok = qwen_layer(&st, il, pulsar_qwen_s3_qsa);
@@ -1525,8 +1526,8 @@ static bool qwen_mtp_forward(pulsar_session *s, pulsar_step_mode mode, const pul
     }
     if (!ok) return false;
     if (head_n && logits_out)
-        ok = pulsar_gpu_tensor_read(q->logits, 0, logits_out,
-                                    (uint64_t)head_n * pulsar_qwen_of(e)->weights->n_draft * sizeof(float)) != 0;
+        ok = pulsar_gpu_tensor_read(q->logits, TensorBytes{0}, logits_out,
+                                    bytes_of<float>((uint64_t)head_n * pulsar_qwen_of(e)->weights->n_draft)) != 0;
     return ok;
 }
 
@@ -1551,8 +1552,8 @@ static uint32_t qwen_mtp_head_width(const pulsar_engine *e) { return pulsar_qwen
 /// @param off byte offset in dst
 /// @return false on a failed copy
 static bool qwen_mtp_trunk_rows(pulsar_session *s, uint32_t row0, uint32_t n, pulsar_gpu_tensor *dst, uint64_t off) {
-    const uint64_t hc = qwen_mtp_cond_bytes(s->engine);
-    return pulsar_gpu_tensor_copy_async(dst, off, qwen_st(s)->streams, (uint64_t)row0 * hc, (uint64_t)n * hc) != 0;
+    const TensorBytes hc = TensorBytes{qwen_mtp_cond_bytes(s->engine)};
+    return pulsar_gpu_tensor_copy_async(dst, TensorBytes{off}, qwen_st(s)->streams, hc.times(row0), hc.times(n)) != 0;
 }
 
 /// pulsar_mtp_ops::out_rows.
@@ -1592,19 +1593,19 @@ static const pulsar_gpu_tensor *qwen_mtp_q_rows(pulsar_session *s, const pulsar_
 /// @param bank the bank
 /// @return false on a failed copy
 static bool qwen_mtp_stage_save(pulsar_session *s, uint32_t bank) {
-    const uint64_t itb = pulsar_qwen_index_tail_bytes(&g_qwen_shape);
-    return pulsar_gpu_tensor_copy_async(qwen_st(s)->mtp_stage, (uint64_t)bank * itb,
+    const TensorBytes itb = TensorBytes{pulsar_qwen_index_tail_bytes(&g_qwen_shape)};
+    return pulsar_gpu_tensor_copy_async(qwen_st(s)->mtp_stage, itb.times(bank),
                                         pulsar_state_tensor(s->states, s->engine->plan.n_layer, PULSAR_QWEN_STATE_IDX_TAIL),
-                                        (uint64_t)bank * itb, itb) != 0;
+                                        itb.times(bank), itb) != 0;
 }
 /// Restore what qwen_mtp_stage_save kept.
 /// @param s the session
 /// @param bank the bank
 /// @return false on a failed copy
 static bool qwen_mtp_stage_restore(pulsar_session *s, uint32_t bank) {
-    const uint64_t itb = pulsar_qwen_index_tail_bytes(&g_qwen_shape);
+    const TensorBytes itb = TensorBytes{pulsar_qwen_index_tail_bytes(&g_qwen_shape)};
     return pulsar_gpu_tensor_copy_async(pulsar_state_tensor(s->states, s->engine->plan.n_layer, PULSAR_QWEN_STATE_IDX_TAIL),
-                                        (uint64_t)bank * itb, qwen_st(s)->mtp_stage, (uint64_t)bank * itb, itb) != 0;
+                                        itb.times(bank), qwen_st(s)->mtp_stage, itb.times(bank), itb) != 0;
 }
 
 /* L289: the verify will embed [x, d_1 ..] after the bank's n-gram context: their PLE rows are read into the page cache

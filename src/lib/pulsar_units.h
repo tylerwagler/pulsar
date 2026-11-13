@@ -494,4 +494,34 @@ static_assert(sizeof(BankId) == sizeof(int32_t) && std::is_trivial<BankId>::valu
                   std::is_standard_layout<BankId>::value,
               "a bank id is as cheap as the int32 it replaces (arrays of it upload as int32)");
 
+/* ---- L334 phase 5: tensor bytes -----------------------------------------------------------------------------------
+ * A tensor's extent or an offset into it, in BYTES -- beside element counts, row counts and float counts of the same
+ * uint64_t in the GPU host API (f3a617af / d0b2fdb5: a launcher took the allocation's bytes for its live rows;
+ * 22c92f71: element size x width priced where a packed row's bytes belonged; read / read_f32, write / write_q_f32,
+ * alloc / alloc_elt are byte and element twins of the same shape).  Its own unit, not KvBytes (that is what the KV
+ * accounting prices; kv_bytes_of crosses by name).  Offsets are TensorBytes too: a distance from the tensor's base.
+ * Element counts stay raw at the element APIs -- the byte APIs no longer take them. */
+/** Tag of TensorBytes (never instantiated). */
+struct pulsar_tensor_bytes_tag;
+/** Bytes of a tensor's extent, or a byte offset into one (L334 P5). */
+typedef pulsar_unit<pulsar_tensor_bytes_tag> TensorBytes;
+
+/** The bytes of `n` elements of T: the named form of `n * sizeof(T)`.
+ *  @param n the elements */
+/// @return their bytes
+template <class T>
+constexpr TensorBytes bytes_of(uint64_t n) { return TensorBytes{n * (uint64_t)sizeof(T)}; }
+/** The bytes of `n` elements of `esz` bytes each (a format's element size: *_ELT_SIZE, alloc_elt).
+ *  @param n   the elements
+ *  @param esz bytes per element */
+/// @return their bytes
+constexpr TensorBytes elt_bytes(uint64_t n, uint64_t esz) { return TensorBytes{n * esz}; }
+/** Tensor bytes as what the KV accounting prices -- the one crossing into KvBytes (a pool's resident extent).
+ *  @param b the tensor bytes */
+/// @return the same bytes as KvBytes
+constexpr KvBytes kv_bytes_of(TensorBytes b) { return KvBytes{b.raw()}; }
+
+static_assert(sizeof(TensorBytes) == sizeof(uint64_t) && std::is_trivial<TensorBytes>::value,
+              "tensor bytes are as cheap as the uint64_t they replace");
+
 #endif

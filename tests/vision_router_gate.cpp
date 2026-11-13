@@ -255,17 +255,17 @@ int main(int argc, char **argv) {
         }
 
         /* ---- the device against the reference ------------------------------ */
-        const uint64_t logits_bytes = rows * g.n_expert * sizeof(float);
+        const TensorBytes logits_bytes = bytes_of<float>(rows * g.n_expert);
         pulsar_gpu_tensor *dlog = pulsar_gpu_tensor_alloc(logits_bytes);
-        pulsar_gpu_tensor *dtok = pulsar_gpu_tensor_alloc(rows * sizeof(int32_t));
-        pulsar_gpu_tensor *dsel = pulsar_gpu_tensor_alloc(rows * g.topk * sizeof(int32_t));
-        pulsar_gpu_tensor *dw = pulsar_gpu_tensor_alloc(rows * g.topk * sizeof(float));
+        pulsar_gpu_tensor *dtok = pulsar_gpu_tensor_alloc(bytes_of<int32_t>(rows));
+        pulsar_gpu_tensor *dsel = pulsar_gpu_tensor_alloc(bytes_of<int32_t>(rows * g.topk));
+        pulsar_gpu_tensor *dw = pulsar_gpu_tensor_alloc(bytes_of<float>(rows * g.topk));
         std::vector<int32_t> idx((size_t)rows * g.topk);
         std::vector<float> w((size_t)rows * g.topk);
         const int launched =
             dlog && dtok && dsel && dw &&
-            pulsar_gpu_tensor_write(dlog, 0, c.logits.data(), logits_bytes) &&
-            pulsar_gpu_tensor_write(dtok, 0, c.tokens.data(), rows * sizeof(int32_t)) &&
+            pulsar_gpu_tensor_write(dlog, TensorBytes{0}, c.logits.data(), logits_bytes) &&
+            pulsar_gpu_tensor_write(dtok, TensorBytes{0}, c.tokens.data(), bytes_of<int32_t>(rows)) &&
             /* The merged signature: the branch's tid2eid arm makes "hash mode"
              * a ROW COUNT rather than a flag (0 = no table), and dev's image
              * bias rides at the end.  A hash case passes its table offset and row
@@ -280,8 +280,8 @@ int main(int argc, char **argv) {
                                                   c.has_vl_bias ? stride * ci + VL_OFF : 0u,
                                                   g.n_vocab, c.has_vl_bias != 0) &&
             pulsar_gpu_end_commands() &&
-            pulsar_gpu_tensor_read(dsel, 0, idx.data(), idx.size() * 4) &&
-            pulsar_gpu_tensor_read(dw, 0, w.data(), w.size() * 4);
+            pulsar_gpu_tensor_read(dsel, TensorBytes{0}, idx.data(), bytes_of<int32_t>(idx.size())) &&
+            pulsar_gpu_tensor_read(dw, TensorBytes{0}, w.data(), bytes_of<float>(w.size()));
         if (!launched) {
             printf("FAIL %-32s: launch/copy failed\n", c.name);
             failures++;

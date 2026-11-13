@@ -998,7 +998,7 @@ static std::vector<uint8_t> declared_bank_state(pulsar_session *s, uint32_t b, i
         if (!ok || !t) return;
         const size_t at = out.size();
         out.resize(at + n);
-        ok = pulsar_gpu_tensor_read(t, off, out.data() + at, n) != 0;
+        ok = pulsar_gpu_tensor_read(t, TensorBytes{off}, out.data() + at, TensorBytes{n}) != 0;
     };
     for (uint32_t k = 0; ok && k < p->n_trunk; k++) {
         for (uint32_t id = 0; id < p->n_decl; id++) {

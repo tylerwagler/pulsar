@@ -199,7 +199,7 @@ struct ctx {
     void put(const char *name, const pulsar_gpu_tensor *t, uint64_t rows, uint32_t width) {
         if (!dump) return;
         std::vector<float> out(rows * width);
-        (void)pulsar_gpu_tensor_read(t, 0, out.data(), out.size() * 4u);
+        (void)pulsar_gpu_tensor_read(t, TensorBytes{0}, out.data(), bytes_of<float>(out.size()));
         write_f32(dump, name, out);
     }
     /* the same of f16 rows, widened */
@@ -210,7 +210,7 @@ struct ctx {
     void put16(const char *name, const pulsar_gpu_tensor *t, uint64_t rows, uint32_t width) {
         if (!dump) return;
         std::vector<uint16_t> h(rows * width);
-        (void)pulsar_gpu_tensor_read(t, 0, h.data(), h.size() * 2u);
+        (void)pulsar_gpu_tensor_read(t, TensorBytes{0}, h.data(), bytes_of<uint16_t>(h.size()));
         std::vector<float> out(h.size());
         for (size_t i = 0; i < h.size(); i++) out[i] = exl3_f16_to_f32(h[i]);
         write_f32(dump, name, out);
@@ -239,9 +239,11 @@ bool tower(ctx &c, const pulsar_nemotron_parse_page &pg, uint32_t n_patch) {
     /* phases (pulsar_group_gpu_phase): the seed through the first LayerNorm, each block, the output's rows */
     std::optional<pulsar_group_gpu_phase> ph;
     ph.emplace();
-    if (!pulsar_gpu_tensor_write(r->t[B_RES], 0, r->cls_rows, (uint64_t)NC * D * 4u) ||
-        !pulsar_gpu_tensor_write(r->t[B_RES], (uint64_t)NC * D * 4u, r->pos_rows.data(), (uint64_t)n_patch * D * 4u) ||
-        !pulsar_gpu_tensor_write(r->t[B_PATCH], 0, pg.patches.data(), (uint64_t)n_patch * P * 2u))
+    if (!pulsar_gpu_tensor_write(r->t[B_RES], TensorBytes{0}, r->cls_rows, bytes_of<float>((uint64_t)NC * D)) ||
+        !pulsar_gpu_tensor_write(r->t[B_RES], bytes_of<float>((uint64_t)NC * D), r->pos_rows.data(),
+                                 bytes_of<float>((uint64_t)n_patch * D)) ||
+        !pulsar_gpu_tensor_write(r->t[B_PATCH], TensorBytes{0}, pg.patches.data(),
+                                 bytes_of<uint16_t>((uint64_t)n_patch * P)))
         return fail(c.err, c.errlen, "the page's rows did not reach the device");
     for (uint32_t r0 = 0; r0 < n_patch; r0 += NP_CHUNK) {
         const uint32_t m = n_patch - r0 < NP_CHUNK ? n_patch - r0 : NP_CHUNK;
@@ -416,7 +418,8 @@ bool gather(ctx &c, const int *ids, uint32_t n, uint32_t at) {
     pulsar_nemotron_parse_run *r = c.r;
     const pulsar_nemotron_parse_shape &s = c.w->shape;
     std::vector<int32_t> v(ids, ids + n);
-    if (!pulsar_gpu_tensor_write(r->t[B_IDS], 0, v.data(), (uint64_t)n * 4u)) return fail(c.err, c.errlen, "ids upload");
+    if (!pulsar_gpu_tensor_write(r->t[B_IDS], TensorBytes{0}, v.data(),
+                                 bytes_of<int32_t>(n))) return fail(c.err, c.errlen, "ids upload");
     return pulsar_rows_gather_f16_launch((const uint16_t *)c.wp(c.w->embed, "parse embed"), s.vocab, s.width,
                                          dp<int32_t>(r->t[B_IDS]), n, s.embed_scale,
                                          dp<float>(r->t[B_EMB]) + (size_t)at * s.width, s.width, 0) == 0 ||
@@ -496,7 +499,7 @@ int parse(pulsar_engine *e, const uint8_t *image, size_t len, const pulsar_parse
         pulsar_group_gpu_phase ph;
         ok = ok && gather(c, prompt.data(), (uint32_t)prompt.size(), n_prefix) &&
              decoder(c, 0, n_prefix + (uint32_t)prompt.size(), true) &&
-             (pulsar_gpu_tensor_read(r->t[B_LOGITS], 0, logits.data(), (uint64_t)s.vocab * 4u) ||
+             (pulsar_gpu_tensor_read(r->t[B_LOGITS], TensorBytes{0}, logits.data(), bytes_of<float>(s.vocab)) ||
               fail(err, errlen, "the logits' read failed"));
         if (ok) c.put("logits0", r->t[B_LOGITS], 1, s.vocab);
     }
@@ -515,7 +518,7 @@ int parse(pulsar_engine *e, const uint8_t *image, size_t len, const pulsar_parse
         if ((uint32_t)tok == s.eos || n_new >= max_new || pos + 1u >= s.max_seq) break;
         pulsar_group_gpu_phase ph;
         ok = gather(c, &tok, 1, 0) && decoder(c, pos, 1, false) &&
-             (pulsar_gpu_tensor_read(r->t[B_LOGITS], 0, logits.data(), (uint64_t)s.vocab * 4u) ||
+             (pulsar_gpu_tensor_read(r->t[B_LOGITS], TensorBytes{0}, logits.data(), bytes_of<float>(s.vocab)) ||
               fail(err, errlen, "the logits' read failed"));
     }
     pthread_mutex_unlock(&r->mu);
@@ -595,7 +598,7 @@ bool pulsar_nemotron_parse_run_create(pulsar_engine *e) {
     r->bytes[B_POOLS] = (uint64_t)s.n_layer * r->pool_bytes;
     uint64_t total = 0;
     for (int b = 0; b < B_COUNT; b++) {
-        r->t[b] = pulsar_gpu_tensor_alloc(r->bytes[b]);
+        r->t[b] = pulsar_gpu_tensor_alloc(TensorBytes{r->bytes[b]});
         if (!r->t[b]) {
             fprintf(stderr, "pulsar: %s: the forward's scratch did not fit the device -- refusing\n", ARCH);
             return false;

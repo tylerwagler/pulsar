@@ -549,7 +549,7 @@ bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb, const
     if (!kc->st) return false;
     /* L347 I3a: the pool, pinned once (a DMA target for the copy-out and a DMA source for a restore), sized at startup:
      * on a unified host its pages are the GPU's, so the guard and admission read them as taken (MemAvailable) */
-    kc->ram_base = ram.bytes ? pulsar_gpu_host_alloc(ram.bytes) : NULL;
+    kc->ram_base = ram.bytes ? pulsar_gpu_host_alloc(TensorBytes{ram.bytes}) : NULL;
     /* L347: touch every page now -- a unified host's allocator backs pages on first touch, and the pool must be out of
      * MemAvailable before the warmup reading (cli_main opens the cache before it), not at the first copy-out */
     if (kc->ram_base) memset(kc->ram_base, 0, (size_t)ram.bytes);

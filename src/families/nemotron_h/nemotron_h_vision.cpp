@@ -245,7 +245,7 @@ bool pulsar_nemotron_h_vision_run_create(const pulsar_model *m, pulsar_nemotron_
     }
     uint64_t total = 0;
     for (int b = 0; b < V_COUNT; b++) {
-        r->t[b] = pulsar_gpu_tensor_alloc(r->bytes[b]);
+        r->t[b] = pulsar_gpu_tensor_alloc(TensorBytes{r->bytes[b]});
         if (!r->t[b]) {
             fprintf(stderr, "pulsar: " NHV "the tower's scratch did not fit the device -- refusing\n");
             return false;
@@ -322,9 +322,11 @@ bool pulsar_nemotron_h_vision_encode(const pulsar_model *m, const pulsar_nemotro
     uint16_t *patch = dp<uint16_t>(r->t[V_PATCH]), *xn = dp<uint16_t>(r->t[V_XN]), *qkv = dp<uint16_t>(r->t[V_QKV]),
              *att = dp<uint16_t>(r->t[V_ATT]), *mlp = dp<uint16_t>(r->t[V_MLP]);
     /* the seed: the prefix rows, the positions, then + the patch embedding */
-    if (!pulsar_gpu_tensor_write(r->t[V_RES], 0, v->cls_rows.data(), (uint64_t)NC * D * 4u) ||
-        !pulsar_gpu_tensor_write(r->t[V_RES], (uint64_t)NC * D * 4u, pos.data(), (uint64_t)np * D * 4u) ||
-        !pulsar_gpu_tensor_write(r->t[V_PATCH], 0, img.patches.data(), (uint64_t)np * P * 2u))
+    if (!pulsar_gpu_tensor_write(r->t[V_RES], TensorBytes{0}, v->cls_rows.data(), bytes_of<float>((uint64_t)NC * D)) ||
+        !pulsar_gpu_tensor_write(r->t[V_RES], bytes_of<float>((uint64_t)NC * D), pos.data(),
+                                 bytes_of<float>((uint64_t)np * D)) ||
+        !pulsar_gpu_tensor_write(r->t[V_PATCH], TensorBytes{0}, img.patches.data(),
+                                 bytes_of<uint16_t>((uint64_t)np * P)))
         return vfail(err, errlen, "the image's rows did not reach the device");
     for (uint32_t r0 = 0; r0 < np; r0 += CHUNK) {
         const uint32_t k = np - r0 < CHUNK ? np - r0 : CHUNK;
@@ -338,7 +340,7 @@ bool pulsar_nemotron_h_vision_encode(const pulsar_model *m, const pulsar_nemotro
     if (!pulsar_vit_encode(m, dims, v->vit, PULSAR_ROWS_OUT_BF16, bufs, N, NULL, err, errlen)) return false;
     if (dbg) {   /* the tower's residual, the patches back in raster order */
         std::vector<float> all((size_t)N * D);
-        if (!pulsar_gpu_tensor_read(r->t[V_RES], 0, all.data(), all.size() * 4u))
+        if (!pulsar_gpu_tensor_read(r->t[V_RES], TensorBytes{0}, all.data(), bytes_of<float>(all.size())))
             return vfail(err, errlen, "the stage read failed");
         dbg->assign(all.begin(), all.begin() + (size_t)NC * D);
         dbg->resize(all.size());
@@ -366,7 +368,8 @@ bool pulsar_nemotron_h_vision_encode(const pulsar_model *m, const pulsar_nemotro
             return vfail(err, errlen, "the projector's mlp1 refused");
     }
     uint16_t *out = (uint16_t *)malloc((size_t)n_llm * LLM_WIDTH * 2u);
-    if (!out || !pulsar_gpu_tensor_read(r->t[V_QKV], 0, out, (uint64_t)n_llm * LLM_WIDTH * 2u)) {
+    if (!out || !pulsar_gpu_tensor_read(r->t[V_QKV], TensorBytes{0}, out,
+                                        bytes_of<uint16_t>((uint64_t)n_llm * LLM_WIDTH))) {
         free(out);
         return vfail(err, errlen, "the rows' read failed");
     }

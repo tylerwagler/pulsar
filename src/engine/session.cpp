@@ -1202,22 +1202,23 @@ void pulsar_engine::destroy() {
 /// @return false (said) when an allocation failed; true with nothing to do
 static bool session_alloc_tp_scratch(pulsar_gpu_graph *g, pulsar_tp *tp) {
     if (!tp || !pulsar_tp_row_lane(tp)) return true;
-    const uint64_t vb = pulsar_tp_vec_bytes(tp);
+    const TensorBytes vb = TensorBytes{pulsar_tp_vec_bytes(tp)};
     const uint64_t bytes = pulsar_tp_vocab_own_bytes(tp, (uint32_t)PULSAR_N_VOCAB, (uint32_t)PULSAR_SPEC_LOGITS_ALLOC_ROWS);
-    g->tp_vocab_own = pulsar_gpu_tensor_alloc(bytes);
+    g->tp_vocab_own = pulsar_gpu_tensor_alloc(TensorBytes{bytes});
     if (!g->tp_vocab_own) {
         fprintf(stderr, "pulsar: tp vocab gather scratch (%llu bytes) allocation failed\n",
                 (unsigned long long)bytes);
         return false;
     }
-    g->tp_ain_own = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_TP_BATCH_MAX_ROWS * vb);
+    g->tp_ain_own = pulsar_gpu_tensor_alloc(vb.times(PULSAR_TP_BATCH_MAX_ROWS));
     if (!g->tp_ain_own) {
         fprintf(stderr, "pulsar: tp attention-input gather scratch allocation failed\n");
         return false;
     }
     const uint32_t zero = 0u;
-    g->tp_stage_ticket = pulsar_gpu_tensor_alloc(sizeof(zero));
-    if (!g->tp_stage_ticket || !pulsar_gpu_tensor_write(g->tp_stage_ticket, 0, &zero, sizeof(zero))) {
+    g->tp_stage_ticket = pulsar_gpu_tensor_alloc(TensorBytes{sizeof(zero)});
+    if (!g->tp_stage_ticket || !pulsar_gpu_tensor_write(g->tp_stage_ticket, TensorBytes{0}, &zero,
+                                                        TensorBytes{sizeof(zero)})) {
         fprintf(stderr, "pulsar: tp row-lane stage ticket allocation failed\n");
         return false;
     }
@@ -1261,12 +1262,12 @@ int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size)
     if (!out || !e || ctx_size <= 0) return 1;
     *out = NULL;
     if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 1;
-    const uint64_t alloc_before = pulsar_gpu_tensor_alloc_bytes_current();
+    const TensorBytes alloc_before = pulsar_gpu_tensor_alloc_bytes_current();
     pulsar_session *s = session_build(e, ctx_size, gpu_graph_bank_pool_n());
     if (!s) return 1;
-    s->resident_bytes = pulsar_gpu_tensor_alloc_bytes_current() - alloc_before;
+    s->resident_bytes = (pulsar_gpu_tensor_alloc_bytes_current() - alloc_before).raw();
     /* the kv-state payload staging buffer, pinned once (pulsar_session::io_buf): a session that cannot have it does not open */
-    s->io_buf = (uint8_t *)pulsar_gpu_host_alloc(PULSAR_SESSION_IO_CHUNK);
+    s->io_buf = (uint8_t *)pulsar_gpu_host_alloc(TensorBytes{PULSAR_SESSION_IO_CHUNK});
     if (!s->io_buf) {
         fprintf(stderr, "pulsar: session create: the %u MiB pinned disk-KV staging buffer could not be allocated -- "
                         "refusing\n", PULSAR_SESSION_IO_CHUNK >> 20);
@@ -1356,10 +1357,10 @@ uint64_t pulsar_engine::session_cost_bytes_banked(int ctx_size, int n_banks, uin
     pulsar_session *s = session_build(e, ctx_size, (uint32_t)n_banks);
     const bool ok = s != NULL;
     if (s) s->destroy();
-    uint64_t bytes = 0, managed = 0;
+    TensorBytes bytes{0}, managed{0};
     pulsar_gpu_tensor_dry_end(&bytes, &managed);
-    if (managed_bytes && ok) *managed_bytes = managed;
-    return ok ? bytes : 0;
+    if (managed_bytes && ok) *managed_bytes = managed.raw();
+    return ok ? bytes.raw() : 0;
 }
 
 uint64_t pulsar_engine::session_cost_bytes(int ctx_size) {

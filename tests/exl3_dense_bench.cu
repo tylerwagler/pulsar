@@ -755,23 +755,23 @@ int main(int argc, char **argv) {
         const int K = sh.K, N = sh.N;
         /* the activation: 16 rows of f32 the bench produces, armed as the A8
          * slot by the engine's own producer-side encoder */
-        pulsar_gpu_tensor *x = pulsar_gpu_tensor_alloc((uint64_t)kMaxRows * K * 4);
+        pulsar_gpu_tensor *x = pulsar_gpu_tensor_alloc(bytes_of<float>((uint64_t)kMaxRows * K));
         /* L251 / ac69748f: the EXL3 dense arm reads BF16 and there is no f32 -> bf16 activation
          * encoder, so the harness carries its own bf16 activation BESIDE the f32 one the MXFP8 arm
          * needs.  Filled from the same values through __float2bfloat16, so both arms still see
          * identical rows -- which is the whole point of this comparison. */
-        pulsar_gpu_tensor *xb = pulsar_gpu_tensor_alloc((uint64_t)kMaxRows * K * 2);
-        pulsar_gpu_tensor *out = pulsar_gpu_tensor_alloc((uint64_t)kMaxRows * N * 4);
+        pulsar_gpu_tensor *xb = pulsar_gpu_tensor_alloc(bytes_of<uint16_t>((uint64_t)kMaxRows * K));
+        pulsar_gpu_tensor *out = pulsar_gpu_tensor_alloc(bytes_of<float>((uint64_t)kMaxRows * N));
         {
             std::vector<float> h((size_t)kMaxRows * K);
             for (auto &v : h) v = ((float)(rnd() >> 8) / 16777216.0f - 0.5f) * 4.0f;
-            pulsar_gpu_tensor_write(x, 0, h.data(), h.size() * 4);
+            pulsar_gpu_tensor_write(x, TensorBytes{0}, h.data(), bytes_of<float>(h.size()));
             std::vector<uint16_t> hb(h.size());
             for (size_t i = 0; i < h.size(); i++) {
                 const __nv_bfloat16 b = __float2bfloat16(h[i]);
                 std::memcpy(&hb[i], &b, sizeof(uint16_t));
             }
-            pulsar_gpu_tensor_write(xb, 0, hb.data(), hb.size() * 2);
+            pulsar_gpu_tensor_write(xb, TensorBytes{0}, hb.data(), bytes_of<uint16_t>(hb.size()));
         }
         float *d_y = nullptr, *d_ws = nullptr;
         const size_t ws_bytes = ds4_exl3_dense_workspace_bytes(kMaxRows, K, N);
@@ -792,10 +792,10 @@ int main(int argc, char **argv) {
             for (int r = 0; r < n_f8; r++) {
                 for (auto &b : hd) { b = (uint8_t)rnd(); if ((b & 0x7f) == 0x7f) b ^= 1; }   /* no NaN codes */
                 for (auto &b : hs) b = (uint8_t)(120 + rnd() % 8);
-                f8d[r] = pulsar_gpu_tensor_alloc(f8_data);
-                f8s[r] = pulsar_gpu_tensor_alloc(f8_scale);
-                pulsar_gpu_tensor_write(f8d[r], 0, hd.data(), f8_data);
-                pulsar_gpu_tensor_write(f8s[r], 0, hs.data(), f8_scale);
+                f8d[r] = pulsar_gpu_tensor_alloc(TensorBytes{f8_data});
+                f8s[r] = pulsar_gpu_tensor_alloc(TensorBytes{f8_scale});
+                pulsar_gpu_tensor_write(f8d[r], TensorBytes{0}, hd.data(), TensorBytes{f8_data});
+                pulsar_gpu_tensor_write(f8s[r], TensorBytes{0}, hs.data(), TensorBytes{f8_scale});
                 if (!pulsar_gpu_register_fp8_lt_weight_resident(key, (uint64_t)r * f8_span, K, N, f8d[r], f8s[r])) {
                     fprintf(stderr, "resident MXFP8 registration refused\n"); return 2;
                 }

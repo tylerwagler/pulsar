@@ -1647,11 +1647,12 @@ int pulsar_gpu_tensor_read_f32(const pulsar_gpu_tensor *t, uint64_t elem_off,
         return 0;
     }
     if (fmt == PULSAR_ELT_F32)
-        return pulsar_gpu_tensor_read(t, elem_off * esz, out, n_elems * sizeof(float)) != 0;
+        return pulsar_gpu_tensor_read(t, elt_bytes(elem_off, esz), out, bytes_of<float>(n_elems)) != 0;
     if (fmt == PULSAR_ELT_F16) {
         __half *tmp16 = (__half *)malloc((size_t)n_elems * sizeof(*tmp16));
         if (!tmp16) return 0;
-        if (pulsar_gpu_tensor_read(t, elem_off * esz, tmp16, n_elems * sizeof(*tmp16)) == 0) {
+        if (pulsar_gpu_tensor_read(t, elt_bytes(elem_off, esz), tmp16,
+                                   bytes_of<__half>(n_elems)) == 0) {
             free(tmp16); return 0;
         }
         for (uint64_t i = 0; i < n_elems; i++) out[i] = __half2float(tmp16[i]);
@@ -1664,7 +1665,7 @@ int pulsar_gpu_tensor_read_f32(const pulsar_gpu_tensor *t, uint64_t elem_off,
      * conversion in the one place that knows the stored type. */
     __nv_bfloat16 *tmp = (__nv_bfloat16 *)malloc((size_t)n_elems * sizeof(*tmp));
     if (!tmp) return 0;
-    if (pulsar_gpu_tensor_read(t, elem_off * esz, tmp, n_elems * sizeof(*tmp)) == 0) {
+    if (pulsar_gpu_tensor_read(t, elt_bytes(elem_off, esz), tmp, bytes_of<__nv_bfloat16>(n_elems)) == 0) {
         free(tmp); return 0;
     }
     for (uint64_t i = 0; i < n_elems; i++) out[i] = __bfloat162float(tmp[i]);

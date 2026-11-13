@@ -1380,7 +1380,7 @@ bool server::send_metrics(int fd) {
             }
             fclose(mf);
         }
-        const uint64_t census = pulsar_gpu_tensor_alloc_bytes_current();
+        const uint64_t census = pulsar_gpu_tensor_alloc_bytes_current().raw();
         if (!base_set && s->started && time(NULL) - s->started >= 60 &&
             avail_kib[0] > 0) {
             base_avail_kib = avail_kib[0];

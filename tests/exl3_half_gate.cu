@@ -106,9 +106,10 @@ static bool routed(const void *map, uint64_t size, const uint64_t off[3], int gk
     const uint64_t pairs = (uint64_t)n_tok * TOPK;
     uint64_t gs = 0, gt = 0, ds = 0, dt = 0, sc = 0;
     if (!exl3_expert_layout(H, mid, gk2, &gt, &sc, &gs) || !exl3_expert_layout(mid, H, dk2, &dt, &sc, &ds)) return false;
-    pulsar_gpu_tensor *out = pulsar_gpu_tensor_alloc((uint64_t)n_tok * H * 4);
-    pulsar_gpu_tensor *up = pulsar_gpu_tensor_alloc(pairs * mid * 4), *md = pulsar_gpu_tensor_alloc(pairs * mid * 4);
-    pulsar_gpu_tensor *down = pulsar_gpu_tensor_alloc(pairs * H * 4);
+    pulsar_gpu_tensor *out = pulsar_gpu_tensor_alloc(bytes_of<float>((uint64_t)n_tok * H));
+    pulsar_gpu_tensor *up = pulsar_gpu_tensor_alloc(bytes_of<float>(pairs * mid)),
+                      *md = pulsar_gpu_tensor_alloc(bytes_of<float>(pairs * mid));
+    pulsar_gpu_tensor *down = pulsar_gpu_tensor_alloc(bytes_of<float>(pairs * H));
     if (!pulsar_gpu_mxfp8_act_cache_encode_f32(x, (uint64_t)n_tok, H)) { printf("x encode failed\n"); exit(1); }
     const uint32_t gtype = gk2 == 4 ? PULSAR_TENSOR_EXL3M_K2 : gk2 == 5 ? PULSAR_TENSOR_EXL3M_K2H : gk2 == 6 ? PULSAR_TENSOR_EXL3M_K3
                          : gk2 == 8 ? PULSAR_TENSOR_EXL3M_K4 : gk2 == 10 ? PULSAR_TENSOR_EXL3M_K5 : PULSAR_TENSOR_EXL3M_K6;
@@ -120,9 +121,9 @@ static bool routed(const void *map, uint64_t size, const uint64_t off[3], int gk
     bool good = ok != 0 && cudaDeviceSynchronize() == cudaSuccess;
     if (good && r) {
         r->gz.resize(pairs * mid); r->uz.resize(pairs * mid); r->out.resize((size_t)n_tok * H);
-        good = pulsar_gpu_tensor_read(up, 0, r->gz.data(), pairs * mid * 4) &&
-               pulsar_gpu_tensor_read(md, 0, r->uz.data(), pairs * mid * 4) &&
-               pulsar_gpu_tensor_read(out, 0, r->out.data(), (uint64_t)n_tok * H * 4);
+        good = pulsar_gpu_tensor_read(up, TensorBytes{0}, r->gz.data(), bytes_of<float>(pairs * mid)) &&
+               pulsar_gpu_tensor_read(md, TensorBytes{0}, r->uz.data(), bytes_of<float>(pairs * mid)) &&
+               pulsar_gpu_tensor_read(out, TensorBytes{0}, r->out.data(), bytes_of<float>((uint64_t)n_tok * H));
         const void *q = NULL, *s = NULL;
         int kbp = 0;
         good = good && pulsar_gpu_mxfp8_act_cache_get_e4m3(md, pairs, mid, &q, &s, &kbp) && q && s;
@@ -219,11 +220,12 @@ int main(int argc, char **argv) {
                     sh[t * TOPK + k] = e;
                     wh[t * TOPK + k] = 0.05f + 0.3f * rndf();
                 }
-            pulsar_gpu_tensor *x = pulsar_gpu_tensor_alloc(xh.size() * 4), *sel = pulsar_gpu_tensor_alloc(pairs * 4),
-                              *wts = pulsar_gpu_tensor_alloc(pairs * 4);
-            pulsar_gpu_tensor_write(x, 0, xh.data(), xh.size() * 4);
-            pulsar_gpu_tensor_write(sel, 0, sh.data(), pairs * 4);
-            pulsar_gpu_tensor_write(wts, 0, wh.data(), pairs * 4);
+            pulsar_gpu_tensor *x = pulsar_gpu_tensor_alloc(bytes_of<float>(xh.size())),
+                              *sel = pulsar_gpu_tensor_alloc(bytes_of<int32_t>(pairs)),
+                              *wts = pulsar_gpu_tensor_alloc(bytes_of<float>(pairs));
+            pulsar_gpu_tensor_write(x, TensorBytes{0}, xh.data(), bytes_of<float>(xh.size()));
+            pulsar_gpu_tensor_write(sel, TensorBytes{0}, sh.data(), bytes_of<int32_t>(pairs));
+            pulsar_gpu_tensor_write(wts, TensorBytes{0}, wh.data(), bytes_of<float>(pairs));
             pulsar_gpu_matmul_set_batch_decode_rows(decode ? n_tok : 0);
             run_out whole, half[NR];
             bool ran = routed(map, fsize, off, gk2, dk2, MID, 0, x, sel, wts, n_tok, &whole);
@@ -279,16 +281,19 @@ int main(int argc, char **argv) {
                                                         64 + HALF), "the builder took a cut off the 128 block");
             CHECK(!pulsar_gpu_register_exl3_expert_half(&key, (key_next++) << 32, map, off[2], E, MID, H, dk2, 1, HALF,
                                                         MID + 128), "the builder took a range past the dim");
-            pulsar_gpu_tensor *x = pulsar_gpu_tensor_alloc(H * 4), *sel = pulsar_gpu_tensor_alloc(TOPK * 4),
-                              *wts = pulsar_gpu_tensor_alloc(TOPK * 4), *o = pulsar_gpu_tensor_alloc(H * 4),
-                              *u = pulsar_gpu_tensor_alloc(TOPK * MID * 4), *m = pulsar_gpu_tensor_alloc(TOPK * MID * 4),
-                              *d = pulsar_gpu_tensor_alloc(TOPK * H * 4);
+            pulsar_gpu_tensor *x = pulsar_gpu_tensor_alloc(bytes_of<float>(H)),
+                              *sel = pulsar_gpu_tensor_alloc(bytes_of<int32_t>(TOPK)),
+                              *wts = pulsar_gpu_tensor_alloc(bytes_of<float>(TOPK)),
+                              *o = pulsar_gpu_tensor_alloc(bytes_of<float>(H)),
+                              *u = pulsar_gpu_tensor_alloc(bytes_of<float>(TOPK * MID)),
+                              *m = pulsar_gpu_tensor_alloc(bytes_of<float>(TOPK * MID)),
+                              *d = pulsar_gpu_tensor_alloc(bytes_of<float>(TOPK * H));
             const int32_t s6[TOPK] = {0, 1, 2, 3, 4, 5};
             const float w6[TOPK] = {0.1f, 0.1f, 0.1f, 0.1f, 0.1f, 0.1f};
             std::vector<float> x1(H, 0.5f);
-            pulsar_gpu_tensor_write(x, 0, x1.data(), H * 4);
-            pulsar_gpu_tensor_write(sel, 0, s6, sizeof(s6));
-            pulsar_gpu_tensor_write(wts, 0, w6, sizeof(w6));
+            pulsar_gpu_tensor_write(x, TensorBytes{0}, x1.data(), bytes_of<float>(H));
+            pulsar_gpu_tensor_write(sel, TensorBytes{0}, s6, TensorBytes{sizeof(s6)});
+            pulsar_gpu_tensor_write(wts, TensorBytes{0}, w6, TensorBytes{sizeof(w6)});
             pulsar_gpu_mxfp8_act_cache_encode_f32(x, 1, H);
             auto split_call = [&](uint32_t gtype, uint32_t dtype, uint32_t mid) {
                 return pulsar_gpu_routed_moe_batch_tensor(o, u, m, d, &key, UINT64_MAX / 2u, hoff[0][0], hoff[0][1],

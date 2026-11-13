@@ -150,7 +150,8 @@ static bool slot_bank_alloc(pulsar_state_set *ss, uint32_t k, uint32_t b) {
     for (uint32_t id = 0; ok && id < p->n_decl; id++) {
         if (!has(p->slot[k], id) || p->decl[id].kind != PULSAR_STATE_POOL) continue;
         pulsar_gpu_tensor *&t = ss->pool[k][id][b];
-        if (!t) t = pulsar_gpu_tensor_alloc_managed(ceil_div(ss->ctx, p->decl[id].tokens) * p->decl[id].bytes);
+        if (!t) t = pulsar_gpu_tensor_alloc_managed(TensorBytes{p->decl[id].bytes}.times(ceil_div(ss->ctx,
+                                                                                                p->decl[id].tokens)));
         ok = t != NULL;
     }
     return ok;
@@ -235,9 +236,9 @@ bool pulsar_state_reset_bank(pulsar_state_set *ss, BankId bank) {
     for (uint32_t k = 0; ok && k < p->n_slots; k++) {
         for (uint32_t id = 0; ok && id < p->n_decl; id++) {
             if (!has(p->slot[k], id) || p->decl[id].kind == PULSAR_STATE_POOL || !ss->t[k][id]) continue;
-            const uint64_t bb = pulsar_state_decl_bank_bytes(&p->decl[id]);
-            pulsar_gpu_tensor *v = pulsar_gpu_tensor_view(ss->t[k][id], (uint64_t)b * bb, bb);
-            ok = v && pulsar_gpu_tensor_fill_f32(v, 0.0f, bb / sizeof(float)) != 0;
+            const TensorBytes bb{pulsar_state_decl_bank_bytes(&p->decl[id])};
+            pulsar_gpu_tensor *v = pulsar_gpu_tensor_view(ss->t[k][id], bb.times(b), bb);
+            ok = v && pulsar_gpu_tensor_fill_f32(v, 0.0f, bb.raw() / sizeof(float)) != 0;
             pulsar_gpu_tensor_free(v);
         }
     }
@@ -287,11 +288,11 @@ bool pulsar_state_verify_capture(pulsar_state_set *ss) {
     for (uint32_t k = 0; ok && k < p->n_trunk; k++) {
         for (uint32_t id = 0; ok && id < p->n_decl; id++) {
             if (!has(p->slot[k], id) || p->decl[id].capture != PULSAR_STATE_CAPTURE_STAGE) continue;
-            const uint64_t blk = pulsar_state_decl_bank_bytes(&p->decl[id]);
+            const TensorBytes blk{pulsar_state_decl_bank_bytes(&p->decl[id])};
             const uint64_t o = ss->ord[k][id];
             for (uint32_t r = 0; ok && r < ss->n_runs; r++)
-                ok = pulsar_gpu_tensor_copy_async(ss->cap_runs[id], (o * ss->verify_rows + r) * blk, ss->t[k][id],
-                                                  (uint64_t)pulsar_bank_index(ss->run_bank[r]) * blk, blk) != 0;
+                ok = pulsar_gpu_tensor_copy_async(ss->cap_runs[id], blk.times(o * ss->verify_rows + r), ss->t[k][id],
+                                                  blk.times(pulsar_bank_index(ss->run_bank[r])), blk) != 0;
         }
     }
     if (!ok) fprintf(stderr, "pulsar: %s: the verify capture of a staged block failed\n", p->name);
@@ -339,7 +340,8 @@ bool pulsar_state_step_begin(pulsar_state_set *ss, bool verify) {
         }
         ss->fold_host[0] = g0;
     }
-    if (!pulsar_gpu_tensor_write_async(ss->fold_dev, 0, ss->fold_host, (uint64_t)(1u + 2u * ss->n_banks) * 4u)) {
+    if (!pulsar_gpu_tensor_write_async(ss->fold_dev, TensorBytes{0}, ss->fold_host,
+                                       bytes_of<int32_t>((uint64_t)(1u + 2u * ss->n_banks)))) {
         fprintf(stderr, "pulsar: %s: the fold table upload failed\n", ss->plan->name);
         return false;
     }
@@ -393,20 +395,22 @@ bool pulsar_state_commit(pulsar_state_set *ss, BankId bank, const TokId *tokens,
             if (!has(p->slot[k], id)) continue;
             const uint64_t o = ss->ord[k][id];
             if (d.capture == PULSAR_STATE_CAPTURE_SNAPSHOT) {
-                ok = pulsar_gpu_tensor_copy_async(ss->t[k][id], (uint64_t)b * d.bytes, ss->cap_rows[id],
-                                                  (o * VR + last_kept) * d.bytes, d.bytes) != 0;
+                const TensorBytes db{d.bytes};
+                ok = pulsar_gpu_tensor_copy_async(ss->t[k][id], db.times(b), ss->cap_rows[id],
+                                                  db.times(o * VR + last_kept), db) != 0;
             } else if (d.capture == PULSAR_STATE_CAPTURE_STAGE) {
                 /* the block as the step found it, then the kept rows of the block that is open at pnext */
-                const uint64_t blk = pulsar_state_decl_bank_bytes(&d);
-                ok = pulsar_gpu_tensor_copy_async(ss->t[k][id], (uint64_t)b * blk, ss->cap_runs[id],
-                                                  (o * VR + run) * blk, blk) != 0;
+                const TensorBytes blk{pulsar_state_decl_bank_bytes(&d)}, db{d.bytes}, cb{d.capture_bytes};
+                ok = pulsar_gpu_tensor_copy_async(ss->t[k][id], blk.times(b), ss->cap_runs[id],
+                                                  blk.times(o * VR + run), blk) != 0;
                 const uint32_t blk0 = pnext / d.tokens * d.tokens;
                 for (uint32_t pp = blk0 > p0 ? blk0 : p0; ok && pp < pnext; pp++)
-                    ok = pulsar_gpu_tensor_copy_async(ss->t[k][id], (uint64_t)b * blk + (pp % d.tokens) * d.bytes,
+                    ok = pulsar_gpu_tensor_copy_async(ss->t[k][id], blk.times(b) + db.times(pp % d.tokens),
                                                       ss->cap_rows[id],
-                                                      (o * VR + pulsar_row_index(vr.row_of(pulsar_ckpt_pos(pp)))) *
-                                                              d.capture_bytes + d.capture_off,
-                                                      d.bytes) != 0;
+                                                      cb.times(o * VR +
+                                                               pulsar_row_index(vr.row_of(pulsar_ckpt_pos(pp)))) +
+                                                          TensorBytes{d.capture_off},
+                                                      db) != 0;
             }
         }
     }
@@ -448,8 +452,10 @@ static bool decl_walk(void *state, int dir, bool, pulsar_gpu_tensor *slab, uint6
             pulsar_gpu_tensor *t = ss->t[k][id];
             if (!has(p->slot[k], id) || p->decl[id].kind == PULSAR_STATE_POOL || !t || !ok) continue;
             const uint64_t bytes = pulsar_state_decl_bank_bytes(&p->decl[id]);
-            if (dir == 0) ok = pulsar_gpu_tensor_copy_async(slab, off, t, (uint64_t)b * bytes, bytes) != 0;
-            else if (dir > 0) ok = pulsar_gpu_tensor_copy_async(t, (uint64_t)b * bytes, slab, off, bytes) != 0;
+            if (dir == 0) ok = pulsar_gpu_tensor_copy_async(slab, TensorBytes{off}, t, TensorBytes{bytes}.times(b),
+                                                            TensorBytes{bytes}) != 0;
+            else if (dir > 0) ok = pulsar_gpu_tensor_copy_async(t, TensorBytes{bytes}.times(b), slab,
+                                                                TensorBytes{off}, TensorBytes{bytes}) != 0;
             off += bytes;
         }
     }
@@ -457,8 +463,8 @@ static bool decl_walk(void *state, int dir, bool, pulsar_gpu_tensor *slab, uint6
         if (!has(p->session, id)) continue;
         void *h = pulsar_state_host(ss, id, bank);
         const uint64_t bytes = p->decl[id].bytes;
-        if (ok && dir == 0) ok = pulsar_gpu_tensor_write(slab, off, h, bytes) != 0;
-        else if (ok && dir > 0) ok = pulsar_gpu_tensor_read(slab, off, h, bytes) != 0;
+        if (ok && dir == 0) ok = pulsar_gpu_tensor_write(slab, TensorBytes{off}, h, TensorBytes{bytes}) != 0;
+        else if (ok && dir > 0) ok = pulsar_gpu_tensor_read(slab, TensorBytes{off}, h, TensorBytes{bytes}) != 0;
         off += bytes;
     }
     if (bytes_out) *bytes_out = off - slot_off;
@@ -673,7 +679,8 @@ pulsar_state_set *pulsar_state_create(const void *engine, const pulsar_state_pla
         for (uint32_t b = 0; ok && b < n_banks; b++) ok = slot_bank_alloc(ss, k, b);
         for (uint32_t id = 0; ok && id < plan->n_decl; id++) {
             if (!has(plan->slot[k], id) || plan->decl[id].kind == PULSAR_STATE_POOL) continue;
-            ok = (ss->t[k][id] = pulsar_gpu_tensor_alloc(nb * pulsar_state_decl_bank_bytes(&plan->decl[id]))) != NULL;
+            const TensorBytes bank_bytes{pulsar_state_decl_bank_bytes(&plan->decl[id])};
+            ok = (ss->t[k][id] = pulsar_gpu_tensor_alloc(bank_bytes.times(nb))) != NULL;
         }
     }
     for (uint32_t id = 0; id < plan->n_decl; id++)
@@ -692,12 +699,14 @@ pulsar_state_set *pulsar_state_create(const void *engine, const pulsar_state_pla
         if (!n_l) continue;
         const uint64_t rows = (uint64_t)n_l * verify_rows;
         if (d.capture == PULSAR_STATE_CAPTURE_STAGE)
-            ok = (ss->cap_runs[id] = pulsar_gpu_tensor_alloc(rows * pulsar_state_decl_bank_bytes(&d))) != NULL;
-        if (ok) ok = (ss->cap_rows[id] = pulsar_gpu_tensor_alloc(rows * capture_gens(&d) * capture_row_bytes(&d))) != NULL;
+            ok = (ss->cap_runs[id] = pulsar_gpu_tensor_alloc(
+                      TensorBytes{pulsar_state_decl_bank_bytes(&d)}.times(rows))) != NULL;
+        if (ok) ok = (ss->cap_rows[id] = pulsar_gpu_tensor_alloc(
+                      TensorBytes{capture_row_bytes(&d)}.times(rows * capture_gens(&d)))) != NULL;
         /* L339: a DELTA capture folds (state_kinds.h THE FOLD) -- the set's one fold table */
         if (ok && d.capture == PULSAR_STATE_CAPTURE_DELTA && !ss->fold_host) {
             ss->fold_host = (int32_t *)xcalloc(1u + 2u * n_banks, sizeof(int32_t));
-            ok = (ss->fold_dev = pulsar_gpu_tensor_alloc((uint64_t)(1u + 2u * n_banks) * 4u)) != NULL;
+            ok = (ss->fold_dev = pulsar_gpu_tensor_alloc(bytes_of<int32_t>((uint64_t)(1u + 2u * n_banks)))) != NULL;
         }
     }
     ss->bank_pos = (TokPos *)xcalloc(n_banks, sizeof(TokPos));   /* calloc: position 0 */

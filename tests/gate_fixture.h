@@ -124,7 +124,7 @@ static inline std::vector<gate_state_piece> gate_bank_state(pulsar_session *s, u
             uint64_t off, n;
             if (d->kind == PULSAR_STATE_POOL) {
                 t = pulsar_state_pool(ss, k, id, BankId{b});
-                n = whole ? (t ? pulsar_gpu_tensor_bytes(t) : 0u) : (uint64_t)rows / d->tokens * d->bytes;
+                n = whole ? pulsar_gpu_tensor_bytes(t).raw() : (uint64_t)rows / d->tokens * d->bytes;
                 off = 0;
             } else {
                 n = d->kind == PULSAR_STATE_STAGED && !whole ? (uint64_t)(rows % d->tokens) * d->bytes
@@ -135,7 +135,7 @@ static inline std::vector<gate_state_piece> gate_bank_state(pulsar_session *s, u
             gate_state_piece pc;
             pc.name = std::string(d->name) + "@" + std::to_string(k);
             pc.bytes.resize(n);
-            ok = t && (n == 0 || pulsar_gpu_tensor_read(t, off, pc.bytes.data(), n) != 0);
+            ok = t && (n == 0 || pulsar_gpu_tensor_read(t, TensorBytes{off}, pc.bytes.data(), TensorBytes{n}) != 0);
             out.push_back(std::move(pc));
         }
     }
