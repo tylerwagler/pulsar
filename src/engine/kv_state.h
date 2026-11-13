@@ -60,8 +60,8 @@ struct pulsar_image_identity;
 typedef struct {
     /// the pool's row tensor, owned by the installed bank (borrowed here)
     struct pulsar_gpu_tensor *rows;
-    /// tokens one row holds; divides pulsar_kv_state_ops::resume_grid
-    uint32_t tokens_per_row;
+    /// tokens one row holds; divides pulsar_kv_state_ops::resume_grid (L334 P2b S9: a factor, not a count)
+    TokPerRow tokens_per_row;
     /// bytes of one row; row r sits at r * row_bytes in `rows`
     uint64_t row_bytes;
     /** A row is written once, when its last token lands (DeepSeek's compressor emit: the open group is the

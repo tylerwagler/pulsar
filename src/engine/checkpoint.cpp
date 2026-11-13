@@ -583,7 +583,7 @@ bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, uint32_t dst, uint32_t src, TokPos
         const uint32_t m = st->ops->bank_pools(st->state, dst, dp, CKPT_ADOPT_POOLS);
         if (n == 0 || n != m || n > CKPT_ADOPT_POOLS) why = "the banks' pools do not pair";
         for (uint32_t i = 0; !why && i < n; i++) {
-            const uint64_t rows = (T + sp[i].tokens_per_row - 1u) / sp[i].tokens_per_row;
+            const uint64_t rows = (uint64_t)pulsar_comp_rows_cover(TokCount{(int)T}, sp[i].tokens_per_row).raw();
             if (!sp[i].rows || !dp[i].rows) why = "a bank's physical is freed";
             else if (sp[i].tokens_per_row != dp[i].tokens_per_row || sp[i].row_bytes != dp[i].row_bytes ||
                      rows * dp[i].row_bytes > pulsar_gpu_tensor_bytes(dp[i].rows) ||
@@ -604,7 +604,7 @@ bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, uint32_t dst, uint32_t src, TokPos
     bool ok = r ? st->ops->install_frontier(st->state, pulsar_ckpt_pos(T), TokCount{(int)T})
                  : st->ops->prepare_restore(st->state, pulsar_ckpt_pos(T));
     for (uint32_t i = 0; ok && i < n; i++) {
-        const uint64_t rows = (T + sp[i].tokens_per_row - 1u) / sp[i].tokens_per_row;
+        const uint64_t rows = (uint64_t)pulsar_comp_rows_cover(TokCount{(int)T}, sp[i].tokens_per_row).raw();
         ok = pulsar_gpu_tensor_copy_async(dp[i].rows, 0, sp[i].rows, 0, rows * sp[i].row_bytes) != 0;
     }
     uint32_t staged = 0;

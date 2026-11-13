@@ -334,18 +334,31 @@ static uint64_t segment_layout_digest(pulsar_ckpt_store *st, uint32_t bank) {
     mix(st->ops->resume_grid);
     mix(st->slot_bytes);
     mix(n);
-    for (uint32_t i = 0; i < n; i++) { mix(pools[i].tokens_per_row); mix(pools[i].row_bytes); }
+    for (uint32_t i = 0; i < n; i++) { mix(pools[i].tokens_per_row.raw()); mix(pools[i].row_bytes); }
     return h;
 }
 
 /* Pool rows [t0 / tokens_per_row, end(t1)) of every pool: a segment's span (grid points, whole rows) or a
  * kv-state payload's [0, frontier) -- its open row too, unless the pool writes whole rows only (kv_state.h).
  * The one sizing and the one copy of pool rows either carries. */
-/** The row a span ending at t ends on: floor for a whole-rows pool, else ceil (the open row carried).
- *  @param p the pool  @param t the position, in tokens  @return the row index (exclusive end) */
-static uint32_t pool_row(const pulsar_kv_pool &p, uint32_t t) {
-    return (t + (p.whole_rows ? 0u : p.tokens_per_row - 1u)) / p.tokens_per_row;
+/** A pool's rows of a span (L334 P2b S9, hazard (h): `row0` named a pool row here and a step row elsewhere). */
+struct pool_span {
+    CompRow first;   ///< the pool row the span starts at: the row its start opens
+    CompRows n;      ///< rows it carries
+};
+/** The pool rows of the span [t0, t1): from the rows t0 has completed to the rows t1 has completed (a whole-rows
+ *  pool) or covers (the open row carried).
+ *  @param p the pool  @param t0 the span's start, in tokens  @param t1 its end, in tokens  @return the rows */
+static pool_span pool_span_of(const pulsar_kv_pool &p, uint32_t t0, uint32_t t1) {
+    const CompRows from = pulsar_comp_rows_held(TokCount{(int)t0}, p.tokens_per_row);
+    const CompRows to = p.whole_rows ? pulsar_comp_rows_held(TokCount{(int)t1}, p.tokens_per_row)
+                                     : pulsar_comp_rows_cover(TokCount{(int)t1}, p.tokens_per_row);
+    return {CompRow::after(from), to - from};
 }
+/** Bytes of `n` rows of pool `p`.  @param p the pool  @param n rows  @return bytes */
+static uint64_t pool_bytes(const pulsar_kv_pool &p, CompRows n) { return (uint64_t)n.raw() * p.row_bytes; }
+/** Byte offset of row `r` in pool `p`'s tensor.  @param p the pool  @param r the row  @return its offset */
+static uint64_t pool_offset(const pulsar_kv_pool &p, CompRow r) { return (uint64_t)r.before().raw() * p.row_bytes; }
 
 /// @param pools [n] the pools
 /// @param n     pools
@@ -354,7 +367,7 @@ static uint32_t pool_row(const pulsar_kv_pool &p, uint32_t t) {
 /// @return the bytes of every pool's rows in the span
 static uint64_t pools_span_bytes(const pulsar_kv_pool *pools, uint32_t n, uint32_t t0, uint32_t t1) {
     uint64_t bytes = 0;
-    for (uint32_t i = 0; i < n; i++) bytes += (uint64_t)(pool_row(pools[i], t1) - t0 / pools[i].tokens_per_row) * pools[i].row_bytes;
+    for (uint32_t i = 0; i < n; i++) bytes += pool_bytes(pools[i], pool_span_of(pools[i], t0, t1).n);
     return bytes;
 }
 
@@ -374,13 +387,13 @@ static int pools_span_io(payload_io *io, const pulsar_kv_pool *pools, uint32_t n
                          uint8_t *buf, uint64_t *remaining, char *err, size_t errlen) {
     int rc = 0;
     for (uint32_t i = 0; rc == 0 && i < n; i++) {
-        const uint32_t row0 = t0 / pools[i].tokens_per_row, rows = pool_row(pools[i], t1) - row0;
-        if (!rows) continue;
+        const pool_span sp = pool_span_of(pools[i], t0, t1);
+        if (sp.n == CompRows{0}) continue;
         if (!pools[i].rows) {   /* L284 #3: an evicted bank's pools are gone until alloc_physical re-backs them */
             payload_set_err(err, errlen, "a KV pool of the installed bank has no physical (an evicted bank)");
             return 1;
         }
-        const uint64_t off = (uint64_t)row0 * pools[i].row_bytes, bytes = (uint64_t)rows * pools[i].row_bytes;
+        const uint64_t off = pool_offset(pools[i], sp.first), bytes = pool_bytes(pools[i], sp.n);
         rc = write ? payload_write_tensor_span(io, pools[i].rows, off, bytes, buf, PULSAR_SESSION_IO_CHUNK, err, errlen)
                    : payload_read_tensor_span(io, pools[i].rows, off, bytes, buf, PULSAR_SESSION_IO_CHUNK, remaining,
                                               err, errlen);
@@ -604,15 +617,15 @@ int pulsar_session::copy_out_segment(uint32_t G_prev, uint32_t G, uint8_t *dst, 
     pulsar_gpu_copy_span spans[PULSAR_KV_POOLS_MAX];
     uint32_t n_spans = 0;
     for (uint32_t i = 0; i < n; i++) {
-        const uint32_t row0 = G_prev / pools[i].tokens_per_row, rows = pool_row(pools[i], G) - row0;
-        if (!rows) continue;
+        const pool_span sp = pool_span_of(pools[i], G_prev, G);
+        if (sp.n == CompRows{0}) continue;
         if (!pools[i].rows) {   /* L284 #3: an evicted bank's pools are gone until alloc_physical re-backs them */
             payload_set_err(err, errlen, "copy-out segment: a KV pool of the installed bank has no physical (an "
                                          "evicted bank)");
             return 1;
         }
-        const uint64_t span = (uint64_t)rows * pools[i].row_bytes;
-        spans[n_spans++] = { pools[i].rows, (uint64_t)row0 * pools[i].row_bytes, o.take(span), span };
+        const uint64_t span = pool_bytes(pools[i], sp.n);
+        spans[n_spans++] = { pools[i].rows, pool_offset(pools[i], sp.first), o.take(span), span };
     }
     uint8_t *dg = o.take(PULSAR_KVDIGEST_BYTES);
     if (!o.ok || o.at != bytes) {
@@ -816,16 +829,16 @@ pulsar_segment_status pulsar_session::load_segment(const uint8_t *seg, uint64_t 
     const uint32_t n = segment_pools(st, pools);
     pulsar_stall_mark("segment load: host to pool rows");
     for (uint32_t i = 0; i < n; i++) {   /* one host -> device copy per pool span */
-        const uint32_t row0 = G_prev / pools[i].tokens_per_row, rows = pool_row(pools[i], G) - row0;
-        if (!rows) continue;
+        const pool_span sp = pool_span_of(pools[i], G_prev, G);
+        if (sp.n == CompRows{0}) continue;
         if (!pools[i].rows) {
             payload_set_err(err, errlen, "load segment: a KV pool of the installed bank has no physical (an evicted "
                                          "bank)");
             return fail(PULSAR_SEGMENT_TRANSIENT);
         }
-        const uint64_t span = (uint64_t)rows * pools[i].row_bytes;
+        const uint64_t span = pool_bytes(pools[i], sp.n);
         const uint8_t *src = in.take(span);
-        if (!src || pulsar_gpu_tensor_write(pools[i].rows, (uint64_t)row0 * pools[i].row_bytes, src, span) == 0) {
+        if (!src || pulsar_gpu_tensor_write(pools[i].rows, pool_offset(pools[i], sp.first), src, span) == 0) {
             payload_set_err(err, errlen, "load segment: restoring a pool's rows failed");
             return fail(src ? PULSAR_SEGMENT_TRANSIENT : PULSAR_SEGMENT_BAD_ROWS);
         }
@@ -962,7 +975,11 @@ static uint64_t kvp_layout_digest(pulsar_ckpt_store *st, const pulsar_kv_pool *p
     uint64_t h = segment_layout_digest(st, bank);
     auto mix = [&h](uint64_t v) { for (int i = 0; i < 8; i++) { h ^= (uint8_t)(v >> (8 * i)); h *= 1099511628211ull; } };
     mix(n);
-    for (uint32_t i = 0; i < n; i++) { mix(pools[i].tokens_per_row); mix(pools[i].row_bytes); mix(pools[i].whole_rows); }
+    for (uint32_t i = 0; i < n; i++) {
+        mix(pools[i].tokens_per_row.raw());
+        mix(pools[i].row_bytes);
+        mix(pools[i].whole_rows);
+    }
     mix(kvp_frontier_bytes(st));
     mix(width);
     return h;

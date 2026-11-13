@@ -118,7 +118,7 @@ static void plan_a(void) {
     const uint32_t np = ss->ops.pools(ss, pools, PULSAR_KV_POOLS_MAX);
     bool pools_ok = np == 7;
     for (uint32_t i = 0; pools_ok && i < np; i++)
-        pools_ok = pools[i].tokens_per_row == 1 && pools[i].row_bytes == KV_ROW &&
+        pools_ok = pools[i].tokens_per_row == TokPerRow{1u} && pools[i].row_bytes == KV_ROW &&
                    pools[i].rows == pulsar_state_pool(ss, 5 + 6 * i, A_KV_GLOBAL, 0);
     check(pools_ok, "the installed bank's pools: the 7 global layers' KV in layer order (%u)", np);
     check(ss->ops.trailing_pools(ss, pools, PULSAR_KV_POOLS_MAX) == 0, "no drafter slot: no trailing pool");
@@ -242,8 +242,9 @@ static void plan_b(void) {
     check(ss->ctx == 1004, "the pools' capacity: whole rows of every pool and block (1001 -> %u)", ss->ctx);
     check(((int32_t *)pulsar_state_host(ss, B_HOST, 1))[0] == -1, "a fresh bank's host state is its init");
     pulsar_kv_pool pools[8];
-    check(ss->ops.pools(ss, pools, 8) == 1 && pools[0].tokens_per_row == 4 &&
-          ss->ops.trailing_pools(ss, pools, 8) == 1 && pools[0].tokens_per_row == 1 && pools[0].row_bytes == 128,
+    check(ss->ops.pools(ss, pools, 8) == 1 && pools[0].tokens_per_row == TokPerRow{4u} &&
+          ss->ops.trailing_pools(ss, pools, 8) == 1 && pools[0].tokens_per_row == TokPerRow{1u} &&
+              pools[0].row_bytes == 128,
           "the trunk's pool is a segment's; the drafter slot's trails");
     pulsar_state_bank_free(ss, 1);
     check(pulsar_state_bank_evicted(ss, 1) && pulsar_state_pool(ss, 3, B_TRAIL, 1) != NULL,

@@ -536,7 +536,7 @@ static uint32_t slot_pools(pulsar_state_set *ss, uint32_t bank, uint32_t k0, uin
         for (uint32_t id = 0; id < p->n_decl; id++) {
             const pulsar_state_decl &d = p->decl[id];
             if (!has(p->slot[k], id) || d.kind != PULSAR_STATE_POOL) continue;
-            if (n < cap) out[n] = {ss->pool[k][id][bank], d.tokens, d.bytes, d.whole_rows};
+            if (n < cap) out[n] = {ss->pool[k][id][bank], TokPerRow{d.tokens}, d.bytes, d.whole_rows};
             n++;
         }
     }

@@ -5666,7 +5666,7 @@ static bool fake_install(void *, TokPos, TokCount) { return true; }
 static pulsar_gpu_tensor *fake_rows[3];
 static uint32_t fake_bank_pools(void *, uint32_t bank, pulsar_kv_pool *out, uint32_t cap) {
     if (bank >= 3u || cap < 1u || !fake_rows[bank]) return 0u;
-    out[0] = {fake_rows[bank], 1u, 16u, false};
+    out[0] = {fake_rows[bank], TokPerRow{1u}, 16u, false};
     return 1u;
 }
 
