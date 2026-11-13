@@ -224,7 +224,7 @@ static bool test_hex_to_bytes(const char *hex, unsigned char *out, int cap, int 
     return true;
 }
 
-static bool test_token_bytes_equal(pulsar_engine *engine, int token,
+static bool test_token_bytes_equal(pulsar_engine *engine, TokId token,
                                    const unsigned char *want, int want_len) {
     size_t got_len = 0;
     char *got = pulsar_token_text(engine, token, &got_len);
@@ -279,8 +279,8 @@ static void test_long_story_fact_recall(void) {
     int generated = 0;
     bool decode_ok = true;
     for (; generated < 350; generated++) {
-        int token = pulsar_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng);
-        if (token < 0) { decode_ok = false; break; }   /* degenerate row refused (L188) */
+        TokId token = pulsar_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng);
+        if (!token.is_token()) { decode_ok = false; break; }   /* degenerate row refused (L188) */
         if (token == pulsar_token_eos(engine)) break;
 
         size_t piece_len = 0;
@@ -431,7 +431,7 @@ static void test_logprob_vector_case(pulsar_engine *engine, const test_vec_case 
     for (int i = 0; i < vc->nsteps; i++) {
         const test_vec_step *step = &vc->steps[i];
         int nscore = pulsar_session_top_logprobs(session, scores, 20);
-        int token = pulsar_session_argmax(session);
+        TokId token = pulsar_session_argmax(session);
         if (!test_token_bytes_equal(engine, token, step->selected, step->selected_len)) {
             fprintf(stderr, "pulsar-test: vector %s step %d selected token mismatch\n",
                     vc->id, i);
@@ -442,7 +442,7 @@ static void test_logprob_vector_case(pulsar_engine *engine, const test_vec_case 
             bool found = false;
             float local_lp = 0.0f;
             for (int j = 0; j < nscore; j++) {
-                if (scores[j].id < 0) continue;
+                if (!scores[j].id.is_token()) continue;
                 if (test_token_bytes_equal(engine, scores[j].id,
                                            step->top[t].bytes,
                                            step->top[t].len)) {
@@ -788,8 +788,8 @@ static bool test_mpp_capture(pulsar_engine *engine, const test_mpp_eq_case *tc,
 
     int n = 0;
     while (ok && n < tc->gen_steps) {
-        const int token = pulsar_session_argmax(session);
-        gen[n++] = token;
+        const TokId token = pulsar_session_argmax(session);
+        gen[n++] = token.raw();
         if (n < tc->gen_steps && pulsar_session_eval(session, token, err, sizeof(err)) != 0) {
             fprintf(stderr, "pulsar-test: Tensor equivalence %s: eval of step %d refused: %s\n", tc->id, n, err);
             ok = false;
@@ -1576,9 +1576,9 @@ static void test_tool_call_quality_one(void) {
     bool decode_ok = true;
     g.finish = "length";
     for (int i = 0; ps && i < r->max_tokens; i++) {
-        int token = pulsar_session_sample(session, r->temperature, r->top_k,
-                                       r->top_p, r->min_p, &rng);
-        if (token < 0) { decode_ok = false; break; }   /* degenerate row refused (L188) */
+        TokId token = pulsar_session_sample(session, r->temperature, r->top_k,
+                                         r->top_p, r->min_p, &rng);
+        if (!token.is_token()) { decode_ok = false; break; }   /* degenerate row refused (L188) */
         if (pulsar_token_is_stop(engine, token)) {
             g.finish = "stop";
             break;
@@ -2976,7 +2976,7 @@ static void test_marked_tokens_ok(pulsar_engine *e, const char *tag, const char 
     int touching = 0;
     for (int i = 0; i < marked->len; i++) {
         size_t n = 0;
-        char *t = pulsar_token_text(e, marked->v[i], &n);
+        char *t = pulsar_token_text(e, TokId{marked->v[i]}, &n);
         const size_t lo = spelled.size();
         if (t) spelled.append(t, n);
         free(t);
@@ -3050,7 +3050,7 @@ static void test_control_tokens(pulsar_engine *e, test_control_probe *p) {
     TEST_ASSERT(n_vocab > 0);
     for (int id = 0; id < n_vocab; id++) {
         size_t n = 0;
-        char *t = pulsar_token_text(e, id, &n);
+        char *t = pulsar_token_text(e, TokId{id}, &n);
         bool text = t && n && strlen(t) == n;
         for (size_t k = 0; text && k < n;) {
             const int m = utf8_seq_ok((const unsigned char *)t + k, n - k);
@@ -4078,14 +4078,14 @@ static void test_driver_context_bound(void) {
     s->ctx_size = 8;
 
     char err[256] = "";
-    pulsar_multiseq_req at_ctx = { 0u, TokPos{8}, 1 };
+    pulsar_multiseq_req at_ctx = { 0u, TokPos{8}, TokId{1} };
     TEST_ASSERT(pulsar_driver_decode_multiseq(s, &at_ctx, 1u, NULL, 0, err, sizeof err) == -1 && err[0]);
     TEST_ASSERT(bank_pos == TokPos{8});                       /* nothing moved */
     for (int i = 0; i < 8; i++) token_vec_push(&s->checkpoint, 1);
     err[0] = '\0';
     TEST_ASSERT(pulsar_driver_eval_row(s, 1, err, sizeof err) == 1 && err[0] && bank_pos == TokPos{8});
     bank_pos = TokPos{7};                                     /* a verify of [7, 8]: its second row is past the pool */
-    const pulsar_multiseq_req run[2] = { { 0u, TokPos{7}, 1 }, { 0u, TokPos{8}, 1 } };
+    const pulsar_multiseq_req run[2] = { { 0u, TokPos{7}, TokId{1} }, { 0u, TokPos{8}, TokId{1} } };
     uint32_t headed = 9u;
     err[0] = '\0';
     TEST_ASSERT(pulsar_driver_decode_mixed(s, run, 2u, NULL, 0, &headed, PULSAR_MSEQ_HEAD_ALL_ROWS, err, sizeof err) == -1 &&
@@ -4238,8 +4238,8 @@ static void test_multiseq_step_view(void) {
     s->engine = e;
     for (int t : {5, 6, 7, 8}) token_vec_push(&s->checkpoint, t);
     const uint32_t live = 1u;
-    const pulsar_multiseq_req others[2] = { {0u, TokPos{10}, 1}, {2u, TokPos{20}, 2} };
-    const pulsar_multiseq_req with_live[2] = { {0u, TokPos{10}, 1}, {1u, TokPos{4}, 2} };
+    const pulsar_multiseq_req others[2] = { {0u, TokPos{10}, TokId{1}}, {2u, TokPos{20}, TokId{2}} };
+    const pulsar_multiseq_req with_live[2] = { {0u, TokPos{10}, TokId{1}}, {1u, TokPos{4}, TokId{2}} };
     auto arm = [&]() {
         s->checkpoint_valid = true;
         s->mseq_dirty = false;
@@ -4300,9 +4300,10 @@ static pulsar_ckpt_store *test_bh_store(pulsar_session *) { return g_test_bh_sto
 static bool test_bh_resident(const pulsar_session *, uint32_t) { return false; }
 static KvBytes test_bh_growth(pulsar_session *, KvRows q) { return KvBytes{(uint64_t)q.raw() * 1000u}; }
 static bool test_bh_not_stale(void *, uint32_t) { return false; }
-static char *test_bh_text(pulsar_engine *, int token, size_t *len) {
+static char *test_bh_text(pulsar_engine *, TokId token, size_t *len) {
     char buf[16];
-    const int n = snprintf(buf, sizeof buf, "<%d>", token);   /* one spelling a token: no seam in these histories */
+    /* one spelling a token: no seam in these histories */
+    const int n = snprintf(buf, sizeof buf, "<%d>", token.raw());
     if (len) *len = (size_t)n;
     return strdup(buf);
 }
@@ -4724,7 +4725,7 @@ static void test_qwen_eos(void) {
     e->family = &fam;
     e->family_state = &qm;
     TEST_ASSERT(!bpe_tokenizer_stop_ids(tok).empty());
-    TEST_ASSERT(k_qwen_tokenizer.eos(e) == bpe_tokenizer_stop_ids(tok).front());
+    TEST_ASSERT(k_qwen_tokenizer.eos(e) == TokId{bpe_tokenizer_stop_ids(tok).front()});
     free(e);
     const char *dir = getenv("PULSAR_TEST_QWEN_TOKENIZER");
     std::string tj;
@@ -4804,10 +4805,10 @@ static void test_tokenizer_refusals(void) {
     TEST_ASSERT(!pulsar_chat_end_assistant(e, &out) && out.len == 0);
     TEST_ASSERT(!pulsar_encode_chat_prompt(e, NULL, "hi", PULSAR_THINK_NONE, &out) && out.len == 0);
     size_t len = 7;
-    TEST_ASSERT(pulsar_token_text(e, 1, &len) == NULL && len == 0);
-    TEST_ASSERT(pulsar_token_eos(e) == -1);
-    TEST_ASSERT(pulsar_token_is_stop(e, 1));   /* fail closed: a generation ends */
-    TEST_ASSERT(pulsar_token_think_close(e) == -1);
+    TEST_ASSERT(pulsar_token_text(e, TokId{1}, &len) == NULL && len == 0);
+    TEST_ASSERT(pulsar_token_eos(e).is_none());
+    TEST_ASSERT(pulsar_token_is_stop(e, TokId{1}));   /* fail closed: a generation ends */
+    TEST_ASSERT(pulsar_token_think_close(e).is_none());
     pulsar_turn_markers tm;
     TEST_ASSERT(!pulsar_chat_turn_markers(e, &tm) && tm.n_user == 0 && tm.n_assistant == 0);
     TEST_ASSERT(!pulsar_tokenize_text(e, "again", &out) && out.len == 0);   /* said once: the log has one line */

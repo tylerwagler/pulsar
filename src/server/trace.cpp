@@ -100,7 +100,7 @@ static void trace_write_token(FILE *fp, pulsar_engine *engine, int token) {
         return;
     }
     size_t len = 0;
-    char *piece = pulsar_token_text(engine, token, &len);
+    char *piece = pulsar_token_text(engine, TokId{token}, &len);
     fprintf(fp, "%d ", token);
     trace_write_escaped_bytes(fp, piece, len);
     free(piece);

@@ -883,7 +883,7 @@ bool pulsar_engine_has_tokenizer(const pulsar_engine *e) {
     return !e || ((e->family->caps & PULSAR_FAMILY_CAP_CHAT) != 0 && e->family->tokenizer);
 }
 
-bool pulsar_token_is_stop(pulsar_engine *e, int token) {
+bool pulsar_token_is_stop(pulsar_engine *e, TokId token) {
     const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_token_is_stop");
     return !t || t->is_stop(e, token);   /* refused: every token is a stop (the generation ends, fail closed) */
 }
@@ -1401,7 +1401,7 @@ static bool vocab_token_is_literal_special(pulsar_str s) {
 
 
 
-char *pulsar_token_text(pulsar_engine *e, int token, size_t *len) {
+char *pulsar_token_text(pulsar_engine *e, TokId token, size_t *len) {
     const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_token_text");
     if (!t) {
         if (len) *len = 0;
@@ -1443,9 +1443,9 @@ char *vocab_token_text(const pulsar_vocab *vocab, int token, size_t *len) {
 
 
 
-int pulsar_token_eos(pulsar_engine *e) {
+TokId pulsar_token_eos(pulsar_engine *e) {
     const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_token_eos");
-    return t ? t->eos(e) : -1;
+    return t ? t->eos(e) : TokId::none();
 }
 
 
@@ -1522,9 +1522,9 @@ void pulsar_turn_markers_add_tool(pulsar_engine *e, const char *opener, const ch
     pulsar_tokens_free(&tok);
 }
 
-int pulsar_token_think_close(pulsar_engine *e) {
+TokId pulsar_token_think_close(pulsar_engine *e) {
     const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_token_think_close");
-    return t ? t->think_close(e) : -1;
+    return t ? t->think_close(e) : TokId::none();
 }
 
 
@@ -1638,16 +1638,29 @@ static void ds4_tok_dump(pulsar_engine *e, FILE *fp, const pulsar_tokens *tokens
 /** pulsar_family_tokenizer::n_tokens.  @param e the engine  @return the vocab size */
 static int ds4_tok_n_tokens(pulsar_engine *e) { return e->vocab.n_vocab; }
 
+/* L334 P3: the family's ids leave the tokenizer here, typed (its internals stay raw). */
+/** pulsar_family_tokenizer::is_stop, typed.  @param e the engine  @param t the token  @return ds4_tok_is_stop's */
+static bool ds4_tok_is_stop_op(pulsar_engine *e, TokId t) { return ds4_tok_is_stop(e, t.raw()); }
+/** pulsar_family_tokenizer::eos, typed.  @param e the engine  @return ds4_tok_eos's (-1 enters as none()) */
+static TokId ds4_tok_eos_op(pulsar_engine *e) { return TokId{ds4_tok_eos(e)}; }
+/** pulsar_family_tokenizer::token_text, typed.  @param e the engine  @param t the token  @param len its length
+ *  @return ds4_tok_token_text's */
+static char *ds4_tok_token_text_op(pulsar_engine *e, TokId t, size_t *len) {
+    return ds4_tok_token_text(e, t.raw(), len);
+}
+/** pulsar_family_tokenizer::think_close, typed.  @param e the engine  @return ds4_tok_think_close's (-1: none()) */
+static TokId ds4_tok_think_close_op(pulsar_engine *e) { return TokId{ds4_tok_think_close(e)}; }
+
 const pulsar_family_tokenizer k_ds4_tokenizer = {
     /* .encode_text              = */ ds4_tok_encode_text,
     /* .encode_rendered          = */ ds4_tok_encode_rendered,
     /* .chat_open                = */ ds4_chat_open,
     /* .chat_turn                = */ ds4_chat_turn,
     /* .chat_end_assistant       = */ ds4_chat_end_assistant,
-    /* .is_stop                  = */ ds4_tok_is_stop,
-    /* .eos                      = */ ds4_tok_eos,
-    /* .token_text               = */ ds4_tok_token_text,
-    /* .think_close              = */ ds4_tok_think_close,
+    /* .is_stop                  = */ ds4_tok_is_stop_op,
+    /* .eos                      = */ ds4_tok_eos_op,
+    /* .token_text               = */ ds4_tok_token_text_op,
+    /* .think_close              = */ ds4_tok_think_close_op,
     /* .turn_markers             = */ ds4_tok_turn_markers,
     /* .dump                     = */ ds4_tok_dump,
     /* .n_tokens                 = */ ds4_tok_n_tokens,

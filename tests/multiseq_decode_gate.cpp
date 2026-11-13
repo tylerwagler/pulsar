@@ -173,7 +173,7 @@ static bool multi_run(pulsar_session *s, int n, int steps, int **streams, double
         for (int k = 0; k < n; k++) {
             reqs[k].bank = (uint32_t)k;
             reqs[k].pos = TokPos{g_prompt_len[k] + (j - 1)};
-            reqs[k].token = streams[k][j - 1];
+            reqs[k].token = TokId{streams[k][j - 1]};
         }
         const int rc = use_mixed
             ? pulsar_session_decode_mixed(s, reqs, (uint32_t)n,
@@ -234,7 +234,7 @@ static bool check_stale_classic_fails_loud(void) {
     if (ok) {
         /* Sanity: eval works BEFORE any multiseq step (so a later failure is
          * the guard firing, not an unrelated broken session). */
-        if (pulsar_session_eval(s, last[1], err, sizeof(err)) != 0) {
+        if (pulsar_session_eval(s, TokId{last[1]}, err, sizeof(err)) != 0) {
             CHECK(0, "stale-guard: eval failed BEFORE any multiseq step (%s)", err);
             ok = false;
         }
@@ -249,7 +249,7 @@ static bool check_stale_classic_fails_loud(void) {
         for (int k = 0; k < 2; k++) {
             reqs[k].bank = (uint32_t)k;
             reqs[k].pos = TokPos{g_prompt_len[k]};
-            reqs[k].token = last[k];
+            reqs[k].token = TokId{last[k]};
         }
         const int rc = pulsar_session_decode_multiseq(s, reqs, 2, logits,
                                                       2 * vocab, err, sizeof(err));
@@ -260,7 +260,7 @@ static bool check_stale_classic_fails_loud(void) {
     }
     if (ok) {
         err[0] = '\0';
-        const int rc = pulsar_session_eval(s, last[0], err, sizeof(err));
+        const int rc = pulsar_session_eval(s, TokId{last[0]}, err, sizeof(err));
         CHECK(rc != 0,
               "STALE CLASSIC STATE NOT CAUGHT: pulsar_session_eval SUCCEEDED after "
               "a multiseq step -- it decoded against cross-bank superset frontier "
@@ -335,11 +335,11 @@ static bool check_all_rows_head_mode(pulsar_session *s) {
         for (int j = 0; j < 3; j++) {
             reqs[j].bank = 0u;
             reqs[j].pos = TokPos{g_prompt_len[0] + j};
-            reqs[j].token = g_first_tok[0];
+            reqs[j].token = TokId{g_first_tok[0]};
         }
         reqs[3].bank = 1u;
         reqs[3].pos = TokPos{g_prompt_len[1]};
-        reqs[3].token = g_first_tok[1];
+        reqs[3].token = TokId{g_first_tok[1]};
         uint32_t got = 0;
         const int rc = pulsar_session_decode_mixed(s, reqs, 4u,
                 mode == 0 ? rows_lor : rows_all,

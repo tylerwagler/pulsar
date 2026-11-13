@@ -262,16 +262,29 @@ static void qwen_tok_dump(pulsar_engine *e, FILE *fp, const pulsar_tokens *token
 /// @return ids in the tokenizer's table
 static int qwen_tok_n_tokens(pulsar_engine *e) { return bpe_tokenizer_n_tokens(pulsar_qwen_of(e)->tok); }
 
+/* L334 P3: the family's ids leave the tokenizer here, typed (its internals stay raw). */
+/** pulsar_family_tokenizer::is_stop, typed.  @param e the engine  @param t the token  @return qwen_tok_is_stop's */
+static bool qwen_tok_is_stop_op(pulsar_engine *e, TokId t) { return qwen_tok_is_stop(e, t.raw()); }
+/** pulsar_family_tokenizer::eos, typed.  @param e the engine  @return qwen_tok_eos's (-1 enters as none()) */
+static TokId qwen_tok_eos_op(pulsar_engine *e) { return TokId{qwen_tok_eos(e)}; }
+/** pulsar_family_tokenizer::token_text, typed.  @param e the engine  @param t the token  @param len its length
+ *  @return qwen_tok_token_text's */
+static char *qwen_tok_token_text_op(pulsar_engine *e, TokId t, size_t *len) {
+    return qwen_tok_token_text(e, t.raw(), len);
+}
+/** pulsar_family_tokenizer::think_close, typed.  @param e the engine  @return qwen_tok_think_close's (-1: none()) */
+static TokId qwen_tok_think_close_op(pulsar_engine *e) { return TokId{qwen_tok_think_close(e)}; }
+
 const pulsar_family_tokenizer k_qwen_tokenizer = {
     /* .encode_text              = */ qwen_tok_encode_text,
     /* .encode_rendered          = */ qwen_tok_encode_rendered,
     /* .chat_open                = */ qwen_chat_open,
     /* .chat_turn                = */ qwen_chat_turn,
     /* .chat_end_assistant       = */ qwen_chat_end_assistant,
-    /* .is_stop                  = */ qwen_tok_is_stop,
-    /* .eos                      = */ qwen_tok_eos,
-    /* .token_text               = */ qwen_tok_token_text,
-    /* .think_close              = */ qwen_tok_think_close,
+    /* .is_stop                  = */ qwen_tok_is_stop_op,
+    /* .eos                      = */ qwen_tok_eos_op,
+    /* .token_text               = */ qwen_tok_token_text_op,
+    /* .think_close              = */ qwen_tok_think_close_op,
     /* .turn_markers             = */ qwen_tok_turn_markers,
     /* .dump                     = */ qwen_tok_dump,
     /* .n_tokens                 = */ qwen_tok_n_tokens,

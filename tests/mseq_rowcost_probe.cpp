@@ -154,7 +154,7 @@ int main(int argc, char **argv) {
                 return 1;
             }
             gpu_graph_bank_counters_capture(g, (uint32_t)k);
-            feed_tok[k] = pulsar_session_argmax(s);
+            feed_tok[k] = pulsar_session_argmax(s).raw();
         }
 
         float *logits = (float *)malloc((size_t)PROBE_MAX_B * PROBE_MAX_R * (size_t)vocab * sizeof(float));
@@ -178,7 +178,7 @@ int main(int argc, char **argv) {
                         for (int j = 0; j < R; j++) {
                             reqs[w].bank = (uint32_t)k;
                             reqs[w].pos = TokPos{depth + it * R + j};
-                            reqs[w].token = feed_tok[k];
+                            reqs[w].token = TokId{feed_tok[k]};
                             w++;
                         }
                     }
@@ -249,7 +249,7 @@ int main(int argc, char **argv) {
                         return 1;
                     }
                     gpu_graph_bank_counters_capture(g, (uint32_t)k);
-                    feed_tok[k] = pulsar_session_argmax(s);
+                    feed_tok[k] = pulsar_session_argmax(s).raw();
                 }
                 if (!cell_ok) continue;
                 qsort(ms, PROBE_ITERS, sizeof(double), cmp_dbl);

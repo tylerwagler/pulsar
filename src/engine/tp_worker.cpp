@@ -386,7 +386,7 @@ static void worker_rows(const pulsar_tp_command *c, pulsar_multiseq_req *rows) {
     for (uint32_t i = 0; i < c->n_items; i++) {
         rows[i].bank  = (uint32_t)c->items[i].bank;
         rows[i].pos   = TokPos{c->items[i].pos};   /* the wire's int32 */
-        rows[i].token = c->items[i].token;
+        rows[i].token = TokId{c->items[i].token};
     }
 }
 

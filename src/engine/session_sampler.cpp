@@ -330,7 +330,7 @@ static bool session_logprobs(pulsar_session *s, const pulsar_gpu_tensor *rows, u
 static int clip_k(int k) { return k < 0 ? 0 : k > (int)PULSAR_GPU_LOGPROB_TOPK_MAX ? (int)PULSAR_GPU_LOGPROB_TOPK_MAX : k; }
 /// @param t a device token score
 /// @return it as the public pulsar_token_score
-static pulsar_token_score score(const pulsar_gpu_token_score &t) { return pulsar_token_score{t.id, t.logit, t.logprob}; }
+static pulsar_token_score score(const pulsar_gpu_token_score &t) { return pulsar_token_score{TokId{t.id}, t.logit, t.logprob}; }
 
 /* the host scorers' contracts: top fills k entries (k clipped to the width; -1 / NEG_INF past the finite ones) and
  * returns that count, 0 for a row with no finite value; the token's 1, or 0 with `out` untouched */
@@ -339,7 +339,7 @@ static pulsar_token_score score(const pulsar_gpu_token_score &t) { return pulsar
 /// @param k entries (already clipped)
 static void fill_top(const pulsar_gpu_logprob_row &L, pulsar_token_score *top, int k) {
     for (int i = 0; i < k; i++)
-        top[i] = (uint32_t)i < L.n_top ? score(L.top[i]) : pulsar_token_score{-1, PULSAR_NEG_INF, PULSAR_NEG_INF};
+        top[i] = (uint32_t)i < L.n_top ? score(L.top[i]) : pulsar_token_score{TokId::none(), PULSAR_NEG_INF, PULSAR_NEG_INF};
 }
 
 int pulsar_session::top_logprobs(pulsar_token_score *out, int k) {

@@ -667,7 +667,7 @@ bool pulsar_session_verify_profile_local(pulsar_session *s, uint32_t rows_max, d
     spec_bank_save(s, bank);
     for (uint32_t rows = rows_max; ok && rows >= 1u; rows--) {
         for (uint32_t k = 0; k < rows; k++)
-            reqs[k] = {bank, P + TokCount{(int)k}, s->checkpoint.v[k % (uint32_t)P.raw()]};
+            reqs[k] = {bank, P + TokCount{(int)k}, TokId{s->checkpoint.v[k % (uint32_t)P.raw()]}};
         double ms[VC_PROFILE_REPS];
         uint32_t timed = 0;
         bool warm = false;

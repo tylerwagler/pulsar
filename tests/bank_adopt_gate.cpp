@@ -51,9 +51,9 @@ static bool install(pulsar_session *s, int *live, uint32_t b) {
 
 static bool greedy(pulsar_session *s, int n, int *out, char *err, size_t errlen) {
     for (int i = 0; i < n; i++) {
-        const int t = pulsar_session_argmax(s);
-        if (t < 0 || pulsar_session_eval(s, t, err, errlen) != 0) return false;
-        out[i] = t;
+        const TokId t = pulsar_session_argmax(s);
+        if (!t.is_token() || pulsar_session_eval(s, t, err, errlen) != 0) return false;
+        out[i] = t.raw();
     }
     return true;
 }
@@ -173,7 +173,7 @@ int GATE_ENTRY(int argc, char **argv) {
         pulsar_tokens a = {0}, b = {0};
         for (int i = 16; i < E && k < 0; i++) {
             size_t n = 0;
-            char *t = pulsar_token_text(e, P.v[i], &n);
+            char *t = pulsar_token_text(e, TokId{P.v[i]}, &n);
             bool word = t && n >= 3;
             for (size_t c = 0; word && c < n; c++) word = (t[c] >= 'a' && t[c] <= 'z') || (t[c] >= 'A' && t[c] <= 'Z');
             if (word) {

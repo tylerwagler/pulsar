@@ -702,7 +702,7 @@ int build_live_continuation_prompt(pulsar_engine *engine, const pulsar_tokens *l
         if (err && errlen) snprintf(err, errlen, "the tokenizer refused the rendered prompt: %s", why);
         return -1;   /* never the history alone: that is a prompt without its tail */
     }
-    join_live_history_and_tail(live, live->len > 0 && pulsar_token_is_stop(engine, live->v[live->len - 1]), &tail,
+    join_live_history_and_tail(live, live->len > 0 && pulsar_token_is_stop(engine, TokId{live->v[live->len - 1]}), &tail,
                                out);
     pulsar_tokens_free(&tail);
     int common = 0;

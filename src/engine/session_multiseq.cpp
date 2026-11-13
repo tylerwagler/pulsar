@@ -99,7 +99,7 @@ static int ds4_batch_step(pulsar_session *s, const pulsar_multiseq_req *reqs, ui
     for (uint32_t k = 0; k < n_rows; k++) {
         pos[k]    = reqs[k].pos.raw();   /* L334: the device rows stay raw */
         bank[k]   = (int32_t)reqs[k].bank;
-        tokens[k] = reqs[k].token;
+        tokens[k] = reqs[k].token.raw();
     }
     uint32_t headed = 0;
     const int rc = gpu_graph_decode_multiseq_batch(s->graph, &e->model, &e->weights, tokens, pos, bank,

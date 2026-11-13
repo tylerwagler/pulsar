@@ -78,7 +78,7 @@ static std::vector<std::vector<float>> continue_greedy(pulsar_session *s, const 
     for (int i = 0; i < steps; i++) {
         const int t = argmax(out.back());
         toks->push_back(t);
-        if (pulsar_session_eval(s, t, err, sizeof(err)) != 0) {
+        if (pulsar_session_eval(s, TokId{t}, err, sizeof(err)) != 0) {
             fprintf(stderr, "bank-residency: eval: %s\n", err);
             out.clear();
             return out;

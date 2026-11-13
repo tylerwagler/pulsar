@@ -181,12 +181,12 @@ static pulsar_grammar_compiler *constrain_compiler(server *s, pulsar_engine *e, 
     std::vector<int32_t> stops;
     for (int t = 0; t < width; t++) {
         size_t n = 0;
-        char *b = pulsar_token_text(e, t, &n);
+        char *b = pulsar_token_text(e, TokId{t}, &n);
         if (b) (*bytes)[(size_t)t].assign(b, n);
         free(b);
         ptrs[(size_t)t] = (*bytes)[(size_t)t].data();
         lens[(size_t)t] = (*bytes)[(size_t)t].size();
-        if (pulsar_token_is_stop(e, t)) stops.push_back(t);
+        if (pulsar_token_is_stop(e, TokId{t})) stops.push_back(t);
     }
     pulsar_grammar_compiler *c = pulsar_grammar_compiler_new(ptrs.data(), lens.data(), width, width, stops.data(),
                                                              (int)stops.size(), k_grammar_cache_bytes, err, errlen);

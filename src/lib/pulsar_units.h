@@ -387,4 +387,60 @@ static_assert(sizeof(StepRow) == sizeof(int) && sizeof(HeadRow) == sizeof(int) &
                   std::is_trivial<CompRow>::value && std::is_trivial<pulsar_step_run>::value,
               "the P2b index spaces are as cheap as the ints they replace (memset / calloc-safe)");
 
+/* ---- L334 phase 3: vocabulary token ids ---------------------------------------------------------------------------
+ * A token id names WHICH token; a position or a count says where / how many.  All three were int side by side
+ * (L251 passed a count of 1 where eval took an id; spec_round_begin(int first_token, int max_tokens, ...)).  An id
+ * is an identity, not a quantity: it compares equal or not and nothing else -- no arithmetic, no ordering, no vocab
+ * of its own.  Which ids are valid is a question for an AUTHORITY (the tokenizer's size, the logits width, a family's
+ * image sentinels at or past the vocab), asked by name where it applies; the type only refuses the confusions. */
+
+/** An identity of the token vocabulary: == / != only; -1 is none() ("no token": a refused sample, an absent marker). */
+template <class Tag, class Rep>
+class pulsar_id {
+    static_assert(std::is_signed<Rep>::value, "an id's sentinel is -1: it is held signed");
+    /// The raw value of none().
+    static constexpr Rep kNone = Rep(-1);
+
+public:
+    /** Uninitialised, as the integer it replaces (value-initialise for id 0). */
+    pulsar_id() = default;
+    /** Enter from a raw integer (explicit only; bool and floating point are refused; -1 enters as none()).
+     *  @param v the raw id */
+    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    constexpr explicit pulsar_id(I v) : v_(static_cast<Rep>(v)) {}
+    /** No token. */
+    /// @return the none() sentinel (raw -1)
+    static constexpr pulsar_id none() { return pulsar_id(kNone); }
+    /** Is this none()? */
+    /// @return true for none()
+    constexpr bool is_none() const { return v_ == kNone; }
+    /** Is this a token at all -- not negative (none(), or a negative a caller forged)?  The vocab bound is an
+     *  authority's (below()), not this. */
+    /// @return true for a non-negative id
+    constexpr bool is_token() const { return v_ >= 0; }
+    /** Is this a token below `n` -- an authority's vocab bound (the tokenizer's size, the logits width)?
+     *  @param n the bound */
+    /// @return true when 0 <= id < n
+    constexpr bool below(uint32_t n) const { return v_ >= 0 && (uint32_t)v_ < n; }
+    /** The raw id, where it leaves the type system: a device upload, a table index, printf, the wire. */
+    /// @return the id as `Rep` (none() as -1)
+    constexpr Rep raw() const { return v_; }
+    /** The same token (none() equals none() only). */
+    friend constexpr bool operator==(pulsar_id a, pulsar_id b) { return a.v_ == b.v_; }
+    /** Another token. */
+    friend constexpr bool operator!=(pulsar_id a, pulsar_id b) { return a.v_ != b.v_; }
+
+private:
+    Rep v_;  ///< the id; -1 = none()
+};
+
+/** Tag of TokId (never instantiated). */
+struct pulsar_tok_id_tag;
+/** A vocabulary token id (L334 P3). */
+typedef pulsar_id<pulsar_tok_id_tag, int32_t> TokId;
+
+static_assert(sizeof(TokId) == sizeof(int32_t) && std::is_trivial<TokId>::value &&
+                  std::is_standard_layout<TokId>::value,
+              "a token id is as cheap as the int32 it replaces (memset / calloc-safe; arrays of it upload as int32)");
+
 #endif

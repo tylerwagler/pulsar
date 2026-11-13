@@ -279,16 +279,27 @@ int n_tokens(pulsar_engine *e) { return bpe_tokenizer_n_tokens(TOK(e)); }
 
 }  // namespace
 
+/* L334 P3: the family's ids leave the tokenizer here, typed (its internals stay raw). */
+/** pulsar_family_tokenizer::is_stop, typed.  @param e the engine  @param t the token  @return is_stop's */
+static bool is_stop_op(pulsar_engine *e, TokId t) { return is_stop(e, t.raw()); }
+/** pulsar_family_tokenizer::eos, typed.  @param e the engine  @return eos's (-1 enters as none()) */
+static TokId eos_op(pulsar_engine *e) { return TokId{eos(e)}; }
+/** pulsar_family_tokenizer::token_text, typed.  @param e the engine  @param t the token  @param len its length
+ *  @return token_text's */
+static char *token_text_op(pulsar_engine *e, TokId t, size_t *len) { return token_text(e, t.raw(), len); }
+/** pulsar_family_tokenizer::think_close, typed.  @param e the engine  @return think_close's (-1: none()) */
+static TokId think_close_op(pulsar_engine *e) { return TokId{think_close(e)}; }
+
 const pulsar_family_tokenizer PULSAR_INKLING_TOKENIZER = {
     /* .encode_text              = */ encode_text,
     /* .encode_rendered          = */ encode_rendered,
     /* .chat_open                = */ chat_open,
     /* .chat_turn                = */ chat_turn,
     /* .chat_end_assistant       = */ chat_end_assistant,
-    /* .is_stop                  = */ is_stop,
-    /* .eos                      = */ eos,
-    /* .token_text               = */ token_text,
-    /* .think_close              = */ think_close,
+    /* .is_stop                  = */ is_stop_op,
+    /* .eos                      = */ eos_op,
+    /* .token_text               = */ token_text_op,
+    /* .think_close              = */ think_close_op,
     /* .turn_markers             = */ turn_markers,
     /* .dump                     = */ dump,
     /* .n_tokens                 = */ n_tokens,

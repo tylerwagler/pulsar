@@ -81,7 +81,7 @@ static bool run_script(pulsar_engine *e, const pulsar_tokens *story, bool graphs
         int32_t tok[ROWS];
         for (uint32_t b = 0; b < ROWS; b++) {
             tok[b] = story->v[bank_off[b] + pos[b]];
-            rq[b] = {b, TokPos{pos[b]}, tok[b]};
+            rq[b] = {b, TokPos{pos[b]}, TokId{tok[b]}};
         }
         uint64_t rb = 0, cb = 0, ra = 0, ca = 0;
         pulsar_gpu_seg_counts(&rb, &cb);

@@ -84,7 +84,7 @@ static bool bank0_logits_at_width(int M, float *row0_out) {
         for (int k = 0; k < M; k++) {
             reqs[k].bank = (uint32_t)k;
             reqs[k].pos = TokPos{g_prompt_len[k]};      /* bank 0 ALWAYS at the same pos */
-            reqs[k].token = argtok[k];
+            reqs[k].token = TokId{argtok[k]};
         }
         uint32_t got = 0;
         const int rc = pulsar_session_decode_mixed(s, reqs, (uint32_t)M, logits,

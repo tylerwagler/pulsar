@@ -1971,7 +1971,8 @@ uint32_t gen_spec_greedy_rows(server *s, const gen_state *g, const int *toks, in
     size_t lens[PULSAR_SPEC_LOGITS_ROWS + 1] = {};
     if (n > (int)PULSAR_SPEC_LOGITS_ROWS + 1) pulsar_die("gen_spec_greedy_rows: more tokens than a round's rows");
     for (int i = 0; i < n; i++) {
-        pieces[i] = pulsar_token_is_stop(s->engine, toks[i]) ? NULL : pulsar_token_text(s->engine, toks[i], &lens[i]);
+        const TokId t{toks[i]};
+        pieces[i] = pulsar_token_is_stop(s->engine, t) ? NULL : pulsar_token_text(s->engine, t, &lens[i]);
     }
     const uint32_t bits = gen_spec_greedy_rows_text(g, pieces, lens, n, base_emitted);
     for (int i = 0; i < n; i++) free(pieces[i]);
@@ -2000,7 +2001,7 @@ bool server::gen_emit_token(session_slot *sl, int token) {
     auto *s = this;
     gen_state *g = sl->gen;
     job *j = g->j;
-    if (pulsar_token_is_stop(s->engine, token)) {
+    if (pulsar_token_is_stop(s->engine, TokId{token})) {
         g->finish = "stop";
         return true;
     }
@@ -2011,7 +2012,7 @@ bool server::gen_emit_token(session_slot *sl, int token) {
     }
 
     size_t piece_len = 0;
-    char *piece = pulsar_token_text(s->engine, token, &piece_len);
+    char *piece = pulsar_token_text(s->engine, TokId{token}, &piece_len);
     g->completion++;
     /* Lane-independent generation counter: every decode lane funnels its
      * accepted tokens through here, so this is the one place that sees them
@@ -2479,7 +2480,7 @@ static bool terminal_slot_applies(const session_slot *sl) {
 /// @return the end a terminal checkpoint syncs it to: its length, a trailing stop excluded (the next render re-spells
 ///         the stop, L290's join)
 static int terminal_turn_end(pulsar_engine *e, const pulsar_tokens *h) {
-    return pulsar_token_is_stop(e, h->v[h->len - 1]) ? h->len - 1 : h->len;
+    return pulsar_token_is_stop(e, TokId{h->v[h->len - 1]}) ? h->len - 1 : h->len;
 }
 
 bool server::slot_turn_reply(session_slot *sl, bool wants, bool called) {

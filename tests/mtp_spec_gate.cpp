@@ -178,7 +178,7 @@ static stream run(pulsar_engine *e, const pulsar_tokens &prompt, int n, bool spe
             break;
         }
         for (int i = 0; i < k; i++) r.out.push_back(buf[i]);
-        if (pulsar_token_is_stop(e, buf[k - 1])) break;
+        if (pulsar_token_is_stop(e, TokId{buf[k - 1]})) break;
     }
     if (!ok) fprintf(stderr, "stream (%s): %s\n", spec ? "spec" : "plain", err);
     r.drafts = drafted(e, &r.rounds, &r.accepted) - d0;
@@ -202,7 +202,7 @@ static std::vector<std::vector<float>> decode4(pulsar_session *s, int W) {
     std::vector<std::vector<float>> out;
     char err[256] = "";
     for (int i = 0; i < 4; i++) {
-        if (pulsar_session_eval(s, kDecode[i], err, sizeof(err)) != 0) { out.clear(); break; }
+        if (pulsar_session_eval(s, TokId{kDecode[i]}, err, sizeof(err)) != 0) { out.clear(); break; }
         out.push_back(logits_of(s, W));
     }
     return out;
@@ -323,7 +323,8 @@ static void batched_lane(pulsar_engine *e, const std::vector<pulsar_tokens> &P, 
             if (!ok) { snprintf(err, sizeof err, "round_end bank %u: %s", st[i].bank, st[i].err); break; }
             const uint32_t b = bank_of[i];
             for (int k = 0; k < st[i].n_accepted; k++) got[b].push_back(acc[i][k]);
-            if ((int)got[b].size() >= n || (st[i].n_accepted && pulsar_token_is_stop(e, acc[i][st[i].n_accepted - 1])))
+            if ((int)got[b].size() >= n ||
+                (st[i].n_accepted && pulsar_token_is_stop(e, TokId{acc[i][st[i].n_accepted - 1]})))
                 done[b] = true;
         }
         if (!ok) break;
@@ -461,11 +462,11 @@ static int exact(pulsar_engine *e, int n, const char *only) {
             /* a stream that ends on a stop token: the plain step emits it without feeding it, a round that verified
              * it as a kept draft has its row -- the twin feeds it too, so both stand at the same frontier (a full
              * model's stream can stop inside `tokens`; the mini's never did) */
-            const bool stopped = !sp.out.empty() && pulsar_token_is_stop(e, sp.out.back());
+            const bool stopped = !sp.out.empty() && pulsar_token_is_stop(e, TokId{sp.out.back()});
             const TokPos at = pulsar_ckpt_pos(len), before = pulsar_ckpt_pos(len - 1u);
             if (stopped && tw->states->bank_pos[0] == before && sp_s->states->bank_pos[0] == at) {
                 char err[256] = "";
-                CHECK(pulsar_session_eval(tw, sp.out.back(), err, sizeof(err)) == 0,
+                CHECK(pulsar_session_eval(tw, TokId{sp.out.back()}, err, sizeof(err)) == 0,
                       "M3 prompt %zu: the twin feeds the stop token the spec round verified: %s", i, err);
             }
             if (stopped && tw->states->bank_pos[0] == before && sp_s->states->bank_pos[0] == before)
@@ -523,7 +524,7 @@ static int exact(pulsar_engine *e, int n, const char *only) {
         memset(&full, 0, sizeof(full));
         for (int k = 0; k < P[i].len; k++) pulsar_tokens_push(&full, P[i].v[k]);
         for (int32_t t : sp.out)
-            if (!pulsar_token_is_stop(e, t)) pulsar_tokens_push(&full, t);
+            if (!pulsar_token_is_stop(e, TokId{t})) pulsar_tokens_push(&full, t);
         for (int k = 0; k < P[3].len; k++) pulsar_tokens_push(&full, P[3].v[k]);   /* the next turn's text */
         char err[256] = "";
         bool ok = wa && sp.ok && pulsar_session_sync(wa, &full, err, sizeof(err)) == 0;
@@ -603,7 +604,8 @@ static int probe(pulsar_engine *e, const char *ids_path, const char *out_dir, in
             pulsar_tokens t = toks(ids, 0, 1);
             ok = pulsar_session_sync(s, &t, err, sizeof(err)) == 0;
             pulsar_tokens_free(&t);
-            for (int i = 1; ok && i <= positions; i++) ok = pulsar_session_eval(s, ids[(size_t)i], err, sizeof(err)) == 0;
+            for (int i = 1; ok && i <= positions; i++)
+                ok = pulsar_session_eval(s, TokId{ids[(size_t)i]}, err, sizeof(err)) == 0;
         }
         for (int c = 31; ok && path == 1; c += 31) {   /* PROMPT: lockstep steps of 31 rows */
             const int end = c < positions + 1 ? c : positions + 1;

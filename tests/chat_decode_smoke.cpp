@@ -53,9 +53,9 @@ int GATE_ENTRY(int argc, char **argv) {
         fails++;
     } else {
         for (int i = 0; i < SMOKE_MAX_NEW; i++) {
-            const int tok = pulsar_session_argmax(s);
+            const TokId tok = pulsar_session_argmax(s);
             if (pulsar_token_is_stop(e, tok)) { stopped = true; break; }
-            ids.push_back(tok);
+            ids.push_back(tok.raw());
             size_t n = 0;
             char *piece = pulsar_token_text(e, tok, &n);
             if (piece) { text.append(piece, n); free(piece); }

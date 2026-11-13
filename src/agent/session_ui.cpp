@@ -90,7 +90,7 @@ static size_t agent_turn_mark_text(pulsar_engine *e, const int *ids, int n, char
     out[0] = '\0';
     for (int i = 0; i < n; i++) {
         size_t k = 0;
-        char *t = pulsar_token_text(e, ids[i], &k);
+        char *t = pulsar_token_text(e, TokId{ids[i]}, &k);
         const bool fits = t && len + k < cap;
         if (fits) memcpy(out + len, t, k);
         free(t);

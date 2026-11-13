@@ -61,7 +61,7 @@ static bool pieces_match_bytes(pulsar_engine *e, const pulsar_tokens *p,
     size_t off = 0;
     for (int i = 0; i < p->len; i++) {
         size_t pl = 0;
-        const char *pt = pulsar_token_text(e, p->v[i], &pl);
+        const char *pt = pulsar_token_text(e, TokId{p->v[i]}, &pl);
         if (!pt || pl == 0) return false;
         if (off + pl > len || memcmp(text + off, pt, pl) != 0) return false;
         off += pl;
@@ -97,7 +97,7 @@ int GATE_ENTRY(int argc, char **argv) {
     int k = -1;
     for (int i = 64; i < 190 && k < 0; i++) {
         size_t tl = 0;
-        const char *tt = pulsar_token_text(e, canon.v[i], &tl);
+        const char *tt = pulsar_token_text(e, TokId{canon.v[i]}, &tl);
         if (!tt || tl < 2 || tl > 63) continue;
         char first[64];
         memcpy(first, tt, 1);
@@ -284,7 +284,7 @@ int GATE_ENTRY(int argc, char **argv) {
         pp.len = pp.cap = n;
         CHECK(pulsar_session_sync(s, &pp, err, sizeof(err)) == 0, "leg5 prompt sync failed: %s", err);
         for (int i = 0; i < 8 && canon.len > n + i; i++)            /* the bank answers it */
-            CHECK(pulsar_session_eval(s, canon.v[n + i], err, sizeof(err)) == 0,
+            CHECK(pulsar_session_eval(s, TokId{canon.v[n + i]}, err, sizeof(err)) == 0,
                   "leg5 eval %d failed: %s", i, err);
         CHECK(pulsar_session_pos(s).raw() > n, "leg5 bank did not advance past the prompt");
         CHECK(pulsar_session_sync(s, &pp, err, sizeof(err)) == 0, "leg5 re-sync failed: %s", err);

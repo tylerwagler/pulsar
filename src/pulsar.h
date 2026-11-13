@@ -93,7 +93,7 @@ typedef struct {
 
 /** One scored candidate token, as returned by the top-k/logprob helpers. */
 typedef struct {
-    int id;         ///< token id
+    TokId id;       ///< token id (none() past the finite entries; L334 P3)
     float logit;    ///< raw pre-softmax score
     float logprob;  ///< natural log of the softmax probability
 } pulsar_token_score;
@@ -924,18 +924,18 @@ bool pulsar_encode_chat_prompt(
  *  @param token the id; an out-of-range id gives ""
  *  @param len receives the byte count (0 when refused); may be NULL
  *  @return a malloc'd NUL-terminated copy (caller frees); NULL when the family has no tokenizer (said once) */
-char *pulsar_token_text(pulsar_engine *e, int token, size_t *len);
+char *pulsar_token_text(pulsar_engine *e, TokId token, size_t *len);
 /** The family's end-of-sequence id (one id; the whole stop set is pulsar_token_is_stop's).
  *  @param e the engine
  *  @return the id; -1 when the family has no tokenizer (said once) */
-int pulsar_token_eos(pulsar_engine *e);
+TokId pulsar_token_eos(pulsar_engine *e);
 /** L251: whether `token` ends generation -- the family's whole stop set (Qwen: <|im_end|> and
  * <|endoftext|>, generation_config.json); DeepSeek: its one eos id. */
 /** @param e the engine
  *  @param token the id
  *  @return true when token is in the stop set; true for every token when the family has no tokenizer (said once:
  *          a generation ends at once, fail closed) */
-bool pulsar_token_is_stop(pulsar_engine *e, int token);
+bool pulsar_token_is_stop(pulsar_engine *e, TokId token);
 /** The chat template's TURN MARKERS as token sequences (L272 B5): the tokens that open a user turn
  * and an assistant turn in a rendered prompt.  DeepSeek names each with one special token
  * (\<｜User｜\>, \<｜Assistant｜\>); Qwen's template spells a turn as the added token \<|im_start|\> followed
@@ -985,7 +985,7 @@ int pulsar_turn_endpoint(const pulsar_turn_markers *m, const int *v, int n);
  * close feeds this id, never the text re-tokenized (L272 B11: BPE pieces on Qwen). */
 /** @param e the engine
  *  @return the id, or -1 (also when the family has no tokenizer: said once) */
-int pulsar_token_think_close(pulsar_engine *e);
+TokId pulsar_token_think_close(pulsar_engine *e);
 
 /** Create a session on `e` with a `ctx_size`-token context (the bank pool sized by pulsar_engine_bank_pool).
  *  Refused on a TP worker rank and for a context past the model's trained positions.
@@ -1312,11 +1312,11 @@ static inline int pulsar_tokens_common_prefix(const pulsar_tokens *t, const puls
 /** Greedy token over the session's live logits: the first finite value seeds,
  * the lowest id wins a tie. @return the id, or -1 when no logit is finite. */
 /** @param s the session */
-int pulsar_session_argmax(pulsar_session *s);
+TokId pulsar_session_argmax(pulsar_session *s);
 /** pulsar_session_argmax with `excluded_id` removed from the row. @return the id, or -1. */
 /** @param s the session
  *  @param excluded_id the id to skip */
-int pulsar_session_argmax_excluding(pulsar_session *s, int excluded_id);
+TokId pulsar_session_argmax_excluding(pulsar_session *s, TokId excluded_id);
 /** Returned by the draws (pulsar_session_draw, _draw_rows, _sample) when the row is DEGENERATE (no finite logit,
  * a NaN or +Inf logit anywhere in it, a probability mass that is not a positive finite number, a non-finite knob):
  * no token is drawn and the caller
@@ -1348,7 +1348,7 @@ typedef struct pulsar_row_draw {
 /** A draw from the session's live logits. @return the token, or PULSAR_SAMPLE_REFUSED. */
 /** @param s the session
  *  @param d the draw's knobs (its rng is stepped) */
-int pulsar_session_draw(pulsar_session *s, const pulsar_row_draw *d);
+TokId pulsar_session_draw(pulsar_session *s, const pulsar_row_draw *d);
 /** Draws from rows rows[0 .. n) of the last batched step's headed rows -- decode_multiseq /
  * decode_mixed / decode_fused's logits row k, which stay on the device -- one per row: tokens[k], or
  * PULSAR_SAMPLE_REFUSED for a degenerate row (that request fails; the others stand).  @return 0, or 1 when nothing
@@ -1373,7 +1373,7 @@ int pulsar_session_step_row_to_bank(pulsar_session *s, uint32_t row, uint32_t ba
  *  @param top_p as pulsar_row_draw
  *  @param min_p as pulsar_row_draw
  *  @param rng the request's stream (stepped) */
-int pulsar_session_sample(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
+TokId pulsar_session_sample(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
 /** The k best tokens of the live logits, best first (on a TP leader, after settling the pending ack).
  *  @param s the session
  *  @param out receives k entries (id -1 / -inf past the finite ones)
@@ -1395,7 +1395,7 @@ int pulsar_session_settle(pulsar_session *s, char *err, size_t errlen);
  *  @param token the id
  *  @param out receives the score
  *  @return 1 when written; 0 for an out-of-range id, a row with no finite logit, or a failure */
-int pulsar_session_token_logprob(pulsar_session *s, int token, pulsar_token_score *out);
+int pulsar_session_token_logprob(pulsar_session *s, TokId token, pulsar_token_score *out);
 /** The logprobs of row `row` of the last batched step's headed rows (pulsar_session_draw_rows' rows): the scored
  * token's (*have_chosen 1, or 0 when the row has no finite logit or token is not an id) and the top k (k <= 20;
  * *n_top as pulsar_session_top_logprobs returns).  @return 0, or 1 on bad arguments / a device failure. */
@@ -1407,7 +1407,7 @@ int pulsar_session_token_logprob(pulsar_session *s, int token, pulsar_token_scor
  *  @param top receives k entries
  *  @param k entries wanted
  *  @param n_top receives the real entries */
-int pulsar_session_step_row_logprobs(pulsar_session *s, uint32_t row, int token, pulsar_token_score *chosen,
+int pulsar_session_step_row_logprobs(pulsar_session *s, uint32_t row, TokId token, pulsar_token_score *chosen,
                                      int *have_chosen, pulsar_token_score *top, int k, int *n_top);
 /** Copy the live logits row to the host.
  *  @param s the session
@@ -1436,7 +1436,7 @@ int pulsar_session_set_logits(pulsar_session *s, const float *logits, int n);
  *  @param err receives the failure
  *  @param errlen bytes at err
  *  @return 0, or nonzero on a failure */
-int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen);
+int pulsar_session_eval(pulsar_session *s, TokId token, char *err, size_t errlen);
 /** Tier-2 batched multi-session decode (bank pool, PULSAR_MSEQ_BANKS >= 2): one
  * decode request per co-scheduled session, all advanced one token by ONE
  * weight sweep.  reqs[k] = {TRUE bank id, absolute position of `token`,
@@ -1498,7 +1498,7 @@ int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen);
 typedef struct {
     uint32_t bank;   ///< TRUE bank id in the session's pool
     TokPos   pos;    ///< absolute position of `token` (the bank's committed length)
-    int      token;  ///< input token id decoded at `pos`
+    TokId    token;  ///< input token id decoded at `pos`
 } pulsar_multiseq_req;
 /** One batched decode step (the Tier-2 contract above the request struct).
  *  @param s the session

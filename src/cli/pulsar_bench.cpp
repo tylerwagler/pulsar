@@ -266,8 +266,8 @@ static int write_frontier_logits_json(
         return 1;
     }
 
-    const int argmax = pulsar_session_argmax(session);
-    if (argmax < 0) {   /* -1: no finite logit -- there is no argmax to write (and logits[-1] is out of bounds) */
+    const TokId argmax = pulsar_session_argmax(session);
+    if (!argmax.is_token()) {   /* none(): no finite logit -- there is no argmax to write (and logits[-1] is out of bounds) */
         fprintf(stderr, "pulsar-bench: no finite logit at frontier %d; refusing its logits dump\n", frontier);
         free(logits);
         return 1;
@@ -294,8 +294,8 @@ static int write_frontier_logits_json(
             frontier - previous,
             cfg->ctx_alloc,
             vocab,
-            argmax,
-            logits[argmax]);
+            argmax.raw(),
+            logits[argmax.raw()]);   /* an id indexes its logit */
     for (int i = 0; i < vocab; i++) {
         if (i) fputc(',', fp);
         if ((i % 8) == 0) fputs("\n    ", fp);
@@ -403,7 +403,7 @@ int main(int argc, char **argv) {
     fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,kvcache_bytes\n");
     fflush(out);
 
-    const int eos = pulsar_token_eos(engine);
+    const TokId eos = pulsar_token_eos(engine);
     pulsar_session_snapshot snap = {0};
     char err[256];
     int previous = 0;
@@ -446,8 +446,8 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
-            const int token = pulsar_session_argmax_excluding(session, eos);
-            if (token < 0) {
+            const TokId token = pulsar_session_argmax_excluding(session, eos);
+            if (!token.is_token()) {
                 fprintf(stderr, "pulsar-bench: failed to choose non-EOS token at frontier %d\n", frontier);
                 rc = 1;
                 break;

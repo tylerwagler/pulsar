@@ -137,7 +137,7 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "qwen-generate: sync at %d: %s\n", P + i, err);
                     break;
                 }
-            } else if (i > 0 && pulsar_session_eval(sess, ids[P + i - 1], err, sizeof(err)) != 0) {
+            } else if (i > 0 && pulsar_session_eval(sess, TokId{ids[P + i - 1]}, err, sizeof(err)) != 0) {
                 fprintf(stderr, "qwen-generate: eval at %d: %s\n", P + i, err);
                 break;
             }
@@ -188,7 +188,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "\nqwen-generate: sync at %d tokens: %s\n", T, err);
                 break;
             }
-        } else if (pulsar_session_eval(sess, ids[T - 1], err, sizeof(err)) != 0) {
+        } else if (pulsar_session_eval(sess, TokId{ids[T - 1]}, err, sizeof(err)) != 0) {
             fprintf(stderr, "\nqwen-generate: eval at %d tokens: %s\n", T, err);
             break;
         }
@@ -269,9 +269,12 @@ int main(int argc, char **argv) {
             plain = (int *)xmalloc((size_t)generated * sizeof(int));
             uint64_t prng = seed;
             while (n_plain < generated) {
-                const int tok = pulsar_session_sample(sess, temp, top_k, top_p, 0.0f, &prng);
-                if (tok < 0) { fprintf(stderr, "qwen-generate: PLAIN sampled: the sampler refused a row\n"); return 1; }
-                plain[n_plain++] = tok;
+                const TokId tok = pulsar_session_sample(sess, temp, top_k, top_p, 0.0f, &prng);
+                if (!tok.is_token()) {
+                    fprintf(stderr, "qwen-generate: PLAIN sampled: the sampler refused a row\n");
+                    return 1;
+                }
+                plain[n_plain++] = tok.raw();
                 if (pulsar_token_is_stop(e, tok) || n_plain == generated) break;
                 if (pulsar_session_eval(sess, tok, err, sizeof(err)) != 0) {
                     fprintf(stderr, "qwen-generate: PLAIN sampled eval: %s\n", err);
@@ -309,7 +312,7 @@ int main(int argc, char **argv) {
             }
             n += k;
             rounds++;
-            if (pulsar_token_is_stop(e, out[n - 1])) break;
+            if (pulsar_token_is_stop(e, TokId{out[n - 1]})) break;
         }
         const double dt = now_s() - t0;
         if (trace) fclose(trace);
@@ -364,7 +367,7 @@ int main(int argc, char **argv) {
         float *lg = (float *)malloc((size_t)W * sizeof(float));
         int same = 0;
         for (int i = 0; i + 1 < generated; i++) {
-            const pulsar_multiseq_req rq = {0u, TokPos{n_tok + i}, ids[n_tok + i]};
+            const pulsar_multiseq_req rq = {0u, TokPos{n_tok + i}, TokId{ids[n_tok + i]}};
             if (pulsar_session_decode_multiseq(sess, &rq, 1, lg, W, err, sizeof(err)) != 0) {
                 fprintf(stderr, "qwen-generate: BATCH step %d failed: %s\n", i, err);
                 free(lg);

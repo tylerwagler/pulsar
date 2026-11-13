@@ -274,13 +274,13 @@ typedef struct pulsar_family_tokenizer {
     /** Append the close of a sampled assistant turn. */
     bool (*chat_end_assistant)(pulsar_engine *e, pulsar_tokens *tokens);
     /** true when `token` is any of the tokenizer's stop ids. */
-    bool (*is_stop)(pulsar_engine *e, int token);
+    bool (*is_stop)(pulsar_engine *e, TokId token);
     /** The stop id a caller that needs ONE uses (pulsar_token_is_stop tests them all). */
-    int (*eos)(pulsar_engine *e);
+    TokId (*eos)(pulsar_engine *e);
     /** `token`'s bytes, malloc'd and NUL-terminated (empty for an id outside the table). */
-    char *(*token_text)(pulsar_engine *e, int token, size_t *len);
+    char *(*token_text)(pulsar_engine *e, TokId token, size_t *len);
     /** The token id that closes a thinking span, or -1 when the tokenizer has none. */
-    int (*think_close)(pulsar_engine *e);
+    TokId (*think_close)(pulsar_engine *e);
     /** The turn markers the server's prefix anchors scan for; false = unknown (said once). */
     bool (*turn_markers)(pulsar_engine *e, pulsar_turn_markers *out);
     /** --dump-tokens: the ids, then one line per token. */

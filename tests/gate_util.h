@@ -136,7 +136,7 @@ static inline bool gate_bank_sync(pulsar_session *s, uint32_t bank, const int *v
         return false;
     }
     pulsar_session_bank_state_save(s, bank);
-    if (argtok) *argtok = pulsar_session_argmax(s);
+    if (argtok) *argtok = pulsar_session_argmax(s).raw();
     return true;
 }
 

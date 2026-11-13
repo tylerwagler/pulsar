@@ -1538,7 +1538,7 @@ done:
 
 /* The engine's vocabulary for the seam walks. */
 char *pulsar_engine_token_text_fn(void *ud, int token, size_t *len) {
-    return pulsar_token_text((pulsar_engine *)ud, token, len);
+    return pulsar_token_text((pulsar_engine *)ud, TokId{token}, len);
 }
 
 void pulsar_tokens_prefix_match(pulsar_engine *e,

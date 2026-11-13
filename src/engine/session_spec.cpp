@@ -842,11 +842,11 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
      * stop set (pulsar_token_is_stop; L284: the round cut only at the one eos
      * id, so a Qwen draft of <|endoftext|> committed past it and the server
      * invalidated the bank for the ghost tail). */
-    if (pulsar_token_is_stop(e, first_token)) {
+    if (pulsar_token_is_stop(e, TokId{first_token})) {
         commit = 0;
     } else {
         for (int i = 0; i < commit; i++) {
-            if (pulsar_token_is_stop(e, (int)pend[i])) { commit = i + 1; break; }
+            if (pulsar_token_is_stop(e, TokId{pend[i]})) { commit = i + 1; break; }
         }
     }
 
@@ -979,10 +979,10 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
 
     /* Emit first_token + accepted drafts. */
     accepted[n_accept++] = first_token;
-    bool hit_eos = pulsar_token_is_stop(e, first_token);
+    bool hit_eos = pulsar_token_is_stop(e, TokId{first_token});
     for (int i = 0; i < commit && n_accept < accepted_cap && !hit_eos; i++) {
         accepted[n_accept++] = (int)pend[i];
-        if (pulsar_token_is_stop(e, (int)pend[i])) hit_eos = true;
+        if (pulsar_token_is_stop(e, TokId{pend[i]})) hit_eos = true;
     }
     /* the stream steps past every token the round emitted: the carry sits at the next index, and the next
      * chain's drafts past it (L288 sdet; a teacher-forced end draws nothing and leaves the stream alone) */
@@ -1003,7 +1003,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
     s->spec.spec_carry_top_k = top_k;
     s->spec.spec_carry_top_p = top_p;
     s->spec.spec_carry_min_p = min_p;
-    if (hit_eos || pulsar_token_is_stop(e, next_base) || s->spec.spec_quenched) {
+    if (hit_eos || pulsar_token_is_stop(e, TokId{next_base}) || s->spec.spec_quenched) {
         /* Quenched: don't draft the next chain — the carry persisted above is
          * still the correctly-distributed next base, which the next
          * generate_speculative call consumes before routing plain. */
@@ -1185,7 +1185,7 @@ int pulsar_session::generate_speculative(float temperature, int top_k,
             return -1;
         }
     }
-    if (pulsar_token_is_stop(s->engine, first)) {
+    if (pulsar_token_is_stop(s->engine, TokId{first})) {
         /* never forward EOS through the target (matches the old caller loops,
          * which broke before eval) */
         accepted[0] = first;
@@ -1292,7 +1292,7 @@ uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, uint32_t bank, 
     for (uint32_t i = 0; i < r->n_batch; i++) {
         out[i].bank = bank;
         out[i].pos = r->saved_len + TokCount{(int)i};
-        out[i].token = i == 0 ? (int)r->base : (int)r->pend[i - 1];
+        out[i].token = TokId{i == 0 ? (int)r->base : (int)r->pend[i - 1]};
     }
     return r->n_batch;
 }
@@ -1524,7 +1524,7 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
             if (first < 0) {
                 st->status = PULSAR_SPEC_STEP_FAILED;
                 snprintf(st->err, sizeof st->err, "sampler refused a degenerate logits row (L188)");
-            } else if (pulsar_token_is_stop(s->engine, first)) {
+            } else if (pulsar_token_is_stop(s->engine, TokId{first})) {
                 st->status = PULSAR_SPEC_STEP_EOS;
             } else if (pulsar_session_spec_round_begin_local(s, st->round, first, st->max_tokens,
                                                              /* the round's rows are at most the cap_rows the budget

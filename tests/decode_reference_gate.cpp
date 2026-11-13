@@ -132,7 +132,9 @@ static bool decode_rows(pulsar_session *s, const int *toks, uint32_t d, uint32_t
                         bool serial) {
     bool ok = true;
     pulsar_multiseq_req rq[PULSAR_SPEC_LOGITS_ROWS];
-    for (uint32_t j = 0; j < w; j++) { rq[j].bank = 0; rq[j].pos = TokPos{(int32_t)(d - w + j)}; rq[j].token = toks[d - w + j]; }
+    for (uint32_t j = 0; j < w; j++) {
+        rq[j].bank = 0; rq[j].pos = TokPos{(int32_t)(d - w + j)}; rq[j].token = TokId{toks[d - w + j]};
+    }
     float *lg = (float *)malloc((size_t)w * (size_t)width * sizeof(float));
     uint32_t nr = 0;
     char err[256];

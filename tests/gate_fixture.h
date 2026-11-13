@@ -71,7 +71,7 @@ static inline bool gate_populate_bank(pulsar_session *s, uint32_t bank, const in
         return false;
     }
     gpu_graph_bank_counters_capture(g, bank);
-    if (argtok) *argtok = pulsar_session_argmax(s);
+    if (argtok) *argtok = pulsar_session_argmax(s).raw();
     return true;
 }
 

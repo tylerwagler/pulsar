@@ -180,7 +180,7 @@ run_rec run(pulsar_engine *e, const std::vector<pulsar_tokens> &P, int n, bool p
         for (uint32_t k = 0; k < rows; k++) {
             T.req.push_back((int32_t)reqs[k].bank);
             T.req.push_back(reqs[k].pos.raw());
-            T.req.push_back(reqs[k].token);
+            T.req.push_back(reqs[k].token.raw());
         }
         if (m == 0 || rows == 0) {
             R.ticks.push_back(T);
@@ -218,7 +218,7 @@ run_rec run(pulsar_engine *e, const std::vector<pulsar_tokens> &P, int n, bool p
                 R.out[b].push_back(acc[i][k]);
             }
             if ((int)R.out[b].size() >= n ||
-                (st[i].n_accepted && pulsar_token_is_stop(e, acc[i][st[i].n_accepted - 1])))
+                (st[i].n_accepted && pulsar_token_is_stop(e, TokId{acc[i][st[i].n_accepted - 1]})))
                 done[b] = true;
         }
         R.ticks.push_back(T);

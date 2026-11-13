@@ -154,13 +154,13 @@ void pulsar_kvtext_tokens_copy_prefix(pulsar_tokens *dst, const pulsar_tokens *s
 
 bool pulsar_kvtext_text_ends_with_live(pulsar_engine *engine, const char *text,
                                      size_t text_len, const pulsar_tokens *tokens) {
-    const int eos = pulsar_token_eos(engine);
+    const TokId eos = pulsar_token_eos(engine);
     size_t eos_len = 0;
     char *eos_text = pulsar_token_text(engine, eos, &eos_len);
     const bool text_eos = eos_len > 0 && text_len >= eos_len &&
                           memcmp(text + text_len - eos_len, eos_text, eos_len) == 0;
     free(eos_text);
-    const bool live_eos = tokens && tokens->len > 0 && tokens->v[tokens->len - 1] == eos;
+    const bool live_eos = tokens && tokens->len > 0 && TokId{tokens->v[tokens->len - 1]} == eos;
     return text_eos == live_eos;
 }
 

@@ -175,8 +175,8 @@ static int sampled_plain_batch(pulsar_session *s, const start_state *snap,
         if (pos0 < 0) pos0 = p;
         if (p != pos0) { snprintf(err, errlen, "bank %d at pos %d, bank 0 at %d", b, p, pos0); return -1; }
         rng[b] = traj_seed(t0 + b, 0);
-        const int tok = pulsar_session_sample(s, temp, 0, top_p, min_p, &rng[b]);
-        seq[t0 + b][0] = tok;
+        const TokId tok = pulsar_session_sample(s, temp, 0, top_p, min_p, &rng[b]);
+        seq[t0 + b][0] = tok.raw();
         got[b] = 1;
         live[b] = !pulsar_token_is_stop(e, tok) && DEPTH > 1;
         reqs[b].bank = (uint32_t)b; reqs[b].pos = TokPos{pos0}; reqs[b].token = tok;
@@ -210,8 +210,8 @@ static int sampled_plain_batch(pulsar_session *s, const start_state *snap,
             const int b = who[q];
             const int tok = drawn[q];
             seq[t0 + b][got[b]++] = tok;
-            reqs[b].pos += TokCount{1}; reqs[b].token = tok;
-            if (pulsar_token_is_stop(e, tok) || got[b] >= DEPTH) live[b] = 0;
+            reqs[b].pos += TokCount{1}; reqs[b].token = TokId{tok};
+            if (pulsar_token_is_stop(e, TokId{tok}) || got[b] >= DEPTH) live[b] = 0;
         }
     }
     for (int b = 0; b < nb; b++)
@@ -249,7 +249,7 @@ static int sampled_spec_batch(pulsar_session *s, const start_state *snap,
                 snprintf(err, errlen, "bank %d restore failed", b); return -1;
             }
             first[b] = pulsar_session_spec_next_base(s, temp, 0, top_p, min_p, &rng[b]);
-            if (pulsar_token_is_stop(e, first[b])) {
+            if (pulsar_token_is_stop(e, TokId{first[b]})) {
                 seq[t0 + b][got[b]++] = first[b];
                 live[b] = 0;
                 pulsar_session_bank_state_save(s, (uint32_t)b);
@@ -299,7 +299,7 @@ static int sampled_spec_batch(pulsar_session *s, const start_state *snap,
                                                          err, errlen);
             if (na < 0) return -1;
             for (int i = 0; i < na && got[b] < DEPTH; i++) seq[t0 + b][got[b]++] = accepted[i];
-            if (got[b] >= DEPTH || (got[b] > 0 && pulsar_token_is_stop(e, seq[t0 + b][got[b] - 1]))) live[b] = 0;
+            if (got[b] >= DEPTH || (got[b] > 0 && pulsar_token_is_stop(e, TokId{seq[t0 + b][got[b] - 1]}))) live[b] = 0;
             pulsar_session_bank_state_save(s, (uint32_t)b);
             if (live[b]) { cont_r[nc] = r[b]; cont_b[nc] = (uint32_t)b; cont_rng[nc] = &rng[b]; nc++; }
         }
@@ -601,11 +601,11 @@ int GATE_ENTRY(int argc, char **argv) {
                 tok = gate_step_batched(session, 0.0f, 0, 1.0f, 0.0f, &rng,
                                         err, sizeof(err));
                 if (tok < 0) { fprintf(stderr, "ref batched step: %s\n", err); free(lg); goto done; }
-                if (pulsar_token_is_stop(engine, tok)) break;
+                if (pulsar_token_is_stop(engine, TokId{tok})) break;
             } else {
-                tok = pulsar_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng);
-                if (pulsar_token_is_stop(engine, tok)) break;
-                if (pulsar_session_eval(session, tok, err, sizeof(err)) != 0) { free(lg); goto done; }
+                tok = pulsar_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng).raw();
+                if (pulsar_token_is_stop(engine, TokId{tok})) break;
+                if (pulsar_session_eval(session, TokId{tok}, err, sizeof(err)) != 0) { free(lg); goto done; }
             }
             ref_gap[nref] = g;
             ref[nref++] = tok;

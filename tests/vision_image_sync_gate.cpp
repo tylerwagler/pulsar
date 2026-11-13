@@ -101,9 +101,9 @@ int main(int argc, char **argv) {
                    c, n_vh, n_vw, err);
             bad++;
         } else {
-            const int am = pulsar_session_argmax(sess);
-            if (am < 0 || am >= (int)PULSAR_N_VOCAB) {
-                printf("  FAIL case %u: argmax %d out of range after an image prefill\n", c, am);
+            const TokId am = pulsar_session_argmax(sess);
+            if (!am.below((uint32_t)PULSAR_N_VOCAB)) {
+                printf("  FAIL case %u: argmax %d out of range after an image prefill\n", c, am.raw());
                 bad++;
             }
             /* copy_logits returns the COUNT it copied, not 0 on success. */

@@ -62,7 +62,7 @@ static bool after_sync(pulsar_session *s, const int32_t *next, int W, std::vecto
     out->clear();
     out->push_back(logits_of(s, W));
     for (int i = 0; i < 4; i++) {
-        if (pulsar_session_eval(s, next[i], err, errlen) != 0) return false;
+        if (pulsar_session_eval(s, TokId{next[i]}, err, errlen) != 0) return false;
         out->push_back(logits_of(s, W));
     }
     return true;
@@ -168,7 +168,7 @@ int main(int argc, char **argv) {
         for (int i = 0; ok && i < 8; i++) {
             const std::vector<float> ls = logits_of(s, W), lx = logits_of(x, W);
             diff_rows += ls.size() != lx.size() || memcmp(ls.data(), lx.data(), ls.size() * sizeof(float)) != 0;
-            const int t = pulsar_session_argmax(s);
+            const TokId t = pulsar_session_argmax(s);
             ok = pulsar_session_eval(s, t, err, sizeof err) == 0 && pulsar_session_eval(x, t, err, sizeof err) == 0;
         }
         CHECK(ok && diff_rows == 0, "PAYLOAD the loaded frontier's logits and next 8 decode steps == the live session's "
@@ -198,8 +198,8 @@ int main(int argc, char **argv) {
         ok = ok && after_sync(s, next, W, &cold, err, sizeof err);
         CHECK(ok && cold.size() == 5, "COLD logits + 4 decode steps %s", err);
         for (int i = 0; ok && i < n_spec; i++) {
-            const int t = pulsar_session_argmax(s);
-            plain.push_back(t);
+            const TokId t = pulsar_session_argmax(s);
+            plain.push_back(t.raw());
             ok = pulsar_session_eval(s, t, err, sizeof err) == 0;
         }
         CHECK(ok && (int)plain.size() == n_spec, "COLD plain greedy %d tokens %s", n_spec, err);
@@ -320,7 +320,7 @@ int main(int argc, char **argv) {
         for (int i = 0; ok && i < 8; i++) {
             const std::vector<float> ls = logits_of(s, W), lx = logits_of(x, W);
             diff_rows += ls.size() != lx.size() || memcmp(ls.data(), lx.data(), ls.size() * sizeof(float)) != 0;
-            const int t = pulsar_session_argmax(s);
+            const TokId t = pulsar_session_argmax(s);
             ok = pulsar_session_eval(s, t, err, sizeof err) == 0 && pulsar_session_eval(x, t, err, sizeof err) == 0;
         }
         CHECK(ok && diff_rows == 0, "PAYLOAD the loaded frontier's logits and next 8 decode steps == the live session's "

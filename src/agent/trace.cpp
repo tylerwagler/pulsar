@@ -89,7 +89,7 @@ void agent_trace_tokens(agent_worker *w, const char *label,
                 start, tokens->len);
     for (int i = start; i < tokens->len; i++) {
         size_t text_len = 0;
-        char *text = pulsar_token_text(w->engine, tokens->v[i], &text_len);
+        char *text = pulsar_token_text(w->engine, TokId{tokens->v[i]}, &text_len);
         agent_trace_token(w, tokens->v[i], text, text_len, i);
         free(text);
     }

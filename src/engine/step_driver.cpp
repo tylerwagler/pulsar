@@ -635,7 +635,7 @@ int pulsar_driver_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *
                 return 1;
             }
         }
-        tok[i] = reqs[i].token;
+        tok[i] = reqs[i].token.raw();
         pos[i] = reqs[i].pos.raw();
         bank[i] = (int32_t)reqs[i].bank;
     }
@@ -682,7 +682,7 @@ static bool driver_verify_rows(pulsar_session *s, const pulsar_multiseq_req *req
             return false;
         }
         if (run_start && driver_bank_stale(s, b, "verify", err, errlen)) return false;
-        tok[i] = reqs[i].token;
+        tok[i] = reqs[i].token.raw();
         pos[i] = reqs[i].pos.raw();
         bk[i] = (int32_t)b;
     }
@@ -805,15 +805,15 @@ int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *req
         const char *why = n_pf > shape->n_pf                                       ? "starts a run past the shape's"
                           : taken                                                 ? "is on a bank the step already carries"
                           : !starts && reqs[i].pos.raw() != reqs[i - 1].pos.raw() + 1         ? "does not follow its run"
-                          : !pulsar_session_token_is_id(s, reqs[i].token, NULL, 0) ? "is not a token id"
-                          : vis && vis->is_sentinel(e, reqs[i].token)               ? "is an image block's (a sync's)"
+                          : !pulsar_session_token_is_id(s, reqs[i].token.raw(), NULL, 0) ? "is not a token id"
+                          : vis && vis->is_sentinel(e, reqs[i].token.raw())         ? "is an image block's (a sync's)"
                                                                                   : NULL;
         if (why) {
             if (err) snprintf(err, errlen, "%s: fused prompt row %u (bank %u pos %d) %s", ARCH(e), i, b, reqs[i].pos.raw(),
                               why);
             return 1;
         }
-        tok[i] = reqs[i].token;
+        tok[i] = reqs[i].token.raw();
         pos[i] = reqs[i].pos.raw();
         bk[i] = (int32_t)b;
     }

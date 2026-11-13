@@ -52,7 +52,7 @@ static std::string tokens_text(pulsar_engine *e, const pulsar_tokens &t) {
     std::string text;
     for (int i = 0; i < t.len; i++) {
         size_t n = 0;
-        char *piece = pulsar_token_text(e, t.v[i], &n);
+        char *piece = pulsar_token_text(e, TokId{t.v[i]}, &n);
         text.append(piece, n);
         free(piece);
     }
@@ -141,8 +141,10 @@ int main(int argc, char **argv) {
           "the tokenizer + chat front (CAP_CHAT, the Nemotron-H chat format)");
     check(pulsar_engine_vocab_size(e) == (int)s->n_vocab, "the tokenizer table: %d ids (== the head's rows)",
           pulsar_engine_vocab_size(e));
-    check(pulsar_token_eos(e) == (int)s->eos_id && pulsar_token_is_stop(e, (int)s->eos_id) && pulsar_token_is_stop(e, 2),
-          "eos %d is the container's eos_token_id %u; </s> 2 stops too (generation_config)", pulsar_token_eos(e), s->eos_id);
+    check(pulsar_token_eos(e) == TokId{(int)s->eos_id} && pulsar_token_is_stop(e, TokId{(int)s->eos_id}) &&
+              pulsar_token_is_stop(e, TokId{2}),
+          "eos %d is the container's eos_token_id %u; </s> 2 stops too (generation_config)", pulsar_token_eos(e).raw(),
+          s->eos_id);
     check(pulsar_engine_think_default(e) == PULSAR_THINK_DEFAULT &&
               pulsar_engine_think_mode_supported(e, PULSAR_THINK_NONE, NULL, 0) &&
               !pulsar_engine_think_mode_supported(e, PULSAR_THINK_LOW, NULL, 0),
@@ -183,7 +185,7 @@ int main(int argc, char **argv) {
               "tool-result turns: the user marker's suffix ends in <tool_response> (16; %d tokens) -- role 3, not a "
               "user turn, for the route anchor and the message endpoint", m.n_tool);
         pulsar_tokens_free(&t);
-        check(pulsar_token_think_close(e) == 13, "the think close is </think> (13, a non-special added token)");
+        check(pulsar_token_think_close(e) == TokId{13}, "the think close is </think> (13, a non-special added token)");
     }
     check(pulsar_engine_drafter(e) == (s->mtp_written ? PULSAR_DRAFTER_MTP : PULSAR_DRAFTER_NONE) &&
               e->drafter_ops == (s->mtp_written ? &PULSAR_NEMOTRON_H_DRAFTER : NULL) && w->drafting == s->mtp_written,

@@ -16735,6 +16735,23 @@ static_assert(std::is_same_v<decltype(pulsar_comp_row_of(TokPos{}, TokPerRow{}))
                   std::is_same_v<decltype(pulsar_step_run{}.row_of(TokPos{})), StepRow>,
               "the crossings' types");
 
+/* L334 P3: a token id is an identity -- the compile-fail checks.  No arithmetic, no ordering, no position / count /
+ * row passes for it or it for them, and no int enters it implicitly (L251's eval(sess, 1, ..) count). */
+template <class A> concept l334_steps = requires(A a) { ++a; };
+static_assert(!l333_adds<TokId, TokCount> && !l333_adds<TokId, TokId> && !l333_adds<TokId, int> && !l334_steps<TokId> &&
+                  !l333_orders<TokId, TokId> && l333_equates<TokId, TokId> && !l333_equates<TokId, int> &&
+                  !l333_equates<TokId, TokPos>,
+              "an id equates with an id only, and moves nowhere");
+static_assert(!l334_passes<int, TokId> && !l334_passes<TokId, int> && !l334_passes<TokCount, TokId> &&
+                  !l334_passes<TokPos, TokId> && !l334_passes<TokId, TokPos> && !l334_passes<StepRow, TokId> &&
+                  !std::is_constructible_v<TokId, TokCount> && !std::is_constructible_v<TokPos, TokId> &&
+                  std::is_constructible_v<TokId, int>,
+              "an int enters an id by name only; a count, a position or a row never does");
+static_assert(TokId::none().raw() == -1 && TokId{-1}.is_none() && !TokId{0}.is_none() && TokId{0}.is_token() &&
+                  !TokId::none().is_token() && TokId{7}.below(8u) && !TokId{8}.below(8u) && !TokId::none().below(8u) &&
+                  TokId{3} == TokId{3} && TokId{3} != TokId{4},
+              "none(), the token test and an authority's bound");
+
 /* L334 P2b: the crossings compute what the open-coded expressions did (pos / ratio, row * ratio, len / ratio,
  * ceil(len / ratio), rows * ratio + ratio - 1, pos0 + (row - first) and its inverse), over a grid of values. */
 static void test_l334_p2b_crossings(void) {

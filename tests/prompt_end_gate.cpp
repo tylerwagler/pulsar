@@ -62,7 +62,7 @@ static int greedy_run(pulsar_engine *e, pulsar_session *s, int n, int *toks, int
             pulsar_session_copy_logits(s, lg, W);
             int best = 0;
             for (int i = 1; i < W; i++) if (lg[i] > lg[best]) best = i;
-            if (pulsar_session_eval(s, best, err, errlen) != 0) return 1;
+            if (pulsar_session_eval(s, TokId{best}, err, errlen) != 0) return 1;
             rounds[(*n_rounds)++] = 1;
             toks[got++] = best;
         }

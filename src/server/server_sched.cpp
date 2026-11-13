@@ -2539,7 +2539,7 @@ int gen_think_close_row(server *s, const gen_state *g, const int *toks, int n, i
     const int budget = g->j->req.think_budget;
     if (budget <= 0) return -1;
     return think_close_row(budget, g->thinking.inside && !g->think_closed, g->think_tokens,
-                           pulsar_token_think_close(s->engine), toks, n, off);
+                           pulsar_token_think_close(s->engine).raw(), toks, n, off);
 }
 
 /// @brief Lay `rows` mask rows of `W` words into `out`: each the grammar's (`gram`, `gram_rows` of them) or
@@ -2574,7 +2574,7 @@ void think_masks_lay(uint32_t *out, size_t W, int row, int rows, int close, cons
 /// @return the rows (rows x the engine's mask width); NULL with g->err set when a grammar row is another width
 const uint32_t *gen_think_masks(server *s, gen_state *g, int row, int rows, const uint32_t *gram, int gram_rows) {
     const size_t W = gen_think_mask_words(s);
-    const int close = pulsar_token_think_close(s->engine);
+    const int close = pulsar_token_think_close(s->engine).raw();
     if (close < 0 || (size_t)close >= W * 32u) {   /* chat_resolve_thinking refused a budget without one */
         snprintf(g->err, sizeof g->err, "thinking budget: the model has no close token in the sampler's rows");
         return NULL;
@@ -2608,7 +2608,7 @@ static int gen_sample_pool(server *s, gen_state *g, pulsar_session *pool, float 
     std::vector<uint32_t> mask;
     pulsar_row_draw d;
     if (!gen_draw_req(s, g, temp, top_k, top_p, min_p, &mask, &d)) return -1;
-    const int tok = pulsar_session_draw(pool, &d);
+    const int tok = pulsar_session_draw(pool, &d).raw();   /* none(): PULSAR_SAMPLE_REFUSED */
     if (tok < 0) snprintf(g->err, sizeof g->err, "sampler refused a degenerate logits row (L188)");
     return tok;
 }
@@ -4209,7 +4209,7 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n, int quantu
             }
             reqs[m].bank = sl->bank;
             reqs[m].pos = g->batch_feed_pos;
-            reqs[m].token = g->batch_feed_token;
+            reqs[m].token = TokId{g->batch_feed_token};
             live_idx[m] = i;
             m++;
         }
@@ -4855,7 +4855,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 for (int j = 0; j < fr[r].k; j++) {
                     fused_reqs[at].bank = (uint32_t)fr[r].sl->bank;
                     fused_reqs[at].pos = TokPos{fr[r].p0 + j};
-                    fused_reqs[at].token = t->v[fr[r].p0 + j];
+                    fused_reqs[at].token = TokId{t->v[fr[r].p0 + j]};
                     at++;
                 }
                 shape.head_last[r] = fr[r].fin ? 1u : 0u;
@@ -4979,7 +4979,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             {
                 int toks[PULSAR_SPEC_LOGITS_ROWS];
                 int nt = 0;
-                for (int i = base_sent[q] ? 1 : 0; i < row_nb[q]; i++) toks[nt++] = reqs[row0s[q] + (uint32_t)i].token;
+                for (int i = base_sent[q] ? 1 : 0; i < row_nb[q]; i++) toks[nt++] = reqs[row0s[q] + (uint32_t)i].token.raw();
                 st->greedy_rows = gen_spec_greedy_rows(s, g, toks, nt, base_sent[q]);
                 /* L303: each verify row's mask -- the gate walked through the round's tokens and back */
                 const int mr = gen_constrain_round(s, g, toks, nt, base_sent[q], &st->masks);
@@ -5273,7 +5273,7 @@ bool server::batch_leave(session_slot *sl) {
     const int tok = g->batch_feed_token;
     g->batch_feed_valid = false;
     char err[160] = "";
-    if (pulsar_session_eval(pool, tok, err, sizeof err) != 0) {
+    if (pulsar_session_eval(pool, TokId{tok}, err, sizeof err) != 0) {
         if (!g->err[0]) snprintf(g->err, sizeof g->err, "leaving the batch: %s", err);
         g->finish = "error";
         g->phase = GEN_FINISH;
@@ -5501,7 +5501,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
                 g->batch_feed_valid = false; g->finish = "length"; g->phase = GEN_FINISH; continue;
             }
             reqs[m].bank = sl->bank; reqs[m].pos = g->batch_feed_pos;
-            reqs[m].token = g->batch_feed_token; live_idx[m] = i; m++;
+            reqs[m].token = TokId{g->batch_feed_token}; live_idx[m] = i; m++;
         }
         /* Fold this step's ascending prefill sub-chunk from P0+pf_done, all the way
          * to len (the FINAL sub-chunk carries the last-position logits used for the
@@ -5525,7 +5525,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
         for (int j = 0; j < kthis; j++) {
             reqs[m + j].bank = pf->bank;
             reqs[m + j].pos = TokPos{pos_now + j};
-            reqs[m + j].token = pp->v[pos_now + j];
+            reqs[m + j].token = TokId{pp->v[pos_now + j]};
         }
         const int nrows = m + kthis;
         if (nrows == 0) break;

@@ -77,7 +77,7 @@ static iso_run run_script(pulsar_engine *e, const pulsar_tokens *story, int len0
         pulsar_multiseq_req rq[2];
         for (int k = 0; k < 2; k++) {
             const uint32_t b = (uint32_t)(swap ? 1 - k : k);
-            rq[k] = {b, TokPos{len[b] + t}, story->v[bank_off[b] + len[b] + t]};
+            rq[k] = {b, TokPos{len[b] + t}, TokId{story->v[bank_off[b] + len[b] + t]}};
         }
         uint32_t n_out = 0;
         err[0] = '\0';

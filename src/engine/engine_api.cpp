@@ -794,7 +794,7 @@ static pulsar_tp_batch_item *tp_mirror_rows(const pulsar_session *s, const pulsa
         items[i].session_id = s->tp_session_id;
         items[i].bank       = (int32_t)reqs[i].bank;
         items[i].pos        = reqs[i].pos.raw();   /* the wire's int32 */
-        items[i].token      = reqs[i].token;
+        items[i].token      = reqs[i].token.raw();   /* the wire's int32 */
         items[i].reserved   = 0;
     }
     return items;
@@ -980,7 +980,7 @@ char *pulsar_history_text(pulsar_engine *e, const pulsar_tokens *tokens, size_t 
             id = e->family->vision->placeholder_id(e);
         }
         size_t n = 0;
-        char *piece = pulsar_token_text(e, id, &n);
+        char *piece = pulsar_token_text(e, TokId{id}, &n);
         out.append(piece, n);
         free(piece);
         i += blk - 1;
@@ -1026,22 +1026,33 @@ int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prom
 }
 TokCount pulsar_session_common_prefix(pulsar_session *s, const pulsar_tokens *prompt) { return TokCount{s->common_prefix(prompt)}; }
 void pulsar_session_prefix_match(pulsar_session *s, const pulsar_tokens *prompt, pulsar_prefix_match *out) { if (s) { s->prefix_match(prompt, out); } else if (out) { out->live_cut = TokCount{0}; out->prompt_cut = PromptToks{0}; out->seamed = false; } }
-int pulsar_session_argmax(pulsar_session *s) { return s->argmax(); }
-int pulsar_session_argmax_excluding(pulsar_session *s, int excluded_id) { return s ? s->argmax_excluding(excluded_id) : -1; }
-int pulsar_session_sample(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) { return s->sample(temperature, top_k, top_p, min_p, rng); }
-int pulsar_session_draw(pulsar_session *s, const pulsar_row_draw *d) { return s && d ? s->draw(d) : PULSAR_SAMPLE_REFUSED; }
+/* L334 P3: the sampler's answers leave the engine typed (PULSAR_SAMPLE_REFUSED / -1 -> none()); the session's
+ * sampler methods stay raw inside */
+TokId pulsar_session_argmax(pulsar_session *s) { return TokId{s->argmax()}; }
+TokId pulsar_session_argmax_excluding(pulsar_session *s, TokId excluded_id) {
+    return s ? TokId{s->argmax_excluding(excluded_id.raw())} : TokId::none();
+}
+TokId pulsar_session_sample(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
+    return TokId{s->sample(temperature, top_k, top_p, min_p, rng)};
+}
+TokId pulsar_session_draw(pulsar_session *s, const pulsar_row_draw *d) {
+    return s && d ? TokId{s->draw(d)} : TokId::none();
+}
 int pulsar_session_draw_rows(pulsar_session *s, const uint32_t *rows, const pulsar_row_draw *d, uint32_t n, int *tokens) {
     return s && rows && d && tokens && n ? s->draw_step_rows(rows, d, n, tokens) : 1;
 }
 int pulsar_session_step_row_to_bank(pulsar_session *s, uint32_t row, uint32_t bank) {
     return s && s->step_row_to_bank(row, bank) ? 0 : 1;
 }
-int pulsar_session_step_row_logprobs(pulsar_session *s, uint32_t row, int token, pulsar_token_score *chosen,
+int pulsar_session_step_row_logprobs(pulsar_session *s, uint32_t row, TokId token, pulsar_token_score *chosen,
                                      int *have_chosen, pulsar_token_score *top, int k, int *n_top) {
-    return s && chosen && have_chosen && n_top && (top || k == 0) ? s->step_row_logprobs(row, token, chosen, have_chosen, top, k, n_top) : 1;
+    return s && chosen && have_chosen && n_top && (top || k == 0)
+               ? s->step_row_logprobs(row, token.raw(), chosen, have_chosen, top, k, n_top) : 1;
 }
 int pulsar_session_top_logprobs(pulsar_session *s, pulsar_token_score *out, int k) { return s && tp_mirror_settle(s, NULL, 0) ? s->top_logprobs(out, k) : 0; }
-int pulsar_session_token_logprob(pulsar_session *s, int token, pulsar_token_score *out) { return s && tp_mirror_settle(s, NULL, 0) ? s->token_logprob(token, out) : 0; }
+int pulsar_session_token_logprob(pulsar_session *s, TokId token, pulsar_token_score *out) {
+    return s && tp_mirror_settle(s, NULL, 0) ? s->token_logprob(token.raw(), out) : 0;
+}
 int pulsar_session_copy_logits(pulsar_session *s, float *out, int cap) { return s && tp_mirror_settle(s, NULL, 0) ? s->copy_logits(out, cap) : 0; }
 int pulsar_session_set_logits(pulsar_session *s, const float *logits, int n) {
     PULSAR_NVTX_FN();
@@ -1063,8 +1074,9 @@ int pulsar_session_set_logits(pulsar_session *s, const float *logits, int n) {
                         NULL, 0)) return 1;
     return tp_mirror_bank_verdict(s, tp, "set logits", s->set_logits(logits, n) != 0 ? 1 : 0, 1);
 }
-int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen) {
+int pulsar_session_eval(pulsar_session *s, TokId token_id, char *err, size_t errlen) {
     PULSAR_NVTX_FN();
+    const int token = token_id.raw();   /* L334 P3: the family's eval and the TP frame take the raw id */
     if (!s) return 1;
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) return pulsar_session_family_eval(s, token, err, errlen);

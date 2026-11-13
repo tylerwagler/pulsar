@@ -122,7 +122,7 @@ int main(int argc, char **argv) {
         double kl_sum = 0.0, dnll_sum = 0.0;
         int agree = 0;
         for (int i = 0; i < w.window; i++) {
-            if (i > 0 && pulsar_session_eval(s, ids[(size_t)P + i - 1], err, sizeof(err)) != 0) {
+            if (i > 0 && pulsar_session_eval(s, TokId{ids[(size_t)P + i - 1]}, err, sizeof(err)) != 0) {
                 fprintf(stderr, "qwen-kv-walk: eval at %d: %s\n", P + i, err);
                 return 1;
             }

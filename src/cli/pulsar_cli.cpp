@@ -387,11 +387,11 @@ static int run_session_generation(pulsar_engine *engine, const cli_config *cfg, 
                 pulsar_session_free(session);
                 return 1;
             }
-            if (ntok == 1 && pulsar_token_is_stop(engine, toks[0])) break;
+            if (ntok == 1 && pulsar_token_is_stop(engine, TokId{toks[0]})) break;
         } else {
-            int token = pulsar_session_sample(session, cfg->gen.temperature, 0,
+            const TokId token = pulsar_session_sample(session, cfg->gen.temperature, 0,
                                            cfg->gen.top_p, cfg->gen.min_p, &rng);
-            if (token < 0) {
+            if (!token.is_token()) {
                 fprintf(stderr, "pulsar: decode failed: sampler refused a degenerate logits row\n");
                 pulsar_session_free(session);
                 return 1;
@@ -403,18 +403,18 @@ static int run_session_generation(pulsar_engine *engine, const cli_config *cfg, 
                 pulsar_session_free(session);
                 return 1;
             }
-            toks[0] = token;
+            toks[0] = token.raw();
             ntok = 1;
         }
 
         bool stop = false;
         for (int j = 0; j < ntok; j++) {
-            if (pulsar_token_is_stop(engine, toks[j])) {
+            if (pulsar_token_is_stop(engine, TokId{toks[j]})) {
                 stop = true;
                 break;
             }
             size_t piece_len = 0;
-            char *piece = pulsar_token_text(engine, toks[j], &piece_len);
+            char *piece = pulsar_token_text(engine, TokId{toks[j]}, &piece_len);
             token_printer_write_text(&printer, piece, piece_len);
             fflush(stdout);
             free(piece);
@@ -498,10 +498,10 @@ static void json_write_string(FILE *fp, const char *s, size_t n) {
  *  @param fp     the stream
  *  @param engine the engine (detokenises)
  *  @param token  the token id */
-static void json_write_token(FILE *fp, pulsar_engine *engine, int token) {
+static void json_write_token(FILE *fp, pulsar_engine *engine, TokId token) {
     size_t n = 0;
     char *text = pulsar_token_text(engine, token, &n);
-    fprintf(fp, "{\"id\":%d,\"text\":", token);
+    fprintf(fp, "{\"id\":%d,\"text\":", token.raw());
     json_write_string(fp, text, n);
     fputs(",\"bytes\":[", fp);
     for (size_t i = 0; i < n; i++) {
@@ -559,8 +559,8 @@ static int run_logits_dump(pulsar_engine *engine, const cli_config *cfg, const p
         return 1;
     }
 
-    const int argmax = pulsar_session_argmax(session);
-    if (argmax < 0) {   /* -1: no finite logit -- there is no argmax to write (and logits[-1] is out of bounds) */
+    const TokId argmax = pulsar_session_argmax(session);
+    if (!argmax.is_token()) {   /* none(): no finite logit -- there is no argmax to write (and logits[-1] is out of bounds) */
         fprintf(stderr, "pulsar: --dump-logits: no finite logit at the prompt's end; refusing the dump\n");
         free(logits);
         pulsar_session_free(session);
@@ -586,7 +586,7 @@ static int run_logits_dump(pulsar_engine *engine, const cli_config *cfg, const p
             vocab);
     fputs("  \"argmax_token\":", fp);
     json_write_token(fp, engine, argmax);
-    fprintf(fp, ",\n  \"argmax_logit\":%.9g,\n  \"logits\":[", logits[argmax]);
+    fprintf(fp, ",\n  \"argmax_logit\":%.9g,\n  \"logits\":[", logits[argmax.raw()]);   /* an id indexes its logit */
     for (int i = 0; i < vocab; i++) {
         if (i) fputc(',', fp);
         if ((i % 8) == 0) fputs("\n    ", fp);
@@ -667,12 +667,12 @@ static int run_logprob_dump(pulsar_engine *engine, const cli_config *cfg, const 
     else if (max_tokens > room - 1) max_tokens = room - 1;
     for (; generated < max_tokens; generated++) {
         int n = pulsar_session_top_logprobs(session, scores, k);
-        int token = pulsar_session_argmax(session);
+        const TokId token = pulsar_session_argmax(session);
         if (generated) fputs(",\n", fp);
         fprintf(fp, "    {\"step\":%d,\"selected\":", generated);
         json_write_token(fp, engine, token);
         fputs(",\"top_logprobs\":[", fp);
-        for (int i = 0; i < n && scores[i].id >= 0; i++) {
+        for (int i = 0; i < n && scores[i].id.is_token(); i++) {
             if (i) fputc(',', fp);
             fputs("{\"token\":", fp);
             json_write_token(fp, engine, scores[i].id);
@@ -753,7 +753,7 @@ static int run_perplexity_file(pulsar_engine *engine, const cli_config *cfg) {
     for (int j = 0; j < scored; j++) {
         const int i = prefix_len + j;
         pulsar_token_score score;
-        if (!pulsar_session_token_logprob(session, tokens.v[i], &score)) {
+        if (!pulsar_session_token_logprob(session, TokId{tokens.v[i]}, &score)) {
             fprintf(stderr, "pulsar: failed to score token %d\n", i);
             pulsar_session_free(session);
             pulsar_tokens_free(&tokens);
@@ -766,7 +766,7 @@ static int run_perplexity_file(pulsar_engine *engine, const cli_config *cfg) {
             fflush(stderr);
         }
 
-        if (j + 1 < scored && pulsar_session_eval(session, tokens.v[i], err, sizeof(err)) != 0) {
+        if (j + 1 < scored && pulsar_session_eval(session, TokId{tokens.v[i]}, err, sizeof(err)) != 0) {
             fprintf(stderr, "\npulsar: perplexity decode failed at token %d: %s\n", i, err);
             pulsar_session_free(session);
             pulsar_tokens_free(&tokens);
@@ -1043,7 +1043,7 @@ tokens_ready:
             fprintf(stderr, "pulsar: kl %s %d/%d\r", dumping ? "dump" : "score", j + 1, scored);
             fflush(stderr);
         }
-        if (j + 1 < scored && pulsar_session_eval(session, tokens.v[i], err, sizeof(err)) != 0) {
+        if (j + 1 < scored && pulsar_session_eval(session, TokId{tokens.v[i]}, err, sizeof(err)) != 0) {
             fprintf(stderr, "\npulsar: --kl-file decode failed at token %d: %s\n", i, err);
             goto done;
         }
@@ -1375,15 +1375,15 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
                 fprintf(stderr, "pulsar: decode failed: %s\n", err);
                 return 1;
             }
-            if (ntok == 1 && pulsar_token_is_stop(engine, toks[0])) break;
+            if (ntok == 1 && pulsar_token_is_stop(engine, TokId{toks[0]})) break;
         } else {
-            int token = pulsar_session_sample(chat->session,
+            const TokId token = pulsar_session_sample(chat->session,
                                            cfg->gen.temperature,
                                            0,
                                            cfg->gen.top_p,
                                            cfg->gen.min_p,
                                            &rng);
-            if (token < 0) {
+            if (!token.is_token()) {
                 fprintf(stderr, "pulsar: decode failed: sampler refused a degenerate logits row\n");
                 return 1;
             }
@@ -1393,18 +1393,18 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
                 fprintf(stderr, "pulsar: decode failed: %s\n", err);
                 return 1;
             }
-            toks[0] = token;
+            toks[0] = token.raw();
             ntok = 1;
         }
 
         bool stop = false;
         for (int j = 0; j < ntok; j++) {
-            if (pulsar_token_is_stop(engine, toks[j])) {
+            if (pulsar_token_is_stop(engine, TokId{toks[j]})) {
                 stop = true;
                 break;
             }
             size_t piece_len = 0;
-            char *piece = pulsar_token_text(engine, toks[j], &piece_len);
+            char *piece = pulsar_token_text(engine, TokId{toks[j]}, &piece_len);
             pulsar_tokens_push(&chat->transcript, toks[j]);
             token_printer_write_text(&printer, piece, piece_len);
             fflush(stdout);

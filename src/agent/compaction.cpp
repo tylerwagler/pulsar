@@ -216,8 +216,8 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
      * cannot accidentally continue from the private compaction exchange. */
     agent_buf summary = {0};
     char eval_err[160] = {0};
-    int think_end_id = pulsar_token_think_close(w->engine);
-    int dsml_id = agent_special_token_id(w->engine, "｜DSML｜");
+    TokId think_end_id = pulsar_token_think_close(w->engine);
+    TokId dsml_id = TokId{agent_special_token_id(w->engine, "｜DSML｜")};
     double t0 = agent_now_sec();
     for (int i = 0; i < summary_max; i++) {
         if (worker_should_interrupt(w)) {
@@ -234,13 +234,13 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
         }
         /* L373: the summary's decode polls the bash jobs as a turn's does (a compaction runs on the worker thread) */
         if (w->bash_jobs && i > 0 && i % AGENT_BASH_POLL_TOKENS == 0) agent_bash_jobs_poll(w);
-        int token = pulsar_session_argmax(w->session);
+        TokId token = pulsar_session_argmax(w->session);
         if (pulsar_token_is_stop(w->engine, token)) break;
         if (token == think_end_id || token == dsml_id) {
             if (token == dsml_id && summary.len && summary.ptr[summary.len - 1] == '<') {
                 summary.ptr[--summary.len] = '\0';
             }
-            agent_trace(w, "compaction summary stopped before control token id=%d", token);
+            agent_trace(w, "compaction summary stopped before control token id=%d", token.raw());
             break;
         }
         if (pulsar_session_eval(w->session, token, eval_err, sizeof(eval_err)) != 0) {
@@ -357,13 +357,13 @@ int worker_accept_generated_token(agent_worker *w,
                                          agent_stream_renderer *stream,
                                          char *err,
                                          size_t err_len) {
-    if (pulsar_session_eval(w->session, token, err, err_len) != 0)
+    if (pulsar_session_eval(w->session, TokId{token}, err, err_len) != 0)
         return 1;
 
     pulsar_tokens_push(&w->transcript, token);
 
     size_t text_len = 0;
-    char *text = pulsar_token_text(w->engine, token, &text_len);
+    char *text = pulsar_token_text(w->engine, TokId{token}, &text_len);
     agent_trace_token(w, token, text, text_len, *generated + 1);
     agent_stream_text(stream, text, text_len, false);
     free(text);

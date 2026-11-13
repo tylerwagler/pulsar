@@ -327,7 +327,7 @@ static bool chat_resolve_thinking(pulsar_engine *e, const server *s, const chat_
     /* L344: a budget closes the block with the family's ONE close token; a family without one refuses it.  A
      * render with no engine (the parse/render tests) has no decode to budget and no tokenizer to ask. */
     if (a.budget > 0) {
-        if (e && pulsar_token_think_close(e) < 0) {
+        if (e && !pulsar_token_think_close(e).is_token()) {
             snprintf(err, errlen, "thinking.budget_tokens: this model's reasoning has no single close token to end "
                                   "it with; send thinking without a budget");
             return false;

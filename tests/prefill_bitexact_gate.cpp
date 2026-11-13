@@ -537,7 +537,7 @@ static int prefill_logits_ctx(uint32_t depth, float *out, int width, int ctx) {
          * group the prefill left half-built closes within these steps and its
          * pooled compressed row is attended before the last one. */
         for (uint32_t k = 0; k < DECODE_STEPS; k++) {
-            if (pulsar_session_eval(s, g_toks.v[depth + k], err, sizeof(err)) != 0) {
+            if (pulsar_session_eval(s, TokId{g_toks.v[depth + k]}, err, sizeof(err)) != 0) {
                 fprintf(stderr, "PREFILL GATE: decode step %u failed after depth %u: %s\n", k, depth, err);
                 pulsar_session_free(s);
                 return 0;

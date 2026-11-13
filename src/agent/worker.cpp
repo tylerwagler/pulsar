@@ -52,8 +52,8 @@ static bool agent_stream_wants_greedy_sampling(const agent_stream_renderer *sr) 
  *  @param cfg    the configuration (sampling knobs)
  *  @param greedy draw the argmax instead
  *  @param rng    the request's sampler stream, stepped
- *  @return the token, or PULSAR_SAMPLE_REFUSED */
-static int worker_sample_with_mode(agent_worker *w, const agent_config *cfg,
+ *  @return the token, or none() (refused) */
+static TokId worker_sample_with_mode(agent_worker *w, const agent_config *cfg,
                                    bool greedy, uint64_t *rng) {
     return pulsar_session_sample(w->session,
                               greedy ? 0.0f : cfg->gen.temperature,
@@ -312,7 +312,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 worker_set_greedy_sampling(w, greedy_sampling);
                 status_greedy_sampling = greedy_sampling;
             }
-            int token = worker_sample_with_mode(w, cfg, greedy_sampling, &rng);
+            const TokId token = worker_sample_with_mode(w, cfg, greedy_sampling, &rng);
             if (pulsar_token_is_stop(w->engine, token)) break;
 
             size_t text_len = 0;
@@ -321,7 +321,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                                                        text, text_len))
             {
                 agent_trace(w, "edit old auto-upto replaced token=%d text=%.*s",
-                            token, (int)(text_len > 80 ? 80 : text_len), text);
+                            token.raw(), (int)(text_len > 80 ? 80 : text_len), text);
                 free(text);
                 if (worker_force_generated_text(w, "[upto]\n", max_tokens,
                                                 &generated, t0, &stream,
@@ -332,7 +332,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 }
             } else {
                 free(text);
-                if (worker_accept_generated_token(w, token, &generated, t0,
+                if (worker_accept_generated_token(w, token.raw(), &generated, t0,
                                                   &stream, err, sizeof(err)) != 0) {
                     agent_dsml_parser_free(&dsml);
                     agent_set_error(w, err);
