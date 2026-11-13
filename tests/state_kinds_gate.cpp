@@ -147,7 +147,7 @@ static void plan_a(void) {
     check(order, "the slot's ORDER: slot by slot, each slot's decls in id order (sconv, then its ring)");
     ok = ok && pulsar_state_reset_bank(ss, 1);
     check(ok && all_zero(rd(pulsar_state_tensor(ss, 7, A_SCONV), SCONV_BYTES, SCONV_BYTES)) &&
-          all_zero(rd(pulsar_state_tensor(ss, 7, A_KV_WINDOW), ring, ring)) && ss->bank_pos[1] == 0,
+          all_zero(rd(pulsar_state_tensor(ss, 7, A_KV_WINDOW), ring, ring)) && ss->bank_pos[1] == TokPos{0},
           "a reset zeroes the bank's state and its counters");
     ok = ok && ss->ops.walk(ss, 1, false, slab, 0, pulsar_ckpt_pos(128u), NULL) && pulsar_gpu_synchronize();
     check(ok && rd(pulsar_state_tensor(ss, 41, A_SCONV), SCONV_BYTES, SCONV_BYTES) == pattern(SCONV_BYTES, 82) &&
@@ -157,9 +157,9 @@ static void plan_a(void) {
     pulsar_gpu_tensor_free(slab);
 
     /* physical residency: bank 0's pools go and come back; the rest stays */
-    pulsar_state_set_pos(ss, 0, 300);
+    pulsar_state_set_pos(ss, 0, TokPos{300});
     pulsar_state_bank_free(ss, 0);
-    check(pulsar_state_bank_evicted(ss, 0) && ss->kv_hw[0] == 0 && !pulsar_state_bank_evicted(ss, 1) &&
+    check(pulsar_state_bank_evicted(ss, 0) && ss->kv_hw[0] == TokCount{0} && !pulsar_state_bank_evicted(ss, 1) &&
           pulsar_state_tensor(ss, 5, A_SCONV) != NULL, "free_physical: bank 0's pools gone, its high-water 0, bank 1 whole");
     check(pulsar_state_bank_alloc(ss, 0) && !pulsar_state_bank_evicted(ss, 0) && pulsar_state_bank_alloc(ss, 0),
           "alloc_physical re-backs it (idempotent)");

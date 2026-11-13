@@ -462,15 +462,17 @@ static int exact(pulsar_engine *e, int n, const char *only) {
              * it as a kept draft has its row -- the twin feeds it too, so both stand at the same frontier (a full
              * model's stream can stop inside `tokens`; the mini's never did) */
             const bool stopped = !sp.out.empty() && pulsar_token_is_stop(e, sp.out.back());
-            if (stopped && tw->states->bank_pos[0] == len - 1u && sp_s->states->bank_pos[0] == len) {
+            const TokPos at = pulsar_ckpt_pos(len), before = pulsar_ckpt_pos(len - 1u);
+            if (stopped && tw->states->bank_pos[0] == before && sp_s->states->bank_pos[0] == at) {
                 char err[256] = "";
                 CHECK(pulsar_session_eval(tw, sp.out.back(), err, sizeof(err)) == 0,
                       "M3 prompt %zu: the twin feeds the stop token the spec round verified: %s", i, err);
             }
-            if (stopped && tw->states->bank_pos[0] == len - 1u && sp_s->states->bank_pos[0] == len - 1u)
+            if (stopped && tw->states->bank_pos[0] == before && sp_s->states->bank_pos[0] == before)
                 len--;   /* neither fed it (the round's own token, not a kept draft) */
-            CHECK(sp_s->states->bank_pos[0] == len && tw->states->bank_pos[0] == len,
-                  "M3 prompt %zu: both at %u tokens (%u, %u)", i, len, sp_s->states->bank_pos[0], tw->states->bank_pos[0]);
+            CHECK(sp_s->states->bank_pos[0] == pulsar_ckpt_pos(len) && tw->states->bank_pos[0] == pulsar_ckpt_pos(len),
+                  "M3 prompt %zu: both at %u tokens (%d, %d)", i, len, sp_s->states->bank_pos[0].raw(),
+                  tw->states->bank_pos[0].raw());
             size_t nb = 0, nd = 0;
             const std::string tdiff = gate_state_diff(gate_bank_state(sp_s, 0, 0, p->n_trunk, len),
                                                       gate_bank_state(tw, 0, 0, p->n_trunk, len), &nb);
@@ -528,7 +530,7 @@ static int exact(pulsar_engine *e, int n, const char *only) {
         pulsar_engine_set_bank_pool(1);
         ok = ok && pulsar_session_create(&co, e, 4096) == 0 && co && pulsar_session_sync(co, &full, err, sizeof(err)) == 0;
         const uint32_t len = (uint32_t)full.len;
-        CHECK(ok && wa->states->bank_pos[0] == len && co->states->bank_pos[0] == len,
+        CHECK(ok && wa->states->bank_pos[0] == pulsar_ckpt_pos(len) && co->states->bank_pos[0] == pulsar_ckpt_pos(len),
               "M6 prompt %zu: the next turn (%u tokens) synced on the served session and cold: %s", i, len, err);
         if (ok) {
             const pulsar_state_plan *p = wa->states->plan;

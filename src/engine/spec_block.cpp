@@ -1540,7 +1540,7 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
             q->keep = 0;
             q->have_conf = true;
             q->refined[0] = q->next_base;
-            const uint32_t P = ss->bank_pos[banks[i]];
+            const uint32_t P = pulsar_ckpt_raw(ss->bank_pos[banks[i]]);   /* the chain's room is raw */
             if (P == 0 || q->n_draft == 0 || (uint64_t)P + 1u >= ss->ctx) continue;   /* no context, or no room */
             if (q->temperature > 0.0f && !rngs[i]) {
                 snprintf(err, errlen, "sampled speculation needs the request's rng");
@@ -1585,7 +1585,7 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
                 spec_redraft_req *q = reqs[pi[b]];
                 chain_of[b] = UINT32_MAX;
                 if (q->temperature <= 0.0f) continue;
-                const uint32_t P = ss->bank_pos[pb[b]];
+                const uint32_t P = pulsar_ckpt_raw(ss->bank_pos[pb[b]]);
                 uint32_t K = std::min(q->n_draft, B - 1u);
                 if ((uint64_t)P + 1u + K > ss->ctx) K = (uint32_t)(ss->ctx - P - 1u);
                 if (nc == PULSAR_GPU_CHAINS_MAX || SL > PULSAR_GPU_CHAIN_SLOTS_MAX) {
@@ -1610,7 +1610,7 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
         }
         for (uint32_t b = 0; b < nb; b++) {
             spec_redraft_req *q = reqs[pi[b]];
-            const uint32_t P = ss->bank_pos[pb[b]];
+            const uint32_t P = pulsar_ckpt_raw(ss->bank_pos[pb[b]]);
             uint32_t K = std::min(q->n_draft, B - 1u);
             if ((uint64_t)P + 1u + K > ss->ctx) K = (uint32_t)(ss->ctx - P - 1u);
             /* the walk over the head's scores: slot s's row is scores[s][prev] (slot 0: the start row) -- greedy the
@@ -1695,10 +1695,11 @@ bool block_absorb_banked(pulsar_session *s, const uint32_t *rows, const uint32_t
         const uint32_t b = banks[i];
         uint32_t j = i + 1;
         while (j < n && banks[j] == b) j++;
-        bool run = b < ss->n_banks && ss->bank_pos[b] >= j - i;
+        bool run = b < ss->n_banks && ss->bank_pos[b] >= TokPos::after(TokCount{(int)(j - i)});
         for (uint32_t r = i + 1; run && r < j; r++) run = rows[r] == rows[r - 1] + 1u;
         if (!run) return fail("a bank's absorbed rows are not one run of its kept rows");
-        const uint32_t p0 = ss->bank_pos[b] - (j - i);   /* the commit moved the counter past the kept rows */
+        /* the commit moved the counter past the kept rows; L334 P2b S7b: the step's row positions stay raw */
+        const uint32_t p0 = pulsar_ckpt_raw(ss->bank_pos[b] - TokCount{(int)(j - i)});
         for (uint32_t r = i; r < j; r++) {
             pos[r] = (int32_t)(p0 + (r - i));
             bank[r] = (int32_t)b;
@@ -1784,7 +1785,7 @@ int block_warm(pulsar_session *s, char *err, size_t errlen) {
     const pulsar_block_drafter *d = l->d;
     const pulsar_state_set *ss = s->states;
     const uint32_t B = d->block, per = kDraftRows / B, bank = ss->live_bank;
-    if (ss->bank_pos[bank] == 0 || ss->ctx < 2u + B) {
+    if (ss->bank_pos[bank] == TokPos{0} || ss->ctx < 2u + B) {
         snprintf(err, errlen, "the installed bank holds no context to warm the draft pass from");
         return -1;
     }

@@ -4050,7 +4050,7 @@ static void test_driver_context_bound(void) {
     pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
     e->family = &fam;
     pulsar_state_set *ss = (pulsar_state_set *)xcalloc(1, sizeof(*ss));
-    uint32_t bank_pos = 8u;
+    TokPos bank_pos = TokPos{8};
     bool stale = false;
     ss->n_banks = 1u;
     ss->ctx = 8u;
@@ -4068,16 +4068,16 @@ static void test_driver_context_bound(void) {
     char err[256] = "";
     pulsar_multiseq_req at_ctx = { 0u, TokPos{8}, 1 };
     TEST_ASSERT(pulsar_driver_decode_multiseq(s, &at_ctx, 1u, NULL, 0, err, sizeof err) == -1 && err[0]);
-    TEST_ASSERT(bank_pos == 8u);                       /* nothing moved */
+    TEST_ASSERT(bank_pos == TokPos{8});                       /* nothing moved */
     for (int i = 0; i < 8; i++) token_vec_push(&s->checkpoint, 1);
     err[0] = '\0';
-    TEST_ASSERT(pulsar_driver_eval_row(s, 1, err, sizeof err) == 1 && err[0] && bank_pos == 8u);
-    bank_pos = 7u;                                     /* a verify of [7, 8]: its second row is past the pool */
+    TEST_ASSERT(pulsar_driver_eval_row(s, 1, err, sizeof err) == 1 && err[0] && bank_pos == TokPos{8});
+    bank_pos = TokPos{7};                                     /* a verify of [7, 8]: its second row is past the pool */
     const pulsar_multiseq_req run[2] = { { 0u, TokPos{7}, 1 }, { 0u, TokPos{8}, 1 } };
     uint32_t headed = 9u;
     err[0] = '\0';
     TEST_ASSERT(pulsar_driver_decode_mixed(s, run, 2u, NULL, 0, &headed, PULSAR_MSEQ_HEAD_ALL_ROWS, err, sizeof err) == -1 &&
-                err[0] && headed == 0u && bank_pos == 7u);
+                err[0] && headed == 0u && bank_pos == TokPos{7});
     token_vec_free(&s->checkpoint);
     free(s);
     free(d);

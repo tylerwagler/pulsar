@@ -198,9 +198,9 @@ typedef struct pulsar_state_set {
     /// [n_runs] each run's first position (tokens)
     int32_t run_pos0[PULSAR_STATE_VERIFY_ROWS];
     /* per bank */
-    uint32_t *bank_pos;            ///< tokens each bank's state holds (pulsar_state_set_pos writes it)
-    uint32_t *kv_hw;               ///< L270: the most tokens each bank has held -- its touched pool pages
-    uint32_t *prefill_pos;         ///< L266: the end of each bank's prefill-only history (the cold prefill's bytes)
+    TokPos *bank_pos;              ///< where each bank's state stands: the end of its history (pulsar_state_set_pos)
+    TokCount *kv_hw;               ///< L270: the most tokens each bank has held -- its touched pool pages
+    TokPos *prefill_pos;           ///< L266: the end of each bank's prefill-only history (the cold prefill's bytes)
     bool *frontier_stale;          ///< a segment load wrote the pools without the lanes
     uint32_t live_bank;            ///< the bank sync / eval / the store's walk run on
     pulsar_ckpt_store ckpt;        ///< the grid checkpoints and prompt ends (kv_state.h)
@@ -231,10 +231,10 @@ bool pulsar_state_reset_bank(pulsar_state_set *ss, uint32_t bank);
 /** L270: the one writer of a bank's position; it keeps the bank's high-water. */
 /// @param ss   the set
 /// @param bank the bank
-/// @param pos  its new position, in tokens held
-static inline void pulsar_state_set_pos(pulsar_state_set *ss, uint32_t bank, uint32_t pos) {
+/// @param pos  its new position (the end of its history)
+static inline void pulsar_state_set_pos(pulsar_state_set *ss, uint32_t bank, TokPos pos) {
     ss->bank_pos[bank] = pos;
-    if (pos > ss->kv_hw[bank]) ss->kv_hw[bank] = pos;
+    if (pos.before() > ss->kv_hw[bank]) ss->kv_hw[bank] = pos.before();
 }
 /** The tensor of a FIXED / STAGED / RING decl on slot `slot` (every bank's). */
 /// @param ss   the set

@@ -245,13 +245,14 @@ bool pulsar_mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const uin
         while (j < n && banks[j] == b) j++;
         const uint32_t k = j - i;
         for (uint32_t r = i + 1; ok && r < j; r++) ok = rows[r] == rows[i] + (r - i);
-        if (!ok || b >= ss->n_banks || ss->bank_pos[b] < k) {
+        if (!ok || b >= ss->n_banks || ss->bank_pos[b] < TokPos::after(TokCount{(int)k})) {
             fprintf(stderr, "pulsar: %s: bank %u's absorbed rows are not one run of its kept rows -- refusing\n",
                     ARCH(s), b);
             ok = false;
             break;
         }
-        const uint32_t p0 = ss->bank_pos[b] - k;   /* the commit moved the counter past the kept rows */
+        /* the commit moved the counter past the kept rows; L334 P2b S7b: the step's row positions stay raw */
+        const uint32_t p0 = pulsar_ckpt_raw(ss->bank_pos[b] - TokCount{(int)k});
         if (l->stage_dirty[b]) {
             ok = ops->stage_restore(s, b);
             l->stage_dirty[b] = false;
@@ -278,10 +279,9 @@ bool pulsar_mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const uin
         const uint32_t b = banks[i];
         uint32_t j = i + 1;
         while (j < n && banks[j] == b) j++;
-        bool parked = ok && b < ss->n_banks && ss->bank_pos[b] >= j - i;
+        bool parked = ok && b < ss->n_banks && ss->bank_pos[b] >= TokPos::after(TokCount{(int)(j - i)});
         if (parked) parked = ops->trunk_rows(s, rows[j - 1], 1u, pend, (uint64_t)b * cb);
-        if (b < ss->n_banks)   /* L334 P2b S7a: bank_pos raw */
-            l->pend_pos[b] = parked ? pulsar_ckpt_pos(ss->bank_pos[b]) - TokCount{1} : TokPos::none();
+        if (b < ss->n_banks) l->pend_pos[b] = parked ? ss->bank_pos[b] - TokCount{1} : TokPos::none();
         ok = ok && parked;
         i = j;
     }
@@ -334,7 +334,7 @@ static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t 
         spec_redraft_req *q = reqs[i];
         chain &ch = c[i];
         ch.b = banks[i];
-        ch.p = ss->bank_pos[ch.b];
+        ch.p = pulsar_ckpt_raw(ss->bank_pos[ch.b]);   /* the chain's arithmetic is raw */
         ch.sampled = q->temperature > 0.0f;
         ch.live = false;
         ch.copy = q->copied;   /* L288: the record holds a copy chain (pulsar_spec_draft_req_init) */

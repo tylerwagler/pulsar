@@ -495,8 +495,9 @@ static bool driver_prefill_chunk(pulsar_session *s, const pulsar_tokens *prompt,
     if (ok && last) ok = s->live_from_rows(s->driver->logits, 0);
     if (ok && ops->absorb)
         ok = ops->absorb(s, PULSAR_STEP_PREFILL, prompt->v + pos0, c->pos, c->bank, rows, 0, false);
-    if (ok) pulsar_state_set_pos(s->states, c->live, pos0 + rows);
-    if (ok && c->canonical) s->states->prefill_pos[c->live] = pos0 + rows;
+    const TokPos end = pulsar_ckpt_pos(pos0 + rows);   /* L334 P2b S7b: the walk's chunk stays raw */
+    if (ok) pulsar_state_set_pos(s->states, c->live, end);
+    if (ok && c->canonical) s->states->prefill_pos[c->live] = end;
     return ok;
 }
 
@@ -514,7 +515,7 @@ int pulsar_driver_prefill(pulsar_session *s, const pulsar_tokens *prompt, uint32
     pulsar_state_set *ss = s->states;
     driver_prefill_ctx c;
     c.live = ss->live_bank;
-    c.canonical = ss->prefill_pos[c.live] == start && !ss->frontier_stale[c.live];
+    c.canonical = ss->prefill_pos[c.live] == pulsar_ckpt_pos(start) && !ss->frontier_stale[c.live];
     c.pos = (int32_t *)xmalloc((size_t)s->prefill_cap * sizeof(int32_t));
     c.bank = (int32_t *)xmalloc((size_t)s->prefill_cap * sizeof(int32_t));
     for (uint32_t r = 0; r < s->prefill_cap; r++) c.bank[r] = (int32_t)c.live;
@@ -533,7 +534,7 @@ int pulsar_driver_prefill(pulsar_session *s, const pulsar_tokens *prompt, uint32
  *  @return true when they agree */
 bool pulsar_driver_sync_state_agrees(pulsar_session *s) {
     const pulsar_state_set *ss = s->states;
-    return ss->bank_pos[ss->live_bank] == (uint32_t)s->checkpoint.len && !ss->frontier_stale[ss->live_bank];
+    return ss->bank_pos[ss->live_bank] == s->hist_end() && !ss->frontier_stale[ss->live_bank];
 }
 
 /** The sync's bank reset: the live bank's declared state starts over.  @param s the session
@@ -572,7 +573,7 @@ int pulsar_driver_eval_row(pulsar_session *s, int token, char *err, size_t errle
         if (err) snprintf(err, errlen, "%s: the drafter's step refused (see the log)", ARCH(s->engine));
         return 1;
     }
-    pulsar_state_set_pos(s->states, live, (uint32_t)pos + 1u);
+    pulsar_state_set_pos(s->states, live, TokPos{pos} + TokCount{1});
     return 0;
 }
 
@@ -617,7 +618,7 @@ int pulsar_driver_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *
     int32_t tok[PULSAR_DRIVER_HEADS_MAX], pos[PULSAR_DRIVER_HEADS_MAX], bank[PULSAR_DRIVER_HEADS_MAX];
     for (uint32_t i = 0; i < n; i++) {
         /* One row per bank, at that bank's next position: a recurrent state advances exactly one token per row. */
-        if (reqs[i].bank >= ss->n_banks || (uint32_t)reqs[i].pos.raw() != ss->bank_pos[reqs[i].bank]) {
+        if (reqs[i].bank >= ss->n_banks || reqs[i].pos != ss->bank_pos[reqs[i].bank]) {
             if (err) snprintf(err, errlen, "%s: row %u (bank %u pos %d) is not its bank's next position", ARCH(e), i,
                               reqs[i].bank, reqs[i].pos.raw());
             return 1;
@@ -641,7 +642,7 @@ int pulsar_driver_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *
         return -1;
     }
     for (uint32_t i = 0; i < n; i++) {
-        pulsar_state_set_pos(ss, reqs[i].bank, ss->bank_pos[reqs[i].bank] + 1u);
+        pulsar_state_set_pos(ss, reqs[i].bank, ss->bank_pos[reqs[i].bank] + TokCount{1});
         if (reqs[i].bank == ss->live_bank) {   /* the live bank moved past the host view */
             s->checkpoint_valid = false;
             s->logits_stale = true;
@@ -668,8 +669,8 @@ static bool driver_verify_rows(pulsar_session *s, const pulsar_multiseq_req *req
     for (uint32_t i = 0; i < n; i++) {
         const uint32_t b = reqs[i].bank;
         const bool run_start = i == 0 || reqs[i - 1].bank != b;
-        const uint32_t want = run_start ? (b < ss->n_banks ? ss->bank_pos[b] : 0u) : (uint32_t)reqs[i - 1].pos.raw() + 1u;
-        if (b >= ss->n_banks || (uint32_t)reqs[i].pos.raw() != want) {
+        const TokPos want = run_start ? (b < ss->n_banks ? ss->bank_pos[b] : TokPos{0}) : reqs[i - 1].pos + TokCount{1};
+        if (b >= ss->n_banks || reqs[i].pos != want) {
             if (err) snprintf(err, errlen, "%s: verify row %u (bank %u pos %d) is not its run's next position",
                               ARCH(s->engine), i, b, reqs[i].pos.raw());
             return false;
@@ -822,7 +823,7 @@ int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *req
         const int32_t p0 = reqs[first[r]].pos.raw();
         const pulsar_image_identity *img = b < ss->n_banks ? pulsar_session_bank_images(s, b, ss->live_bank) : NULL;
         const char *why = b >= ss->n_banks                            ? "is outside the pool"
-                          : p0 != 0 && (uint32_t)p0 != ss->bank_pos[b] ? "holds a different position"
+                          : p0 != 0 && TokPos{p0} != ss->bank_pos[b]   ? "holds a different position"
                           : p0 != 0 && ss->frontier_stale[b]           ? "has a stale frontier (a segment chain "
                                                                          "without its last restore)"
                           : (uint64_t)p0 + m > ss->ctx                 ? "has no room"
@@ -844,7 +845,7 @@ int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *req
             return -1;
         }
         /* (no stale bank reaches here: a run from 0 just reset its bank, any other was refused above) */
-        canonical[r] = ss->prefill_pos[b] == (uint32_t)reqs[first[r]].pos.raw();
+        canonical[r] = ss->prefill_pos[b] == reqs[first[r]].pos;
     }
     pulsar_driver_heads hl = pulsar_driver_heads_span(0, n_dec);
     for (uint32_t r = 0; r < n_pf; r++)
@@ -859,7 +860,8 @@ int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *req
         return -1;
     }
     for (uint32_t r = 0; r < n_pf; r++) {
-        const uint32_t b = reqs[first[r]].bank, end = (uint32_t)reqs[first[r]].pos.raw() + (first[r + 1] - first[r]);
+        const uint32_t b = reqs[first[r]].bank;
+        const TokPos end = reqs[first[r]].pos + TokCount{(int)(first[r + 1] - first[r])};
         pulsar_state_set_pos(ss, b, end);
         if (canonical[r]) ss->prefill_pos[b] = end;
         if (b == ss->live_bank) {   /* the live bank moved past the host view */
@@ -917,7 +919,7 @@ static bool driver_spec_commit(pulsar_session *s, pulsar_spec_round *r, uint32_t
     if (!driver_verify_rows(s, reqs, r->n_batch, tok, pos, bank, NULL, 0)) return false;
     const uint32_t keep = 1u + commit;
     if (!pulsar_state_commit(ss, ss->live_bank, tok, keep)) return false;
-    pulsar_state_set_pos(ss, ss->live_bank, pulsar_ckpt_raw(r->saved_len) + keep);   /* L334 P2b S7a: bank_pos raw */
+    pulsar_state_set_pos(ss, ss->live_bank, r->saved_len + TokCount{(int)keep});
     s->logits_stale = false;
     return true;
 }
