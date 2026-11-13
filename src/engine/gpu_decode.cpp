@@ -854,7 +854,7 @@ bool gpu_graph_dspark_draft_forward_banks(
                  pulsar_gpu_hc_expand_split_tensor(
                      after_attn_view, g->batch_attn_out,
                      g->batch_cur_hc, g->batch_hc_split,
-                     PULSAR_N_EMBD, PULSAR_N_HC) != 0;
+                     PULSAR_N_EMBD, PULSAR_N_HC, n_draft) != 0;
             pulsar_gpu_tensor_free(after_attn_view);
         }
 
@@ -974,12 +974,12 @@ bool gpu_graph_encode_output_head(
                                                         tensor_map_base(model, weights->output_hc_scale), tensor_map_size(model, weights->output_hc_scale),
                                                         weights->output_hc_scale->abs_offset,
                                                         weights->output_hc_base->abs_offset,
-                                                        PULSAR_N_HC, PULSAR_HC_EPS) != 0;
+                                                        PULSAR_N_HC, PULSAR_HC_EPS, 1u) != 0;   /* one row */
         if (ok) {
             gpu_graph_debug_dump_tensor("result_hc_weights", g->output_weights, PULSAR_N_HC, PULSAR_N_LAYER, 0);
         }
         if (ok) ok = pulsar_gpu_hc_weighted_sum_tensor(g->output_embd, row_hc, g->output_weights,
-                                                      PULSAR_N_EMBD, PULSAR_N_HC) != 0;
+                                                      PULSAR_N_EMBD, PULSAR_N_HC, 1u) != 0;
     } else {
         if (ok) {
             gpu_graph_debug_dump_tensor("result_hc_weights", row_pre, PULSAR_N_HC, PULSAR_N_LAYER, 0);
@@ -988,7 +988,7 @@ bool gpu_graph_encode_output_head(
                                                       row_hc,
                                                       row_pre,
                                                       PULSAR_N_EMBD,
-                                                      PULSAR_N_HC) != 0;
+                                                      PULSAR_N_HC, 1u) != 0;
     }
     pulsar_gpu_tensor_free(row_pre);
     pulsar_gpu_tensor_free(row_hc);
@@ -1314,9 +1314,9 @@ static bool gpu_graph_encode_output_head_batch_impl(
                                                         weights->output_hc_scale->abs_offset,
                                                         weights->output_hc_base->abs_offset,
                                                         PULSAR_N_HC,
-                                                        PULSAR_HC_EPS) != 0;
+                                                        PULSAR_HC_EPS, n_tokens) != 0;
         if (ok) ok = pulsar_gpu_hc_weighted_sum_tensor(output_embd, rows_hc, hc_w,
-                                                      PULSAR_N_EMBD, PULSAR_N_HC) != 0;
+                                                      PULSAR_N_EMBD, PULSAR_N_HC, n_tokens) != 0;
         pulsar_gpu_tensor_free(hc_w);
         pulsar_gpu_tensor_free(hc_pre);
     } else if (ok) {
@@ -1324,7 +1324,7 @@ static bool gpu_graph_encode_output_head_batch_impl(
                                               rows_hc,
                                               rows_pre,
                                               PULSAR_N_EMBD,
-                                              PULSAR_N_HC) != 0;
+                                              PULSAR_N_HC, n_tokens) != 0;
     }
     void *on_b = NULL;
     if (ok && weights->output->type == PULSAR_TENSOR_BF16 &&
@@ -1441,14 +1441,14 @@ bool gpu_graph_encode_dspark_output_head_batch(
                                                         tensor_map_base(dspark_model, dw->hc_head_scale), tensor_map_size(dspark_model, dw->hc_head_scale),
                                                         dw->hc_head_scale->abs_offset,
                                                         dw->hc_head_base->abs_offset,
-                                                        PULSAR_N_HC, PULSAR_HC_EPS) != 0;
+                                                        PULSAR_N_HC, PULSAR_HC_EPS, n_tokens) != 0;
         if (ok) ok = pulsar_gpu_hc_weighted_sum_tensor(output_embd, g->batch_cur_hc, mix_weights,
-                                                      PULSAR_N_EMBD, PULSAR_N_HC) != 0;
+                                                      PULSAR_N_EMBD, PULSAR_N_HC, n_tokens) != 0;
         pulsar_gpu_tensor_free(output_pre);
         pulsar_gpu_tensor_free(mix_weights);
     } else if (ok) {
         ok = pulsar_gpu_hc_weighted_sum_tensor(output_embd, g->batch_cur_hc, rows_pre,
-                                              PULSAR_N_EMBD, PULSAR_N_HC) != 0;
+                                              PULSAR_N_EMBD, PULSAR_N_HC, n_tokens) != 0;
     }
     void *dn_b = NULL;
     if (ok && bw->output->type == PULSAR_TENSOR_BF16 &&

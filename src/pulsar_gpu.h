@@ -3774,13 +3774,16 @@ int pulsar_cutlass_gemv_down(float *down_out, const int32_t *selected,
  *  @param weights     f32 [n_tokens][n_hc]
  *  @param n_embd      embedding width
  *  @param n_hc        HC streams
+ *  @param n_tokens    rows to process: the CALLER's live count (L334 P5 S4 -- never inferred from out's allocation;
+ *                     f3a617af / d0b2fdb5); `out` must hold at least that many
  *  @return 1 on success, 0 on a bad size or launch failure */
 int pulsar_gpu_hc_weighted_sum_tensor(
         pulsar_gpu_tensor       *out,
         const pulsar_gpu_tensor *residual_hc,
         const pulsar_gpu_tensor *weights,
         uint32_t                n_embd,
-        uint32_t                n_hc);
+        uint32_t                n_hc,
+        uint32_t                n_tokens);
 
 /** The HC HEAD MIX (0731): the two steps that produce the coefficients the
  * collapse above consumes.  V4.1 has neither -- it collapses with the pre its
@@ -3815,6 +3818,8 @@ int pulsar_gpu_hc_norm_mix_tensor(
  *  @param base_offset  byte offset of the f32 [n_hc] base
  *  @param n_hc         HC streams
  *  @param eps          added after the sigmoid
+ *  @param n_tokens     rows to process: the caller's live count (L334 P5 S4 -- never inferred from out's
+ *                      allocation; f3a617af / d0b2fdb5); `out` and `pre` must hold at least that many
  *  @return 1 on success, 0 on a bad size or launch failure */
 int pulsar_gpu_output_hc_weights_tensor(
         pulsar_gpu_tensor       *out,
@@ -3824,7 +3829,8 @@ int pulsar_gpu_output_hc_weights_tensor(
         uint64_t                scale_offset,
         uint64_t                base_offset,
         uint32_t                n_hc,
-        float                   eps);
+        float                   eps,
+        uint32_t                n_tokens);
 
 
 /** Same, but also emits norm_out's E4M3 + swizzled E8M0 encoding (norm_out_q,
@@ -3905,12 +3911,14 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
  *  @return 1 on success, 0 on a bad size or launch failure */
 int pulsar_gpu_hc_pre_identity_tensor(pulsar_gpu_tensor *pre, uint32_t n_rows, uint32_t n_hc);
 /** @brief Expand a sublayer's output back into the HC streams with the split's post / comb coefficients.
- *  @param out_hc      HC residual out [n_tokens][n_hc][n_embd] (rows from its size)
+ *  @param out_hc      HC residual out [n_tokens][n_hc][n_embd]
  *  @param block_out   f32 [n_tokens][n_embd] sublayer output
  *  @param residual_hc the HC residual the sublayer collapsed
  *  @param split       f32 per-row split [pre | post | comb] (2 n_hc + n_hc^2 per row)
  *  @param n_embd      embedding width
  *  @param n_hc        HC streams
+ *  @param n_tokens    rows to process: the CALLER's live count (L334 P5 S4 -- never inferred from out's allocation;
+ *                     f3a617af / d0b2fdb5); `out` must hold at least that many
  *  @return 1 on success, 0 on a bad argument or launch failure */
 int pulsar_gpu_hc_expand_split_tensor(
         pulsar_gpu_tensor       *out_hc,
@@ -3918,7 +3926,8 @@ int pulsar_gpu_hc_expand_split_tensor(
         const pulsar_gpu_tensor *residual_hc,
         const pulsar_gpu_tensor *split,
         uint32_t                n_embd,
-        uint32_t                n_hc);
+        uint32_t                n_hc,
+        uint32_t                n_tokens);
 
 /** @brief pulsar_gpu_hc_expand_split_tensor with block_out + block_add as the sublayer output.
  *  @param out_hc      HC residual out
@@ -3928,6 +3937,8 @@ int pulsar_gpu_hc_expand_split_tensor(
  *  @param split       f32 per-row split [pre | post | comb]
  *  @param n_embd      embedding width
  *  @param n_hc        HC streams
+ *  @param n_tokens    rows to process: the CALLER's live count (L334 P5 S4 -- never inferred from out's allocation;
+ *                     f3a617af / d0b2fdb5); `out` must hold at least that many
  *  @return 1 on success, 0 on a bad argument or launch failure */
 int pulsar_gpu_hc_expand_add_split_tensor(
         pulsar_gpu_tensor       *out_hc,
@@ -3936,7 +3947,8 @@ int pulsar_gpu_hc_expand_add_split_tensor(
         const pulsar_gpu_tensor *residual_hc,
         const pulsar_gpu_tensor *split,
         uint32_t                n_embd,
-        uint32_t                n_hc);
+        uint32_t                n_hc,
+        uint32_t                n_tokens);
 
 /* ---- L302: THE sampler, on the device (pulsar_cuda_sampler.cu has the rule) ------------------------------------ */
 

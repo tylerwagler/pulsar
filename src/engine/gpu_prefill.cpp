@@ -2692,7 +2692,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                             g->batch_cur_hc,
                                             hc_split_view,
                                             PULSAR_N_EMBD,
-                                            PULSAR_N_HC) != 0;
+                                            PULSAR_N_HC, n_tokens) != 0;
     }
     if (ok) gpu_graph_debug_dump_tensor("hc_split_coef", hc_split_view, (uint64_t)n_tokens * mix_hc, il, pos0);
     if (ok) {
@@ -3138,7 +3138,7 @@ bool gpu_graph_encode_layer_ffn_batch(
                                               g->batch_after_attn_hc,
                                               hc_split_view,
                                               PULSAR_N_EMBD,
-                                              PULSAR_N_HC) != 0;
+                                              PULSAR_N_HC, n_tokens) != 0;
     }
     else if (ok) {
         ok = pulsar_gpu_hc_expand_add_split_tensor(next_hc_view,
@@ -3147,7 +3147,7 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                   g->batch_after_attn_hc,
                                                   hc_split_view,
                                                   PULSAR_N_EMBD,
-                                                  PULSAR_N_HC) != 0;
+                                                  PULSAR_N_HC, n_tokens) != 0;
     }
     if (ok) {
         gpu_graph_debug_dump_hc_tensor("hc_ffn_post", g->batch_next_hc,

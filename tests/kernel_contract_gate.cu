@@ -256,7 +256,7 @@ static void case_hc_expand_nhc(void) {
             pulsar_gpu_tensor_write(res, TensorBytes{0}, z.data(), bytes_of<uint16_t>((uint64_t)n_tok * n_hc * n_embd));
             pulsar_gpu_tensor_write(blk, TensorBytes{0}, z.data(), bytes_of<float>((uint64_t)n_tok * n_embd));
             pulsar_gpu_tensor_write(split, TensorBytes{0}, z.data(), bytes_of<float>((uint64_t)n_tok * mix));
-            const bool ran = pulsar_gpu_hc_expand_split_tensor(out, blk, res, split, n_embd, n_hc) != 0 &&
+            const bool ran = pulsar_gpu_hc_expand_split_tensor(out, blk, res, split, n_embd, n_hc, n_tok) != 0 &&
                              pulsar_gpu_synchronize() != 0;
             if (ran != (n_hc == 4u)) {
                 fprintf(stderr, "  hc-expand-nhc: n_hc %u %s\n", n_hc, ran ? "ran" : "refused");
@@ -501,12 +501,14 @@ static void case_hc_expand_sizes(void) {
         pulsar_gpu_tensor *sa = pulsar_gpu_tensor_view(add, TensorBytes{0}, TensorBytes{(n_tok - 1u) * f_row});
         pulsar_gpu_tensor *sr = pulsar_gpu_tensor_view(res, TensorBytes{0}, TensorBytes{(n_tok - 1u) * hc_row});
         pulsar_gpu_tensor *ss = pulsar_gpu_tensor_view(split, TensorBytes{0}, TensorBytes{(n_tok - 1u) * m_row});
-        const bool full = pulsar_gpu_hc_expand_split_tensor(out, blk, res, split, n_embd, n_hc) &&
-                          pulsar_gpu_hc_expand_add_split_tensor(out, blk, add, res, split, n_embd, n_hc);
-        const bool any_short = pulsar_gpu_hc_expand_split_tensor(out, sb, res, split, n_embd, n_hc) ||
-                               pulsar_gpu_hc_expand_split_tensor(out, blk, sr, split, n_embd, n_hc) ||
-                               pulsar_gpu_hc_expand_split_tensor(out, blk, res, ss, n_embd, n_hc) ||
-                               pulsar_gpu_hc_expand_add_split_tensor(out, blk, sa, res, split, n_embd, n_hc);
+        const bool full = pulsar_gpu_hc_expand_split_tensor(out, blk, res, split, n_embd, n_hc, n_tok) &&
+                          pulsar_gpu_hc_expand_add_split_tensor(out, blk, add, res, split, n_embd, n_hc, n_tok);
+        const bool any_short = pulsar_gpu_hc_expand_split_tensor(out, sb, res, split, n_embd, n_hc, n_tok) ||
+                               pulsar_gpu_hc_expand_split_tensor(out, blk, sr, split, n_embd, n_hc, n_tok) ||
+                               pulsar_gpu_hc_expand_split_tensor(out, blk, res, ss, n_embd, n_hc, n_tok) ||
+                               /* L334 P5 S4: more rows than the output holds */
+                               pulsar_gpu_hc_expand_split_tensor(out, blk, res, split, n_embd, n_hc, n_tok + 1u) ||
+                               pulsar_gpu_hc_expand_add_split_tensor(out, blk, sa, res, split, n_embd, n_hc, n_tok);
         const bool synced = pulsar_gpu_synchronize() != 0;
         printf("  9 hc-expand-sizes: full operands %s, a short operand %s, device %s\n", full ? "ran" : "REFUSED",
                any_short ? "RAN" : "refused", synced ? "clean" : "FAULT");
