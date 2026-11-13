@@ -137,13 +137,12 @@ static bool ds4_walk(void *state, int dir, bool frontier, pulsar_gpu_tensor *sla
 /** pulsar_kv_state_ops::min_checkpoint: the raw window.  @param state the graph  @return tokens */
 static TokPos ds4_min_checkpoint(void *state) { return pulsar_ckpt_pos(G_(state)->raw_window); }
 
-/* The compressed rows layer `il`'s pools hold at a frontier at G: floor(G / ratio) (L334 P2b S2: the named crossing;
- * S8 types gpu_graph_n_comp's CompRows). */
+/* The compressed rows layer `il`'s pools hold at a frontier at G: floor(G / ratio), the named crossing. */
 /// @param G  the frontier
 /// @param il a KV-source layer
 /// @return its complete rows
-static uint32_t ds4_rows_at(TokPos G, uint32_t il) {
-    return (uint32_t)pulsar_comp_rows_held(G.before(), TokPerRow{pulsar_layer_compress_ratio(il)}).raw();
+static CompRows ds4_rows_at(TokPos G, uint32_t il) {
+    return pulsar_comp_rows_held(G.before(), TokPerRow{pulsar_layer_compress_ratio(il)});
 }
 
 /** pulsar_kv_state_ops::stands_at: every kv source's compressed-row count is G / its ratio.
@@ -157,10 +156,10 @@ static bool ds4_stands_at(void *state, TokPos G, char *why, size_t whylen) {
     const uint32_t bank = gpu_graph_cur_bank(g);
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
-        const uint32_t want = ds4_rows_at(G, il);
+        const CompRows want = ds4_rows_at(G, il);
         if (gpu_graph_n_comp(g, bank, il) != want) {
-            snprintf(why, whylen, "layer %u holds %u compressed rows, a frontier at %u holds %u", il,
-                     gpu_graph_n_comp(g, bank, il), pulsar_ckpt_raw(G), want);
+            snprintf(why, whylen, "layer %u holds %d compressed rows, a frontier at %u holds %d", il,
+                     gpu_graph_n_comp(g, bank, il).raw(), pulsar_ckpt_raw(G), want.raw());
             return false;
         }
     }

@@ -1994,9 +1994,9 @@ static inline uint32_t gpu_graph_cur_bank(const pulsar_gpu_graph *g) {
 /// @param g     the graph
 /// @param bank  the bank, named by the caller
 /// @param il    the layer
-/// @return the row count, ms_n_comp[bank][il].
-static inline uint32_t gpu_graph_n_comp(const pulsar_gpu_graph *g, uint32_t bank, uint32_t il) {
-    return g->ms_n_comp[bank][il];
+/// @return the row count, ms_n_comp[bank][il] (L334 P2b S8: CompRows; the array stays raw behind the two accessors)
+static inline CompRows gpu_graph_n_comp(const pulsar_gpu_graph *g, uint32_t bank, uint32_t il) {
+    return CompRows{(int)g->ms_n_comp[bank][il]};
 }
 /** The one writer of a bank's compressed frontier: sets ms_n_comp and raises the
  * bank's resident high-water (ms_comp_hw) with it, so no write can move the
@@ -2004,8 +2004,9 @@ static inline uint32_t gpu_graph_n_comp(const pulsar_gpu_graph *g, uint32_t bank
 /// @param g     the graph
 /// @param bank  the bank
 /// @param il    the layer
-/// @param rows  the new compressed row count
-static inline void gpu_graph_set_n_comp(pulsar_gpu_graph *g, uint32_t bank, uint32_t il, uint32_t rows) {
+/// @param rows_n the new compressed row count
+static inline void gpu_graph_set_n_comp(pulsar_gpu_graph *g, uint32_t bank, uint32_t il, CompRows rows_n) {
+    const uint32_t rows = (uint32_t)rows_n.raw();
     /* L264: rows below a checkpoint's frontier may be rewritten once the counter
      * drops under them, so the checkpoint goes with them -- here, where every
      * rewind, cut and invalidate already passes.  The intact rows [0, rows) serve
@@ -6102,15 +6103,15 @@ bool gpu_graph_encode_layer_batch(
 /// @param weights the weights
 /// @param pos0 first position
 /// @param n_positions positions
-/// @param save_row0 the session's first row in the comp-save buffers
+/// @param save_row0 the session's first STEP row in the comp-save buffers (pulsar_verify_step_row: hazard (b))
 /// @return false (printed) on a failed stage
 bool gpu_graph_dspark_compressor_rollforward(
         pulsar_gpu_graph  *g,
         const pulsar_model  *model,
         const pulsar_weights *weights,
-        uint32_t          pos0,
-        uint32_t          n_positions,
-        uint32_t          save_row0);
+        TokPos            pos0,
+        TokCount          n_positions,
+        StepRow           save_row0);
 bool imatrix_collector_init(pulsar_imatrix_collector *c, uint32_t cap_tokens, const char *dataset_path);
 void imatrix_collector_free(pulsar_imatrix_collector *c);
 bool imatrix_collector_save(

@@ -211,7 +211,7 @@ static bool spec_frontier_snapshot(pulsar_spec_frontier *f, pulsar_session *s) {
 
     bool ok = pulsar_gpu_begin_commands() != 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        f->n_comp[il] = gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il);
+        f->n_comp[il] = (uint32_t)gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il).raw();   /* the snapshot's raw copy */
     }
     if (ok && g->spec_frontier_copy_n)
         ok = pulsar_gpu_batched_copy_run(g->spec_snap_copies,
@@ -239,7 +239,7 @@ static bool spec_frontier_restore(pulsar_spec_frontier *f, pulsar_session *s) {
     if (!spec_frontier_copy_tables_init(g)) return false;
     bool ok = pulsar_gpu_begin_commands() != 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        gpu_graph_set_n_comp(g, gpu_graph_cur_bank(g), il, f->n_comp[il]);
+        gpu_graph_set_n_comp(g, gpu_graph_cur_bank(g), il, CompRows{(int)f->n_comp[il]});
     }
     if (ok && g->spec_frontier_copy_n)
         ok = pulsar_gpu_batched_copy_run(g->spec_restore_copies,
@@ -840,8 +840,8 @@ static bool ds4_commit(pulsar_session *s, pulsar_spec_round *r, uint32_t commit,
     const StepRow save0 = pulsar_verify_step_row(HeadRow{(int)row0}, saved);
     (void)pulsar_verify_step_row(HeadRow{(int)(row0 + commit)}, saved);
     if (!ds4_spec_restore(s, r)) return false;
-    return gpu_graph_dspark_compressor_rollforward(s->graph, &e->model, &e->weights,
-                                                   pulsar_ckpt_raw(r->saved_len), 1u + commit, pulsar_row_index(save0));
+    return gpu_graph_dspark_compressor_rollforward(s->graph, &e->model, &e->weights, r->saved_len,
+                                                   TokCount{(int)(1u + commit)}, save0);
 }
 
 const pulsar_spec_target_ops k_ds4_spec_target = {

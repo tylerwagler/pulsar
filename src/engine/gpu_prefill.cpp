@@ -141,10 +141,10 @@ bool gpu_graph_upload_prompt_tokens(
 /// @param il the source layer
 /// @param banked address the bank's pool (multiseq), else the installed views
 /// @param bank the bank
-/// @param n_rows rows staged at attn_comp_stage[0, n_rows)
-/// @param cache_row0 the pool row the first lands at
-/// @param pos_first the first row's group position
-/// @param ratio the compression ratio
+/// @param n_rows_c rows staged at attn_comp_stage[0, n_rows)
+/// @param cache_row0_at the pool row the first lands at
+/// @param pos_first_at the first row's group position
+/// @param ratio_r the compression ratio
 /// @return false = refused (said) or failed
 static bool gpu_graph_csa2_emit_rows(
         pulsar_gpu_graph           *g,
@@ -153,10 +153,14 @@ static bool gpu_graph_csa2_emit_rows(
         uint32_t                    il,
         bool                        banked,
         uint32_t                    bank,
-        uint32_t                    n_rows,
-        uint32_t                    cache_row0,
-        uint32_t                    pos_first,
-        uint32_t                    ratio) {
+        CompRows                    n_rows_c,       /* compressed rows emitted */
+        CompRow                     cache_row0_at,  /* the pool's row they land from */
+        TokPos                      pos_first_at,   /* the first group's first POSITION */
+        TokPerRow                   ratio_r) {
+    /* L334 P2b S8: the three spaces typed at the call (f7e05077 / c9dd9499 passed one for another); the kernels'
+     * raw indices from here */
+    const uint32_t n_rows = (uint32_t)n_rows_c.raw(), cache_row0 = (uint32_t)cache_row0_at.before().raw(),
+                   pos_first = pulsar_ckpt_raw(pos_first_at), ratio = ratio_r.raw();
     if (n_rows == 0) return true;
     if (cache_row0 > g->layer_comp_cap[il] || n_rows > g->layer_comp_cap[il] - cache_row0) {
         fprintf(stderr, "pulsar: kv source %u: compressed rows %u+%u exceed the pool cap %u -- refusing\n",
@@ -357,10 +361,10 @@ static bool gpu_graph_index_comp_prefill(
 /// @param il the source layer
 /// @param banked address the bank's pool
 /// @param bank the row's bank
-/// @param row the batch row
-/// @param pos its position
-/// @param out_row the index pool row a closed group lands at
-/// @param ratio the compression ratio
+/// @param row_at the batch row
+/// @param pos_at its position
+/// @param out_row_at the index pool row a closed group lands at
+/// @param ratio_r the compression ratio
 /// @param freq_base rope base
 /// @param freq_scale rope frequency scale
 /// @param ext_factor YaRN extrapolation factor
@@ -373,16 +377,19 @@ static bool gpu_graph_index_comp_update(
         const pulsar_layer_weights *layer,
         uint32_t                    il,
         bool                        banked,
-        uint32_t                    bank,      /* which BANK this row belongs to */
-        uint32_t                    row,       /* which BATCH ROW to read */
-        uint32_t                    pos,       /* that row's absolute POSITION */
-        uint32_t                    out_row,
-        uint32_t                    ratio,
+        uint32_t                    bank,        /* which BANK this row belongs to */
+        StepRow                     row_at,      /* which BATCH ROW to read */
+        TokPos                      pos_at,      /* that row's absolute POSITION */
+        CompRow                     out_row_at,  /* the index pool's row a closed group lands at */
+        TokPerRow                   ratio_r,
         float                       freq_base,
         float                       freq_scale,
         float                       ext_factor,
         float                       attn_factor,
         int                        *emitted) {
+    /* L334 P2b S8: a batch row, a position and a compressed row -- three spaces, typed at the call */
+    const uint32_t row = pulsar_row_index(row_at), pos = pulsar_ckpt_raw(pos_at),
+                   out_row = (uint32_t)out_row_at.before().raw(), ratio = ratio_r.raw();
     const uint32_t width = pulsar_comp_row_width(ratio, PULSAR_N_INDEXER_HEAD_DIM);
     pulsar_gpu_tensor *kv = gpu_graph_tensor_row_view(g->batch_index_comp_kv, row, width);
     pulsar_gpu_tensor *sc = gpu_graph_tensor_row_view(g->batch_index_comp_sc, row, width);
@@ -619,9 +626,10 @@ static bool gpu_graph_csa2_produce(
         if (ok && own_index) ok = gpu_graph_index_comp_prefill(g, model, layer, il, mseq, run_bank,
                                                                row0, n, before, rpos0,
                                                                ratio, freq_base, freq_scale, ext_factor, attn_factor);
-        if (ok) ok = gpu_graph_csa2_emit_rows(g, model, layer, il, mseq, run_bank, n_groups, before, rpos0, ratio);
+        if (ok) ok = gpu_graph_csa2_emit_rows(g, model, layer, il, mseq, run_bank, CompRows{(int)n_groups},
+                                              CompRow{(int)before}, pulsar_ckpt_pos(rpos0), TokPerRow{ratio});
         if (ok) {
-            gpu_graph_set_n_comp(g, run_bank, il, before + n_groups);
+            gpu_graph_set_n_comp(g, run_bank, il, CompRows{(int)(before + n_groups)});
             for (uint32_t t = 0; t < n; t++) comp_counts[row0 + t] = (rpos0 + t + 1u) / ratio;
             if (has_state) {
                 const uint64_t lane_floats = (uint64_t)pulsar_comp_state_rows(ratio) * comp_width;
@@ -682,8 +690,9 @@ static bool gpu_graph_csa2_produce(
              * would mean the second pool's row indices had drifted off the first's,
              * which no later check would notice. */
             int idx_emitted = 0;
-            if (ok && own_index) ok = gpu_graph_index_comp_update(g, model, layer, il, mseq, bank, t, pos,
-                                                                  *n_comp_slot, ratio,
+            if (ok && own_index) ok = gpu_graph_index_comp_update(g, model, layer, il, mseq, bank, StepRow{(int)t},
+                                                                  pulsar_ckpt_pos(pos), CompRow{(int)*n_comp_slot},
+                                                                  TokPerRow{ratio},
                                                                   freq_base, freq_scale, ext_factor, attn_factor,
                                                                   &idx_emitted);
             if (ok && own_index && (idx_emitted != 0) != (emitted != 0)) {
@@ -693,13 +702,15 @@ static bool gpu_graph_csa2_produce(
             }
             if (ok && emitted) {
                 const uint32_t row = *n_comp_slot;
-                if (row != pos / ratio) {
+                if (CompRow{(int)row} != pulsar_comp_row_of(pulsar_ckpt_pos(pos), TokPerRow{ratio})) {
                     fprintf(stderr, "pulsar: kv source %u bank %u: frontier %u is not position-true at %u (ratio %u) -- refusing\n",
                             il, bank, row, pos, ratio);
                     ok = false;
                 }
-                if (ok) ok = gpu_graph_csa2_emit_rows(g, model, layer, il, mseq, bank, 1u, row, pos + 1u - ratio, ratio);
-                if (ok) gpu_graph_set_n_comp(g, bank, il, *n_comp_slot + 1u);
+                /* the closed group's first position: pos + 1 - ratio (the group ends at pos) */
+                if (ok) ok = gpu_graph_csa2_emit_rows(g, model, layer, il, mseq, bank, CompRows{1}, CompRow{(int)row},
+                                                      pulsar_ckpt_pos(pos + 1u - ratio), TokPerRow{ratio});
+                if (ok) gpu_graph_set_n_comp(g, bank, il, gpu_graph_n_comp(g, bank, il) + CompRows{1});
             }
             if (ok) comp_counts[t] = *n_comp_slot;
             pulsar_gpu_tensor_free(latent_row);
@@ -2076,7 +2087,8 @@ bool gpu_graph_encode_layer_attention_batch(
         /* The comp bound the attention launch below hands the kernels for the
          * WHOLE batch: banked, the step's superset computed and cap-checked
          * once in step_begin (L178); classic, the source's frontier. */
-        uint32_t n_comp = mseq ? g->batch_comp_sup[src] : gpu_graph_n_comp(g, gpu_graph_cur_bank(g), src);
+        uint32_t n_comp =
+            mseq ? g->batch_comp_sup[src] : (uint32_t)gpu_graph_n_comp(g, gpu_graph_cur_bank(g), src).raw();
 
         /* The QUERY side belongs to the layers that run an indexer: FULL and
          * REINDEX publish a top-k, REUSE reads one it did not compute, and
@@ -3319,9 +3331,12 @@ bool gpu_graph_dspark_compressor_rollforward(
         pulsar_gpu_graph  *g,
         const pulsar_model  *model,
         const pulsar_weights *weights,
-        uint32_t          pos0,
-        uint32_t          n_positions,
-        uint32_t          save_row0) {
+        TokPos            pos0_at,
+        TokCount          n_positions_c,
+        StepRow           save_row0_at) {
+    /* L334 P2b S8: a position, a count and a step row, typed at the call; the replay's raw indices from here */
+    const uint32_t pos0 = pulsar_ckpt_raw(pos0_at), n_positions = (uint32_t)n_positions_c.raw(),
+                   save_row0 = pulsar_row_index(save_row0_at);
     (void)model;
     (void)weights;
     if (!g) {
@@ -3437,7 +3452,8 @@ bool gpu_graph_dspark_compressor_rollforward(
                 pulsar_gpu_tensor_free(idx_latent);
             }
         }
-        gpu_graph_set_n_comp(g, gpu_graph_cur_bank(g), il, (pos0 + n_positions) / ratio);
+        gpu_graph_set_n_comp(g, gpu_graph_cur_bank(g), il,
+                             pulsar_comp_rows_held(TokCount{(int)(pos0 + n_positions)}, TokPerRow{ratio}));
     }
     return true;
 }
