@@ -138,7 +138,7 @@ typedef struct {
  *  @param event   the event name; only "prefill_chunk" and (on a TTY) "prefill_display" are drawn
  *  @param current the engine position reached, tokens (base_tokens is subtracted)
  *  @param total   unused */
-static void cli_prefill_progress_cb(void *ud, const char *event, int current, int total) {
+static void cli_prefill_progress_cb(void *ud, const char *event, TokPos current, TokCount total) {
     (void)total;
     cli_prefill_progress *p = (cli_prefill_progress *)ud;
     if (!p || !event || p->input_tokens <= 0) return;
@@ -146,7 +146,7 @@ static void cli_prefill_progress_cb(void *ud, const char *event, int current, in
     if (strcmp(event, "prefill_chunk") && !is_display) return;
     if (is_display && !p->use_color) return;
 
-    int processed = current - p->base_tokens;
+    int processed = current.raw() - p->base_tokens;
     if (processed < 0) processed = 0;
     if (processed > p->input_tokens) processed = p->input_tokens;
     double pct = 100.0 * (double)processed / (double)p->input_tokens;

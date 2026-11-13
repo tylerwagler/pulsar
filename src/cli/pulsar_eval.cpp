@@ -4128,19 +4128,19 @@ static double tui_wait_if_paused(eval_ui *ui, const char *phase) {
  *  honours a pause (the paused time is taken out of the phase's speed).
  *  @param ud      the eval_ui
  *  @param event   the event name; only "prefill_chunk" and "prefill_display" are handled
- *  @param current prefill rows done
+ *  @param current the position the prefill stands at
  *  @param total   prefill rows total */
-static void eval_prefill_progress(void *ud, const char *event, int current, int total) {
+static void eval_prefill_progress(void *ud, const char *event, TokPos current, TokCount total) {
     eval_ui *ui = (eval_ui *)ud;
     if (!ui || !event) return;
     if (strcmp(event, "prefill_chunk") && strcmp(event, "prefill_display"))
         return;
     tui_consume_input(ui);
     tui_run_clock_tick(ui);
-    ui->prefill_current = current;
-    ui->prefill_total = total;
+    ui->prefill_current = current.raw();
+    ui->prefill_total = total.raw();
     double elapsed = now_sec() - ui->phase_start_sec;
-    ui->speed_tps = elapsed > 0.001 ? (double)current / elapsed : 0.0;
+    ui->speed_tps = elapsed > 0.001 ? (double)current.raw() / elapsed : 0.0;
     tui_refresh(ui, "prefill");
     double paused_sec = tui_wait_if_paused(ui, "prefill");
     if (paused_sec > 0.0) ui->phase_start_sec += paused_sec;

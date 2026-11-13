@@ -684,11 +684,11 @@ static void test_worker_progress_uses_session_total(void) {
     w.wake_pending = true;   /* no wake pipe: agent_wake_locked writes nothing */
     w.progress_base = 100;
     w.status.prefill_total = 5;   /* a stale estimate */
-    worker_progress_cb(&w, "prefill_chunk", 150, 300);
+    worker_progress_cb(&w, "prefill_chunk", TokPos{150}, TokCount{300});
     AGENT_TEST_ASSERT(w.status.prefill_total == 200 && w.status.prefill_done == 50);
-    worker_progress_cb(&w, "prefill_display", 400, 300);
+    worker_progress_cb(&w, "prefill_display", TokPos{400}, TokCount{300});
     AGENT_TEST_ASSERT(w.status.prefill_total == 200 && w.status.prefill_done == 200);
-    worker_progress_cb(&w, "decode", 500, 900);   /* not a prefill event: ignored */
+    worker_progress_cb(&w, "decode", TokPos{500}, TokCount{900});   /* not a prefill event: ignored */
     AGENT_TEST_ASSERT(w.status.prefill_total == 200);
     pthread_mutex_destroy(&w.mu);
 }

@@ -267,9 +267,9 @@ void pulsar_session_read_ahead_cancel(pulsar_session *s, uint32_t bank) {
 
 /** Report prefill progress to the session's progress and display-progress hooks (each when set).
  *  @param s       the session
- *  @param current tokens prefilled so far
+ *  @param current the position the prefill stands at (L334 P7: TokPos)
  *  @param total   the prompt's tokens */
-static void prefill_loop_progress(pulsar_session *s, int current, int total) {
+static void prefill_loop_progress(pulsar_session *s, TokPos current, TokCount total) {
     if (s->progress) s->progress(s->progress_ud, "prefill_chunk", current, total);
     if (s->display_progress) s->display_progress(s->display_progress_ud, "prefill_display", current, total);
 }
@@ -338,7 +338,7 @@ static bool prefill_loop_landed(void *ud, uint32_t chunk_end) {
         (void)pulsar_ckpt_record_capture(c->ckpt, c->bank, PULSAR_CKPT_REC_ENDPOINT, TokPos{(int)chunk_end}, c->prompt->v, NULL, 0u,
                                          s->sync_n_images > 0 ? &s->sync_identity : NULL);
     c->at_resume_point = c->ckpt->ops->split_invariant || chunk_end % c->ckpt->ops->resume_grid == 0u;
-    prefill_loop_progress(s, (int)chunk_end, c->prompt->len);
+    prefill_loop_progress(s, TokPos{(int)chunk_end}, TokCount{c->prompt->len});
     return true;
 }
 
@@ -406,7 +406,7 @@ int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, TokPos s
     s->checkpoint.len = 0;
     for (uint32_t i = 0; i < start; i++) token_vec_push(&s->checkpoint, prompt->v[i]);
     s->checkpoint_valid = start > 0u;
-    prefill_loop_progress(s, (int)start, prompt->len);
+    prefill_loop_progress(s, TokPos{(int)start}, TokCount{prompt->len});
     prefill_loop_ctx c = { s, prompt, pulsar_session_live_bank(s), ckpt, chunk, ud, plan.endpoint, true };
     const pulsar_prefill_walk w = { &plan, prefill_loop_chunk, prefill_loop_landed, prefill_loop_stop, &c };
     const int rc = pulsar_prefill_walk_run(&w, start_at, pulsar_ckpt_pos(end));

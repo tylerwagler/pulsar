@@ -431,12 +431,12 @@ int kv_cache_commit_written(kv_disk_cache *kc) {
         char key[41];
         memcpy(key, pulsar_segstore_job_key(it.job), 41);
         const bool rp = pulsar_segstore_job_kind(it.job) == PULSAR_SEGSTORE_PART_RP;
-        const uint32_t G_prev = pulsar_segstore_job_G_prev(it.job), G = pulsar_segstore_job_G(it.job);
+        const TokPos G_prev = pulsar_segstore_job_G_prev(it.job), G = pulsar_segstore_job_G(it.job);
         const uint64_t bytes = pulsar_segstore_job_bytes(it.job);
         const bool indexed = pulsar_segstore_commit(kc->st, it.job, it.ok);
         if (!it.ok)
-            server_log(PULSAR_LOG_WARNING, "pulsar-server: kv cache %s %.40s [%u,%u) not written: %s",
-                       rp ? "restore point" : "segment", key, G_prev, G, it.err);
+            server_log(PULSAR_LOG_WARNING, "pulsar-server: kv cache %s %.40s [%d,%d) not written: %s",
+                       rp ? "restore point" : "segment", key, G_prev.raw(), G.raw(), it.err);
         else if (indexed) {
             n++;
             server_log(PULSAR_LOG_KVCACHE,
@@ -619,7 +619,7 @@ void kv_cache_close(kv_disk_cache *kc) {
 /// @param tokens   the tokens
 /// @param out_len  receives the text's length in bytes
 /// @return malloc'd text
-char *render_tokens_text(pulsar_engine *engine, const pulsar_tokens *tokens, size_t *out_len) {
+char *render_tokens_text(pulsar_engine *engine, const pulsar_tokens *tokens, TextBytes *out_len) {
     return pulsar_kvtext_render_tokens_text(engine, tokens, out_len);
 }
 
@@ -629,8 +629,8 @@ char *render_tokens_text(pulsar_engine *engine, const pulsar_tokens *tokens, siz
 /// @param prefix  the prefix
 /// @param prefix_len  bytes at `prefix`
 /// @return true on a match
-static bool byte_prefix_match(const char *text, size_t text_len,
-                              const char *prefix, size_t prefix_len) {
+static bool byte_prefix_match(const char *text, TextBytes text_len,
+                              const char *prefix, TextBytes prefix_len) {
     return pulsar_kvtext_byte_prefix_match(text, text_len, prefix, prefix_len);
 }
 
@@ -638,7 +638,7 @@ static bool byte_prefix_match(const char *text, size_t text_len,
 /// @param dst  the destination
 /// @param src  the source
 /// @param n  tokens to copy
-void tokens_copy_prefix(pulsar_tokens *dst, const pulsar_tokens *src, int n) {
+void tokens_copy_prefix(pulsar_tokens *dst, const pulsar_tokens *src, TokCount n) {
     pulsar_kvtext_tokens_copy_prefix(dst, src, n);
 }
 
@@ -682,7 +682,7 @@ bool build_prompt_from_exact_prefix_and_text_suffix(
  * leaves the history untouched; any other stop row (<|endoftext|>) is rewound past by the sync. */
 void join_live_history_and_tail(const pulsar_tokens *live, bool live_ends_at_stop, const pulsar_tokens *tail,
                                 pulsar_tokens *out) {
-    tokens_copy_prefix(out, live, live->len - (live_ends_at_stop && live->len > 0 ? 1 : 0));
+    tokens_copy_prefix(out, live, TokCount{live->len - (live_ends_at_stop && live->len > 0 ? 1 : 0)});
     for (int i = 0; i < tail->len; i++) pulsar_tokens_push(out, tail->v[i]);
 }
 
@@ -734,9 +734,9 @@ int kv_cache_preamble_pos(const kv_disk_cache *kc, const pulsar_tokens *prompt, 
     return i >= kc->opt.min_tokens ? i : -1;
 }
 
-int kv_cache_anchor_cut(const kv_disk_cache *kc, int anchor, int grid) {
-    if (grid <= 0 || anchor < kc->opt.min_tokens) return 0;
-    const int cut = anchor - anchor % grid;
+int kv_cache_anchor_cut(const kv_disk_cache *kc, int anchor, TokCount grid) {
+    if (grid.raw() <= 0 || anchor < kc->opt.min_tokens) return 0;
+    const int cut = anchor - anchor % grid.raw();
     return cut >= kc->opt.min_tokens ? cut : 0;
 }
 
@@ -748,7 +748,7 @@ bool server::kv_cache_anchor_due(const pulsar_tokens *prompt, int cut) {
     memset(&head, 0, sizeof head);
     head.v = prompt->v;
     head.len = head.cap = cut;
-    size_t len = 0;
+    TextBytes len{0};
     char *text = pulsar_kvtext_render_tokens_text(engine, &head, &len);
     if (!text) return false;
     bool rp_at_cut = false;
@@ -767,15 +767,17 @@ bool server::kv_cache_pin_anchor(const pulsar_tokens *prompt, int cut) {
     memset(&head, 0, sizeof head);
     head.v = prompt->v;
     head.len = head.cap = cut;
-    size_t len = 0;
+    TextBytes len{0};
     char *text = pulsar_kvtext_render_tokens_text(engine, &head, &len);
     if (!text) return false;
     /* the deepest stored chain with a restore point inside the anchor's text: one ending exactly at the cut is it */
-    const pulsar_segstore_end at_rp = { 0u, true };
+    const pulsar_segstore_end at_rp = { TokCount{0}, true };
     pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
     const int n = pulsar_segstore_lookup(kv.st, text, len, &at_rp, chain, PULSAR_KVCHAIN_MAX);
     free(text);
-    if (n == 0 || chain[n - 1].text_end != len || (int)chain[n - 1].G != cut) return false;
+    /* the cut is a position on the prompt's tokens; the anchor's chain was written by a cold prefill of that prompt,
+     * whose live history is the prompt from position 0, so the cut is the chain's live end (L334 P7) */
+    if (n == 0 || chain[n - 1].text_end != len || chain[n - 1].G != TokPos{cut}) return false;
     if (!(chain[n - 1].rp_flags & PULSAR_SEGSTORE_RP_PINNED)) {
         const bool ok = pulsar_segstore_flag_rp(kv.st, chain[n - 1].key, PULSAR_SEGSTORE_RP_PINNED);
         server_log(ok ? PULSAR_LOG_KVCACHE : PULSAR_LOG_WARNING, "pulsar-server: kv cache anchor at %d (%.12s) %s "
@@ -857,37 +859,37 @@ bool server::kv_rp_writes_for_end(kv_persist_trigger why, unsigned kv_flags, uns
     const pulsar_tokens *toks = pulsar_session_tokens(s->sess);
     const TokPos end_pos = toks ? pulsar_session_persist_end(s->sess) : TokPos{0};
     if (end_pos.is_none() || end_pos.raw() <= 0) return true;
-    const int E = pulsar_session_checkpoint_best(s->sess, end_pos).raw();
-    if (E <= 0) return true;
+    const TokPos E = pulsar_session_checkpoint_best(s->sess, end_pos);
+    if (E.raw() <= 0) return true;
     /* the deepest restore point already stored on this history (an anchor, a periodic point, an earlier end) */
     pulsar_tokens head = *toks;
-    head.len = E;
-    size_t len = 0;
+    head.len = E.raw();
+    TextBytes len{0};
     char *text = pulsar_kvtext_render_tokens_text(s->engine, &head, &len);
     kv_chain_hit hit;
     /* L353: with the history's own images: without them an image history's chain stopped at its first block, which
      * overstated the gain and logged a warning a persist */
     uint64_t hashes[PULSAR_IMAGE_BLOCKS_MAX];
-    const int n_hashes = pulsar_session_span_image_hashes(s->sess, TokPos{0}, TokPos{E}, hashes,
-                                                          PULSAR_IMAGE_BLOCKS_MAX);
-    const int D = text ? kv_cache_find(text, n_hashes > 0 ? hashes : NULL, n_hashes > 0 ? n_hashes : 0, &hit) : 0;
+    const int n_hashes = pulsar_session_span_image_hashes(s->sess, TokPos{0}, E, hashes, PULSAR_IMAGE_BLOCKS_MAX);
+    const TokPos D =
+        text ? kv_cache_find(text, n_hashes > 0 ? hashes : NULL, n_hashes > 0 ? n_hashes : 0, &hit) : TokPos{0};
     free(text);
-    const uint32_t gain = E > D ? (uint32_t)(E - D) : 0u;
-    uint64_t rp = pulsar_session_restore_point_bytes(s->sess, TokPos{E});
+    const uint32_t gain = E > D ? (uint32_t)(E - D).raw() : 0u;
+    uint64_t rp = pulsar_session_restore_point_bytes(s->sess, E);
     uint64_t state = 0;
-    const uint64_t rows = gain ? pulsar_session_segment_bytes(s->sess, TokPos{D}, TokPos{E}, &state) : 0u;
+    const uint64_t rows = gain ? pulsar_session_segment_bytes(s->sess, D, E, &state) : 0u;
     double read_ms = 0.0, prefill_ms = 0.0;
     pthread_mutex_lock(&s->mu);
     const bool measured = kv_read_cost_ms(&s->kv.meter.read, rp + rows, 0, server_now_sec(), &read_ms);
     pthread_mutex_unlock(&s->mu);
     const int cap = pulsar_session_prefill_cap(s->sess).raw();
-    const bool priced = gain && pulsar_engine_prefill_ms(s->engine, gain, (uint32_t)D, cap > 0 ? (uint32_t)cap : 0u,
-                                                         &prefill_ms);
+    const bool priced = gain && pulsar_engine_prefill_ms(s->engine, gain, (uint32_t)D.raw(),
+                                                         cap > 0 ? (uint32_t)cap : 0u, &prefill_ms);
     if (kv_rp_worth(gain, measured, read_ms, priced, prefill_ms)) return true;
     server_log(PULSAR_LOG_KVCACHE,
                "pulsar-server: kv cache %s: no restore point at %d: %u tokens past the stored one at %d re-prefill in "
-               "%.1f ms, cheaper than its read (%.1f ms)", kv_persist_trigger_names[why], E, gain, D, prefill_ms,
-               read_ms);
+               "%.1f ms, cheaper than its read (%.1f ms)", kv_persist_trigger_names[why], E.raw(), gain, D.raw(),
+               prefill_ms, read_ms);
     *what &= ~PULSAR_KVCHAIN_RP;
     return true;
 }
@@ -967,14 +969,15 @@ int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chai
     /* L347: a loss writes the chain end's restore point only where kv_restore_decide would load it */
     unsigned what = 0;
     (void)kv_rp_writes_for_end(why, sl->kv_flags, &what);   /* writes: kv_persist_writes said so above */
-    pulsar_kvchain_persist(s->kv.st, s->engine, s->sess, s->kv.opt.min_tokens, what, &tool_maps, &writer, &r);
+    pulsar_kvchain_persist(s->kv.st, s->engine, s->sess, TokCount{s->kv.opt.min_tokens}, what, &tool_maps, &writer,
+                           &r);
     if (r.err[0])
         server_log(PULSAR_LOG_WARNING, "pulsar-server: kv cache chain not fully stored (reason=%s): %s", reason, r.err);
     if (r.written || r.rp_written)
         server_log(PULSAR_LOG_KVCACHE,
                    "pulsar-server: kv cache persisted reason=%s chain to %d (%d new segments, %.1f MiB; %d restore "
                    "points, %.1f MiB; copied out, written behind) in %.1f ms",
-                   reason, r.end, r.written, (double)r.bytes / (1024.0 * 1024.0), r.rp_written,
+                   reason, r.end.raw(), r.written, (double)r.bytes / (1024.0 * 1024.0), r.rp_written,
                    (double)r.rp_bytes / (1024.0 * 1024.0), (server_now_sec() - t0) * 1000.0);
     if (r.no_room) {
         s->count_metric(&s->m_persist_no_room);
@@ -989,7 +992,7 @@ int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chai
         pthread_mutex_unlock(&s->mu);
         s->kv_cache_publish_store();   /* L347 I3b: a write may have made room by a pin */
     }
-    if (chain_end) *chain_end = r.end;
+    if (chain_end) *chain_end = r.end.raw();
     /* L347: a spill frees its bank only when the history is stored: no host pool room, or any persist error (the
      * store full, a write refused), keeps the bank resident */
     if (no_room) *no_room = r.no_room || r.err[0] != '\0';
@@ -1071,19 +1074,19 @@ bool kv_read_cost_ms(const kv_read_cost *c, uint64_t bytes, uint64_t cached, dou
     return true;
 }
 
-int server::kv_cache_try_load_text(session_slot *sl, const char *prompt_text,
-                                  const pulsar_text_span *prompt_spans,
-                                  uint32_t prompt_n_spans,
-                                  const uint64_t *image_hashes, int n_images, int base,
-                                  pulsar_tokens *effective_prompt,
-                                  char **loaded_key_out,
-                                  bool responses_protocol) {
+TokPos server::kv_cache_try_load_text(session_slot *sl, const char *prompt_text,
+                                     const pulsar_text_span *prompt_spans,
+                                     uint32_t prompt_n_spans,
+                                     const uint64_t *image_hashes, int n_images, TokPos base,
+                                     pulsar_tokens *effective_prompt,
+                                     char **loaded_key_out,
+                                     bool responses_protocol) {
     (void)sl;   /* the caller installed the slot's bank */
     if (loaded_key_out) *loaded_key_out = NULL;
     kv_chain_hit hit;
-    const int G = kv_cache_find(prompt_text, image_hashes, n_images, &hit);
-    if (G <= base) return 0;   /* nothing past what the bank serves: no read is priced */
-    if (kv_cache_price(&hit, base) == KV_RESTORE_RECOMPUTE) return 0;
+    const TokPos G = kv_cache_find(prompt_text, image_hashes, n_images, &hit);
+    if (G <= base) return TokPos{0};   /* nothing past what the bank serves: no read is priced */
+    if (kv_cache_price(&hit, base) == KV_RESTORE_RECOMPUTE) return TokPos{0};
     return kv_cache_load(&hit, prompt_text, prompt_spans, prompt_n_spans, base, effective_prompt, loaded_key_out,
                          responses_protocol);
 }
@@ -1092,63 +1095,66 @@ int server::kv_cache_try_load_text(session_slot *sl, const char *prompt_text,
 
 const char *const resume_pick_names[RESUME_PICKS] = { "own", "adopt", "disk" };
 
-int server_resume_memory_depth(int own, int adopt) {
-    return adopt > own + PULSAR_SERVER_ADOPT_MIN_GAIN ? adopt : own;
+PromptToks server_resume_memory_depth(PromptToks own, PromptToks adopt) {
+    return adopt > own + PromptToks{PULSAR_SERVER_ADOPT_MIN_GAIN} ? adopt : own;
 }
 
-resume_pick server_resume_pick(int own, int adopt, int disk, kv_restore_verdict disk_verdict) {
-    const int mem = server_resume_memory_depth(own, adopt);
+resume_pick server_resume_pick(PromptToks own, PromptToks adopt, PromptToks disk, kv_restore_verdict disk_verdict) {
+    const PromptToks mem = server_resume_memory_depth(own, adopt);
     if (disk > mem && disk_verdict != KV_RESTORE_RECOMPUTE) return RESUME_DISK;
     return mem > own ? RESUME_ADOPT : RESUME_OWN;
 }
 
-resume_pick server_failed_restore_pick(int own, int adopt, bool bank_kept) {
-    return server_resume_pick(bank_kept ? own : 0, adopt, 0, KV_RESTORE_RECOMPUTE);
+resume_pick server_failed_restore_pick(PromptToks own, PromptToks adopt, bool bank_kept) {
+    return server_resume_pick(bank_kept ? own : PromptToks{0}, adopt, PromptToks{0}, KV_RESTORE_RECOMPUTE);
 }
 
-int server::kv_cache_find(const char *prompt_text, const uint64_t *image_hashes, int n_images, kv_chain_hit *hit) {
+TokPos server::kv_cache_find(const char *prompt_text, const uint64_t *image_hashes, int n_images, kv_chain_hit *hit) {
     auto *s = this;
     hit->n = 0;
     hit->bytes = 0;
     hit->cached = 0;
-    if (!s->kv.enabled || !prompt_text) return 0;
+    if (!s->kv.enabled || !prompt_text) return TokPos{0};
     if (kv_cache_commit_written(&s->kv) > 0) s->kv_cache_publish_store();   /* L338; L347 I3b: a pinned anchor's */
     char err[384];
-    hit->n = pulsar_kvchain_find(s->kv.st, prompt_text, strlen(prompt_text), image_hashes, n_images,
-                                 s->kv.opt.min_tokens, hit->chain, PULSAR_KVCHAIN_MAX, &hit->bytes, err, sizeof(err));
+    hit->n = pulsar_kvchain_find(s->kv.st, prompt_text, TextBytes{strlen(prompt_text)}, image_hashes, n_images,
+                                 TokCount{s->kv.opt.min_tokens}, hit->chain, PULSAR_KVCHAIN_MAX, &hit->bytes, err,
+                                 sizeof(err));
     if (err[0]) server_log(hit->n ? PULSAR_LOG_KVCACHE : PULSAR_LOG_WARNING, "pulsar-server: kv cache %s", err);
     /* L327 / L347 I3a: how much of that read the RAM tier holds -- the read is priced, and measured, by the two apart
      * (the store reads and writes with O_DIRECT, so the page cache holds none of it) */
     if (hit->n > 0) hit->cached = pulsar_kvchain_resident_bytes(s->kv.st, hit->chain, hit->n);
-    return hit->n > 0 ? (int)hit->chain[hit->n - 1].G : 0;
+    return hit->n > 0 ? hit->chain[hit->n - 1].G : TokPos{0};
 }
 
-int server::kv_cache_find_req(const request *req, kv_chain_hit *hit) {
+TokPos server::kv_cache_find_req(const request *req, kv_chain_hit *hit) {
     /* L281: the chain loads past an image block only when this request brings the same image there */
     uint64_t hashes[PULSAR_IMAGE_BLOCKS_MAX];
     const int n_images = req->n_images < PULSAR_IMAGE_BLOCKS_MAX ? req->n_images : PULSAR_IMAGE_BLOCKS_MAX;
     for (int i = 0; i < n_images; i++) hashes[i] = pulsar_image_hash(&req->images[i]);
-    const int G = kv_cache_find(req->prompt_text, hashes, n_images, hit);
+    const TokPos G = kv_cache_find(req->prompt_text, hashes, n_images, hit);
     /* L353 no. 15: a chain ending at the prompt's end can't be resumed (a load leaves no record there, and a resume stops short
-     * of the last row).  The next stored point below it can: look again without the last segment's last byte. */
-    if (G < req->prompt.len || G <= 0) return G;
-    const uint64_t cut = hit->chain[hit->n - 1].text_end;
-    if (cut == 0u) return 0;
-    std::string shorter(req->prompt_text, (size_t)cut - 1u);
+     * of the last row).  The next stored point below it can: look again without the last segment's last byte.
+     * L334 P7: the chain's live-side end against the request's prompt length -- the P1 mix-up of kv_cache_find's
+     * depth, kept as it was (raw) */
+    if (G.raw() < req->prompt.len || G.raw() <= 0) return G;
+    const TextBytes cut = hit->chain[hit->n - 1].text_end;
+    if (cut == TextBytes{0}) return TokPos{0};
+    std::string shorter(req->prompt_text, (size_t)cut.raw() - 1u);
     return kv_cache_find(shorter.c_str(), hashes, n_images, hit);
 }
 
-kv_restore_verdict server::kv_cache_price(const kv_chain_hit *hit, int base) {
+kv_restore_verdict server::kv_cache_price(const kv_chain_hit *hit, TokPos base_at) {
     auto *s = this;
     /* L310: price the read against the prefill of what the chain adds past `base` */
-    const uint32_t chain_G = hit->chain[hit->n - 1].G;
+    const TokPos chain_G = hit->chain[hit->n - 1].G;
     const uint64_t bytes = hit->bytes;
     const int n = hit->n;
-    if (base < 0) base = 0;
-    const uint32_t gained = chain_G > (uint32_t)base ? chain_G - (uint32_t)base : 0u;
+    const TokPos base = base_at.raw() < 0 ? TokPos{0} : base_at;
+    const uint32_t gained = chain_G > base ? (uint32_t)(chain_G - base).raw() : 0u;
     double prefill_ms = 0.0, transfer_ms = 0.0;
     const int cap = s->sess ? pulsar_session_prefill_cap(s->sess).raw() : 0;
-    const bool priced = pulsar_engine_prefill_ms(s->engine, gained, (uint32_t)base, cap > 0 ? (uint32_t)cap : 0u,
+    const bool priced = pulsar_engine_prefill_ms(s->engine, gained, (uint32_t)base.raw(), cap > 0 ? (uint32_t)cap : 0u,
                                                  &prefill_ms);
     pthread_mutex_lock(&s->mu);
     const bool measured = kv_read_cost_ms(&s->kv.meter.read, bytes, hit->cached, server_now_sec(), &transfer_ms);
@@ -1161,9 +1167,10 @@ kv_restore_verdict server::kv_cache_price(const kv_chain_hit *hit, int base) {
     if (v == KV_RESTORE_RECOMPUTE) s->kv.meter.recomputed_tokens += gained;
     pthread_mutex_unlock(&s->mu);
     server_log(PULSAR_LOG_KVCACHE,
-               "pulsar-server: kv cache restore-vs-recompute: chain to %u (%d segments, %.1f MiB, %.1f MiB in RAM) adds "
-               "%u tokens past %d: read %.1f ms%s vs prefill %.1f ms%s -> %s",
-               chain_G, n, (double)bytes / (1024.0 * 1024.0), (double)hit->cached / (1024.0 * 1024.0), gained, base,
+               "pulsar-server: kv cache restore-vs-recompute: chain to %d (%d segments, %.1f MiB, %.1f MiB in RAM) "
+               "adds %u tokens past %d: read %.1f ms%s vs prefill %.1f ms%s -> %s",
+               chain_G.raw(), n, (double)bytes / (1024.0 * 1024.0), (double)hit->cached / (1024.0 * 1024.0), gained,
+               base.raw(),
                transfer_ms, measured ? "" : " (unmeasured)", prefill_ms, priced ? "" : " (no fit)",
                kv_restore_verdict_names[v]);
     return v;
@@ -1214,11 +1221,11 @@ static int server_restore_slice_segments(const double *pred_ms, int next, int n,
  *   the RAM copy the load reads.  A failure after the first write (a transient one) leaves the bank invalid: the
  *   request then resumes from another bank's adopt if one serves, else from 0 (server::gen_step_restore). */
 
-void server::kv_restore_begin(kv_restore *r, const kv_chain_hit *hit, int base, bool sliced, bool verify) {
+void server::kv_restore_begin(kv_restore *r, const kv_chain_hit *hit, TokPos base, bool sliced, bool verify) {
     auto *s = this;
     r->hit = hit;
     r->next = 0;
-    r->base = base < 0 ? 0 : base;
+    r->base = base.raw() < 0 ? TokPos{0} : base;
     r->read_ms = 0.0;
     r->slice_max_ms = 0.0;
     r->slices = 0;
@@ -1315,35 +1322,35 @@ int server::kv_restore_next(kv_restore *r) {
     double target_ms = (double)s->restore_slice_ms;
     if (s->restore_slice_ms <= 0) {
         const int cap = pulsar_session_prefill_cap(s->sess).raw();
-        const uint32_t depth = r->hit->chain[kv_restore_at(r)].G_prev;
+        const uint32_t depth = (uint32_t)r->hit->chain[kv_restore_at(r)].G_prev.raw();
         if (cap <= 0 || !pulsar_engine_prefill_ms(s->engine, (uint32_t)cap, depth, (uint32_t)cap, &target_ms))
             target_ms = 0.0;
     }
     return kv_restore_slice(r, server_restore_slice_segments(r->pred_ms, kv_restore_at(r), r->hit->n, target_ms));
 }
 
-int server::kv_restore_finish(kv_restore *r, const char *text, const pulsar_text_span *spans, uint32_t n_spans,
-                              pulsar_tokens *effective_prompt, char **loaded_key_out, bool responses_protocol) {
+TokPos server::kv_restore_finish(kv_restore *r, const char *text, const pulsar_text_span *spans, uint32_t n_spans,
+                                 pulsar_tokens *effective_prompt, char **loaded_key_out, bool responses_protocol) {
     auto *s = this;
     if (loaded_key_out) *loaded_key_out = NULL;
     const pulsar_segstore_seg *chain = r->hit->chain;
     const int n = r->hit->n;
     char err[384];
-    const int G = pulsar_kvchain_load_check(s->kv.st, s->engine, s->sess, text, chain, n, err, sizeof err);
+    const TokPos G = pulsar_kvchain_load_check(s->kv.st, s->engine, s->sess, text, chain, n, err, sizeof err);
     if (err[0]) server_log(PULSAR_LOG_WARNING, "pulsar-server: kv cache %s", err);
-    if (G == 0) {
+    if (G == TokPos{0}) {
         s->count_metric(&s->kv.meter.restores[2]);   /* L378: failed -- the load did not check out */
-        return 0;
+        return TokPos{0};
     }
-    const size_t text_bytes = strlen(text);
+    const TextBytes text_bytes{strlen(text)};
     pthread_mutex_lock(&s->mu);
     /* L353 no. 16: a checked restore read the chain twice unless the check's read stayed as the RAM copy; the time is both */
     const uint64_t reads = kv_restore_reads(r->verify, pulsar_segstore_retains(s->kv.st));
     kv_read_cost_observe(&s->kv.meter.read, r->hit->bytes * reads, r->hit->cached * reads, r->read_ms, server_now_sec());
-    s->kv.meter.restored_tokens += G > r->base ? (uint64_t)(G - r->base) : 0u;
+    s->kv.meter.restored_tokens += G > r->base ? (uint64_t)(G - r->base).raw() : 0u;
     pthread_mutex_unlock(&s->mu);
     const pulsar_tokens *loaded = pulsar_session_tokens(s->sess);
-    const uint64_t text_end = chain[n - 1].text_end;
+    const TextBytes text_end = chain[n - 1].text_end;
     /* The chain's tool maps: the exact DSML of every tool call inside it. */
     for (int i = 0; i < n; i++) {
         FILE *fp = pulsar_segstore_open_trailer(s->kv.st, chain[i].key, NULL);
@@ -1357,40 +1364,42 @@ int server::kv_restore_finish(kv_restore *r, const char *text, const pulsar_text
          * it -- carrying the client-data ranges into the suffix's coordinates
          * so client bytes stay plain text there too (L223). */
         uint32_t tail_n = 0;
-        pulsar_text_span *tail = pulsar_text_spans_slice(spans, n_spans, (uint32_t)text_end,
-                                                         (uint32_t)(text_bytes - text_end), &tail_n);
-        const bool built = build_prompt_from_exact_prefix_and_text_suffix(s->engine, loaded, text + text_end, tail,
-                                                                          tail_n, effective_prompt);
+        /* L334 P7: the old call narrowed both to uint32_t; so does this (a rendered prompt is far below 4 GiB) */
+        pulsar_text_span *tail = pulsar_text_spans_slice(spans, n_spans, TextBytes{(uint32_t)text_end.raw()},
+                                                         TextBytes{(uint32_t)(text_bytes - text_end).raw()}, &tail_n);
+        const bool built = build_prompt_from_exact_prefix_and_text_suffix(s->engine, loaded, text + text_end.raw(),
+                                                                          tail, tail_n, effective_prompt);
         free(tail);
         if (!built) {   /* a failed restore: the request's own prompt is synced (the bank was touched) */
             s->count_metric(&s->kv.meter.restores[2]);   /* L378: failed */
-            return 0;
+            return TokPos{0};
         }
     }
     s->count_metric(&s->kv.meter.restores[1]);   /* L378: done */
     if (loaded_key_out) *loaded_key_out = server_xstrdup(chain[n - 1].key);
     server_log(PULSAR_LOG_KVCACHE,
-               "pulsar-server: kv cache hit%s chain of %d to %u (text %llu of %zu bytes) load=%.1f ms in %d slice%s "
+               "pulsar-server: kv cache hit%s chain of %d to %d (text %llu of %llu bytes) load=%.1f ms in %d slice%s "
                "(longest %.1f ms)",
-               responses_protocol ? " [responses]" : "", n, chain[n - 1].G, (unsigned long long)text_end, text_bytes,
+               responses_protocol ? " [responses]" : "", n, chain[n - 1].G.raw(), (unsigned long long)text_end.raw(),
+               (unsigned long long)text_bytes.raw(),
                r->read_ms, r->slices, r->slices == 1 ? "" : "s", r->slice_max_ms);
     return G;
 }
 
-int server::kv_cache_load(const kv_chain_hit *hit, const char *prompt_text, const pulsar_text_span *prompt_spans,
-                          uint32_t prompt_n_spans, int base, pulsar_tokens *effective_prompt, char **loaded_key_out,
-                          bool responses_protocol) {
+TokPos server::kv_cache_load(const kv_chain_hit *hit, const char *prompt_text, const pulsar_text_span *prompt_spans,
+                             uint32_t prompt_n_spans, TokPos base, pulsar_tokens *effective_prompt,
+                             char **loaded_key_out, bool responses_protocol) {
     if (loaded_key_out) *loaded_key_out = NULL;
     /* the one-shot load: the whole chain as one slice (canonicalize_tool_checkpoint's rebuild, the one caller, runs to
      * completion inside its quantum like the sync it serves -- and reads only what L310 prices under half the
      * prefill it saves, so the read never stalls longer than that sync would) */
     kv_restore r;
-    kv_restore_begin(&r, hit, base, false, base > 0);   /* L347 I3b: checked first when the bank serves some of it */
+    kv_restore_begin(&r, hit, base, false, base.raw() > 0);   /* L347 I3b: checked first when the bank serves some */
     int rc = 0;
     while (rc == 0) rc = kv_restore_slice(&r, hit->n);   /* the check (when it runs), then the load */
-    const int G = rc == 1 ? kv_restore_finish(&r, prompt_text, prompt_spans, prompt_n_spans, effective_prompt,
-                                              loaded_key_out, responses_protocol)
-                          : 0;
+    const TokPos G = rc == 1 ? kv_restore_finish(&r, prompt_text, prompt_spans, prompt_n_spans, effective_prompt,
+                                                 loaded_key_out, responses_protocol)
+                             : TokPos{0};
     kv_restore_end(&r);
     return G;
 }
@@ -1410,7 +1419,7 @@ void server::kv_cache_restore_tool_memory_for_messages(const chat_msgs *msgs) {
     wanted.len = keep;
     if (wanted.len > 0) {
         struct walk { server *s; stop_list *wanted; } w = { s, &wanted };
-        pulsar_segstore_foreach_trailer(s->kv.st, [](FILE *fp, uint64_t, const char *, size_t, void *ud) {
+        pulsar_segstore_foreach_trailer(s->kv.st, [](FILE *fp, uint64_t, const char *, TextBytes, void *ud) {
             walk *wk = (walk *)ud;
             wk->s->kv_tool_map_load_from_pos(fp, wk->wanted);
             for (int i = 0; i < wk->wanted->len; i++)
@@ -1524,11 +1533,11 @@ int server::responses_live_visible_prefix_prompt(session_slot *sl,
     if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
     if (req->api != API_RESPONSES) return 0;
 
-    const size_t prompt_len = strlen(req->prompt_text);
-    size_t visible_len = 0;
+    const TextBytes prompt_len{strlen(req->prompt_text)};
+    TextBytes visible_len{0};
     pthread_mutex_lock(&s->tool_mu);
     bool ok = sl->responses_live.valid &&
-              sl->responses_live.live_tokens == live_pos &&
+              sl->responses_live.live_tokens == TokCount{live_pos} &&
               sl->responses_live.visible_text &&
               sl->responses_live.visible_len < prompt_len &&
               byte_prefix_match(req->prompt_text, prompt_len,
@@ -1552,7 +1561,7 @@ int server::responses_live_visible_prefix_prompt(session_slot *sl,
         pulsar_text_spans_slice(req->prompt_spans, req->prompt_n_spans, visible_len,
                                 prompt_len - visible_len, &tail_n);
     const bool built = build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->prompt_text + visible_len,
+        s->engine, live_tokens, req->prompt_text + visible_len.raw(),
         tail_spans, tail_n, effective_prompt);
     free(tail_spans);
     return built ? live_tokens->len : 0;

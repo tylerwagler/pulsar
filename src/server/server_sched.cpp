@@ -1591,7 +1591,7 @@ void server::kv_dup_census_update() {
         common[i] = common_rows[i];
         resident[i] = s->slots[i].provisioned && !pulsar_session_bank_is_evicted(s->sess, s->slots[i].bank);
     }
-    const int grid = pulsar_kvchain_grid(s->sess);
+    const int grid = pulsar_kvchain_grid(s->sess).raw();   /* a page's rows: KvRows below */
     const KvBytes page_bytes = grid > 0 ? pulsar_session_quantum_growth_bytes_per_bank(s->sess, KvRows{(uint32_t)grid})
                                         : KvBytes{};
     kv_dup_census c;
@@ -3038,7 +3038,7 @@ bool server::bank_unspill(BankId bank, spilled_history *was) {
     /* the host view is the bank's history as it was spilled (its carry); its rows are gone with the physical */
     const pulsar_tokens *hist = pulsar_session_tokens(pool);
     if (was && hist && hist->len > 0) {
-        size_t len = 0;
+        TextBytes len{0};
         was->text = render_tokens_text(s->engine, hist, &len);
         /* L281: the bank's own image records are what its chain must carry back */
         const int n_img = pulsar_session_image_hashes(pool, was->hashes, PULSAR_IMAGE_BLOCKS_MAX);
@@ -4951,8 +4951,8 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                  * fused rounds was silent to its client for minutes), the
                  * prefill log line with its rate, and the L114 counter through
                  * the per-slot watermark. */
-                gen_prefill_progress_cb(pg, "prefill_chunk", fr[r].p0 + fr[r].k,
-                                        pg->prompt_for_sync->len);
+                gen_prefill_progress_cb(pg, "prefill_chunk", TokPos{(int)(fr[r].p0 + fr[r].k)},
+                                        TokCount{pg->prompt_for_sync->len});
                 rider_verdict *v = &rv[c - s->slots];
                 v->rounds++;
                 v->rows += fr[r].k;

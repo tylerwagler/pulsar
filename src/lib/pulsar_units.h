@@ -1,5 +1,6 @@
 /** @file
- *  Typed quantities that share a raw integer type but must never mix (L333, L334): KvRows, KvBytes, TokCount, PromptToks, TokPos */
+ *  Typed quantities that share a raw integer type but must never mix (L333, L334): KvRows, KvBytes, TokCount,
+ *  PromptToks, TokPos, the P2b index spaces, TokId, BankId, TensorBytes, TextBytes */
 #ifndef PULSAR_UNITS_H
 #define PULSAR_UNITS_H
 
@@ -523,5 +524,32 @@ constexpr KvBytes kv_bytes_of(TensorBytes b) { return KvBytes{b.raw()}; }
 
 static_assert(sizeof(TensorBytes) == sizeof(uint64_t) && std::is_trivial<TensorBytes>::value,
               "tensor bytes are as cheap as the uint64_t they replace");
+
+
+/* ---- L334 phase 7: rendered-text bytes ----------------------------------------------------------------------------
+ * The disk KV chains (pulsar_segstore.h, pulsar_kvchain.h) and the server's KV cache key a history by the bytes its
+ * tokens RENDER to (pulsar_kvtext_render_tokens_text), so a chain's text length sat beside its token span G -- a
+ * uint64_t / size_t of text beside a uint32_t / int of tokens, in the same signatures (pulsar_segstore_put took
+ * (G_prev, G, text, text_len) in a row).  The bugs were semantic, not arithmetic: a chain's text carrying an EOS its
+ * tokens lacked (27d5bff6: a text end taken for a token end), and byte spans cut from the wrong text (9637c76b).
+ *
+ *   TextBytes   a length of rendered text in bytes -- a segment's own text, a chain's text from byte 0 to its G, a
+ *               request's rendered prompt -- or an offset into such a text, which IS the length up to it: no point
+ *               type and no sentinel (an offset is never "none").
+ *
+ * The rules are the P1 ones: no implicit conversion, arithmetic and ordering only within the unit (uint64_t's), .raw()
+ * where the bytes leave the type system (a memcmp / memcpy, a hash's update, a printf, a file offset).  A token
+ * position or count never becomes a byte length: the two meet only where a chain is checked (a stored text_end against
+ * the length its G tokens render to).  pulsar_text_span {lo, hi} (pulsar.h) stays a renderer's uint32 pair; a span
+ * built from TextBytes crosses with .raw().  Out of scope: a segment file's header / payload / trailer offsets (the
+ * file format's arithmetic, HDR + text_len + payload via .raw()), byte offsets inside the tokenizer and BPE, JSON body
+ * offsets. */
+/** Tag of TextBytes (never instantiated). */
+struct pulsar_text_bytes_tag;
+/** Bytes of rendered text: a length, or an offset from byte 0 (the length up to it) (L334 P7). */
+typedef pulsar_unit<pulsar_text_bytes_tag> TextBytes;
+
+static_assert(sizeof(TextBytes) == sizeof(uint64_t) && std::is_trivial<TextBytes>::value,
+              "text bytes are as cheap as the uint64_t they replace");
 
 #endif

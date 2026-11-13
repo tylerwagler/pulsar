@@ -1032,8 +1032,9 @@ bool pulsar_tokenize_rendered_chat_spans(pulsar_engine *e, const char *text,
 }
 
 pulsar_text_span *pulsar_text_spans_slice(const pulsar_text_span *spans, uint32_t n_spans,
-                                          size_t skip, size_t len, uint32_t *n_out) {
+                                          TextBytes skip_bytes, TextBytes len_bytes, uint32_t *n_out) {
     if (n_out) *n_out = 0;
+    const size_t skip = (size_t)skip_bytes.raw(), len = (size_t)len_bytes.raw();   /* a renderer span is raw bytes */
     if (!spans || !n_spans || !len) return NULL;
     pulsar_text_span *out = (pulsar_text_span *)xmalloc((size_t)n_spans * sizeof *out);
     const size_t end = skip + len;

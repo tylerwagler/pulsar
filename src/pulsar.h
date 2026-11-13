@@ -153,8 +153,9 @@ typedef enum {
 } pulsar_drafter_kind;
 
 /** Progress callback: `event` names the phase ("prefill_chunk" from pulsar_session_set_progress,
- *  "prefill_display" from the display hook), `current` of `total` tokens done; `ud` is the caller's pointer. */
-typedef void (*pulsar_session_progress_fn)(void *ud, const char *event, int current, int total);
+ *  "prefill_display" from the display hook), the prefill standing at position `current` of the `total` tokens of the
+ *  prompt the sync runs (both live-side: L334 P7, TokPos / TokCount); `ud` is the caller's pointer. */
+typedef void (*pulsar_session_progress_fn)(void *ud, const char *event, TokPos current, TokCount total);
 /** Cancellation callback, polled at safe chunk boundaries of pulsar_session_sync: return true to stop the sync
  *  there (it then returns PULSAR_SESSION_SYNC_INTERRUPTED). */
 typedef bool (*pulsar_session_cancel_fn)(void *ud);
@@ -804,12 +805,12 @@ bool pulsar_tokenize_rendered_chat_spans(pulsar_engine *e, const char *text,
  * there too. */
 /** @param spans the recorded ranges
  *  @param n_spans their count
- *  @param skip the slice's first byte
- *  @param len the slice's length, bytes
+ *  @param skip_bytes the slice's first byte (L334 P7: TextBytes, an offset into the rendered text)
+ *  @param len_bytes the slice's length
  *  @param n_out receives the surviving count
  *  @return the malloc'd ranges, or NULL */
 pulsar_text_span *pulsar_text_spans_slice(const pulsar_text_span *spans, uint32_t n_spans,
-                                          size_t skip, size_t len, uint32_t *n_out);
+                                          TextBytes skip_bytes, TextBytes len_bytes, uint32_t *n_out);
 
 /** ONE authority for the tool-result body's escape rule (L185): emit `s` with
  * every literal `</tool_result>` rewritten so the body cannot close its own

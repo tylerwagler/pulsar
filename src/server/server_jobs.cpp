@@ -140,9 +140,9 @@ static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
 ///        the prefill progress log and display.
 /// @param ud       the job's server_prefill_progress
 /// @param event    "prefill_chunk" or "prefill_display" (others ignored)
-/// @param current  the prefill position reached, tokens
-/// @param total    the prefill's target, tokens
-static void server_progress_cb(void *ud, const char *event, int current, int total) {
+/// @param current  the prefill position reached (live-side)
+/// @param total    the prefill's target, the tokens of the prompt the sync runs
+static void server_progress_cb(void *ud, const char *event, TokPos current, TokCount total) {
     server_prefill_progress *p = (server_prefill_progress *)ud;
     if (!p || !event) return;
     const bool is_chunk = strcmp(event, "prefill_chunk") == 0;
@@ -175,20 +175,22 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     }
     if (is_display) return;
     double elapsed = now - p->t0;
-    if (p->seen && current == p->last_current) {
+    if (p->seen && current.raw() == p->last_current) {
         if (p->srv && p->slot && current > p->cached_tokens) {
             p->srv->kv_cache_persist(p->slot, KV_PERSIST_CONTINUED);
         }
         return;
     }
-    int display_start = p->cached_tokens;
-    if (display_start < 0 || display_start > p->prompt_tokens) display_start = 0;
-    int display_total = p->prompt_tokens - display_start;
+    /* L334 P7: request-side total vs live-side position (P1's reported mix-up) -- same numbers as before */
+    const int prompt_total = p->prompt_tokens.raw();
+    int display_start = p->cached_tokens.raw();
+    if (display_start < 0 || display_start > prompt_total) display_start = 0;
+    int display_total = prompt_total - display_start;
     if (display_total <= 0) {
         display_start = 0;
-        display_total = p->prompt_tokens > total ? p->prompt_tokens : total;
+        display_total = prompt_total > total.raw() ? prompt_total : total.raw();
     }
-    int display_current = current - display_start;
+    int display_current = current.raw() - display_start;
     if (display_current < 0) display_current = 0;
     if (display_current > display_total) display_current = display_total;
     double pct = display_total > 0 ? 100.0 * (double)display_current / (double)display_total : 100.0;
@@ -199,20 +201,20 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
      * chunk of every prefill -- which read as a stall on any monitor
      * (pulsar-tui showed alternating dead samples through the 08-25 perf
      * run). Subsequent chunks are unchanged: delta tokens over delta time. */
-    int interval_tokens = p->seen ? current - p->last_current : display_current;
+    int interval_tokens = p->seen ? current.raw() - p->last_current : display_current;
     if (interval_tokens < 0) interval_tokens = 0;
     /* L114: chunk-granular prefill accounting via the per-slot watermark
      * (see session_slot.prefill_counted) — NOT interval_tokens, because the
      * mixed lane's fused sub-chunks also advance the watermark and an
      * interval here would recount them. Computed rows only. */
-    if (p->srv && p->slot && current > p->slot->prefill_counted) {
+    if (p->srv && p->slot && current.raw() > p->slot->prefill_counted) {
         p->srv->w_prefill_chunk_tokens +=
-            (uint64_t)(current - p->slot->prefill_counted);
-        p->slot->prefill_counted = current;
+            (uint64_t)(current.raw() - p->slot->prefill_counted);
+        p->slot->prefill_counted = current.raw();
     }
     double interval_s = p->seen ? now - p->last_t : elapsed;
     double chunk_tps = interval_s > 0.0 ? (double)interval_tokens / interval_s : 0.0;
-    p->last_current = current;
+    p->last_current = current.raw();
     p->last_t = now;
     p->seen = true;
     char flags[64];
@@ -405,12 +407,12 @@ void server::canonicalize_tool_checkpoint(session_slot *sl,
     const int common = pulsar_session_common_prefix(s->sess, &canonical).raw();
     if (common == live_len && canonical.len == live_len) goto done;
 
-    size_t live_text_len;
-    live_text_len = 0;
+    TextBytes live_text_len;
+    live_text_len = TextBytes{0};
     char *live_text;
     live_text = render_tokens_text(s->engine, pulsar_session_tokens(s->sess), &live_text_len);
-    if (live_text_len == rendered.len &&
-        (live_text_len == 0 || memcmp(live_text, rendered.ptr, live_text_len) == 0))
+    if (live_text_len == TextBytes{rendered.len} &&
+        (live_text_len.raw() == 0 || memcmp(live_text, rendered.ptr, (size_t)live_text_len.raw()) == 0))
     {
         /* The graph already represents the bytes the next request will render.
          * Token-level canonicalization would only replace a valid sampled
@@ -439,8 +441,12 @@ void server::canonicalize_tool_checkpoint(session_slot *sl,
         const int resume = own.served.raw();
         char *path = NULL;
         pulsar_tokens effective = {0};
-        const int loaded = s->kv_cache_try_load_text(sl, rendered.ptr ? rendered.ptr : "", rendered.spans,
-                                                     rendered.n_spans, NULL, 0, resume, &effective, &path, false);
+        /* L334 P7: the bank's prompt-side depth handed to the chain's pricing as a live position, and the chain's end
+         * counted as the canonical prompt's tokens -- P1's mix-up on this path too (report only; values unchanged) */
+        const TokPos loaded_at = s->kv_cache_try_load_text(sl, rendered.ptr ? rendered.ptr : "", rendered.spans,
+                                                           rendered.n_spans, NULL, 0, TokPos{resume}, &effective,
+                                                           &path, false);
+        const int loaded = loaded_at.raw();
         const pulsar_tokens *sync_prompt = loaded > 0 ? &effective : &canonical;
         const int cached = loaded > 0 ? loaded : resume;
         const char *source = loaded > 0 ? "disk" : cached > 0 ? "memory" : "full";
@@ -455,8 +461,8 @@ void server::canonicalize_tool_checkpoint(session_slot *sl,
             .srv = s,
             .slot = sl,
             .kind = j->req.kind,
-            .prompt_tokens = sync_prompt->len,
-            .cached_tokens = loaded > 0 ? loaded : own.at.raw(),   /* L334: where the computed rows start */
+            .prompt_tokens = PromptToks{sync_prompt->len},
+            .cached_tokens = loaded > 0 ? loaded_at : own.at,   /* L334: where the computed rows start */
             .phase = "tool checkpoint canonicalization",
             .has_tools = j->req.has_tools,
             .t0 = server_now_sec(),
@@ -550,14 +556,14 @@ done:
  * The fused lane calls it too, once per recorded chunk (server_sched.cpp), so a
  * prompt riding fused rounds reports progress, keeps its SSE stream alive and
  * logs its rate exactly like a classic sync. */
-void gen_prefill_progress_cb(void *ud, const char *event, int current, int total) {
+void gen_prefill_progress_cb(void *ud, const char *event, TokPos current, TokCount total) {
     gen_state *g = (gen_state *)ud;
     if (event && strcmp(event, "prefill_chunk") == 0) {
-        if (g->prefill_last_current >= 0 && current > g->prefill_last_current) {
+        if (g->prefill_last_current >= 0 && current.raw() > g->prefill_last_current) {
             g->prefill_chunks_done++;
         }
-        if (current > g->prefill_last_current) g->prefill_last_current = current;
-        g->prefill_total = total;
+        if (current.raw() > g->prefill_last_current) g->prefill_last_current = current.raw();
+        g->prefill_total = total.raw();
         /* L281: publish the snapshot here as well as per quantum.  An image prompt's mm sync
          * yields only at the planner's exact resume points (its cancel hook is armed like any
          * prefill's, sync_hooks), so the worker can stay inside one sync for a
@@ -684,10 +690,10 @@ void server::gen_prefill_abandon(session_slot *sl) {
     if (s->kv.enabled && s->bank_switch(sl->bank)) {
         int end = 0;
         s->kv_cache_persist(sl, KV_PERSIST_ABANDONED, &end);
-        const int kept = end - g->progress.cached_tokens;
+        const int kept = end - g->progress.cached_tokens.raw();
         server_log(PULSAR_LOG_KVCACHE,
                    "pulsar-server: abandoned prefill of bank %d: chain stored to %d (resumed at %d, prompt %d)",
-                   sl->bank.raw(), end, g->progress.cached_tokens, g->prompt_tokens);
+                   sl->bank.raw(), end, g->progress.cached_tokens.raw(), g->prompt_tokens);
         if (kept > 0) {
             pthread_mutex_lock(&s->mu);
             s->kv.meter.abandon_persisted_tokens += (uint64_t)kept;
@@ -785,10 +791,10 @@ static void gen_restore_start(session_slot *sl, gen_restore *gr) {
     sl->state = SLOT_PREFILLING;
     const kv_chain_hit *h = &gr->hit;
     server_log(PULSAR_LOG_KVCACHE,
-               "pulsar-server: bank %d restores %s chain of %d segments to %u (%.1f MiB, %.1f MiB cached) a slice "
+               "pulsar-server: bank %d restores %s chain of %d segments to %d (%.1f MiB, %.1f MiB cached) a slice "
                "per worker turn", sl->bank.raw(),
                gr->kind == GEN_RESTORE_SPILLED ? "its spilled history's" : "the request's",
-               h->n, h->chain[h->n - 1].G, (double)h->bytes / (1024.0 * 1024.0),
+               h->n, h->chain[h->n - 1].G.raw(), (double)h->bytes / (1024.0 * 1024.0),
                (double)h->cached / (1024.0 * 1024.0));
 }
 
@@ -809,8 +815,8 @@ static bool gen_restore_spilled_start(server *s, session_slot *sl, spilled_histo
     memset(gr, 0, sizeof(*gr));
     /* L353 no. 21: the spill's own files may still be in the writer's queue: the chain ends short without them */
     (void)kv_cache_wait_written(&s->kv);
-    const int G = s->kv_cache_find(was->text, was->hashes, was->n_img, &gr->hit);
-    if (G <= 0 || s->kv_cache_price(&gr->hit, 0) == KV_RESTORE_RECOMPUTE) {
+    const TokPos G = s->kv_cache_find(was->text, was->hashes, was->n_img, &gr->hit);
+    if (G.raw() <= 0 || s->kv_cache_price(&gr->hit, TokPos{0}) == KV_RESTORE_RECOMPUTE) {
         free(gr);
         return false;
     }
@@ -818,7 +824,7 @@ static bool gen_restore_spilled_start(server *s, session_slot *sl, spilled_histo
     gr->text = was->text;
     was->text = NULL;
     gr->adopt_src = -1;
-    s->kv_restore_begin(&gr->r, &gr->hit, 0, true, false);   /* the bank came back empty: nothing to keep */
+    s->kv_restore_begin(&gr->r, &gr->hit, TokPos{0}, true, false);   /* the bank came back empty: nothing to keep */
     gen_restore_start(sl, gr);
     return true;
 }
@@ -845,7 +851,7 @@ void server::gen_step_restore(session_slot *sl) {
     g->restore = NULL;
     j->kvr.restore_ms += r->read_ms;   /* L378: the chain reads this request waited for */
     if (gr->kind == GEN_RESTORE_SPILLED) {
-        const int G = rc > 0 ? s->kv_restore_finish(r, gr->text, NULL, 0, NULL, NULL, false) : 0;
+        const int G = rc > 0 ? s->kv_restore_finish(r, gr->text, NULL, 0, NULL, NULL, false).raw() : 0;
         j->kvr.spill_restored = G > 0;
         s->kv_restore_end(r);
         pulsar_session_bank_state_save(s->sess, sl->bank);
@@ -859,18 +865,20 @@ void server::gen_step_restore(session_slot *sl) {
         return;
     }
     gen_resolution res = gr->res;
-    const int G = rc > 0 ? s->kv_restore_finish(r, j->req.prompt_text, j->req.prompt_spans, j->req.prompt_n_spans,
-                                                &g->effective_prompt, &g->disk_cache_path,
-                                                j->req.api == API_RESPONSES)
-                         : 0;
+    const TokPos G_at = rc > 0 ? s->kv_restore_finish(r, j->req.prompt_text, j->req.prompt_spans,
+                                                      j->req.prompt_n_spans, &g->effective_prompt,
+                                                      &g->disk_cache_path, j->req.api == API_RESPONSES)
+                               : TokPos{0};
+    const int G = G_at.raw();
     s->kv_restore_end(r);
     /* L347 I3b (D7): a failed restore costs at most a miss -- the pick's best in-memory source: the bank's own history
      * while the restore wrote nothing into it (it checked the chain first), else another bank's adopt, else 0 */
     const bool bank_kept = !r->touched;
-    const int own = gr->own, adopt_src = gr->adopt_src;
+    const PromptToks own = gr->own;
+    const int adopt_src = gr->adopt_src;
     free(gr);
     if (G <= 0) {
-        const int adopt_at = s->gen_adopt_depth(sl, adopt_src);   /* again: slices ran since the pick */
+        const PromptToks adopt_at{s->gen_adopt_depth(sl, adopt_src)};   /* again: slices ran since the pick */
         const resume_pick fb = server_failed_restore_pick(own, adopt_at, bank_kept);
         if (!bank_kept) {
             res.cached = 0;
@@ -882,13 +890,13 @@ void server::gen_step_restore(session_slot *sl) {
         server_log(PULSAR_LOG_KVCACHE, "pulsar-server: bank %d's disk restore failed: resumes from %s at %d (own %d%s, "
                    "adopt %d)", sl->bank.raw(),
                    fb == RESUME_ADOPT ? "an adopt" : res.cached > 0 ? "its own history" : "0",
-                   res.cached, own, bank_kept ? ", kept: the chain was checked before the load"
-                                              : ", lost: the load had written it", adopt_at);
+                   res.cached, own.raw(), bank_kept ? ", kept: the chain was checked before the load"
+                                                    : ", lost: the load had written it", adopt_at.raw());
         s->gen_begin_plan(sl, &res);
         return;
     }
-    res.cached = G;
-    res.resumed_at = TokPos{G};   /* the chain ends at G on the bank's own tokens */
+    res.cached = G;   /* L334 P7: a live-side chain end counted as the request's tokens (P1's mix-up; kept) */
+    res.resumed_at = G_at;   /* the chain ends at G on the bank's own tokens */
     res.disk_cached = G;
     res.cache_source = "disk-text";
     /* The chain's tokens are usually the request's own up to its end: then the sync runs the request's
@@ -1181,30 +1189,37 @@ void server::gen_begin(session_slot *sl) {
      * exact frontier; nothing serves it deeper. */
     kv_chain_hit *disk_hit = NULL;   /* heap: PULSAR_KVCHAIN_MAX segments */
     resume_pick pick = RESUME_OWN;
-    int adopt_src = -1, adopt_at = 0, disk_at = 0, mem = 0, own = 0;
+    int adopt_src = -1;
+    /* L334 P7: the memory tiers' depths are the request's tokens (.served); the disk chain's end is a live position */
+    PromptToks adopt_at{0}, mem{0}, own{0}, disk_served{0};
+    TokPos disk_at{0};
     if (prompt_for_sync == &j->req.prompt) {
-        own = cached > memory_resume ? cached : memory_resume;
+        own = PromptToks{cached > memory_resume ? cached : memory_resume};
         if (s->pool_banks > 1 && !image_request) {
             for (int i = 0; i < s->n_slots; i++) {
-                const int T = s->gen_adopt_depth(sl, s->slots[i].bank.raw());
+                const PromptToks T{s->gen_adopt_depth(sl, s->slots[i].bank.raw())};
                 if (T > adopt_at) { adopt_at = T; adopt_src = s->slots[i].bank.raw(); }
             }
         }
         mem = server_resume_memory_depth(own, adopt_at);
         kv_restore_verdict disk_v = KV_RESTORE_RECOMPUTE;
-        if (s->kv.enabled && mem < j->req.prompt.len) {
+        if (s->kv.enabled && mem < PromptToks{j->req.prompt.len}) {
             disk_hit = (kv_chain_hit *)server_xmalloc(sizeof(kv_chain_hit));
             disk_at = s->kv_cache_find_req(&j->req, disk_hit);
-            if (disk_at > mem) disk_v = s->kv_cache_price(disk_hit, mem);
+            /* L334 P7: a live-side chain depth taken as prompt tokens (P1's reported mix-up; the prompt-side depth
+             * needs a re-tokenise -- Tyler's call) -- and, the same mix-up the other way, the memory depth handed to
+             * the chain's pricing as the live position the chain's tokens count past */
+            disk_served = PromptToks{disk_at.raw()};
+            if (disk_served > mem) disk_v = s->kv_cache_price(disk_hit, TokPos{mem.raw()});
         }
-        pick = server_resume_pick(own, adopt_at, disk_at, disk_v);
+        pick = server_resume_pick(own, adopt_at, disk_served, disk_v);
         pthread_mutex_lock(&s->mu);
         s->kv.meter.picks[pick]++;
         pthread_mutex_unlock(&s->mu);
         server_log(PULSAR_LOG_KVCACHE,
                    "pulsar-server: resume: bank %d own %d adopt %d%s disk %d of %d (match %d) -> %s", sl->bank.raw(),
-                   own, adopt_at, adopt_src >= 0 ? "" : " (none)", disk_at, j->req.prompt.len, pm.prompt_cut.raw(),
-                   resume_pick_names[pick]);
+                   own.raw(), adopt_at.raw(), adopt_src >= 0 ? "" : " (none)", disk_at.raw(), j->req.prompt.len,
+                   pm.prompt_cut.raw(), resume_pick_names[pick]);
     }
     /* L334: a miss is a sync from token 0 -- the live side (`cached` counts the request's tokens) */
     const bool sync_from_zero = resumed_at == TokPos{0};
@@ -1243,7 +1258,7 @@ void server::gen_begin(session_slot *sl) {
         free(disk_hit);
         /* L347 I3b (D7): what the request resumes from if the restore fails -- the bank's own resolution (checked
          * before the load writes the bank, so a content fault keeps it), and the adopt the pick weighed */
-        s->kv_restore_begin(&gr->r, &gr->hit, mem, true, own > 0);
+        s->kv_restore_begin(&gr->r, &gr->hit, TokPos{mem.raw()}, true, own > PromptToks{0});   /* L334 P7: as above */
         gr->own = own;
         gr->adopt_src = adopt_src;
         gr->res.prompt_for_sync = prompt_for_sync;
@@ -1359,8 +1374,8 @@ void server::gen_begin_plan(session_slot *sl, gen_resolution *r) {
         .srv = s,
         .slot = sl,
         .kind = j->req.kind,
-        .prompt_tokens = prompt_tokens,
-        .cached_tokens = resumed_at.raw(),   /* L334: the progress line and its persist gate count computed rows */
+        .prompt_tokens = PromptToks{prompt_tokens},
+        .cached_tokens = resumed_at,   /* L334: the progress line and its persist gate count computed rows */
         .has_tools = j->req.has_tools,
         .responses_protocol = responses_protocol,
         .t0 = g->t0,
@@ -1441,7 +1456,7 @@ void server::gen_begin_plan(session_slot *sl, gen_resolution *r) {
         /* L353: a pin-anchor's place is its caller's prompt shape (the judge: one user message), as L347 pinned it */
         const int anchor = pin_anchor ? kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync, &s->turn_markers)
                                       : kv_cache_preamble_pos(&s->kv, prompt_for_sync, &s->turn_markers);
-        int cut = kv_cache_anchor_cut(&s->kv, anchor, (int)pulsar_session_resume_grid(s->sess));
+        int cut = kv_cache_anchor_cut(&s->kv, anchor, TokCount{(int)pulsar_session_resume_grid(s->sess)});
         if (cut >= prompt_for_sync->len) cut = 0;
         if (pin_anchor && cut > 0 && s->kv_cache_pin_anchor(prompt_for_sync, cut)) cut = 0;   /* stored: pinned now */
         /* L334: the live side (what is computed, not what is counted).  A pin-anchor: from token 0, as L347 pinned it */
@@ -1491,7 +1506,7 @@ void server::gen_begin_plan(session_slot *sl, gen_resolution *r) {
         g->cold_store_len >= s->kv.opt.min_tokens &&
         g->cold_store_len < g->prompt_for_sync->len)
     {
-        tokens_copy_prefix(&g->cold_prefix, g->prompt_for_sync, g->cold_store_len);
+        tokens_copy_prefix(&g->cold_prefix, g->prompt_for_sync, TokCount{g->cold_store_len});
         g->phase = GEN_PREFILL_COLD;
     } else {
         g->phase = GEN_PREFILL_MAIN;
@@ -1539,7 +1554,7 @@ void server::gen_step_prefill(session_slot *sl) {
     const bool cut = n_images == 0 && g->share_mark > server_bank_pos(s->sess, sl->bank).raw() &&
                      g->share_mark < target->len;
     if (cut) {
-        tokens_copy_prefix(&to_cut, target, g->share_mark);
+        tokens_copy_prefix(&to_cut, target, TokCount{g->share_mark});
         target = &to_cut;
     }
 
@@ -2555,14 +2570,14 @@ struct terminal_sync_watch {
 /// pulsar_session_set_progress hook of the terminal checkpoint: counts a chunk when the position moved.
 /// @param ud      a terminal_sync_watch
 /// @param event   the phase ("prefill_chunk")
-/// @param current tokens done
+/// @param current the position the prefill stands at
 /// @param total   the sync's target
-static void terminal_progress_cb(void *ud, const char *event, int current, int total) {
+static void terminal_progress_cb(void *ud, const char *event, TokPos current, TokCount total) {
     (void)event;
     (void)total;
     terminal_sync_watch *w = (terminal_sync_watch *)ud;
-    if (w->last >= 0 && current > w->last) w->landed++;
-    w->last = current;
+    if (w->last >= 0 && current.raw() > w->last) w->landed++;
+    w->last = current.raw();
 }
 
 /// pulsar_session_set_cancel hook of the terminal checkpoint, polled at chunk ends where a resume is exact.
@@ -2614,7 +2629,7 @@ bool server::terminal_checkpoint_step(double now_sec, bool grace_waived) {
     if (!s->bank_switch(pick->bank)) return true;
     /* the records keep no image identity: a history holding an image block stays as decoded */
     if (pulsar_session_image_hashes(s->sess, NULL, 0) > 0) return true;
-    if (!resumed) tokens_copy_prefix(&target, pulsar_session_tokens(s->sess), C);
+    if (!resumed) tokens_copy_prefix(&target, pulsar_session_tokens(s->sess), TokCount{C});
     const int old_len = pulsar_session_pos(s->sess).raw();
     const double t0 = server_now_sec();
     char err[192] = "";
@@ -2645,8 +2660,8 @@ bool server::terminal_checkpoint_step(double now_sec, bool grace_waived) {
          * ending there): a live tool binding at the old end describes C now (the continuation's tail re-spells a
          * dropped stop) */
         pulsar::ScopedLock lk(&s->tool_mu);
-        if (pick->anthropic_live.valid && pick->anthropic_live.live_tokens == old_len)
-            pick->anthropic_live.live_tokens = C;
+        if (pick->anthropic_live.valid && pick->anthropic_live.live_tokens == TokCount{old_len})
+            pick->anthropic_live.live_tokens = TokCount{C};
     }
     if (out.rearm) {
         /* L380: the bank stands at the last chunk that landed, a prefix of the turn the next sync extends -- its own

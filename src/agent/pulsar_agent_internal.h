@@ -1267,9 +1267,9 @@ bool agent_on_worker_thread(agent_worker *w);
  *  once a second itself.
  *  @param ud      the agent_worker
  *  @param event   the event name
- *  @param current tokens processed so far (absolute position)
+ *  @param current the position the prefill stands at (absolute)
  *  @param total   the prompt's tokens (absolute): the bar ends at total - progress_base */
-void worker_progress_cb(void *ud, const char *event, int current, int total);
+void worker_progress_cb(void *ud, const char *event, TokPos current, TokCount total);
 /** Whether an interrupt or stop is pending.  Takes w->mu.
  *  @param w the worker
  *  @return true to abandon the current operation */

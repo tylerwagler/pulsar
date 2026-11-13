@@ -299,7 +299,7 @@ static void gpu_graph_report_prefill_display_progress(
     uint64_t done = (uint64_t)n_tokens * layer_done / (uint32_t)PULSAR_N_LAYER;
     if (layer_done == (uint32_t)PULSAR_N_LAYER) done = n_tokens;
     display_progress(display_progress_ud, "prefill_display",
-                     (int)(start + (uint32_t)done), total);
+                     TokPos{(int)(start + (uint32_t)done)}, TokCount{total});
 }
 
 
@@ -600,7 +600,7 @@ static bool gpu_graph_prefill_layer_major_inner(
     if (n_tokens > (uint32_t)prompt->len - start) return false;
 
     if (display_progress)
-        display_progress(display_progress_ud, "prefill_display", (int)start, prompt->len);
+        display_progress(display_progress_ud, "prefill_display", TokPos{(int)start}, TokCount{prompt->len});
 
     bool ok = gpu_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
     if (!ok) return false;
@@ -656,7 +656,7 @@ static bool gpu_graph_prefill_layer_major_inner(
         if (show_progress) fputc('\n', stderr);
         if (display_progress)
             display_progress(display_progress_ud, "prefill_display",
-                             (int)(start + n_tokens), prompt->len);
+                             TokPos{(int)(start + n_tokens)}, TokCount{prompt->len});
 
         /* the head reads the last row of the sweep-final stream and the pre
          * its last FFN handed on, both by row */

@@ -113,8 +113,8 @@ static std::vector<std::vector<float>> run(pulsar_engine *e, const pulsar_tokens
 struct c5_hooks {
     std::vector<int> chunk_events;
 };
-static void c5_progress(void *ud, const char *event, int current, int) {
-    if (!strcmp(event, "prefill_chunk")) ((c5_hooks *)ud)->chunk_events.push_back(current);
+static void c5_progress(void *ud, const char *event, TokPos current, TokCount) {
+    if (!strcmp(event, "prefill_chunk")) ((c5_hooks *)ud)->chunk_events.push_back(current.raw());
 }
 static bool c5_cancel(void *ud) {
     const c5_hooks *h = (const c5_hooks *)ud;

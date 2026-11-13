@@ -56,31 +56,32 @@ enum put_rc { PUT_FAILED, PUT_NO_CUT, PUT_STORED };
  *  @param key_out receives the segment's key
  *  @return PUT_STORED, PUT_NO_CUT or PUT_FAILED */
 put_rc kvchain_put(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const pulsar_tokens *toks,
-                   const char *parent, int G_prev, int G, const pulsar_kvchain_trailer *trailer,
+                   const char *parent, TokPos G_prev, TokPos G, const pulsar_kvchain_trailer *trailer,
                    const pulsar_kvchain_writer *writer, pulsar_kvchain_persist_result *r, char key_out[41]) {
-    const uint64_t payload = pulsar_session_segment_bytes(s, TokPos{G_prev}, TokPos{G}, NULL);
+    const uint64_t payload = pulsar_session_segment_bytes(s, G_prev, G, NULL);
     if (payload == 0) return PUT_NO_CUT;
-    const pulsar_tokens span = view(toks, G_prev, G);
-    size_t text_len = 0;
+    const pulsar_tokens span = view(toks, G_prev.raw(), G.raw());
+    TextBytes text_len{0};
     char *text = pulsar_kvtext_render_tokens_text(e, &span, &text_len);
     if (!text) {
-        snprintf(r->err, sizeof(r->err), "segment [%d,%d) could not be rendered", G_prev, G);
+        snprintf(r->err, sizeof(r->err), "segment [%d,%d) could not be rendered", G_prev.raw(), G.raw());
         return PUT_FAILED;
     }
     uint64_t tbytes = 0;
     if (trailer && !trailer->size(trailer->ud, text, &tbytes)) tbytes = 0;
     /* L353: the key covers the span's images: same-size images render the same text */
     uint64_t hashes[PULSAR_IMAGE_BLOCKS_MAX];
-    const int n_hashes = pulsar_session_span_image_hashes(s, TokPos{G_prev}, TokPos{G}, hashes, PULSAR_IMAGE_BLOCKS_MAX);
+    const int n_hashes = pulsar_session_span_image_hashes(s, G_prev, G, hashes, PULSAR_IMAGE_BLOCKS_MAX);
     if (n_hashes < 0) {
         free(text);
-        snprintf(r->err, sizeof(r->err), "segment [%d,%d): its image records could not be read", G_prev, G);
+        snprintf(r->err, sizeof(r->err), "segment [%d,%d): its image records could not be read", G_prev.raw(),
+                 G.raw());
         return PUT_FAILED;
     }
     pulsar_segstore_job *job = NULL;
     const uint64_t need = pulsar_segstore_seg_file_bytes(text_len, payload, tbytes);
     const int rc = reserve_with_room(writer, need, [&]() {
-        return pulsar_segstore_reserve_images(st, parent, (uint32_t)G_prev, (uint32_t)G, text, text_len, hashes,
+        return pulsar_segstore_reserve_images(st, parent, G_prev, G, text, text_len, hashes,
                                               (uint32_t)n_hashes, payload, tbytes, key_out, &job, r->err, sizeof(r->err));
     }, r);
     if (rc <= 0) {   /* held or being written (0), or refused (-1 / -2, err) */
@@ -88,15 +89,15 @@ put_rc kvchain_put(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, con
         return rc == 0 ? PUT_STORED : PUT_FAILED;
     }
     /* the bank's rows are copied out now (the bank moves on); the file is the writer's */
-    bool ok = pulsar_session_copy_out_segment(s, TokPos{G_prev}, TokPos{G}, key_out, pulsar_segstore_job_payload(job),
+    bool ok = pulsar_session_copy_out_segment(s, G_prev, G, key_out, pulsar_segstore_job_payload(job),
                                               payload, r->err, sizeof(r->err)) == 0;
     if (ok && tbytes) {   /* a memory stream over the trailer's place in the image (one byte past it is the image's) */
         FILE *m = fmemopen(pulsar_segstore_job_trailer(job), (size_t)tbytes + 1u, "wb");
         ok = m && trailer->write(m, trailer->ud, text, r->err, sizeof(r->err)) == 0 && fflush(m) == 0 &&
              (uint64_t)ftello(m) == tbytes;
         if (m) fclose(m);
-        if (!ok && !r->err[0]) snprintf(r->err, sizeof(r->err), "segment [%d,%d): its trailer was not written", G_prev,
-                                        G);
+        if (!ok && !r->err[0])
+            snprintf(r->err, sizeof(r->err), "segment [%d,%d): its trailer was not written", G_prev.raw(), G.raw());
     }
     free(text);
     if (!ok) {
@@ -124,7 +125,8 @@ bool kvchain_put_rp(pulsar_segstore *st, const pulsar_kvchain_rp_source *src, co
     pulsar_segstore_seg had;
     if (pulsar_segstore_get(st, link.key, &had) && had.rp_bytes > 0u) {
         if (pulsar_segstore_flag_rp(st, link.key, flags)) return true;
-        snprintf(r->err, sizeof(r->err), "restore point %.40s at %d: its flags could not be written", link.key, link.G);
+        snprintf(r->err, sizeof(r->err), "restore point %.40s at %d: its flags could not be written", link.key,
+                 link.G.raw());
         return false;
     }
     const uint64_t bytes = src->bytes(src->ud, link.G);
@@ -145,14 +147,14 @@ bool kvchain_put_rp(pulsar_segstore *st, const pulsar_kvchain_rp_source *src, co
 }
 /** The installed bank's checkpoints as a pulsar_kvchain_rp_source::bytes.  @param ud the pulsar_session
  *  @param G the position  @return pulsar_session_restore_point_bytes at G (0: no checkpoint there) */
-uint64_t session_rp_bytes(void *ud, int G) {
-    return pulsar_session_restore_point_bytes((pulsar_session *)ud, TokPos{G});
+uint64_t session_rp_bytes(void *ud, TokPos G) {
+    return pulsar_session_restore_point_bytes((pulsar_session *)ud, G);
 }
 /** The installed bank's checkpoints as a pulsar_kvchain_rp_source::copy.  @param ud the session  @param G the position
  *  @param key the segment's key  @param dst the restore point's place  @param bytes its size  @param err reason
  *  @param errlen bytes at err  @return pulsar_session_copy_out_restore_point's status: 0 = copied */
-int session_rp_copy(void *ud, int G, const char *key, uint8_t *dst, uint64_t bytes, char *err, size_t errlen) {
-    return pulsar_session_copy_out_restore_point((pulsar_session *)ud, TokPos{G}, key, dst, bytes, err, errlen);
+int session_rp_copy(void *ud, TokPos G, const char *key, uint8_t *dst, uint64_t bytes, char *err, size_t errlen) {
+    return pulsar_session_copy_out_restore_point((pulsar_session *)ud, G, key, dst, bytes, err, errlen);
 }
 /** The inline writer's wait_room: nothing is ever in flight, so the pool's room is what eviction makes now.
  *  @param ud the store  @param file_bytes the file's bytes  @return pulsar_segstore_ram_make_room */
@@ -172,21 +174,26 @@ pulsar_kvchain_writer pulsar_kvchain_writer_inline(pulsar_segstore *st) {
     return w;
 }
 
-int pulsar_kvchain_grid(pulsar_session *s) { return pulsar_session_prefill_cap(s).raw(); }
+TokCount pulsar_kvchain_grid(pulsar_session *s) { return pulsar_session_prefill_cap(s); }
 
-int pulsar_kvchain_segment_ends(int prev, int deepest, int grid, bool tail, int *ends, int cap) {
-    if (grid <= 0 || prev < 0 || deepest <= prev) return 0;
+int pulsar_kvchain_segment_ends(TokPos prev, TokPos deepest, TokCount grid, bool tail, TokPos *ends, int cap) {
+    /* L334 P7: a grid point is a multiple of the grid -- a scaled position, int arithmetic on the raw values (a
+     * negative prev, none() included, writes nothing, as the int did) */
+    const int p = prev.raw(), d = deepest.raw(), gr = grid.raw();
+    if (gr <= 0 || p < 0 || d <= p) return 0;
     int m = 0;
-    for (int g = (prev / grid + 1) * grid; g <= deepest && m < cap; g += grid) ends[m++] = g;
-    if (tail && deepest % grid != 0 && m < cap) ends[m++] = deepest;
+    for (int g = (p / gr + 1) * gr; g <= d && m < cap; g += gr) ends[m++] = TokPos{g};
+    if (tail && d % gr != 0 && m < cap) ends[m++] = deepest;
     return m;
 }
 
-bool pulsar_kvchain_rp_periodic(int G, int grid) {
-    return grid > 0 && G > 0 && G % (grid * PULSAR_KVCHAIN_RP_EVERY_CELLS) == 0;
+bool pulsar_kvchain_rp_periodic(TokPos G, TokCount grid) {
+    /* a multiple of whole cells: raw int arithmetic, as for the grid points */
+    return grid.raw() > 0 && G.raw() > 0 && G.raw() % (grid.raw() * PULSAR_KVCHAIN_RP_EVERY_CELLS) == 0;
 }
 
-void pulsar_kvchain_place_rps(pulsar_segstore *st, const pulsar_kvchain_link *links, int n, int grid, unsigned what,
+void pulsar_kvchain_place_rps(pulsar_segstore *st, const pulsar_kvchain_link *links, int n, TokCount grid,
+                              unsigned what,
                               const pulsar_kvchain_rp_source *src, const pulsar_kvchain_writer *writer,
                               pulsar_kvchain_persist_result *r) {
     for (int i = 0; i < n; i++) {
@@ -205,7 +212,8 @@ void pulsar_kvchain_place_rps(pulsar_segstore *st, const pulsar_kvchain_link *li
     }
 }
 
-int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, int min_tokens, unsigned what,
+int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, TokCount min_tokens,
+                           unsigned what,
                            const pulsar_kvchain_trailer *trailer, const pulsar_kvchain_writer *writer,
                            pulsar_kvchain_persist_result *out) {
     pulsar_kvchain_persist_result r;
@@ -236,40 +244,39 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
         if (out) *out = r;
         return 0;
     }
-    const int end = end_pos.raw();
-    const int deepest = end > 0 ? pulsar_session_checkpoint_best(s, end_pos).raw() : 0;
-    const int grid = pulsar_kvchain_grid(s);
-    if (deepest <= 0 || deepest < min_tokens || grid <= 0) {
+    const TokPos deepest = end_pos.raw() > 0 ? pulsar_session_checkpoint_best(s, end_pos) : TokPos{0};
+    const TokCount grid = pulsar_kvchain_grid(s);
+    if (deepest.raw() <= 0 || deepest.before() < min_tokens || grid.raw() <= 0) {
         if (out) *out = r;
         return 0;
     }
     /* L323: the parent is the deepest stored GRID-ENDED chain of this history -- a tail is never extended */
     char parent[41] = "";
-    int prev = 0;
+    TokPos prev{0};
     {
-        const pulsar_tokens head = view(toks, 0, deepest);
-        size_t full_len = 0;
+        const pulsar_tokens head = view(toks, 0, deepest.raw());
+        TextBytes full_len{0};
         char *full = pulsar_kvtext_render_tokens_text(e, &head, &full_len);
-        const pulsar_segstore_end grid_end = { (uint32_t)grid, false };
+        const pulsar_segstore_end grid_end = { grid, false };
         pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
         /* L353: this history's own images: another image's chain over the same text is not its parent */
         uint64_t hashes[PULSAR_IMAGE_BLOCKS_MAX];
-        const int n_hashes = pulsar_session_span_image_hashes(s, TokPos{0}, TokPos{deepest}, hashes, PULSAR_IMAGE_BLOCKS_MAX);
+        const int n_hashes = pulsar_session_span_image_hashes(s, TokPos{0}, deepest, hashes, PULSAR_IMAGE_BLOCKS_MAX);
         const int c = full && n_hashes >= 0 ? pulsar_segstore_lookup_images(st, full, full_len, &grid_end, hashes,
                                                                             (uint32_t)n_hashes, chain, PULSAR_KVCHAIN_MAX)
                                             : 0;
         free(full);
-        if (c > 0 && (int)chain[c - 1].G <= deepest) {
-            const pulsar_tokens upto = view(toks, 0, (int)chain[c - 1].G);
-            size_t upto_len = 0;
+        if (c > 0 && chain[c - 1].G <= deepest) {
+            const pulsar_tokens upto = view(toks, 0, chain[c - 1].G.raw());
+            TextBytes upto_len{0};
             free(pulsar_kvtext_render_tokens_text(e, &upto, &upto_len));
             if (upto_len == chain[c - 1].text_end) {
                 memcpy(parent, chain[c - 1].key, 41);
-                prev = (int)chain[c - 1].G;
+                prev = chain[c - 1].G;
             }
         }
     }
-    int ends[PULSAR_KVCHAIN_MAX];
+    TokPos ends[PULSAR_KVCHAIN_MAX];
     const int m = pulsar_kvchain_segment_ends(prev, deepest, grid, (what & PULSAR_KVCHAIN_TAIL) != 0u, ends,
                                               PULSAR_KVCHAIN_MAX);
     /* the chain's segments this persist passes, for the restore point policy: the new ones, or the stored end alone */
@@ -280,7 +287,7 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
         const put_rc rc = kvchain_put(st, e, s, toks, parent, prev, ends[k], trailer, writer, &r, key);
         if (rc == PUT_NO_CUT && ends[k] != deepest) continue;   /* an image block across this grid point: no cut */
         if (rc != PUT_STORED) {
-            if (!r.err[0]) snprintf(r.err, sizeof(r.err), "[%d,%d) is not a segment span", prev, ends[k]);
+            if (!r.err[0]) snprintf(r.err, sizeof(r.err), "[%d,%d) is not a segment span", prev.raw(), ends[k].raw());
             break;
         }
         memcpy(parent, key, 41);
@@ -288,7 +295,7 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
         memcpy(links[n_links].key, key, 41);
         links[n_links++].G = prev;
     }
-    if (n_links == 0 && prev > 0) {
+    if (n_links == 0 && prev > TokPos{0}) {
         memcpy(links[0].key, parent, 41);
         links[n_links++].G = prev;
     }
@@ -302,18 +309,18 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
     return r.written;
 }
 
-int pulsar_kvchain_find(pulsar_segstore *st, const char *text, size_t text_len, const uint64_t *image_hashes,
-                        int n_images, int min_tokens, pulsar_segstore_seg *chain, int cap, uint64_t *bytes, char *err,
-                        size_t errlen) {
+int pulsar_kvchain_find(pulsar_segstore *st, const char *text, TextBytes text_len, const uint64_t *image_hashes,
+                        int n_images, TokCount min_tokens, pulsar_segstore_seg *chain, int cap, uint64_t *bytes,
+                        char *err, size_t errlen) {
     if (bytes) *bytes = 0;
     if (err && errlen) err[0] = '\0';
     if (!st || !text) return 0;
-    const pulsar_segstore_end state_end = { 0u, true };   /* L323: a restore needs the state at the chain's end */
+    const pulsar_segstore_end state_end = { TokCount{0}, true };   /* L323: a restore needs the state at its end */
     /* L281 / L353: the keys cover the images, so the chain stops at the first block that is not the request's */
     int n = pulsar_segstore_lookup_images(st, text, text_len, &state_end, image_hashes,
                                           n_images > 0 ? (uint32_t)n_images : 0u, chain, cap);
     while (n > 0 && chain[n - 1].rp_bytes == 0) n--;   /* L347: back to the last restore point below an image cut */
-    if (n == 0 || (int)chain[n - 1].G < min_tokens) return 0;
+    if (n == 0 || chain[n - 1].G.before() < min_tokens) return 0;
     if (bytes) *bytes = pulsar_kvchain_load_bytes(chain, n);
     return n;
 }
@@ -413,8 +420,8 @@ int pulsar_kvchain_verify_slice_with(pulsar_segstore *st, const pulsar_segstore_
         }
         if (why != PULSAR_SEGMENT_OK) {
             if (err && errlen)
-                snprintf(err, errlen, "segment %s [%u,%u) failed its check before the load (%s) -- %s", chain[i].key,
-                         chain[i].G_prev, chain[i].G, lerr, kvchain_fault_word(why));
+                snprintf(err, errlen, "segment %s [%d,%d) failed its check before the load (%s) -- %s", chain[i].key,
+                         chain[i].G_prev.raw(), chain[i].G.raw(), lerr, kvchain_fault_word(why));
             return kvchain_fault(st, chain[i], why, read_failed);
         }
         *next = i + 1;
@@ -434,15 +441,15 @@ int pulsar_kvchain_load_slice_with(pulsar_segstore *st, const pulsar_segstore_se
         /* L347 I3a: each part from its RAM copy, or read off disk and digest-checked by the store */
         bool read_failed = false;
         pulsar_segment_status why = kvchain_map(st, chain, n, i, &seg, &pb, &rp, &rb, &read_failed, lerr, sizeof lerr);
-        int G = 0;
+        TokPos G{0};
         if (why == PULSAR_SEGMENT_OK) {
             why = load(ud, seg, pb, last, rp, rb, &G, chain[i].key, lerr, sizeof(lerr));
             kvchain_unmap(st, chain, n, i);
         }
         if (why != PULSAR_SEGMENT_OK) {
             if (err && errlen)
-                snprintf(err, errlen, "segment %s [%u,%u) failed to load (%s) -- %s", chain[i].key, chain[i].G_prev,
-                         chain[i].G, lerr, kvchain_fault_word(why));
+                snprintf(err, errlen, "segment %s [%d,%d) failed to load (%s) -- %s", chain[i].key,
+                         chain[i].G_prev.raw(), chain[i].G.raw(), lerr, kvchain_fault_word(why));
             return kvchain_fault(st, chain[i], why, read_failed);
         }
         *next = i + 1;
@@ -484,12 +491,12 @@ int pulsar_kvchain_verify_slice(pulsar_segstore *st, pulsar_session *s, const pu
  *  @param errlen   size of `err`
  *  @return pulsar_session_load_segment's status */
 static pulsar_segment_status session_segment_loader(void *ud, const uint8_t *seg, uint64_t bytes, bool last,
-                                                    const uint8_t *rp, uint64_t rp_bytes, int *G, const char *key,
+                                                    const uint8_t *rp, uint64_t rp_bytes, TokPos *G, const char *key,
                                                     char *err, size_t errlen) {
     TokPos at{0};
     const pulsar_segment_status rc = pulsar_session_load_segment((pulsar_session *)ud, seg, bytes, last, rp, rp_bytes,
                                                                  G ? &at : NULL, key, err, errlen);
-    if (G) *G = at.raw();
+    if (G) *G = at;
     return rc;
 }
 
@@ -500,46 +507,47 @@ int pulsar_kvchain_load_slice(pulsar_segstore *st, pulsar_session *s, const puls
     return rc;
 }
 
-int pulsar_kvchain_load_check(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const char *text,
-                              const pulsar_segstore_seg *chain, int n, char *err, size_t errlen) {
+TokPos pulsar_kvchain_load_check(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const char *text,
+                                 const pulsar_segstore_seg *chain, int n, char *err, size_t errlen) {
     if (err && errlen) err[0] = '\0';
     const pulsar_tokens *loaded = pulsar_session_tokens(s);
     /* L196: a chain whose text ends with an EOS its tokens never sampled (or the
      * reverse) would have the rest tokenised from the wrong byte. */
-    if (!loaded || loaded->len != (int)chain[n - 1].G ||
+    if (!loaded || loaded->len != chain[n - 1].G.raw() ||
         !pulsar_kvtext_text_ends_with_live(e, text, chain[n - 1].text_end, loaded)) {
         if (err && errlen)
-            snprintf(err, errlen, "chain to %u disagrees with its tokens at the boundary -- dropped", chain[n - 1].G);
+            snprintf(err, errlen, "chain to %d disagrees with its tokens at the boundary -- dropped",
+                     chain[n - 1].G.raw());
         pulsar_segstore_drop(st, chain[n - 1].key);
         pulsar_session_invalidate(s);
-        return 0;
+        return TokPos{0};
     }
     pulsar_segstore_touch(st, chain, n);
-    return (int)chain[n - 1].G;
+    return chain[n - 1].G;
 }
 
-int pulsar_kvchain_load(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const char *text,
-                        const pulsar_segstore_seg *chain, int n, char *err, size_t errlen) {
+TokPos pulsar_kvchain_load(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const char *text,
+                           const pulsar_segstore_seg *chain, int n, char *err, size_t errlen) {
     if (err && errlen) err[0] = '\0';
-    if (!st || !text || n <= 0) return 0;
+    if (!st || !text || n <= 0) return TokPos{0};
     /* the one-shot load is the sliced load's one slice: the whole chain */
     int next = 0;
-    if (pulsar_kvchain_load_slice(st, s, chain, n, &next, n, err, errlen) != 0) return 0;
+    if (pulsar_kvchain_load_slice(st, s, chain, n, &next, n, err, errlen) != 0) return TokPos{0};
     return pulsar_kvchain_load_check(st, e, s, text, chain, n, err, errlen);
 }
 
-int pulsar_kvchain_restore(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const char *text,
-                           size_t text_len, const uint64_t *image_hashes, int n_images, int min_tokens,
-                           pulsar_segstore_seg *chain, int cap, int *n_out, char *err, size_t errlen) {
+TokPos pulsar_kvchain_restore(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const char *text,
+                              TextBytes text_len, const uint64_t *image_hashes, int n_images, TokCount min_tokens,
+                              pulsar_segstore_seg *chain, int cap, int *n_out, char *err, size_t errlen) {
     if (n_out) *n_out = 0;
     const int n = pulsar_kvchain_find(st, text, text_len, image_hashes, n_images, min_tokens, chain, cap, NULL, err,
                                       errlen);
-    if (n == 0) return 0;
+    if (n == 0) return TokPos{0};
     /* a chain cut at an image still loads (find said why in `err`); a load failure says its own why instead */
     char lerr[384] = "";
-    const int G = pulsar_kvchain_load(st, e, s, text, chain, n, lerr, sizeof(lerr));
+    const TokPos G = pulsar_kvchain_load(st, e, s, text, chain, n, lerr, sizeof(lerr));
     if (lerr[0] && err && errlen) snprintf(err, errlen, "%s", lerr);
-    if (G > 0 && n_out) *n_out = n;
+    if (G > TokPos{0} && n_out) *n_out = n;
     return G;
 }
 

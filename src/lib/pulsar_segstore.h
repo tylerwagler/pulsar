@@ -59,6 +59,8 @@
  * used first.  Apart from that, pulsar_segstore_pin holds a key against eviction while a restore
  * reads its chain (the same count as a write in flight's parent). */
 
+#include "pulsar_units.h"   /* TokPos / TokCount: a segment's span; TextBytes: its text (L334 P7) */
+
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -101,10 +103,11 @@ typedef struct {
     /// This segment's key: 40 hex chars of sha1(parent || text) + NUL
     char key[41];
     char parent[41];          ///< "" for a root
-    /** Token span [G_prev, G): G_prev is the parent's end (0 for a root), G this segment's end. */
-    uint32_t G_prev, G;       ///< token span
-    uint64_t text_end;        ///< bytes of chain text from position 0 to G (index-derived)
-    uint64_t text_len;        ///< this segment's own text bytes
+    /** Token span [G_prev, G): G_prev is the parent's end (0 for a root), G this segment's end -- live-side
+     *  positions on the writer's history (L334 P7: TokPos; the file holds them as uint32). */
+    TokPos G_prev, G;         ///< token span
+    TextBytes text_end;       ///< bytes of chain text from position 0 to G (index-derived)
+    TextBytes text_len;       ///< this segment's own text bytes
     /// Engine payload bytes (rows only, L347), pulsar_session_copy_out_segment's output
     uint64_t payload_bytes;
     uint64_t rp_bytes;        ///< L347: bytes of the key's .rp file, the restore point at G (0 = none)
@@ -129,8 +132,8 @@ typedef struct {
 /** L323: which chain ends a lookup accepts.  `grid`: the last segment's G is a multiple of it (0 = any end);
  *  `state`: the last segment has a restore point (L347). */
 typedef struct {
-    /// In tokens: the chain's end G must be a multiple of it (0 = any end)
-    uint32_t grid;
+    /// In tokens: the chain's end G must be a multiple of it (0 = any end; L334 P7: TokCount)
+    TokCount grid;
     /// The last segment must have a restore point (rp_bytes > 0)
     bool state;
 } pulsar_segstore_end;
@@ -242,7 +245,7 @@ void pulsar_segstore_set_ram(pulsar_segstore *st, pulsar_kvpool *pool, bool reta
 /// @param len    bytes of `text`
 /// @param out    receives the 40 hex chars of sha1(parent || text) and a NUL
 /** The key rule, the one authority for it. */
-void pulsar_segstore_child_key(const char *parent, const char *text, size_t len, char out[41]);
+void pulsar_segstore_child_key(const char *parent, const char *text, TextBytes len, char out[41]);
 
 /** L353: a segment's key: its parent, its text, and the content hashes of the image blocks in its span.  An image block
  *  renders as a fixed placeholder, so without the hashes two same-size images share every key: "the same key is the
@@ -253,7 +256,7 @@ void pulsar_segstore_child_key(const char *parent, const char *text, size_t len,
  *  @param hashes [n] the span's image content hashes, in position order
  *  @param n      hashes
  *  @param out    receives the 40 hex digits and a NUL */
-void pulsar_segstore_child_key_images(const char *parent, const char *text, size_t len, const uint64_t *hashes,
+void pulsar_segstore_child_key_images(const char *parent, const char *text, TextBytes len, const uint64_t *hashes,
                                       uint32_t n, char out[41]);
 
 /** L353: pulsar_segstore_lookup for a request carrying images: each child's key is reproduced from the request's bytes
@@ -268,7 +271,7 @@ void pulsar_segstore_child_key_images(const char *parent, const char *text, size
  *  @param chain  receives the deepest accepted chain, root first
  *  @param cap    entries `chain` holds
  *  @return segments in `chain`, 0 when none */
-int pulsar_segstore_lookup_images(pulsar_segstore *st, const char *text, size_t len, const pulsar_segstore_end *want,
+int pulsar_segstore_lookup_images(pulsar_segstore *st, const char *text, TextBytes len, const pulsar_segstore_end *want,
                                   const uint64_t *hashes, uint32_t n, pulsar_segstore_seg *chain, int cap);
 
 /// @param st    the store
@@ -280,7 +283,7 @@ int pulsar_segstore_lookup_images(pulsar_segstore *st, const char *text, size_t 
 /// @return the chain's length, 0 when no chain matches
 /** The deepest chain (by G, then by text) whose text is a byte prefix of text[0, len) and whose last segment `want`
  * accepts (NULL: any), root first, at most `cap` long.  Returns its length (0: none). */
-int pulsar_segstore_lookup(pulsar_segstore *st, const char *text, size_t len, const pulsar_segstore_end *want,
+int pulsar_segstore_lookup(pulsar_segstore *st, const char *text, TextBytes len, const pulsar_segstore_end *want,
                            pulsar_segstore_seg *chain, int cap);
 /** Is `key` stored?
  *  @param st  the store, or NULL (false)
@@ -314,8 +317,8 @@ bool pulsar_segstore_get(pulsar_segstore *st, const char key[41], pulsar_segstor
  * from parent and text here, so a caller cannot store a segment under the
  * wrong name.  The written key is returned in key_out.  The same key twice is one
  * segment: a put of a stored key writes nothing. */
-bool pulsar_segstore_put(pulsar_segstore *st, const char *parent, uint32_t G_prev, uint32_t G,
-                         const char *text, size_t text_len,
+bool pulsar_segstore_put(pulsar_segstore *st, const char *parent, TokPos G_prev, TokPos G,
+                         const char *text, TextBytes text_len,
                          uint64_t payload_bytes, pulsar_segstore_write_fn write_payload,
                          uint64_t trailer_bytes, pulsar_segstore_write_fn write_trailer,
                          void *ud, char key_out[41], char *err, size_t errlen);
@@ -345,10 +348,10 @@ typedef struct pulsar_segstore_job pulsar_segstore_job;
 /// @param job_out       receives the job
 /// @param err           receives a reason on failure
 /// @param errlen        size of `err`
-int pulsar_segstore_reserve_images(pulsar_segstore *st, const char *parent, uint32_t G_prev, uint32_t G, const char *text,
-                                   size_t text_len, const uint64_t *hashes, uint32_t n_hashes, uint64_t payload_bytes,
-                                   uint64_t trailer_bytes, char key_out[41], pulsar_segstore_job **job_out, char *err,
-                                   size_t errlen);
+int pulsar_segstore_reserve_images(pulsar_segstore *st, const char *parent, TokPos G_prev, TokPos G, const char *text,
+                                   TextBytes text_len, const uint64_t *hashes, uint32_t n_hashes,
+                                   uint64_t payload_bytes, uint64_t trailer_bytes, char key_out[41],
+                                   pulsar_segstore_job **job_out, char *err, size_t errlen);
 
 /// @param st            the store
 /// @param parent        the parent's key, "" for a root (stored, or pending)
@@ -364,8 +367,8 @@ int pulsar_segstore_reserve_images(pulsar_segstore *st, const char *parent, uint
 /// @param errlen        size of `err`
 /// @return 1: a job to write and commit; 0: the store holds (or is writing) what this write would; -1: refused; -2:
 ///         no room in the RAM pool now (nothing changed but evictions; the caller may wait for its writer and retry)
-int pulsar_segstore_reserve(pulsar_segstore *st, const char *parent, uint32_t G_prev, uint32_t G, const char *text,
-                            size_t text_len, uint64_t payload_bytes, uint64_t trailer_bytes, char key_out[41],
+int pulsar_segstore_reserve(pulsar_segstore *st, const char *parent, TokPos G_prev, TokPos G, const char *text,
+                            TextBytes text_len, uint64_t payload_bytes, uint64_t trailer_bytes, char key_out[41],
                             pulsar_segstore_job **job_out, char *err, size_t errlen);
 /** L347 I3a: a restore point's reserve -- the restore point of stored (or pending) segment `key`, as a job like a
  *  segment's: room made (never `key`), its image allocated with its header, the key pinned until the commit; the
@@ -401,10 +404,10 @@ const char *pulsar_segstore_job_key(const pulsar_segstore_job *job);
 int pulsar_segstore_job_kind(const pulsar_segstore_job *job);
 /// @param job the job
 /// @return its first token position (0 for a restore point)
-uint32_t pulsar_segstore_job_G_prev(const pulsar_segstore_job *job);
+TokPos pulsar_segstore_job_G_prev(const pulsar_segstore_job *job);
 /// @param job the job
 /// @return its end position (a restore point: its segment's, 0 while that one is pending)
-uint32_t pulsar_segstore_job_G(const pulsar_segstore_job *job);
+TokPos pulsar_segstore_job_G(const pulsar_segstore_job *job);
 /// @param job the job
 /// @return the file's bytes
 uint64_t pulsar_segstore_job_bytes(const pulsar_segstore_job *job);
@@ -425,7 +428,7 @@ uint8_t *pulsar_segstore_job_trailer(pulsar_segstore_job *job);
  *  @param payload_bytes its payload's bytes
  *  @param trailer_bytes its trailer's bytes
  *  @return the file's bytes */
-uint64_t pulsar_segstore_seg_file_bytes(uint64_t text_len, uint64_t payload_bytes, uint64_t trailer_bytes);
+uint64_t pulsar_segstore_seg_file_bytes(TextBytes text_len, uint64_t payload_bytes, uint64_t trailer_bytes);
 /** L347 I3a: a restore point file's bytes (header, payload).
  *  @param rp_bytes the restore point's bytes
  *  @return the file's bytes */
@@ -475,7 +478,7 @@ bool pulsar_segstore_flag_rp(pulsar_segstore *st, const char key[41], uint32_t f
  *  @param len       bytes of it to cover
  *  @param rp_at_len receives whether a chain ending at `len` has a restore point
  *  @return true when stored rows cover text[0, len) */
-bool pulsar_segstore_covers(pulsar_segstore *st, const char *text, size_t len, bool *rp_at_len);
+bool pulsar_segstore_covers(pulsar_segstore *st, const char *text, TextBytes len, bool *rp_at_len);
 /** L347 I3a: a stored part's payload for a load: its RAM copy when it has one, else its file read whole with O_DIRECT
  *  into an image, checked (size, header, the payload's digest) -- kept as its RAM copy with the RAM tier, else lent
  *  until the unmap.  The part stays mapped (never evicted from RAM) until pulsar_segstore_unmap_part.
@@ -572,7 +575,7 @@ uint64_t pulsar_segstore_release(pulsar_segstore *st, const char tip[41], const 
  *  @param text_len      bytes of `text`
  *  @param ud            context given to pulsar_segstore_foreach_trailer
  *  @return false to stop the walk */
-typedef bool (*pulsar_segstore_trailer_fn)(FILE *fp, uint64_t trailer_bytes, const char *text, size_t text_len,
+typedef bool (*pulsar_segstore_trailer_fn)(FILE *fp, uint64_t trailer_bytes, const char *text, TextBytes text_len,
                                            void *ud);
 /** Run `fn` over every segment that carries a trailer, in index order.  L353: the one call safe off the store's thread
  *  (a chat parse's): it copies the entries under a lock and reads the files without it, so one evicted meanwhile is

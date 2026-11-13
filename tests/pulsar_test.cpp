@@ -234,8 +234,9 @@ static bool test_token_bytes_equal(pulsar_engine *engine, TokId token,
     return eq;
 }
 
-static void test_long_prefill_progress(void *ud, const char *event, int current, int total) {
+static void test_long_prefill_progress(void *ud, const char *event, TokPos current_at, TokCount total_n) {
     (void)ud;
+    const int current = current_at.raw(), total = total_n.raw();
     if (strcmp(event, "prefill_chunk")) return;
     if (current == 0 || current == total || current % 8192 == 0) {
         fprintf(stderr, "pulsar-test: long-context prefill %d/%d\n", current, total);
@@ -1035,8 +1036,9 @@ struct test_quantum {
     int start;    /* the position the quantum began at: the planner's first event (-1 until it arrives) */
     int chunks;   /* chunks landed past it */
 };
-static void test_quantum_progress(void *ud, const char *event, int current, int) {
+static void test_quantum_progress(void *ud, const char *event, TokPos current_at, TokCount) {
     test_quantum *q = (test_quantum *)ud;
+    const int current = current_at.raw();
     if (strcmp(event, "prefill_chunk") != 0) return;
     if (q->start < 0) q->start = current;   /* the walk announces where it starts before any chunk runs */
     else if (current > q->start) q->chunks++;
@@ -1190,13 +1192,14 @@ static void test_image_chain_round_trip(void) {
     pulsar_kvchain_persist_result pr;
     memset(&pr, 0, sizeof pr);
     const pulsar_kvchain_writer inl = pulsar_kvchain_writer_inline(st);
-    if (ok) pulsar_kvchain_persist(st, engine, sa, 0, PULSAR_KVCHAIN_TAIL | PULSAR_KVCHAIN_RP, NULL, &inl, &pr);
+    if (ok)
+        pulsar_kvchain_persist(st, engine, sa, TokCount{0}, PULSAR_KVCHAIN_TAIL | PULSAR_KVCHAIN_RP, NULL, &inl, &pr);
     fprintf(stderr, "image-chain gate: %d-token prompt, block at %d; persisted %d segment(s) to %d%s%s\n", prompt.len,
-            img.start_pos, pr.written, pr.end, pr.err[0] ? " -- " : "", pr.err);
-    TEST_ASSERT(pr.written > 0 && pr.end > img.start_pos);   /* the chain goes past the image */
+            img.start_pos, pr.written, pr.end.raw(), pr.err[0] ? " -- " : "", pr.err);
+    TEST_ASSERT(pr.written > 0 && pr.end.raw() > img.start_pos);   /* the chain goes past the image */
     if (sa) pulsar_session_free(sa);
 
-    size_t tlen = 0;
+    TextBytes tlen{0};
     char *text = pulsar_kvtext_render_tokens_text(engine, &longer, &tlen);
     const uint64_t right = pulsar_image_hash(&img), wrong = right ^ 1u;
     pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
@@ -1207,11 +1210,11 @@ static void test_image_chain_round_trip(void) {
     float *cold = (float *)xmalloc((size_t)vocab * sizeof(float));
     pulsar_session *sb = NULL;
     TEST_ASSERT(pulsar_session_create(&sb, engine, ctx) == 0);
-    const int G = sb && text ? pulsar_kvchain_restore(st, engine, sb, text, tlen, &right, 1, 0, chain, PULSAR_KVCHAIN_MAX,
-                                                       &nseg, err, sizeof err) : 0;
+    const int G = sb && text ? pulsar_kvchain_restore(st, engine, sb, text, tlen, &right, 1, TokCount{0}, chain,
+                                                       PULSAR_KVCHAIN_MAX, &nseg, err, sizeof err).raw() : 0;
     fprintf(stderr, "image-chain gate: restore with the image stands at %d (%d segment(s))%s%s\n", G, nseg,
             err[0] ? " -- " : "", err);
-    TEST_ASSERT(G == pr.end);
+    TEST_ASSERT(G == pr.end.raw());
     pulsar_image_ref ib = img;
     bool okb = G > 0 && pulsar_session_sync_mm(sb, &longer, &ib, 1, err, sizeof err) == 0 &&
                pulsar_session_copy_logits(sb, reused, vocab) == vocab;
@@ -1239,8 +1242,8 @@ static void test_image_chain_round_trip(void) {
     pulsar_session *sd = NULL;
     TEST_ASSERT(pulsar_session_create(&sd, engine, ctx) == 0);
     err[0] = '\0';
-    const int Gd = sd && text ? pulsar_kvchain_restore(st, engine, sd, text, tlen, &wrong, 1, 0, chain,
-                                                        PULSAR_KVCHAIN_MAX, &nseg, err, sizeof err) : -1;
+    const int Gd = sd && text ? pulsar_kvchain_restore(st, engine, sd, text, tlen, &wrong, 1, TokCount{0}, chain,
+                                                        PULSAR_KVCHAIN_MAX, &nseg, err, sizeof err).raw() : -1;
     fprintf(stderr, "image-chain gate: restore with another image stands at %d -- %s\n", Gd, err);
     TEST_ASSERT(Gd >= 0 && Gd <= img.start_pos);
     if (sd) pulsar_session_free(sd);
@@ -1261,9 +1264,10 @@ static void test_image_chain_round_trip(void) {
     TEST_ASSERT(oky);
     pulsar_kvchain_persist_result py;
     memset(&py, 0, sizeof py);
-    if (oky) pulsar_kvchain_persist(st, engine, sy, 0, PULSAR_KVCHAIN_TAIL | PULSAR_KVCHAIN_RP, NULL, &inl, &py);
-    fprintf(stderr, "image-chain gate: the same-size other image persisted %d segment(s) to %d%s%s\n", py.written, py.end,
-            py.err[0] ? " -- " : "", py.err);
+    if (oky)
+        pulsar_kvchain_persist(st, engine, sy, TokCount{0}, PULSAR_KVCHAIN_TAIL | PULSAR_KVCHAIN_RP, NULL, &inl, &py);
+    fprintf(stderr, "image-chain gate: the same-size other image persisted %d segment(s) to %d%s%s\n", py.written,
+            py.end.raw(), py.err[0] ? " -- " : "", py.err);
     if (sy) pulsar_session_free(sy);
     const uint64_t hash_y = pulsar_image_hash(&iy);
     for (int which = 0; which < 2; which++) {
@@ -1272,12 +1276,12 @@ static void test_image_chain_round_trip(void) {
         pulsar_session *se = NULL, *sf = NULL;
         TEST_ASSERT(pulsar_session_create(&se, engine, ctx) == 0 && pulsar_session_create(&sf, engine, ctx) == 0);
         err[0] = '\0';
-        const int Ge = se && text ? pulsar_kvchain_restore(st, engine, se, text, tlen, &h, 1, 0, chain, PULSAR_KVCHAIN_MAX,
-                                                            &nseg, err, sizeof err) : -1;
+        const int Ge = se && text ? pulsar_kvchain_restore(st, engine, se, text, tlen, &h, 1, TokCount{0}, chain,
+                                                            PULSAR_KVCHAIN_MAX, &nseg, err, sizeof err).raw() : -1;
         fprintf(stderr, "image-chain gate: same-size image %c restores to %d%s%s\n", which ? 'Y' : 'X', Ge,
                 err[0] ? " -- " : "", err);
         TEST_ASSERT(Ge >= 0);
-        if (which) TEST_ASSERT(Ge == py.end);   /* Y was stored, not dropped as "already held" */
+        if (which) TEST_ASSERT(Ge == py.end.raw());   /* Y was stored, not dropped as "already held" */
         else TEST_ASSERT(Ge <= img.start_pos);  /* X's end state is gone, and Y's is not X's */
         const bool oke = se && sf && pulsar_session_sync_mm(se, &longer, &ir, 1, err, sizeof err) == 0 &&
                          pulsar_session_copy_logits(se, reused, vocab) == vocab &&
@@ -2942,25 +2946,26 @@ static void test_control_token_spans(void) {
     {
         const pulsar_text_span whole[2] = {{10, 20}, {30, 40}};
         uint32_t n = 0;
-        pulsar_text_span *sl = pulsar_text_spans_slice(whole, 2, 15, 20, &n);   /* [15,35) */
+        pulsar_text_span *sl = pulsar_text_spans_slice(whole, 2, TextBytes{15}, TextBytes{20}, &n);   /* [15,35) */
         TEST_ASSERT(sl != NULL && n == 2);
         if (sl) {
             TEST_ASSERT(sl[0].lo == 0 && sl[0].hi == 5);
             TEST_ASSERT(sl[1].lo == 15 && sl[1].hi == 20);
         }
         free(sl);
-        sl = pulsar_text_spans_slice(whole, 2, 12, 100, &n);                    /* clamped */
+        sl = pulsar_text_spans_slice(whole, 2, TextBytes{12}, TextBytes{100}, &n);                    /* clamped */
         TEST_ASSERT(sl != NULL && n == 2);
         if (sl) {
             TEST_ASSERT(sl[0].lo == 0 && sl[0].hi == 8);
             TEST_ASSERT(sl[1].lo == 18 && sl[1].hi == 28);
         }
         free(sl);
-        sl = pulsar_text_spans_slice(whole, 2, 21, 5, &n);                      /* between ranges */
+        sl = pulsar_text_spans_slice(whole, 2, TextBytes{21}, TextBytes{5},
+                                     &n);                      /* between ranges */
         TEST_ASSERT(sl == NULL && n == 0);
-        sl = pulsar_text_spans_slice(whole, 2, 100, 5, &n);                     /* past the end */
+        sl = pulsar_text_spans_slice(whole, 2, TextBytes{100}, TextBytes{5}, &n);                     /* past the end */
         TEST_ASSERT(sl == NULL && n == 0);
-        sl = pulsar_text_spans_slice(NULL, 0, 0, 10, &n);
+        sl = pulsar_text_spans_slice(NULL, 0, TextBytes{0}, TextBytes{10}, &n);
         TEST_ASSERT(sl == NULL && n == 0);
     }
 }
