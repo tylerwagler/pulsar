@@ -35,15 +35,18 @@
  *   8. a logical width short of the stored 128 multiple (L295 F7: Inkling's head 4096 -> 201024, stored 201088):
  *      bit for bit the stored call's columns, nothing written past N, graded vs double.
  *   9. the GEMV's two CTA forms (L380: 16 warps, one CTA an SM; 8 warps, two an SM): (a) the selection rule
- *      (ds4_exl3_dense_gemv_arm) on a table of (rows, grid, SMs, device) -- the measured GB10 launches on their side
- *      of it, one wave, five waves, M > 8, two passes and every other architecture on the 16-warp side; (b) each
+ *      (ds4_exl3_dense_gemv_arm) on a table of (rows, grid, SMs, device, CTA width) -- the measured GB10 launches
+ *      on their side of it, one wave, five waves, M > 8, two passes; L405's measured sm_75 launches (narrow past one
+ *      wave on the 8-warp side, one wave and every wide grid on the 16-warp side); every other architecture on the
+ *      16-warp side; (b) each
  *      form FORCED (ds4_exl3_dense_arm_force) on the same launches -- every rate, the narrow and the wide CTA
  *      (shapes sized from the device's SM count so gemv_wide picks each; the description proves which kernel ran),
  *      K of 1, 3, 5 and 20 blocks, M = 1, 2, 3, 4, 8, 16, single and multi launches (one rate and mixed), f32 and
  *      bf16 outputs: the 8-warp form's bytes are the 16-warp form's, every f32 row its M = 16 row, every bf16 row
  *      the f32 row rounded, the single shapes graded vs double; any differing byte fails; (c) a mutated weight
  *      moves the 8-warp output; the forced 8-warp form refuses a two-pass launch.  Run on every device: the forced
- *      8-warp form runs on sm_75 too (the rule never picks it there), so its bytes are held on Turing as well.
+ *      8-warp form runs on sm_75 too (since L405 the rule picks it there for narrow grids past one wave), so its
+ *      bytes are held on Turing as well.
  *  10. the prompt arm's two kernels (L381: the fixed-algorithm GEMM on the weight decoded to fp16; the in-place
  *      kernel on small chunks): (a) the selection rule (ds4_exl3_dense_prompt_arm) on a table of (rows, device);
  *      (b) each kernel FORCED (ds4_exl3_dense_prompt_force) on the same launches -- every rate; K of 1, 3 and 20
@@ -249,44 +252,56 @@ static void grade_prefill(const dev &d, const weight &w, const slot &s, const st
 static void arm_section(const double tol) {
     const int W16 = DS4_EXL3_DENSE_ARM_16W, W8 = DS4_EXL3_DENSE_ARM_8W;
     /* (a) the rule: rows, the launched grid, the device's SMs and compute capability -> the form */
-    struct rule { int M, ctas, sms, cc, want; const char *what; };
+    struct rule { int M, ctas, sms, cc, nt, want; const char *what; };
     const rule rules[] = {
-        {1, 512, 48, 121, W8, "GB10 2560->10240+6144 narrow, 11 waves, 1 row (measured 0.85)"},
-        {4, 512, 48, 121, W8, "the same at 4 rows (0.83)"},
-        {8, 256, 48, 121, W8, "the same launch wide at 8 rows, 6 waves (0.93)"},
-        {1, 416, 48, 121, W8, "GB10 2560->12288+2x512 narrow, 9 waves (0.88)"},
-        {8, 208, 48, 121, W16, "the same launch wide at 8 rows, 5 waves (measured 1.07: slower)"},
-        {1, 320, 48, 121, W8, "GB10 2560->10240 narrow, 7 waves (0.85)"},
-        {8, 160, 48, 121, W16, "the same wide at 8 rows, 4 waves (0.97: inside the noise)"},
-        {1, 3880, 48, 121, W8, "GB10 lm_head wide, 81 waves, 1 row (0.90)"},
-        {8, 3880, 48, 121, W8, "GB10 lm_head wide at 8 rows (0.91)"},
-        {1, 40, 48, 121, W16, "GB10 one wave of 40 CTAs, 1 row (1.05-1.50: slower)"},
-        {8, 40, 48, 121, W16, "GB10 one wave of 40 CTAs, 8 rows"},
-        {1, 240, 48, 121, W16, "5 full waves: the last grid that keeps 16 warps"},
-        {1, 241, 48, 121, W8, "the first CTA of a 6th wave"},
-        {9, 3880, 48, 121, W16, "9 rows: past the measured widths"},
-        {16, 512, 48, 121, W16, "16 rows"},
-        {17, 3880, 48, 121, W16, "two passes (17 rows)"},
-        {32, 3880, 48, 121, W16, "two passes (32 rows)"},
-        {1, 512, 48, 120, W8, "sm_120: the same family as GB10's sm_121"},
-        {1, 512, 170, 120, W16, "sm_120 with 170 SMs: the same grid is 4 waves there"},
-        {1, 1024, 170, 120, W8, "sm_120 with 170 SMs: 7 waves"},
-        {1, 512, 48, 75, W16, "sm_75 (Turing, 48 SMs): not measured"},
-        {1, 3880, 72, 75, W16, "sm_75 (Turing, 72 SMs): not measured"},
-        {1, 3880, 48, 89, W16, "sm_89: not measured"},
-        {1, 3880, 48, 100, W16, "sm_100: not measured"},
-        {1, 3880, 48, 0, W16, "a device whose capability is unknown"},
-        {0, 3880, 48, 121, W16, "no rows"},
-        {1, 3880, 0, 121, W16, "no SM count"},
+        {1, 512, 48, 121, 2, W8, "GB10 2560->10240+6144 narrow, 11 waves, 1 row (measured 0.85)"},
+        {4, 512, 48, 121, 2, W8, "the same at 4 rows (0.83)"},
+        {8, 256, 48, 121, 4, W8, "the same launch wide at 8 rows, 6 waves (0.93)"},
+        {1, 416, 48, 121, 2, W8, "GB10 2560->12288+2x512 narrow, 9 waves (0.88)"},
+        {8, 208, 48, 121, 4, W16, "the same launch wide at 8 rows, 5 waves (measured 1.07: slower)"},
+        {1, 320, 48, 121, 2, W8, "GB10 2560->10240 narrow, 7 waves (0.85)"},
+        {8, 160, 48, 121, 4, W16, "the same wide at 8 rows, 4 waves (0.97: inside the noise)"},
+        {1, 3880, 48, 121, 4, W8, "GB10 lm_head wide, 81 waves, 1 row (0.90)"},
+        {8, 3880, 48, 121, 4, W8, "GB10 lm_head wide at 8 rows (0.91)"},
+        {1, 40, 48, 121, 2, W16, "GB10 one wave of 40 CTAs, 1 row (1.05-1.50: slower)"},
+        {8, 40, 48, 121, 2, W16, "GB10 one wave of 40 CTAs, 8 rows"},
+        {1, 240, 48, 121, 2, W16, "5 full waves: the last grid that keeps 16 warps"},
+        {1, 241, 48, 121, 2, W8, "the first CTA of a 6th wave"},
+        {9, 3880, 48, 121, 2, W16, "9 rows: past the measured widths"},
+        {16, 512, 48, 121, 2, W16, "16 rows"},
+        {17, 3880, 48, 121, 2, W16, "two passes (17 rows)"},
+        {32, 3880, 48, 121, 2, W16, "two passes (32 rows)"},
+        {1, 512, 48, 120, 2, W8, "sm_120: the same family as GB10's sm_121"},
+        {1, 512, 170, 120, 2, W16, "sm_120 with 170 SMs: the same grid is 4 waves there"},
+        {1, 1024, 170, 120, 2, W8, "sm_120 with 170 SMs: 7 waves"},
+        {1, 3880, 48, 89, 2, W16, "sm_89: not measured"},
+        {1, 3880, 48, 100, 2, W16, "sm_100: not measured"},
+        {1, 3880, 48, 0, 2, W16, "a device whose capability is unknown"},
+        {0, 3880, 48, 121, 2, W16, "no rows"},
+        {1, 3880, 0, 121, 2, W16, "no SM count"},
+        /* L405: sm_75 (RTX 5000, 48 SMs), measured 8 warps / 16 warps (exl3_dense_bench round, 200 x 5) */
+        {1, 512, 48, 75, 2, W8, "sm_75 Qwen GDN qkv+z narrow, 11 waves, 1 row (0.84)"},
+        {4, 416, 48, 75, 2, W8, "sm_75 Qwen QSA q+k+v narrow, 9 waves, 4 rows (0.90)"},
+        {1, 136, 48, 75, 2, W8, "sm_75 Gemma mlp gate+up narrow, 3 waves (0.86)"},
+        {1, 128, 48, 75, 2, W8, "sm_75 Nemotron out_proj narrow, 3 waves (0.94)"},
+        {1, 32, 48, 75, 2, W16, "sm_75 Nemotron latent in narrow, one wave (1.12: slower)"},
+        {1, 48, 48, 75, 2, W16, "sm_75 narrow, one full wave: keeps 16 warps"},
+        {1, 49, 48, 75, 2, W8, "sm_75 narrow, the first CTA of a second wave"},
+        {8, 32, 48, 75, 2, W16, "sm_75 narrow at 8 rows, one wave (1.03)"},
+        {16, 512, 48, 75, 2, W16, "sm_75 16 rows: past 8"},
+        {1, 128, 48, 75, 4, W16, "sm_75 Gemma swa q+k+v wide, 3 waves (1.24: slower)"},
+        {1, 3880, 48, 75, 4, W16, "sm_75 Qwen lm_head wide, 81 waves (1.26: slower)"},
+        {1, 4096, 72, 75, 4, W16, "sm_75 RTX 6000 (72 SMs): Gemma's head goes wide there"},
+        {1, 3880, 48, 86, 2, W16, "sm_86: not measured"},
     };
     size_t rule_bad = 0;
     for (const rule &r : rules) {
-        const int got = ds4_exl3_dense_gemv_arm(r.M, r.ctas, r.sms, r.cc);
-        CHECK(got == r.want, "arm rule: M=%d grid=%d SMs=%d sm_%d (%s) -> %s, want %s", r.M, r.ctas, r.sms, r.cc, r.what,
+        const int got = ds4_exl3_dense_gemv_arm(r.M, r.ctas, r.sms, r.cc, r.nt);
+        CHECK(got == r.want, "arm rule: M=%d grid=%d (nt %d) SMs=%d sm_%d (%s) -> %s, want %s", r.M, r.ctas, r.nt, r.sms, r.cc, r.what,
               got == W8 ? "8 warps" : "16 warps", r.want == W8 ? "8 warps" : "16 warps");
         rule_bad += got != r.want;
     }
-    printf("  arm rule: %zu of %zu (rows, grid, SMs, device) cases on their side (8 warps iff sm_12x, M <= 8, 6+ waves)\n",
+    printf("  arm rule: %zu of %zu (rows, grid, SMs, device) cases on their side (8 warps iff M <= 8 and: sm_12x, 6+ waves; or sm_75, narrow, 2+ waves)\n",
            sizeof rules / sizeof *rules - rule_bad, sizeof rules / sizeof *rules);
 
     ds4_exl3_dense_gemv_desc dv{};
@@ -296,7 +311,7 @@ static void arm_section(const double tol) {
     }
     const int sms = dv.sms, cc = pulsar_cuda_device_cc();
     printf("  this device: sm_%d, %d SMs; unforced, a 512-CTA launch runs %d warps at 1 row and %d at 16\n", cc, sms,
-           ds4_exl3_dense_gemv_arm(1, 512, sms, cc) == W8 ? 8 : 16, ds4_exl3_dense_gemv_arm(16, 256, sms, cc) == W8 ? 8 : 16);
+           ds4_exl3_dense_gemv_arm(1, 512, sms, cc, 2) == W8 ? 8 : 16, ds4_exl3_dense_gemv_arm(16, 256, sms, cc, 4) == W8 ? 8 : 16);
     CHECK(ds4_exl3_dense_arm_force(7) == -1, "arm forms: an unknown forced form accepted");
 
     /* (b) the launches.  Narrow: at most one wave of 32-output CTAs (gemv_wide keeps 32 outputs at every M); wide:

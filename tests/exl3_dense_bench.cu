@@ -32,6 +32,7 @@
  *
  *   tests/exl3_dense_bench round [iters=200] [repeats=3] [M list=1,2,4,8] [set: qwen (default) | nemotron]
  *                                [k2, 0 = the set's rate] [arms: rule (default) | 8w] [shape index, -1 = all]
+ *                                (set gemma, L405: Gemma 4 26B-A4B's dense launches at K = 4)
  *
  * see round_main below.  How the 8-warp CTA's rule (ds4_exl3_dense_gemv_arm) was priced on GB10 (gpuq #702 / #703:
  * `round 200 5 1,2,4,8 qwen`) and how it is re-priced on another device, rate or model.  Build with the served arch
@@ -163,20 +164,20 @@ static int round_main(int argc, char **argv) {
         }
     }
     const char *set = argc > 5 ? argv[5] : "qwen";
-    const bool nemotron = !strcmp(set, "nemotron");
-    const int k2 = argc > 6 && atoi(argv[6]) ? atoi(argv[6]) : nemotron ? 8 : 10;
+    const bool nemotron = !strcmp(set, "nemotron"), gemma = !strcmp(set, "gemma");
+    const int k2 = argc > 6 && atoi(argv[6]) ? atoi(argv[6]) : nemotron || gemma ? 8 : 10;
     const char *arms_s = argc > 7 ? argv[7] : "rule";
     const bool with_8w = !strcmp(arms_s, "8w");
     const int only_shape = argc > 8 ? atoi(argv[8]) : -1;
     int maxM = 0;
-    bool usage = iters < 1 || repeats < 1 || Ms.empty() || (!nemotron && strcmp(set, "qwen")) ||
+    bool usage = iters < 1 || repeats < 1 || Ms.empty() || (!nemotron && !gemma && strcmp(set, "qwen")) ||
                  (!with_8w && strcmp(arms_s, "rule")) || !ds4_exl3_dense_rate_supported(k2);
     for (int M : Ms) {
         usage = usage || M < 1 || M > 32;   /* one launch: 16-row passes, two at most */
         maxM = std::max(maxM, M);
     }
     if (usage) {
-        fprintf(stderr, "usage: exl3_dense_bench round [iters=200] [repeats=3] [M list=1,2,4,8 (1..32)] [qwen|nemotron] "
+        fprintf(stderr, "usage: exl3_dense_bench round [iters=200] [repeats=3] [M list=1,2,4,8 (1..32)] [qwen|nemotron|gemma] "
                         "[k2, 0 = the set's] [rule|8w] [shape]\n");
         return 2;
     }
@@ -202,8 +203,21 @@ static int round_main(int argc, char **argv) {
         {"shared down 5376->4096",       5376, 1, {4096, 0, 0, 0}, 40},
         {"lm_head 4096->131072",         4096, 1, {131072, 0, 0, 0}, 1},
     };
-    const lshape *shapes = nemotron ? nemotron_shapes : qwen_shapes;
+    /* L405: Gemma 4 26B-A4B (CT 130), K = 4 dense (the pack's rate; the tied head is K = 6 there, priced here at the
+     * set's rate: read its row as a shape, not as the round's head).  25 sliding + 5 global layers; a global layer's
+     * K is its V (attention_k_eq_v: q + k only); the MLP's 2112 is stored 2176 (exl3_out_stored, gemma4.h). */
+    const lshape gemma_shapes[] = {
+        {"swa q+k+v 2816->4096+2x2048",  2816, 3, {4096, 2048, 2048, 0}, 25},
+        {"global q+k 2816->8192+1024",   2816, 2, {8192, 1024, 0, 0}, 5},
+        {"swa o_proj 4096->2816",        4096, 1, {2816, 0, 0, 0}, 25},
+        {"global o_proj 8192->2816",     8192, 1, {2816, 0, 0, 0}, 5},
+        {"mlp gate+up 2816->2x2176",     2816, 2, {2176, 2176, 0, 0}, 30},
+        {"mlp down 2176->2816",          2176, 1, {2816, 0, 0, 0}, 30},
+        {"head 2816->262144",            2816, 1, {262144, 0, 0, 0}, 1},
+    };
+    const lshape *shapes = nemotron ? nemotron_shapes : gemma ? gemma_shapes : qwen_shapes;
     const int n_shapes = nemotron ? (int)(sizeof nemotron_shapes / sizeof *nemotron_shapes)
+                         : gemma  ? (int)(sizeof gemma_shapes / sizeof *gemma_shapes)
                                   : (int)(sizeof qwen_shapes / sizeof *qwen_shapes);
     struct form { const char *name; int force; };
     const form forms[] = {{"16w", DS4_EXL3_DENSE_ARM_16W}, {"rule", 0}, {"8w", DS4_EXL3_DENSE_ARM_8W}};
