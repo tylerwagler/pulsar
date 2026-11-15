@@ -197,19 +197,44 @@ void thinking_state::feed(const char *p, size_t len) {
             st->tail_len--;
         }
         st->tail[st->tail_len++] = p[i];
-        if (st->tail_ends_with("<think>")) st->inside = true;
-        else if (st->tail_ends_with("</think>")) st->inside = false;
+        if (!st->markers) {
+            if (st->tail_ends_with("<think>")) st->inside = true;
+            else if (st->tail_ends_with("</think>")) st->inside = false;
+            continue;
+        }
+        if (st->tail_ends_with(st->markers->open)) {
+            st->inside = true;
+            continue;
+        }
+        for (const char *const *c = st->markers->close; c < st->markers->close + 4 && *c; c++) {
+            if (st->tail_ends_with(*c)) {
+                st->inside = false;
+                break;
+            }
+        }
     }
 }
 
 
 
-/// @brief The reasoning tracker at the start of generation: fed the rendered prompt text (its generation prefix
-/// opens or closes \<think\>), or, with no text, inside reasoning when the think mode is on.
+/* L344: a token inside the block spends the budget; the one that closes it latches the block closed */
+void think_budget_note(gen_state *g, bool was_inside) {
+    if (was_inside && !g->think_closed) {
+        if (g->thinking.inside) g->think_tokens++;
+        else g->think_closed = true;
+    }
+}
+
+
+
+/// @brief The reasoning tracker at the start of generation, with the family's markers (L398): fed the rendered
+/// prompt text (its generation prefix opens or closes the block), or, with no text, inside reasoning when the think
+/// mode is on.
 /// @param r the request (NULL: outside reasoning)
 /// @return the tracker
 thinking_state thinking_state_from_prompt(const request *r) {
     thinking_state st = {0};
+    if (r && r->family) st.markers = r->family->reasoning;
     if (r && r->prompt_text) {
         st.feed(r->prompt_text, strlen(r->prompt_text));
     } else if (r && pulsar_think_mode_enabled(r->think_mode)) {

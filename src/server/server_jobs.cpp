@@ -2050,11 +2050,7 @@ bool server::gen_emit_token(session_slot *sl, int token) {
     const size_t stream_len = gen_release(&j->req.stops, g->text.ptr, g->text.len, piece, piece_len,
                                           g->plain_stream_pos, &g->thinking, &g->stop_scan_from,
                                           &hit_stop, &stop_pos, &stop_len);
-    /* L344: a token inside the block spends the budget; the one that closes it latches the block closed */
-    if (was_inside && !g->think_closed) {
-        if (g->thinking.inside) g->think_tokens++;
-        else g->think_closed = true;
-    }
+    think_budget_note(g, was_inside);
 
     if (gen_streams_plain(g) && stream_len > g->plain_stream_pos) {
         char *delta = server_xstrndup(g->text.ptr + g->plain_stream_pos, stream_len - g->plain_stream_pos);

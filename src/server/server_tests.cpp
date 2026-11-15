@@ -2444,6 +2444,81 @@ static void test_l344_thinking_budget_close_row(void) {
     TEST_ASSERT(out[0] == 1u && out[1] == 0u && out[2] == 0u && out[3] == 0u);
 }
 
+/* L398: the reasoning tracker reads the FAMILY's markers.  Gemma 4 reasons in a thought channel (<|channel>thought\n
+ * ... <channel|>), never <think>: the tracker matched <think> only, so on Gemma `inside` never turned on and the L344
+ * budget counted nothing (inert), the stop scan ran inside reasoning, and a prompt that leaves the channel open (after
+ * tool results, thinking on) started the grammar gate outside it.  Here a rendered Gemma prompt and a generated turn,
+ * a token at a time through the real accounting: the budget is spent by the channel's tokens and its forced draw is
+ * due exactly at the budget; <channel|> or a call ends the block.  The tracker fed a prompt agrees with the family's
+ * own rule (gemma4_prompt_opens_reasoning) on every generation prefix; a <think> family is unchanged. */
+static void test_l398_gemma_reasoning_tracker(void) {
+    char err[256];
+    request r;
+    /* thinking on: "<|turn>model\n" -- the model opens the channel itself */
+    TEST_ASSERT(effort_case(PULSAR_CHAT_GEMMA4, EFFORT_BODY(""), &r, err, sizeof err));
+    TEST_ASSERT(r.family && r.family->reasoning);
+    job j;
+    memset(&j, 0, sizeof j);
+    gen_state g;
+    memset(&g, 0, sizeof g);
+    g.j = &j;
+    j.req.think_budget = 4;
+    g.thinking = thinking_state_from_prompt(&r);
+    TEST_ASSERT(!g.thinking.inside);
+    const TokId close{106};   /* stands for <channel|>: think_close_row only compares ids */
+    static const char *const turn[] = {"<|channel>", "thought", "\n", "Let", " me", " think", "<channel|>", "Hi"};
+    int forced_at = -1;
+    for (int i = 0; i < (int)(sizeof turn / sizeof turn[0]); i++) {
+        if (forced_at < 0 && think_close_row(j.req.think_budget, g.thinking.inside && !g.think_closed,
+                                             g.think_tokens, close, NULL, 0, 0) == 0)
+            forced_at = i;
+        const bool was = g.thinking.inside;
+        g.thinking.feed(turn[i], strlen(turn[i]));
+        think_budget_note(&g, was);
+        if (i == 0) TEST_ASSERT(g.thinking.inside);   /* the open marker turns it on */
+    }
+    TEST_ASSERT(forced_at == 5);           /* thought, \n, Let, me = 4 spent: the draw after them is forced */
+    TEST_ASSERT(g.think_tokens == 5);      /* this unforced run also spent " think" */
+    TEST_ASSERT(g.think_closed && !g.thinking.inside);
+    request_free(&r);
+
+    /* the generation prefixes: off closes an empty channel; after tool results with thinking on it stays open */
+    static const char *const prompts[] = {
+        "<bos><|turn>user\nx<turn|>\n<|turn>model\n",
+        "<bos><|turn>user\nx<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+        "<bos><|turn>user\nx<turn|>\n<|turn>model\n<|tool_call>call:f{}<tool_call|><|tool_response>response:f{}"
+        "<tool_response|><|channel>thought\n",
+        "<bos><|turn>user\nx<turn|>\n<|turn>model\n<|channel>thought\nhm<channel|><|tool_call>call:f{}<tool_call|>"
+        "<|tool_response>response:f{}<tool_response|>",
+    };
+    for (const char *p : prompts) {
+        request q;
+        memset(&q, 0, sizeof q);
+        q.family = server_family_for_format(PULSAR_CHAT_GEMMA4);
+        q.prompt_text = (char *)p;
+        TEST_ASSERT(thinking_state_from_prompt(&q).inside == gemma4_prompt_opens_reasoning(p));
+    }
+    /* a call opened from reasoning ends it (gemma4_chat.h) */
+    thinking_state st = {};
+    st.markers = server_family_for_format(PULSAR_CHAT_GEMMA4)->reasoning;
+    st.feed("<|channel>thought\nx", 19);
+    TEST_ASSERT(st.inside);
+    st.feed("<|tool_call>", 12);
+    TEST_ASSERT(!st.inside);
+
+    /* a <think> family: unchanged, and Gemma's markers mean nothing to it */
+    request q;
+    memset(&q, 0, sizeof q);
+    q.family = server_family_for_format(PULSAR_CHAT_QWEN);
+    q.prompt_text = (char *)"<|im_start|>assistant\n<think>\n";
+    thinking_state qs = thinking_state_from_prompt(&q);
+    TEST_ASSERT(qs.inside && !qs.markers);
+    qs.feed("<channel|>", 10);
+    TEST_ASSERT(qs.inside);
+    qs.feed("</think>", 8);
+    TEST_ASSERT(!qs.inside);
+}
+
 /* L335: a malformed effort string or a non-bool thinking switch refuses WITH its reason (both left err empty, so the
  * client got the generic "invalid JSON request"). */
 static void test_effort_controls_name_their_error(void) {
@@ -17352,6 +17427,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_api_thinking_controls_parse();
     test_l344_thinking_budget_parse();
     test_l344_thinking_budget_close_row();
+    test_l398_gemma_reasoning_tracker();
     test_effort_controls_name_their_error();
     test_render_think_max_prompt_prefix();
     test_render_think_effort_prefixes();
