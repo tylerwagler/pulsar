@@ -140,11 +140,19 @@ struct constrain_plan {
     pulsar_grammar *calls = nullptr;    /* one call region, opened by the call trigger in free text: ends when complete */
     /// The family's grammar markup the regions were built from (static, not owned).
     const server_grammar_shape *shape = nullptr;
+    /// L396: the answer region behind an optional reasoning block, for a turn that starts outside reasoning with
+    /// thinking on in a family whose output opens its own block (Gemma 4: the model may write
+    /// <|channel>thought ... <channel|> before the format); NULL otherwise (the turn opens on `answer`).
+    pulsar_grammar *answer_after_thought = nullptr;
+    /// L396: the call trigger also ends reasoning (a family reasoning-close marker): a call opened from inside the
+    /// block is a call region, not reasoning text (Gemma 4's <|tool_call>).
+    bool call_ends_reasoning = false;
 };
 
 void constrain_plan_free(constrain_plan *p) {
     if (!p) return;
     pulsar_grammar_free(p->answer);
+    pulsar_grammar_free(p->answer_after_thought);
     pulsar_grammar_free(p->calls);
     delete p;
 }
@@ -438,6 +446,10 @@ bool constrain_plan_build(pulsar_engine *e, server *s, const chat_conversation *
     if (!comp) return false;
     auto *plan = new constrain_plan();
     plan->shape = sh;
+    const server_reasoning_markers *rm = r->family->reasoning;
+    if (rm && sh->call_trigger)
+        for (const char *const *m = rm->close; m < rm->close + 4 && *m; m++)
+            if (!strcmp(*m, sh->call_trigger)) plan->call_ends_reasoning = true;
     if (want_calls) {
         buf f = {0};
         j_call_region(&f, sh, tools);
@@ -475,6 +487,37 @@ bool constrain_plan_build(pulsar_engine *e, server *s, const chat_conversation *
         }
         buf_puts(&f, "]}");
         plan->answer = constrain_compile(comp, &f, "response_format", err, errlen);
+        /* L396: thinking on, a family whose output opens its own reasoning block (an explicit open marker, its
+         * close[0] the close token) and an answer that opens at the reasoning close: a turn the prompt leaves
+         * outside reasoning may still think first, so that turn's answer region takes an optional block before the
+         * format (llama.cpp's Gemma 4 grammar: start + optional(thought) + response_format).  The block's text is
+         * any text up to the close; the L344 budget's forced close token is that end. */
+        if (plan->answer && sh->answer_at_think_close && rm && rm->open && rm->close[0] &&
+            pulsar_think_mode_enabled(r->think_mode)) {
+            buf t = {0};
+            buf_puts(&t, "{\"type\":\"sequence\",\"elements\":[{\"type\":\"optional\",\"content\":"
+                         "{\"type\":\"tag\",\"begin\":");
+            json_escape(&t, rm->open);
+            buf_puts(&t, ",\"content\":{\"type\":\"any_text\"");
+            /* with calls on offer, a call from inside the block would skip the call region: the block closes first */
+            if (or_calls && plan->call_ends_reasoning) {
+                buf_puts(&t, ",\"excludes\":[");
+                json_escape(&t, sh->call_trigger);
+                buf_putc(&t, ']');
+            }
+            buf_puts(&t, "},\"end\":");
+            json_escape(&t, rm->close[0]);
+            buf_puts(&t, "}},");
+            buf_append(&t, f.ptr, f.len);
+            buf_puts(&t, "]}");
+            plan->answer_after_thought = constrain_compile(comp, &t, "response_format", err, errlen);
+            buf_free(&t);
+            if (!plan->answer_after_thought) {
+                buf_free(&f);
+                constrain_plan_free(plan);
+                return false;
+            }
+        }
         buf_free(&f);
         if (!plan->answer) {
             constrain_plan_free(plan);
@@ -652,7 +695,17 @@ static bool gate_feed(constrain_gate *gt, int token, const char *b, size_t n) {
         }
         const char c = b[i++];
         if (gt->phase == GATE_THINK) {
+            /* L396: a call opened from inside reasoning ends it (the family's markers say so): the call region */
+            if (p->calls && p->call_ends_reasoning && gt->call.step(gt->kmp_call, c)) {
+                gt->kmp_think = 0;
+                std::string open = gt->call.pat;
+                open.append(b + i, n - i);
+                ok = gate_open(gt, p->calls, true, open.data(), open.size(), &rec);
+                if (ok) gate_region_done(gt);
+                break;
+            }
             if (!gt->think.step(gt->kmp_think, c)) continue;
+            gt->kmp_call = 0;
             /* reasoning closed: the answer opens on the rest of the token, or the turn is free text */
             if (!p->answer) {
                 gt->phase = GATE_FREE;
@@ -766,7 +819,8 @@ bool gen_constrain_begin(server *s, gen_state *g) {
         gt->phase = GATE_THINK;
     } else if (gt->plan->answer && sh->answer_at_think_close) {
         constrain_rec rec = {};
-        if (!gate_open(gt, gt->plan->answer, false, NULL, 0, &rec)) {
+        pulsar_grammar *opening = gt->plan->answer_after_thought ? gt->plan->answer_after_thought : gt->plan->answer;
+        if (!gate_open(gt, opening, false, NULL, 0, &rec)) {
             gate_fail(g, "response_format");
             return false;
         }

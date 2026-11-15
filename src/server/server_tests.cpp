@@ -4422,6 +4422,103 @@ static void test_l303_response_format_answer(void) {
 #undef L303_RF
 }
 
+/* L396: Gemma 4 turns with thinking ON under a grammar.  The model opens its own thought channel (the prompt ends
+ * "<|turn>model\n"), so a response format's region takes an optional <|channel> ... <channel|> block first (llama.cpp:
+ * start + optional(thought) + response_format); with calls on offer the block must close before a call (a call from
+ * inside it would skip the call region).  A turn the prompt leaves inside the channel (after tool results) opens a
+ * strict call region at <|tool_call>, which ends reasoning in Gemma's markers (L398). */
+static void test_l396_gemma_thinking_turns(void) {
+#define L396_RF ",\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"n\",\"schema\":{\"type\":" \
+                "\"object\",\"properties\":{\"n\":{\"type\":\"integer\"}},\"required\":[\"n\"],\"additionalProperties\":false}}}"
+    l303_vocab v;
+    server srv;
+    l303_server(&srv, v);
+    char err[300];
+    /* a response format, thinking on: the thought block is optional */
+    static const char *const rf_turns[] = {"<|channel>thought\nhm, seven<channel|>{\"n\": 7}", "{\"n\": 7}",
+                                           "<|channel>thought\n<channel|>\n{\"n\":7}"};
+    for (const char *turn : rf_turns) {
+        job j;
+        memset(&j, 0, sizeof j);
+        TEST_ASSERT(l303_request(&srv, PULSAR_CHAT_GEMMA4, API_OPENAI,
+                                 "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"reasoning_effort\":\"high\"" L396_RF
+                                 "}", &j.req, err, sizeof err));
+        TEST_ASSERT(j.req.constrain != NULL);
+        gen_state g;
+        TEST_ASSERT(l303_begin(&srv, &j, &g));
+        TEST_ASSERT(!g.thinking.inside && gen_constrain_live(&g));
+        TEST_ASSERT(!l303_allows(&srv, &g, 'x'));
+        const std::string out = turn;
+        const size_t fed = l303_feed(&srv, &g, out);
+        if (fed != out.size()) fprintf(stderr, "l396 gemma thinking rf: refused at %zu of \"%s\"\n", fed, turn);
+        TEST_ASSERT(fed == out.size());
+        TEST_ASSERT(l303_allows(&srv, &g, v.stop) && !l303_allows(&srv, &g, ','));
+        l303_end(&j, &g);
+    }
+    /* thinking off: no block (the prompt closed the channel; '<' cannot open the answer) */
+    {
+        job j;
+        memset(&j, 0, sizeof j);
+        TEST_ASSERT(l303_request(&srv, PULSAR_CHAT_GEMMA4, API_OPENAI,
+                                 "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"reasoning_effort\":\"none\"" L396_RF
+                                 "}", &j.req, err, sizeof err));
+        gen_state g;
+        TEST_ASSERT(l303_begin(&srv, &j, &g));
+        TEST_ASSERT(l303_feed(&srv, &g, "<|channel>") == 0);
+        l303_end(&j, &g);
+    }
+    /* a response format and strict tools, thinking on: think, close, then the call (or the answer); a call opened
+     * inside the block is refused before its trigger completes */
+    for (int closed = 0; closed < 2; closed++) {
+        job j;
+        memset(&j, 0, sizeof j);
+        TEST_ASSERT(l303_request(&srv, PULSAR_CHAT_GEMMA4, API_OPENAI,
+                                 "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]," L303_TOOLS
+                                 ",\"reasoning_effort\":\"high\"" L396_RF "}", &j.req, err, sizeof err));
+        gen_state g;
+        TEST_ASSERT(l303_begin(&srv, &j, &g));
+        const std::string think = closed ? "<|channel>thought\nsearch it<channel|>" : "<|channel>thought\nsearch it";
+        const std::string out = think + "<|tool_call>call:search{q:<|\"|>pulsars<|\"|>}<tool_call|>";
+        const size_t fed = l303_feed(&srv, &g, out);
+        if (closed) {
+            if (fed != out.size()) fprintf(stderr, "l396 gemma thinking rf+strict: refused at %zu\n", fed);
+            TEST_ASSERT(fed == out.size());
+        } else {
+            TEST_ASSERT(fed >= think.size() && fed < think.size() + strlen("<|tool_call>"));
+        }
+        l303_end(&j, &g);
+    }
+    /* the prompt leaves the channel open (tool results, thinking on): reasoning is free, and a call opened from it is
+     * the strict call region -- on its schema, refused off it */
+    for (int off_schema = 0; off_schema < 2; off_schema++) {
+        job j;
+        memset(&j, 0, sizeof j);
+        TEST_ASSERT(l303_request(&srv, PULSAR_CHAT_GEMMA4, API_OPENAI,
+                                 "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"},{\"role\":\"assistant\","
+                                 "\"content\":\"\",\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{"
+                                 "\"name\":\"now\",\"arguments\":\"{}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"c1\","
+                                 "\"content\":\"noon\"}]," L303_TOOLS ",\"reasoning_effort\":\"high\"}",
+                                 &j.req, err, sizeof err));
+        TEST_ASSERT(j.req.constrain != NULL);
+        gen_state g;
+        TEST_ASSERT(l303_begin(&srv, &j, &g));
+        TEST_ASSERT(g.thinking.inside && !gen_constrain_live(&g));
+        const std::string pre = "noon, so search<|tool_call>";
+        const std::string out = pre + (off_schema ? "call:search{z:" : "call:search{q:<|\"|>pulsars<|\"|>}<tool_call|>");
+        const size_t fed = l303_feed(&srv, &g, out);
+        if (off_schema) {
+            TEST_ASSERT(fed == pre.size() + strlen("call:search{"));   /* `z` is not a declared argument */
+        } else {
+            if (fed != out.size()) fprintf(stderr, "l396 gemma call from reasoning: refused at %zu\n", fed);
+            TEST_ASSERT(fed == out.size());
+            TEST_ASSERT(!gen_constrain_live(&g));   /* the call region ended with the call */
+        }
+        l303_end(&j, &g);
+    }
+    l303_server_free(&srv);
+#undef L396_RF
+}
+
 /* L396: Gemma 4's template writes a call's argument keys in dictsort order (case-folded), at every depth, whatever
  * the schema's order; the strict grammar takes the call the template rendered into the history byte for byte, and
  * refuses the schema's own order. */
@@ -17503,6 +17600,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l303_forced_call_grammar();
     test_l303_response_format_answer();
     test_l396_gemma_call_key_order();
+    test_l396_gemma_thinking_turns();
     test_l303_round_masks_match_plain();
     test_l397_long_repeat_keeps_json_string_filter();
     test_l309_draft_prefix();
