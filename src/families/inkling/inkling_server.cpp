@@ -362,5 +362,6 @@ const server_family_ops k_family_inkling = {
     /* .grammar               = */ &k_grammar_inkling,
     /* .find_call_block       = */ inkling_find_call_block,
     /* .tool_defs_text        = */ inkling_tool_defs_text,
+    /* .reasoning             = */ NULL,   /* <think> / </think> */
 };
 SERVER_FAMILY(k_family_inkling)

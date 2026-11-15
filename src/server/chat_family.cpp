@@ -773,6 +773,7 @@ static const server_family_ops k_family_deepseek_v41 = {
     /* .grammar               = */ &k_grammar_deepseek_v41,
     /* .find_call_block       = */ find_next_dsml_tool_block,
     /* .tool_defs_text        = */ deepseek_tool_defs_text,
+    /* .reasoning             = */ NULL,   /* <think> / </think> */
 };
 /** DeepSeek V4 (0731)'s family table. */
 static const server_family_ops k_family_deepseek_v4 = {
@@ -791,6 +792,7 @@ static const server_family_ops k_family_deepseek_v4 = {
     /* .grammar               = */ &k_grammar_deepseek_v4,
     /* .find_call_block       = */ find_next_dsml_tool_block,
     /* .tool_defs_text        = */ deepseek_tool_defs_text,
+    /* .reasoning             = */ NULL,   /* <think> / </think> */
 };
 
 /* L295 F8 step 5: the tables this file owns (DeepSeek's two); every other family's registers in its module */

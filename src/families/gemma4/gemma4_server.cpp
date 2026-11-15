@@ -220,6 +220,15 @@ static const server_grammar_shape k_grammar_gemma4 = {
     /* .block_tail            = */ "",
 };
 
+/* L398: the thought channel as text -- <|channel> opens it, <channel|> (the close token, L344's forced draw) ends it,
+ * and so does a call opened from it, a turn boundary or a tool response: gemma4_prompt_opens_reasoning's rule, so the
+ * tracker fed the prompt agrees with the output parser on where the turn starts. */
+/** Gemma 4's reasoning markers (server_family_ops::reasoning). */
+static const server_reasoning_markers k_reasoning_gemma4 = {
+    /* .open  = */ "<|channel>",
+    /* .close = */ {"<channel|>", "<|tool_call>", "<|turn>", "<|tool_response>"},
+};
+
 /// Gemma 4's server table (registered below by SERVER_FAMILY; found by its chat format).
 const server_family_ops k_family_gemma4 = {
     /* .name                  = */ "Gemma 4",
@@ -237,5 +246,6 @@ const server_family_ops k_family_gemma4 = {
     /* .grammar               = */ &k_grammar_gemma4,   /* response formats; strict tools refused by name */
     /* .find_call_block       = */ NULL,
     /* .tool_defs_text        = */ NULL,
+    /* .reasoning             = */ &k_reasoning_gemma4,
 };
 SERVER_FAMILY(k_family_gemma4)

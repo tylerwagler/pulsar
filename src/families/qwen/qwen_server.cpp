@@ -369,5 +369,6 @@ static const server_family_ops k_family_qwen = {
     /* .grammar               = */ &k_grammar_qwen_xml,
     /* .find_call_block       = */ qwen_find_call_block,
     /* .tool_defs_text        = */ qwen_tool_defs_text,
+    /* .reasoning             = */ NULL,   /* <think> / </think> */
 };
 SERVER_FAMILY(k_family_qwen)

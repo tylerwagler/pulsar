@@ -358,5 +358,6 @@ const server_family_ops k_family_nemotron_h = {
     /* .grammar               = */ &k_grammar_qwen_xml,   /* Qwen's markup (nemotron_chat.cpp) */
     /* .find_call_block       = */ nemotron_find_call_block,
     /* .tool_defs_text        = */ nemotron_tool_defs_text,
+    /* .reasoning             = */ NULL,   /* <think> / </think> */
 };
 SERVER_FAMILY(k_family_nemotron_h)
