@@ -407,12 +407,14 @@ bool constrain_plan_build(pulsar_engine *e, server *s, const chat_conversation *
     }
     if (want_answer) {
         /* whitespace, then the format and the family's answer close -- or, with tools on offer, the turn's calls
-         * instead (a turn may answer with calls; each may follow whitespace) */
+         * instead (a turn may answer with calls; each may follow whitespace).  A shape without call markup (Gemma 4's,
+         * L338) has no call region to offer: the turn is the format.  L395: building one dereferenced its NULL
+         * call_trigger and took the server down on any response_format request that also offered tools. */
         buf f = {0};
         buf_puts(&f, "{\"type\":\"sequence\",\"elements\":[");
         j_ws(&f);
         buf_puts(&f, ",");
-        const bool or_calls = !tools.empty() && c->tool_choice != CHAT_TOOL_CHOICE_NONE;
+        const bool or_calls = sh->call_trigger && !tools.empty() && c->tool_choice != CHAT_TOOL_CHOICE_NONE;
         if (or_calls) buf_puts(&f, "{\"type\":\"or\",\"elements\":[");
         buf_puts(&f, "{\"type\":\"sequence\",\"elements\":[");
         j_answer_format(&f, &c->response_format);

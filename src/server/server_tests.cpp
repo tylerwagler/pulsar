@@ -4323,6 +4323,27 @@ static void test_l303_response_format_answer(void) {
                                   &jg.req, err, sizeof err));
         TEST_ASSERT(strstr(err, "no tool-call markup") != NULL);
     }
+    /* L395: Gemma 4 with a response format and NON-strict tools on offer.  The shape has no call region to offer
+     * beside the format, so the turn is the format; building that alternative dereferenced the shape's NULL
+     * call_trigger and terminated the server. */
+    {
+        job jg;
+        memset(&jg, 0, sizeof jg);
+        TEST_ASSERT(l303_request(&srv, PULSAR_CHAT_GEMMA4, API_OPENAI,
+                                 "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"tools\":[{\"type\":\"function\","
+                                 "\"function\":{\"name\":\"search\",\"parameters\":{\"type\":\"object\",\"properties\":{"
+                                 "\"q\":{\"type\":\"string\"}}}}}],\"reasoning_effort\":\"none\"" L303_RF "}",
+                                 &jg.req, err, sizeof err));
+        TEST_ASSERT(jg.req.constrain != NULL);
+        gen_state g;
+        TEST_ASSERT(l303_begin(&srv, &jg, &g));
+        TEST_ASSERT(gen_constrain_live(&g));               /* the answer is the first byte */
+        TEST_ASSERT(!l303_allows(&srv, &g, '<'));          /* no call markup to open */
+        const std::string ans = "{\"n\": 7}";
+        TEST_ASSERT(l303_feed(&srv, &g, ans) == ans.size());
+        TEST_ASSERT(l303_allows(&srv, &g, v.stop));
+        l303_end(&jg, &g);
+    }
     l303_server_free(&srv);
 #undef L303_RF
 }
