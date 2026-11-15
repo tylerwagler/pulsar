@@ -821,9 +821,9 @@ bool request_prepare_images(pulsar_engine *e, const chat_msgs *msgs, struct requ
  *  `call_trigger` (the bytes that open the turn's calls) and is
  *      call_trigger block_head ( name_open NAME name_close ARGS call_close )[+ when repeat] block_tail
  *  with ARGS the tool's schema in `style` (xgrammar's: "qwen_xml", "deepseek_xml", "deepseek_v4_1_xml",
- *  "json") -- a strict tool's declared schema, another tool's any arguments.  The answer (a response format)
- *  opens on `answer_open`, or at once when it is the think close and the turn starts outside reasoning, and
- *  is: whitespace, the format, `answer_close`, then a stop token. */
+ *  "json", "gemma") -- a strict tool's declared schema, another tool's any arguments.  The answer (a response
+ *  format) opens on `answer_open`, or at once when it is the think close and the turn starts outside reasoning,
+ *  and is: whitespace, the format, `answer_close`, then a stop token. */
 typedef struct server_grammar_shape {
     const char *answer_open;    ///< the bytes that open the answer ("</think>"; Inkling "<|content_text|>")
     bool answer_at_think_close; ///< answer_open is the reasoning close: a turn outside reasoning starts there
@@ -836,6 +836,8 @@ typedef struct server_grammar_shape {
     const char *call_close;     ///< after the arguments
     bool repeat;                ///< more calls may follow in the same block
     const char *block_tail;     ///< closes the block
+    bool dictsort_keys;         ///< the template writes argument keys in Jinja's dictsort order (Gemma 4): the strict
+                                ///< schemas' properties are compiled in that order, not the schema's (L396)
 } server_grammar_shape;
 
 /** Qwen's markup, which Nemotron-H writes too (chat_family.cpp). */

@@ -4165,6 +4165,9 @@ static void test_l303_shapes_accept_rendered_calls(void) {
          "<|content_invoke_tool_json|>{\"name\":\"search\",\"args\":{\"q\":\"pulsars\"}}<|end_message|>",
          "<|content_invoke_tool_json|>{\"name\":\"now\",\"args\":{}}<|end_message|>",
          "<|content_invoke_tool_json|>{\"name\":\"search\",\"args\":{\"q\":1", 1},
+        /* L396: Gemma 4 -- bare keys, <|"|>-quoted strings */
+        {PULSAR_CHAT_GEMMA4, "", "<|tool_call>call:search{q:<|\"|>pulsars<|\"|>}<tool_call|>",
+         "<|tool_call>call:now{}<tool_call|>", "<|tool_call>call:search{q:1", 1},
     };
     for (const fcase &fc : cases) {
         for (int which = 0; which < 3; which++) {
@@ -4216,6 +4219,9 @@ static void test_l303_forced_call_grammar(void) {
          PULSAR_INVOKE_END "\n" PULSAR_TOOL_CALLS_END, " name=\"ask",
          PULSAR_PARAM_START " name=\"q\" string=\"true\">pulsars" PULSAR_PARAM_END "\n" PULSAR_INVOKE_END "\n"
          PULSAR_TOOL_CALLS_END},
+        /* L396: Gemma 4's seed is "<|tool_call>call:" (+ "NAME{" when named) */
+        {PULSAR_CHAT_GEMMA4, "search{q:<|\"|>pulsars<|\"|>}<tool_call|>", "ask",
+         "q:<|\"|>pulsars<|\"|>}<tool_call|>"},
     };
     for (const fcase &fc : cases) {
         for (int named = 0; named < 2; named++) {
@@ -4315,18 +4321,9 @@ static void test_l303_response_format_answer(void) {
                               "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"response_format\":{\"type\":"
                               "\"regex\",\"pattern\":\"(\"}}", &j.req, err, sizeof err));
     TEST_ASSERT(strstr(err, "response_format") != NULL);
-    /* L338 P4: Gemma 4's shape has no call markup -- strict tools are refused by name, never left unconstrained */
-    {
-        job jg;
-        memset(&jg, 0, sizeof jg);
-        TEST_ASSERT(!l303_request(&srv, PULSAR_CHAT_GEMMA4, API_OPENAI, L303_BODY(",\"reasoning_effort\":\"none\""),
-                                  &jg.req, err, sizeof err));
-        TEST_ASSERT(strstr(err, "no tool-call markup") != NULL);
-    }
-    /* L395: Gemma 4 with a response format and NON-strict tools on offer.  The shape has no call region to offer
-     * beside the format, so the turn is the format; building that alternative dereferenced the shape's NULL
-     * call_trigger and terminated the server. */
-    {
+    /* L396: Gemma 4 with a response format and NON-strict tools on offer (L395's crash case): the turn is the format
+     * or calls, each a call region in Gemma's markup with any arguments. */
+    for (int as_call = 0; as_call < 2; as_call++) {
         job jg;
         memset(&jg, 0, sizeof jg);
         TEST_ASSERT(l303_request(&srv, PULSAR_CHAT_GEMMA4, API_OPENAI,
@@ -4337,15 +4334,66 @@ static void test_l303_response_format_answer(void) {
         TEST_ASSERT(jg.req.constrain != NULL);
         gen_state g;
         TEST_ASSERT(l303_begin(&srv, &jg, &g));
-        TEST_ASSERT(gen_constrain_live(&g));               /* the answer is the first byte */
-        TEST_ASSERT(!l303_allows(&srv, &g, '<'));          /* no call markup to open */
-        const std::string ans = "{\"n\": 7}";
-        TEST_ASSERT(l303_feed(&srv, &g, ans) == ans.size());
-        TEST_ASSERT(l303_allows(&srv, &g, v.stop));
+        TEST_ASSERT(gen_constrain_live(&g));   /* the answer is the first byte */
+        const std::string out = as_call ? "<|tool_call>call:search{q:<|\"|>x<|\"|>,n:7}<tool_call|>" : "{\"n\": 7}";
+        const size_t fed = l303_feed(&srv, &g, out);
+        if (fed != out.size()) fprintf(stderr, "l396 gemma rf+tools %d: refused at %zu\n", as_call, fed);
+        TEST_ASSERT(fed == out.size());
+        if (!as_call) TEST_ASSERT(l303_allows(&srv, &g, v.stop));
+        TEST_ASSERT(!l303_allows(&srv, &g, 'x'));
         l303_end(&jg, &g);
     }
     l303_server_free(&srv);
 #undef L303_RF
+}
+
+/* L396: Gemma 4's template writes a call's argument keys in dictsort order (case-folded), at every depth, whatever
+ * the schema's order; the strict grammar takes the call the template rendered into the history byte for byte, and
+ * refuses the schema's own order. */
+static void test_l396_gemma_call_key_order(void) {
+    l303_vocab v;
+    server srv;
+    l303_server(&srv, v);
+    static const char body[] =
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"},{\"role\":\"assistant\",\"content\":\"\",\""
+        "tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"put\",\"arguments\":"
+        "\"{\\\"zeta\\\":3,\\\"mid\\\":[\\\"a\\\",\\\"b\\\"],\\\"Alpha\\\":{\\\"y\\\":true,\\\"x\\\":1.5}"
+        "}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"ok\"},{\"role\":\"user\",\"cont"
+        "ent\":\"again\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"put\",\"strict\":tr"
+        "ue,\"parameters\":{\"type\":\"object\",\"properties\":{\"zeta\":{\"type\":\"integer\"},\"Alpha\""
+        ":{\"type\":\"object\",\"properties\":{\"y\":{\"type\":\"boolean\"},\"x\":{\"type\":\"number\"}},"
+        "\"required\":[\"y\",\"x\"],\"additionalProperties\":false},\"mid\":{\"type\":\"array\",\"items\""
+        ":{\"type\":\"string\"}}},\"required\":[\"zeta\",\"Alpha\",\"mid\"],\"additionalProperties\":fals"
+        "e}}}],\"reasoning_effort\":\"none\"}";
+    job j;
+    memset(&j, 0, sizeof j);
+    char err[300];
+    TEST_ASSERT(l303_request(&srv, PULSAR_CHAT_GEMMA4, API_OPENAI, body, &j.req, err, sizeof err));
+    TEST_ASSERT(j.req.constrain != NULL);
+    /* the call as the template rendered it into the history */
+    const std::string prompt = j.req.prompt_text;
+    const size_t a = prompt.find("<|tool_call>"), z = prompt.find("<tool_call|>");
+    TEST_ASSERT(a != std::string::npos && z != std::string::npos && z > a);
+    const std::string call = prompt.substr(a, z + strlen("<tool_call|>") - a);
+    TEST_ASSERT(call == "<|tool_call>call:put{Alpha:{x:1.5,y:true},mid:[<|\"|>a<|\"|>,<|\"|>b<|\"|>],zeta:3}<tool_call|>");
+    for (int schema_order = 0; schema_order < 2; schema_order++) {
+        gen_state g;
+        TEST_ASSERT(l303_begin(&srv, &j, &g));
+        const std::string out = schema_order ? "<|tool_call>call:put{zeta:3" : call;
+        const size_t fed = l303_feed(&srv, &g, out);
+        if (schema_order) {
+            TEST_ASSERT(fed == strlen("<|tool_call>call:put{"));   /* "zeta" first is not the template's order */
+        } else {
+            if (fed != out.size()) fprintf(stderr, "l396 gemma key order: refused at %zu: \"%.*s\"\n", fed, (int)fed + 1,
+                                           out.c_str());
+            TEST_ASSERT(fed == out.size());
+            TEST_ASSERT(!gen_constrain_live(&g));
+        }
+        gen_constrain_end(&g);
+        buf_free(&g.text);
+    }
+    request_free(&j.req);
+    l303_server_free(&srv);
 }
 
 /* L303: a speculative round's masks are the plain lane's -- row i is the mask after the base and drafts 0..i-1,
@@ -17334,6 +17382,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l303_shapes_accept_rendered_calls();
     test_l303_forced_call_grammar();
     test_l303_response_format_answer();
+    test_l396_gemma_call_key_order();
     test_l303_round_masks_match_plain();
     test_l309_draft_prefix();
     test_l303_protocol_fields();

@@ -25,7 +25,9 @@
  */
 #include "pulsar_server_internal.h"
 #include "../lib/pulsar_grammar.h"
+#include "../lib/pyjson.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <mutex>
@@ -262,6 +264,47 @@ static void j_const(buf *b, const char *s) {
     buf_putc(b, '}');
 }
 
+/* L396: Gemma 4's template writes a call's arguments with every mapping's keys in Jinja's dictsort order (ASCII
+ * case-folded, stable: gemma4_chat.cpp format_argument), and xgrammar's object rule follows the schema's property
+ * order -- so the strict schema's `properties` maps are put in that order before compiling, at every depth
+ * (llama.cpp 93cf736a8 sorts its Gemma 4 rules the same way).  Only member order changes; the schema means the
+ * same. */
+/// @param v  a schema (or any JSON value inside one), reordered in place
+static void schema_dictsort_properties(pyjson_value *v) {
+    if (v->kind == pyjson_value::ARR) {
+        for (pyjson_value &x : v->a) schema_dictsort_properties(&x);
+        return;
+    }
+    if (v->kind != pyjson_value::OBJ) return;
+    for (auto &kv : v->o) {
+        if (kv.first == "properties" && kv.second.kind == pyjson_value::OBJ) {
+            auto lower = [](std::string s) {
+                for (char &ch : s)
+                    if (ch >= 'A' && ch <= 'Z') ch = (char)(ch + 32);
+                return s;
+            };
+            std::stable_sort(kv.second.o.begin(), kv.second.o.end(),
+                             [&](const auto &a, const auto &b) { return lower(a.first) < lower(b.first); });
+            for (auto &p : kv.second.o) schema_dictsort_properties(&p.second);   /* each property's schema */
+        } else {
+            schema_dictsort_properties(&kv.second);
+        }
+    }
+}
+
+/// @param schema  a tool's arguments schema (JSON text)
+/// @param sh      the family's markup
+/// @return the schema as the shape compiles it: dictsorted when the shape asks (L396), else unchanged
+static std::string shape_schema(const std::string &schema, const server_grammar_shape *sh) {
+    if (!sh->dictsort_keys) return schema;
+    pyjson_value v;
+    if (!pyjson_parse(schema.data(), schema.size(), &v, NULL, 0)) return schema;   /* the compiler names the error */
+    schema_dictsort_properties(&v);
+    std::string out;
+    pyjson_dump(v, &out);
+    return out;
+}
+
 /* One call region: call_trigger block_head (name_open NAME name_close ARGS call_close)[+] block_tail. */
 /// @param b      the format being built
 /// @param sh     the family's markup
@@ -281,7 +324,7 @@ static void j_call_region(buf *b, const server_grammar_shape *sh, const std::vec
         std::string open = std::string(sh->name_open) + tools[i].name + sh->name_close;
         j_const(b, open.c_str());
         buf_puts(b, ",{\"type\":\"json_schema\",\"json_schema\":");
-        buf_puts(b, tools[i].schema.c_str());
+        buf_puts(b, shape_schema(tools[i].schema, sh).c_str());
         buf_puts(b, ",\"style\":");
         json_escape(b, sh->style);
         buf_printf(b, ",\"max_whitespace_cnt\":%d},", k_json_ws_max);
@@ -375,7 +418,7 @@ bool constrain_plan_build(pulsar_engine *e, server *s, const chat_conversation *
                  want_answer ? "response_format" : "strict tools", r->family->name);
         return false;
     }
-    if (want_calls && !sh->call_trigger) {   /* L338: a shape for response formats only (Gemma 4's) */
+    if (want_calls && !sh->call_trigger) {   /* a shape for response formats only (Gemma 4's until L396; none today) */
         if (any_strict) {
             snprintf(err, errlen, "strict tools: the %s family's grammar shape has no tool-call markup (L338)",
                      r->family->name);
@@ -407,8 +450,8 @@ bool constrain_plan_build(pulsar_engine *e, server *s, const chat_conversation *
     }
     if (want_answer) {
         /* whitespace, then the format and the family's answer close -- or, with tools on offer, the turn's calls
-         * instead (a turn may answer with calls; each may follow whitespace).  A shape without call markup (Gemma 4's,
-         * L338) has no call region to offer: the turn is the format.  L395: building one dereferenced its NULL
+         * instead (a turn may answer with calls; each may follow whitespace).  A shape without call markup (Gemma 4's
+         * until L396) has no call region to offer: the turn is the format.  L395: building one dereferenced its NULL
          * call_trigger and took the server down on any response_format request that also offered tools. */
         buf f = {0};
         buf_puts(&f, "{\"type\":\"sequence\",\"elements\":[");
