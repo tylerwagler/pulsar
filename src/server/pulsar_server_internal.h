@@ -5903,7 +5903,8 @@ void server_slot_take_history(session_slot *sl, const request *r);
  *  among the idle provisioned slots (server_evict_pick_victim's order) sparing the queued live-tool `owners` always
  *  and, first, every queued job's usable `warm` match that is not scratch; with nothing left, the owners alone
  *  (binding must progress).  A request never evicts the bank it matched best: when the victim is `best`, the verdict
- *  is to run in place on it.
+ *  is to run in place on it.  L394: unless `best` is guard-spilled (session_slot::spilled: no resident rows to keep)
+ *  and a resident idle bank may go -- then that bank is the victim.
  *  @param slots        the slot array
  *  @param n_slots      its length
  *  @param owners       per slot: owned by a queued live-tool continuation, never evicted (NULL: none)

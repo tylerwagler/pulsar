@@ -1140,6 +1140,25 @@ make_room_verdict server_make_room(const session_slot *slots, int n_slots, const
         soft[i] = (owners && owners[i]) || (warm && warm[i] && !(scratch && scratch[i]));
     int vi = server_evict_pick_victim(slots, n_slots, soft, allow_slot0, dominated, scratch);
     if (vi < 0) vi = server_evict_pick_victim(slots, n_slots, owners, allow_slot0, dominated, scratch);
+    /* L394: "in place" keeps the matched bank's RESIDENT rows (L379).  A guard-spilled best holds none -- its physical
+     * is freed and its history is a disk chain, which any bank restores from (server_resume_pick) -- so running in
+     * place keeps nothing and needs the prompt's whole KV paged in, room only another bank's spill could make, and
+     * with that bank the chat pool's last resident one the spill cannot park (CT 130, 2026-11-15: bank 0 spilled,
+     * bank 1 resident and idle, a 129,724-token prompt re-admitted 76,135 times in 2 min).  So the pick passes over
+     * the spilled banks to a resident idle one, under the same two tiers: the job lands on its pages (worker_evict
+     * persists its history first unless it is read-only) and restores its match from the chain there.  With no such
+     * bank, in place as before. */
+    if (vi >= 0 && vi == best && slots[best].spilled) {
+        bool soft_r[PULSAR_SESSION_POOL_CAP], owners_r[PULSAR_SESSION_POOL_CAP];
+        for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) {
+            const bool gone = i < n_slots && slots[i].spilled;
+            soft_r[i] = soft[i] || gone;
+            owners_r[i] = (owners && owners[i]) || gone;
+        }
+        int alt = server_evict_pick_victim(slots, n_slots, soft_r, allow_slot0, dominated, scratch);
+        if (alt < 0) alt = server_evict_pick_victim(slots, n_slots, owners_r, allow_slot0, dominated, scratch);
+        if (alt >= 0) vi = alt;
+    }
     *victim = vi;
     if (vi < 0) return MAKE_ROOM_NONE;
     return vi == best ? MAKE_ROOM_IN_PLACE : MAKE_ROOM_EVICT;
@@ -3146,7 +3165,7 @@ bool server::spill_bank(session_slot *victim) {
  * (as Flare's: its image features are not reconstructed). */
 static int guard_victim_order(server *s, session_slot **dec, int n, int *order, bool *dominated_out = nullptr);
 static int guard_spill_victims(server *s, session_slot **dec, int n, int *order, KvBytes *drop,
-                               bool *dominated_out = nullptr);
+                               bool *dominated_out = nullptr, bool room_parks = false);
 static prompt_kv_verdict server_prompt_kv_verdict(KvBytes touched, KvBytes delta, KvBytes bound,
                                                   const KvBytes *drop, int n_victims, bool busy_may_free,
                                                   int *n_spill);
@@ -3198,6 +3217,31 @@ static int server_park_pick(const bool *resident, int n, int except) {
     return -1;
 }
 
+/* L394: how many of a spill plan's victims, in its order, a spill can take.  Each spill parks the pool on another
+ * resident bank while the victim's physical goes (server_park_pick), so once every resident bank of the chat pool is a
+ * victim the last of them has nowhere to park: spill_bank refuses it, every time.  Counted, it made a SPILL verdict
+ * that could never execute and was re-decided every worker turn -- the livelock of CT 130, 2026-11-15 (bank 0
+ * spilled, bank 1 the only resident bank and the plan's one victim, 76,135 admission passes in 2 min, then the
+ * client left).  Without it the arithmetic resolves to WAIT or REFUSE (server_prompt_kv_verdict), which are real.
+ * The plan keeps every victim when another resident bank stays, or when the bank the room is for becomes one before
+ * the spills run (`room_parks`). */
+/// @param resident per bank: resident (pool_residency)
+/// @param n banks
+/// @param victim_bank per victim, in spill order: its bank
+/// @param m victims
+/// @param room_parks the room's own bank is resident by the time the spills run
+/// @return the victims a spill can take: m, or m - 1 when the plan would spill the last resident bank
+static int server_spill_parkable(const bool *resident, int n, const int *victim_bank, int m, bool room_parks) {
+    if (m == 0 || room_parks) return m;
+    for (int b = 0; b < n; b++) {
+        if (!resident[b]) continue;
+        bool victim = false;
+        for (int k = 0; k < m && !victim; k++) victim = victim_bank[k] == b;
+        if (!victim) return m;   /* a resident bank that stays: every spill parks on it */
+    }
+    return m - 1;
+}
+
 /* L328 (2): does preempting a decoder of `freed` bytes make a prompt adding `need` fit, pure -- beside the reserved
  * base, once the idle banks (`idle`, their bytes summed) are spilled too: the re-check after the preemption spills
  * them (PROMPT_KV_SPILL).  Before bank 0 could be spilled, an idle bank 0 holding the warmup's high-water was no
@@ -3236,12 +3280,20 @@ static bool server_guard_may_preempt(int n_decoding, bool reserving) {
     return n_decoding > 1 || reserving;
 }
 
-BankId server::park_bank(BankId except) {
-    auto *s = this;
-    bool resident[PULSAR_SESSION_POOL_CAP];
+/* The chat pool's residency, the one read park_bank and a spill plan's parkability (guard_spill_victims) share:
+ * resident[b] for bank b, the judge's reserved bank (past pool_banks) not among them. */
+/// @param s the server
+/// @param resident receives, per bank, whether its physical is backed (room for PULSAR_SESSION_POOL_CAP)
+/// @return the banks written
+static int pool_residency(server *s, bool *resident) {
     const int n = s->pool_banks < PULSAR_SESSION_POOL_CAP ? s->pool_banks : PULSAR_SESSION_POOL_CAP;
-    /* resident[] is indexed by bank: entry b is bank b */
     for (int b = 0; b < n; b++) resident[b] = !pulsar_session_bank_is_evicted(s->sess, BankId{b});
+    return n;
+}
+
+BankId server::park_bank(BankId except) {
+    bool resident[PULSAR_SESSION_POOL_CAP];
+    const int n = pool_residency(this, resident);
     return BankId{server_park_pick(resident, n, except.raw())};   /* -1 (nowhere) enters as none() */
 }
 
@@ -3346,7 +3398,8 @@ bool server::worker_readmit_preempted() {
          * made for it is not retaken before it lands; the decoder stays parked until a job ends and frees it) */
         int order[PULSAR_SESSION_POOL_CAP], n_spill = 0;
         KvBytes drop[PULSAR_SESSION_POOL_CAP];
-        const int n_victims = guard_spill_victims(s, NULL, 0, order, drop);
+        /* L394: its own bank parks the pool, re-backed first (L362, below) */
+        const int n_victims = guard_spill_victims(s, NULL, 0, order, drop, nullptr, /*room_parks=*/true);
         bool busy = server_judge_holds_kv(s);   /* another job whose end may make room (L372: a judge request's) */
         int n_decoding = 0;
         for (int i = 0; i < s->n_slots; i++) {
@@ -3580,18 +3633,26 @@ static int guard_victim_order(server *s, session_slot **dec, int n, int *order, 
 /// @param order receives the victims' slot indexes, in pick order
 /// @param drop receives, per victim, the bytes its spill frees (may be NULL)
 /// @param dominated_out receives the dominance facts per slot (may be NULL)
+/// @param room_parks the bank the room is for is resident before the spills run though it is not now (a fresh bank
+///        the job provisions; a parked decoder's bank, re-backed first, L362)
 /// @return victims written
-static int guard_spill_victims(server *s, session_slot **dec, int n, int *order, KvBytes *drop, bool *dominated_out) {
+static int guard_spill_victims(server *s, session_slot **dec, int n, int *order, KvBytes *drop, bool *dominated_out,
+                               bool room_parks) {
     const int all = guard_victim_order(s, dec, n, order, dominated_out);
     int m = 0;
+    int banks[PULSAR_SESSION_POOL_CAP];
     for (int k = 0; k < all; k++) {
         const KvBytes frees = pulsar_session_bank_touched_kv_bytes(s->sess, s->slots[order[k]].bank);
         if (frees == KvBytes{}) continue;
         order[m] = order[k];
+        banks[m] = s->slots[order[k]].bank.raw();
         if (drop) drop[m] = frees;
         m++;
     }
-    return m;
+    /* L394: and only the victims a spill can take -- the last resident bank cannot be (spill_bank: nowhere to park) */
+    bool resident[PULSAR_SESSION_POOL_CAP];
+    const int nb = pool_residency(s, resident);
+    return server_spill_parkable(resident, nb, banks, m, room_parks);
 }
 
 /* L280: the prompt's KV admission, as arithmetic.  touched = the pool's resident KV now, delta = what binding the
@@ -3635,6 +3696,16 @@ static bool server_slot_end_frees_kv(const session_slot *c) {
     return c->provisioned && !c->spilled && c->active_job && !c->preempted;
 }
 
+/* Whether a busy bank turns into a victim once its job ends -- the WAIT half of a prompt's verdict. */
+/// @param s the server
+/// @param sl the slot the prompt binds to (never counted; may be NULL)
+/// @return true when a bound job's end, or a judge request's, may make room
+static bool prompt_kv_busy_may_free(server *s, const session_slot *sl) {
+    bool busy = server_judge_holds_kv(s);   /* L372 (O12): as is the judge bank under a judge request */
+    for (int i = 0; i < s->n_slots && !busy; i++) busy = &s->slots[i] != sl && server_slot_end_frees_kv(&s->slots[i]);
+    return busy;
+}
+
 prompt_kv_verdict server::prompt_kv_check(const session_slot *sl, const job *j, int *order, int *n_spill,
                                           KvBytes *need) {
     auto *s = this;
@@ -3648,13 +3719,14 @@ prompt_kv_verdict server::prompt_kv_check(const session_slot *sl, const job *j, 
     const KvBytes have = sl ? pulsar_session_bank_touched_kv_bytes(pool, sl->bank) : KvBytes{};
     *need = want > have ? want - have : KvBytes{};
     /* the victims: every idle bank but the job's own (guard_pick_victim's filter: never a bound or spilled bank) that
-     * holds resident KV (guard_spill_victims) */
+     * holds resident KV and that a spill can take (guard_spill_victims).  L394: a fresh bank (NULL) is resident once
+     * provisioned, before the spills, and parks the pool; a spilled `sl` is re-backed only when its job begins
+     * (gen_begin), after them, so it parks nothing */
     session_slot *self[1] = {(session_slot *)sl};
     KvBytes drop[PULSAR_SESSION_POOL_CAP];
-    const int n_victims = guard_spill_victims(s, self, sl ? 1 : 0, order, drop);
+    const int n_victims = guard_spill_victims(s, self, sl ? 1 : 0, order, drop, nullptr, /*room_parks=*/sl == NULL);
     /* a bank bound to a job now is a victim once that job ends */
-    bool busy = server_judge_holds_kv(s);   /* L372 (O12): as is the judge bank under a judge request */
-    for (int i = 0; i < s->n_slots && !busy; i++) busy = &s->slots[i] != sl && server_slot_end_frees_kv(&s->slots[i]);
+    const bool busy = prompt_kv_busy_may_free(s, sl);
     /* L326: from the reserved base -- prompts bound earlier in this worker turn have touched nothing yet */
     return server_prompt_kv_verdict(s->kv_reserved_bytes(sl), *need, s->guard_budget(), drop, n_victims, busy,
                                     n_spill);
@@ -3678,20 +3750,27 @@ bool server::prompt_kv_admit(session_slot *sl, job *j, bool *refused) {
     const double gib = 1024.0 * 1024.0 * 1024.0;
     const KvBytes touched = s->kv_reserved_bytes(sl);   /* the base the verdict read (L326) */
     if (v == PROMPT_KV_SPILL) {
-        server_log(PULSAR_LOG_DEFAULT,
-                   "pulsar-server: kv admission: a %d-token prompt adds %.2f GiB of KV to bank %d (resident %.2f + "
-                   "%.2f > budget %.2f GiB): spilling %d idle bank(s) first",
-                   j->req.prompt.len, (double)need.raw() / gib, sl->bank.raw(), (double)touched.raw() / gib,
-                   (double)need.raw() / gib, (double)s->guard_budget().raw() / gib, n_spill);
-        for (int k = 0; k < n_spill; k++) {
-            if (!s->spill_bank(&s->slots[order[k]])) break;
-            s->count_metric(&s->m_spills);
+        /* L394: said once per job, like the WAIT below: a job the worker retries says it again only once it bound */
+        if (j->refusal_counted != PROVISION_REFUSED_KV_TOUCHED)
+            server_log(PULSAR_LOG_DEFAULT,
+                       "pulsar-server: kv admission: a %d-token prompt adds %.2f GiB of KV to bank %d (resident %.2f + "
+                       "%.2f > budget %.2f GiB): spilling %d idle bank(s) first",
+                       j->req.prompt.len, (double)need.raw() / gib, sl->bank.raw(), (double)touched.raw() / gib,
+                       (double)need.raw() / gib, (double)s->guard_budget().raw() / gib, n_spill);
+        bool failed = false;
+        for (int k = 0; k < n_spill && !failed; k++) {
+            failed = !s->spill_bank(&s->slots[order[k]]);
+            if (!failed) s->count_metric(&s->m_spills);
         }
         /* a spill that failed leaves the breach: decide again on what is resident now */
         KvBytes again{};
         int n2 = 0;
-        const prompt_kv_verdict v2 = s->prompt_kv_check(sl, j, order, &n2, &again);
+        prompt_kv_verdict v2 = s->prompt_kv_check(sl, j, order, &n2, &again);
         if (v2 == PROMPT_KV_FITS) return true;
+        /* L394: a plan whose spill just failed is no plan this turn: retried as SPILL it was re-run every worker turn,
+         * and with nothing running the worker never sleeps (its wait predicate holds the queued head).  It waits when
+         * a busy bank's end will make room, else the prompt is refused -- once, by name (rule 9) */
+        if (failed && v2 == PROMPT_KV_SPILL) v2 = prompt_kv_busy_may_free(s, sl) ? PROMPT_KV_WAIT : PROMPT_KV_REFUSE;
         if (v2 != PROMPT_KV_REFUSE) {
             s->note_provision_refusal(j, PROVISION_REFUSED_KV_TOUCHED);
             return false;

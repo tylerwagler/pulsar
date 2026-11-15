@@ -10534,6 +10534,99 @@ static void test_l379_scratch_banks_go_first(void) {
     }
 }
 
+/* L394: the CT 130 shape of 2026-11-15 00:46Z (two chat banks + the judge's): a 129,724-token read-only prompt whose
+ * best match (common 46,139) is bank 0, which the guard had spilled; bank 1, resident and idle (1.49 GiB), served
+ * more recently; both histories read-only (scratch).  Before: bank 0, the LRU scratch bank, was the make-room pick,
+ * that is the matched bank, so the prompt ran "in place" on a bank with no resident rows -- and its admission could
+ * only make room by spilling bank 1, the pool's last resident bank, which the guard refuses every time. */
+static void test_l394_spilled_best_is_not_in_place(void) {
+    session_slot slots[PULSAR_SESSION_POOL_CAP];
+    bool scratch[PULSAR_SESSION_POOL_CAP];
+    int victim = -9;
+    const int tokens[3] = {60987, 41200, 52000};
+    const bool ro[3] = {true, true, false};
+    const uint64_t served[3] = {100, 200, 300};
+    l379_banks(slots, 2, tokens, ro, served, scratch);
+    TEST_ASSERT(scratch[0] && scratch[1]);
+    /* L379 intact: a RESIDENT best that is the pick runs in place */
+    TEST_ASSERT(server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, 0, &victim) == MAKE_ROOM_IN_PLACE &&
+                victim == 0);
+    /* the incident: bank 0 spilled -- the resident idle bank 1 goes, and the prompt lands on its pages */
+    slots[0].spilled = true;
+    TEST_ASSERT(server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, 0, &victim) == MAKE_ROOM_EVICT &&
+                victim == 1);
+    /* bank 1 some queued job's warm match, and a conversation: spared first, taken in the owners tier (binding must
+     * progress, and in place on bank 0 cannot) */
+    bool warm[PULSAR_SESSION_POOL_CAP] = {false};
+    warm[1] = true;
+    scratch[1] = false;
+    slots[1].kv_flags = 0u;
+    TEST_ASSERT(server_make_room(slots, 2, NULL, warm, true, NULL, scratch, 0, &victim) == MAKE_ROOM_EVICT &&
+                victim == 1);
+    /* a queued live-tool continuation owns bank 1: never evicted -- in place, as before */
+    bool owners[PULSAR_SESSION_POOL_CAP] = {false};
+    owners[1] = true;
+    TEST_ASSERT(server_make_room(slots, 2, owners, warm, true, NULL, scratch, 0, &victim) == MAKE_ROOM_IN_PLACE &&
+                victim == 0);
+    /* bank 1 busy, or spilled too: no resident idle bank -- in place */
+    slots[1].active_job = (struct job *)slots;
+    TEST_ASSERT(server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, 0, &victim) == MAKE_ROOM_IN_PLACE &&
+                victim == 0);
+    slots[1].active_job = NULL;
+    slots[1].spilled = true;
+    TEST_ASSERT(server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, 0, &victim) == MAKE_ROOM_IN_PLACE &&
+                victim == 0);
+    /* three banks, two spilled: the pick passes over both to the resident one, whatever its class */
+    l379_banks(slots, 3, tokens, ro, served, scratch);
+    slots[0].spilled = slots[1].spilled = true;
+    TEST_ASSERT(server_make_room(slots, 3, NULL, NULL, true, NULL, scratch, 0, &victim) == MAKE_ROOM_EVICT &&
+                victim == 2);
+    /* a spilled bank that is not the best is still a victim like any (its slot is what a fresh bank needs) */
+    TEST_ASSERT(server_make_room(slots, 3, NULL, NULL, true, NULL, scratch, 2, &victim) == MAKE_ROOM_EVICT &&
+                victim == 0);
+    TEST_ASSERT(server_make_room(slots, 3, NULL, NULL, true, NULL, scratch, -1, &victim) == MAKE_ROOM_EVICT &&
+                victim == 0);
+}
+
+/* L394: a spill plan counts only the victims a spill can take (server_spill_parkable): the last resident bank of the
+ * chat pool has nowhere to park the pool, so a plan naming it resolves to WAIT or REFUSE -- not a SPILL re-decided
+ * every worker turn (CT 130: 76,135 passes in 2 min).  The incident's numbers: 1.49 GiB resident on bank 1, the
+ * prompt adds 2.47 GiB to the spilled bank 0, budget 2.55 GiB. */
+static void test_l394_unparkable_spill_is_no_plan(void) {
+    const uint64_t GiB = 1024ull * 1024ull * 1024ull;
+    const KvBytes touched{(uint64_t)(1.49 * (double)GiB)}, delta{(uint64_t)(2.47 * (double)GiB)},
+            budget{(uint64_t)(2.55 * (double)GiB)};
+    const KvBytes drop[1] = {touched};
+    int k = -1;
+    /* before: bank 1 counted -- SPILL, and spill_bank refused it every pass */
+    TEST_ASSERT(server_prompt_kv_verdict(touched, delta, budget, drop, 1, false, &k) == PROMPT_KV_SPILL && k == 1);
+    /* bank 0 spilled, bank 1 the plan's one victim and the only resident bank: no spill can take it */
+    const bool incident[2] = {false, true};
+    const int v1[1] = {1};
+    const int n = server_spill_parkable(incident, 2, v1, 1, false);
+    TEST_ASSERT(n == 0);
+    TEST_ASSERT(server_prompt_kv_verdict(touched, delta, budget, drop, n, false, &k) == PROMPT_KV_REFUSE && k == 0);
+    TEST_ASSERT(server_prompt_kv_verdict(touched, delta, budget, drop, n, true, &k) == PROMPT_KV_WAIT && k == 0);
+    /* the room's own bank resident before the spills (a fresh bank; a parked decoder's, re-backed first, L362): the
+     * pool parks on it */
+    TEST_ASSERT(server_spill_parkable(incident, 2, v1, 1, true) == 1);
+    /* another resident bank stays: every victim may go */
+    const bool both[2] = {true, true};
+    TEST_ASSERT(server_spill_parkable(both, 2, v1, 1, false) == 1);
+    const bool three[3] = {true, true, true};
+    const int v12[2] = {1, 2};
+    TEST_ASSERT(server_spill_parkable(three, 3, v12, 2, false) == 2);
+    /* every resident bank a victim: the plan stops one short -- the last has nowhere to park */
+    const bool two_of_three[3] = {false, true, true};
+    TEST_ASSERT(server_spill_parkable(two_of_three, 3, v12, 2, false) == 1);
+    /* no victims: nothing */
+    TEST_ASSERT(server_spill_parkable(two_of_three, 3, v12, 0, false) == 0);
+    /* a one-bank pool (server_park_pick -1): its bank is never a spill */
+    const bool one[1] = {true};
+    const int v0[1] = {0};
+    TEST_ASSERT(server_spill_parkable(one, 1, v0, 1, false) == 0 && server_park_pick(one, 1, 0) == -1);
+}
+
 /* L379 (v), (vi): what makes a bank scratch -- the history of a read-only request, or one under the disk tier's
  * minimum -- and that the mark follows the request that takes the bank's history. */
 static void test_l379_scratch_predicate(void) {
@@ -17191,6 +17284,8 @@ static void pulsar_server_unit_tests_run(void) {
     test_l379_request_does_not_evict_its_matched_bank();
     test_l379_scratch_banks_go_first();
     test_l379_scratch_predicate();
+    test_l394_spilled_best_is_not_in_place();
+    test_l394_unparkable_spill_is_no_plan();
     test_l372_abandoned_decode_is_not_a_turn();
     test_l372_abandoned_prefill_drops_stale_bindings();
     test_l353_eviction_keeps_chain_ends();
