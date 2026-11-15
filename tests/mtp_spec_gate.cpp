@@ -34,6 +34,14 @@
  *       pulsar_spec_step::greedy_rows -- == each bank's plain stream, rounds that cross between the modes counted
  *   M6  (L298) the prefix-cache must-pass: the next turn synced on the session that served a speculative stream (the
  *       reuse) == the same text synced cold, every trunk and drafter slot byte for byte, the same logits
+ *   M7  (L403, after TensorFold 783380bd4 / 87d500f19) the depth sweep: one greedy stream whose draft depth moves EVERY
+ *       round -- 1 .. depth_max, then zig-zag (max, 1, max - 1, 2, ...) -- no stop rule, unpriced.  Each round: the
+ *       chain the drafter stamped is exactly min(depth, depth_max) drafts (a copy chain: at most depth_max), the
+ *       count `draft` returned is the count it stamped, and (block lane) the chain is the first `depth` drafts of a
+ *       full-depth redraft from the same state; the stream == plain.  M1's equality and its drafted >= 0.95 x depth
+ *       cannot see a drafter that drafts past the depth it was asked for, or a wrong draft the verify rejects -- so
+ *       four planted faulty drafters (the depth ignored, one draft short, the last draft wrong, the count misreported)
+ *       must each fail the sweep
  *
  * --probe (the draft grade's capture, tests/nemotron_mtp_grade.py): the first draft step's logits at every position of
  * a reference prompt, teacher-forced by the trunk (the lane's probe: each lockstep module row headed) -- the DECODE
@@ -47,6 +55,7 @@
 #include "pulsar_engine_internal.h"   /* the drafter's numbers, the pendings, the lane's probe */
 #include "spec_mtp.h"
 #include "spec_block.h"
+#include "spec_internal.h"      /* pulsar_spec_cur_depth: the depth a round is asked for (M7) */
 
 #include <math.h>
 #include <stdio.h>
@@ -353,6 +362,130 @@ static void batched_lane(pulsar_engine *e, const std::vector<pulsar_tokens> &P, 
     if (s) pulsar_session_free(s);
 }
 
+/* M7 (L403): the drafter the sweep runs -- g_fixed's draft wrapped, so a round's request and stamp are observed and a
+ * planted fault can be put between them. */
+enum m7_fault { M7_CLEAN = 0, M7_IGNORES_DEPTH, M7_ONE_SHORT, M7_LAST_WRONG, M7_MISCOUNTS, M7_FAULTS };
+static const char *const m7_fault_name[M7_FAULTS] = {"clean", "the depth ignored (drafts depth_max)",
+                                                     "one draft short", "the last draft wrong",
+                                                     "the count misreported"};
+static int g_m7_fault;
+static uint32_t g_m7_keep, g_m7_asked;   /* the last call's return and the depth it was asked for */
+static uint32_t m7_draft(pulsar_session *s, TokId next_base, float temperature, int top_k, float top_p, float min_p,
+                         uint64_t *rng) {
+    pulsar_spec_carry_state &sp = s->spec;
+    g_m7_asked = pulsar_spec_cur_depth(s);
+    const int depth = sp.spec_adaptive_depth;
+    if (g_m7_fault == M7_IGNORES_DEPTH) sp.spec_adaptive_depth = (int)g_base->depth_max;
+    uint32_t keep = g_base->draft(s, next_base, temperature, top_k, top_p, min_p, rng);
+    sp.spec_adaptive_depth = depth;
+    if (keep != PULSAR_DRAFT_REFUSED && !sp.pend_copy) {
+        if (g_m7_fault == M7_ONE_SHORT && sp.n_pend > 1) keep = --sp.n_pend;
+        if (g_m7_fault == M7_LAST_WRONG && sp.n_pend > 0) {
+            TokId &t = sp.pend[sp.n_pend - 1];
+            t = TokId{t.raw() == 1000 ? 1001 : 1000};   /* an ordinary id; the verify rejects it, the text holds */
+        }
+    }
+    if (g_m7_fault == M7_MISCOUNTS && keep != PULSAR_DRAFT_REFUSED) keep = sp.n_pend + 1u;
+    g_m7_keep = keep;
+    return keep;
+}
+
+/* M7's depth schedule: 1 .. D, then D, 1, D - 1, 2, ... (D values) */
+static std::vector<uint32_t> m7_schedule(uint32_t D) {
+    std::vector<uint32_t> v;
+    for (uint32_t d = 1; d <= D; d++) v.push_back(d);
+    for (uint32_t lo = 1, hi = D; lo <= hi; lo++, hi--) {
+        v.push_back(hi);
+        if (lo != hi) v.push_back(lo);
+    }
+    return v;
+}
+
+struct m7_tally {
+    uint32_t rounds = 0, copies = 0, over_cap = 0, wrong_count = 0, misreported = 0, off_reference = 0, compared = 0;
+    size_t steps = 0, scheduled = 0;   /* the schedule's depths run, of its length */
+    int first_diff = -1;   /* the stream against plain */
+    bool ok = true;        /* every call ran */
+    uint32_t bad() const { return over_cap + wrong_count + misreported + off_reference + (first_diff != -1); }
+};
+
+/* One sweep: the prompts' greedy streams in turn, the depth set before every round, until the schedule is spent. */
+static m7_tally m7_sweep(pulsar_engine *e, const std::vector<pulsar_tokens> &P, const std::vector<stream> &plain,
+                         bool block, int fault) {
+    m7_tally t;
+    const uint32_t D = g_base->depth_max;
+    const std::vector<uint32_t> sched = m7_schedule(D);
+    drafter_at_depth(e, D);   /* no stop rule, unpriced, no controller: the depth is the round's */
+    g_fixed.draft = m7_draft;
+    g_m7_fault = fault;
+    size_t at = 0;
+    for (size_t i = 0; t.ok && at < sched.size() && i < P.size(); i++) {
+        pulsar_engine_set_bank_pool(1);
+        pulsar_session *s = NULL;
+        char err[256] = "";
+        t.ok = pulsar_session_create(&s, e, 4096) == 0 && s && pulsar_session_sync(s, &P[i], err, sizeof(err)) == 0;
+        std::vector<int32_t> out;
+        uint64_t rng = 0;
+        while (t.ok && at < sched.size()) {
+            const uint32_t d = sched[at];
+            s->spec.spec_quenched = false;   /* as run(): the yield quench disarmed */
+            s->spec.spec_quench_steps = 0;
+            s->spec.spec_quench_debt = 0.0f;
+            s->spec.spec_quench_ewma = 0.0f;
+            s->spec.spec_adaptive_depth = (int)d;   /* the depth this round's redraft is asked for */
+            g_m7_keep = g_m7_asked = UINT32_MAX;
+            TokId buf[17];
+            const int k = pulsar_session_generate_speculative(s, 0.0f, 0, 1.0f, 0.0f, &rng, 1 << 20, buf, 17, err,
+                                                              sizeof(err));
+            if (k <= 0) {
+                t.ok = k == 0;
+                break;
+            }
+            for (int j = 0; j < k; j++) out.push_back(buf[j].raw());
+            if (pulsar_token_is_stop(e, buf[k - 1]) || g_m7_keep == UINT32_MAX) break;   /* no redraft: next prompt */
+            at++;
+            t.rounds++;
+            pulsar_spec_carry_state &sp = s->spec;
+            const uint32_t n_pend = sp.n_pend;
+            t.over_cap += n_pend > D || n_pend > 16u;
+            t.misreported += g_m7_keep != n_pend;
+            if (sp.pend_copy) {
+                t.copies++;
+                continue;
+            }
+            const uint32_t want = d < D ? d : D;
+            t.wrong_count += g_m7_asked != d || n_pend != want;
+            if (!block || n_pend == 0) continue;
+            /* the reference: the same state redrafted at the full depth by the drafter itself, then put back */
+            const pulsar_spec_carry_state keep = sp;
+            sp.spec_adaptive_depth = (int)D;
+            uint64_t rr = 0;
+            const uint32_t full = g_base->draft(s, sp.pend_base, 0.0f, 0, 1.0f, 0.0f, &rr);
+            /* a copy chain here is the copy lane's stateful re-probe, not the drafter's: not a reference */
+            const bool copy = full != PULSAR_DRAFT_REFUSED && sp.pend_copy;
+            bool same = full != PULSAR_DRAFT_REFUSED && sp.n_pend >= n_pend;
+            for (uint32_t j = 0; same && j < n_pend; j++) same = sp.pend[j] == keep.pend[j];
+            sp = keep;
+            if (copy) continue;
+            t.compared++;
+            t.off_reference += !same;
+        }
+        if (fault == M7_CLEAN && t.first_diff == -1) {
+            const size_t m = out.size() < plain[i].out.size() ? out.size() : plain[i].out.size();
+            for (size_t j = 0; j < m && t.first_diff == -1; j++)
+                if (out[j] != plain[i].out[j]) t.first_diff = (int)j;
+        }
+        if (!t.ok) fprintf(stderr, "M7 stream (%s): %s\n", m7_fault_name[fault], err);
+        if (s) pulsar_session_free(s);
+    }
+    t.steps = at;
+    t.scheduled = sched.size();
+    t.ok = t.ok && at == sched.size();   /* the prompts carried the whole schedule */
+    g_fixed.draft = g_base->draft;
+    g_m7_fault = M7_CLEAN;
+    return t;
+}
+
 static int exact(pulsar_engine *e, int n, const char *only) {
     auto on = [only](char c) { return !only || strchr(only, c) != NULL; };   /* the sections to run (M0 always) */
     const int W = pulsar_engine_logits_width(e);
@@ -404,7 +537,7 @@ static int exact(pulsar_engine *e, int n, const char *only) {
     }
     /* M1, M2: plain references */
     std::vector<stream> plain(P.size()), plain_t(P.size());
-    for (size_t i = 0; (on('1') || on('2') || on('4')) && i < P.size(); i++) {
+    for (size_t i = 0; (on('1') || on('2') || on('4') || on('7')) && i < P.size(); i++) {
         plain[i] = run(e, P[i], n, false, 0.0f, 0);
         plain_t[i] = on('2') ? run(e, P[i], n, false, 0.7f, 0x5eed + i) : plain[i];
         CHECK(plain[i].ok && plain_t[i].ok && !plain[i].out.empty(), "M1 prompt %zu (%d tokens): plain greedy %zu tokens, "
@@ -554,6 +687,28 @@ static int exact(pulsar_engine *e, int n, const char *only) {
         pulsar_tokens_free(&full);
         if (wa) pulsar_session_free(wa);
         if (co) pulsar_session_free(co);
+    }
+    /* M7 (L403): the depth sweep, then the planted faults */
+    if (on('7')) {
+        const uint32_t D = g_base->depth_max;
+        const m7_tally c = m7_sweep(e, P, plain, block, M7_CLEAN);
+        CHECK(c.ok && c.rounds > 0 && c.bad() == 0,
+              "M7 depth sweep 1..%u then zig-zag, the depth moved every round (%zu of %zu depths run): %u rounds (%u "
+              "copy chains), %u over depth_max, %u not exactly the depth asked, %u counts misreported, %u of %u off "
+              "the full-depth redraft%s; the stream == plain (first difference at %d)", D, c.steps, c.scheduled,
+              c.rounds, c.copies, c.over_cap, c.wrong_count, c.misreported, c.off_reference, c.compared,
+              block ? "" : " (block lane only)", c.first_diff);
+        for (int f = M7_IGNORES_DEPTH; f < M7_FAULTS; f++) {
+            if (f == M7_LAST_WRONG && !block) {
+                printf("  info  M7 planted fault \"%s\": the reference redraft is the block lane's -- not run\n",
+                       m7_fault_name[f]);
+                continue;
+            }
+            const m7_tally t = m7_sweep(e, P, plain, block, f);
+            CHECK(t.rounds > 0 && t.bad() > 0, "M7 planted fault \"%s\" fails the sweep: %u of %u rounds caught "
+                  "(%u over cap, %u wrong count, %u misreported, %u off the redraft)", m7_fault_name[f], t.bad(),
+                  t.rounds, t.over_cap, t.wrong_count, t.misreported, t.off_reference);
+        }
     }
     drafter_at_depth(e, 0);
     if (own_curve) {
