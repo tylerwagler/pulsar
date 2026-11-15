@@ -4425,6 +4425,50 @@ static void test_l309_draft_prefix(void) {
 }
 
 /* L303: the protocols' format fields and the Responses forced tool_choice. */
+/* L397: a JSON string whose `pattern` repeats more than 128 times keeps the JSON-string filter (xgrammar #949, pin
+ * 1ec3f99): a raw '"' ends the string (so a byte after it is refused), and a raw '\\' (xgrammar keeps a pattern's
+ * strings escape-free) and a control byte are refused -- the same as under a short repeat. */
+static void test_l397_long_repeat_keeps_json_string_filter(void) {
+    l303_vocab v;
+    std::vector<const char *> p;
+    std::vector<size_t> l;
+    for (const std::string &t : v.tok) {
+        p.push_back(t.data());
+        l.push_back(t.size());
+    }
+    char err[400] = "";
+    pulsar_grammar_compiler *c = pulsar_grammar_compiler_new(p.data(), l.data(), (int)v.tok.size(), (int)v.tok.size(),
+                                                             &v.stop, 1, 64LL << 20, err, sizeof err);
+    TEST_ASSERT(c != NULL);
+    for (int n : {100, 200, 900}) {
+        const std::string tag = "{\"type\":\"structural_tag\",\"format\":{\"type\":\"json_schema\",\"json_schema\":"
+                                "{\"type\":\"string\",\"pattern\":\"^[^,]{1," + std::to_string(n) + "}$\"}}}";
+        pulsar_grammar *g = pulsar_grammar_compile(c, tag.c_str(), 30.0, err, sizeof err);
+        TEST_ASSERT(g != NULL);
+        /* each case: the bytes that must be accepted, then one that must be refused */
+        struct scase {
+            const char *ok;
+            char refused;
+        } cases[] = {{"\"a\"", 'b'}, {"\"a", '\\'}, {"\"a", '\x01'}};
+        for (const scase &k : cases) {
+            pulsar_grammar_matcher *m = pulsar_grammar_matcher_new(g, true, err, sizeof err);
+            TEST_ASSERT(m != NULL);
+            for (const char *b = k.ok; *b; b++) TEST_ASSERT(pulsar_grammar_matcher_accept(m, (uint8_t)*b, err, sizeof err));
+            const bool took = pulsar_grammar_matcher_accept(m, (uint8_t)k.refused, err, sizeof err);
+            if (took) fprintf(stderr, "L397: {1,%d} accepted 0x%02x after \"%s\"\n", n, (uint8_t)k.refused, k.ok);
+            TEST_ASSERT(!took);
+            pulsar_grammar_matcher_free(m);
+        }
+        /* and a plain string still passes to its end */
+        pulsar_grammar_matcher *m = pulsar_grammar_matcher_new(g, true, err, sizeof err);
+        for (const char *b = "\"abc\""; *b; b++) TEST_ASSERT(pulsar_grammar_matcher_accept(m, (uint8_t)*b, err, sizeof err));
+        TEST_ASSERT(pulsar_grammar_matcher_terminated(m));
+        pulsar_grammar_matcher_free(m);
+        pulsar_grammar_free(g);
+    }
+    pulsar_grammar_compiler_free(c);
+}
+
 static void test_l303_protocol_fields(void) {
     response_format_spec f = {};
     char err[200];
@@ -17314,6 +17358,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l303_forced_call_grammar();
     test_l303_response_format_answer();
     test_l303_round_masks_match_plain();
+    test_l397_long_repeat_keeps_json_string_filter();
     test_l309_draft_prefix();
     test_l303_protocol_fields();
     test_qwen_payload_is_sampled_structure_greedy();
