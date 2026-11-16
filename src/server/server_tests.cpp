@@ -4422,6 +4422,55 @@ static void test_l303_response_format_answer(void) {
 #undef L303_RF
 }
 
+/* L396 (2026-11-16): a forced call on Gemma 4 skips thinking, as on every family: with thinking on the prompt ends in
+ * an empty, closed thought channel and the call opener -- the same bytes as thinking off -- whether the render left
+ * the channel unopened (a fresh turn) or open (after tool results); never a channel opened twice.  The generation's
+ * seed carries the same skip, and the strict call grammar takes the call after it. */
+static void test_l396_gemma_forced_skips_thought(void) {
+    l303_vocab v;
+    server srv;
+    l303_server(&srv, v);
+    char err[300];
+    static const char *const msgs_fresh = "\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]";
+    static const char *const msgs_tools =
+        "\"messages\":[{\"role\":\"user\",\"content\":\"x\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":"
+        "[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"now\",\"arguments\":\"{}\"}}]},{\"role\":"
+        "\"tool\",\"tool_call_id\":\"c1\",\"content\":\"noon\"}]";
+    /* the expected prompt end: thinking off after tool results is the template's own (no channel there); the seed adds
+     * nothing with thinking off */
+    static const char k_skip[] = "<|channel>thought\n<channel|><|tool_call>call:";
+    struct fcase {
+        const char *msgs, *effort, *tail;
+    } cases[] = {{msgs_fresh, "high", k_skip},
+                 {msgs_fresh, "none", k_skip},
+                 {msgs_tools, "high", "<tool_response|><|channel>thought\n<channel|><|tool_call>call:"},
+                 {msgs_tools, "none", "<tool_response|><|tool_call>call:"}};
+    for (const fcase &fc : cases) {
+        const std::string body = std::string("{") + fc.msgs + "," L303_TOOLS ",\"tool_choice\":\"required\","
+                                 "\"reasoning_effort\":\"" + fc.effort + "\"}";
+        job j;
+        memset(&j, 0, sizeof j);
+        TEST_ASSERT(l303_request(&srv, PULSAR_CHAT_GEMMA4, API_OPENAI, body.c_str(), &j.req, err, sizeof err));
+        TEST_ASSERT(j.req.force_tool_call && j.req.prompt_text);
+        const std::string pt = j.req.prompt_text;
+        const size_t tn = strlen(fc.tail);
+        const bool ends = pt.size() >= tn && !pt.compare(pt.size() - tn, tn, fc.tail);
+        if (!ends) fprintf(stderr, "l396 forced %s: prompt ends \"%s\"\n", fc.effort, pt.substr(pt.size() > 60 ? pt.size() - 60 : 0).c_str());
+        TEST_ASSERT(ends);
+        TEST_ASSERT(pt.find("thought\n<|channel>") == std::string::npos);    /* never opened twice */
+        TEST_ASSERT(pt.find("<channel|><|channel>thought\n<channel|><|tool_call>") == std::string::npos);
+        gen_state g;
+        TEST_ASSERT(l303_begin(&srv, &j, &g));
+        TEST_ASSERT(gen_constrain_live(&g));   /* the seed opened the call region */
+        const std::string call = "search{q:<|\"|>pulsars<|\"|>}<tool_call|>";
+        const size_t fed = l303_feed(&srv, &g, call);
+        if (fed != call.size()) fprintf(stderr, "l396 forced %s: refused at %zu\n", fc.effort, fed);
+        TEST_ASSERT(fed == call.size() && !gen_constrain_live(&g));
+        l303_end(&j, &g);
+    }
+    l303_server_free(&srv);
+}
+
 /* L396: Gemma 4 turns with thinking ON under a grammar.  The model opens its own thought channel (the prompt ends
  * "<|turn>model\n"), so a response format's region takes an optional <|channel> ... <channel|> block first (llama.cpp:
  * start + optional(thought) + response_format); with calls on offer the block must close before a call (a call from
@@ -17696,6 +17745,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l303_response_format_answer();
     test_l396_gemma_call_key_order();
     test_l396_gemma_thinking_turns();
+    test_l396_gemma_forced_skips_thought();
     test_l303_round_masks_match_plain();
     test_l397_long_repeat_keeps_json_string_filter();
     test_l309_draft_prefix();

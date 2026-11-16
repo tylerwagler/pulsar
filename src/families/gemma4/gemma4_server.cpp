@@ -132,13 +132,18 @@ bool gemma4_render(pulsar_engine *e, server *s, chat_conversation *c, request *r
 }
 
 /* L338 P4: the forced call's opener -- "<|tool_call>call:" (vLLM's reading of Gemma's call body), and for a named
- * tool its name and the arguments' "{".  A call opens from the answer or from reasoning alike (it ends the
- * reasoning: gemma4_chat.h), so the seed is the same with thinking on or off.  The call grammar (k_grammar_gemma4)
- * takes over from the seed: an unnamed call may name only a declared tool, and the arguments follow its schema. */
+ * tool its name and the arguments' "{".  The call grammar (k_grammar_gemma4) takes over from the seed: an unnamed
+ * call may name only a declared tool, and the arguments follow its schema.
+ * L396 (2026-11-16): a forced call skips thinking, as on every family (DeepSeek's seed closes its <think>): with
+ * thinking on the seed opens with an empty thought channel, the bytes the thinking-off prompt ends with.  Seeded
+ * straight after "<|turn>model\n" with thinking on, the model ran on inside the call to the token cap (CT 130
+ * constrained_live: 4/4 unterminated, against 12/12 valid thinking off). */
+static const char k_gemma4_skip_thought[] = "<|channel>thought\n<channel|>";
 /** server_family_ops::forced_call_seed for Gemma 4.
- *  @param r the request (forced_tool_name)
+ *  @param r the request (forced_tool_name, think_mode)
  *  @param out appended to: the seed bytes */
 void gemma4_forced_call_seed(const request *r, buf *out) {
+    if (pulsar_think_mode_enabled(r->think_mode)) buf_puts(out, k_gemma4_skip_thought);
     buf_puts(out, "<|tool_call>call:");
     if (r->forced_tool_name && r->forced_tool_name[0]) {
         buf_puts(out, r->forced_tool_name);
@@ -146,11 +151,25 @@ void gemma4_forced_call_seed(const request *r, buf *out) {
     }
 }
 
-/** server_family_ops::forced_call_prefill for Gemma 4: the prompt kept whole, the seed appended.
+/** server_family_ops::forced_call_prefill for Gemma 4: the seed appended; with thinking on, a prompt that already
+ *  opened the thought channel (after tool results) drops its opener, which the seed writes closed (DeepSeek's
+ *  prefill drops a trailing "<think>" the same way), and one that already closed it keeps it and skips the seed's.
  *  @param r the request
+ *  @param prompt the rendered prompt
+ *  @param keep in: the prompt's length; out: lowered past a trailing channel opener
  *  @param append receives the seed */
-void gemma4_forced_call_prefill(const request *r, const char *, size_t *, buf *append) {
-    gemma4_forced_call_seed(r, append);
+void gemma4_forced_call_prefill(const request *r, const char *prompt, size_t *keep, buf *append) {
+    buf seed = {0};
+    gemma4_forced_call_seed(r, &seed);
+    size_t skip = 0;
+    if (pulsar_think_mode_enabled(r->think_mode)) {
+        static const char open[] = "<|channel>thought\n";
+        const size_t on = sizeof open - 1, sn = sizeof k_gemma4_skip_thought - 1;
+        if (*keep >= on && !memcmp(prompt + *keep - on, open, on)) *keep -= on;
+        else if (*keep >= sn && !memcmp(prompt + *keep - sn, k_gemma4_skip_thought, sn)) skip = sn;
+    }
+    buf_puts(append, seed.ptr + skip);
+    buf_free(&seed);
 }
 
 /* the longest prefix two UNRELATED prompts share by template construction: <bos> (a system turn is not always
