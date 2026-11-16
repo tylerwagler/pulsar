@@ -642,7 +642,9 @@ int main(int argc, char **argv) {
         /* L298 / L299 (L317: on the hosted engines, no load of its own -- it was lilicorr-spec-gate and
          * dflash2-spec-gate, each a process and a model load): the block drafter's lane -- greedy spec == plain at
          * depths 1..5 and the drafter's own numbers, seeded T0.7, the forced-reject stress (every state byte back to
-         * the plain twin's), the batched lane over 4 banks, the prefix-cache must-pass.  M0 names the drafter it
+         * the plain twin's), the batched lane over 4 banks, the prefix-cache must-pass; L403 M7: the depth moved every
+         * round (1 .. depth_max, then zig-zag), each chain exactly the depth asked and the first drafts of a full-depth
+         * redraft, four planted faulty drafters failing it.  M0 names the drafter it
          * graded.  128 tokens a stream; the make targets' MTP_GATE_TOKENS (256) is the gates-dev depth. */
         {"block-spec-gate",           gate_mtp_spec_gate_main,          4, NULL, NULL, {"128", NULL},
          NEED_BLOCK | NEED_TOKENIZER},
