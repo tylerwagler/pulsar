@@ -723,6 +723,7 @@ static const server_grammar_shape k_grammar_deepseek_v41 = {
     /* .call_close            = */ PULSAR_INVOKE_END "\n",
     /* .repeat                = */ true,
     /* .block_tail            = */ PULSAR_TOOL_CALLS_END,
+    /* .dictsort_keys         = */ false,
 };
 /** V4 (0731)'s grammar shape: the same shape in V4's tag spelling. */
 static const server_grammar_shape k_grammar_deepseek_v4 = {
@@ -737,6 +738,7 @@ static const server_grammar_shape k_grammar_deepseek_v4 = {
     /* .call_close            = */ PULSAR_INVOKE_END_V4 "\n",
     /* .repeat                = */ true,
     /* .block_tail            = */ PULSAR_TOOL_CALLS_END_V4,
+    /* .dictsort_keys         = */ false,
 };
 /* Qwen and Nemotron-H write the same markup (qwen_chat.cpp, nemotron_chat.cpp): one <tool_call> block a call,
  * <function=NAME> and its <parameter=KEY> lines -- xgrammar's qwen_xml style. */
@@ -752,6 +754,7 @@ const server_grammar_shape k_grammar_qwen_xml = {
     /* .call_close            = */ "</function>\n</tool_call>",
     /* .repeat                = */ false,
     /* .block_tail            = */ "",
+    /* .dictsort_keys         = */ false,
 };
 
 /* ---- the tables and the dispatch ------------------------------------------------------------------- */
@@ -773,6 +776,7 @@ static const server_family_ops k_family_deepseek_v41 = {
     /* .grammar               = */ &k_grammar_deepseek_v41,
     /* .find_call_block       = */ find_next_dsml_tool_block,
     /* .tool_defs_text        = */ deepseek_tool_defs_text,
+    /* .reasoning             = */ NULL,   /* <think> / </think> */
 };
 /** DeepSeek V4 (0731)'s family table. */
 static const server_family_ops k_family_deepseek_v4 = {
@@ -791,6 +795,7 @@ static const server_family_ops k_family_deepseek_v4 = {
     /* .grammar               = */ &k_grammar_deepseek_v4,
     /* .find_call_block       = */ find_next_dsml_tool_block,
     /* .tool_defs_text        = */ deepseek_tool_defs_text,
+    /* .reasoning             = */ NULL,   /* <think> / </think> */
 };
 
 /* L295 F8 step 5: the tables this file owns (DeepSeek's two); every other family's registers in its module */

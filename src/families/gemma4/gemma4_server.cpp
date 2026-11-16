@@ -133,8 +133,8 @@ bool gemma4_render(pulsar_engine *e, server *s, chat_conversation *c, request *r
 
 /* L338 P4: the forced call's opener -- "<|tool_call>call:" (vLLM's reading of Gemma's call body), and for a named
  * tool its name and the arguments' "{".  A call opens from the answer or from reasoning alike (it ends the
- * reasoning: gemma4_chat.h), so the seed is the same with thinking on or off.  The arguments are the model's (the
- * shape has no call markup to constrain them with). */
+ * reasoning: gemma4_chat.h), so the seed is the same with thinking on or off.  The call grammar (k_grammar_gemma4)
+ * takes over from the seed: an unnamed call may name only a declared tool, and the arguments follow its schema. */
 /** server_family_ops::forced_call_seed for Gemma 4.
  *  @param r the request (forced_tool_name)
  *  @param out appended to: the seed bytes */
@@ -202,22 +202,34 @@ const server_output_parser_ops k_parser_gemma4 = {
 
 }  // namespace
 
-/* L338 P4: the response formats' shape -- the answer opens where the thought channel closes (thinking off, the
- * prompt already closed it: "<|channel>thought\n<channel|>"), Qwen's arrangement around "</think>"; no call markup
- * (strict tools refused by name, constrain_plan_build). */
-/** Gemma 4's grammar shape (server_family_ops::grammar): response formats only. */
+/* L338 P4: the answer opens where the thought channel closes (thinking off, the prompt already closed it:
+ * "<|channel>thought\n<channel|>"), Qwen's arrangement around "</think>".  L396: the calls as the template renders
+ * them (gemma4_chat.cpp) -- "<|tool_call>call:NAME{k:v,...}<tool_call|>", one call a block, the arguments in
+ * xgrammar's gemma style (bare keys, <|"|>-quoted strings, JSON scalars) with the keys in the template's dictsort
+ * order; more calls are more blocks. */
+/** Gemma 4's grammar shape (server_family_ops::grammar). */
 static const server_grammar_shape k_grammar_gemma4 = {
     /* .answer_open           = */ "<channel|>",
     /* .answer_at_think_close = */ true,
     /* .answer_close          = */ "",
-    /* .call_trigger          = */ NULL,   /* no call markup: strict tools refused */
+    /* .call_trigger          = */ "<|tool_call>",
     /* .block_head            = */ "",
-    /* .name_open             = */ "",
+    /* .name_open             = */ "call:",
     /* .name_close            = */ "",
-    /* .style                 = */ NULL,
-    /* .call_close            = */ "",
+    /* .style                 = */ "gemma",
+    /* .call_close            = */ "<tool_call|>",
     /* .repeat                = */ false,
     /* .block_tail            = */ "",
+    /* .dictsort_keys         = */ true,
+};
+
+/* L398: the thought channel as text -- <|channel> opens it, <channel|> (the close token, L344's forced draw) ends it,
+ * and so does a call opened from it, a turn boundary or a tool response: gemma4_prompt_opens_reasoning's rule, so the
+ * tracker fed the prompt agrees with the output parser on where the turn starts. */
+/** Gemma 4's reasoning markers (server_family_ops::reasoning). */
+static const server_reasoning_markers k_reasoning_gemma4 = {
+    /* .open  = */ "<|channel>",
+    /* .close = */ {"<channel|>", "<|tool_call>", "<|turn>", "<|tool_response>"},
 };
 
 /// Gemma 4's server table (registered below by SERVER_FAMILY; found by its chat format).
@@ -234,8 +246,9 @@ const server_family_ops k_family_gemma4 = {
     /* .tool_error_suffix     = */ NULL,
     /* .forced_call_seed      = */ gemma4_forced_call_seed,      /* L338 P4 */
     /* .forced_call_prefill   = */ gemma4_forced_call_prefill,
-    /* .grammar               = */ &k_grammar_gemma4,   /* response formats; strict tools refused by name */
+    /* .grammar               = */ &k_grammar_gemma4,   /* response formats and strict tools (L396) */
     /* .find_call_block       = */ NULL,
     /* .tool_defs_text        = */ NULL,
+    /* .reasoning             = */ &k_reasoning_gemma4,
 };
 SERVER_FAMILY(k_family_gemma4)

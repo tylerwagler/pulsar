@@ -25,7 +25,9 @@
  */
 #include "pulsar_server_internal.h"
 #include "../lib/pulsar_grammar.h"
+#include "../lib/pyjson.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <mutex>
@@ -138,11 +140,19 @@ struct constrain_plan {
     pulsar_grammar *calls = nullptr;    /* one call region, opened by the call trigger in free text: ends when complete */
     /// The family's grammar markup the regions were built from (static, not owned).
     const server_grammar_shape *shape = nullptr;
+    /// L396: the answer region behind an optional reasoning block, for a turn that starts outside reasoning with
+    /// thinking on in a family whose output opens its own block (Gemma 4: the model may write
+    /// <|channel>thought ... <channel|> before the format); NULL otherwise (the turn opens on `answer`).
+    pulsar_grammar *answer_after_thought = nullptr;
+    /// L396: the call trigger also ends reasoning (a family reasoning-close marker): a call opened from inside the
+    /// block is a call region, not reasoning text (Gemma 4's <|tool_call>).
+    bool call_ends_reasoning = false;
 };
 
 void constrain_plan_free(constrain_plan *p) {
     if (!p) return;
     pulsar_grammar_free(p->answer);
+    pulsar_grammar_free(p->answer_after_thought);
     pulsar_grammar_free(p->calls);
     delete p;
 }
@@ -262,6 +272,47 @@ static void j_const(buf *b, const char *s) {
     buf_putc(b, '}');
 }
 
+/* L396: Gemma 4's template writes a call's arguments with every mapping's keys in Jinja's dictsort order (ASCII
+ * case-folded, stable: gemma4_chat.cpp format_argument), and xgrammar's object rule follows the schema's property
+ * order -- so the strict schema's `properties` maps are put in that order before compiling, at every depth
+ * (llama.cpp 93cf736a8 sorts its Gemma 4 rules the same way).  Only member order changes; the schema means the
+ * same. */
+/// @param v  a schema (or any JSON value inside one), reordered in place
+static void schema_dictsort_properties(pyjson_value *v) {
+    if (v->kind == pyjson_value::ARR) {
+        for (pyjson_value &x : v->a) schema_dictsort_properties(&x);
+        return;
+    }
+    if (v->kind != pyjson_value::OBJ) return;
+    for (auto &kv : v->o) {
+        if (kv.first == "properties" && kv.second.kind == pyjson_value::OBJ) {
+            auto lower = [](std::string s) {
+                for (char &ch : s)
+                    if (ch >= 'A' && ch <= 'Z') ch = (char)(ch + 32);
+                return s;
+            };
+            std::stable_sort(kv.second.o.begin(), kv.second.o.end(),
+                             [&](const auto &a, const auto &b) { return lower(a.first) < lower(b.first); });
+            for (auto &p : kv.second.o) schema_dictsort_properties(&p.second);   /* each property's schema */
+        } else {
+            schema_dictsort_properties(&kv.second);
+        }
+    }
+}
+
+/// @param schema  a tool's arguments schema (JSON text)
+/// @param sh      the family's markup
+/// @return the schema as the shape compiles it: dictsorted when the shape asks (L396), else unchanged
+static std::string shape_schema(const std::string &schema, const server_grammar_shape *sh) {
+    if (!sh->dictsort_keys) return schema;
+    pyjson_value v;
+    if (!pyjson_parse(schema.data(), schema.size(), &v, NULL, 0)) return schema;   /* the compiler names the error */
+    schema_dictsort_properties(&v);
+    std::string out;
+    pyjson_dump(v, &out);
+    return out;
+}
+
 /* One call region: call_trigger block_head (name_open NAME name_close ARGS call_close)[+] block_tail. */
 /// @param b      the format being built
 /// @param sh     the family's markup
@@ -281,7 +332,7 @@ static void j_call_region(buf *b, const server_grammar_shape *sh, const std::vec
         std::string open = std::string(sh->name_open) + tools[i].name + sh->name_close;
         j_const(b, open.c_str());
         buf_puts(b, ",{\"type\":\"json_schema\",\"json_schema\":");
-        buf_puts(b, tools[i].schema.c_str());
+        buf_puts(b, shape_schema(tools[i].schema, sh).c_str());
         buf_puts(b, ",\"style\":");
         json_escape(b, sh->style);
         buf_printf(b, ",\"max_whitespace_cnt\":%d},", k_json_ws_max);
@@ -375,7 +426,7 @@ bool constrain_plan_build(pulsar_engine *e, server *s, const chat_conversation *
                  want_answer ? "response_format" : "strict tools", r->family->name);
         return false;
     }
-    if (want_calls && !sh->call_trigger) {   /* L338: a shape for response formats only (Gemma 4's) */
+    if (want_calls && !sh->call_trigger) {   /* a shape for response formats only (Gemma 4's until L396; none today) */
         if (any_strict) {
             snprintf(err, errlen, "strict tools: the %s family's grammar shape has no tool-call markup (L338)",
                      r->family->name);
@@ -395,6 +446,10 @@ bool constrain_plan_build(pulsar_engine *e, server *s, const chat_conversation *
     if (!comp) return false;
     auto *plan = new constrain_plan();
     plan->shape = sh;
+    const server_reasoning_markers *rm = r->family->reasoning;
+    if (rm && sh->call_trigger)
+        for (const char *const *m = rm->close; m < rm->close + 4 && *m; m++)
+            if (!strcmp(*m, sh->call_trigger)) plan->call_ends_reasoning = true;
     if (want_calls) {
         buf f = {0};
         j_call_region(&f, sh, tools);
@@ -407,12 +462,14 @@ bool constrain_plan_build(pulsar_engine *e, server *s, const chat_conversation *
     }
     if (want_answer) {
         /* whitespace, then the format and the family's answer close -- or, with tools on offer, the turn's calls
-         * instead (a turn may answer with calls; each may follow whitespace) */
+         * instead (a turn may answer with calls; each may follow whitespace).  A shape without call markup (Gemma 4's
+         * until L396) has no call region to offer: the turn is the format.  L395: building one dereferenced its NULL
+         * call_trigger and took the server down on any response_format request that also offered tools. */
         buf f = {0};
         buf_puts(&f, "{\"type\":\"sequence\",\"elements\":[");
         j_ws(&f);
         buf_puts(&f, ",");
-        const bool or_calls = !tools.empty() && c->tool_choice != CHAT_TOOL_CHOICE_NONE;
+        const bool or_calls = sh->call_trigger && !tools.empty() && c->tool_choice != CHAT_TOOL_CHOICE_NONE;
         if (or_calls) buf_puts(&f, "{\"type\":\"or\",\"elements\":[");
         buf_puts(&f, "{\"type\":\"sequence\",\"elements\":[");
         j_answer_format(&f, &c->response_format);
@@ -430,6 +487,37 @@ bool constrain_plan_build(pulsar_engine *e, server *s, const chat_conversation *
         }
         buf_puts(&f, "]}");
         plan->answer = constrain_compile(comp, &f, "response_format", err, errlen);
+        /* L396: thinking on, a family whose output opens its own reasoning block (an explicit open marker, its
+         * close[0] the close token) and an answer that opens at the reasoning close: a turn the prompt leaves
+         * outside reasoning may still think first, so that turn's answer region takes an optional block before the
+         * format (llama.cpp's Gemma 4 grammar: start + optional(thought) + response_format).  The block's text is
+         * any text up to the close; the L344 budget's forced close token is that end. */
+        if (plan->answer && sh->answer_at_think_close && rm && rm->open && rm->close[0] &&
+            pulsar_think_mode_enabled(r->think_mode)) {
+            buf t = {0};
+            buf_puts(&t, "{\"type\":\"sequence\",\"elements\":[{\"type\":\"optional\",\"content\":"
+                         "{\"type\":\"tag\",\"begin\":");
+            json_escape(&t, rm->open);
+            buf_puts(&t, ",\"content\":{\"type\":\"any_text\"");
+            /* with calls on offer, a call from inside the block would skip the call region: the block closes first */
+            if (or_calls && plan->call_ends_reasoning) {
+                buf_puts(&t, ",\"excludes\":[");
+                json_escape(&t, sh->call_trigger);
+                buf_putc(&t, ']');
+            }
+            buf_puts(&t, "},\"end\":");
+            json_escape(&t, rm->close[0]);
+            buf_puts(&t, "}},");
+            buf_append(&t, f.ptr, f.len);
+            buf_puts(&t, "]}");
+            plan->answer_after_thought = constrain_compile(comp, &t, "response_format", err, errlen);
+            buf_free(&t);
+            if (!plan->answer_after_thought) {
+                buf_free(&f);
+                constrain_plan_free(plan);
+                return false;
+            }
+        }
         buf_free(&f);
         if (!plan->answer) {
             constrain_plan_free(plan);
@@ -607,7 +695,17 @@ static bool gate_feed(constrain_gate *gt, int token, const char *b, size_t n) {
         }
         const char c = b[i++];
         if (gt->phase == GATE_THINK) {
+            /* L396: a call opened from inside reasoning ends it (the family's markers say so): the call region */
+            if (p->calls && p->call_ends_reasoning && gt->call.step(gt->kmp_call, c)) {
+                gt->kmp_think = 0;
+                std::string open = gt->call.pat;
+                open.append(b + i, n - i);
+                ok = gate_open(gt, p->calls, true, open.data(), open.size(), &rec);
+                if (ok) gate_region_done(gt);
+                break;
+            }
             if (!gt->think.step(gt->kmp_think, c)) continue;
+            gt->kmp_call = 0;
             /* reasoning closed: the answer opens on the rest of the token, or the turn is free text */
             if (!p->answer) {
                 gt->phase = GATE_FREE;
@@ -721,7 +819,8 @@ bool gen_constrain_begin(server *s, gen_state *g) {
         gt->phase = GATE_THINK;
     } else if (gt->plan->answer && sh->answer_at_think_close) {
         constrain_rec rec = {};
-        if (!gate_open(gt, gt->plan->answer, false, NULL, 0, &rec)) {
+        pulsar_grammar *opening = gt->plan->answer_after_thought ? gt->plan->answer_after_thought : gt->plan->answer;
+        if (!gate_open(gt, opening, false, NULL, 0, &rec)) {
             gate_fail(g, "response_format");
             return false;
         }

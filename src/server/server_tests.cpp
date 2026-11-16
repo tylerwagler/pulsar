@@ -2444,6 +2444,81 @@ static void test_l344_thinking_budget_close_row(void) {
     TEST_ASSERT(out[0] == 1u && out[1] == 0u && out[2] == 0u && out[3] == 0u);
 }
 
+/* L398: the reasoning tracker reads the FAMILY's markers.  Gemma 4 reasons in a thought channel (<|channel>thought\n
+ * ... <channel|>), never <think>: the tracker matched <think> only, so on Gemma `inside` never turned on and the L344
+ * budget counted nothing (inert), the stop scan ran inside reasoning, and a prompt that leaves the channel open (after
+ * tool results, thinking on) started the grammar gate outside it.  Here a rendered Gemma prompt and a generated turn,
+ * a token at a time through the real accounting: the budget is spent by the channel's tokens and its forced draw is
+ * due exactly at the budget; <channel|> or a call ends the block.  The tracker fed a prompt agrees with the family's
+ * own rule (gemma4_prompt_opens_reasoning) on every generation prefix; a <think> family is unchanged. */
+static void test_l398_gemma_reasoning_tracker(void) {
+    char err[256];
+    request r;
+    /* thinking on: "<|turn>model\n" -- the model opens the channel itself */
+    TEST_ASSERT(effort_case(PULSAR_CHAT_GEMMA4, EFFORT_BODY(""), &r, err, sizeof err));
+    TEST_ASSERT(r.family && r.family->reasoning);
+    job j;
+    memset(&j, 0, sizeof j);
+    gen_state g;
+    memset(&g, 0, sizeof g);
+    g.j = &j;
+    j.req.think_budget = 4;
+    g.thinking = thinking_state_from_prompt(&r);
+    TEST_ASSERT(!g.thinking.inside);
+    const TokId close{106};   /* stands for <channel|>: think_close_row only compares ids */
+    static const char *const turn[] = {"<|channel>", "thought", "\n", "Let", " me", " think", "<channel|>", "Hi"};
+    int forced_at = -1;
+    for (int i = 0; i < (int)(sizeof turn / sizeof turn[0]); i++) {
+        if (forced_at < 0 && think_close_row(j.req.think_budget, g.thinking.inside && !g.think_closed,
+                                             g.think_tokens, close, NULL, 0, 0) == 0)
+            forced_at = i;
+        const bool was = g.thinking.inside;
+        g.thinking.feed(turn[i], strlen(turn[i]));
+        think_budget_note(&g, was);
+        if (i == 0) TEST_ASSERT(g.thinking.inside);   /* the open marker turns it on */
+    }
+    TEST_ASSERT(forced_at == 5);           /* thought, \n, Let, me = 4 spent: the draw after them is forced */
+    TEST_ASSERT(g.think_tokens == 5);      /* this unforced run also spent " think" */
+    TEST_ASSERT(g.think_closed && !g.thinking.inside);
+    request_free(&r);
+
+    /* the generation prefixes: off closes an empty channel; after tool results with thinking on it stays open */
+    static const char *const prompts[] = {
+        "<bos><|turn>user\nx<turn|>\n<|turn>model\n",
+        "<bos><|turn>user\nx<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+        "<bos><|turn>user\nx<turn|>\n<|turn>model\n<|tool_call>call:f{}<tool_call|><|tool_response>response:f{}"
+        "<tool_response|><|channel>thought\n",
+        "<bos><|turn>user\nx<turn|>\n<|turn>model\n<|channel>thought\nhm<channel|><|tool_call>call:f{}<tool_call|>"
+        "<|tool_response>response:f{}<tool_response|>",
+    };
+    for (const char *p : prompts) {
+        request q;
+        memset(&q, 0, sizeof q);
+        q.family = server_family_for_format(PULSAR_CHAT_GEMMA4);
+        q.prompt_text = (char *)p;
+        TEST_ASSERT(thinking_state_from_prompt(&q).inside == gemma4_prompt_opens_reasoning(p));
+    }
+    /* a call opened from reasoning ends it (gemma4_chat.h) */
+    thinking_state st = {};
+    st.markers = server_family_for_format(PULSAR_CHAT_GEMMA4)->reasoning;
+    st.feed("<|channel>thought\nx", 19);
+    TEST_ASSERT(st.inside);
+    st.feed("<|tool_call>", 12);
+    TEST_ASSERT(!st.inside);
+
+    /* a <think> family: unchanged, and Gemma's markers mean nothing to it */
+    request q;
+    memset(&q, 0, sizeof q);
+    q.family = server_family_for_format(PULSAR_CHAT_QWEN);
+    q.prompt_text = (char *)"<|im_start|>assistant\n<think>\n";
+    thinking_state qs = thinking_state_from_prompt(&q);
+    TEST_ASSERT(qs.inside && !qs.markers);
+    qs.feed("<channel|>", 10);
+    TEST_ASSERT(qs.inside);
+    qs.feed("</think>", 8);
+    TEST_ASSERT(!qs.inside);
+}
+
 /* L335: a malformed effort string or a non-bool thinking switch refuses WITH its reason (both left err empty, so the
  * client got the generic "invalid JSON request"). */
 static void test_effort_controls_name_their_error(void) {
@@ -4165,6 +4240,9 @@ static void test_l303_shapes_accept_rendered_calls(void) {
          "<|content_invoke_tool_json|>{\"name\":\"search\",\"args\":{\"q\":\"pulsars\"}}<|end_message|>",
          "<|content_invoke_tool_json|>{\"name\":\"now\",\"args\":{}}<|end_message|>",
          "<|content_invoke_tool_json|>{\"name\":\"search\",\"args\":{\"q\":1", 1},
+        /* L396: Gemma 4 -- bare keys, <|"|>-quoted strings */
+        {PULSAR_CHAT_GEMMA4, "", "<|tool_call>call:search{q:<|\"|>pulsars<|\"|>}<tool_call|>",
+         "<|tool_call>call:now{}<tool_call|>", "<|tool_call>call:search{q:1", 1},
     };
     for (const fcase &fc : cases) {
         for (int which = 0; which < 3; which++) {
@@ -4216,6 +4294,9 @@ static void test_l303_forced_call_grammar(void) {
          PULSAR_INVOKE_END "\n" PULSAR_TOOL_CALLS_END, " name=\"ask",
          PULSAR_PARAM_START " name=\"q\" string=\"true\">pulsars" PULSAR_PARAM_END "\n" PULSAR_INVOKE_END "\n"
          PULSAR_TOOL_CALLS_END},
+        /* L396: Gemma 4's seed is "<|tool_call>call:" (+ "NAME{" when named) */
+        {PULSAR_CHAT_GEMMA4, "search{q:<|\"|>pulsars<|\"|>}<tool_call|>", "ask",
+         "q:<|\"|>pulsars<|\"|>}<tool_call|>"},
     };
     for (const fcase &fc : cases) {
         for (int named = 0; named < 2; named++) {
@@ -4315,16 +4396,176 @@ static void test_l303_response_format_answer(void) {
                               "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"response_format\":{\"type\":"
                               "\"regex\",\"pattern\":\"(\"}}", &j.req, err, sizeof err));
     TEST_ASSERT(strstr(err, "response_format") != NULL);
-    /* L338 P4: Gemma 4's shape has no call markup -- strict tools are refused by name, never left unconstrained */
-    {
+    /* L396: Gemma 4 with a response format and NON-strict tools on offer (L395's crash case): the turn is the format
+     * or calls, each a call region in Gemma's markup with any arguments. */
+    for (int as_call = 0; as_call < 2; as_call++) {
         job jg;
         memset(&jg, 0, sizeof jg);
-        TEST_ASSERT(!l303_request(&srv, PULSAR_CHAT_GEMMA4, API_OPENAI, L303_BODY(",\"reasoning_effort\":\"none\""),
-                                  &jg.req, err, sizeof err));
-        TEST_ASSERT(strstr(err, "no tool-call markup") != NULL);
+        TEST_ASSERT(l303_request(&srv, PULSAR_CHAT_GEMMA4, API_OPENAI,
+                                 "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"tools\":[{\"type\":\"function\","
+                                 "\"function\":{\"name\":\"search\",\"parameters\":{\"type\":\"object\",\"properties\":{"
+                                 "\"q\":{\"type\":\"string\"}}}}}],\"reasoning_effort\":\"none\"" L303_RF "}",
+                                 &jg.req, err, sizeof err));
+        TEST_ASSERT(jg.req.constrain != NULL);
+        gen_state g;
+        TEST_ASSERT(l303_begin(&srv, &jg, &g));
+        TEST_ASSERT(gen_constrain_live(&g));   /* the answer is the first byte */
+        const std::string out = as_call ? "<|tool_call>call:search{q:<|\"|>x<|\"|>,n:7}<tool_call|>" : "{\"n\": 7}";
+        const size_t fed = l303_feed(&srv, &g, out);
+        if (fed != out.size()) fprintf(stderr, "l396 gemma rf+tools %d: refused at %zu\n", as_call, fed);
+        TEST_ASSERT(fed == out.size());
+        if (!as_call) TEST_ASSERT(l303_allows(&srv, &g, v.stop));
+        TEST_ASSERT(!l303_allows(&srv, &g, 'x'));
+        l303_end(&jg, &g);
     }
     l303_server_free(&srv);
 #undef L303_RF
+}
+
+/* L396: Gemma 4 turns with thinking ON under a grammar.  The model opens its own thought channel (the prompt ends
+ * "<|turn>model\n"), so a response format's region takes an optional <|channel> ... <channel|> block first (llama.cpp:
+ * start + optional(thought) + response_format); with calls on offer the block must close before a call (a call from
+ * inside it would skip the call region).  A turn the prompt leaves inside the channel (after tool results) opens a
+ * strict call region at <|tool_call>, which ends reasoning in Gemma's markers (L398). */
+static void test_l396_gemma_thinking_turns(void) {
+#define L396_RF ",\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"n\",\"schema\":{\"type\":" \
+                "\"object\",\"properties\":{\"n\":{\"type\":\"integer\"}},\"required\":[\"n\"],\"additionalProperties\":false}}}"
+    l303_vocab v;
+    server srv;
+    l303_server(&srv, v);
+    char err[300];
+    /* a response format, thinking on: the thought block is optional */
+    static const char *const rf_turns[] = {"<|channel>thought\nhm, seven<channel|>{\"n\": 7}", "{\"n\": 7}",
+                                           "<|channel>thought\n<channel|>\n{\"n\":7}"};
+    for (const char *turn : rf_turns) {
+        job j;
+        memset(&j, 0, sizeof j);
+        TEST_ASSERT(l303_request(&srv, PULSAR_CHAT_GEMMA4, API_OPENAI,
+                                 "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"reasoning_effort\":\"high\"" L396_RF
+                                 "}", &j.req, err, sizeof err));
+        TEST_ASSERT(j.req.constrain != NULL);
+        gen_state g;
+        TEST_ASSERT(l303_begin(&srv, &j, &g));
+        TEST_ASSERT(!g.thinking.inside && gen_constrain_live(&g));
+        TEST_ASSERT(!l303_allows(&srv, &g, 'x'));
+        const std::string out = turn;
+        const size_t fed = l303_feed(&srv, &g, out);
+        if (fed != out.size()) fprintf(stderr, "l396 gemma thinking rf: refused at %zu of \"%s\"\n", fed, turn);
+        TEST_ASSERT(fed == out.size());
+        TEST_ASSERT(l303_allows(&srv, &g, v.stop) && !l303_allows(&srv, &g, ','));
+        l303_end(&j, &g);
+    }
+    /* thinking off: no block (the prompt closed the channel; '<' cannot open the answer) */
+    {
+        job j;
+        memset(&j, 0, sizeof j);
+        TEST_ASSERT(l303_request(&srv, PULSAR_CHAT_GEMMA4, API_OPENAI,
+                                 "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"reasoning_effort\":\"none\"" L396_RF
+                                 "}", &j.req, err, sizeof err));
+        gen_state g;
+        TEST_ASSERT(l303_begin(&srv, &j, &g));
+        TEST_ASSERT(l303_feed(&srv, &g, "<|channel>") == 0);
+        l303_end(&j, &g);
+    }
+    /* a response format and strict tools, thinking on: think, close, then the call (or the answer); a call opened
+     * inside the block is refused before its trigger completes */
+    for (int closed = 0; closed < 2; closed++) {
+        job j;
+        memset(&j, 0, sizeof j);
+        TEST_ASSERT(l303_request(&srv, PULSAR_CHAT_GEMMA4, API_OPENAI,
+                                 "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]," L303_TOOLS
+                                 ",\"reasoning_effort\":\"high\"" L396_RF "}", &j.req, err, sizeof err));
+        gen_state g;
+        TEST_ASSERT(l303_begin(&srv, &j, &g));
+        const std::string think = closed ? "<|channel>thought\nsearch it<channel|>" : "<|channel>thought\nsearch it";
+        const std::string out = think + "<|tool_call>call:search{q:<|\"|>pulsars<|\"|>}<tool_call|>";
+        const size_t fed = l303_feed(&srv, &g, out);
+        if (closed) {
+            if (fed != out.size()) fprintf(stderr, "l396 gemma thinking rf+strict: refused at %zu\n", fed);
+            TEST_ASSERT(fed == out.size());
+        } else {
+            TEST_ASSERT(fed >= think.size() && fed < think.size() + strlen("<|tool_call>"));
+        }
+        l303_end(&j, &g);
+    }
+    /* the prompt leaves the channel open (tool results, thinking on): reasoning is free, and a call opened from it is
+     * the strict call region -- on its schema, refused off it */
+    for (int off_schema = 0; off_schema < 2; off_schema++) {
+        job j;
+        memset(&j, 0, sizeof j);
+        TEST_ASSERT(l303_request(&srv, PULSAR_CHAT_GEMMA4, API_OPENAI,
+                                 "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"},{\"role\":\"assistant\","
+                                 "\"content\":\"\",\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{"
+                                 "\"name\":\"now\",\"arguments\":\"{}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"c1\","
+                                 "\"content\":\"noon\"}]," L303_TOOLS ",\"reasoning_effort\":\"high\"}",
+                                 &j.req, err, sizeof err));
+        TEST_ASSERT(j.req.constrain != NULL);
+        gen_state g;
+        TEST_ASSERT(l303_begin(&srv, &j, &g));
+        TEST_ASSERT(g.thinking.inside && !gen_constrain_live(&g));
+        const std::string pre = "noon, so search<|tool_call>";
+        const std::string out = pre + (off_schema ? "call:search{z:" : "call:search{q:<|\"|>pulsars<|\"|>}<tool_call|>");
+        const size_t fed = l303_feed(&srv, &g, out);
+        if (off_schema) {
+            TEST_ASSERT(fed == pre.size() + strlen("call:search{"));   /* `z` is not a declared argument */
+        } else {
+            if (fed != out.size()) fprintf(stderr, "l396 gemma call from reasoning: refused at %zu\n", fed);
+            TEST_ASSERT(fed == out.size());
+            TEST_ASSERT(!gen_constrain_live(&g));   /* the call region ended with the call */
+        }
+        l303_end(&j, &g);
+    }
+    l303_server_free(&srv);
+#undef L396_RF
+}
+
+/* L396: Gemma 4's template writes a call's argument keys in dictsort order (case-folded), at every depth, whatever
+ * the schema's order; the strict grammar takes the call the template rendered into the history byte for byte, and
+ * refuses the schema's own order. */
+static void test_l396_gemma_call_key_order(void) {
+    l303_vocab v;
+    server srv;
+    l303_server(&srv, v);
+    static const char body[] =
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"},{\"role\":\"assistant\",\"content\":\"\",\""
+        "tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"put\",\"arguments\":"
+        "\"{\\\"zeta\\\":3,\\\"mid\\\":[\\\"a\\\",\\\"b\\\"],\\\"Alpha\\\":{\\\"y\\\":true,\\\"x\\\":1.5}"
+        "}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"ok\"},{\"role\":\"user\",\"cont"
+        "ent\":\"again\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"put\",\"strict\":tr"
+        "ue,\"parameters\":{\"type\":\"object\",\"properties\":{\"zeta\":{\"type\":\"integer\"},\"Alpha\""
+        ":{\"type\":\"object\",\"properties\":{\"y\":{\"type\":\"boolean\"},\"x\":{\"type\":\"number\"}},"
+        "\"required\":[\"y\",\"x\"],\"additionalProperties\":false},\"mid\":{\"type\":\"array\",\"items\""
+        ":{\"type\":\"string\"}}},\"required\":[\"zeta\",\"Alpha\",\"mid\"],\"additionalProperties\":fals"
+        "e}}}],\"reasoning_effort\":\"none\"}";
+    job j;
+    memset(&j, 0, sizeof j);
+    char err[300];
+    TEST_ASSERT(l303_request(&srv, PULSAR_CHAT_GEMMA4, API_OPENAI, body, &j.req, err, sizeof err));
+    TEST_ASSERT(j.req.constrain != NULL);
+    /* the call as the template rendered it into the history */
+    const std::string prompt = j.req.prompt_text;
+    const size_t a = prompt.find("<|tool_call>"), z = prompt.find("<tool_call|>");
+    TEST_ASSERT(a != std::string::npos && z != std::string::npos && z > a);
+    const std::string call = prompt.substr(a, z + strlen("<tool_call|>") - a);
+    TEST_ASSERT(call == "<|tool_call>call:put{Alpha:{x:1.5,y:true},mid:[<|\"|>a<|\"|>,<|\"|>b<|\"|>],zeta:3}<tool_call|>");
+    for (int schema_order = 0; schema_order < 2; schema_order++) {
+        gen_state g;
+        TEST_ASSERT(l303_begin(&srv, &j, &g));
+        const std::string out = schema_order ? "<|tool_call>call:put{zeta:3" : call;
+        const size_t fed = l303_feed(&srv, &g, out);
+        if (schema_order) {
+            TEST_ASSERT(fed == strlen("<|tool_call>call:put{"));   /* "zeta" first is not the template's order */
+        } else {
+            if (fed != out.size()) fprintf(stderr, "l396 gemma key order: refused at %zu: \"%.*s\"\n", fed, (int)fed + 1,
+                                           out.c_str());
+            TEST_ASSERT(fed == out.size());
+            TEST_ASSERT(!gen_constrain_live(&g));
+        }
+        gen_constrain_end(&g);
+        buf_free(&g.text);
+    }
+    request_free(&j.req);
+    l303_server_free(&srv);
 }
 
 /* L303: a speculative round's masks are the plain lane's -- row i is the mask after the base and drafts 0..i-1,
@@ -4425,6 +4666,50 @@ static void test_l309_draft_prefix(void) {
 }
 
 /* L303: the protocols' format fields and the Responses forced tool_choice. */
+/* L397: a JSON string whose `pattern` repeats more than 128 times keeps the JSON-string filter (xgrammar #949, pin
+ * 1ec3f99): a raw '"' ends the string (so a byte after it is refused), and a raw '\\' (xgrammar keeps a pattern's
+ * strings escape-free) and a control byte are refused -- the same as under a short repeat. */
+static void test_l397_long_repeat_keeps_json_string_filter(void) {
+    l303_vocab v;
+    std::vector<const char *> p;
+    std::vector<size_t> l;
+    for (const std::string &t : v.tok) {
+        p.push_back(t.data());
+        l.push_back(t.size());
+    }
+    char err[400] = "";
+    pulsar_grammar_compiler *c = pulsar_grammar_compiler_new(p.data(), l.data(), (int)v.tok.size(), (int)v.tok.size(),
+                                                             &v.stop, 1, 64LL << 20, err, sizeof err);
+    TEST_ASSERT(c != NULL);
+    for (int n : {100, 200, 900}) {
+        const std::string tag = "{\"type\":\"structural_tag\",\"format\":{\"type\":\"json_schema\",\"json_schema\":"
+                                "{\"type\":\"string\",\"pattern\":\"^[^,]{1," + std::to_string(n) + "}$\"}}}";
+        pulsar_grammar *g = pulsar_grammar_compile(c, tag.c_str(), 30.0, err, sizeof err);
+        TEST_ASSERT(g != NULL);
+        /* each case: the bytes that must be accepted, then one that must be refused */
+        struct scase {
+            const char *ok;
+            char refused;
+        } cases[] = {{"\"a\"", 'b'}, {"\"a", '\\'}, {"\"a", '\x01'}};
+        for (const scase &k : cases) {
+            pulsar_grammar_matcher *m = pulsar_grammar_matcher_new(g, true, err, sizeof err);
+            TEST_ASSERT(m != NULL);
+            for (const char *b = k.ok; *b; b++) TEST_ASSERT(pulsar_grammar_matcher_accept(m, (uint8_t)*b, err, sizeof err));
+            const bool took = pulsar_grammar_matcher_accept(m, (uint8_t)k.refused, err, sizeof err);
+            if (took) fprintf(stderr, "L397: {1,%d} accepted 0x%02x after \"%s\"\n", n, (uint8_t)k.refused, k.ok);
+            TEST_ASSERT(!took);
+            pulsar_grammar_matcher_free(m);
+        }
+        /* and a plain string still passes to its end */
+        pulsar_grammar_matcher *m = pulsar_grammar_matcher_new(g, true, err, sizeof err);
+        for (const char *b = "\"abc\""; *b; b++) TEST_ASSERT(pulsar_grammar_matcher_accept(m, (uint8_t)*b, err, sizeof err));
+        TEST_ASSERT(pulsar_grammar_matcher_terminated(m));
+        pulsar_grammar_matcher_free(m);
+        pulsar_grammar_free(g);
+    }
+    pulsar_grammar_compiler_free(c);
+}
+
 static void test_l303_protocol_fields(void) {
     response_format_spec f = {};
     char err[200];
@@ -17334,6 +17619,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_api_thinking_controls_parse();
     test_l344_thinking_budget_parse();
     test_l344_thinking_budget_close_row();
+    test_l398_gemma_reasoning_tracker();
     test_effort_controls_name_their_error();
     test_render_think_max_prompt_prefix();
     test_render_think_effort_prefixes();
@@ -17408,7 +17694,10 @@ static void pulsar_server_unit_tests_run(void) {
     test_l303_shapes_accept_rendered_calls();
     test_l303_forced_call_grammar();
     test_l303_response_format_answer();
+    test_l396_gemma_call_key_order();
+    test_l396_gemma_thinking_turns();
     test_l303_round_masks_match_plain();
+    test_l397_long_repeat_keeps_json_string_filter();
     test_l309_draft_prefix();
     test_l303_protocol_fields();
     test_qwen_payload_is_sampled_structure_greedy();
