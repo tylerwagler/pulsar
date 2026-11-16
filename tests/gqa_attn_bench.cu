@@ -6,8 +6,8 @@
  *               mma.sync m16n8k16 bf16 loop (achievable tensor-core rate),
  *               measured here, beside GB10's 273 GB/s and 125 TFLOPS specs
  *   decode      1 / 4 / 16 sequences x one row, and a 6-row verify, at 4K /
- *               32K / 128K context, DRAM-cold (each sequence its own pool, an
- *               L2 flush between calls): time per call, the KV bytes it must
+ *               32K / 128K context, DRAM-cold (each sequence its own pool, a
+ *               read-only L2 flush, untimed, between calls): time per call, the KV bytes it must
  *               read, GB/s against the measured read bandwidth
  *   (L338, GQA_BENCH_GEMMA=1 alone) Gemma 4's wide-head verify by decode group (pulsar_gqa_io::decode_group)
  *   prefill     a 4096-row chunk at position 0 and at 32K: time, attention
@@ -58,7 +58,16 @@ __global__ void mma_kernel(float *sink, int iters) {
 
 static uint8_t *g_flush;
 static const uint64_t FLUSH = 256ull << 20;
-static void flush_l2() { CK(cudaMemsetAsync(g_flush, 0, FLUSH, 0)); }
+static uint32_t *g_flush_sink;
+static int g_flush_grid;
+/* L400: a READ of 256 MiB evicts L2 with clean lines; a memset left ~L2-size of
+ * dirty lines whose write-back landed inside the timed call (flashinfer
+ * 0e0931876).  Synchronised so nothing of the flush overlaps the e0 record. */
+static void flush_l2() {
+    read_kernel<<<g_flush_grid, 512>>>((const uint4 *)g_flush, FLUSH / 16, g_flush_sink);
+    CK(cudaGetLastError());
+    CK(cudaDeviceSynchronize());
+}
 
 struct Layer {
     pulsar_gqa_layer L{};
@@ -196,6 +205,9 @@ int main() {
     CK(cudaGetDeviceProperties(&prop, 0));
     printf("gqa_attn_bench: %s, %d SMs, L2 %d MB\n", prop.name, prop.multiProcessorCount, prop.l2CacheSize >> 20);
     CK(cudaMalloc(&g_flush, FLUSH));
+    CK(cudaMemset(g_flush, 0, FLUSH));            /* written once, read by every flush */
+    CK(cudaMalloc(&g_flush_sink, 64));
+    g_flush_grid = prop.multiProcessorCount * 8;
     uint32_t *sink;
     CK(cudaMalloc(&sink, 64));
 
