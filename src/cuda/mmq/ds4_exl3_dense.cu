@@ -103,6 +103,9 @@ constexpr int kArm8MinWaves = 6;
 /** L380: the compute-capability major the 8-warp CTA was measured on (sm_12x: GB10 is sm_121), the only one that
  *  takes it (ds4_exl3_dense_gemv_arm). */
 constexpr int kArm8Major = 12;
+/** L405: the compute capability whose NARROW CTA takes the 8-warp form past one wave (RTX 5000, sm_75: the wide one
+ *  loses there at every grid; ds4_exl3_dense_gemv_arm). */
+constexpr int kArm8NarrowCC = 75;
 constexpr int kPF        = 4;    ///< the trellis words' register prefetch ring, in k-steps
 constexpr int kRows      = 16;   ///< the MMA's M: every row block is 16 rows
 /** L341: rows one GEMV launch carries -- kRows-row passes over the trellis words the CTA reads once (the verify
@@ -814,9 +817,10 @@ int g_arm_force = 0;
 /// @param M     rows, 1..kMaxRows
 /// @param ctas  the launch's grid (after gemv_wide)
 /// @param sms   the device's SM count
+/// @param wide  the 64-output CTA (gemv_wide)
 /// @return      DS4_EXL3_DENSE_ARM_16W or DS4_EXL3_DENSE_ARM_8W
-int gemv_arm(int M, int ctas, int sms) {
-    return g_arm_force ? g_arm_force : ds4_exl3_dense_gemv_arm(M, ctas, sms, pulsar_cuda_device_cc());
+int gemv_arm(int M, int ctas, int sms, bool wide) {
+    return g_arm_force ? g_arm_force : ds4_exl3_dense_gemv_arm(M, ctas, sms, pulsar_cuda_device_cc(), wide ? kWideNT : 2);
 }
 
 /// The GEMV kernel's instance at rate R: the 8-warp CTA (one pass), else exl3_dense_kernel at one or two passes;
@@ -888,12 +892,13 @@ size_t proj_ws_bytes(int M, int K, int N) {
 
 bool ds4_exl3_dense_rate_supported(int k2) { return exl3_arm_has_rate(EXL3_ARM_DENSE, k2); }
 
-int ds4_exl3_dense_gemv_arm(int M, int ctas, int sms, int cc) {
+int ds4_exl3_dense_gemv_arm(int M, int ctas, int sms, int cc, int nt) {
     static_assert(kArm8MaxRows <= kRows, "the 8-warp CTA is one pass");
-    if (M < 1 || ctas < 1 || sms < 1) return DS4_EXL3_DENSE_ARM_16W;
+    if (M < 1 || ctas < 1 || sms < 1 || M > kArm8MaxRows) return DS4_EXL3_DENSE_ARM_16W;
     const int waves = (ctas + sms - 1) / sms;   /* of 16-warp CTAs, one an SM */
-    return cc / 10 == kArm8Major && M <= kArm8MaxRows && waves >= kArm8MinWaves ? DS4_EXL3_DENSE_ARM_8W
-                                                                              : DS4_EXL3_DENSE_ARM_16W;
+    if (cc / 10 == kArm8Major && waves >= kArm8MinWaves) return DS4_EXL3_DENSE_ARM_8W;
+    if (cc == kArm8NarrowCC && nt == 2 && waves > 1) return DS4_EXL3_DENSE_ARM_8W;   /* L405 */
+    return DS4_EXL3_DENSE_ARM_16W;
 }
 
 int ds4_exl3_dense_arm_force(int arm) {
@@ -906,7 +911,7 @@ int ds4_exl3_dense_gemv_describe(int k2, int M, int c32, ds4_exl3_dense_gemv_des
     const int sms = device_sms();
     if (!d || sms <= 0 || M < 1 || M > kMaxRows || c32 < 1 || !ds4_exl3_dense_rate_supported(k2)) return -1;
     const bool wide = gemv_wide(M, c32, sms);
-    const int ctas = c32 / (wide ? kWideNT / 2 : 1), arm = gemv_arm(M, ctas, sms);
+    const int ctas = c32 / (wide ? kWideNT / 2 : 1), arm = gemv_arm(M, ctas, sms, wide);
     const bool w8 = arm == DS4_EXL3_DENSE_ARM_8W;
     if (w8 && M > kRows) return -1;   /* the forced 8-warp CTA has no two-pass instance: the launch refuses too */
     void (*k)(const dense_set, int, int) = gemv_kernel(k2, M, wide, w8);
@@ -1094,13 +1099,14 @@ int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void 
         for (int i = 0; i < m; ++i) g.end[i] = ctas += g.p[i].N / tw;
         for (int i = m; i < kMaxProj; ++i) g.end[i] = INT_MAX;
         /* L380: the CTA form -- the 8-warp CTA, two an SM, where the rule (ds4_exl3_dense_gemv_arm) says */
-        const bool w8 = gemv_arm(M, ctas, sms) == DS4_EXL3_DENSE_ARM_8W;
+        const bool w8 = gemv_arm(M, ctas, sms, wide) == DS4_EXL3_DENSE_ARM_8W;
         if (w8) {
             static bool announced = false;
             if (!__atomic_exchange_n(&announced, true, __ATOMIC_RELAXED))
-                fprintf(stderr, "pulsar: EXL3 dense one-pass GEMVs of %d+ waves at up to %d rows run the 8-warp CTA, two an "
-                                "SM (L380; first call: M=%d K=%d, %d CTAs on %d SMs%s)\n", kArm8MinWaves, kArm8MaxRows, M, K,
-                        ctas, sms, g_arm_force ? ", FORCED by an instrument" : "");
+                fprintf(stderr, "pulsar: EXL3 dense one-pass GEMVs at up to %d rows run the 8-warp CTA, two an SM, where "
+                                "ds4_exl3_dense_gemv_arm says (L380 / L405; first call: M=%d K=%d, %d %s CTAs on %d SMs%s)\n",
+                        kArm8MaxRows, M, K, ctas, wide ? "wide" : "narrow", sms,
+                        g_arm_force ? ", FORCED by an instrument" : "");
         }
         const cudaError_t le = gemv_launch(p[j0].k2, wide, w8, dim3((unsigned)ctas), stream, g, M, K);
         if (le != cudaSuccess) {

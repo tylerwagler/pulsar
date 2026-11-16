@@ -183,10 +183,13 @@ int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void 
  *  and device.  A function of the launch's shape and the device only (never the family, the rate or a switch), and a
  *  choice of SPEED only: both forms write the same bytes (exl3_dense_gate section 9).
  *
- *  8 warps iff   the device is sm_12x (cc / 10 == 12)
- *            and M <= 8 rows
- *            and the grid is 6 or more waves of 16-warp CTAs at one an SM: ceil(ctas / sms) >= 6
- *                (ctas = the launched grid, after the narrow / wide choice; 241+ CTAs on GB10's 48 SMs).
+ *  8 warps iff   M <= 8 rows, and either
+ *                the device is sm_12x (cc / 10 == 12) and the grid is 6 or more waves of 16-warp CTAs at one an SM:
+ *                ceil(ctas / sms) >= 6 (ctas = the launched grid, after the narrow / wide choice; 241+ CTAs on GB10's
+ *                48 SMs), at either CTA width;
+ *             or (L405) the device is sm_75 (cc == 75), the CTA is the narrow one (nt == 2, 32 outputs) and the grid is
+ *                more than one wave: ctas > sms.  (Below 8 rows gemv_wide leaves a launch narrow only at one wave or
+ *                at 3+: the measured points.)
  *
  *  Why: the 16-warp CTA needs 128 registers a thread, so one fills an SM; the 8-warp CTA fits two, so a grid of
  *  several waves keeps twice the CTAs' loads in flight, while a grid of one wave gets nothing for it and runs its
@@ -209,14 +212,25 @@ int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void 
  *  they keep 16 warps.  Rows: measured on the arm production takes at 1, 2, 4 and 8 rows, and with the narrow CTA
  *  forced at 8 and 16; 9..16 rows were not measured on the wide CTA they take (narrow at 16 rows the gain is down to
  *  4-7 %), so they keep 16 warps, as does a two-pass launch (M > 16), which has no 8-warp instance.  The device:
- *  nothing was measured off GB10 -- sm_75 (Turing) and every other architecture keep 16 warps until they are; the
- *  other rates (K = 2, 3, 4, 6, 8) take the rule on K = 5's measurement.
+ *  this clause was measured on GB10 only -- sm_75 has its own (L405, below) and every other architecture keeps 16
+ *  warps until it is measured; the other rates (K = 2, 3, 4, 6, 8) take the rule on K = 5's measurement.
+ *
+ *  L405, sm_75 (RTX 5000, TU104, 48 SMs; exllamav3 ff88a8de / b85c615a make the same split): the same bench, 200
+ *  calls x 5 repeats, 8 warps / 16 warps at M = 1 / 2 / 4, every output byte-identical.  The narrow CTA past one wave
+ *  wins at every point: Qwen K = 5 GDN qkv+z (512 CTAs) 0.84-0.90, QSA q+k+v (416) 0.86-0.90, PLE key (320)
+ *  0.87-0.91; Nemotron K = 4 Mamba in_proj (580) 0.84-0.85, out_proj (128) 0.94-0.96, attention q+k+v (144) /
+ *  o_proj (128) 0.91-0.93, latent out (128) 0.81-0.82, shared down (128) 0.93-0.94; Gemma K = 4 mlp gate+up (136)
+ *  0.86-0.87, head (8192) 0.84-0.86.  One wave narrow loses (Nemotron latent in, 32 CTAs: 1.12), and the WIDE CTA
+ *  loses at every grid, 1 to 81 waves (1.14-1.82, though it sits two CTAs an SM at 128 registers; the cause was
+ *  not probed) -- unlike GB10, so sm_12x keeps its own clause.  The 72-SM RTX 6000
+ *  (CT 130) takes the wide CTA at every Gemma launch, so the clause leaves it as it was.
  *  @param M     rows of the launch, 1..32
  *  @param ctas  the launch's GEMV grid, CTAs
  *  @param sms   the device's SM count
  *  @param cc    the device's compute capability, major * 10 + minor (pulsar_cuda_device_cc)
+ *  @param nt    n-tiles a CTA: 2 (narrow, 32 outputs) or 4 (wide, 64; gemv_wide's choice)
  *  @return DS4_EXL3_DENSE_ARM_8W or DS4_EXL3_DENSE_ARM_16W */
-int ds4_exl3_dense_gemv_arm(int M, int ctas, int sms, int cc);
+int ds4_exl3_dense_gemv_arm(int M, int ctas, int sms, int cc, int nt);
 
 /** L380: an instrument's forced CTA form for every decode GEMV launch -- 0 the rule's (ds4_exl3_dense_gemv_arm),
  *  DS4_EXL3_DENSE_ARM_16W, or DS4_EXL3_DENSE_ARM_8W (a two-pass launch, M > 16, then refuses: the form is one pass).
