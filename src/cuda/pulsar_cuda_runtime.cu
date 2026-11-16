@@ -1394,6 +1394,22 @@ int pulsar_gpu_layout_supported(uint32_t layout, const char **need) {
 /// @return 1 ready, 0 refused
 int pulsar_gpu_init(void) {
     int dev = 0;
+    /* L401: how a host thread waits on the device (every step's drain, pulsar_gpu_end_commands).  CUDA's default
+     * (auto) spins on a box with more cores than GPUs; PULSAR_CUDA_SYNC=spin|yield|block|auto picks one for the A/B.
+     * Set before the first runtime call on the device: it fixes the primary context's flags. */
+    if (const char *v = getenv("PULSAR_CUDA_SYNC")) {
+        unsigned flag = !strcmp(v, "spin")    ? cudaDeviceScheduleSpin
+                        : !strcmp(v, "yield") ? cudaDeviceScheduleYield
+                        : !strcmp(v, "block") ? cudaDeviceScheduleBlockingSync
+                        : !strcmp(v, "auto")  ? cudaDeviceScheduleAuto
+                                              : ~0u;
+        if (flag == ~0u) {
+            fprintf(stderr, "pulsar: PULSAR_CUDA_SYNC=%s is not spin, yield, block or auto\n", v);
+            return 0;
+        }
+        if (!cuda_ok(cudaSetDeviceFlags(flag), "set device flags (PULSAR_CUDA_SYNC)")) return 0;
+        fprintf(stderr, "pulsar: host waits on the device: %s (PULSAR_CUDA_SYNC)\n", v);
+    }
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
     cudaDeviceProp prop;
     /* L335: the device checks below are the gate every lane relies on; a failed property query used to skip them
