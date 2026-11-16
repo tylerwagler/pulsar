@@ -138,6 +138,7 @@ bool gemma4_render(pulsar_engine *e, server *s, chat_conversation *c, request *r
  * thinking on the seed opens with an empty thought channel, the bytes the thinking-off prompt ends with.  Seeded
  * straight after "<|turn>model\n" with thinking on, the model ran on inside the call to the token cap (CT 130
  * constrained_live: 4/4 unterminated, against 12/12 valid thinking off). */
+/** The thought channel a forced call skips with thinking on: opened and closed empty (L396). */
 static const char k_gemma4_skip_thought[] = "<|channel>thought\n<channel|>";
 /** server_family_ops::forced_call_seed for Gemma 4.
  *  @param r the request (forced_tool_name, think_mode)
