@@ -370,7 +370,7 @@ static void p1_roundtrip(const std::string &cases_dir, const std::string &dir) {
                            contains(m.content, "</think>");
                 for (int k = 0; k < m.n_calls; k++)
                     amb |= contains(m.calls[k].arguments, "</parameter>") || contains(m.calls[k].arguments, "</function>") ||
-                           contains(m.calls[k].arguments, "</tool_call>") || contains(m.calls[k].name, ">");
+                           contains(m.calls[k].name, ">");   /* "</tool_call>" in a value reads back (L410) */
                 if (amb) { ambiguous++; continue; }
                 const std::string head = "<|im_start|>assistant\n<think>\n";
                 const size_t a = out.text.rfind(head);
@@ -466,6 +466,14 @@ static void p2_units(void) {
          "text after </function>"},
         {"unterminated_param", true, "</think><tool_call><function=f><parameter=s>x</function></tool_call>", "", "", "",
          "unterminated parameter value"},
+        /* L410: the call's close marker spelled inside a parameter value is the value's text */
+        {"close_marker_in_value", true, "</think>\n\n<tool_call>\n<function=f>\n<parameter=s>\nwrite </tool_call> to end "
+                                        "a call\n</parameter>\n<parameter=n>\n3\n</parameter>\n</function>\n</tool_call>",
+         "", "", "0:f:{\"s\": \"write </tool_call> to end a call\", \"n\": 3}\n", NULL},
+        {"both_markers_in_value", true, "</think><tool_call>\n<function=f>\n<parameter=s>\n<tool_call>\n</tool_call>\n"
+                                        "</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=f>\n</function>\n"
+                                        "</tool_call>",
+         "", "", "0:f:{\"s\": \"<tool_call>\\n</tool_call>\"}\n1:f:{}\n", NULL},
         {"stray_close_after_reasoning", true, "r\n</think>\n\nstill thinking</think>\n\nThe answer.", "r",
          "still thinking\n\nThe answer.", "", NULL},
         {"literal_close_thinking_off", false, "Plain answer with <angle> and </think> text.", "",

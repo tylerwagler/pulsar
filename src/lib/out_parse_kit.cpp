@@ -247,6 +247,11 @@ void out_parser::feed(const char *p, size_t n, std::vector<out_event> *ev) {
                 body_->grow(block_, hold_.size(), false, index_, ev);
                 return;
             }
+            if (body_->holds_closer(block_)) {   /* L410: the marker is a value's text, the call is still open */
+                block_.append(hold_, at, len);
+                hold_.erase(0, at + len);
+                continue;
+            }
             raw_hi_ = fed_ - hold_.size() + at + len;
             const size_t marker_at = fed_ - hold_.size() + at;
             hold_.erase(0, at + len);
@@ -714,6 +719,27 @@ void xml_call_body::scan_payload(const std::string &b, size_t held) {
      * "</" of a closer (this block's or the held "</tool_call>") */
     const size_t pending = b.size() - std::min(ps.pos, b.size());
     ps.payload = ps.value && (ps.is_string || ps.json_str) && b.size() > ps.vstart && pending < 2 && held < 2;
+}
+
+/* L410: a "</tool_call>" found after `b` is a value's text when `b` ends inside a parameter value -- past a
+ * "<parameter=KEY>" with no "</parameter>" after it (read_param's reading: a value ends at the first one).
+ * One exception keeps a malformed call's error where it was: a value never closed but followed by
+ * "</function>" is a call that ended, not a value that goes on (the model wrote the call's close). */
+bool xml_call_body::holds_closer(const std::string &b) const {
+    static const char kParam[] = "<parameter=", kParamEnd[] = "</parameter>", kFnEnd[] = "</function>";
+    size_t pos = 0;
+    for (;;) {
+        const size_t at = b.find(kParam, pos);
+        if (at == std::string::npos) return false;
+        const size_t gt = b.find('>', at);
+        if (gt == std::string::npos) return false;
+        const size_t end = b.find(kParamEnd, gt + 1);
+        if (end == std::string::npos) break;
+        pos = end + strlen(kParamEnd);
+    }
+    size_t e = b.size();
+    while (e && (b[e - 1] == ' ' || b[e - 1] == '\n' || b[e - 1] == '\t' || b[e - 1] == '\r')) e--;
+    return !(e >= strlen(kFnEnd) && !b.compare(e - strlen(kFnEnd), strlen(kFnEnd), kFnEnd));
 }
 
 void xml_call_body::grow(const std::string &b, size_t held, bool closing, int index,

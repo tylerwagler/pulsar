@@ -351,7 +351,7 @@ static bool ambiguous(const nemotron_msg_in &m) {
         if (contains(m.reasoning, k) || contains(m.content, k)) return true;
     for (int i = 0; i < m.n_calls; i++)
         if (contains(m.calls[i].arguments, "</parameter>") || contains(m.calls[i].arguments, "</function>") ||
-            contains(m.calls[i].arguments, "</tool_call>") || contains(m.calls[i].name, ">"))
+            contains(m.calls[i].name, ">"))   /* "</tool_call>" in a value reads back (L410) */
             return true;
     return false;
 }

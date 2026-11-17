@@ -43,6 +43,7 @@ public:
     void open() override;
     void grow(const std::string &b, size_t held, bool closing, int index, std::vector<out_event> *ev) override;
     bool in_payload() const override { return pay_.value && pay_.payload; }
+    bool holds_closer(const std::string &b) const override;
     bool close(const std::string &b, int index, std::vector<out_event> *ev, out_call *call, const char **why,
                size_t *at) override;
 

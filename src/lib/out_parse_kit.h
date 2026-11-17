@@ -168,6 +168,14 @@ public:
      *  P6: structure decodes greedily, payload is sampled). */
     /// @return true when the next byte is payload (sampled), false when it is structure (greedy)
     virtual bool in_payload() const = 0;
+    /** The call's closing marker was found right after body `b`: whether it is the body's own text and not
+     *  the call's end (L410: a parameter value that spells the marker).  The kit then keeps reading. */
+    /// @param b the call's body up to the marker found
+    /// @return true when the marker belongs to the body; false (the default) when it closes the call
+    virtual bool holds_closer(const std::string &b) const {
+        (void)b;
+        return false;
+    }
     /** The call closed with body `b`: the call (true; TOOL_BEGIN first if grow never announced it), or false
      *  with `why` (what is missing or wrong) and `at` (the byte of the body where reading stopped). */
     /// @param b     the call's complete body
