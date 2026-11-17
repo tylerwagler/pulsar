@@ -314,7 +314,7 @@ struct gdn_no_cluster {
  *  @tparam TP tensor-parallel degree.
  *  @param qkvn       kernel 1's f32 [rows][Sh::QKV] (q^, k^, v).
  *  @param gb         kernel 1's f32 [rows][Sh::GB] (decay, beta).
- *  @param z          in_proj_z output, f32 [rows][ld_z]: the norm's gate (SiLU).
+ *  @param z          in_proj_z output, f32 [rows][ld_z]: the norm's gate (applied as sigmoid(z)).
  *  @param ld_z       z pitch in floats.
  *  @param norm_w     gated-norm weight, bf16 [DV] (used as is).
  *  @param seq_rows   rows per sequence, or the longest's with seq_first.
@@ -353,7 +353,8 @@ gdn_recur_norm_kernel(const float *__restrict__ qkvn,
     __shared__ float  so[T2][32];
     __shared__ float  sdec[T2], sbeta[T2];
     __shared__ float2 red[2][RW][32];
-    __shared__ float  redKQ[2][RW];
+    __shared__ float  skq[T2][RW];           /* a tile's k^.q^ partials, one a warp slice (L412) */
+    __shared__ float  sKQ[T2];               /* a tile's k^.q^, one a token */
     __shared__ float  ssp[2][T2];            /* this CTA's sum of o^2, read by the cluster */
 
 #if PULSAR_SM90
@@ -414,6 +415,27 @@ gdn_recur_norm_kernel(const float *__restrict__ qkvn,
         }
         __syncthreads();
 
+        /* L412: k^.q^ depends on the token and the K head only, so it is computed once a (token, warp slice) here
+         * rather than by every thread of the tile's loop -- the same fma chain over the slice's RPW elements, then
+         * the same left-to-right sum over the RW slices: the bytes are the ones the loop produced. */
+        for (int i = tid; i < tn * RW; i += 256) {
+            const int j = i / RW, u = i % RW;
+            const float *kf = reinterpret_cast<const float *>(sk[j]) + u * RPW;
+            const float *qf = reinterpret_cast<const float *>(sq[j]) + u * RPW;
+            float kq = 0.f;
+            #pragma unroll
+            for (int e = 0; e < RPW; e++) kq = fmaf(kf[e], qf[e], kq);
+            skq[j][u] = kq;
+        }
+        __syncthreads();
+        if (tid < tn) {
+            float KQ = skq[tid][0];
+            #pragma unroll
+            for (int u = 1; u < RW; u++) KQ += skq[tid][u];
+            sKQ[tid] = KQ;
+        }
+        __syncthreads();
+
         for (int j = 0; j < tn; j++) {
             float kr[RPW], qv[RPW];
             #pragma unroll
@@ -422,24 +444,21 @@ gdn_recur_norm_kernel(const float *__restrict__ qkvn,
                 kr[4 * i] = k4.x; kr[4 * i + 1] = k4.y; kr[4 * i + 2] = k4.z; kr[4 * i + 3] = k4.w;
                 qv[4 * i] = q4.x; qv[4 * i + 1] = q4.y; qv[4 * i + 2] = q4.z; qv[4 * i + 3] = q4.w;
             }
-            float pk = 0.f, pq = 0.f, kq = 0.f;
+            float pk = 0.f, pq = 0.f;
             #pragma unroll
             for (int i = 0; i < RPW; i++) {
                 pk = fmaf(s[i], kr[i], pk);
                 pq = fmaf(s[i], qv[i], pq);
-                kq = fmaf(kr[i], qv[i], kq);
             }
             red[par][w][lane] = make_float2(pk, pq);
-            if (lane == 0) redKQ[par][w] = kq;
             __syncthreads();
 
             float2 acc = red[par][0][lane];
-            float KQ = redKQ[par][0];
+            const float KQ = sKQ[j];
             #pragma unroll
             for (int u = 1; u < RW; u++) {
                 const float2 p2 = red[par][u][lane];
                 acc.x += p2.x; acc.y += p2.y;
-                KQ += redKQ[par][u];
             }
             const float dec = sdec[j];
             const float vv = reinterpret_cast<const float *>(sv4[j])[lane];
