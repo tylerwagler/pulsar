@@ -3,12 +3,17 @@
 
 The reference decodes with Pillow (libpng for PNG, libjpeg-turbo for JPEG), so
 the engine links the same two libraries.  This records, per case, the encoded
-file AND the RGB Pillow's `.convert("RGB")` produced from it -- which is what
+file AND the RGB the reference produced from it -- which is what
 `vision_decode_rgb` must reproduce byte for byte.
 
-Covered on purpose: PNG RGB / RGBA (alpha dropped) / grayscale / palette, and
-JPEG colour at two qualities plus grayscale -- the conversions where a decoder
-difference would show up first.
+The reference (L408) is vLLM's `convert_image_mode(image, "RGB")`: an image that
+carries transparency is converted to RGBA and pasted onto WHITE with its alpha
+as the mask; anything else is Pillow's `.convert("RGB")`.
+
+Covered on purpose: PNG RGB / grayscale / palette, every transparency form (RGBA
+at one alpha, RGBA over an alpha ramp with BLACK under the clear pixels, grey +
+alpha, palette + tRNS, RGB + tRNS colour key), and JPEG colour at two qualities
+plus grayscale -- the conversions where a decoder difference would show up first.
 
     python3 tests/vision_codec_goldens.py > tests/test-vectors/vision-codec-goldens.bin
 """
@@ -39,6 +44,18 @@ def cases():
     yield 0, Image.fromarray(rgb, "RGB"), dict(format="PNG")
     rgba = np.dstack([rgb, np.full((H, W), 200, np.uint8)])
     yield 0, Image.fromarray(rgba, "RGBA"), dict(format="PNG")
+    # a logo on a transparent background: black under the clear pixels, an alpha ramp across, opaque rows at the bottom
+    y, x = np.mgrid[0:H, 0:W]
+    alpha = np.where(y >= H - 8, 255, x * 255 // (W - 1)).astype(np.uint8)
+    hidden = np.where((alpha == 0)[:, :, None], 0, rgb).astype(np.uint8)
+    yield 0, Image.fromarray(np.dstack([hidden, alpha]), "RGBA"), dict(format="PNG")
+    la = np.dstack([np.asarray(Image.fromarray(rgb, "RGB").convert("L"), dtype=np.uint8), alpha])
+    yield 0, Image.fromarray(la, "LA"), dict(format="PNG")
+    palt = Image.fromarray(rgb, "RGB").convert("P", palette=Image.ADAPTIVE, colors=64)
+    yield 0, palt, dict(format="PNG", transparency=bytes((i * 4 + 3) for i in range(64)))
+    keyed = rgb.copy()
+    keyed[8:24, 8:40] = (10, 20, 30)
+    yield 0, Image.fromarray(keyed, "RGB"), dict(format="PNG", transparency=(10, 20, 30))
     gray = np.asarray(Image.fromarray(rgb, "RGB").convert("L"), dtype=np.uint8)
     yield 0, Image.fromarray(gray, "L"), dict(format="PNG")
     pal = Image.fromarray(rgb, "RGB").convert("P", palette=Image.ADAPTIVE, colors=64)
@@ -51,6 +68,16 @@ def cases():
     yield 1, Image.fromarray(synth_rgb(129, 97), "RGB"), dict(format="JPEG", quality=50)
 
 
+def to_rgb(image):
+    """vLLM's convert_image_mode(image, "RGB") (vllm/multimodal/image.py)."""
+    if image.mode in ("RGBA", "LA", "PA") or "transparency" in image.info:
+        rgba = image if image.mode == "RGBA" else image.convert("RGBA")
+        out = Image.new("RGB", rgba.size, (255, 255, 255))
+        out.paste(rgba, mask=rgba.split()[3])
+        return out
+    return image.convert("RGB")
+
+
 def main():
     out = sys.stdout.buffer
     items = list(cases())
@@ -60,7 +87,7 @@ def main():
         buf = io.BytesIO()
         img.save(buf, **save_kw)
         enc = buf.getvalue()
-        decoded = Image.open(io.BytesIO(enc)).convert("RGB")
+        decoded = to_rgb(Image.open(io.BytesIO(enc)))
         w, h = decoded.size
         arr = np.asarray(decoded, dtype=np.uint8)
         out.write(struct.pack("<IiiI", fmt, w, h, len(enc)))

@@ -834,9 +834,11 @@ int vision_preprocess_rgb(const uint8_t *rgb, int width, int height,
 /* ---------------------------------------------------------------------------
  * The CODEC.
  *
- * PNG through libpng's simplified API (PNG_FORMAT_RGB: every colour type, bit
- * depth and interlace mode reduced to 8-bit RGB, alpha dropped -- exactly what
- * Pillow's .convert("RGB") yields).  JPEG through libjpeg-turbo with Pillow's
+ * PNG through libpng's simplified API (PNG_FORMAT_RGBA: every colour type, bit
+ * depth and interlace mode reduced to 8-bit RGBA), then composited over WHITE
+ * (L408): what a viewer shows, and what vLLM's convert_image_mode and Qwen's
+ * to_rgb hand the model -- Pillow's paste(mask=alpha) onto a white image, byte
+ * for byte.  An opaque PNG comes out as Pillow's .convert("RGB").  JPEG through libjpeg-turbo with Pillow's
  * settings, which are libjpeg's DEFAULTS: Pillow only touches dct_method and
  * do_fancy_upsampling in draft mode (see libImaging/JpegDecode.c), so JDCT_ISLOW
  * + fancy upsampling + block smoothing + JCS_RGB output is what it gets and what
@@ -887,7 +889,7 @@ bool vision_decode_admits(uint64_t width, uint64_t height) {
     return true;
 }
 
-/// Decode a PNG to RGB8, alpha dropped (Pillow's convert("RGB")).
+/// Decode a PNG to RGB8, transparency composited over white (L408; Pillow's paste(mask=alpha) on white).
 /// @param bytes the encoded image
 /// @param len its length
 /// @param[out] rgb_out RGB8 pixels, malloc'd (caller frees)
@@ -900,11 +902,13 @@ static vision_decode vision_decode_png(const uint8_t *bytes, size_t len,
     memset(&image, 0, sizeof image);
     image.version = PNG_IMAGE_VERSION;
     if (!png_image_begin_read_from_memory(&image, bytes, len)) return vision_decode::refused;
-    /* Decode to RGBA and drop the alpha HERE rather than asking libpng for
-     * PNG_FORMAT_RGB: given an alpha source and a background of NULL, libpng
-     * composites (measured: an alpha=200 pixel came back as 69 where the source
-     * was 0), while Pillow's .convert("RGB") discards the alpha outright.  The
-     * gate caught exactly that on an RGBA PNG. */
+    /* Decode to RGBA and composite HERE rather than asking libpng for
+     * PNG_FORMAT_RGB: libpng's own compositing does not give Pillow's bytes
+     * (measured: an alpha=200 pixel whose value is 0 came back as 69, where
+     * Pillow's paste onto white gives 55), and the reference is Pillow.  libpng
+     * expands every
+     * transparency form to the alpha channel: RGBA, grey + alpha, and a tRNS
+     * chunk on a palette, grey or RGB image. */
     image.format = PNG_FORMAT_RGBA;
     if (!vision_decode_admits(image.width, image.height)) {
         png_image_free(&image);
@@ -926,10 +930,12 @@ static vision_decode vision_decode_png(const uint8_t *bytes, size_t len,
     const size_t npix = (size_t)image.width * (size_t)image.height;
     uint8_t *buf = (uint8_t *)malloc(npix * 3u);
     if (!buf) { free(rgba); png_image_free(&image); return vision_decode::refused; }
+    /* Over white: (255 * (255 - a) + c * a) / 255, rounded to nearest -- Pillow's
+     * paste for every (c, a), checked over all 65536.  a == 255 leaves c. */
     for (size_t i = 0; i < npix; i++) {
-        buf[i * 3 + 0] = rgba[i * 4 + 0];
-        buf[i * 3 + 1] = rgba[i * 4 + 1];
-        buf[i * 3 + 2] = rgba[i * 4 + 2];
+        const uint32_t a = rgba[i * 4 + 3];
+        for (int c = 0; c < 3; c++)
+            buf[i * 3 + c] = (uint8_t)((255u * (255u - a) + rgba[i * 4 + c] * a + 127u) / 255u);
     }
     free(rgba);
     *w_out = (int)image.width;
