@@ -2061,13 +2061,13 @@ warnings-gate:
 	progs=$$($(MAKE) -C "$$d" -qp CUTLASS_DIR=$(abspath $(CUTLASS_DIR)) 2>/dev/null | grep -oE '^tests/[A-Za-z0-9_]+:' \
 	  | tr -d : | sort -u); \
 	$(MAKE) -C "$$d" -j$(GATE_JOBS) --no-print-directory pulsar-server pulsar pulsar_test pulsar_agent_test \
-	  $$progs $(BATTERY_MUTANT_NAMES:%=tests/gates_runner_mutant_%) \
+	  $$progs $(BATTERY_MUTANT_NAMES:%=tests/gates_runner_mutant_%) tools/quality-testing/score_official \
 	  CUDA_ARCH=$(or $(CUDA_ARCH),sm_120f) CUTLASS_DIR=$(abspath $(CUTLASS_DIR)) > "$$d/build.log" 2>&1; rc=$$?; \
 	grep -E ': warning( #[0-9]+-D)?:' "$$d/build.log" | grep -v '^make' | sort -u > "$$d/warnings"; n=$$(wc -l < "$$d/warnings"); \
 	head -40 "$$d/warnings"; \
 	[ $$rc -eq 0 ] || { tail -30 "$$d/build.log"; echo "WARNINGS GATE: FAIL (the build failed, rc $$rc)"; exit 1; }; \
 	[ "$$n" -eq 0 ] || { echo "WARNINGS GATE: FAIL ($$n warnings)"; exit 1; }; \
-	echo "WARNINGS GATE: PASS (a build from nothing, the engine and $$(echo $$progs | wc -w) test programs + the mutants, 0 warnings)"
+	echo "WARNINGS GATE: PASS (a build from nothing, the engine and $$(echo $$progs | wc -w) test programs + the mutants + the official-continuation scorer, 0 warnings)"
 doxygen-gate:
 	@rm -f docs/api/doxygen-warnings.log; \
 	(cat docs/Doxyfile; echo "HAVE_DOT = NO") | doxygen - > /dev/null 2>&1 || { echo "DOXYGEN GATE: FAIL (doxygen did not run)"; exit 1; }; \
@@ -3163,6 +3163,12 @@ tests/loader_open.o: tests/loader_open.cpp
 	$(CXX) $(CXXFLAGS) -Isrc -c -o $@ $<
 tests/loader_open: tests/loader_open.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+# L414: the official-continuation scorer (tools/quality-testing/README.md), on any generative family through the
+# public API.  Not a gate: it needs a GPU, a container and a collected suite; --dry-run is host-only.
+tools/quality-testing/score_official.o: tools/quality-testing/score_official.cc src/pulsar.h src/lib/pyjson.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
+tools/quality-testing/score_official: tools/quality-testing/score_official.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 # L338: the f16 m16n8k16 MMA's sm_75 body (two m16n8k8) graded against the exact product and the k16 instruction --
 # model-free, on an sm_80+ card (it refuses below: the k16 instruction is the comparison).  The split is not the k16
 # instruction's bits (a numerics change on sm_75); both must hold 2^-21 * sum |terms| of exact.
@@ -3568,6 +3574,7 @@ test: pulsar_test seam-check
 clean:
 	rm -rf .build
 	rm -rf tests/runner
+	rm -f tools/quality-testing/score_official tools/quality-testing/score_official.o tools/quality-testing/score_official.d
 	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/families/*/*.o src/families/*/*.d src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o $(XGRAMMAR_OBJS) $(XGRAMMAR_OBJS:.o=.d) tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/vision_chunk_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/spec_sampling_gate tests/spec_sampling_gate_wide tests/algo_stability_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/draft_refusal_gate tests/scratch_poison_gate tests/scratch_poison_gate_mutant tests/gates_runner_mutant_* tests/mutant/family_qwen_s4_l307.cpp tests/mutant/family_qwen_s4_l307.o tests/mutant/family_qwen_s4_l307.d tests/decode_reference_gate tests/verify_width_probe tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/sampler_device_gate tests/nt_crossover_sweep tests/vision_router_gate tests/router_gate tests/bf16_rows_gate tests/nvfp4_rows_gate tests/lilicorr_head_gate tests/inkling_family_gate tests/nemotron_family_gate tests/nemotron_fwd_gate tests/nemotron_enc_gate tests/nemotron_parse_gate tests/rowops_gate tests/state_kinds_gate tests/payload_frontier_gate tests/prompt_end_gate tests/bank_adopt_gate tests/bank_residency_gate tests/bank_isolation_gate tests/kv_accounting_gate tests/graph_eager_gate
 
 # Pull in the generated header dependencies.  `-include` (not `include`) so a
