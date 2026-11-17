@@ -1273,13 +1273,19 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     }
     st->ops->restored(st->state);
     pulsar_gpu_tensor_free(front);
+    front = NULL;   /* fail() below must not free it again */
     if (G) pulsar_ckpt_commit(st, bank, at.slot, TokPos{(int)G});
+    /* L411: the live row goes to the device BEFORE the session takes the tokens.  Until then toks and logits are
+     * still this function's, so a failed write frees each once (fail -> drop) and the session keeps no pointer into
+     * a freed token buffer; the bank is cleared like every other failed restore. */
+    if (!s->live_from_host(logits)) {
+        payload_set_err(err, errlen, "session payload: writing the live row to the device failed");
+        return fail();
+    }
+    free(logits);
     token_vec_free(&s->checkpoint);
     s->checkpoint = toks;
     s->live_images = imgs;
-    const bool live_ok = s->live_from_host(logits);
-    free(logits);
-    if (!live_ok) return fail();
     s->prefill_frontier = pulsar_ckpt_pos(PF);   /* the session's mirror (DeepSeek's own: L195), as a fused prompt chunk sets it */
     s->checkpoint_valid = true;
     s->logits_stale = false;
