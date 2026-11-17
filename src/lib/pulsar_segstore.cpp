@@ -579,13 +579,16 @@ struct pulsar_segstore {
         if (!victim) return unpin_oldest("the store needs room and nothing else may go", keep, keep2);
         const std::string k = victim->key;
         evicting = true;   /* L378: the removal below is for room */
+        /* L415: the victim's class closes both lines (L377's evidence had to rebuild it from the line order) */
         if (victim->rp_bytes > 0u) {
-            drop_rp_of(segs[k], victim_class < 4 ? "store over budget"
-                                                 : "store over budget (a flagged or branch point's)");
+            char why[96];
+            snprintf(why, sizeof why, "store over budget%s class=%d",
+                     victim_class < 4 ? "" : " (a flagged or branch point's)", victim_class);
+            drop_rp_of(segs[k], why);
         } else {
-            logf("evicted segment %s [%d,%d) %llu bytes%s: store over budget", k.c_str(), victim->G_prev.raw(),
-                 victim->G.raw(),
-                 (unsigned long long)victim->file_bytes, victim->dominated ? " (dominated)" : "");
+            logf("evicted segment %s [%d,%d) %llu bytes%s: store over budget class=%d", k.c_str(),
+                 victim->G_prev.raw(), victim->G.raw(),
+                 (unsigned long long)victim->file_bytes, victim->dominated ? " (dominated)" : "", victim_class);
             unlink_files(k);
             unlink_index(k);
         }

@@ -976,9 +976,11 @@ int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chai
     if (r.written || r.rp_written)
         server_log(PULSAR_LOG_KVCACHE,
                    "pulsar-server: kv cache persisted reason=%s chain to %d (%d new segments, %.1f MiB; %d restore "
-                   "points, %.1f MiB; copied out, written behind) in %.1f ms",
+                   "points, %.1f MiB; copied out, written behind) in %.1f ms bank=%d id=%llu",
                    reason, r.end.raw(), r.written, (double)r.bytes / (1024.0 * 1024.0), r.rp_written,
-                   (double)r.rp_bytes / (1024.0 * 1024.0), (server_now_sec() - t0) * 1000.0);
+                   (double)r.rp_bytes / (1024.0 * 1024.0), (server_now_sec() - t0) * 1000.0,
+                   /* L415: whose history it is -- the bank, and the request bound to it (0: none, e.g. a spill) */
+                   sl ? sl->bank.raw() : -1, (unsigned long long)(sl && sl->active_job ? sl->active_job->seq : 0u));
     if (r.no_room) {
         s->count_metric(&s->m_persist_no_room);
         server_log(PULSAR_LOG_WARNING, "pulsar-server: kv cache persist reason=%s: the %.0f MiB host pool had no room "
