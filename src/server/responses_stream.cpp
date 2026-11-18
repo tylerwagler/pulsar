@@ -546,9 +546,9 @@ static const char *responses_status_for_finish(const char *finish) {
 
 
 
-/// Append the Responses "usage" object (input with the cache split, output, total).
+/// Append the Responses "usage" object (input with the cache split, output with its reasoning tokens (L417), total).
 /// @param b              the JSON being built
-/// @param r              the request (its cache split; NULL: none)
+/// @param r              the request (its cache split and reasoning tokens; NULL: none)
 /// @param input_tokens   the prompt's tokens
 /// @param output_tokens  the tokens generated
 static void append_responses_usage_json(buf *b, const request *r,
@@ -558,10 +558,10 @@ static void append_responses_usage_json(buf *b, const request *r,
     resolve_cache_split(&cached_tokens, &cache_write_tokens, input_tokens);
     buf_printf(b,
         "{\"input_tokens\":%d,\"input_tokens_details\":{\"cached_tokens\":%d,\"cache_write_tokens\":%d},"
-        "\"output_tokens\":%d,\"output_tokens_details\":{\"reasoning_tokens\":0},"
+        "\"output_tokens\":%d,\"output_tokens_details\":{\"reasoning_tokens\":%d},"
         "\"total_tokens\":%d}",
         input_tokens, cached_tokens, cache_write_tokens,
-        output_tokens, input_tokens + output_tokens);
+        output_tokens, r ? r->reasoning_tokens : 0, input_tokens + output_tokens);
 }
 
 

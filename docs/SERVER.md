@@ -215,6 +215,13 @@ the Anthropic one. `cached_tokens` counts the request's own prompt tokens that a
 reused state served. Since L334 this is counted correctly even when the client
 re-spells text the model generated.
 
+The OpenAI surfaces also report `reasoning_tokens` (chat completions:
+`usage.completion_tokens_details`; Responses: `usage.output_tokens_details`):
+the completion tokens the model emitted inside a reasoning block, a subset of
+the completion tokens. The markers that open and close a block are not counted,
+so with a thinking budget the number never passes the budget. A raw completion
+reports 0.
+
 ### Thinking and effort
 
 Thinking is on unless the request turns it off with any of:

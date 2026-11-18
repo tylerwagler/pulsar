@@ -383,9 +383,10 @@ void resolve_cache_split(int *cache_read, int *cache_write, int total) {
 
 
 
-/// Append OpenAI's "usage" object (with prompt_tokens_details: cached_tokens and the cache_write_tokens extension).
+/// Append OpenAI's "usage" object (with prompt_tokens_details: cached_tokens and the cache_write_tokens extension;
+/// L417: completion_tokens_details: reasoning_tokens, the completion tokens emitted inside a reasoning block).
 /// @param b                  the JSON being built
-/// @param r                  the request (its cache split; NULL: none)
+/// @param r                  the request (its cache split and reasoning tokens; NULL: none)
 /// @param prompt_tokens      the prompt's tokens
 /// @param completion_tokens  the tokens generated
 void append_openai_usage_json(buf *b, const request *r,
@@ -399,9 +400,10 @@ void append_openai_usage_json(buf *b, const request *r,
      * cache hits. */
     buf_printf(b,
                "{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d,"
-               "\"prompt_tokens_details\":{\"cached_tokens\":%d,\"cache_write_tokens\":%d}}",
+               "\"prompt_tokens_details\":{\"cached_tokens\":%d,\"cache_write_tokens\":%d},"
+               "\"completion_tokens_details\":{\"reasoning_tokens\":%d}}",
                prompt_tokens, completion_tokens, prompt_tokens + completion_tokens,
-               cached_tokens, cache_write_tokens);
+               cached_tokens, cache_write_tokens, r ? r->reasoning_tokens : 0);
 }
 
 

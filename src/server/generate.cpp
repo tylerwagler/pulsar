@@ -225,6 +225,20 @@ void think_budget_note(gen_state *g, bool was_inside) {
     }
 }
 
+/* L417: what a usage report calls reasoning tokens -- OpenAI's definition, a subset of the completion tokens: the
+ * generated tokens emitted inside a reasoning block.  Not the L344 budget's counter: that one stops at the first
+ * close (the budget governs the block the turn opened with) and counts a literal <think> block a turn that started
+ * outside reasoning writes; this one counts every block the family reads as reasoning and no other.  A block the
+ * model opens is reasoning only where the family's model opens them (server_reasoning_markers::model_opens: Gemma 4's
+ * channel); in a <think> family the prompt opens the block, so a <think> in the answer is text.  A raw completion
+ * has no reasoning to report (its text is returned whole).  The count lives on the request beside the cache split and
+ * runs across decode attempts, as the reported completion tokens do (completion_total + completion). */
+void reasoning_usage_note(gen_state *g, bool was_inside) {
+    const thinking_state *t = &g->thinking;
+    if (!was_inside && t->inside) g->reasoning_block = t->markers && t->markers->model_opens;
+    if (was_inside && t->inside && g->reasoning_block && g->j->req.kind == REQ_CHAT) g->j->req.reasoning_tokens++;
+}
+
 
 
 /// @brief The reasoning tracker at the start of generation, with the family's markers (L398): fed the rendered
