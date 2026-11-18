@@ -470,6 +470,10 @@ typedef struct {
 /** Per-response timings -- see the note above for the emission contract. */
 typedef struct {
     bool valid;     ///< the timings below were populated; suppresses a half-filled object
+    /** L420: the turn's content is its reasoning (server_turn::reasoning_answer): `"reasoning_as_content":true`
+     *  in the object, absent otherwise -- the one flag in it that is not a timing, here because this object is
+     *  where the OpenAI routes carry the server's own fields. */
+    bool reasoning_as_content;
     double ttft_s;  ///< wall time from request start to first emitted token
     double prefill_s;  ///< wall time spent in prefill (request start -> decode start)
     double decode_s;  ///< wall time spent decoding (decode start -> finish)
@@ -720,6 +724,10 @@ typedef struct {
     const char *tail;
     /// bytes at `tail` (borrowed from gen_state::text, not NUL-terminated); 0 when tail is NULL
     size_t tail_len;
+    /** L420: the turn stopped inside its reasoning block with nothing else to answer with, so `content` is that
+     *  reasoning as well (turn_answers_with_reasoning; `reasoning` keeps it too).  A stream has sent the text as
+     *  reasoning only: its finish sends it once more as content (turn_stream_reasoning_answer). */
+    bool reasoning_answer;
 } server_turn;
 /** A family's output parser (L272 P3 steps 2-3): the hooks the server drives per decode attempt.  The state
  *  `create` returns is owned by the attempt and used only on the worker thread. */
@@ -1244,6 +1252,9 @@ typedef struct request {
      * set for Anthropic {"type":"tool","name":X}: the opener then includes
      * the named invoke so the model can only fill in the parameters. */
     bool force_tool_call;      ///< the model must emit a tool call this turn
+    /** L420: the request asked for a response format (structured output), whether or not this server compiled a
+     *  grammar for it: prose cannot answer it.  Set by constrain_plan_build. */
+    bool response_format_set;
     char *forced_tool_name;    ///< force this specific tool; NULL = any, owned
     /** The replayed prompt still contains the model's prior reasoning. When
      * false the reasoning was stripped by the client, and the server must not
@@ -5319,9 +5330,33 @@ bool turn_tool_retry_allowed(const struct gen_state *g);
 /// @param logged  the family already logged it
 /// @param tail_from  where the stream's unsent tail starts in g->text, bytes
 /// @param ok  the family's stream status
+/// @param open_reasoning  L420: the turn ended inside its reasoning block: that reasoning as the family's content
+///                        path reports text; NULL when the block closed (or the turn has none).  The turn then
+///                        answers with it when turn_answers_with_reasoning says so
 /// @return the retry's result when one ran, else `ok`
 bool parser_finish_turn(server *s, struct session_slot *sl, struct gen_state *g, server_turn *out, bool broken,
-                        const char *why, bool logged, size_t tail_from, bool ok);
+                        const char *why, bool logged, size_t tail_from, bool ok, const char *open_reasoning);
+/** L420: whether a turn that ended inside its reasoning block answers with that reasoning -- the ONE decision
+ *  every family's parser and every protocol share (parser_finish_turn applies it).  All of: a chat turn; the
+ *  reasoning never closed (`open_reasoning`) and holds more than whitespace; the model ended the turn with its
+ *  own stop token -- not the length cap, not a client stop string, not an error, a shutdown or an abandoned
+ *  decode (a reasoning budget's forced close closes the block, so it never gets here); the reading kept no tool
+ *  call and found no broken one, and the reasoning does not spell the family's call opener (a call the model tried
+ *  to write inside the block is not an answer); the request forced no tool call and asked for no response format;
+ *  and the turn has no content of its own. */
+/// @param g  the request's generation state (its finish label, stop string, request)
+/// @param out  the turn's reading (calls, parse_failed, content)
+/// @param open_reasoning  the open block's reasoning as content, or NULL when the block closed
+/// @return true when the turn's content is to be `open_reasoning`
+bool turn_answers_with_reasoning(const struct gen_state *g, const server_turn *out, const char *open_reasoning);
+/** L420: a streamed turn that answers with its reasoning (server_turn::reasoning_answer) sends that text once more,
+ *  as one content delta through the protocol's sink -- after the family's final flush, before the protocol's
+ *  finish; the reasoning deltas already sent stand.  No logprob entries ride on it (they went out with the
+ *  reasoning).  A turn without the flag, or a request without a sink, sends nothing. */
+/// @param g  the request's generation state (its sink)
+/// @param turn  the turn's reading
+/// @return false when the client write failed
+bool turn_stream_reasoning_answer(struct gen_state *g, const server_turn *turn);
 void append_json_object_string(buf *b, const char *json);
 void append_tool_calls_json(buf *b, const tool_calls *calls, const char *id_prefix);
 void append_tool_call_deltas_json(buf *b, const tool_calls *calls, int first, const char *id_prefix);

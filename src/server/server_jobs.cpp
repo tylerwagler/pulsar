@@ -2245,6 +2245,7 @@ void server::gen_step_finish(session_slot *sl) {
         t->spec_draft = g->req_spec_draft;
         t->spec_drafts = g->req_spec_rounds;
         t->spec_active = t->spec_gen > 0; /* the spec lane ran this request */
+        t->reasoning_as_content = turn.reasoning_answer;   /* L420 */
         t->valid = true;
         /* Same numbers the response body already carries, folded into the
          * /metrics histograms so TTFT and per-token latency are observable
@@ -2346,6 +2347,8 @@ void server::gen_step_finish(session_slot *sl) {
              * the protocol's finish, which sends any calls not yet streamed. */
             const int completion = g->completion_total + g->completion;
             response_ok = stream_ok && g->parser->feed(g->parser_st, s, g, g->text.len, true);
+            /* L420: a turn that answers with its reasoning sends it once more, as content */
+            response_ok = response_ok && turn_stream_reasoning_answer(g, &turn);
             if (response_ok && j->req.api == API_ANTHROPIC) {
                 response_ok = anthropic_sse_finish(&g->sink, &parsed_calls, final_finish, g->stop_sequence, completion);
             } else if (response_ok && j->req.api == API_RESPONSES) {
@@ -2394,6 +2397,9 @@ void server::gen_step_finish(session_slot *sl) {
                        g->completion_total + g->completion,
                        &g->logprobs);
     }
+    /* L420: the finish line says so when the turn's content is its reasoning (the Anthropic and Responses bodies
+     * have no field of the server's own to carry it; the OpenAI ones say it in "timings") */
+    const char *answer_note = turn.reasoning_answer ? " answer=reasoning" : "";
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
         log_flags(flags, sizeof(flags),
@@ -2404,22 +2410,24 @@ void server::gen_step_finish(session_slot *sl) {
                   tool_closed);
         if (!strcmp(final_finish, "error") && g->err[0]) {
             server_log(PULSAR_LOG_GENERATION,
-                       "pulsar-server: chat ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
+                       "pulsar-server: chat ctx=%s gen=%d%s%s finish=%s%s error=\"%s\" %.3fs",
                        g->ctx_span,
                        g->completion,
                        flags[0] ? " " : "",
                        flags,
                        said_finish,
+                       answer_note,
                        g->err,
                        server_now_sec() - g->t0);
         } else {
             server_log(PULSAR_LOG_GENERATION,
-                       "pulsar-server: chat ctx=%s gen=%d%s%s finish=%s %.3fs",
+                       "pulsar-server: chat ctx=%s gen=%d%s%s finish=%s%s %.3fs",
                        g->ctx_span,
                        g->completion,
                        flags[0] ? " " : "",
                        flags,
                        said_finish,
+                       answer_note,
                        server_now_sec() - g->t0);
         }
     } else {
@@ -2432,24 +2440,26 @@ void server::gen_step_finish(session_slot *sl) {
                   false);
         if (!strcmp(final_finish, "error") && g->err[0]) {
             server_log(PULSAR_LOG_GENERATION,
-                       "pulsar-server: %s ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
+                       "pulsar-server: %s ctx=%s gen=%d%s%s finish=%s%s error=\"%s\" %.3fs",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
                        g->ctx_span,
                        g->completion,
                        flags[0] ? " " : "",
                        flags,
                        said_finish,
+                       answer_note,
                        g->err,
                        server_now_sec() - g->t0);
         } else {
             server_log(PULSAR_LOG_GENERATION,
-                       "pulsar-server: %s ctx=%s gen=%d%s%s finish=%s %.3fs",
+                       "pulsar-server: %s ctx=%s gen=%d%s%s finish=%s%s %.3fs",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
                        g->ctx_span,
                        g->completion,
                        flags[0] ? " " : "",
                        flags,
                        said_finish,
+                       answer_note,
                        server_now_sec() - g->t0);
         }
     }

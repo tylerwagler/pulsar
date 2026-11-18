@@ -181,8 +181,31 @@ including `temperature: 0` (greedy).
 
 Streaming (`stream: true`) is SSE on all three chat surfaces. Reasoning streams
 on the protocol's reasoning channel and never as visible content, even when
-generation stops inside an unterminated think block. Tool calls stream as the
-parser recognises them: the header first, then argument deltas.
+generation stops inside an unterminated think block -- with one exception,
+below. Tool calls stream as the parser recognises them: the header first, then
+argument deltas.
+
+A turn that the model ends itself (its stop token) while its think block is
+still open, with no tool call read, would answer with nothing: empty `content`
+on Chat Completions, a thinking block and an empty text block on Messages, a
+reasoning item alone on Responses. Its reasoning is then the answer as well:
+`content` repeats the text and `reasoning_content` keeps it, Messages returns
+the thinking block and then a text block, Responses the reasoning item and then
+a message. A stream has already sent the text as reasoning deltas and sends it
+once more, as one content delta before the finish, so the joined deltas equal
+the whole reply. It applies only to the model's own stop: not to `max_tokens`,
+a stop string, an error or a client that left, not when the think block closed
+(a reasoning budget's forced close included), not when the reasoning spells a
+tool-call opener (a call attempted inside the block), and not to a request
+that forced a tool call or asked for a response format, which prose cannot
+answer. Chat
+Completions says so with `"reasoning_as_content": true` in `timings` (the
+response body, and the stream's usage chunk under
+`stream_options.include_usage`); Messages and Responses have no field of the
+server's own, so there the server's log has it: a line when it happens and
+`answer=reasoning` on the request's finish line. A client that sends the
+reasoning back sends the text twice, which costs prompt tokens on the next
+turn; what the next prompt reuses of the live KV is unchanged.
 
 Tool-call markup the model quotes in Markdown code is text, not a call (Qwen,
 Nemotron-H, Gemma 4 and Inkling: the output-parser kit; DeepSeek's DSML parser

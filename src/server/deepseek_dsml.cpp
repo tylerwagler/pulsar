@@ -796,7 +796,10 @@ static void split_reasoning_content(const char *text, size_t n, char **content_o
          * partial reasoning is still reasoning: surfacing it as content
          * hands raw chain-of-thought to clients that score or display the
          * answer channel (the streaming path already promises reasoning is
-         * never visible assistant text). */
+         * never visible assistant text).  L420's one exception is decided
+         * after this reading, by the finish every family shares
+         * (turn_answers_with_reasoning): the model's own stop inside the
+         * block, nothing else to answer with. */
         *reasoning_out = server_xstrdup(body);
         *content_out = server_xstrdup("");
     } else {

@@ -415,6 +415,7 @@ bool constrain_plan_build(pulsar_engine *e, server *s, const chat_conversation *
                           size_t errlen) {
     constrain_plan_free(r->constrain);
     r->constrain = NULL;
+    r->response_format_set = c->response_format.kind != RESPONSE_FORMAT_NONE;   /* L420: with or without a compiler */
     if (r->kind != REQ_CHAT) return true;
     std::vector<constrain_tool> tools;
     bool any_strict = false;

@@ -566,6 +566,8 @@ void append_openai_timings_json(buf *b, const request *r) {
         buf_printf(b, ",\"spec_tokens_per_step\":%.4f",
                    (double)t->spec_gen / (double)t->spec_drafts);
     }
+    /* L420: the turn stopped inside its reasoning and its content repeats it */
+    if (t->reasoning_as_content) buf_puts(b, ",\"reasoning_as_content\":true");
     buf_putc(b, '}');
 }
 

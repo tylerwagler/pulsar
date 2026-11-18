@@ -228,7 +228,12 @@ static bool ds_parser_finish(void *st, server *s, session_slot *sl, gen_state *g
     if (out->calls.len && ps->walk_on) apply_stream_tool_ids(&out->calls, &ps->walk.tool);
     /* as text, the walk stopped at the block's marker: the rest goes out at the finish */
     const size_t tail_from = ps->walk_on ? ps->walk.emit_pos : SIZE_MAX;
-    return parser_finish_turn(s, sl, g, out, broken, why, /*logged=*/false, tail_from, true);
+    /* L420: thinking on and no </think> in the text (parse_generated_message_ex's test): the turn ended inside its
+     * reasoning, which the content path would report verbatim */
+    const bool open = pulsar_think_mode_enabled(j->req.think_mode) && out->reasoning &&
+                      !strstr(g->text.ptr ? g->text.ptr : "", "</think>");
+    return parser_finish_turn(s, sl, g, out, broken, why, /*logged=*/false, tail_from, true,
+                              open ? out->reasoning : NULL);
 }
 
 /** DeepSeek's output parser table (server_family_ops::output of both DeepSeek variants). */

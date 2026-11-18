@@ -283,6 +283,13 @@ public:
     /** The parser sits inside an open call. */
     /// @return true while state is OUT_CALL
     bool in_tool_call() const { return state_ == OUT_CALL; }
+    /** L420: the turn is (after finish(): ended) inside its reasoning block.  `as_content` then receives the
+     *  reasoning reported so far as the grammar's content policy reports a turn's text with no call read: stripped
+     *  for OUT_TEXT_STRIP, right-stripped for OUT_TEXT_RSTRIP, as it is for the two policies that keep text
+     *  verbatim.  What a turn that never closed its reasoning has to answer with. */
+    /// @param as_content receives the reasoning as content (untouched on false)
+    /// @return true while state is OUT_REASONING
+    bool open_reasoning(std::string *as_content) const;
     /** The next byte is an open call's payload (out_call_body::in_payload). */
     /// @return true when the next byte is sampled payload rather than greedy structure
     bool in_payload() const { return state_ == OUT_CALL && body_->in_payload(); }

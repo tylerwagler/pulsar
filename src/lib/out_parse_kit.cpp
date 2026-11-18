@@ -340,6 +340,17 @@ void out_parser::finish(std::vector<out_event> *ev) {
     finish_section(OUT_CONTENT, ev);
 }
 
+bool out_parser::open_reasoning(std::string *as_content) const {
+    if (state_ != OUT_REASONING) return false;
+    size_t lo = 0, hi = reasoning_.size();
+    if (g_->content == OUT_TEXT_STRIP || g_->content == OUT_TEXT_RSTRIP) {
+        py_strip_bounds(reasoning_.data(), reasoning_.size(), &lo, &hi);
+        if (g_->content == OUT_TEXT_RSTRIP) lo = 0;
+    }
+    as_content->assign(reasoning_, lo, hi - lo);
+    return true;
+}
+
 bool out_parser::raw_span(size_t *lo, size_t *hi) const {
     if (calls_.empty()) return false;
     *lo = raw_lo_;

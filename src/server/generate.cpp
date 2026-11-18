@@ -321,8 +321,38 @@ static void turn_as_text(const gen_state *g, server_turn *out) {
     out->finish = turn_finish(g, 0);
 }
 
+/* L420: a turn the model ended itself while its reasoning block was still open, with no call read, answers with
+ * nothing on every protocol.  Its reasoning is then the answer as well (it stays the reasoning): the ONE decision
+ * for every family's parser and every protocol, taken where every parser's finish ends (parser_finish_turn).  The
+ * protocols only serialise it: a whole reply carries the text in both fields, a stream sends it once more as a
+ * content delta (turn_stream_reasoning_answer). */
+/// @param g the decode attempt (its finish label, stop string, request)
+/// @param out the turn's reading
+/// @param open_reasoning the open block's reasoning as the family's content path reports text; NULL = it closed
+/// @return true when the turn's content is to be `open_reasoning` (pulsar_server_internal.h lists the conditions)
+bool turn_answers_with_reasoning(const gen_state *g, const server_turn *out, const char *open_reasoning) {
+    static const char ws[] = " \t\n\r\f\v";
+    const request *r = &g->j->req;
+    if (r->kind != REQ_CHAT || !open_reasoning) return false;
+    /* the model's own stop token: "stop" with no stop string behind it, in a decode its client heard out */
+    if (strcmp(g->finish, "stop") || g->stop_sequence || g->abandoned) return false;
+    if (out->calls.len || out->parse_failed) return false;
+    if (r->force_tool_call || r->response_format_set) return false;   /* prose cannot answer either */
+    if (out->content && out->content[strspn(out->content, ws)]) return false;
+    /* a call the model tried to write inside the block (no family reads one there once the turn has ended in it) is
+     * not an answer: its markup stays reasoning */
+    const server_grammar_shape *sh = r->family ? r->family->grammar : NULL;
+    if (sh && sh->call_trigger && strstr(open_reasoning, sh->call_trigger)) return false;
+    return open_reasoning[strspn(open_reasoning, ws)] != '\0';
+}
+
+bool turn_stream_reasoning_answer(gen_state *g, const server_turn *turn) {
+    if (!turn->reasoning_answer || !g->sink.text) return true;
+    return g->sink.text(&g->sink, false, turn->content, strlen(turn->content), 0);
+}
+
 bool parser_finish_turn(server *s, session_slot *sl, gen_state *g, server_turn *out, bool broken,
-                        const char *why, bool logged, size_t tail_from, bool ok) {
+                        const char *why, bool logged, size_t tail_from, bool ok, const char *open_reasoning) {
     const request *r = &g->j->req;
     const char *detail = why;
     char dropped[512];
@@ -377,6 +407,18 @@ bool parser_finish_turn(server *s, session_slot *sl, gen_state *g, server_turn *
         s->tool_memory_remember(&out->calls);   /* a no-op without the sampled bytes */
     }
     out->finish = turn_finish(g, out->calls.len);
+    if (turn_answers_with_reasoning(g, out, open_reasoning)) {
+        /* L420: the model stopped inside its reasoning and said nothing else: an empty answer on every protocol.
+         * The reasoning is the answer too; it stays the reasoning. */
+        free(out->content);
+        out->content = server_xstrdup(open_reasoning);
+        out->reasoning_answer = true;
+        server_log(PULSAR_LOG_WARNING,
+                   "pulsar-server: chat ctx=%s%s%s the turn stopped inside its reasoning block with no answer: the "
+                   "reasoning is served as the content too",
+                   g->ctx_span, g->req_flags[0] ? " " : "", g->req_flags);
+        s->trace_event(g->trace_id, "the turn stopped inside its reasoning block: reasoning served as content");
+    }
     return ok;
 }
 

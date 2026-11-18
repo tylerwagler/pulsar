@@ -4433,6 +4433,398 @@ static void test_l419_gate_and_parser_agree_on_quoted_calls(void) {
     l303_server_free(&srv);
 }
 
+/* ==== L420: a turn that stops inside its reasoning answers with it ======================================== */
+
+/* One turn through its family's output parser and its protocol, as the server drives them: the sink (a stream), the
+ * parser fed a byte at a time, the finish every family shares (parser_finish_turn), then the response -- a stream's
+ * final flush, the L420 content delta and the protocol's finish, or the protocol's final body -- into `wire`. */
+struct l420_case {
+    pulsar_chat_format fmt = PULSAR_CHAT_QWEN;
+    api_style api = API_OPENAI;
+    bool stream = false;
+    const char *raw = "";              /* the sampled bytes */
+    const char *gen_finish = "stop";   /* how the decode ended */
+    const char *stop_string = NULL;    /* the client stop string that ended it */
+    bool abandoned = false;
+    bool forced = false;               /* tool_choice forced a call */
+    bool format = false;               /* a response format was asked for */
+};
+struct l420_result {
+    std::string content, reasoning, wire, finish;
+    int calls = 0;
+    bool answer = false;   /* server_turn::reasoning_answer */
+};
+
+static l420_result l420_run(const l420_case &c) {
+    l420_result res;
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    server srv;
+    memset(&srv, 0, sizeof srv);
+    pthread_mutex_init(&srv.tool_mu, NULL);
+    job j;
+    memset(&j, 0, sizeof j);
+    j.fd = sv[0];
+    request *r = &j.req;
+    test_request_init(r, REQ_CHAT, 64);
+    r->family = server_family_for_format(c.fmt);
+    r->api = c.api;
+    r->stream = c.stream;
+    r->stream_include_usage = true;
+    r->reasoning_summary_emit = true;
+    r->think_mode = PULSAR_THINK_DEFAULT;
+    r->has_tools = true;
+    r->tool_orders = make_bash_order();
+    r->tools_json = server_xstrdup("[{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"parameters\":"
+                                   "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}}}}}]");
+    r->force_tool_call = c.forced;
+    r->response_format_set = c.format;
+    gen_state *g = new gen_state();
+    g->j = &j;
+    snprintf(g->id, sizeof g->id, "id_l420");
+    g->thinking = thinking_state_from_prompt(r);
+    if (c.stream) {
+        if (c.api == API_ANTHROPIC) {
+            TEST_ASSERT(anthropic_sse_start_live(sv[0], r, g->id, 10, &g->anthropic_live));
+            anthropic_sink_init(&g->sink, sv[0], NULL, r, g->id, &g->anthropic_live);
+        } else if (c.api == API_RESPONSES) {
+            responses_stream_init(r, &g->responses_live);
+            g->responses_live.active = true;
+            TEST_ASSERT(responses_sse_created(sv[0], r, &g->responses_live, 1));
+            responses_sink_init(&g->sink, sv[0], NULL, r, g->id, &g->responses_live);
+        } else {
+            openai_stream_start(r, &g->openai_live);
+            openai_sink_init(&g->sink, sv[0], NULL, r, g->id, &g->openai_live);
+        }
+    }
+    char err[200] = "";
+    void *ps = r->family->output->create(&srv, g, err, sizeof err);
+    TEST_ASSERT(ps != NULL);
+    for (const char *p = c.raw; *p; p++) {   /* a token at a time */
+        buf_append(&g->text, p, 1);
+        g->thinking.feed(p, 1);
+        TEST_ASSERT(r->family->output->feed(ps, &srv, g, g->text.len, false));
+    }
+    g->finish = c.gen_finish;
+    g->abandoned = c.abandoned;
+    if (c.stop_string) g->stop_sequence = server_xstrdup(c.stop_string);
+    server_turn turn;
+    memset(&turn, 0, sizeof turn);
+    turn.finish = g->finish;
+    TEST_ASSERT(r->family->output->finish(ps, &srv, NULL, g, &turn));
+    res.content = turn.content ? turn.content : "";
+    res.reasoning = turn.reasoning ? turn.reasoning : "";
+    res.calls = turn.calls.len;
+    res.finish = turn.finish;
+    res.answer = turn.reasoning_answer;
+    /* the response, as gen_step_finish sends it */
+    r->timings.valid = true;
+    r->timings.reasoning_as_content = turn.reasoning_answer;
+    if (c.stream) {
+        TEST_ASSERT(r->family->output->feed(ps, &srv, g, g->text.len, true));
+        TEST_ASSERT(turn_stream_reasoning_answer(g, &turn));
+        if (c.api == API_ANTHROPIC)
+            TEST_ASSERT(anthropic_sse_finish(&g->sink, &turn.calls, turn.finish, g->stop_sequence, 5));
+        else if (c.api == API_RESPONSES)
+            TEST_ASSERT(responses_sse_finish(sv[0], r, &g->responses_live, turn.tail, turn.tail_len, &turn.calls,
+                                             turn.finish, 10, 5, 1));
+        else
+            TEST_ASSERT(openai_sse_finish(&g->sink, &turn.calls, turn.finish, 10, 5));
+    } else if (c.api == API_ANTHROPIC) {
+        TEST_ASSERT(anthropic_final_response(sv[0], r, g->id, turn.content, turn.reasoning, &turn.calls, turn.finish,
+                                             g->stop_sequence, 10, 5));
+    } else if (c.api == API_RESPONSES) {
+        TEST_ASSERT(responses_final_response(sv[0], r, g->id, turn.content, turn.reasoning, &turn.calls, turn.finish,
+                                             10, 5));
+    } else {
+        TEST_ASSERT(final_response(sv[0], r, g->id, turn.content, turn.reasoning, &turn.calls, turn.finish, 10, 5,
+                                   NULL));
+    }
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    res.wire = out ? out : "";
+    free(out);
+    r->family->output->destroy(ps);
+    free(turn.content);
+    free(turn.reasoning);
+    tool_calls_free(&turn.calls);
+    if (c.stream && c.api == API_RESPONSES) responses_stream_free(&g->responses_live);
+    free(g->stop_sequence);
+    buf_free(&g->text);
+    delete g;
+    request_free(r);
+    pthread_mutex_destroy(&srv.tool_mu);
+    close(sv[0]);
+    close(sv[1]);
+    return res;
+}
+
+static int l420_count(const std::string &hay, const char *needle) {
+    int n = 0;
+    for (size_t at = 0; (at = hay.find(needle, at)) != std::string::npos; at += strlen(needle)) n++;
+    return n;
+}
+
+/* The model's own stop inside an open reasoning block, no call read, nothing forced: the reasoning is the content as
+ * well, on every protocol, whole and streamed, for every family's parser (the kit's three and DeepSeek's). */
+static void test_l420_stop_inside_reasoning_answers_with_it(void) {
+    static const char R[] = "The answer is 42.";
+    struct fam { pulsar_chat_format fmt; const char *raw; };
+    static const fam fams[] = {
+        {PULSAR_CHAT_QWEN, "The answer is 42.\n"},
+        {PULSAR_CHAT_NEMOTRON_H, "The answer is 42.\n"},
+        {PULSAR_CHAT_GEMMA4, "<|channel>thought\nThe answer is 42.\n"},
+        {PULSAR_CHAT_DS4_V41, "The answer is 42."},
+    };
+    for (const fam &f : fams) {
+        for (api_style api : {API_OPENAI, API_ANTHROPIC, API_RESPONSES}) {
+            for (int stream = 0; stream < 2; stream++) {
+                l420_case c;
+                c.fmt = f.fmt;
+                c.api = api;
+                c.stream = stream != 0;
+                c.raw = f.raw;
+                const l420_result r = l420_run(c);
+                const bool ok = r.answer && r.content == R && r.reasoning == R && r.calls == 0 && r.finish == "stop";
+                if (!ok)
+                    fprintf(stderr, "l420 fmt %d api %d stream %d: answer %d content [%s] reasoning [%s]\n", (int)f.fmt,
+                            (int)api, stream, (int)r.answer, r.content.c_str(), r.reasoning.c_str());
+                TEST_ASSERT(ok);
+                const std::string &w = r.wire;
+                if (api == API_OPENAI && !stream) {
+                    TEST_ASSERT(w.find("\"content\":\"The answer is 42.\",\"reasoning_content\":\"The answer is 42.\"") !=
+                                std::string::npos);
+                    TEST_ASSERT(w.find("\"finish_reason\":\"stop\"") != std::string::npos);
+                    TEST_ASSERT(w.find("\"reasoning_as_content\":true}") != std::string::npos);   /* in "timings" */
+                } else if (api == API_OPENAI) {
+                    /* the reasoning deltas stand; then ONE content delta with the whole text; then the finish */
+                    const size_t content = w.find("\"delta\":{\"content\":\"The answer is 42.\"}");
+                    TEST_ASSERT(content != std::string::npos && l420_count(w, "\"delta\":{\"content\":") == 1);
+                    TEST_ASSERT(w.find("\"reasoning_content\":") < content);
+                    TEST_ASSERT(w.find("\"finish_reason\":\"stop\"") > content);
+                    TEST_ASSERT(w.find("\"reasoning_as_content\":true}") != std::string::npos);   /* the usage chunk */
+                } else if (api == API_ANTHROPIC && !stream) {
+                    /* a thinking block, then a text block with the same text -- not the empty one */
+                    const size_t think = w.find("{\"type\":\"thinking\",\"thinking\":\"The answer is 42.\"");
+                    const size_t text = w.find("{\"type\":\"text\",\"text\":\"The answer is 42.\"}");
+                    TEST_ASSERT(think != std::string::npos && text != std::string::npos && think < text);
+                    TEST_ASSERT(w.find("\"text\":\"\"") == std::string::npos);
+                    TEST_ASSERT(w.find("\"stop_reason\":\"end_turn\"") != std::string::npos);
+                } else if (api == API_ANTHROPIC) {
+                    const size_t think = w.find("\"type\":\"thinking_delta\"");
+                    const size_t text = w.find("\"type\":\"text_delta\",\"text\":\"The answer is 42.\"");
+                    TEST_ASSERT(think != std::string::npos && text != std::string::npos && think < text);
+                    TEST_ASSERT(l420_count(w, "\"type\":\"text_delta\"") == 1);
+                    TEST_ASSERT(w.find("\"stop_reason\":\"end_turn\"") > text);
+                } else if (!stream) {
+                    const size_t reason = w.find("\"type\":\"summary_text\",\"text\":\"The answer is 42.\"");
+                    const size_t text = w.find("\"type\":\"output_text\",\"text\":\"The answer is 42.\"");
+                    TEST_ASSERT(reason != std::string::npos && text != std::string::npos && reason < text);
+                    TEST_ASSERT(w.find("\"status\":\"completed\"") != std::string::npos);
+                } else {
+                    const size_t delta = w.find("\"type\":\"response.output_text.delta\"");
+                    TEST_ASSERT(delta != std::string::npos && l420_count(w, "\"type\":\"response.output_text.delta\"") == 1);
+                    TEST_ASSERT(w.find("\"delta\":\"The answer is 42.\"", delta) != std::string::npos);
+                    TEST_ASSERT(w.find("response.reasoning_summary_text.delta") < delta);
+                    /* the terminal event carries both items */
+                    const size_t done = w.find("\"type\":\"response.completed\"");
+                    TEST_ASSERT(done != std::string::npos);
+                    TEST_ASSERT(w.find("\"type\":\"output_text\",\"text\":\"The answer is 42.\"", done) != std::string::npos);
+                }
+            }
+        }
+    }
+}
+
+/* Every other ending keeps today's reply: the length cap, a stop string, an abandoned decode, an error, a forced tool,
+ * a response format, a block that closed (with an answer or without one), a tool call, a blank block. */
+static void test_l420_other_endings_are_unchanged(void) {
+    struct ucase {
+        const char *name;
+        pulsar_chat_format fmt;
+        const char *raw, *gen_finish, *stop_string;
+        bool abandoned, forced, format;
+        const char *content;   /* the turn's content, as before L420 */
+        int calls;
+    };
+    static const char kCall[] = "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n"
+                                "</tool_call>";
+    const std::string closed_call = std::string("plan\n</think>\n\n") + kCall;
+    const std::string from_reasoning = std::string("plan\n") + kCall;
+    const ucase cases[] = {
+        {"length", PULSAR_CHAT_QWEN, "The answer is", "length", NULL, false, false, false, "", 0},
+        {"stop string", PULSAR_CHAT_QWEN, "The answer is", "stop", "42", false, false, false, "", 0},
+        {"abandoned", PULSAR_CHAT_QWEN, "The answer is 42.", "stop", NULL, true, false, false, "", 0},
+        {"forced tool", PULSAR_CHAT_QWEN, "The answer is 42.", "stop", NULL, false, true, false, "", 0},
+        {"response format", PULSAR_CHAT_QWEN, "The answer is 42.", "stop", NULL, false, false, true, "", 0},
+        {"closed, answered", PULSAR_CHAT_QWEN, "plan\n</think>\n\nThe answer is 42.", "stop", NULL, false, false, false,
+         "The answer is 42.", 0},
+        {"closed, no answer", PULSAR_CHAT_QWEN, "plan\n</think>\n\n", "stop", NULL, false, false, false, "", 0},
+        {"tool call", PULSAR_CHAT_QWEN, closed_call.c_str(), "stop", NULL, false, false, false, "", 1},
+        {"blank block", PULSAR_CHAT_QWEN, " \n\n", "stop", NULL, false, false, false, "", 0},
+        /* a call written inside the block is no call (Qwen opens none from reasoning) and no answer */
+        {"call attempted in the block", PULSAR_CHAT_QWEN, from_reasoning.c_str(), "stop", NULL, false, false, false, "", 0},
+        /* Nemotron opens a call from its reasoning: the call is the turn's answer */
+        {"call from reasoning", PULSAR_CHAT_NEMOTRON_H, from_reasoning.c_str(), "stop", NULL, false, false, false, "", 1},
+        {"length (DeepSeek)", PULSAR_CHAT_DS4_V41, "The answer is", "length", NULL, false, false, false, "", 0},
+        {"closed (DeepSeek)", PULSAR_CHAT_DS4_V41, "plan</think>The answer is 42.", "stop", NULL, false, false, false,
+         "The answer is 42.", 0},
+        {"length (Gemma)", PULSAR_CHAT_GEMMA4, "<|channel>thought\nThe answer is", "length", NULL, false, false, false, "", 0},
+    };
+    for (const ucase &u : cases) {
+        for (api_style api : {API_OPENAI, API_ANTHROPIC, API_RESPONSES}) {
+            for (int stream = 0; stream < 2; stream++) {
+                l420_case c;
+                c.fmt = u.fmt;
+                c.api = api;
+                c.stream = stream != 0;
+                c.raw = u.raw;
+                c.gen_finish = u.gen_finish;
+                c.stop_string = u.stop_string;
+                c.abandoned = u.abandoned;
+                c.forced = u.forced;
+                c.format = u.format;
+                const l420_result r = l420_run(c);
+                const bool ok = !r.answer && r.content == u.content && r.calls == u.calls;
+                if (!ok)
+                    fprintf(stderr, "l420 %s api %d stream %d: answer %d content [%s] calls %d\n", u.name, (int)api, stream,
+                            (int)r.answer, r.content.c_str(), r.calls);
+                TEST_ASSERT(ok);
+                TEST_ASSERT(r.wire.find("reasoning_as_content") == std::string::npos);
+                if (u.content[0] == '\0' && u.calls == 0) {
+                    /* no answer text on the wire: the empty content, or the protocol's empty text block */
+                    TEST_ASSERT(r.wire.find("\"content\":\"The") == std::string::npos);
+                    TEST_ASSERT(r.wire.find("text_delta") == std::string::npos);
+                    TEST_ASSERT(r.wire.find("output_text") == std::string::npos);
+                    if (api == API_ANTHROPIC && !stream && r.reasoning.size())
+                        TEST_ASSERT(r.wire.find("{\"type\":\"text\",\"text\":\"\"}") != std::string::npos);
+                }
+            }
+        }
+    }
+    /* an error is not the model's stop either (the decision alone: an errored turn has no reading to finish) */
+    job j;
+    memset(&j, 0, sizeof j);
+    test_request_init(&j.req, REQ_CHAT, 16);
+    gen_state *g = new gen_state();
+    g->j = &j;
+    server_turn turn;
+    memset(&turn, 0, sizeof turn);
+    g->finish = "stop";
+    TEST_ASSERT(turn_answers_with_reasoning(g, &turn, "text"));
+    TEST_ASSERT(!turn_answers_with_reasoning(g, &turn, NULL));     /* the block closed */
+    TEST_ASSERT(!turn_answers_with_reasoning(g, &turn, " \n\t"));
+    for (const char *finish : {"error", "length", "tool_calls"}) {
+        g->finish = finish;
+        TEST_ASSERT(!turn_answers_with_reasoning(g, &turn, "text"));
+    }
+    g->finish = "stop";
+    turn.parse_failed = true;   /* a broken call was read as text */
+    TEST_ASSERT(!turn_answers_with_reasoning(g, &turn, "text"));
+    turn.parse_failed = false;
+    char answered[] = "an answer";
+    turn.content = answered;
+    TEST_ASSERT(!turn_answers_with_reasoning(g, &turn, "text"));
+    turn.content = NULL;
+    j.req.kind = REQ_COMPLETION;
+    TEST_ASSERT(!turn_answers_with_reasoning(g, &turn, "text"));
+    j.req.kind = REQ_CHAT;
+    delete g;
+    request_free(&j.req);
+}
+
+/* The request says whether a response format was asked for, with a grammar compiler or without one (the flag is the
+ * protocol's, not the plan's). */
+static void test_l420_request_records_its_response_format(void) {
+    l303_vocab v;
+    server srv;
+    l303_server(&srv, v);
+    for (int with = 0; with < 2; with++) {
+        job j;
+        memset(&j, 0, sizeof j);
+        char err[300];
+        const char *body = with ? "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"response_format\":{\"type\":"
+                                  "\"json_object\"}}"
+                                : "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}";
+        TEST_ASSERT(l303_request(&srv, PULSAR_CHAT_QWEN, API_OPENAI, body, &j.req, err, sizeof err));
+        TEST_ASSERT(j.req.response_format_set == (with != 0));
+        request_free(&j.req);
+        /* no compiler (a server that constrains nothing): the flag is still set */
+        memset(&j, 0, sizeof j);
+        test_request_init(&j.req, REQ_CHAT, 64);
+        chat_conversation c;
+        memset(&c, 0, sizeof c);
+        TEST_ASSERT(parse_chat_conversation_openai(body, &c, &j.req, err, sizeof err));
+        TEST_ASSERT(render_chat_conversation(NULL, PULSAR_CHAT_QWEN, NULL, &c, &j.req, err, sizeof err));
+        TEST_ASSERT(j.req.response_format_set == (with != 0) && j.req.constrain == NULL);
+        chat_conversation_free(&c);
+        request_free(&j.req);
+    }
+    l303_server_free(&srv);
+}
+
+/* L420, the replay: the bank holds the turn as sampled -- the generation prompt, the reasoning text, the stop -- and
+ * the client's next request renders the turn as it was served.  How many bytes of the sampled reasoning the next
+ * prompt still spells in place (the bank's reuse: the sync resumes where the two part), with the reasoning echoed
+ * back and without, for the reply as served now (content = the reasoning) and as it was (content empty).  The two
+ * are the same for every family: the text served a second time as content renders AFTER the point where a turn that
+ * never closed its reasoning already parted from the bank -- Qwen's echoed reasoning is reused whole and parts at the
+ * stop (the prompt closes the block the bank never closed), every other render parts at the turn's first byte (the
+ * templates drop or re-spell an earlier turn's reasoning).  No render extends the bank past the reasoning, before
+ * or now; none is shortened. */
+static void test_l420_replay_reuses_the_bank_as_before(void) {
+    l303_vocab v;
+    server srv;
+    l303_server(&srv, v);
+    static const char R[] = "The answer is 42.";
+    struct fam {
+        pulsar_chat_format fmt;
+        const char *opened;   /* what the model samples before the reasoning text when the prompt leaves it outside */
+        size_t echo, plain;   /* bytes of R the next prompt reuses: reasoning echoed back, not echoed */
+    };
+    static const fam fams[] = {
+        {PULSAR_CHAT_QWEN, "", sizeof R - 1, 0},
+        {PULSAR_CHAT_NEMOTRON_H, "", 0, 0},
+        {PULSAR_CHAT_GEMMA4, "<|channel>thought\n", 0, 0},
+        {PULSAR_CHAT_DS4_V41, "", 0, 0},
+    };
+    auto prompt_of = [&](pulsar_chat_format fmt, const std::string &body) {
+        job j;
+        memset(&j, 0, sizeof j);
+        char err[300];
+        std::string text;
+        const bool ok = l303_request(&srv, fmt, API_OPENAI, body.c_str(), &j.req, err, sizeof err);
+        if (!ok) fprintf(stderr, "l420 replay fmt %d: %s\n", (int)fmt, err);
+        TEST_ASSERT(ok);
+        if (ok) text = j.req.prompt_text;
+        request_free(&j.req);
+        return text;
+    };
+    for (const fam &f : fams) {
+        const std::string first = "{\"messages\":[{\"role\":\"user\",\"content\":\"q\"}";
+        const std::string live = prompt_of(f.fmt, first + "]}") + f.opened + R;   /* the bank, up to the stop */
+        size_t reused[2][2];   /* [served now, served before][echoed, not] */
+        for (int before = 0; before < 2; before++) {
+            for (int plain = 0; plain < 2; plain++) {
+                std::string turn = std::string(",{\"role\":\"assistant\",\"content\":\"") + (before ? "" : R) + "\"";
+                if (!plain) turn += std::string(",\"reasoning_content\":\"") + R + "\"";
+                const std::string next = prompt_of(f.fmt, first + turn + "},{\"role\":\"user\",\"content\":\"next\"}]}");
+                size_t same = 0;
+                while (same < live.size() && same < next.size() && live[same] == next[same]) same++;
+                const size_t reply = live.size() - strlen(R);
+                reused[before][plain] = same > reply ? same - reply : 0;
+            }
+        }
+        const bool same = reused[0][0] == f.echo && reused[0][1] == f.plain && reused[1][0] == f.echo &&
+                          reused[1][1] == f.plain;
+        if (!same)
+            fprintf(stderr, "l420 replay fmt %d: now echo %zu plain %zu; before echo %zu plain %zu (of %zu)\n", (int)f.fmt,
+                    reused[0][0], reused[0][1], reused[1][0], reused[1][1], strlen(R));
+        TEST_ASSERT(same);
+    }
+    l303_server_free(&srv);
+}
+
 /* L303 (L272's case): a forced call is the call grammar from the family's seed on -- an unnamed one may only name
  * a declared tool, and its arguments follow the tool's schema; a named one starts at its arguments. */
 static void test_l303_forced_call_grammar(void) {
@@ -17901,6 +18293,10 @@ static void pulsar_server_unit_tests_run(void) {
     test_forced_call_names_a_declared_tool();
     test_l303_shapes_accept_rendered_calls();
     test_l419_gate_and_parser_agree_on_quoted_calls();
+    test_l420_stop_inside_reasoning_answers_with_it();
+    test_l420_other_endings_are_unchanged();
+    test_l420_request_records_its_response_format();
+    test_l420_replay_reuses_the_bank_as_before();
     test_l303_forced_call_grammar();
     test_l303_response_format_answer();
     test_l396_gemma_call_key_order();

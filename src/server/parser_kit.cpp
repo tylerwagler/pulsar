@@ -240,6 +240,9 @@ bool parser_kit_finish(void *st, server *s, session_slot *sl, gen_state *g, serv
     /* as text, the stream stopped at the first call's marker: the rest goes out at the finish.  The parser says
      * where that was (L419: a marker quoted in Markdown code before it was text, and streamed as text) */
     const size_t call = p.first_call_at();
+    std::string open_reasoning;   /* L420: the turn ended inside its reasoning */
+    const bool open = p.open_reasoning(&open_reasoning);
     return parser_finish_turn(s, sl, g, out, p.errors() > 0 || q->undeclared > 0, q->last_error.c_str(),
-                              /*logged=*/true, call == std::string::npos ? SIZE_MAX : call, ok);
+                              /*logged=*/true, call == std::string::npos ? SIZE_MAX : call, ok,
+                              open ? open_reasoning.c_str() : NULL);
 }
