@@ -4868,12 +4868,13 @@ bool tool_call_declared(const request *r, const char *name, char *detail, size_t
 void request_init(request *r, req_kind kind, int max_tokens);
 /** L375: what a failed parse_*_request was, when it was not the request's own fault.  The parsers and the family
  *  render hooks report with a bool and a text (and free the request on a failure), so the kind rides beside them
- *  as the parsing thread's record: request_init resets it, the two sites below set it, and the handler that turns
+ *  as the parsing thread's record: request_init resets it, the sites named below set it, and the handler that turns
  *  the false into an HTTP error reads it there, on the same thread (http_parse_error). */
 typedef enum {
     PARSE_REFUSED_REQUEST = 0,   ///< the request is malformed or asks what the model cannot do: 400
     PARSE_REFUSED_BUSY,          ///< the engine's shared image-decode budget was held by other decodes
-                                 ///< (pulsar_expand_image_placeholders' -1): 503 with Retry-After
+                                 ///< (pulsar_expand_image_placeholders' -1), or the grammar compile slots were
+                                 ///< (L427, constrain_compile): 503 with Retry-After
     PARSE_REFUSED_RENDER,        ///< the tokenizer refused the prompt the server itself rendered -- a renderer
                                  ///< defect, since an ill-formed UTF-8 body is refused at the parse: 500
 } parse_refusal;

@@ -3,25 +3,39 @@
 /* L303: the exception boundary between pulsar and the vendored xgrammar core (pulsar_grammar.h says why it exists
  * and what crosses it).  Built with -fexceptions; every entry catches everything. */
 #include "pulsar_grammar.h"
+#include "pulsar_grammar_admit.h"
 
 #include <xgrammar/xgrammar.h>
 
-#include <atomic>
-#include <chrono>
-#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <exception>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
-#include <thread>
 #include <vector>
 
-/* Workers alive (on time or late): the PULSAR_GRAMMAR_COMPILES_MAX cap. */
-/// Compile workers alive, on time or late; capped at PULSAR_GRAMMAR_COMPILES_MAX.
-static std::atomic<int> g_compiles{0};
+/* L427: every compile of the process goes through this one admission (pulsar_grammar_admit.h has the rules).
+ *
+ * THE KEY is (the xgrammar compiler, the structural tag's text), and that is exactly what a cache entry is keyed
+ * on: the only compile entry called here is CompileStructuralTag, whose cache key is StructuralTagKey{the JSON
+ * text} inside ONE GrammarCompiler (vendor/xgrammar/cpp/grammar_compiler.cc).  Everything else that shapes the
+ * result is either inside that text -- constrain.cpp writes strictness, whitespace caps, the tool-parameter style
+ * and every schema into the tag -- or fixed when the compiler was built (the vocabulary, the stop ids, RAW
+ * decoding), which the compiler's identity covers.  Two requests share a compile only when they would have shared
+ * a cache entry.
+ *
+ * WHAT XGRAMMAR ALREADY DOES.  Its cache stores a shared_future per key: a second thread asking for a key that is
+ * being computed blocks on the first thread's future instead of compiling again, and a compile that threw stays in
+ * the cache as that exception (ThreadSafeLRUCache: nothing removes a failed entry but LRU eviction), so an
+ * identical invalid tag is refused again without a compile.  That dedupes the WORK, not the waiting: before L427
+ * every identical request still started a worker that held one of the four slots while it slept on the future, so
+ * the fifth request of a fan-out was refused.  The pending set removes those workers; the future and the cached
+ * failure are xgrammar's and stay as they were (a job leaves the pending set when it returns, so a retry of a
+ * failed tag asks xgrammar again and gets its cached answer). */
+/// The process's compile admission: PULSAR_GRAMMAR_COMPILES_MAX slots, PULSAR_GRAMMAR_WAITERS_MAX waiting callers.
+static pulsar_grammar_admit<xgrammar::CompiledGrammar> g_admit(PULSAR_GRAMMAR_COMPILES_MAX,
+                                                               PULSAR_GRAMMAR_WAITERS_MAX);
 
 /** Opaque compiler handle: one xgrammar compiler over one model vocabulary. */
 struct pulsar_grammar_compiler {
@@ -112,69 +126,59 @@ bool pulsar_grammar_compiler_is_stop(const pulsar_grammar_compiler *c, int t) {
     return t >= 0 && t < c->n_vocab && c->stop[(size_t)t];
 }
 
-namespace {
-/* One compile, shared by the waiting request and the worker (which may outlive the wait). */
-/** Shared state of one detached grammar compile; held by shared_ptr in both the request and the worker thread. */
-struct compile_job {
-    /// Guards done / out / err
-    std::mutex mu;
-    /// Signalled by the worker when done
-    std::condition_variable cv;
-    /// Worker finished (success or failure)
-    bool done = false;
-    /// The compiled grammar on success
-    std::optional<xgrammar::CompiledGrammar> out;
-    /// Failure message when `out` is empty
-    std::string err;
-};
-}  // namespace
-
-pulsar_grammar *pulsar_grammar_compile(pulsar_grammar_compiler *c, const char *src,
-                                       double deadline_s, char *err, size_t errlen) {
+pulsar_grammar *pulsar_grammar_compile(pulsar_grammar_compiler *c, const char *src, double deadline_s,
+                                       pulsar_grammar_compile_info *info, char *err, size_t errlen) {
+    pulsar_grammar_compile_info met = {PULSAR_GRAMMAR_INVALID, false, 0.0};
+    if (info) *info = met;
     try {
-        if (g_compiles.fetch_add(1) >= PULSAR_GRAMMAR_COMPILES_MAX) {
-            g_compiles.fetch_sub(1);
-            snprintf(err, errlen, "grammar compile: %d compiles already running", PULSAR_GRAMMAR_COMPILES_MAX);
-            return NULL;
-        }
-        auto job = std::make_shared<compile_job>();
+        /* the worker's copies: it may outlive this call and the compiler handle (a late compile) */
         std::shared_ptr<xgrammar::GrammarCompiler> xc = c->xc;
         std::string text = src ? src : "";
-        std::thread([job, xc, text]() {
-            std::optional<xgrammar::CompiledGrammar> out;
-            std::string e;
+        auto work = [xc, text](std::string *e) -> std::optional<xgrammar::CompiledGrammar> {
             try {
-                out = xc->CompileStructuralTag(text);
+                return xc->CompileStructuralTag(text);
             } catch (const std::exception &ex) {
                 char b[400];
                 say(b, sizeof b, "grammar compile", &ex);
-                e = b;
+                *e = b;
             } catch (...) {
-                e = "grammar compile: unknown failure";
+                *e = "grammar compile: unknown failure";
             }
-            {
-                std::lock_guard<std::mutex> lk(job->mu);
-                job->out = std::move(out);
-                job->err = std::move(e);
-                job->done = true;
-            }
-            job->cv.notify_all();
-            g_compiles.fetch_sub(1);
-        }).detach();
-        std::unique_lock<std::mutex> lk(job->mu);
-        if (!job->cv.wait_for(lk, std::chrono::duration<double>(deadline_s), [&] { return job->done; })) {
-            snprintf(err, errlen, "grammar compile: still running after %.1f s (refused; the result is cached)",
-                     deadline_s);
-            return NULL;
+            return std::nullopt;
+        };
+        std::string reason;
+        std::optional<xgrammar::CompiledGrammar> out = g_admit.run(xc.get(), text, work, deadline_s, &met, &reason);
+        if (info) *info = met;
+        switch (met.end) {
+        case PULSAR_GRAMMAR_COMPILED: return new pulsar_grammar{std::move(*out)};
+        case PULSAR_GRAMMAR_INVALID: snprintf(err, errlen, "%s", reason.c_str()); break;
+        case PULSAR_GRAMMAR_LATE:
+            if (met.slot_wait_s > 0.0)
+                snprintf(err, errlen, "grammar compile: still running after %.1f s, %.1f s of it waiting for a slot "
+                         "(refused; the result is cached)", deadline_s, met.slot_wait_s);
+            else
+                snprintf(err, errlen, "grammar compile: still running after %.1f s (refused; the result is cached)",
+                         deadline_s);
+            break;
+        case PULSAR_GRAMMAR_NO_SLOT:
+            snprintf(err, errlen, "grammar compile: waited %.1f s for one of %d compile slots (refused; retry)",
+                     deadline_s, PULSAR_GRAMMAR_COMPILES_MAX);
+            break;
+        case PULSAR_GRAMMAR_CROWDED:
+            snprintf(err, errlen, "grammar compile: %d requests already wait for a compile (refused; retry)",
+                     PULSAR_GRAMMAR_WAITERS_MAX);
+            break;
+        case PULSAR_GRAMMAR_NO_THREAD:
+            snprintf(err, errlen, "grammar compile: no worker thread: %s (refused; retry)", reason.c_str());
+            break;
+        case PULSAR_GRAMMAR_ENDS: break;
         }
-        if (!job->out) {
-            snprintf(err, errlen, "%s", job->err.c_str());
-            return NULL;
-        }
-        return new pulsar_grammar{std::move(*job->out)};
+        return NULL;
     }
     GRAMMAR_TRY("grammar compile", NULL)
 }
+
+pulsar_grammar_compile_stats pulsar_grammar_compile_stats_get(void) { return g_admit.stats(); }
 
 void pulsar_grammar_free(pulsar_grammar *g) { delete g; }
 

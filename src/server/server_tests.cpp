@@ -5449,7 +5449,7 @@ static void test_l397_long_repeat_keeps_json_string_filter(void) {
     for (int n : {100, 200, 900}) {
         const std::string tag = "{\"type\":\"structural_tag\",\"format\":{\"type\":\"json_schema\",\"json_schema\":"
                                 "{\"type\":\"string\",\"pattern\":\"^[^,]{1," + std::to_string(n) + "}$\"}}}";
-        pulsar_grammar *g = pulsar_grammar_compile(c, tag.c_str(), 30.0, err, sizeof err);
+        pulsar_grammar *g = pulsar_grammar_compile(c, tag.c_str(), 30.0, NULL, err, sizeof err);
         TEST_ASSERT(g != NULL);
         /* each case: the bytes that must be accepted, then one that must be refused */
         struct scase {

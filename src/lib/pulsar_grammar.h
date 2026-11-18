@@ -26,13 +26,52 @@
  * a wall-clock deadline: xgrammar has none of its own, and a pathological schema can take seconds
  * (CVE-2025-32381's class; its recursion guard is xgrammar's).  A compile that misses its deadline fails the
  * request; the worker finishes in the background and its result lands in the compiler's cache, which is capped in
- * bytes.  At most PULSAR_GRAMMAR_COMPILES_MAX compiles run at once; another is refused by name. */
+ * bytes.
+ *
+ * ADMISSION (L427; pulsar_grammar_admit.h is the mechanism).  At most PULSAR_GRAMMAR_COMPILES_MAX compiles run at
+ * once (late ones included).  A request that finds them all busy WAITS for a slot, in arrival order, inside its own
+ * deadline: the wait and the compile share the one deadline.  Requests for the same structural tag on the same
+ * compiler -- xgrammar's cache key -- share ONE compile and hold no slot of their own; each waits inside its own
+ * deadline, and a compile nobody waits for any more still finishes into the cache.  At most
+ * PULSAR_GRAMMAR_WAITERS_MAX requests wait at once (each holds its connection thread); one more is refused at once.
+ * pulsar_grammar_compile_info says which of these a call met. */
 
 #include <stddef.h>
 #include <stdint.h>
 
-/** The compile workers that may run at once (late ones included); a compile past it is refused. */
+/** The compile workers that may run at once (late ones included); a compile past it waits for a slot. */
 #define PULSAR_GRAMMAR_COMPILES_MAX 4
+/** The requests that may wait in pulsar_grammar_compile at once -- for a slot, on a shared compile or on their own
+ *  (each holds its HTTP connection thread and nothing else); one more is refused at once. */
+#define PULSAR_GRAMMAR_WAITERS_MAX 32
+
+/** How a pulsar_grammar_compile call ended. */
+typedef enum {
+    PULSAR_GRAMMAR_COMPILED = 0,   ///< a grammar came back
+    PULSAR_GRAMMAR_INVALID,        ///< the compile ran and failed: the grammar's own error (the request's fault)
+    PULSAR_GRAMMAR_LATE,           ///< the compile was still running at the deadline (it finishes into the cache)
+    PULSAR_GRAMMAR_NO_SLOT,        ///< the deadline passed while the compile still waited for a slot (server busy)
+    PULSAR_GRAMMAR_CROWDED,        ///< PULSAR_GRAMMAR_WAITERS_MAX requests already waited (server busy)
+    PULSAR_GRAMMAR_NO_THREAD,      ///< the worker thread could not be started (server busy)
+    PULSAR_GRAMMAR_ENDS,           ///< array bound, not an end
+} pulsar_grammar_compile_end;
+
+/** What one pulsar_grammar_compile call met on its way (L427), for the caller's status, log and counters. */
+typedef struct {
+    pulsar_grammar_compile_end end;   ///< how the call ended
+    bool shared;                      ///< it joined a compile another request had already asked for
+    double slot_wait_s;               ///< seconds its compile waited for a slot while this call waited; 0 = none
+} pulsar_grammar_compile_info;
+
+/** The process's compile admission counters (L427), as /metrics exports them. */
+typedef struct {
+    int running;                          ///< compile workers alive now (<= PULSAR_GRAMMAR_COMPILES_MAX)
+    int waiting;                          ///< requests waiting in pulsar_grammar_compile now
+    uint64_t slot_waits;                  ///< calls whose compile had to wait for a slot
+    double slot_wait_s;                   ///< ... and the seconds they waited, summed
+    uint64_t shared;                      ///< calls that joined another request's compile
+    uint64_t ends[PULSAR_GRAMMAR_ENDS];   ///< calls by pulsar_grammar_compile_end
+} pulsar_grammar_compile_stats;
 
 /// A grammar compiler bound to one model's vocabulary, with its compiled-grammar cache (opaque).
 typedef struct pulsar_grammar_compiler pulsar_grammar_compiler;
@@ -78,16 +117,21 @@ int pulsar_grammar_compiler_vocab(const pulsar_grammar_compiler *c);
 bool pulsar_grammar_compiler_is_stop(const pulsar_grammar_compiler *c, int t);
 
 /** Compile the structural tag `src` (JSON: {"type":"structural_tag","format":{...}}), waiting at most
- *  `deadline_s` seconds.  NULL + err: the grammar is invalid, the deadline
- *  passed, or the compile workers are all busy.  The result is the caller's (pulsar_grammar_free). */
+ *  `deadline_s` seconds in all: for a slot, then for the compile (ADMISSION above).  NULL + err: the grammar is
+ *  invalid, the deadline passed, or too many requests wait; `info` says which.  The result is the caller's
+ *  (pulsar_grammar_free).  Holds no lock while it waits; call it with none that the decode loop needs. */
 /// @param c          the compiler
 /// @param src        the structural tag, JSON text
-/// @param deadline_s wall-clock seconds to wait for the compile
+/// @param deadline_s wall-clock seconds to wait for a slot and the compile
+/// @param info       receives what the call met, or NULL
 /// @param err        receives the reason on failure
 /// @param errlen     size of `err`
 /// @return the compiled grammar (caller frees), or NULL
-pulsar_grammar *pulsar_grammar_compile(pulsar_grammar_compiler *c, const char *src,
-                                       double deadline_s, char *err, size_t errlen);
+pulsar_grammar *pulsar_grammar_compile(pulsar_grammar_compiler *c, const char *src, double deadline_s,
+                                       pulsar_grammar_compile_info *info, char *err, size_t errlen);
+/** The process's compile admission counters.
+ *  @return a snapshot (taken under the admission lock) */
+pulsar_grammar_compile_stats pulsar_grammar_compile_stats_get(void);
 /** Free a compiled grammar (pulsar_grammar_compile).
  *  @param g the grammar, or NULL */
 void pulsar_grammar_free(pulsar_grammar *g);

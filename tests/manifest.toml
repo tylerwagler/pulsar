@@ -250,3 +250,9 @@ name = "segstore-tsan"
 tier = "check"
 overlap = true
 budget = 90
+
+[[test]]
+name = "grammar-admit-gate"
+tier = "check"
+overlap = true
+budget = 90   # L427: the admission legs plain and under ThreadSanitizer (the VM: 2 s to run; the build links xgrammar)

@@ -3,6 +3,7 @@
  *  /metrics and /metrics/stream.
  */
 #include "pulsar_server_internal.h"
+#include "../lib/pulsar_grammar.h"   /* L427: the compile admission counters */
 #include <time.h>
 #include "pulsar_lock.hpp"
 #include "pulsar_gpu.h"   /* tensor census for the reconciliation gauge */
@@ -1332,6 +1333,34 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# HELP pulsar:hint_dead_reuse_total Requests placed on a dead bank instead of a fresh bank or an eviction.\n");
     buf_puts(&b, "# TYPE pulsar:hint_dead_reuse_total counter\n");
     buf_printf(&b, "pulsar:hint_dead_reuse_total %llu\n", hint_dead_reuse);
+    {
+        /* L427: grammar compile admission (pulsar_grammar_admit.h), counted where it is decided */
+        static const char *const end_names[PULSAR_GRAMMAR_ENDS] = {"compiled", "invalid",  "deadline",
+                                                                  "slot_wait", "waiters", "no_thread"};
+        const pulsar_grammar_compile_stats gs = pulsar_grammar_compile_stats_get();
+        buf_printf(&b, "# HELP pulsar:grammar_compiles_running Grammar compile workers alive (late ones included; at most %d).\n",
+                   PULSAR_GRAMMAR_COMPILES_MAX);
+        buf_puts(&b, "# TYPE pulsar:grammar_compiles_running gauge\n");
+        buf_printf(&b, "pulsar:grammar_compiles_running %d\n", gs.running);
+        buf_puts(&b, "# HELP pulsar:grammar_compile_waiters Requests waiting for a grammar: for a slot, on a shared compile or on their own.\n");
+        buf_puts(&b, "# TYPE pulsar:grammar_compile_waiters gauge\n");
+        buf_printf(&b, "pulsar:grammar_compile_waiters %d\n", gs.waiting);
+        buf_puts(&b, "# HELP pulsar:grammar_compile_requests_total Grammar compile calls by how they ended: compiled, invalid (the grammar's "
+                     "error), deadline (the compile outlasted it), slot_wait (gave up waiting for a slot), waiters (too many waiting), no_thread.\n");
+        buf_puts(&b, "# TYPE pulsar:grammar_compile_requests_total counter\n");
+        for (int i = 0; i < PULSAR_GRAMMAR_ENDS; i++)
+            buf_printf(&b, "pulsar:grammar_compile_requests_total{end=\"%s\"} %llu\n", end_names[i],
+                       (unsigned long long)gs.ends[i]);
+        buf_puts(&b, "# HELP pulsar:grammar_compile_slot_waits_total Grammar compile calls whose compile waited for a slot.\n");
+        buf_puts(&b, "# TYPE pulsar:grammar_compile_slot_waits_total counter\n");
+        buf_printf(&b, "pulsar:grammar_compile_slot_waits_total %llu\n", (unsigned long long)gs.slot_waits);
+        buf_puts(&b, "# HELP pulsar:grammar_compile_slot_wait_seconds_total Seconds those calls waited for a slot, summed.\n");
+        buf_puts(&b, "# TYPE pulsar:grammar_compile_slot_wait_seconds_total counter\n");
+        buf_printf(&b, "pulsar:grammar_compile_slot_wait_seconds_total %.3f\n", gs.slot_wait_s);
+        buf_puts(&b, "# HELP pulsar:grammar_compile_shared_total Grammar compile calls that joined another request's pending compile.\n");
+        buf_puts(&b, "# TYPE pulsar:grammar_compile_shared_total counter\n");
+        buf_printf(&b, "pulsar:grammar_compile_shared_total %llu\n", (unsigned long long)gs.shared);
+    }
     buf_puts(&b, "# HELP pulsar:prefill_mem_refusals_total Prefills stopped mid-prompt because MemAvailable was under the memory floor before a chunk.\n");
     buf_puts(&b, "# TYPE pulsar:prefill_mem_refusals_total counter\n");
     buf_printf(&b, "pulsar:prefill_mem_refusals_total %llu\n", prefill_mem_refusals);
