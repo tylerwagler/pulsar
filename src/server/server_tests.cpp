@@ -2362,6 +2362,28 @@ static void test_effort_names_one_table(void) {
             TEST_ASSERT(err[0] != 0);
             request_free(&r);
         }
+        /* L418: a number is range-tested before it is cast -- one no int holds (1e30, inf), NaN, a negative, 0 and a
+         * non-integer are each the one refusal 101 gets, on every key that carries an effort; the ends 1 and 100 pass */
+        static const char *const not_effort[] = {"1e30", "-1e30", "1e999", "-1e999", "inf", "-inf", "Infinity", "nan",
+                                                 "NaN", "-nan", "2147483648", "4294967297", "0", "-1", "0.5", "100.5",
+                                                 "101"};
+        for (const char *v : not_effort) {
+            char body[160];
+            snprintf(body, sizeof body, EFFORT_BODY(",\"reasoning_effort\":%s"), v);
+            TEST_ASSERT(!effort_case(f, body, &r, err, sizeof err));
+            TEST_ASSERT(!strcmp(err, "reasoning_effort: an effort is a name or an integer 1..100"));
+            request_free(&r);
+            snprintf(body, sizeof body, EFFORT_BODY(",\"chat_template_kwargs\":{\"reasoning_effort\":%s}"), v);
+            TEST_ASSERT(!effort_case(f, body, &r, err, sizeof err));
+            TEST_ASSERT(!strcmp(err, "chat_template_kwargs.reasoning_effort: an effort is a name or an integer 1..100"));
+            request_free(&r);
+        }
+        for (const char *v : {"1", "100", "1e2", "50.0"}) {
+            char body[160];
+            snprintf(body, sizeof body, EFFORT_BODY(",\"reasoning_effort\":%s"), v);
+            TEST_ASSERT(effort_case(f, body, &r, err, sizeof err));
+            request_free(&r);
+        }
         /* deepseek-chat: thinking off by default on any family; an explicit switch wins */
         TEST_ASSERT(effort_case(f, EFFORT_BODY(",\"model\":\"deepseek-chat\""), &r, err, sizeof err));
         TEST_ASSERT(r.think_mode == PULSAR_THINK_NONE);

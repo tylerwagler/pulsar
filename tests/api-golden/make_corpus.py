@@ -68,6 +68,10 @@ for fam in ("deepseek", "qwen"):
     add("chat/thinking-null", "chat", {"messages": USER, "thinking": None}, fam)
     for eff in ("low", "medium", "high", "max", "xhigh", "none", "minimal", "bogus", 50, 101, None):
         add(f"chat/effort-{eff}", "chat", {"messages": USER, "reasoning_effort": eff}, fam)
+    # L418: numbers no int holds (the range is tested before the cast) and a non-integer: each the same refusal as 101.
+    # json.dumps spells them 1e+30, NaN, Infinity, -Infinity and 50.5; the server's strtod reads all five.
+    for eff in (1e30, float("nan"), float("inf"), float("-inf"), 50.5):
+        add(f"chat/effort-{eff}", "chat", {"messages": USER, "reasoning_effort": eff}, fam)
     add("chat/effort-and-off", "chat", {"messages": USER, "reasoning_effort": "low", "think": False}, fam)
     add("chat/kwargs", "chat", {"messages": USER, "chat_template_kwargs": {"enable_thinking": False}}, fam)
     add("chat/kwargs-effort", "chat", {"messages": USER, "chat_template_kwargs": {"reasoning_effort": "low"}}, fam)
