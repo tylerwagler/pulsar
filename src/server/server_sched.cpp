@@ -2201,6 +2201,16 @@ void kv_line_hash(kv_line *l, const char *key, bool have, uint64_t h) {
     if (have) kv_line_put(l, key, "%016llx", (unsigned long long)h);
     else kv_line_put(l, key, "-");
 }
+/** L424: a sampling knob as the request sent it, and after `>` the value that runs when the parse replaced it.  The
+ *  two are compared as printed, so a value that only changed in its float rounding prints once.
+ *  @param l the line  @param key the key  @param asked the value as sent  @param used the value the request runs with */
+void kv_line_asked(kv_line *l, const char *key, double asked, double used) {
+    char a[32], u[32];
+    snprintf(a, sizeof a, "%g", asked);
+    snprintf(u, sizeof u, "%g", used);
+    if (!strcmp(a, u)) kv_line_put(l, key, "%s", a);
+    else kv_line_put(l, key, "%s>%s", a, u);
+}
 /** Copy a client id cut to KV_REQ_ID_CHARS.  @param dst receives it  @param id the id as received */
 void kv_id_cut(char dst[KV_REQ_ID_CHARS + 1], const char *id) {
     const size_t n = strnlen(id, KV_REQ_ID_CHARS);
@@ -2261,6 +2271,11 @@ void kv_req_format(const kv_req_line *r, char *out, size_t cap) {
     kv_line_ms(&l, "ttft_ms", r->ttft_ms);
     kv_line_int(&l, "out", r->out);
     kv_line_word(&l, "finish", r->finish);
+    /* L424: the sampling knobs the request set, as sent; none set, nothing more (new fields go after these) */
+    if (r->has_temp) kv_line_put(&l, "temp", "%g", r->temp);
+    if (r->has_top_p) kv_line_asked(&l, "top_p", r->top_p, r->top_p_used);
+    if (r->has_top_k) kv_line_asked(&l, "top_k", r->top_k, (double)r->top_k_used);
+    if (r->has_min_p) kv_line_asked(&l, "min_p", r->min_p, r->min_p_used);
 }
 
 void server::kv_req_key(job *j) {
@@ -2280,6 +2295,17 @@ void server::kv_req_key(job *j) {
     r->pre = r->has_pre ? server_kv_token_hash(q->prompt.v, pre_end) : 0u;
     r->conv = server_kv_token_hash(q->prompt.v, server_prompt_conv_end(&q->prompt, &s->turn_markers));
     r->prompt = q->prompt.len;
+    r->has_temp = q->has_temperature;   /* L424: what the request asked the sampler for */
+    r->has_top_p = q->has_top_p;
+    r->has_top_k = q->has_top_k;
+    r->has_min_p = q->has_min_p;
+    r->temp = (double)q->temperature;
+    r->top_p = q->asked_top_p;
+    r->top_p_used = (double)q->top_p;
+    r->top_k = q->asked_top_k;
+    r->top_k_used = q->top_k;
+    r->min_p = q->asked_min_p;
+    r->min_p_used = (double)q->min_p;
     r->bank = r->best = r->common = r->score = r->anchor = r->frontier = r->prefilled = r->deep = -1;
     r->from = r->at = r->reused = r->prefilled_now = r->epcut = r->reply = r->evict = r->evict_tokens = -1;
     r->qwait_ms = r->prefill_ms = r->ttft_ms = -1.0;

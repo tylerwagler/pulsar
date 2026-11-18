@@ -11235,6 +11235,86 @@ static void test_l378_kv_req_line_format(void) {
     pthread_mutex_destroy(&s.mu);
 }
 
+/// L424: the tail of the `kv req:` line (what follows ` finish=x`) of a request that set the given sampling knobs.
+/// @param knobs  key/value pairs as a request body carries them, each value followed by a comma, NULL-terminated
+/// @param tail   receives the tail ("" when nothing follows finish)
+/// @param cap    bytes at `tail`
+static void l424_sampling_tail(const char *const *knobs, char *tail, size_t cap) {
+    server s;
+    memset(&s, 0, sizeof s);
+    job j;
+    memset(&j, 0, sizeof j);
+    TokId toks[] = {TokId{10}, TokId{11}};
+    j.req.prompt = {toks, 2, 2};
+    j.req.kind = REQ_CHAT;
+    for (int i = 0; knobs[i]; i += 2) {
+        const char *p = knobs[i + 1];
+        TEST_ASSERT(parse_sampling_key(knobs[i], &p, &j.req) == 1);
+    }
+    s.kv_req_key(&j);
+    j.kvr.finish = "x";
+    char line[KV_REQ_LINE_MAX];
+    kv_req_format(&j.kvr, line, sizeof line);
+    const char *f = strstr(line, " finish=x");
+    TEST_ASSERT(f && strlen(line) < 600);
+    snprintf(tail, cap, "%s", f ? f + strlen(" finish=x") : "?");
+}
+
+/* L424: the `kv req:` line ends with the sampling knobs the request itself set, as sent (the parse's replacement of
+ * an out-of-range value after `>`), and with nothing when it set none. */
+static void test_l424_kv_req_sampling(void) {
+    char tail[160];
+    /* nothing set: the line is what it was */
+    const char *const none[] = {NULL};
+    l424_sampling_tail(none, tail, sizeof tail);
+    TEST_ASSERT(!strcmp(tail, ""));
+    /* a seed is no sampling knob of the line */
+    const char *const seed[] = {"seed", "7,", NULL};
+    l424_sampling_tail(seed, tail, sizeof tail);
+    TEST_ASSERT(!strcmp(tail, ""));
+    /* temperature only */
+    const char *const temp[] = {"temperature", "0.7,", NULL};
+    l424_sampling_tail(temp, tail, sizeof tail);
+    TEST_ASSERT(!strcmp(tail, " temp=0.7"));
+    /* temperature 0 is a value, not an absence */
+    const char *const zero[] = {"temperature", "0,", NULL};
+    l424_sampling_tail(zero, tail, sizeof tail);
+    TEST_ASSERT(!strcmp(tail, " temp=0"));
+    /* the usual values print as written */
+    const char *const usual[] = {"0.2,", "0.7,", "1,", "1.0,", "1.5,", "2,", NULL};
+    const char *const usual_want[] = {" temp=0.2", " temp=0.7", " temp=1", " temp=1", " temp=1.5", " temp=2"};
+    for (int i = 0; usual[i]; i++) {
+        const char *const one[] = {"temperature", usual[i], NULL};
+        l424_sampling_tail(one, tail, sizeof tail);
+        TEST_ASSERT(!strcmp(tail, usual_want[i]));
+    }
+    /* all four, in the line's order whatever the body's */
+    const char *const all[] = {"min_p", "0.05,", "top_k", "40,", "top_p", "0.95,", "temperature", "1.5,", NULL};
+    l424_sampling_tail(all, tail, sizeof tail);
+    TEST_ASSERT(!strcmp(tail, " temp=1.5 top_p=0.95 top_k=40 min_p=0.05"));
+    /* an out-of-range top_p: as sent, then what runs */
+    const char *const top_p0[] = {"top_p", "0,", NULL};
+    l424_sampling_tail(top_p0, tail, sizeof tail);
+    TEST_ASSERT(!strcmp(tail, " top_p=0>1"));
+    const char *const top_p2[] = {"temperature", "0.2,", "top_p", "1.7,", NULL};
+    l424_sampling_tail(top_p2, tail, sizeof tail);
+    TEST_ASSERT(!strcmp(tail, " temp=0.2 top_p=1.7>1"));
+    /* the other two replacements */
+    const char *const others[] = {"top_k", "5000,", "min_p", "1.5,", NULL};
+    l424_sampling_tail(others, tail, sizeof tail);
+    TEST_ASSERT(!strcmp(tail, " top_k=5000>1024 min_p=1.5>0"));
+    const char *const neg[] = {"top_k", "-1,", "temperature", "-0.5,", NULL};
+    l424_sampling_tail(neg, tail, sizeof tail);
+    TEST_ASSERT(!strcmp(tail, " temp=-0.5 top_k=-1>0"));
+    const char *const frac[] = {"top_k", "40.9,", NULL};   /* top_k is read as an integer */
+    l424_sampling_tail(frac, tail, sizeof tail);
+    TEST_ASSERT(!strcmp(tail, " top_k=40.9>40"));
+    /* the widest values still leave no blank inside one */
+    const char *const wide[] = {"temperature", "1e30,", "top_p", "-1.5e300,", "min_p", "123456789.25,", NULL};
+    l424_sampling_tail(wide, tail, sizeof tail);
+    TEST_ASSERT(!strcmp(tail, " temp=1e+30 top_p=-1.5e+300>1 min_p=1.23457e+08>0"));
+}
+
 /* L378: the `kv ledger:` line prints the variables /metrics publishes (read under mu by server::kv_ledger_read),
  * every field, and is due once an hour. */
 static void test_l378_kv_ledger_line(void) {
@@ -18329,6 +18409,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l372_evict_snapshot_word();
     test_l378_token_hash_and_conversation_key();
     test_l378_kv_req_line_format();
+    test_l424_kv_req_sampling();
     test_l378_kv_ledger_line();
     test_l378_segstore_io_ledger();
     test_l379_request_does_not_evict_its_matched_bank();

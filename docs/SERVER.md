@@ -537,9 +537,11 @@ unserved. A request that never bound to a bank has `bank=-` and `-` in every fie
 | `ttft_ms` | acceptance to the first generated token |
 | `out` | tokens generated, every attempt |
 | `finish` | the turn's finish label (`stop`, `length`, `tool_calls`, `abandoned`, `error`, ...), or the server's word for an end that is no turn: `failed`, `busy`, `gone`, `conflict` (409), `stream-failed`, `refused-memory` (a 503 mid-prefill), and for a request that never bound `gone-queued`, `refused-context` (400), `refused-bank` (500), `refused-kv` (503) |
+| `temp`, `top_p`, `top_k`, `min_p` | after `finish`, and only the ones the request body itself set (`temperature`, `top_p`, `top_k`, `min_p`; the same on every endpoint): the value as it arrived, in `%g` form (`0`, `0.2`, `0.7`, `1`, `1.5`). When the server replaced an out-of-range value, the value that runs follows a `>`: `top_p=0>1`, `top_k=5000>1024`, `top_k=-1>0`, `min_p=1.5>0`. A knob the request left out has no field (not `-`), so a request that set none ends at `finish`, and the server's default applies. These are the request's values: the greedy draw on a tool call's structure is not shown. Fields added later go after these |
 
 ```text
 pulsar-server: kv req: id=4711 ep=messages class=subagent ro=1 sess=0123456789abcdef agent=agent_7 parent=- pre=00000000000000ab conv=fd1f0f4381eb0395 prompt=60812 bank=1 route=fresh best=0 common=60460 score=0 anchor=31104 frontier=60987 prefilled=60900 noresume=ckpt-above pick=disk from=disk at=31104 reused=31104 prefilled_now=29708 below=29356 epcut=1 reply=- evict=1 evict_tokens=69233 evict_conv=84c39a079fc08121 evict_ro=0 snapshot=none(read-only) qwait_ms=3 restore_ms=456 prefill_ms=37300 ttft_ms=38012 out=16 finish=stop
+pulsar-server: kv req: id=4712 ep=chat ... out=212 finish=stop temp=0.7 top_p=0>1
 ```
 
 ### The cumulative ledger: `pulsar-server: kv ledger:`

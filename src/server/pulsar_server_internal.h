@@ -1139,6 +1139,18 @@ typedef struct {
     double ttft_ms;      ///< acceptance to the first generated token (-1 = none)
     int out;             ///< tokens generated, every attempt
     const char *finish;  ///< how it ended (the turn's finish label, or the refusal's word; NULL = unknown)
+    /* L424: the sampling knobs the request itself set (request::has_*), as sent and as stored after the parse */
+    bool has_temp;       ///< the request set `temperature`
+    bool has_top_p;      ///< the request set `top_p`
+    bool has_top_k;      ///< the request set `top_k`
+    bool has_min_p;      ///< the request set `min_p`
+    double temp;         ///< `temperature` as sent (the parse never replaces it)
+    double top_p;        ///< `top_p` as sent
+    double top_p_used;   ///< `top_p` the request runs with (request::top_p)
+    double top_k;        ///< `top_k` as sent
+    int top_k_used;      ///< `top_k` the request runs with (request::top_k)
+    double min_p;        ///< `min_p` as sent
+    double min_p_used;   ///< `min_p` the request runs with (request::min_p)
 } kv_req_line;
 /// Room for one formatted `kv req:` line (kv_req_format)
 #define KV_REQ_LINE_MAX 1024
@@ -1158,6 +1170,8 @@ int server_prompt_preamble_end(const pulsar_tokens *prompt, const pulsar_turn_ma
  *          length when there is none (a completion, a template without markers) */
 int server_prompt_conv_end(const pulsar_tokens *prompt, const pulsar_turn_markers *m);
 /** Format one `kv req:` line (no prefix, no newline): every field, space-separated key=value, `-` for absent.
+ *  After `finish`, only for the sampling knobs the request set (L424): temp=, top_p=, top_k=, min_p=, each the value
+ *  as sent (%g), followed by `>` and the value that runs when the parse replaced it (`top_p=0>1`).
  *  @param r the line's facts  @param out receives it  @param cap bytes at `out` (KV_REQ_LINE_MAX holds any) */
 void kv_req_format(const kv_req_line *r, char *out, size_t cap);
 /** L378: say how a bound job ended, for its `kv req:` line: the turn's finish label, or the server's word for an end
@@ -1236,6 +1250,12 @@ typedef struct request {
     bool has_top_k;        ///< the client sent `top_k`
     bool has_top_p;        ///< the client sent `top_p`
     bool has_min_p;        ///< the client sent `min_p`
+    /** L424: the values as the client sent them, before the parse replaces an out-of-range one (top_p, min_p, top_k
+     * above hold what runs; temperature is never replaced).  Read only when the knob's has_ flag is set; the
+     * `kv req:` line prints them. */
+    double asked_top_p;    ///< `top_p` as sent
+    double asked_min_p;    ///< `min_p` as sent
+    double asked_top_k;    ///< `top_k` as sent (a number: json_int's reading of it is top_k)
     /** OpenAI logprobs (chat completions only).  `logprobs` alone reports the
      * chosen token's logprob; `top_logprobs` additionally asks for that many
      * alternatives per position and is rejected without logprobs:true, per the

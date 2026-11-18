@@ -193,6 +193,7 @@ int parse_sampling_key(const char *key, const char **p, request *r) {
     } else if (!strcmp(key, "top_p")) {
         double v = 0.0;
         if (!json_number(p, &v) || !isfinite(v)) return -1;
+        r->asked_top_p = v;   /* L424: as sent, for the `kv req:` line */
         /* The engine maps anything outside (0,1] to 1.0 (THE sampler, pulsar_cuda_sampler.cu).
          * Clamp here too so the stored request matches what will run, and say so
          * once: top_p=0 is a common near-greedy idiom that clients expect to
@@ -211,6 +212,7 @@ int parse_sampling_key(const char *key, const char **p, request *r) {
     } else if (!strcmp(key, "min_p")) {
         double v = 0.0;
         if (!json_number(p, &v) || !isfinite(v)) return -1;
+        r->asked_min_p = v;   /* L424: as sent, for the `kv req:` line */
         /* out-of-range disables the filter, matching the engine sampler
          * (pulsar_cuda_sampler.cu); an unvalidated min_p>1 collapses to greedy. */
         if (v < 0.0 || v > 1.0) {
@@ -225,7 +227,12 @@ int parse_sampling_key(const char *key, const char **p, request *r) {
         r->min_p = (float)v;
         r->has_min_p = true;
     } else if (!strcmp(key, "top_k")) {
-        if (!json_int(p, &r->top_k)) return -1;
+        /* L424: read as json_int reads it (a negative or NaN is 0, a fraction truncates, INT_MAX caps), keeping the
+         * number as sent for the `kv req:` line */
+        const char *q = *p;
+        double v = 0.0;
+        if (!json_number(&q, &v) || !json_int(p, &r->top_k)) return -1;
+        r->asked_top_k = v;
         /* Same range the engine enforces (>1024 -> 1024, <=0 -> 0). */
         if (r->top_k < 0 || r->top_k > 1024) {
             static bool warned = false;
