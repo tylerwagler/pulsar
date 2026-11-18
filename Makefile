@@ -1243,13 +1243,23 @@ QWEN_CALIB ?= $(call need_path,QWEN_CALIB)
 QWEN_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/families/qwen/qwen_chat.cpp src/families/qwen/qwen_output.cpp src/lib/out_parse_kit.cpp
 tests/qwen_chat_gate: tests/qwen_chat_gate.cpp tests/bpe_gate_util.h $(QWEN_CHAT_SRCS) src/lib/bpe_tokenizer.h \
                       src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/families/qwen/qwen_chat.h src/lib/out_parse_kit.h src/lib/md_code_scan.h src/lib/xml_call_body.h src/lib/pulsar_utf8.h src/lib/chat_refuse.h \
-                      src/lib/sha1.hpp Makefile
+                      src/lib/sha1.hpp tests/xml_call_body_ref.h Makefile
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/lib -o $@ tests/qwen_chat_gate.cpp $(QWEN_CHAT_SRCS)
 .PHONY: qwen-chat-gate
 qwen-chat-gate: tests/qwen_chat_gate
 	./tests/qwen_chat_gate --tok $(QWEN_TOK_DIR) --vectors tests/test-vectors/qwen38 \
 	    --cases $(QWEN_RENDER_CASES) --calib $(QWEN_CALIB)
 
+# L429: what the XML call body's parse costs while a call streams, the body before L429 (tests/xml_call_body_ref.h)
+# against the live one.  It prints; it does not grade.  No model, no tokenizer.
+XML_CALL_BENCH_SRCS = src/lib/pyjson.cpp src/families/qwen/qwen_output.cpp src/lib/out_parse_kit.cpp
+tests/xml_call_bench: tests/xml_call_bench.cpp tests/xml_call_body_ref.h $(XML_CALL_BENCH_SRCS) src/lib/pyjson.h \
+                      src/families/qwen/qwen_chat.h src/lib/out_parse_kit.h src/lib/md_code_scan.h src/lib/xml_call_body.h \
+                      src/lib/pulsar_utf8.h Makefile
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/lib -o $@ tests/xml_call_bench.cpp $(XML_CALL_BENCH_SRCS)
+.PHONY: xml-call-bench
+xml-call-bench: tests/xml_call_bench
+	./tests/xml_call_bench
 
 # L296 N8: the Nemotron-H frontend -- the shared BPE engine in its HF "tekken" configuration (no normaliser,
 # ignore_merges) graded against HF tokenizers, the ChatML + <think> renderer against the checkpoint's

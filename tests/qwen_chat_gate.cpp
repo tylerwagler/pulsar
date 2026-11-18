@@ -17,6 +17,9 @@
  *                                 re-rendered: byte-identical; any chunking gives the same
  *                                 events   (--cases)
  *   P2 output parser units        malformed / truncated / split-marker outputs
+ *   P3 call body differential     L429: the XML call body against its pre-L429 reading (xml_call_body_ref.h) on
+ *                                 random call bodies, well-formed and broken, under many chunkings: the same
+ *                                 events and in_payload() answer at every feed, the same result
  *   E1 effort resolution          the API's effort / thinking fields -> the template's efforts
  *   C1 turn-by-turn composition   head + turns + sampled turns + closes == the full render: text and ids
  *
@@ -32,8 +35,11 @@
 #include <string>
 #include <vector>
 
+#include <memory>
+
 #include "bpe_gate_util.h"
 #include "../src/families/qwen/qwen_chat.h"
+#include "xml_call_body_ref.h"
 
 /* T3's context for one codepoint c (tests/qwen/gen_qwen_goldens.py sweep_text) */
 static std::string qwen_sweep_context(const std::string &c) { return "x" + c + c + c + " " + c + "1'" + c + "\n"; }
@@ -613,6 +619,312 @@ static void p2_units(void) {
     printf("P2 output parser units: %zu outputs x 2 chunkings, %d mismatched\n", sizeof units / sizeof units[0], bad);
 }
 
+/* ---- P3 (L429): the XML call body against its reading before L429 -------------------------------------------
+ * L429 made the body's per-feed readings resume where the last feed stopped.  That must change nothing a caller
+ * can see: the kit is run twice over the same bytes in the same chunks, once around the live body and once around
+ * the body as it was (tests/xml_call_body_ref.h, which rereads the open parameter from its start at every feed),
+ * and after EVERY feed the two must have produced the same events (kind, index, name, text, arguments) and give the
+ * same in_payload() -- the sampling decision for the next byte -- and at the end the same calls, text, error
+ * count and raw span.  The bodies are random: 0-6 parameters of string / JSON / python-scalar values built from
+ * fragments that spell closers, their prefixes, other markers, backticks, newlines and multi-byte UTF-8; empty and
+ * very long values; both scalar spellings; and broken ones (cuts, deletions, insertions, a key with a newline, a
+ * key or a name that never ends, text between parameters, long whitespace runs). */
+
+namespace {
+
+/// P3's generator (the gate's LCG: a fixed seed, the same bodies on every run).
+struct p3_rng {
+    unsigned s;   ///< the state
+    /// @return the next 15 bits
+    unsigned next() {
+        s = s * 1103515245u + 12345u;
+        return (s >> 16) & 0x7fff;
+    }
+    /// @param n a bound (> 0)
+    /// @return a value in [0, n)
+    unsigned below(unsigned n) { return next() % n; }
+    /// @param n the odds
+    /// @return true once in `n`
+    bool one_in(unsigned n) { return below(n) == 0; }
+};
+
+/// What a value's text is built from: text, the body's own markup and its prefixes, the kit's markers, quotes.
+const char *const kP3Frag[] = {
+    "a", "word ", "x = 1;", "\n", "\n\n", " ", "\t", "\r\n", "<", "</", "</p", "</param", "</parameter", "<parameter",
+    "<parameter=", "<parameter=k>", "</tool_call>", "</tool_call>", "<tool_call>", "</tool_cal", "</function>",
+    "</functio", "<function=g>", "`", "```", "```xml\n", "\"", "\\", "\\\"", ">", "=", "\xc3\xa9",
+    "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e", "\xf0\x9f\x98\x80", "\xe6\x97", "{", "}", "[1, 2]", "true", "None", "</think>",
+    "{\"k\": \"v\"}", "0", "-1.5",
+};
+
+/// @param r    the generator
+/// @param n    how many fragments
+/// @return their concatenation
+std::string p3_text(p3_rng *r, unsigned n) {
+    std::string t;
+    for (unsigned i = 0; i < n; i++) t += kP3Frag[r->below(sizeof kP3Frag / sizeof kP3Frag[0])];
+    return t;
+}
+
+/// @param r     the generator
+/// @param depth nesting left
+/// @return a random JSON value (its strings from the fragments)
+pyjson_value p3_json(p3_rng *r, int depth) {
+    pyjson_value v;
+    switch (r->below(depth > 0 ? 7 : 5)) {
+    case 0: break;   /* null */
+    case 1: v.kind = pyjson_value::BOOL; v.b = r->one_in(2); break;
+    case 2: {
+        const std::string num = std::to_string((int)r->below(2000) - 1000);
+        char jerr[8];
+        pyjson_parse(num.data(), num.size(), &v, jerr, sizeof jerr);
+        break;
+    }
+    case 3:
+    case 4: v.kind = pyjson_value::STR; v.s = p3_text(r, r->below(6)); break;
+    case 5:
+        v.kind = pyjson_value::ARR;
+        for (unsigned i = r->below(4); i > 0; i--) v.a.push_back(p3_json(r, depth - 1));
+        break;
+    default:
+        v.kind = pyjson_value::OBJ;
+        for (unsigned i = r->below(4); i > 0; i--) v.o.emplace_back(p3_text(r, 1 + r->below(2)), p3_json(r, depth - 1));
+        break;
+    }
+    return v;
+}
+
+/// @param r the generator
+/// @return one parameter value's text as a template would have written it (or would not)
+std::string p3_value(p3_rng *r) {
+    const unsigned kind = r->below(100);
+    if (kind < 8) return "";
+    if (kind < 50) return p3_text(r, 1 + r->below(12));
+    if (kind < 52) {   /* a very long string: the case L429 is about */
+        std::string t;
+        const size_t want = 2000 + r->below(8000);
+        while (t.size() < want) t += r->one_in(4) ? p3_text(r, 3) : "    the quick brown fox(jumps < over) the lazy dog;\n";
+        return t;
+    }
+    if (kind < 55) return p3_text(r, 2) + "</parameter>" + p3_text(r, 2);   /* the value ends early: a broken call */
+    if (kind < 66) {
+        static const char *const scalars[] = {"True", "False", "None", "true", "false", "null", "12", "-3.5", "1e3", "007"};
+        return scalars[r->below(sizeof scalars / sizeof scalars[0])];
+    }
+    std::string d;
+    pyjson_dump(p3_json(r, 3), &d);
+    if (r->one_in(8)) d.insert(r->below((unsigned)d.size() + 1), r->one_in(2) ? " " : "\"");   /* not tojson's spelling */
+    return d;
+}
+
+/// @param r the generator
+/// @return one turn's sampled bytes: text, one or two calls, sometimes text after -- sometimes broken
+std::string p3_stream(p3_rng *r) {
+    static const char *const keys[] = {"s", "n", "o", "a", "b", "u", "x", "s"};
+    std::string out;
+    if (r->one_in(3)) out += p3_text(r, r->below(4)) + (r->one_in(2) ? "\n\n" : "");
+    for (unsigned c = r->one_in(5) ? 2 : 1; c > 0; c--) {
+        out += "<tool_call>";
+        switch (r->below(40)) {   /* before the call's name */
+        case 0: break;
+        case 1: out += std::string(1 + r->below(1500), r->one_in(2) ? ' ' : '\n'); break;
+        case 2: out += "text\n"; break;
+        default: out += "\n"; break;
+        }
+        switch (r->below(40)) {   /* the name */
+        case 0: out += "<function=f\n>"; break;
+        case 1: out += "<function=" + std::string(1 + r->below(1500), 'f') + (r->one_in(2) ? ">" : ""); break;
+        case 2: out += "<function=<parameter=s>"; break;
+        case 3: out += "<function"; break;
+        default: out += r->one_in(5) ? "<function=g>" : "<function=f>"; break;
+        }
+        out += r->one_in(20) ? "" : "\n";
+        for (unsigned n = r->below(7); n > 0; n--) {
+            out += "<parameter=";
+            switch (r->below(50)) {   /* the key */
+            case 0: out += "s\nx"; break;
+            case 1: out += std::string(1 + r->below(1500), 'k') + (r->one_in(2) ? "" : "\n"); break;
+            case 2: break;
+            default: out += keys[r->below(sizeof keys / sizeof keys[0])]; break;
+            }
+            out += ">";
+            const unsigned wrap = r->below(20);   /* the template's newlines around the value, mostly */
+            out += wrap == 0 || wrap == 1 ? "" : "\n";
+            out += p3_value(r);
+            out += wrap == 1 || wrap == 2 ? "" : "\n";
+            out += r->one_in(40) ? "</parameter" : "</parameter>";
+            switch (r->below(30)) {   /* between parameters */
+            case 0: break;
+            case 1: out += "  \n\t\r\n"; break;
+            case 2: out += std::string(1 + r->below(1500), '\n'); break;
+            case 3: out += "junk\n"; break;
+            default: out += "\n"; break;
+            }
+        }
+        out += r->one_in(30) ? "" : "</function>";
+        out += r->one_in(20) ? (r->one_in(2) ? "" : " text\n") : "\n";
+        if (!r->one_in(30)) out += "</tool_call>";
+        if (c > 1) out += r->one_in(2) ? "\n" : "";
+    }
+    if (r->one_in(6)) out += p3_text(r, 1 + r->below(4));
+    for (unsigned m = r->one_in(4) ? 1 + r->below(2) : 0; m > 0 && !out.empty(); m--) {   /* break it */
+        const size_t at = r->below((unsigned)out.size());
+        switch (r->below(3)) {
+        case 0: out.resize(at); break;
+        case 1: out.erase(at, 1 + r->below(20)); break;
+        default: out.insert(at, p3_text(r, 1)); break;
+        }
+    }
+    return out;
+}
+
+/// What one P3 run counted (proof the generator reached the cases).
+struct p3_stats {
+    long feeds = 0;      ///< feeds compared
+    long payload = 0;    ///< feeds after which in_payload() was true
+    long begins = 0;     ///< TOOL_BEGIN events
+    long fragments = 0;  ///< TOOL_ARGS events
+    long ends = 0;       ///< TOOL_END events
+    long errors = 0;     ///< ERROR events
+};
+
+/// @param a one parser's events of a feed
+/// @param b the other's
+/// @return true when they are the same events
+bool p3_same_events(const std::vector<out_event> &a, const std::vector<out_event> &b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); i++)
+        if (a[i].kind != b[i].kind || a[i].index != b[i].index || a[i].name != b[i].name || a[i].text != b[i].text ||
+            a[i].arguments != b[i].arguments)
+            return false;
+    return true;
+}
+
+/* One stream under one chunking through the live body and the reference: "" when every feed agrees, else where
+ * they part.  `clone_at` >= 0: both parsers are replaced by their clone() before that feed (the server's probe
+ * copies a reading; the copy must go on as the original would). */
+/// @param out      the turn's bytes
+/// @param cuts     where the feeds split it (ascending, inside the stream)
+/// @param tools    the tools array as JSON text
+/// @param python   the body's scalar spelling
+/// @param clone_at the feed before which both parsers continue as clones, or -1
+/// @param st       receives the counts
+/// @return "" or the first difference
+std::string p3_compare(const std::string &out, const std::vector<size_t> &cuts, const char *tools, bool python,
+                       int clone_at, p3_stats *st) {
+    auto *live0 = new call_body_parser<xml_call_body>();
+    auto *ref0 = new call_body_parser<xml_call_body_ref>();
+    std::unique_ptr<out_parser> live(live0), ref(ref0);
+    if (!live0->start(qwen_output_grammar(false), tools, python, OUT_CONTENT) ||
+        !ref0->start(qwen_output_grammar(false), tools, python, OUT_CONTENT))
+        return "the tools did not parse";
+    std::vector<out_event> el, er;
+    size_t at = 0;
+    for (size_t k = 0; k <= cuts.size(); k++) {
+        const size_t end = k < cuts.size() ? cuts[k] : out.size();
+        if ((int)k == clone_at) {
+            live.reset(live->clone());
+            ref.reset(ref->clone());
+        }
+        el.clear();
+        er.clear();
+        live->feed(out.data() + at, end - at, &el);
+        ref->feed(out.data() + at, end - at, &er);
+        st->feeds++;
+        st->payload += live->in_payload();
+        for (const out_event &e : el) {
+            st->begins += e.kind == out_event::TOOL_BEGIN;
+            st->fragments += e.kind == out_event::TOOL_ARGS;
+            st->ends += e.kind == out_event::TOOL_END;
+            st->errors += e.kind == out_event::ERROR;
+        }
+        if (!p3_same_events(el, er)) return "events differ after the feed ending at byte " + std::to_string(end);
+        if (live->in_payload() != ref->in_payload() || live->in_tool_call() != ref->in_tool_call())
+            return "in_payload() differs after the feed ending at byte " + std::to_string(end);
+        at = end;
+    }
+    el.clear();
+    er.clear();
+    live->finish(&el);
+    ref->finish(&er);
+    for (const out_event &e : el) st->errors += e.kind == out_event::ERROR;
+    if (!p3_same_events(el, er)) return "the finish's events differ";
+    if (live->content() != ref->content() || live->reasoning() != ref->reasoning() || live->errors() != ref->errors() ||
+        live->calls().size() != ref->calls().size() || live->first_call_at() != ref->first_call_at())
+        return "the result differs";
+    for (size_t i = 0; i < live->calls().size(); i++)
+        if (live->calls()[i].name != ref->calls()[i].name || live->calls()[i].arguments != ref->calls()[i].arguments)
+            return "call " + std::to_string(i) + " differs";
+    size_t llo = 0, lhi = 0, rlo = 0, rhi = 0;
+    if (live->raw_span(&llo, &lhi) != ref->raw_span(&rlo, &rhi) || llo != rlo || lhi != rhi) return "the raw span differs";
+    return "";
+}
+
+}  // namespace
+
+static void p3_call_body_differential(void) {
+    const char *tools =
+        R"([{"type": "function", "function": {"name": "f", "parameters": {"type": "object", "properties": )"
+        R"({"s": {"type": "string"}, "n": {"type": "integer"}, "o": {"type": "object"}, "a": {"type": "array"}, )"
+        R"("b": {"type": "boolean"}, "u": {"type": ["string", "null"]}}}}}])";
+    static const char *const markers[] = {"<tool_call>", "</tool_call>", "<function=", "</function>", "<parameter=",
+                                          "</parameter>"};
+    const int kBodies = 3000;
+    p3_rng r = {429};
+    p3_stats st;
+    int streams = 0, readings = 0, bad = 0;
+    size_t bytes = 0, longest = 0;
+    for (int b = 0; b < kBodies && bad < 10; b++, streams++) {
+        const bool python = b & 1;
+        const std::string out = p3_stream(&r);
+        bytes += out.size();
+        longest = std::max(longest, out.size());
+        std::vector<std::vector<size_t>> chunkings;
+        chunkings.push_back({});   /* whole */
+        chunkings.emplace_back();   /* byte by byte */
+        for (size_t k = 1; k < out.size(); k++) chunkings.back().push_back(k);
+        for (unsigned step : {5u, 23u, 300u}) {   /* random pieces */
+            chunkings.emplace_back();
+            for (size_t k = 0; k < out.size();) {
+                k += 1 + r.below(step);
+                if (k < out.size()) chunkings.back().push_back(k);
+            }
+        }
+        /* every marker of the stream split at offset k (k = 0: fed apart from what precedes it), for every k */
+        std::vector<std::pair<size_t, size_t>> found;   /* (start, length) */
+        for (const char *m : markers)
+            for (size_t p = out.find(m); p != std::string::npos; p = out.find(m, p + 1)) found.emplace_back(p, strlen(m));
+        std::sort(found.begin(), found.end());
+        for (size_t k = 0; k <= 12 && !found.empty(); k++) {
+            std::vector<size_t> cuts;
+            for (const auto &f : found)
+                if (k <= f.second && f.first + k > 0 && f.first + k < out.size()) cuts.push_back(f.first + k);
+            std::sort(cuts.begin(), cuts.end());
+            cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
+            chunkings.push_back(std::move(cuts));
+        }
+        for (size_t c = 0; c < chunkings.size() && bad < 10; c++) {
+            /* a random-pieces reading continues as a clone from a random feed, every other body */
+            const int clone_at = c == 2 && (b & 2) ? (int)r.below((unsigned)chunkings[c].size() + 1) : -1;
+            const std::string diff = p3_compare(out, chunkings[c], tools, python, clone_at, &st);
+            readings++;
+            g_checks++;
+            if (!diff.empty()) {
+                bad++;
+                fail("P3 body %d chunking %zu: %s; the stream: %.600s", b, c, diff.c_str(), out.c_str());
+            }
+        }
+    }
+    printf("P3 call body vs its pre-L429 reading: %d random streams (%zu bytes, longest %zu), %d readings, %ld feeds "
+           "(in_payload after %ld); %ld calls announced, %ld argument fragments, %ld calls closed, %ld errors; %d "
+           "mismatched\n", streams, bytes, longest, readings, st.feeds, st.payload, st.begins, st.fragments, st.ends,
+           st.errors, bad);
+    /* the generator must reach both outcomes and the payload, or the comparison proves little */
+    CHECK(bad || (st.ends > kBodies / 4 && st.errors > kBodies / 4 && st.payload > st.feeds / 20 &&
+                  st.fragments > st.ends),
+          "P3: the random streams do not cover closed calls, errors and payload");
+}
+
 static void e1_effort(void) {
     struct { const char *name; int thinking; bool ok; qwen_effort want; } u[] = {
         {NULL, -1, true, QWEN_EFFORT_XHIGH}, {NULL, 1, true, QWEN_EFFORT_XHIGH}, {NULL, 0, true, QWEN_EFFORT_NONE},
@@ -812,6 +1124,7 @@ int main(int argc, char **argv) {
         printf("R2 render corpus / P1 parser round trip: SKIPPED (no --cases)\n");
     }
     p2_units();
+    p3_call_body_differential();
     e1_effort();
     c1_composition(t);
     bpe_tokenizer_free(t);
