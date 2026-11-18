@@ -326,6 +326,7 @@ const server_grammar_shape k_grammar_inkling = {
     /* .repeat                = */ false,
     /* .block_tail            = */ "",
     /* .dictsort_keys         = */ false,
+    /* .call_quotable         = */ true,
 };
 
 }  // namespace

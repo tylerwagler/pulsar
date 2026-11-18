@@ -4274,6 +4274,165 @@ static void test_l303_shapes_accept_rendered_calls(void) {
     l303_server_free(&srv);
 }
 
+/* L419: a call trigger quoted in Markdown code -- an inline span, a fenced block -- is text to the family's output
+ * parser, and the gate opens no call region there: the two read the same scanner (md_code_scan.h) over the same
+ * bytes.  Shown per family on fixed turns, then on random prose around the trigger, where after every byte the gate
+ * is inside a call region exactly when the parser is inside a call -- across the reasoning close, a reasoning block
+ * the turn opens itself (Gemma 4), calls that complete, and a rolled-back draft walk.  DeepSeek's parser is not the
+ * kit and reads every trigger as a call; its shape says so (call_quotable false) and the gate opens the region. */
+static void test_l419_gate_and_parser_agree_on_quoted_calls(void) {
+    l303_vocab v;
+    server srv;
+    l303_server(&srv, v);
+    static const char kTools[] = "[{\"type\":\"function\",\"function\":{\"name\":\"now\",\"parameters\":{\"type\":"
+                                 "\"object\",\"properties\":{}}}}]";
+    struct fam {
+        pulsar_chat_format fmt;
+        const char *before;    /* the turn up to its free text */
+        const char *trigger;   /* the call opener */
+        const char *rest;      /* the rest of a call to now() */
+        std::vector<const char *> extra;   /* family markers the random prose may spell */
+    };
+    const fam fams[] = {
+        /* Qwen's random turns start inside the reasoning half the time: no reader opens a call there */
+        {PULSAR_CHAT_QWEN, "plan</think>", "<tool_call>", "\n<function=now>\n</function>\n</tool_call>",
+         {"</think>", "<think>"}},
+        /* Nemotron's parser opens a call from the reasoning, the gate does not follow one there (before L419 too):
+         * its turns start past the close */
+        {PULSAR_CHAT_NEMOTRON_H, "plan</think>", "<tool_call>", "\n<function=now>\n</function>\n</tool_call>", {}},
+        {PULSAR_CHAT_GEMMA4, "", "<|tool_call>", "call:now{}<tool_call|>", {"<|channel>", "<channel|>", "<tool_call|>"}},
+    };
+    auto parser_of = [&](const fam &f, bool thinking) -> out_parser * {
+        char err[160];
+        if (f.fmt == PULSAR_CHAT_QWEN) {
+            auto *p = new qwen_output_parser();
+            TEST_ASSERT(p->init(thinking, kTools, err, sizeof err));
+            return p;
+        }
+        if (f.fmt == PULSAR_CHAT_NEMOTRON_H) {
+            auto *p = new nemotron_output_parser();
+            TEST_ASSERT(p->init(thinking, kTools, err, sizeof err));
+            return p;
+        }
+        auto *p = new gemma4_output_parser();
+        TEST_ASSERT(p->init(thinking, kTools, err, sizeof err));
+        return p;
+    };
+    /* feed both readers `text`; false at the first byte where they part (or the gate refuses a byte) */
+    auto feed_both = [&](gen_state *g, out_parser *p, const std::string &text) {
+        std::vector<out_event> ev;
+        for (size_t i = 0; i < text.size(); i++) {
+            const int tok = (uint8_t)text[i];
+            if (!l303_allows(&srv, g, tok) || !gen_constrain_accept(&srv, g, tok)) return false;
+            p->feed(&text[i], 1, &ev);
+            if (gen_constrain_live(g) != p->in_tool_call()) return false;
+        }
+        return true;
+    };
+    unsigned rng = 419;
+    auto pick = [&](unsigned n) {
+        rng = rng * 1103515245u + 12345u;
+        return (rng >> 16) % n;
+    };
+    for (const fam &f : fams) {
+        job j;
+        memset(&j, 0, sizeof j);
+        char err[300];
+        TEST_ASSERT(l303_request(&srv, f.fmt, API_OPENAI, L303_BODY(""), &j.req, err, sizeof err));
+        TEST_ASSERT(j.req.constrain != NULL);
+        const std::string T = f.trigger, call = T + f.rest;
+        struct turn {
+            std::string text;
+            int calls;   /* the calls both readers must read */
+        };
+        const turn fixed[] = {
+            {"Wrap it in `" + T + "` tags.\n\n" + call, 1},
+            {"Like this:\n```\n" + call + "\n```\nNow for real.\n" + call, 1},
+            {"~~~\n" + T + "\nnever closed\n", 0},
+            {"Press the ` key.\n" + call, 1},
+            {"Either ``" + T + "`` or `` a ` " + T + " `` works.\n" + call, 1},
+            {"```\nls\n```" + call + "\n`" + T + "`", 1},
+            {call + call, 2},
+        };
+        for (const turn &t : fixed) {
+            gen_state g;
+            TEST_ASSERT(l303_begin(&srv, &j, &g));
+            out_parser *p = parser_of(f, g.thinking.inside);
+            const bool same = feed_both(&g, p, f.before + t.text);
+            if (!same) fprintf(stderr, "l419 gate %d: readers part on \"%s\"\n", (int)f.fmt, t.text.c_str());
+            TEST_ASSERT(same);
+            std::vector<out_event> ev;
+            p->finish(&ev);
+            TEST_ASSERT((int)p->calls().size() == t.calls && p->errors() == 0);
+            delete p;
+            gen_constrain_end(&g);
+            buf_free(&g.text);
+        }
+        /* random prose: Markdown's pieces, the family's markers and the trigger; a trigger both read as a call is
+         * followed by the rest of one */
+        std::vector<std::string> pieces = {"`", "`", "``", "```", "```", "~~~", "\n", "\n", "\n\n", " ", "   ", "\t", "x",
+                                           "a b", "> ", "- ", "```js", "<"};
+        for (const char *m : f.extra) pieces.push_back(m);
+        int quoted = 0, called = 0;
+        for (int it = 0; it < 400; it++) {
+            gen_state g;
+            TEST_ASSERT(l303_begin(&srv, &j, &g));
+            out_parser *p = parser_of(f, g.thinking.inside);
+            const std::string before = f.fmt == PULSAR_CHAT_QWEN && pick(2) ? "" : f.before;
+            bool same = feed_both(&g, p, before);
+            std::string said = before;
+            for (int k = 0, n = 4 + (int)pick(24); same && k < n; k++) {
+                if (pick(4) == 0) {
+                    same = feed_both(&g, p, T);
+                    said += T;
+                    if (same && p->in_tool_call()) {
+                        same = feed_both(&g, p, f.rest);
+                        said += f.rest;
+                        called++;
+                    } else {
+                        quoted++;
+                    }
+                    continue;
+                }
+                if (pick(6) == 0) {
+                    /* a draft walk the gate rolls back leaves it where it was */
+                    const TokId drafts[3] = {TokId{(int)'\n'}, TokId{(int)'`'}, TokId{(int)'<'}};
+                    TEST_ASSERT(gen_constrain_draft_prefix(&srv, &g, TokId{(int)'`'}, drafts, 3) >= 0);
+                }
+                const std::string &piece = pieces[pick((unsigned)pieces.size())];
+                same = feed_both(&g, p, piece);
+                said += piece;
+            }
+            if (!same) {
+                std::string shown;
+                pyjson_dump_string(said.data(), said.size(), &shown);
+                fprintf(stderr, "l419 gate %d: readers part after %s\n", (int)f.fmt, shown.c_str());
+            }
+            TEST_ASSERT(same);
+            delete p;
+            gen_constrain_end(&g);
+            buf_free(&g.text);
+            if (!same) break;
+        }
+        TEST_ASSERT(quoted > 50 && called > 50);   /* the walk reaches both readings */
+        request_free(&j.req);
+    }
+    /* DeepSeek: the quoted trigger opens the region, as its own parser reads a call there */
+    {
+        job j;
+        memset(&j, 0, sizeof j);
+        char err[300];
+        TEST_ASSERT(l303_request(&srv, PULSAR_CHAT_DS4_V41, API_OPENAI, L303_BODY(""), &j.req, err, sizeof err));
+        gen_state g;
+        TEST_ASSERT(l303_begin(&srv, &j, &g));
+        const std::string text = "plan</think>The block opens with `" PULSAR_TOOL_CALLS_START;
+        TEST_ASSERT(l303_feed(&srv, &g, text) == text.size());
+        TEST_ASSERT(gen_constrain_live(&g));
+        l303_end(&j, &g);
+    }
+    l303_server_free(&srv);
+}
+
 /* L303 (L272's case): a forced call is the call grammar from the family's seed on -- an unnamed one may only name
  * a declared tool, and its arguments follow the tool's schema; a named one starts at its arguments. */
 static void test_l303_forced_call_grammar(void) {
@@ -17741,6 +17900,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_qwen_forced_call_prefill_and_seed();
     test_forced_call_names_a_declared_tool();
     test_l303_shapes_accept_rendered_calls();
+    test_l419_gate_and_parser_agree_on_quoted_calls();
     test_l303_forced_call_grammar();
     test_l303_response_format_answer();
     test_l396_gemma_call_key_order();

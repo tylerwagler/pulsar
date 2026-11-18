@@ -1220,7 +1220,7 @@ QWEN_RENDER_CASES ?= $(call need_path,QWEN_RENDER_CASES)
 QWEN_CALIB ?= $(call need_path,QWEN_CALIB)
 QWEN_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/families/qwen/qwen_chat.cpp src/families/qwen/qwen_output.cpp src/lib/out_parse_kit.cpp
 tests/qwen_chat_gate: tests/qwen_chat_gate.cpp tests/bpe_gate_util.h $(QWEN_CHAT_SRCS) src/lib/bpe_tokenizer.h \
-                      src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/families/qwen/qwen_chat.h src/lib/out_parse_kit.h src/lib/xml_call_body.h src/lib/pulsar_utf8.h src/lib/chat_refuse.h \
+                      src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/families/qwen/qwen_chat.h src/lib/out_parse_kit.h src/lib/md_code_scan.h src/lib/xml_call_body.h src/lib/pulsar_utf8.h src/lib/chat_refuse.h \
                       src/lib/sha1.hpp Makefile
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/lib -o $@ tests/qwen_chat_gate.cpp $(QWEN_CHAT_SRCS)
 .PHONY: qwen-chat-gate
@@ -1239,7 +1239,7 @@ NEMOTRON_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/families/n
                      src/lib/out_parse_kit.cpp
 tests/nemotron_chat_gate: tests/nemotron_chat_gate.cpp tests/bpe_gate_util.h $(NEMOTRON_CHAT_SRCS) src/lib/bpe_tokenizer.h \
                           src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/families/nemotron_h/nemotron_chat.h src/lib/xml_call_body.h \
-                          src/lib/out_parse_kit.h src/lib/pulsar_utf8.h src/lib/chat_refuse.h src/lib/sha1.hpp Makefile
+                          src/lib/out_parse_kit.h src/lib/md_code_scan.h src/lib/pulsar_utf8.h src/lib/chat_refuse.h src/lib/sha1.hpp Makefile
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/lib -o $@ tests/nemotron_chat_gate.cpp $(NEMOTRON_CHAT_SRCS)
 .PHONY: nemotron-chat-gate
 nemotron-chat-gate: tests/nemotron_chat_gate
@@ -1268,7 +1268,7 @@ GEMMA4_TOK_DIR ?= $(call need_path,GEMMA4_TOK_DIR)
 GEMMA4_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/families/gemma4/gemma4_chat.cpp src/families/gemma4/gemma4_output.cpp \
                    src/lib/chat_render_kit.cpp src/lib/out_parse_kit.cpp
 tests/gemma4_chat_gate: tests/gemma4_chat_gate.cpp tests/bpe_gate_util.h $(GEMMA4_CHAT_SRCS) src/lib/bpe_tokenizer.h \
-                        src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/families/gemma4/gemma4_chat.h src/lib/chat_render_kit.h src/lib/out_parse_kit.h \
+                        src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/families/gemma4/gemma4_chat.h src/lib/chat_render_kit.h src/lib/out_parse_kit.h src/lib/md_code_scan.h \
                         src/lib/chat_refuse.h src/lib/pulsar_utf8.h src/lib/sha1.hpp Makefile
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/lib -o $@ tests/gemma4_chat_gate.cpp $(GEMMA4_CHAT_SRCS)
 .PHONY: gemma4-chat-gate

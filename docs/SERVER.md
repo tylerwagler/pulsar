@@ -184,6 +184,18 @@ on the protocol's reasoning channel and never as visible content, even when
 generation stops inside an unterminated think block. Tool calls stream as the
 parser recognises them: the header first, then argument deltas.
 
+Tool-call markup the model quotes in Markdown code is text, not a call (Qwen,
+Nemotron-H, Gemma 4 and Inkling: the output-parser kit; DeepSeek's DSML parser
+reads every block as a call). A call opener inside an inline code span (a run
+of backticks closed by a run of the same length on the same line) or inside a
+fenced block (three or more backticks or tildes starting a line, closed by a
+line that is only a run at least as long) stays in the content, or in the
+reasoning for a family that can open a call from there, and the real call after
+it is read. A span never crosses a line, so a stray backtick quotes nothing
+past its own line; a fence that is never closed quotes to the end of that
+content. Strict and forced tool grammars follow the same rule: a quoted opener
+opens no constrained call region (`src/lib/md_code_scan.h`).
+
 Endpoint specifics:
 
 - **Chat Completions:**

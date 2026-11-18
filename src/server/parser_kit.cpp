@@ -237,9 +237,9 @@ bool parser_kit_finish(void *st, server *s, session_slot *sl, gen_state *g, serv
         if (raw_hi > g->text.len || raw_lo >= raw_hi) pulsar_die("output parser: raw span outside the turn's text");
         out->calls.raw_calls = server_xstrndup(g->text.ptr + raw_lo, raw_hi - raw_lo);
     }
-    /* as text, the stream stopped at the call: the rest goes out at the finish */
-    const char *t = g->text.ptr ? g->text.ptr : "";
-    const char *call = strstr(t, p.grammar().call_open);
+    /* as text, the stream stopped at the first call's marker: the rest goes out at the finish.  The parser says
+     * where that was (L419: a marker quoted in Markdown code before it was text, and streamed as text) */
+    const size_t call = p.first_call_at();
     return parser_finish_turn(s, sl, g, out, p.errors() > 0 || q->undeclared > 0, q->last_error.c_str(),
-                              /*logged=*/true, call ? (size_t)(call - t) : SIZE_MAX, ok);
+                              /*logged=*/true, call == std::string::npos ? SIZE_MAX : call, ok);
 }

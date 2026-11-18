@@ -15,6 +15,12 @@
  * The machine (vLLM's ParserEngine shape: vllm/parser/engine/parser_engine_config.py):
  *   - in each state only the markers with a transition FROM that state are structure; any other text,
  *     another family's marker spelling included, is the state's text;
+ *   - L419: a marker that would open a call from CONTENT or REASONING is that state's text when it lies inside
+ *     Markdown code -- an inline span or a fenced block of the section's text so far (md_code_scan.h has the
+ *     rules) -- for a model explaining tool calls quotes its own markup; a real call is written outside code by
+ *     every template.  So is a marker whose transition says OUT_ACT_CODE_TEXT (the stray closer of such a quoted
+ *     call).  Every other marker reads as before, quoted or not (a quoted think close still closes the reasoning:
+ *     the templates split a replayed turn on it);
  *   - a marker split across feeds waits (the held bytes are text if the turn ends there);
  *   - CONTENT and REASONING report text under their section policy; HEADER (a message header -- the name
  *     between a role marker and a content-kind marker) buffers its text, which a transition either drops or
@@ -30,6 +36,8 @@
 
 #include <string>
 #include <vector>
+
+#include "md_code_scan.h"
 
 /** One thing the parser recognised. */
 struct out_event {
@@ -90,6 +98,10 @@ enum out_text_policy {
 /** A transition's extra action. */
 enum : uint32_t {
     OUT_ACT_HEADER_TEXT = 1u,   ///< leaving HEADER: its buffered text is content (else it is dropped)
+    /** L419: inside Markdown code (md_code_scan) the marker is its state's text and the transition is not taken.
+     *  For a CONTENT or REASONING edge that only drops a stray call closer: quoted with its call, it stays in the
+     *  quotation.  (An edge INTO OUT_CALL from those states has the rule without the bit.) */
+    OUT_ACT_CODE_TEXT = 2u,
 };
 
 /// One edge of an out_grammar's state machine: in state `from`, marker `marker` moves the reading to `to`.
@@ -114,8 +126,7 @@ struct out_grammar {
     out_text_policy reasoning;
     /// How OUT_CONTENT text (and HEADER text sent as content) is reported.
     out_text_policy content;
-    /** The marker that opens a call, as the diagnostics name it ("the turn ended inside <tool_call>") and as
-     *  the server finds where a turn's calls start in its text. */
+    /** The marker that opens a call, as the diagnostics name it ("the turn ended inside <tool_call>"). */
     const char *call_open;
     /** Markers removed wherever they appear (the tokenizer's other special tokens: vLLM drops a special
      *  token that is not one of the grammar's terminals). */
@@ -282,6 +293,10 @@ public:
     /// @param hi receives the stream offset one past the last closed call's closer
     /// @return true when at least one well-formed call was read (then `*lo`, `*hi` are set)
     bool raw_span(size_t *lo, size_t *hi) const;
+    /** Where the turn's first call opened: the stream offset of the marker that opened it -- a marker quoted in
+     *  Markdown code (L419) is text and opens none -- or std::string::npos when no call opened. */
+    /// @return the first call-opening marker's offset in the fed stream, or std::string::npos
+    size_t first_call_at() const { return block_seen_ ? call_at_ : std::string::npos; }
 
 protected:
     /** A configuration's clone: the base's reading copied, then pointed at the copy's own body. */
@@ -325,6 +340,12 @@ private:
     /// @param keep receives how many bytes at hold_'s end are a proper prefix of some candidate marker
     /// @return the marker's offset in hold_, or std::string::npos
     size_t find_marker(const out_transition **tr, size_t *len, size_t *keep) const;
+    /** L419: whether the marker of transition `tr`, found in the current state right after the text scanned so
+     *  far, is quoted Markdown code and therefore text: only in CONTENT or REASONING, only for an edge into
+     *  OUT_CALL or one marked OUT_ACT_CODE_TEXT. */
+    /// @param tr the transition the marker would take
+    /// @return true when the marker is the state's text
+    bool quoted(const out_transition &tr) const;
     /// Close the open call: the body's verdict becomes TOOL_END (and calls_) or ERROR; index_ advances either way.
     /// @param ev receives the event
     void close_call(std::vector<out_event> *ev);
@@ -341,6 +362,8 @@ private:
     size_t header_at_ = 0;     ///< stream offset of the current header's text (past the marker that opened it)
     bool block_seen_ = false;  ///< a call opened: raw_lo_ is set
     size_t raw_lo_ = 0;        ///< stream offset of the first call's bytes
+    size_t call_at_ = 0;       ///< stream offset of the marker that opened the first call
+    md_code_scan code_;        ///< L419: the current CONTENT / REASONING section's Markdown code state
     size_t raw_hi_ = 0;        ///< stream offset past the last call's closer
     section sec_[2];           ///< [0] content, [1] reasoning
     std::string block_;        ///< the open call's body

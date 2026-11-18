@@ -851,6 +851,11 @@ typedef struct server_grammar_shape {
     const char *block_tail;     ///< closes the block
     bool dictsort_keys;         ///< the template writes argument keys in Jinja's dictsort order (Gemma 4): the strict
                                 ///< schemas' properties are compiled in that order, not the schema's (L396)
+    /** L419: the family's output parser reads `call_trigger` quoted in Markdown code -- an inline span or a fenced
+     *  block of the text before it (md_code_scan.h) -- as text, not a call: the output-parser kit's rule
+     *  (out_parse_kit.h).  The gate then opens no call region there, so the two agree on where a call starts.
+     *  false: the parser reads every trigger as a call (DeepSeek's DSML parser, which is not the kit). */
+    bool call_quotable;
 } server_grammar_shape;
 
 /** Qwen's markup, which Nemotron-H writes too (chat_family.cpp). */

@@ -52,7 +52,8 @@ void out_parser::init(const out_grammar *g, out_call_body *body, out_state initi
     header_.clear();
     header_at_ = 0;
     block_seen_ = false;
-    raw_lo_ = raw_hi_ = 0;
+    raw_lo_ = raw_hi_ = call_at_ = 0;
+    code_.reset();
     sec_[0] = sec_[1] = section();
     block_.clear();
     index_ = errors_ = 0;
@@ -91,6 +92,7 @@ void out_parser::emit_text(out_state st, const char *p, size_t n, std::vector<ou
     const bool reasoning = st == OUT_REASONING;
     const out_text_policy policy = reasoning ? g_->reasoning : g_->content;
     section &s = sec_[reasoning ? 1 : 0];
+    if (st == state_) code_.feed(p, n);   /* L419: the section's bytes as sampled (not a header's text sent as content) */
     std::string buf = s.partial + std::string(p, n);
     s.partial.clear();
     std::string out;
@@ -201,6 +203,11 @@ size_t out_parser::find_marker(const out_transition **tr, size_t *len, size_t *k
     return best;
 }
 
+bool out_parser::quoted(const out_transition &tr) const {
+    if (state_ != OUT_CONTENT && state_ != OUT_REASONING) return false;
+    return (tr.to == OUT_CALL || (tr.act & OUT_ACT_CODE_TEXT)) && code_.in_code();
+}
+
 void out_parser::close_call(std::vector<out_event> *ev) {
     out_call call;
     const char *why = "";
@@ -236,6 +243,7 @@ void out_parser::feed(const char *p, size_t n, std::vector<out_event> *ev) {
         if (at != std::string::npos && !tr) {   /* a dropped marker: the bytes around it join */
             if (state_ == OUT_CALL) block_.append(hold_, 0, at);
             else emit_text(state_, hold_.data(), at, ev);
+            if (state_ == OUT_CONTENT || state_ == OUT_REASONING) code_.feed(hold_.data() + at, len);
             hold_.erase(0, at + len);
             continue;
         }
@@ -267,7 +275,16 @@ void out_parser::feed(const char *p, size_t n, std::vector<out_event> *ev) {
             return;
         }
         emit_text(state_, hold_.data(), at, ev);
+        if (quoted(*tr)) {   /* L419: quoted in Markdown code, the marker is the section's text */
+            emit_text(state_, hold_.data() + at, len, ev);
+            hold_.erase(0, at + len);
+            continue;
+        }
         const size_t marker_at = fed_ - hold_.size() + at;
+        /* the scanner follows the section's sampled bytes: a marker that keeps the state is among them (it reads no
+         * backtick, but it is on the line); one that leaves the state starts the next section afresh */
+        if (tr->to == state_) code_.feed(hold_.data() + at, len);
+        else code_.reset();
         if (state_ == OUT_HEADER) {
             /* a header is a call's name (dropped) or, closed with no content kind, text */
             if (tr->act & OUT_ACT_HEADER_TEXT) emit_text(OUT_CONTENT, header_.data(), header_.size(), ev);
@@ -284,6 +301,7 @@ void out_parser::feed(const char *p, size_t n, std::vector<out_event> *ev) {
             }
             if (!block_seen_) {
                 raw_lo_ = state_ == OUT_HEADER ? header_at_ : marker_at;
+                call_at_ = marker_at;
                 block_seen_ = true;
             }
             block_.clear();

@@ -147,6 +147,10 @@ struct constrain_plan {
     /// L396: the call trigger also ends reasoning (a family reasoning-close marker): a call opened from inside the
     /// block is a call region, not reasoning text (Gemma 4's <|tool_call>).
     bool call_ends_reasoning = false;
+    /// L419: the family writes its reasoning block's open marker itself (server_reasoning_markers::open): a turn in
+    /// free text may open the block and close it again.  The gate follows both -- each starts a section of text,
+    /// as it does in the family's output parser -- only to keep its Markdown code scanner on the parser's bytes.
+    const server_reasoning_markers *reopens = nullptr;
 };
 
 void constrain_plan_free(constrain_plan *p) {
@@ -450,6 +454,7 @@ bool constrain_plan_build(pulsar_engine *e, server *s, const chat_conversation *
     if (rm && sh->call_trigger)
         for (const char *const *m = rm->close; m < rm->close + 4 && *m; m++)
             if (!strcmp(*m, sh->call_trigger)) plan->call_ends_reasoning = true;
+    if (rm && rm->open && rm->close[0]) plan->reopens = rm;
     if (want_calls) {
         buf f = {0};
         j_call_region(&f, sh, tools);
@@ -582,6 +587,14 @@ struct constrain_rec {
     int cur_after;
     /// This advance created a matcher.
     bool opened;      /* this advance created a matcher (a rollback frees it; its accepts go with it) */
+    /// L419: the Markdown code scanner, the mid-turn reasoning flag and its two KMP states before the advance.
+    md_code_scan code;
+    /// constrain_gate::in_reason before the advance.
+    bool in_reason;
+    /// constrain_gate::kmp_ropen before the advance.
+    int kmp_ropen;
+    /// constrain_gate::kmp_rclose before the advance.
+    int kmp_rclose;
 };
 
 /** @var constrain_rec::kmp_call
@@ -613,6 +626,23 @@ struct constrain_gate {
     std::vector<uint32_t> rows;   /* a round's masks */
     /// One draw's mask (`words` long), the buffer gen_constrain_base_mask hands out.
     std::vector<uint32_t> one;    /* a single draw's mask */
+    /** L419: the Markdown code state of the current section of free text or reasoning, so a call trigger quoted in
+     *  an inline span or a fenced block opens no region -- the output parser reads it as text (out_parse_kit.h),
+     *  and the two must agree on where a call starts.  It has read the section's bytes up to the call trigger's
+     *  pending partial match (kmp_call bytes, which are the trigger's own prefix): when the trigger completes, the
+     *  scanner stands exactly where the marker starts.  Only fed while the shape says call_quotable. */
+    md_code_scan code;
+    /// L419: matches the reasoning open marker of a family that writes it mid-turn (constrain_plan::reopens); empty
+    /// otherwise.
+    constrain_kmp ropen;
+    /// L419: matches that family's reasoning close token; empty otherwise.
+    constrain_kmp rclose;
+    /// `ropen`'s KMP state.
+    int kmp_ropen = 0;
+    /// `rclose`'s KMP state.
+    int kmp_rclose = 0;
+    /// L419: free text is inside a reasoning block the turn opened itself (ropen seen, rclose not yet).
+    bool in_reason = false;
     /// Emitted tokens accepted while a region was live (PULSAR_GRAMMAR_FAIL_AFTER counts these).
     int live_accepts = 0;         /* emitted tokens a live region took (the failure injection's count) */
     /// The last failure's message (NUL-terminated; empty = none).
@@ -661,7 +691,55 @@ static void gate_region_done(constrain_gate *gt) {
     if (gt->phase == GATE_REGION && pulsar_grammar_matcher_terminated(gt->matchers[(size_t)gt->cur])) {
         gt->phase = GATE_FREE;
         gt->kmp_call = gt->kmp_answer = 0;
+        /* L419: the call closed and content starts afresh (the output parser's CALL -> CONTENT) */
+        gt->code.reset();
+        gt->in_reason = false;
+        gt->kmp_ropen = gt->kmp_rclose = 0;
     }
+}
+
+/* L419: the call trigger's KMP took byte `c` from state `before` and did not complete.  The bytes that left its
+ * pending match -- the head of (the trigger's first `before` bytes, then `c`) -- are the section's text: the code
+ * scanner reads them, and so always stands at the start of the pending match. */
+/// @param gt      the gate (kmp_call is the state after the step)
+/// @param before  kmp_call before the step
+/// @param c       the byte stepped
+static void gate_code_text(constrain_gate *gt, int before, char c) {
+    if (!gt->plan->shape->call_quotable) return;
+    const int out = before + 1 - gt->kmp_call;
+    if (out > before) {
+        gt->code.feed(gt->call.pat.data(), (size_t)before);
+        gt->code.feed(&c, 1);
+    } else {
+        gt->code.feed(gt->call.pat.data(), (size_t)out);
+    }
+}
+
+/* L419: the call trigger just completed in free text or reasoning: quoted in Markdown code it is text (the output
+ * parser's reading), no region opens, and the scanner reads it. */
+/// @param gt  the gate, its scanner at the trigger's first byte
+/// @return true when the trigger is quoted (the scanner has then read it)
+static bool gate_call_quoted(constrain_gate *gt) {
+    if (!gt->plan->shape->call_quotable || !gt->code.in_code()) return false;
+    gt->code.feed(gt->call.pat.data(), gt->call.pat.size());
+    return true;
+}
+
+
+/// @brief Put the gate's own state back to what `rec` recorded (a refused advance, a rollback); the matchers are the
+/// caller's.
+/// @param gt   the gate
+/// @param rec  the state before an advance
+static void gate_restore(constrain_gate *gt, const constrain_rec &rec) {
+    gt->phase = rec.phase;
+    gt->kmp_think = rec.kmp_think;
+    gt->kmp_call = rec.kmp_call;
+    gt->kmp_answer = rec.kmp_answer;
+    gt->cur = rec.cur;
+    gt->code = rec.code;
+    gt->in_reason = rec.in_reason;
+    gt->kmp_ropen = rec.kmp_ropen;
+    gt->kmp_rclose = rec.kmp_rclose;
 }
 
 /* Advance by one token (`token` >= 0) or by raw bytes (the seed, token -1).  false = gt->err. */
@@ -671,7 +749,8 @@ static void gate_region_done(constrain_gate *gt) {
 /// @param n      bytes at `b`
 /// @return false (gate unchanged) when refused
 static bool gate_feed(constrain_gate *gt, int token, const char *b, size_t n) {
-    constrain_rec rec = {gt->phase, gt->kmp_think, gt->kmp_call, gt->kmp_answer, gt->cur, 0, -1, false};
+    constrain_rec rec = {gt->phase, gt->kmp_think, gt->kmp_call, gt->kmp_answer, gt->cur, 0, -1, false,
+                         gt->code, gt->in_reason, gt->kmp_ropen, gt->kmp_rclose};
     const constrain_plan *p = gt->plan;
     gt->err[0] = '\0';
     bool ok = true;
@@ -696,16 +775,22 @@ static bool gate_feed(constrain_gate *gt, int token, const char *b, size_t n) {
         const char c = b[i++];
         if (gt->phase == GATE_THINK) {
             /* L396: a call opened from inside reasoning ends it (the family's markers say so): the call region */
-            if (p->calls && p->call_ends_reasoning && gt->call.step(gt->kmp_call, c)) {
-                gt->kmp_think = 0;
-                std::string open = gt->call.pat;
-                open.append(b + i, n - i);
-                ok = gate_open(gt, p->calls, true, open.data(), open.size(), &rec);
-                if (ok) gate_region_done(gt);
-                break;
+            if (p->calls && p->call_ends_reasoning) {
+                const int before = gt->kmp_call;
+                if (!gt->call.step(gt->kmp_call, c)) {
+                    gate_code_text(gt, before, c);
+                } else if (!gate_call_quoted(gt)) {   /* L419: quoted in Markdown code, it is reasoning text */
+                    gt->kmp_think = 0;
+                    std::string open = gt->call.pat;
+                    open.append(b + i, n - i);
+                    ok = gate_open(gt, p->calls, true, open.data(), open.size(), &rec);
+                    if (ok) gate_region_done(gt);
+                    break;
+                }
             }
             if (!gt->think.step(gt->kmp_think, c)) continue;
             gt->kmp_call = 0;
+            gt->code.reset();   /* L419: the answer's text is a new section (the output parser's REASONING -> CONTENT) */
             /* reasoning closed: the answer opens on the rest of the token, or the turn is free text */
             if (!p->answer) {
                 gt->phase = GATE_FREE;
@@ -715,12 +800,23 @@ static bool gate_feed(constrain_gate *gt, int token, const char *b, size_t n) {
             break;
         }
         /* FREE */
-        if (p->calls && gt->call.step(gt->kmp_call, c)) {
-            std::string open = gt->call.pat;
-            open.append(b + i, n - i);
-            ok = gate_open(gt, p->calls, true, open.data(), open.size(), &rec);
-            if (ok) gate_region_done(gt);
-            break;
+        if (p->calls) {
+            const int before = gt->kmp_call;
+            if (!gt->call.step(gt->kmp_call, c)) {
+                gate_code_text(gt, before, c);
+            } else if (!gate_call_quoted(gt)) {   /* L419: quoted in Markdown code, it is text and opens nothing */
+                std::string open = gt->call.pat;
+                open.append(b + i, n - i);
+                ok = gate_open(gt, p->calls, true, open.data(), open.size(), &rec);
+                if (ok) gate_region_done(gt);
+                break;
+            }
+        }
+        /* L419: a reasoning block the turn opens or closes itself starts a section (the scanner's, nothing else) */
+        if (!gt->in_reason ? gt->ropen.step(gt->kmp_ropen, c) : gt->rclose.step(gt->kmp_rclose, c)) {
+            gt->in_reason = !gt->in_reason;
+            gt->kmp_ropen = gt->kmp_rclose = 0;
+            gt->code.reset();
         }
         if (p->answer && !p->shape->answer_at_think_close && gt->answer.step(gt->kmp_answer, c)) {
             ok = gate_open(gt, p->answer, false, b + i, n - i, &rec);
@@ -734,11 +830,7 @@ static bool gate_feed(constrain_gate *gt, int token, const char *b, size_t n) {
             pulsar_grammar_matcher_free(gt->matchers.back());
             gt->matchers.pop_back();
         }
-        gt->phase = rec.phase;
-        gt->kmp_think = rec.kmp_think;
-        gt->kmp_call = rec.kmp_call;
-        gt->kmp_answer = rec.kmp_answer;
-        gt->cur = rec.cur;
+        gate_restore(gt, rec);
         return false;
     }
     gt->hist.push_back(rec);
@@ -761,11 +853,7 @@ static bool gate_rollback(constrain_gate *gt, int n) {
                                                     sizeof gt->err)) {
             return false;
         }
-        gt->phase = rec.phase;
-        gt->kmp_think = rec.kmp_think;
-        gt->kmp_call = rec.kmp_call;
-        gt->kmp_answer = rec.kmp_answer;
-        gt->cur = rec.cur;
+        gate_restore(gt, rec);
     }
     return true;
 }
@@ -812,6 +900,10 @@ bool gen_constrain_begin(server *s, gen_state *g) {
     gt->think.init(sh->answer_at_think_close ? sh->answer_open : "</think>");
     gt->call.init(sh->call_trigger);
     gt->answer.init(sh->answer_at_think_close ? "" : sh->answer_open);
+    if (gt->plan->reopens && sh->call_quotable) {
+        gt->ropen.init(gt->plan->reopens->open);
+        gt->rclose.init(gt->plan->reopens->close[0]);
+    }
     g->gate = gt;
     /* where the turn starts: inside reasoning (the prompt left a think block open: the stop scan's authority),
      * in the answer when it opens at the think close, else free */

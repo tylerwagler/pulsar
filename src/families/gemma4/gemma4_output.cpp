@@ -202,7 +202,8 @@ const out_grammar &gemma4_output_grammar(void) {
             {OUT_REASONING, CALL_OPEN, OUT_CALL, 0},       /* a call ends the reasoning */
             {OUT_CONTENT, CALL_OPEN, OUT_CALL, 0},
             {OUT_CALL, CALL_CLOSE, OUT_CONTENT, 0},
-            {OUT_CONTENT, CALL_CLOSE, OUT_CONTENT, 0},     /* back-to-back calls' stray closer: dropped */
+            /* back-to-back calls' stray closer: dropped -- unless quoted in Markdown code with its call (L419) */
+            {OUT_CONTENT, CALL_CLOSE, OUT_CONTENT, OUT_ACT_CODE_TEXT},
         },
         /* .reasoning   = */ OUT_TEXT_RSTRIP,
         /* .content     = */ OUT_TEXT_TRIM_AT_CALLS,

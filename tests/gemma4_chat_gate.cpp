@@ -413,6 +413,60 @@ static void p1_vllm(const std::string &dir) {
            "after the calls (kept here)\n", v.a.size(), bad, typed, broken, after);
 }
 
+/* P3 (L419): call markup quoted in Markdown code is text -- hand-written, the kit's own rule (vLLM's parser has none, so
+ * these are not among P1's goldens).  Gemma's markers are single tokens the model can sample inside a quotation; its
+ * grammar opens a call from the thought channel too, and drops a stray call closer from the content -- which, quoted
+ * with its call, is the quotation's text. */
+static void p3_quoted(void) {
+    const char *tools = R"([{"type": "function", "function": {"name": "f", "parameters": {"type": "object", "properties": )"
+                        R"({"n": {"type": "integer"}}}}}])";
+#define RC "<|tool_call>call:f{n:3}<tool_call|>"
+#define EXAMPLE "<|tool_call>call:f{n:1}<tool_call|>"
+    struct unit {
+        const char *name, *out, *reasoning, *content;
+        size_t calls;
+    } units[] = {
+        {"quoted_inline_then_call", "Wrap it in `<|tool_call>` tags." RC, "", "Wrap it in `<|tool_call>` tags.", 1},
+        {"quoted_inline_whole_call", "`" EXAMPLE "` is the form.", "", "`" EXAMPLE "` is the form.", 0},
+        {"fenced_example_then_prose", "Like this:\n```\n" EXAMPLE "\n```\nThat is all.", "",
+         "Like this:\n```\n" EXAMPLE "\n```\nThat is all.", 0},
+        {"fenced_example_then_call", "Like this:\n```\n" EXAMPLE "\n```\nNow for real.\n" RC, "",
+         "Like this:\n```\n" EXAMPLE "\n```\nNow for real.", 1},
+        {"call_then_fenced_example", RC "The form was:\n~~~\n" EXAMPLE "\n~~~", "", "The form was:\n~~~\n" EXAMPLE "\n~~~", 1},
+        {"fence_closed_then_call_same_line", "```\nls\n```" RC, "", "```\nls\n```", 1},
+        {"fence_never_closed", "```\n" EXAMPLE "\nno closing fence", "", "```\n" EXAMPLE "\nno closing fence", 0},
+        {"stray_backtick_then_call", "Press ` first\n" RC, "", "Press ` first", 1},
+        {"double_backtick_span", "Either ``<|tool_call>`` or `` a ` <|tool_call> `` works.\n" RC, "",
+         "Either ``<|tool_call>`` or `` a ` <|tool_call> `` works.", 1},
+        {"stray_closer_still_dropped", "a<tool_call|>b", "", "ab", 0},
+        {"quoted_in_reasoning", "<|channel>thought\nI could write `<|tool_call>` here<channel|>Answer.",
+         "I could write `<|tool_call>` here", "Answer.", 0},
+        {"quoted_in_reasoning_then_call_from_it", "<|channel>thought\nthe form is\n```\n<|tool_call>\n```\nso now" RC,
+         "the form is\n```\n<|tool_call>\n```\nso now", "", 1},
+        {"reasoning_backticks_do_not_leak", "<|channel>thought\nan unclosed ```\nfence<channel|>" RC,
+         "an unclosed ```\nfence", "", 1},
+    };
+#undef RC
+#undef EXAMPLE
+    int bad = 0;
+    for (const auto &u : units) {
+        for (int bytewise = 0; bytewise < 2; bytewise++) {
+            const reading r = read_turn(u.out, false, tools, bytewise != 0);
+            const int before = g_fail;
+            CHECK(r.reasoning == u.reasoning, "P3 %s: reasoning [%s]", u.name, r.reasoning.c_str());
+            CHECK(r.content == u.content, "P3 %s: content [%s]", u.name, r.content.c_str());
+            CHECK(r.calls.size() == u.calls && r.errors == 0, "P3 %s: %zu calls, %d errors", u.name, r.calls.size(),
+                  r.errors);
+            for (const out_call &c : r.calls)
+                CHECK(c.name == "f" && c.arguments == "{\"n\": 3}", "P3 %s: call %s %s", u.name, c.name.c_str(),
+                      c.arguments.c_str());
+            bad += g_fail != before;
+        }
+    }
+    printf("P3 call markup quoted in Markdown code: %zu outputs x 2 chunkings, %d mismatched\n",
+           sizeof units / sizeof units[0], bad);
+}
+
 /* P2: every corpus call rendered (format_argument) and read back == its arguments */
 static void p2_roundtrip(const std::string &cases_dir) {
     int calls = 0, bad = 0, declared = 0;
@@ -651,6 +705,7 @@ int main(int argc, char **argv) {
     c1_composition();
     c2_tool_turn();
     p1_vllm(vec_dir);
+    p3_quoted();
     if (!cases.empty()) p2_roundtrip(cases);
     bpe_tokenizer_free(t);
     printf("\ngemma4_chat_gate: %d checks, %s\n", g_checks, g_fail ? "FAIL" : "PASS");

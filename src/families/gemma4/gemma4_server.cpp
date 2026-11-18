@@ -241,6 +241,7 @@ static const server_grammar_shape k_grammar_gemma4 = {
     /* .repeat                = */ false,
     /* .block_tail            = */ "",
     /* .dictsort_keys         = */ true,
+    /* .call_quotable         = */ true,
 };
 
 /* L398: the thought channel as text -- <|channel> opens it, <channel|> (the close token, L344's forced draw) ends it,

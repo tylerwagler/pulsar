@@ -724,6 +724,7 @@ static const server_grammar_shape k_grammar_deepseek_v41 = {
     /* .repeat                = */ true,
     /* .block_tail            = */ PULSAR_TOOL_CALLS_END,
     /* .dictsort_keys         = */ false,
+    /* .call_quotable         = */ false,   /* the DSML parser reads every trigger as a call */
 };
 /** V4 (0731)'s grammar shape: the same shape in V4's tag spelling. */
 static const server_grammar_shape k_grammar_deepseek_v4 = {
@@ -739,6 +740,7 @@ static const server_grammar_shape k_grammar_deepseek_v4 = {
     /* .repeat                = */ true,
     /* .block_tail            = */ PULSAR_TOOL_CALLS_END_V4,
     /* .dictsort_keys         = */ false,
+    /* .call_quotable         = */ false,   /* the DSML parser reads every trigger as a call */
 };
 /* Qwen and Nemotron-H write the same markup (qwen_chat.cpp, nemotron_chat.cpp): one <tool_call> block a call,
  * <function=NAME> and its <parameter=KEY> lines -- xgrammar's qwen_xml style. */
@@ -755,6 +757,7 @@ const server_grammar_shape k_grammar_qwen_xml = {
     /* .repeat                = */ false,
     /* .block_tail            = */ "",
     /* .dictsort_keys         = */ false,
+    /* .call_quotable         = */ true,
 };
 
 /* ---- the tables and the dispatch ------------------------------------------------------------------- */

@@ -346,9 +346,29 @@ static bool contains(const char *s, const char *needle) { return s && strstr(s, 
 /* A turn whose text spells the grammar's own markers reads differently by construction (a reasoning that writes
  * "<tool_call>" opens a call there: vLLM skips to the next <function=, the kit refuses the block).  P1 and P2 skip
  * them (gen_nemotron_goldens.py ambiguous). */
-static bool ambiguous(const nemotron_msg_in &m) {
-    for (const char *k : {"<tool_call>", "</tool_call>", "<think>", "</think>"})
+/* L419: whether `text` spells "<tool_call>" where the kit reads it -- outside Markdown code */
+static bool opens_call(const char *text) {
+    if (!text) return false;
+    md_code_scan code;
+    const char *from = text;
+    for (const char *at; (at = strstr(from, "<tool_call>")) != NULL; from = at + 1) {
+        code.feed(from, (size_t)(at - from));
+        if (!code.in_code()) return true;
+        code.feed(at, 1);   /* a quoted one: the search goes on past its first byte */
+    }
+    return false;
+}
+
+/* `kit` (P1, the kit's own round trip): an opener quoted in Markdown code is text (L419) and the turn reads back; vLLM
+ * has no such rule, so P2's selection keeps every spelling out. */
+static bool ambiguous(const nemotron_msg_in &m, bool kit = false) {
+    for (const char *k : {"<tool_call>", "</tool_call>", "<think>", "</think>"}) {
+        if (kit && !strcmp(k, "<tool_call>")) {
+            if (opens_call(m.reasoning) || opens_call(m.content)) return true;
+            continue;
+        }
         if (contains(m.reasoning, k) || contains(m.content, k)) return true;
+    }
     for (int i = 0; i < m.n_calls; i++)
         if (contains(m.calls[i].arguments, "</parameter>") || contains(m.calls[i].arguments, "</function>") ||
             contains(m.calls[i].name, ">"))   /* "</tool_call>" in a value reads back (L410) */
@@ -400,7 +420,7 @@ static void p1_roundtrip(const std::string &cases_dir, const std::string &dir) {
                 if (strcmp(m.role, "assistant") || !m.reasoning) continue;
                 std::string r = m.reasoning;
                 if (r.find_first_not_of(" \t\n\r") == std::string::npos) continue;   /* no reasoning: not sampled so */
-                if (ambiguous(m)) { n_ambiguous++; continue; }
+                if (ambiguous(m, /*kit=*/true)) { n_ambiguous++; continue; }
                 std::string sampled, full;
                 if (!sampled_turn(cv, m, &sampled, &full)) continue;   /* refused turns: R2 */
                 /* a reasoning that ends in whitespace re-renders without it (vLLM's rstrip, the reading graded in P2):
@@ -662,6 +682,61 @@ static void p2_vllm(const std::string &dir, const std::string &cases_dir) {
            "readings differ\n", units.a.size(), bad, dep.content_strip, dep.after_calls, dep.arg_typing, turns, files_bad);
 }
 
+/* P3 (L419): call markup quoted in Markdown code is text -- hand-written, the kit's own rule (vLLM's parser has none,
+ * so these are not among P2's goldens).  Nemotron's grammar opens a call from the reasoning too, so the rule is
+ * shown there as well: a quoted opener stays reasoning, a real call after it still ends the reasoning. */
+static void p3_quoted(void) {
+    const char *tools = R"([{"type": "function", "function": {"name": "f", "parameters": {"type": "object", "properties": )"
+                        R"({"s": {"type": "string"}, "n": {"type": "integer"}}}}}])";
+#define RC "<tool_call>\n<function=f>\n<parameter=n>\n3\n</parameter>\n</function>\n</tool_call>"
+#define RC_READ "0:f:{\"n\": 3}\n"
+#define EXAMPLE "<tool_call>\n<function=f>\n<parameter=n>\n1\n</parameter>\n</function>\n</tool_call>"
+    struct unit {
+        const char *name, *out, *reasoning, *content, *calls;
+    } units[] = {
+        {"quoted_inline_then_call", "plan</think>Wrap it in `<tool_call>` tags.\n" RC, "plan",
+         "Wrap it in `<tool_call>` tags.", RC_READ},
+        {"fenced_example_then_prose", "plan</think>Like this:\n```xml\n" EXAMPLE "\n```\nThat is all.", "plan",
+         "Like this:\n```xml\n" EXAMPLE "\n```\nThat is all.", ""},
+        {"fenced_example_then_call", "plan</think>Like this:\n```xml\n" EXAMPLE "\n```\nNow for real.\n" RC, "plan",
+         "Like this:\n```xml\n" EXAMPLE "\n```\nNow for real.", RC_READ},
+        {"stray_backtick_then_call", "plan</think>Press ` first\n" RC, "plan", "Press ` first", RC_READ},
+        {"double_backtick_span", "plan</think>Either ``<tool_call>`` or `` a ` <tool_call> `` works.\n" RC, "plan",
+         "Either ``<tool_call>`` or `` a ` <tool_call> `` works.", RC_READ},
+        {"fence_never_closed", "plan</think>~~~\n" EXAMPLE "\nno closing fence", "plan",
+         "~~~\n" EXAMPLE "\nno closing fence", ""},
+        {"quoted_in_reasoning", "I would write `<tool_call>` here\n</think>fine", "I would write `<tool_call>` here", "fine",
+         ""},
+        {"quoted_in_reasoning_then_call_from_it", "the form is\n```\n<tool_call>\n```\nso now\n" RC,
+         "the form is\n```\n<tool_call>\n```\nso now", "", RC_READ},
+        {"stray_backtick_in_reasoning_then_call_from_it", "a ` b\n" RC, "a ` b", "", RC_READ},
+        {"reasoning_backticks_do_not_leak", "an unclosed ```\nfence\n</think>" RC, "an unclosed ```\nfence", "", RC_READ},
+        {"call_body_backticks_do_not_leak", "plan</think><tool_call>\n<function=f>\n<parameter=s>\n```\n`\n</parameter>\n"
+                                            "</function>\n</tool_call>\n" RC,
+         "plan", "", "0:f:{\"s\": \"```\\n`\"}\n1:f:{\"n\": 3}\n"},
+    };
+#undef RC
+#undef RC_READ
+#undef EXAMPLE
+    int bad = 0;
+    for (const auto &u : units) {
+        const std::string out = u.out;
+        std::vector<size_t> bytes;
+        for (size_t k = 1; k < out.size(); k++) bytes.push_back(k);
+        for (int pass = 0; pass < 2; pass++) {
+            const parse_result r = run_parser(out, true, tools, pass ? bytes : std::vector<size_t>{});
+            const int before = g_fail;
+            CHECK(r.reasoning == u.reasoning, "P3 %s: reasoning [%s]", u.name, r.reasoning.c_str());
+            CHECK(r.content == u.content, "P3 %s: content [%s]", u.name, r.content.c_str());
+            CHECK(r.calls == u.calls, "P3 %s: calls [%s]", u.name, r.calls.c_str());
+            CHECK(r.errors.empty(), "P3 %s: unexpected error %s", u.name, r.errors.c_str());
+            bad += g_fail != before;
+        }
+    }
+    printf("P3 call markup quoted in Markdown code: %zu outputs x 2 chunkings, %d mismatched\n",
+           sizeof units / sizeof units[0], bad);
+}
+
 static void e1_effort(void) {
     int bad = 0;
     const int before = g_fail;
@@ -899,6 +974,7 @@ int main(int argc, char **argv) {
         printf("R2 render corpus / P1 parser round trip: SKIPPED (no --cases)\n");
     }
     p2_vllm(vec_dir, cases_dir);
+    p3_quoted();
     e1_effort();
     c1_composition(t);
     bpe_tokenizer_free(t);

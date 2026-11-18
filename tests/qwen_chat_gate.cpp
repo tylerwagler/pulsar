@@ -333,12 +333,105 @@ static parse_result run_parser(const std::string &out, bool thinking, const char
 
 static bool contains(const char *s, const char *needle) { return s && strstr(s, needle); }
 
+/* L419: whether the content spells "<tool_call>" where the parser reads it -- outside Markdown code.  Quoted in an
+ * inline span or a fenced block it is the content's text and the turn reads back. */
+static bool content_opens_call(const char *content) {
+    if (!content) return false;
+    md_code_scan code;
+    const char *from = content;
+    for (const char *at; (at = strstr(from, "<tool_call>")) != NULL; from = at + 1) {
+        code.feed(from, (size_t)(at - from));
+        if (!code.in_code()) return true;
+        code.feed(at, 1);   /* a quoted one: the search goes on past its first byte */
+    }
+    return false;
+}
+
 static void p1_roundtrip(const std::string &cases_dir, const std::string &dir) {
     std::string tsv;
     if (!read_file(dir + "/render_corpus.tsv", &tsv)) return;
-    int turns = 0, ambiguous = 0, bad = 0, with_calls = 0;
+    int turns = 0, ambiguous = 0, bad = 0, with_calls = 0, quoted = 0;
     unsigned rng = 12345;
     std::string last;
+    bool stop = false;
+    /* one assistant turn `m` of a conversation with these tools, as the model would have sampled it */
+    auto turn = [&](const qwen_msg_in &m, const std::string &tools_json, bool has_tools, const std::string &file) {
+        /* the turn as the model would have sampled it: [user, this assistant] */
+        conv one;
+        one.store.reserve(2);
+        qwen_msg_in user = {};
+        user.role = "user";
+        user.content = "q";
+        one.msgs = {user, m};
+        one.tools = tools_json;
+        one.has_tools = has_tools;
+        qwen_render_out out;
+        std::string refusal;
+        if (!render(one, QWEN_EFFORT_XHIGH, false, &out, &refusal)) return;   /* refused turns: R2 */
+        /* "<tool_call>" in the content reads back when it is quoted in Markdown code (L419) */
+        bool amb = contains(m.reasoning, "</think>") || content_opens_call(m.content) ||
+                   contains(m.content, "</think>");
+        for (int k = 0; k < m.n_calls; k++)
+            amb |= contains(m.calls[k].arguments, "</parameter>") || contains(m.calls[k].arguments, "</function>") ||
+                   contains(m.calls[k].name, ">");   /* "</tool_call>" in a value reads back (L410) */
+        if (amb) { ambiguous++; return; }
+        quoted += contains(m.content, "<tool_call>");
+        const std::string head = "<|im_start|>assistant\n<think>\n";
+        const size_t a = out.text.rfind(head);
+        const std::string sampled = out.text.substr(a + head.size(), out.text.size() - a - head.size() -
+                                                                         strlen("<|im_end|>\n"));
+        turns++;
+        with_calls += m.n_calls > 0;
+        const char *tools = one.has_tools ? one.tools.c_str() : NULL;
+        const parse_result whole = run_parser(sampled, true, tools, {});
+        std::vector<size_t> bytes;
+        for (size_t k = 1; k < sampled.size(); k++) bytes.push_back(k);
+        const parse_result each = run_parser(sampled, true, tools, bytes);
+        std::vector<size_t> rnd;
+        for (size_t k = 0; k < sampled.size();) {
+            rng = rng * 1103515245u + 12345u;
+            k += 1 + (rng >> 16) % 23;
+            if (k < sampled.size()) rnd.push_back(k);
+        }
+        const parse_result random = run_parser(sampled, true, tools, rnd);
+        const int before = g_fail;
+        g_checks++;
+        if (!whole.errors.empty()) fail("P1 %s: parser error: %s", file.c_str(), whole.errors.c_str());
+        if (each.reasoning != whole.reasoning || each.content != whole.content || each.calls != whole.calls ||
+            random.reasoning != whole.reasoning || random.content != whole.content || random.calls != whole.calls)
+            fail("P1 %s: chunking changed the parse", file.c_str());
+        /* re-render what the parser read */
+        conv back;
+        back.store.reserve(4 + 2 * (size_t)std::count(whole.calls.begin(), whole.calls.end(), '\n'));
+        qwen_msg_in r = {};
+        r.role = "assistant";
+        r.content = keep(&back, whole.content);
+        r.reasoning = keep(&back, whole.reasoning);
+        std::vector<qwen_tool_call_in> calls;
+        for (size_t s = 0; s < whole.calls.size();) {
+            const size_t e = whole.calls.find('\n', s);
+            const std::string row = whole.calls.substr(s, e - s);
+            const size_t c1 = row.find(':'), c2 = row.find(':', c1 + 1);
+            calls.push_back({keep(&back, row.substr(c1 + 1, c2 - c1 - 1)), keep(&back, row.substr(c2 + 1))});
+            s = e + 1;
+        }
+        r.calls = calls.data();
+        r.n_calls = (int)calls.size();
+        back.msgs = {user, r};
+        back.tools = one.tools;
+        back.has_tools = one.has_tools;
+        qwen_render_out again;
+        if (!render(back, QWEN_EFFORT_XHIGH, false, &again, &refusal)) fail("P1 %s: re-render refused: %s", file.c_str(), refusal.c_str());
+        else if (again.text != out.text) {
+            size_t d = 0;
+            while (d < again.text.size() && d < out.text.size() && again.text[d] == out.text[d]) d++;
+            std::string x, y;
+            pyjson_dump_string(again.text.data() + d, std::min<size_t>(60, again.text.size() - d), &x);
+            pyjson_dump_string(out.text.data() + d, std::min<size_t>(60, out.text.size() - d), &y);
+            fail("P1 %s: re-render differs at %zu: %s vs %s", file.c_str(), d, x.c_str(), y.c_str());
+        }
+        if (g_fail != before && ++bad > 20) { printf("P1: stopping after 20 failures\n"); stop = true; }
+    };
     for (size_t pos = 0; pos < tsv.size();) {
         const size_t nl = tsv.find('\n', pos);
         const std::string line = tsv.substr(pos, nl - pos);
@@ -354,84 +447,46 @@ static void p1_roundtrip(const std::string &cases_dir, const std::string &dir) {
             for (size_t i = 0; i < cv.msgs.size(); i++) {
                 const qwen_msg_in &m = cv.msgs[i];
                 if (strcmp(m.role, "assistant")) continue;
-                /* the turn as the model would have sampled it: [user, this assistant] */
-                conv one;
-                one.store.reserve(2);
-                qwen_msg_in user = {};
-                user.role = "user";
-                user.content = "q";
-                one.msgs = {user, m};
-                one.tools = cv.tools;
-                one.has_tools = cv.has_tools;
-                qwen_render_out out;
-                std::string refusal;
-                if (!render(one, QWEN_EFFORT_XHIGH, false, &out, &refusal)) continue;   /* refused turns: R2 */
-                bool amb = contains(m.reasoning, "</think>") || contains(m.content, "<tool_call>") ||
-                           contains(m.content, "</think>");
-                for (int k = 0; k < m.n_calls; k++)
-                    amb |= contains(m.calls[k].arguments, "</parameter>") || contains(m.calls[k].arguments, "</function>") ||
-                           contains(m.calls[k].name, ">");   /* "</tool_call>" in a value reads back (L410) */
-                if (amb) { ambiguous++; continue; }
-                const std::string head = "<|im_start|>assistant\n<think>\n";
-                const size_t a = out.text.rfind(head);
-                const std::string sampled = out.text.substr(a + head.size(), out.text.size() - a - head.size() -
-                                                                                 strlen("<|im_end|>\n"));
-                turns++;
-                with_calls += m.n_calls > 0;
-                const char *tools = one.has_tools ? one.tools.c_str() : NULL;
-                const parse_result whole = run_parser(sampled, true, tools, {});
-                std::vector<size_t> bytes;
-                for (size_t k = 1; k < sampled.size(); k++) bytes.push_back(k);
-                const parse_result each = run_parser(sampled, true, tools, bytes);
-                std::vector<size_t> rnd;
-                for (size_t k = 0; k < sampled.size();) {
-                    rng = rng * 1103515245u + 12345u;
-                    k += 1 + (rng >> 16) % 23;
-                    if (k < sampled.size()) rnd.push_back(k);
-                }
-                const parse_result random = run_parser(sampled, true, tools, rnd);
-                const int before = g_fail;
-                g_checks++;
-                if (!whole.errors.empty()) fail("P1 %s: parser error: %s", file.c_str(), whole.errors.c_str());
-                if (each.reasoning != whole.reasoning || each.content != whole.content || each.calls != whole.calls ||
-                    random.reasoning != whole.reasoning || random.content != whole.content || random.calls != whole.calls)
-                    fail("P1 %s: chunking changed the parse", file.c_str());
-                /* re-render what the parser read */
-                conv back;
-                back.store.reserve(4 + 2 * (size_t)std::count(whole.calls.begin(), whole.calls.end(), '\n'));
-                qwen_msg_in r = {};
-                r.role = "assistant";
-                r.content = keep(&back, whole.content);
-                r.reasoning = keep(&back, whole.reasoning);
-                std::vector<qwen_tool_call_in> calls;
-                for (size_t s = 0; s < whole.calls.size();) {
-                    const size_t e = whole.calls.find('\n', s);
-                    const std::string row = whole.calls.substr(s, e - s);
-                    const size_t c1 = row.find(':'), c2 = row.find(':', c1 + 1);
-                    calls.push_back({keep(&back, row.substr(c1 + 1, c2 - c1 - 1)), keep(&back, row.substr(c2 + 1))});
-                    s = e + 1;
-                }
-                r.calls = calls.data();
-                r.n_calls = (int)calls.size();
-                back.msgs = {user, r};
-                back.tools = one.tools;
-                back.has_tools = one.has_tools;
-                qwen_render_out again;
-                if (!render(back, QWEN_EFFORT_XHIGH, false, &again, &refusal)) fail("P1 %s: re-render refused: %s", file.c_str(), refusal.c_str());
-                else if (again.text != out.text) {
-                    size_t d = 0;
-                    while (d < again.text.size() && d < out.text.size() && again.text[d] == out.text[d]) d++;
-                    std::string x, y;
-                    pyjson_dump_string(again.text.data() + d, std::min<size_t>(60, again.text.size() - d), &x);
-                    pyjson_dump_string(out.text.data() + d, std::min<size_t>(60, out.text.size() - d), &y);
-                    fail("P1 %s: re-render differs at %zu: %s vs %s", file.c_str(), d, x.c_str(), y.c_str());
-                }
-                if (g_fail != before && ++bad > 20) { printf("P1: stopping after 20 failures\n"); return; }
+                turn(m, cv.tools, cv.has_tools, file);
+                if (stop) return;
             }
         }
     }
-    printf("P1 output parser round trip: %d assistant turns (%d with tool calls; %d ambiguous by construction "
-           "skipped), whole / byte-by-byte / random chunking; %d mismatched\n", turns, with_calls, ambiguous, bad);
+    /* L419: the corpus quotes no call markup in its content, so these turns do -- an explanation of the format
+     * beside real calls -- through the same round trip: the quotation is content, the calls are the calls, and
+     * the re-render is the turn byte for byte */
+    {
+        static const char kTools[] =
+            R"([{"type": "function", "function": {"name": "f", "parameters": {"type": "object", "properties": )"
+            R"({"s": {"type": "string"}, "n": {"type": "integer"}}}}}])";
+        static const char kExample[] = "<tool_call>\n<function=f>\n<parameter=n>\n1\n</parameter>\n</function>\n</tool_call>";
+        const std::string fenced = std::string("A call is written like this:\n\n```xml\n") + kExample +
+                                   "\n```\n\nI will make one now.";
+        const std::string listed = std::string("1. Open with `<tool_call>`.\n2. Then:\n   ~~~\n   ") + kExample +
+                                   "\n   ~~~\n3. Close with ``</tool_call>``.";
+        static const qwen_tool_call_in call[2] = {{"f", "{\"n\": 3}"}, {"f", "{\"s\": \"`<tool_call>` and ```\"}"}};
+        struct { const char *content; int n_calls; } quoting[] = {
+            {"The opener is `<tool_call>`; I will use it now.", 1},
+            {"The opener is `<tool_call>`.", 0},
+            {fenced.c_str(), 2},
+            {fenced.c_str(), 0},
+            {listed.c_str(), 1},
+            {"Press the ` key, then I call the tool.", 1},
+        };
+        for (const auto &q : quoting) {
+            qwen_msg_in m = {};
+            m.role = "assistant";
+            m.reasoning = "The format wraps a call in ``` fences? No: in `<tool_call>` tags.";
+            m.content = q.content;
+            m.calls = call;
+            m.n_calls = q.n_calls;
+            turn(m, kTools, true, "(L419 quoting turns)");
+            if (stop) return;
+        }
+    }
+    printf("P1 output parser round trip: %d assistant turns (%d with tool calls, %d quoting call markup in Markdown "
+           "code; %d ambiguous by construction skipped), whole / byte-by-byte / random chunking; %d mismatched\n", turns,
+           with_calls, quoted, ambiguous, bad);
 }
 
 static void p2_units(void) {
@@ -486,6 +541,55 @@ static void p2_units(void) {
          "", "", "0:g:{\"x\": \"\\\"hi\\\"\"}\n", NULL},
         {"lookalike_markers", true, "</thinking> <tool_calls>\n</think>c </tool_call> <tool_cal", "</thinking> <tool_calls>",
          "c </tool_call> <tool_cal", "", NULL},
+        /* L419: a call opener quoted in Markdown code is the content's text; the real call after it is read */
+#define RC "<tool_call>\n<function=f>\n<parameter=n>\n3\n</parameter>\n</function>\n</tool_call>"
+#define RC_READ "0:f:{\"n\": 3}\n"
+#define EXAMPLE "<tool_call>\n<function=f>\n<parameter=n>\n1\n</parameter>\n</function>\n</tool_call>"
+        {"quoted_inline_then_call", true, "</think>\n\nWrap it in `<tool_call>` tags.\n\n" RC, "",
+         "Wrap it in `<tool_call>` tags.", RC_READ, NULL},
+        {"quoted_inline_no_call", false, "The opener is `<tool_call>` and the closer `</tool_call>`.", "",
+         "The opener is `<tool_call>` and the closer `</tool_call>`.", "", NULL},
+        {"quoted_inline_malformed", true, "</think>`<tool_call>oops` is not a call", "", "`<tool_call>oops` is not a call",
+         "", NULL},
+        {"fenced_example_then_prose", true, "</think>\n\nA call looks like this:\n```xml\n" EXAMPLE "\n```\nThat is all.",
+         "", "A call looks like this:\n```xml\n" EXAMPLE "\n```\nThat is all.", "", NULL},
+        {"fenced_example_then_call", true, "</think>\n\nA call looks like this:\n```xml\n" EXAMPLE "\n```\nNow for real."
+                                          "\n\n" RC,
+         "", "A call looks like this:\n```xml\n" EXAMPLE "\n```\nNow for real.", RC_READ, NULL},
+        {"tilde_fence_then_call", true, "</think>~~~\n" EXAMPLE "\n~~~\n" RC, "", "~~~\n" EXAMPLE "\n~~~", RC_READ, NULL},
+        {"fence_in_list_item", true, "</think>1. Send:\n   ```\n   <tool_call>\n   ```\n2. Wait.\n\n" RC, "",
+         "1. Send:\n   ```\n   <tool_call>\n   ```\n2. Wait.", RC_READ, NULL},
+        /* a fence closes at a run at least as long as its opener, alone on its line */
+        {"fence_longer_than_inner", true, "</think>````\n```\n<tool_call>\n```\n````\n" RC, "",
+         "````\n```\n<tool_call>\n```\n````", RC_READ, NULL},
+        {"fence_closed_then_call_same_line", true, "</think>```\nls\n```" RC, "", "```\nls\n```", RC_READ, NULL},
+        /* a fence never closed quotes to the end of the content (CommonMark: to the end of the document) */
+        {"fence_never_closed", true, "</think>```\n" EXAMPLE "\nand no closing fence", "",
+         "```\n" EXAMPLE "\nand no closing fence", "", NULL},
+        /* a stray backtick quotes no further than its own line: the call on a later line is a call */
+        {"stray_backtick_then_call", true, "</think>\n\nPress the ` key to open it.\n\n" RC, "",
+         "Press the ` key to open it.", RC_READ, NULL},
+        {"stray_backtick_previous_line", true, "</think>Press ` first\n" RC, "", "Press ` first", RC_READ, NULL},
+        {"stray_backticks_not_a_fence", true, "</think>Use ``` to open a block\n" RC, "", "Use ``` to open a block", RC_READ,
+         NULL},
+        {"info_string_with_backtick_is_inline", true, "</think>``` not a `fence\n" RC "\n```", "", "``` not a `fence```",
+         RC_READ, NULL},
+        /* spans close at a run of the same length only */
+        {"double_backtick_span", true, "</think>Either ``<tool_call>`` or `` a ` <tool_call> `` works.\n" RC, "",
+         "Either ``<tool_call>`` or `` a ` <tool_call> `` works.", RC_READ, NULL},
+        {"span_closed_before_call", true, "</think>`a` and ``b`` " RC, "", "`a` and ``b``", RC_READ, NULL},
+        /* the state is the section's: backticks in the reasoning or in a call's value quote nothing in the content */
+        {"reasoning_backticks_do_not_leak", true, "an unclosed ```\nfence and a ` here\n</think>\n\n" RC,
+         "an unclosed ```\nfence and a ` here", "", RC_READ, NULL},
+        {"call_body_backticks_do_not_leak", true, "</think><tool_call>\n<function=f>\n<parameter=s>\n```\n`\n</parameter>"
+                                                 "\n</function>\n</tool_call>\n" RC "\nthen `<tool_call>` again",
+         "", "then `<tool_call>` again", "0:f:{\"s\": \"```\\n`\"}\n1:f:{\"n\": 3}\n", NULL},
+        /* unchanged: a think close is structure wherever it is spelled (the templates split a replayed turn on it) */
+        {"quoted_think_close_still_dropped", true, "r</think>a `</think>` b", "r", "a `` b", "", NULL},
+        {"quoted_think_close_still_closes", true, "write `</think>` then answer", "write `", "` then answer", "", NULL},
+#undef RC
+#undef RC_READ
+#undef EXAMPLE
     };
     int bad = 0;
     for (const auto &u : units) {
