@@ -186,6 +186,7 @@ tests/runner/
 /tests/fmha_gate
 /tests/rowops_gate
 /tests/qwen_chat_gate
+/tests/xml_call_bench
 /tests/inkling_chat_gate
 /tests/nemotron_chat_gate
 /tests/gemma4_chat_gate

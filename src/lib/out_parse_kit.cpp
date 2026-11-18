@@ -603,16 +603,20 @@ const out_parser_family *out_parser_family_find(int chat_format) {
 
 void xml_call_body::open() {
     began_ = false;
+    head_ws_ = head_seen_ = 0;
     fn_.clear();
-    pay_ = payload_scan();
+    pay_ = closer_ = value_scan();
 }
 
 /* One "<parameter=KEY>\nVALUE\n</parameter>" of function `fn` at b[*i]: 1 = read (*key, the typed *v,
  * *i past it), 0 = not complete yet, -1 = not a parameter; *why names what is missing or wrong.  The one
- * reading close and the stream share. */
+ * reading close and the stream share.  L429: the stream reads the parameter it waits on at every feed, so it
+ * passes `r`, where a 0 leaves how far the key's end and then the value's closer were looked for; the next
+ * reading starts there (a 0 said nothing before it ends the key or starts a whole closer, and the body only
+ * grows).  The answers are those of a reading from the parameter's start. */
 int xml_call_body::read_param(const std::string &b, size_t *i, const std::string &fn, std::string *key,
-                              pyjson_value *v, const char **why) const {
-    static const char kParam[] = "<parameter=";
+                              pyjson_value *v, const char **why, param_resume *r) const {
+    static const char kParam[] = "<parameter=", kParamEnd[] = "</parameter>";
     const size_t n = strlen(kParam), rem = b.size() - *i;
     if (b.compare(*i, std::min(rem, n), kParam, std::min(rem, n))) {
         *why = "expected <parameter= or </function>";
@@ -621,18 +625,30 @@ int xml_call_body::read_param(const std::string &b, size_t *i, const std::string
     *why = "unterminated <parameter=KEY>";
     if (rem < n) return 0;
     const size_t at = *i + n;
-    const size_t key_end = b.find('>', at);
-    if (b.find('\n', at) < key_end) return -1;
-    if (key_end == std::string::npos) return 0;
+    size_t key_end = r ? r->key_end : 0;
+    if (!key_end) {
+        /* the key ends at its '>'; a newline before it (or with no '>' yet) is not a key */
+        key_end = b.find_first_of(">\n", r ? std::max(at, r->seen) : at);
+        if (key_end == std::string::npos) {
+            if (r) r->seen = b.size();
+            return 0;
+        }
+        if (b[key_end] == '\n') return -1;
+        if (r) *r = {key_end, key_end + 1};
+    }
     *why = "unterminated parameter value";
-    const size_t close = b.find("</parameter>", key_end + 1);
-    if (close == std::string::npos) return 0;
+    const size_t close = b.find(kParamEnd, r ? r->seen : key_end + 1);
+    if (close == std::string::npos) {
+        /* a closer that starts in the last strlen - 1 bytes may still complete */
+        if (r) r->seen = std::max(r->seen, b.size() - std::min(b.size(), strlen(kParamEnd) - 1));
+        return 0;
+    }
     *key = b.substr(at, key_end - at);
     size_t vlo = key_end + 1, vhi = close;
     if (vlo < vhi && b[vlo] == '\n') vlo++;
     if (vhi > vlo && b[vhi - 1] == '\n') vhi--;
     const std::string text = b.substr(vlo, vhi - vlo);
-    *i = close + 12;
+    *i = close + strlen(kParamEnd);
     /* A value is JSON only when the schema does not declare it a string
      * AND the text is exactly what tojson would have written for it: the
      * template writes every non-string with tojson, so text in any other
@@ -663,19 +679,21 @@ int xml_call_body::read_param(const std::string &b, size_t *i, const std::string
     return 1;
 }
 
-/* The open call's parameters that closed since the last call, as TOOL_ARGS fragments. */
+/* The open call's parameters that closed since the last call, as TOOL_ARGS fragments.  L429: the parameter
+ * still open is read from where its last reading stopped (arg_resume_), not from its start. */
 void xml_call_body::stream_params(const std::string &b, int index, std::vector<out_event> *ev) {
     static const char kFnEnd[] = "</function>";
     while (!arg_stop_) {
         size_t i = arg_pos_;
         while (i < b.size() && (b[i] == ' ' || b[i] == '\n' || b[i] == '\t' || b[i] == '\r')) i++;
+        arg_pos_ = i;   /* the whitespace between parameters is skipped once */
         const size_t rem = b.size() - i;
         if (!rem || !b.compare(i, std::min(rem, strlen(kFnEnd)), kFnEnd, std::min(rem, strlen(kFnEnd))))
             return;   /* the call's close is close()'s */
         std::string key;
         pyjson_value v;
         const char *why = NULL;
-        const int r = read_param(b, &i, fn_, &key, &v, &why);
+        const int r = read_param(b, &i, fn_, &key, &v, &why, &arg_resume_);
         if (r == 0) return;
         if (r < 0) {
             arg_stop_ = true;   /* close() names the fault */
@@ -693,15 +711,16 @@ void xml_call_body::stream_params(const std::string &b, int index, std::vector<o
         ev->push_back(std::move(e));
         arg_n_++;
         arg_pos_ = i;
+        arg_resume_ = param_resume();
     }
 }
 
-/* Advance pay_ over the body's new bytes (the kit holds a partial "</tool_call>" out of it: `held`).  A
- * parameter value starts past "<parameter=KEY>" and ends at the first "</parameter>" -- close()'s
- * reading. */
-void xml_call_body::scan_payload(const std::string &b, size_t held) {
+/* Advance a value scan over the body's new bytes.  A parameter value starts past "<parameter=KEY>" and ends at
+ * the first "</parameter>" -- close()'s reading.  Outside a value `pos` waits at an open tag (or where one may
+ * still start); inside one it waits at a partial closer. */
+void xml_call_body::scan_values(value_scan *vs, const std::string &b) const {
     static const char kParam[] = "<parameter=", kParamEnd[] = "</parameter>";
-    payload_scan &ps = pay_;
+    value_scan &ps = *vs;
     for (;;) {
         if (!ps.value) {
             const size_t at = b.find(kParam, ps.pos);
@@ -709,9 +728,12 @@ void xml_call_body::scan_payload(const std::string &b, size_t held) {
                 ps.pos = b.size() > strlen(kParam) ? std::max(ps.pos, b.size() - strlen(kParam)) : ps.pos;
                 break;
             }
-            const size_t gt = b.find('>', at);
+            /* L429: a tag still open is looked through once (key_seen is at most the '>' of the last tag read,
+             * so it never hides a later tag's) */
+            const size_t gt = b.find('>', std::max(at, ps.key_seen));
             if (gt == std::string::npos) {
                 ps.pos = at;
+                ps.key_seen = b.size();
                 break;
             }
             const char *type = out_tool_param_type(tools, fn_, b.substr(at + strlen(kParam), gt - at - strlen(kParam)));
@@ -723,15 +745,17 @@ void xml_call_body::scan_payload(const std::string &b, size_t held) {
         }
         bool closed = false;
         while (ps.pos < b.size()) {
-            if (!b.compare(ps.pos, strlen(kParamEnd), kParamEnd)) {
-                ps.pos += strlen(kParamEnd);
-                ps.value = false;
-                closed = true;
-                break;
+            if (b[ps.pos] == '<') {
+                if (!b.compare(ps.pos, strlen(kParamEnd), kParamEnd)) {
+                    ps.pos += strlen(kParamEnd);
+                    ps.value = false;
+                    closed = true;
+                    break;
+                }
+                if (b.size() - ps.pos < strlen(kParamEnd) &&
+                    !b.compare(ps.pos, b.size() - ps.pos, kParamEnd, b.size() - ps.pos))
+                    break;   /* a partial closer waits for its next bytes */
             }
-            if (b[ps.pos] == '<' && b.size() - ps.pos < strlen(kParamEnd) &&
-                !b.compare(ps.pos, b.size() - ps.pos, kParamEnd, b.size() - ps.pos))
-                break;   /* a partial closer waits for its next bytes */
             const char c = b[ps.pos++];
             if (ps.is_string) continue;
             if (ps.json_str) {
@@ -744,6 +768,13 @@ void xml_call_body::scan_payload(const std::string &b, size_t held) {
         }
         if (!closed) break;
     }
+}
+
+/* Advance pay_ over the body's new bytes (the kit holds a partial "</tool_call>" out of it: `held`) and say
+ * whether the next byte is payload. */
+void xml_call_body::scan_payload(const std::string &b, size_t held) {
+    value_scan &ps = pay_;
+    scan_values(&ps, b);
     /* the payload: inside a string value or a JSON string, past the template's leading newline, not on
      * "</" of a closer (this block's or the held "</tool_call>") */
     const size_t pending = b.size() - std::min(ps.pos, b.size());
@@ -753,19 +784,13 @@ void xml_call_body::scan_payload(const std::string &b, size_t held) {
 /* L410: a "</tool_call>" found after `b` is a value's text when `b` ends inside a parameter value -- past a
  * "<parameter=KEY>" with no "</parameter>" after it (read_param's reading: a value ends at the first one).
  * One exception keeps a malformed call's error where it was: a value never closed but followed by
- * "</function>" is a call that ended, not a value that goes on (the model wrote the call's close). */
-bool xml_call_body::holds_closer(const std::string &b) const {
-    static const char kParam[] = "<parameter=", kParamEnd[] = "</parameter>", kFnEnd[] = "</function>";
-    size_t pos = 0;
-    for (;;) {
-        const size_t at = b.find(kParam, pos);
-        if (at == std::string::npos) return false;
-        const size_t gt = b.find('>', at);
-        if (gt == std::string::npos) return false;
-        const size_t end = b.find(kParamEnd, gt + 1);
-        if (end == std::string::npos) break;
-        pos = end + strlen(kParamEnd);
-    }
+ * "</function>" is a call that ended, not a value that goes on (the model wrote the call's close).
+ * L429: the values are followed by a scan of its own (closer_), advanced over what `b` gained since the last
+ * marker; a value that spells the marker many times is not read from the body's start each time. */
+bool xml_call_body::holds_closer(const std::string &b) {
+    static const char kFnEnd[] = "</function>";
+    scan_values(&closer_, b);
+    if (!closer_.value) return false;
     size_t e = b.size();
     while (e && (b[e - 1] == ' ' || b[e - 1] == '\n' || b[e - 1] == '\t' || b[e - 1] == '\r')) e--;
     return !(e >= strlen(kFnEnd) && !b.compare(e - strlen(kFnEnd), strlen(kFnEnd), kFnEnd));
@@ -774,13 +799,15 @@ bool xml_call_body::holds_closer(const std::string &b) const {
 void xml_call_body::grow(const std::string &b, size_t held, bool closing, int index,
                          std::vector<out_event> *ev) {
     if (!began_) {
-        /* announce the call as soon as its name is complete */
-        size_t i = 0;
+        /* announce the call as soon as its name is complete (L429: looking from where the last feed stopped) */
+        size_t i = head_ws_;
         while (i < b.size() && (b[i] == ' ' || b[i] == '\n' || b[i] == '\t' || b[i] == '\r')) i++;
+        head_ws_ = i;
         if (!b.compare(i, 10, "<function=")) {
-            const size_t e = b.find('>', i + 10);
-            const size_t nl = b.find('\n', i + 10);
-            if (e != std::string::npos && nl > e) {
+            /* the name ends at its '>'; a newline first is no name (close() names the fault) */
+            const size_t e = b.find_first_of(">\n", std::max(i + 10, head_seen_));
+            head_seen_ = e == std::string::npos ? b.size() : e;
+            if (e != std::string::npos && b[e] == '>') {
                 out_event ev_begin;
                 ev_begin.kind = out_event::TOOL_BEGIN;
                 ev_begin.index = index;
@@ -789,6 +816,7 @@ void xml_call_body::grow(const std::string &b, size_t held, bool closing, int in
                 ev->push_back(std::move(ev_begin));
                 began_ = true;
                 arg_pos_ = e + 1;
+                arg_resume_ = param_resume();
                 arg_n_ = 0;
                 arg_stop_ = false;
             }
@@ -829,7 +857,7 @@ bool xml_call_body::close(const std::string &b, int index, std::vector<out_event
         std::string key;
         pyjson_value v;
         const char *w = NULL;
-        if (read_param(b, &i, name, &key, &v, &w) != 1) return fail(w);
+        if (read_param(b, &i, name, &key, &v, &w, NULL) != 1) return fail(w);
         bool replaced = false;   /* a repeated key: first position, last value */
         for (auto &kv : args.o)
             if (kv.first == key) { kv.second = v; replaced = true; }

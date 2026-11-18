@@ -180,10 +180,11 @@ public:
     /// @return true when the next byte is payload (sampled), false when it is structure (greedy)
     virtual bool in_payload() const = 0;
     /** The call's closing marker was found right after body `b`: whether it is the body's own text and not
-     *  the call's end (L410: a parameter value that spells the marker).  The kit then keeps reading. */
+     *  the call's end (L410: a parameter value that spells the marker).  The kit then keeps reading.  Not const:
+     *  a body may keep a scan of `b` between calls (L429; `b` only grows while the call is open). */
     /// @param b the call's body up to the marker found
     /// @return true when the marker belongs to the body; false (the default) when it closes the call
-    virtual bool holds_closer(const std::string &b) const {
+    virtual bool holds_closer(const std::string &b) {
         (void)b;
         return false;
     }

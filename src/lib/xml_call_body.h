@@ -30,7 +30,12 @@
  *
  * L284 P6: the payload is inside a parameter value the schema declares a string, or inside a JSON string
  * literal of any other value -- past the value's leading newline (the template's) and not on a partial
- * closer ("</" onward). */
+ * closer ("</" onward).
+ *
+ * L429: every per-feed reading resumes where the last one stopped (the body only grows between open() calls), so a
+ * feed costs its new bytes and not the body so far: the call's name, the parameter the stream waits on
+ * (param_resume), the payload scan and holds_closer's scan (two cursors over one tokenizer, scan_values).  close()
+ * reads the whole body once, from its start, and is the authority on the call. */
 class xml_call_body : public out_call_body {
 public:
     /** The request's tools (the schema that types arguments). */
@@ -43,7 +48,7 @@ public:
     void open() override;
     void grow(const std::string &b, size_t held, bool closing, int index, std::vector<out_event> *ev) override;
     bool in_payload() const override { return pay_.value && pay_.payload; }
-    bool holds_closer(const std::string &b) const override;
+    bool holds_closer(const std::string &b) override;
     bool close(const std::string &b, int index, std::vector<out_event> *ev, out_call *call, const char **why,
                size_t *at) override;
 
@@ -52,6 +57,19 @@ private:
     /// @param b    the call's body so far
     /// @param held bytes the kit holds back as a possible "</tool_call>"
     void scan_payload(const std::string &b, size_t held);
+    struct value_scan;
+    /// Advance a value scan over the body's new bytes: where parameter values open ("<parameter=KEY>") and
+    /// close (the first "</parameter>" after it), and inside one, whether a JSON string literal is open.  The
+    /// one tokenizer the payload scan and holds_closer share.
+    /// @param vs the scan's state (its own cursor)
+    /// @param b  the call's body so far
+    void scan_values(value_scan *vs, const std::string &b) const;
+    /// Where the stream's reading of the one parameter it waits on stands (L429): what read_param found so far, so
+    /// its next reading of the same parameter in a longer body starts there.
+    struct param_resume {
+        size_t key_end = 0;    ///< the offset of the key's '>', once found (0: not yet; a key never ends at 0)
+        size_t seen = 0;       ///< no key end (before key_end is known) or value closer (after) starts before it
+    };
     /// Read one "<parameter=KEY>\nVALUE\n</parameter>" of function `fn` at b[*i] (the reading close() and the
     /// stream share).
     /// @param b   the call's body
@@ -60,30 +78,36 @@ private:
     /// @param key receives the parameter's name
     /// @param v   receives the typed value
     /// @param why receives what is missing or wrong (static string)
+    /// @param r   NULL (close(): a whole reading), or the stream's resume state for THIS parameter: read on 0,
+    ///            updated on 0 -- the same answers as a whole reading, without rescanning what a 0 already covered
     /// @return 1 = read, 0 = not complete yet, -1 = not a parameter
     int read_param(const std::string &b, size_t *i, const std::string &fn, std::string *key, pyjson_value *v,
-                   const char **why) const;
+                   const char **why, param_resume *r) const;
     /// Emit a TOOL_ARGS fragment for each parameter that closed since the last call.
     /// @param b     the call's body so far
     /// @param index the call's index, for the events
     /// @param ev    receives the fragments
     void stream_params(const std::string &b, int index, std::vector<out_event> *ev);
 
-    /** @var pay_
-    *  Where the open block's decode is (in_payload), scanned incrementally. */
     bool began_ = false;       ///< TOOL_BEGIN sent for the open call
+    size_t head_ws_ = 0;       ///< leading whitespace of the body skipped so far (before began_)
+    size_t head_seen_ = 0;     ///< no '>' or newline of "<function=NAME>" before this offset (before began_)
     std::string fn_;           ///< the open call's function name, once complete
-    size_t arg_pos_ = 0;       ///< body offset past the last parameter streamed (TOOL_ARGS)
+    size_t arg_pos_ = 0;       ///< body offset past the last parameter streamed (TOOL_ARGS) and the whitespace after it
+    param_resume arg_resume_;  ///< the reading of the parameter at arg_pos_ so far
     int arg_n_ = 0;            ///< parameters streamed for the open call
     bool arg_stop_ = false;    ///< the open call stopped streaming: its next bytes are not a parameter
-    /// The incremental payload scanner's state for the open call.
-    struct payload_scan {
+    /// An incremental scan of the open call's parameter values (scan_values).
+    struct value_scan {
         size_t pos = 0;        ///< bytes of the body classified
+        size_t key_seen = 0;   ///< an open "<parameter=" tag at pos has no '>' before this offset
         bool value = false;    ///< inside a parameter value
         size_t vstart = 0;     ///< where its text starts (past the tag)
         bool is_string = false;///< the schema declares it a string
         bool json_str = false; ///< inside a JSON string literal of a non-string value
         bool esc = false;      ///< the previous byte was a backslash in that literal
-        bool payload = false;  ///< the result for the next byte
-    } pay_;
+        bool payload = false;  ///< the result for the next byte (scan_payload's; pay_ only)
+    };
+    value_scan pay_;           ///< the scan in_payload reads: advanced by every grow of an announced call
+    value_scan closer_;        ///< holds_closer's scan: advanced to each closing marker found
 };
