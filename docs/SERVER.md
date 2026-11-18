@@ -223,20 +223,22 @@ Endpoint specifics:
 
 - **Chat Completions:**
   - `messages`, `tools`, `tool_choice` (`none` / `auto` / `required` / a named
-    function), `max_tokens` / `max_completion_tokens`, `stop`, `stream`,
-    `stream_options.include_usage`, `response_format`.
+    function), `parallel_tool_calls`, `max_tokens` / `max_completion_tokens`,
+    `stop`, `stream`, `stream_options.include_usage`, `response_format`.
   - `logprobs` / `top_logprobs` (0..20): a logprobs request decodes without
     speculation, so the reported distribution is the target model's.
 - **Responses:**
   - `input`, `instructions`, `tools` (function, custom and tool-search tools,
-    with `defer_loading`), `tool_choice`, `max_output_tokens`, `reasoning`,
+    with `defer_loading`), `tool_choice`, `parallel_tool_calls` (echoed in the
+    response object as applied, when sent), `max_output_tokens`, `reasoning`,
     `text.format`, `stream`.
   - A non-null `previous_response_id` or `conversation` is refused: there is no
     durable response store, so send the full input. Live continuations are
     matched by transcript and call ids.
 - **Messages:**
-  - `system`, `messages`, `tools`, `tool_choice`, `max_tokens`,
-    `stop_sequences`, `thinking`, `output_config` (`effort`, `format`), `stream`.
+  - `system`, `messages`, `tools`, `tool_choice` (with
+    `disable_parallel_tool_use`), `max_tokens`, `stop_sequences`, `thinking`,
+    `output_config` (`effort`, `format`), `stream`.
   - Anthropic **server** tool entries (`web_search_*`) are dropped at parse time.
     The server runs no server tools, and any other non-custom tool type is
     refused with Anthropic's wording.
@@ -297,6 +299,21 @@ Nemotron and Inkling use their own templates' formats.
   is decided per position, the same as in plain decode.
 - **Forced calls.** `tool_choice` `required` or a named tool is enforced by a
   grammar over the name and the arguments, in every lane.
+- **At most one call a turn.** `parallel_tool_calls: false` (Chat Completions,
+  Responses) or `tool_choice.disable_parallel_tool_use: true` (Messages) ends
+  the turn where its first tool call closes: one call comes back, with the
+  finish reason a single-call turn has (`tool_calls` / `tool_use`), and nothing
+  the model would have written after it is generated into the reply or counted.
+  Content and reasoning before the call stay; a turn that makes no call is
+  unaffected. The cut is the output parser's reading, so it holds with or
+  without a grammar; a call grammar (strict or forced tools) admits one call
+  and then only the end of the turn. On DeepSeek, whose calls share one DSML
+  block, the turn's calls are constrained by the flag alone (the grammar admits
+  one invoke and the block's close), so such a request is refused on a
+  tensor-parallel pair, as any constrained request is.
+- **Deferred tools.** `defer_loading: true` is read beside a tool's definition
+  and inside OpenAI's nested `function` object. The key itself is never part of
+  a rendered tool schema.
 
 ### Structured output
 

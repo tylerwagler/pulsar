@@ -1593,7 +1593,8 @@ static void test_tool_call_quality_one(void) {
         g.thinking.feed(piece, piece_len);
         free(piece);
         if (!ops->feed(ps, &srv, &g, g.text.len, false)) { decode_ok = false; break; }
-        if (ops->turn_complete(ps, &g)) {
+        size_t turn_end = g.text.len;   /* L428: where the turn ends (its whole text: no single-call request here) */
+        if (ops->turn_complete(ps, &g, &turn_end)) {
             g.finish = "stop";
             break;
         }

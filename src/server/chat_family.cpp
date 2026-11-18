@@ -469,8 +469,10 @@ bool chat_openai_tools_json(const chat_conversation *c, request *r, char **head_
     *head_json = NULL;
     if (c->tool_choice == CHAT_TOOL_CHOICE_NONE) return true;
     const bool deferred = c->deferred_tool_schemas && c->deferred_tool_schemas[0];
-    /* HF's input as sent -- unless some tool is deferred (L325), which only the schema lines separate */
-    if (r->api == API_OPENAI && c->tools_raw && !deferred) {
+    /* HF's input as sent -- unless some tool is deferred (L325), which only the schema lines separate, or an entry
+     * spells defer_loading at all (L428: the key is the client's instruction to the server, never a schema's; the
+     * lines leave it out) */
+    if (r->api == API_OPENAI && c->tools_raw && !deferred && !tools_array_says_defer_loading(c->tools_raw)) {
         r->tools_json = server_xstrdup(c->tools_raw);
         *head_json = server_xstrdup(c->tools_raw);
         return true;
@@ -782,6 +784,7 @@ static const server_family_ops k_family_deepseek_v41 = {
     /* .find_call_block       = */ find_next_dsml_tool_block,
     /* .tool_defs_text        = */ deepseek_tool_defs_text,
     /* .reasoning             = */ NULL,   /* <think> / </think> */
+    /* .call_tail             = */ "",     /* the calls share one block: its close ends them (the grammar's block_tail) */
 };
 /** DeepSeek V4 (0731)'s family table. */
 static const server_family_ops k_family_deepseek_v4 = {
@@ -801,6 +804,7 @@ static const server_family_ops k_family_deepseek_v4 = {
     /* .find_call_block       = */ find_next_dsml_tool_block,
     /* .tool_defs_text        = */ deepseek_tool_defs_text,
     /* .reasoning             = */ NULL,   /* <think> / </think> */
+    /* .call_tail             = */ "",     /* the calls share one block: its close ends them (the grammar's block_tail) */
 };
 
 /* L295 F8 step 5: the tables this file owns (DeepSeek's two); every other family's registers in its module */

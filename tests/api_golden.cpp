@@ -9,7 +9,9 @@
  * The corpus is JSONL, one case a line: {"name":..., "endpoint":"chat|anthropic|responses",
  * "family":"deepseek|qwen|inkling", "body":{...}}.  The golden was recorded from the parsers before L267 moved
  * them; any difference is a change in what a request means.  The Inkling rows (L294 E6) are appended after the
- * others, recorded from inkling_server.cpp's first build (its render is graded against vLLM by inkling-chat-gate). */
+ * others, recorded from inkling_server.cpp's first build (its render is graded against vLLM by inkling-chat-gate).
+ * The L428 rows (parallel_tool_calls / disable_parallel_tool_use, a nested defer_loading) are appended after those;
+ * a request that says nothing about parallel calls prints no line for it. */
 #define PULSAR_SERVER_TEST
 #define PULSAR_SERVER_TEST_NO_MAIN
 #include "../src/server/util.cpp"
@@ -79,6 +81,10 @@ static void dump(const request *r) {
            r->stream_include_usage);
     printf("  think_mode %d has_tools %d force_tool_call %d summary %d\n", (int)r->think_mode, r->has_tools,
            r->force_tool_call, r->reasoning_summary_emit);
+    /* L428: printed only when the request said something about parallel calls, so the rows recorded before it are
+     * the bytes they were */
+    if (r->single_tool_call || r->parallel_tool_calls_sent)
+        printf("  single_tool_call %d parallel_tool_calls_sent %d\n", r->single_tool_call, r->parallel_tool_calls_sent);
     put_str("forced_tool_name", r->forced_tool_name);
     put_list("stops", &r->stops);
     printf("  tool_orders %d:", r->tool_orders.len);

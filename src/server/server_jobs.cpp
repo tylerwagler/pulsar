@@ -1751,6 +1751,7 @@ void server::gen_decode_init(session_slot *sl) {
     g->stop_scan_from = 0;
     g->finish = "length";
     g->abandoned = false;
+    g->turn_cut_short = false;
     g->completion = 0;
     /* Continued attempts (tool-error recovery) spend the request's ONE
      * max_tokens budget: completion_total holds what earlier attempts already
@@ -1997,6 +1998,59 @@ uint32_t gen_spec_greedy_rows(server *s, const gen_state *g, const TokId *toks, 
     return bits;
 }
 
+/* L428: where a pending chain meets the end of a turn that may make one call.  The walk is gen_spec_greedy_rows_text's
+ * -- a scratch copy of the decode-time state (the parser's probe, the reasoning tracker, the stop scan, the text)
+ * advanced by the emit path's own release rule -- and it asks the probe what the emit path asks the parser after each
+ * token (turn_complete).  The chain is cut after the token that says yes: the round then verifies nothing the server
+ * would commit and not emit.  A stop token or a stop string ends the walk (the round clamps or the emit stops there
+ * as before). */
+int gen_turn_draft_prefix_text(const gen_state *g, const char *const *pieces, const size_t *piece_lens, int n) {
+    const request *req = &g->j->req;
+    if (n <= 0 || !req->single_tool_call || req->kind != REQ_CHAT || !req->has_tools || !g->parser_st) return n;
+    void *probe = g->parser->probe_new(g->parser_st);
+    buf text;
+    memset(&text, 0, sizeof text);
+    if (g->text.len) buf_append(&text, g->text.ptr, g->text.len);
+    thinking_state thinking = g->thinking;
+    size_t stop_scan_from = g->stop_scan_from;
+    size_t plain_stream_pos = g->plain_stream_pos;
+    int keep = n;
+    for (int i = 0; i <= n; i++) {   /* pieces[0] is the base, pieces[i] draft i - 1 */
+        if (!pieces[i]) break;
+        buf_append(&text, pieces[i], piece_lens[i]);
+        size_t stop_pos = 0, stop_len = 0, end = 0;
+        bool hit_stop = false;
+        const size_t upto = gen_release(&req->stops, text.ptr, text.len, pieces[i], piece_lens[i], plain_stream_pos,
+                                        &thinking, &stop_scan_from, &hit_stop, &stop_pos, &stop_len);
+        if (hit_stop) break;
+        if (gen_streams_plain(g) && upto > plain_stream_pos) plain_stream_pos = upto;
+        g->parser->probe_feed(probe, g, text.ptr, text.len, upto);
+        if (g->parser->turn_complete(probe, g, &end)) {
+            keep = i;
+            break;
+        }
+    }
+    buf_free(&text);
+    g->parser->probe_free(probe);
+    return keep;
+}
+
+/* gen_turn_draft_prefix_text over the chain's token ids (the engine's texts and stop set). */
+int gen_turn_draft_prefix(server *s, const gen_state *g, TokId base_id, const TokId *drafts, int n) {
+    const request *req = &g->j->req;
+    if (n <= 0 || !req->single_tool_call || req->kind != REQ_CHAT || !req->has_tools || !g->parser_st) return n;
+    char *pieces[PULSAR_SPEC_LOGITS_ROWS + 1] = {};
+    size_t lens[PULSAR_SPEC_LOGITS_ROWS + 1] = {};
+    if (n > (int)PULSAR_SPEC_LOGITS_ROWS) pulsar_die("gen_turn_draft_prefix: more drafts than a round's rows");
+    for (int i = 0; i <= n; i++) {
+        const TokId t = i ? drafts[i - 1] : base_id;
+        pieces[i] = pulsar_token_is_stop(s->engine, t) ? NULL : pulsar_token_text(s->engine, t, &lens[i]);
+    }
+    const int keep = gen_turn_draft_prefix_text(g, pieces, lens, n);
+    for (int i = 0; i <= n; i++) free(pieces[i]);
+    return keep;
+}
+
 
 /* Emit one already-decoded token into the response stream: append it to the
  * accumulated text, feed the thinking/DSML trackers, run stop-string and
@@ -2018,7 +2072,6 @@ uint32_t gen_spec_greedy_rows(server *s, const gen_state *g, const TokId *toks, 
 bool server::gen_emit_token(session_slot *sl, int token) {
     auto *s = this;
     gen_state *g = sl->gen;
-    job *j = g->j;
     if (pulsar_token_is_stop(s->engine, TokId{token})) {
         g->finish = "stop";
         return true;
@@ -2031,6 +2084,14 @@ bool server::gen_emit_token(session_slot *sl, int token) {
 
     size_t piece_len = 0;
     char *piece = pulsar_token_text(s->engine, TokId{token}, &piece_len);
+    const bool stop = s->gen_emit_piece(g, token, piece, piece_len);
+    free(piece);
+    return stop;
+}
+
+bool server::gen_emit_piece(gen_state *g, int token, const char *piece, size_t piece_len) {
+    auto *s = this;
+    job *j = g->j;
     g->completion++;
     /* Lane-independent generation counter: every decode lane funnels its
      * accepted tokens through here, so this is the one place that sees them
@@ -2061,7 +2122,6 @@ bool server::gen_emit_token(session_slot *sl, int token) {
         if (!ok) {
             g->finish = "error";
             snprintf(g->err, sizeof(g->err), "client stream write failed");
-            free(piece);
             return true;
         }
         g->plain_stream_pos = stream_len;
@@ -2070,10 +2130,8 @@ bool server::gen_emit_token(session_slot *sl, int token) {
     if (!g->parser->feed(g->parser_st, s, g, stream_len, false)) {
         g->finish = "error";
         snprintf(g->err, sizeof(g->err), "client stream write failed");
-        free(piece);
         return true;
     }
-    free(piece);
 
     if (g->completion >= g->next_decode_log) {
         bool tool_open = false, tool_closed = false;
@@ -2104,12 +2162,28 @@ bool server::gen_emit_token(session_slot *sl, int token) {
         return true;
     }
 
-    /* the family's turn ends before the stop token (DeepSeek: a closed DSML block) */
-    if (j->req.kind == REQ_CHAT && j->req.has_tools && g->parser->turn_complete(g->parser_st, g)) {
-        g->finish = "tool_calls";
-        return true;
+    return gen_turn_complete(g);
+}
+
+/* The family's turn ends before the stop token: DeepSeek's closed DSML block, and (L428) the first call of a turn
+ * that may make one (request::single_tool_call), in every family.  The parser says where the turn ends; the text is
+ * cut there, as it is cut at a stop string.  The bank keeps the tokens through this one: when the turn ends at this
+ * token's last byte, that is the state a turn whose next draw was its stop token leaves (a stop is never evaluated
+ * as a round's base), and the family's tail joins it with the turn's close (L290).  When it ends earlier -- a token
+ * that runs past the call's close, a model that left its template after it -- the bank holds more than the turn,
+ * and the turn is marked (gen_state::turn_cut_short) so that nothing is appended to that history blind. */
+bool gen_turn_complete(gen_state *g) {
+    const request *r = &g->j->req;
+    size_t end = g->text.len;
+    if (r->kind != REQ_CHAT || !r->has_tools || !g->parser->turn_complete(g->parser_st, g, &end)) return false;
+    if (end > g->text.len) pulsar_die("output parser: the turn ends past its text");
+    if (end < g->text.len) {
+        g->text.len = end;
+        g->text.ptr[end] = '\0';
+        g->turn_cut_short = true;   /* the bank holds this token whole: no live continuation from it (gen_step_finish) */
     }
-    return false;
+    g->finish = "tool_calls";
+    return true;
 }
 
 
@@ -2267,7 +2341,10 @@ void server::gen_step_finish(session_slot *sl) {
     if (j->req.api == API_RESPONSES) {
         /* the visible suffix is the family's sampled-turn render; a family without one keeps no
          * visible memory (its renderer refuses a request that needs the live state) */
-        if (j->req.family->assistant_turn_sampled && strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
+        /* L428: nor after a turn cut short of its last token (gen_turn_complete): the tail would join a history
+         * that holds more than the turn */
+        if (j->req.family->assistant_turn_sampled && strcmp(final_finish, "error") && strcmp(final_finish, "length") &&
+            !g->turn_cut_short) {
             /* Store the post-turn visible transcript plus the live token
              * frontier.  The next Responses request may replay only this
              * visible surface, while the real session also contains hidden
@@ -2293,7 +2370,8 @@ void server::gen_step_finish(session_slot *sl) {
          * continuation that would need it), so nothing is remembered for it */
         /* L337: nor after an edited prompt -- the KV is the edited history, and the client's next request renders
          * as sent unless its own edits clear the same parts, so only a prefix match can tell */
-        if (parsed_calls.len && j->req.family->tool_result_tail && !j->req.ctx_edited &&
+        /* L428: nor after a turn cut short of its last token (gen_turn_complete) */
+        if (parsed_calls.len && j->req.family->tool_result_tail && !j->req.ctx_edited && !g->turn_cut_short &&
             strcmp(final_finish, "error") && strcmp(final_finish, "length"))
         {
             s->anthropic_live_remember(sl, &parsed_calls);

@@ -426,6 +426,48 @@ static bool parse_openai_tool_choice(const char **p, chat_conversation *c, reque
     return json_skip_value(p);
 }
 
+/* L428: OpenAI's `parallel_tool_calls` (chat and Responses; default true): false allows the turn at most one tool
+ * call (request::single_tool_call).  null is the SDKs' "not set".  Anthropic says the same with
+ * tool_choice.disable_parallel_tool_use (take_disable_parallel_tool_use). */
+/// Read `parallel_tool_calls`.
+/// @param p       the parse cursor, at the value (advanced past it)
+/// @param r       the request (single_tool_call, parallel_tool_calls_sent)
+/// @param err     receives the reason on refusal
+/// @param errlen  size of `err`
+/// @return false when the value is neither a boolean nor null
+static bool take_parallel_tool_calls(const char **p, request *r, char *err, size_t errlen) {
+    json_ws(p);
+    if (json_lit(p, "null")) return true;
+    bool parallel = true;
+    if (!json_bool(p, &parallel)) {
+        snprintf(err, errlen, "parallel_tool_calls: not a boolean");
+        return false;
+    }
+    r->single_tool_call = !parallel;
+    r->parallel_tool_calls_sent = true;
+    return true;
+}
+
+/* L428: Anthropic's tool_choice.disable_parallel_tool_use (on "auto", "any" and "tool"; default false): true allows
+ * the turn at most one tool use (request::single_tool_call). */
+/// Read tool_choice's `disable_parallel_tool_use`.
+/// @param p       the parse cursor, at the value (advanced past it)
+/// @param r       the request (single_tool_call)
+/// @param err     receives the reason on refusal
+/// @param errlen  size of `err`
+/// @return false when the value is neither a boolean nor null
+static bool take_disable_parallel_tool_use(const char **p, request *r, char *err, size_t errlen) {
+    json_ws(p);
+    if (json_lit(p, "null")) return true;
+    bool disable = false;
+    if (!json_bool(p, &disable)) {
+        snprintf(err, errlen, "tool_choice.disable_parallel_tool_use: not a boolean");
+        return false;
+    }
+    r->single_tool_call = disable;
+    return true;
+}
+
 bool parse_chat_conversation_openai(const char *body, chat_conversation *c, request *r, char *err,
                                     size_t errlen) {
     if (err && errlen) err[0] = '\0';
@@ -457,6 +499,8 @@ bool parse_chat_conversation_openai(const char *body, chat_conversation *c, requ
             ok = take_tools(&p, c, r, false, err, errlen);
         } else if (!strcmp(key, "tool_choice")) {
             ok = parse_openai_tool_choice(&p, c, r, err, errlen);
+        } else if (!strcmp(key, "parallel_tool_calls")) {
+            ok = take_parallel_tool_calls(&p, r, err, errlen);   /* L428 */
         } else if (!strcmp(key, "model")) {
             free(r->model);
             ok = json_string(&p, &r->model);
@@ -633,8 +677,8 @@ bool parse_chat_conversation_anthropic(const char *body, chat_conversation *c, r
         } else if (!strcmp(key, "tools")) {
             ok = take_tools(&p, c, r, true, err, errlen);
         } else if (!strcmp(key, "tool_choice")) {
-            /* {"type":"auto"|"any"|"none"|"tool", "name":...}: "any" and "tool"
-             * require a call (a named one for "tool"). */
+            /* {"type":"auto"|"any"|"none"|"tool", "name":..., "disable_parallel_tool_use":...}: "any" and "tool"
+             * require a call (a named one for "tool"); L428: disable_parallel_tool_use allows the turn one. */
             json_ws(&p);
             if (*p == '{') {
                 p++;
@@ -660,6 +704,8 @@ bool parse_chat_conversation_anthropic(const char *body, chat_conversation *c, r
                         free(r->forced_tool_name);
                         r->forced_tool_name = NULL;
                         ok = json_string(&p, &r->forced_tool_name);
+                    } else if (ok && !strcmp(ckey, "disable_parallel_tool_use")) {
+                        ok = take_disable_parallel_tool_use(&p, r, err, errlen);   /* L428 */
                     } else if (ok) {
                         ok = json_skip_value(&p);
                     }
@@ -1720,6 +1766,8 @@ bool parse_chat_conversation_responses(const char *body, chat_conversation *c, r
             } else {
                 ok = json_skip_value(&p);
             }
+        } else if (!strcmp(key, "parallel_tool_calls")) {
+            ok = take_parallel_tool_calls(&p, r, err, errlen);   /* L428 */
         } else if (!strcmp(key, "text")) {
             ok = take_response_format(&p, c, "format", err, errlen);
         } else if (!strcmp(key, "model")) {

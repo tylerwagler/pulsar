@@ -398,6 +398,26 @@ bool parser_finish_turn(server *s, session_slot *sl, gen_state *g, server_turn *
         }
         out->calls.len = kept;
     }
+    if (r->single_tool_call && out->calls.len > 1) {
+        /* L428: a turn that may make one call ends where its first call closes (gen_turn_complete) or is constrained
+         * to one (a family whose calls share a block), so more than one reaches here only from a reading outside
+         * both: DeepSeek's recovery of a complete DSML block from unclosed reasoning, which neither the gate nor the
+         * turn's end sees coming.  The request's limit still holds: the first call is the turn's, the rest are
+         * dropped as an undeclared call is -- said in the log, and with no tool memory, since the sampled bytes hold
+         * them (the next prompt re-renders the one call: a prefix miss, never a wrong prompt). */
+        server_log(PULSAR_LOG_WARNING,
+                   "pulsar-server: chat ctx=%s%s%s the turn may make one tool call and read %d: the first is kept",
+                   g->ctx_span, g->req_flags[0] ? " " : "", g->req_flags, out->calls.len);
+        s->trace_event(g->trace_id, "single tool call: %d calls read, the first kept", out->calls.len);
+        for (int i = 1; i < out->calls.len; i++) {
+            free(out->calls.v[i].id);
+            free(out->calls.v[i].name);
+            free(out->calls.v[i].arguments);
+        }
+        out->calls.len = 1;
+        free(out->calls.raw_calls);
+        out->calls.raw_calls = NULL;
+    }
     if (broken && !logged) {
         server_log(PULSAR_LOG_WARNING, "pulsar-server: chat ctx=%s%s%s %s", g->ctx_span, g->req_flags[0] ? " " : "",
                    g->req_flags, detail);

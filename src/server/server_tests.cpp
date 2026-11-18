@@ -4533,6 +4533,56 @@ static void test_l419_gate_and_parser_agree_on_quoted_calls(void) {
             gen_constrain_end(&g);
             buf_free(&g.text);
         }
+        /* L428: the same turns in a request that may make one call.  To the turn's first complete call the two
+         * readers agree byte for byte as before.  From that call's close the region goes on through the bytes the
+         * family's template writes after a call (call_tail), which is where the server ends the turn
+         * (parser_kit.cpp): there the gate is past the turn's call (gen_constrain_turn_over), not a byte earlier, and
+         * admits the stop token alone. */
+        {
+            job j1;
+            memset(&j1, 0, sizeof j1);
+            TEST_ASSERT(l303_request(&srv, f.fmt, API_OPENAI, L303_BODY(",\"parallel_tool_calls\":false"), &j1.req, err,
+                                     sizeof err));
+            TEST_ASSERT(j1.req.constrain != NULL && j1.req.single_tool_call);
+            const std::string tail = j1.req.family->call_tail;
+            for (const turn &t : fixed) {
+                gen_state g;
+                TEST_ASSERT(l303_begin(&srv, &j1, &g));
+                out_parser *p = parser_of(f, g.thinking.inside);
+                const std::string text = f.before + t.text;
+                std::vector<out_event> ev;
+                bool same = true;
+                size_t i = 0;
+                for (; same && i < text.size() && p->calls().empty(); i++) {
+                    const int tok = (uint8_t)text[i];
+                    same = l303_allows(&srv, &g, tok) && gen_constrain_accept(&srv, &g, tok);
+                    if (!same) break;
+                    p->feed(&text[i], 1, &ev);
+                    if (p->calls().empty()) same = gen_constrain_live(&g) == p->in_tool_call() && !gen_constrain_turn_over(&g);
+                }
+                if (!same) fprintf(stderr, "l428 gate %d: readers part at byte %zu of \"%s\"\n", (int)f.fmt, i, t.text.c_str());
+                TEST_ASSERT(same);
+                TEST_ASSERT((int)p->calls().size() == (t.calls > 0 ? 1 : 0) && p->errors() == 0 && !p->in_tool_call());
+                if (t.calls > 0) {
+                    /* the call closed: the template's bytes after it, then the turn is over */
+                    for (size_t k = 0; k < tail.size(); k++) {
+                        TEST_ASSERT(gen_constrain_live(&g) && !gen_constrain_turn_over(&g));
+                        TEST_ASSERT(!l303_allows(&srv, &g, v.stop) && l303_allows(&srv, &g, (uint8_t)tail[k]));
+                        TEST_ASSERT(gen_constrain_accept(&srv, &g, (uint8_t)tail[k]));
+                    }
+                    TEST_ASSERT(gen_constrain_turn_over(&g));
+                    TEST_ASSERT(l303_allows(&srv, &g, v.stop) && !l303_allows(&srv, &g, '\n') &&
+                                !l303_allows(&srv, &g, v.id("<tool_call>")) && !l303_allows(&srv, &g, '<'));
+                    if (t.calls > 1) TEST_ASSERT(i < text.size());   /* the second call was never read */
+                } else {
+                    TEST_ASSERT(!gen_constrain_turn_over(&g) && i == text.size());
+                }
+                delete p;
+                gen_constrain_end(&g);
+                buf_free(&g.text);
+            }
+            request_free(&j1.req);
+        }
         /* random prose: Markdown's pieces, the family's markers and the trigger; a trigger both read as a call is
          * followed by the rest of one */
         std::vector<std::string> pieces = {"`", "`", "``", "```", "```", "~~~", "\n", "\n", "\n\n", " ", "   ", "\t", "x",
@@ -4594,6 +4644,862 @@ static void test_l419_gate_and_parser_agree_on_quoted_calls(void) {
         TEST_ASSERT(l303_feed(&srv, &g, text) == text.size());
         TEST_ASSERT(gen_constrain_live(&g));
         l303_end(&j, &g);
+    }
+    l303_server_free(&srv);
+}
+
+/* ==== L428: a turn that may make one tool call ============================================================ */
+
+/* Two tools, neither strict: search(q) and now(), in each protocol's spelling. */
+#define L428_TOOLS                                                                                                  \
+    "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"search\",\"parameters\":{\"type\":\"object\","       \
+    "\"properties\":{\"q\":{\"type\":\"string\"}},\"required\":[\"q\"]}}},"                                          \
+    "{\"type\":\"function\",\"function\":{\"name\":\"now\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}]"
+#define L428_AN_TOOLS                                                                                               \
+    "\"tools\":[{\"name\":\"search\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"q\":{\"type\":"         \
+    "\"string\"}},\"required\":[\"q\"]}},{\"name\":\"now\",\"input_schema\":{\"type\":\"object\",\"properties\":{}}}]"
+#define L428_RS_TOOLS                                                                                               \
+    "\"tools\":[{\"type\":\"function\",\"name\":\"search\",\"parameters\":{\"type\":\"object\",\"properties\":"      \
+    "{\"q\":{\"type\":\"string\"}},\"required\":[\"q\"]}},{\"type\":\"function\",\"name\":\"now\",\"parameters\":"   \
+    "{\"type\":\"object\",\"properties\":{}}}]"
+#define L428_OA(extra) "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]," L428_TOOLS extra "}"
+#define L428_AN(extra) "{\"max_tokens\":64,\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]," L428_AN_TOOLS extra "}"
+#define L428_RS(extra) "{\"input\":\"x\"," L428_RS_TOOLS extra "}"
+
+/* L428: "at most one tool call this turn" is read on every surface -- OpenAI chat and Responses
+ * `parallel_tool_calls: false`, Anthropic tool_choice.disable_parallel_tool_use on auto / any / tool -- into
+ * request::single_tool_call; true, null and no key are today's request; a value that is not a boolean is refused by
+ * name; and the flag renders nothing (the prompt is the flagless request's, every family). */
+static void test_l428_flag_parses_on_every_surface(void) {
+    struct pcase {
+        api_style api;
+        const char *body;
+        bool ok, single, sent;
+        chat_tool_choice choice;
+        const char *forced;   /* the named tool, or NULL */
+    };
+    static const pcase cases[] = {
+        {API_OPENAI, L428_OA(""), true, false, false, CHAT_TOOL_CHOICE_AUTO, NULL},
+        {API_OPENAI, L428_OA(",\"parallel_tool_calls\":false"), true, true, true, CHAT_TOOL_CHOICE_AUTO, NULL},
+        {API_OPENAI, L428_OA(",\"parallel_tool_calls\":true"), true, false, true, CHAT_TOOL_CHOICE_AUTO, NULL},
+        {API_OPENAI, L428_OA(",\"parallel_tool_calls\":null"), true, false, false, CHAT_TOOL_CHOICE_AUTO, NULL},
+        {API_OPENAI, L428_OA(",\"parallel_tool_calls\":\"no\""), false, false, false, CHAT_TOOL_CHOICE_AUTO, NULL},
+        {API_OPENAI, L428_OA(",\"parallel_tool_calls\":0"), false, false, false, CHAT_TOOL_CHOICE_AUTO, NULL},
+        {API_OPENAI, L428_OA(",\"parallel_tool_calls\":false,\"tool_choice\":\"required\""), true, true, true,
+         CHAT_TOOL_CHOICE_ANY, NULL},
+        {API_OPENAI,
+         L428_OA(",\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":\"now\"}},\"parallel_tool_calls\":false"),
+         true, true, true, CHAT_TOOL_CHOICE_NAMED, "now"},
+        /* no tools: read, and a no-op (nothing to call) */
+        {API_OPENAI, "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"parallel_tool_calls\":false}", true, true,
+         true, CHAT_TOOL_CHOICE_AUTO, NULL},
+        {API_RESPONSES, L428_RS(""), true, false, false, CHAT_TOOL_CHOICE_AUTO, NULL},
+        {API_RESPONSES, L428_RS(",\"parallel_tool_calls\":false"), true, true, true, CHAT_TOOL_CHOICE_AUTO, NULL},
+        {API_RESPONSES, L428_RS(",\"parallel_tool_calls\":true"), true, false, true, CHAT_TOOL_CHOICE_AUTO, NULL},
+        {API_RESPONSES, L428_RS(",\"parallel_tool_calls\":null"), true, false, false, CHAT_TOOL_CHOICE_AUTO, NULL},
+        {API_RESPONSES, L428_RS(",\"parallel_tool_calls\":[]"), false, false, false, CHAT_TOOL_CHOICE_AUTO, NULL},
+        {API_RESPONSES, L428_RS(",\"tool_choice\":\"required\",\"parallel_tool_calls\":false"), true, true, true,
+         CHAT_TOOL_CHOICE_ANY, NULL},
+        {API_ANTHROPIC, L428_AN(""), true, false, false, CHAT_TOOL_CHOICE_AUTO, NULL},
+        {API_ANTHROPIC, L428_AN(",\"tool_choice\":{\"type\":\"auto\"}"), true, false, false, CHAT_TOOL_CHOICE_AUTO, NULL},
+        {API_ANTHROPIC, L428_AN(",\"tool_choice\":{\"type\":\"auto\",\"disable_parallel_tool_use\":true}"), true, true,
+         false, CHAT_TOOL_CHOICE_AUTO, NULL},
+        {API_ANTHROPIC, L428_AN(",\"tool_choice\":{\"disable_parallel_tool_use\":true,\"type\":\"any\"}"), true, true,
+         false, CHAT_TOOL_CHOICE_ANY, NULL},
+        {API_ANTHROPIC,
+         L428_AN(",\"tool_choice\":{\"type\":\"tool\",\"name\":\"search\",\"disable_parallel_tool_use\":true}"), true,
+         true, false, CHAT_TOOL_CHOICE_NAMED, "search"},
+        {API_ANTHROPIC, L428_AN(",\"tool_choice\":{\"type\":\"auto\",\"disable_parallel_tool_use\":false}"), true,
+         false, false, CHAT_TOOL_CHOICE_AUTO, NULL},
+        {API_ANTHROPIC, L428_AN(",\"tool_choice\":{\"type\":\"auto\",\"disable_parallel_tool_use\":null}"), true, false,
+         false, CHAT_TOOL_CHOICE_AUTO, NULL},
+        {API_ANTHROPIC, L428_AN(",\"tool_choice\":{\"type\":\"any\",\"disable_parallel_tool_use\":\"yes\"}"), false,
+         false, false, CHAT_TOOL_CHOICE_AUTO, NULL},
+    };
+    for (const pcase &pc : cases) {
+        chat_conversation c = {};
+        request r;
+        test_request_init(&r, REQ_CHAT, 64);
+        r.api = pc.api;
+        char err[200] = "";
+        const bool ok = pc.api == API_RESPONSES   ? parse_chat_conversation_responses(pc.body, &c, &r, err, sizeof err)
+                        : pc.api == API_ANTHROPIC ? parse_chat_conversation_anthropic(pc.body, &c, &r, err, sizeof err)
+                                                  : parse_chat_conversation_openai(pc.body, &c, &r, err, sizeof err);
+        if (ok != pc.ok) fprintf(stderr, "l428 parse: %s -> %d (%s)\n", pc.body, (int)ok, err);
+        TEST_ASSERT(ok == pc.ok);
+        if (ok) {
+            TEST_ASSERT(r.single_tool_call == pc.single && r.parallel_tool_calls_sent == pc.sent);
+            TEST_ASSERT(c.tool_choice == pc.choice);
+            TEST_ASSERT(pc.forced ? r.forced_tool_name && !strcmp(r.forced_tool_name, pc.forced) : !r.forced_tool_name);
+        } else {
+            TEST_ASSERT(strstr(err, "parallel_tool") && strstr(err, "not a boolean"));
+        }
+        request_free(&r);
+        chat_conversation_free(&c);
+    }
+    /* the flag changes no byte of the prompt, with tools and without, forced or not */
+    static const char *const pairs[][2] = {
+        {L428_OA(""), L428_OA(",\"parallel_tool_calls\":false")},
+        {L428_OA(",\"tool_choice\":\"required\""), L428_OA(",\"tool_choice\":\"required\",\"parallel_tool_calls\":false")},
+        {"{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+         "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"parallel_tool_calls\":false}"},
+    };
+    for (pulsar_chat_format fmt : {PULSAR_CHAT_QWEN, PULSAR_CHAT_NEMOTRON_H, PULSAR_CHAT_GEMMA4, PULSAR_CHAT_DS4_V41,
+                                   PULSAR_CHAT_DS4_V4, PULSAR_CHAT_INKLING}) {
+        for (const auto &pair : pairs) {
+            if (fmt == PULSAR_CHAT_INKLING && strstr(pair[0], "required")) continue;   /* its render takes no forced call */
+            request r[2];
+            char err[200];
+            for (int k = 0; k < 2; k++) {
+                const bool ok = l303_request(NULL, fmt, API_OPENAI, pair[k], &r[k], err, sizeof err);
+                if (!ok) fprintf(stderr, "l428 render fmt %d: %s\n", (int)fmt, err);
+                TEST_ASSERT(ok);
+            }
+            TEST_ASSERT(r[0].prompt_text && r[1].prompt_text && !strcmp(r[0].prompt_text, r[1].prompt_text));
+            TEST_ASSERT(r[0].has_tools == r[1].has_tools && r[0].force_tool_call == r[1].force_tool_call);
+            TEST_ASSERT(!r[0].single_tool_call && r[1].single_tool_call);
+            for (int k = 0; k < 2; k++) request_free(&r[k]);
+        }
+    }
+}
+
+/* One family's turn for the L428 tests, in the bytes its template renders: the reasoning and its close, what
+ * separates the turn's content from its calls, the bytes that open the calls' block (a family whose calls share
+ * one), a call to search(q="pulsars"), what separates two calls (after the first one's call_tail), a call to now(),
+ * and the block's close. */
+struct l428_fam {
+    pulsar_chat_format fmt;
+    const char *before, *gap, *open, *call, *between, *now, *close;
+    /// the family's call_tail (server_family_ops): what its template writes after each call
+    const char *tail() const { return server_family_for_format(fmt)->call_tail; }
+};
+static const l428_fam k_l428_fams[] = {
+    {PULSAR_CHAT_QWEN, "plan</think>\n\n", "\n\n", "",
+     "<tool_call>\n<function=search>\n<parameter=q>\npulsars\n</parameter>\n</function>\n</tool_call>", "\n",
+     "<tool_call>\n<function=now>\n</function>\n</tool_call>", ""},
+    {PULSAR_CHAT_NEMOTRON_H, "plan</think>", "\n", "",
+     "<tool_call>\n<function=search>\n<parameter=q>\npulsars\n</parameter>\n</function>\n</tool_call>", "",
+     "<tool_call>\n<function=now>\n</function>\n</tool_call>", ""},
+    {PULSAR_CHAT_GEMMA4, "", "", "", "<|tool_call>call:search{q:<|\"|>pulsars<|\"|>}<tool_call|>", "",
+     "<|tool_call>call:now{}<tool_call|>", ""},
+    /* Inkling: each call is a message of its own, headed by the tool's name */
+    {PULSAR_CHAT_INKLING, "", "", "",
+     "search<|content_invoke_tool_json|>{\"name\":\"search\",\"args\":{\"q\":\"pulsars\"}}<|end_message|>",
+     "<|message_model|>", "now<|content_invoke_tool_json|>{\"name\":\"now\",\"args\":{}}<|end_message|>", ""},
+    {PULSAR_CHAT_DS4_V41, "plan</think>", "", "\n\n" PULSAR_TOOL_CALLS_START "\n",
+     PULSAR_INVOKE_START " name=\"search\">\n" PULSAR_PARAM_START " name=\"q\" string=\"true\">pulsars" PULSAR_PARAM_END
+     "\n" PULSAR_INVOKE_END "\n",
+     "", PULSAR_INVOKE_START " name=\"now\">\n\n" PULSAR_INVOKE_END "\n", PULSAR_TOOL_CALLS_END},
+    {PULSAR_CHAT_DS4_V4, "plan</think>", "", "\n\n" PULSAR_TOOL_CALLS_START_V4 "\n",
+     PULSAR_INVOKE_START_V4 " name=\"search\">\n" PULSAR_PARAM_START_V4 " name=\"q\" string=\"true\">pulsars"
+     PULSAR_PARAM_END_V4 "\n" PULSAR_INVOKE_END_V4 "\n",
+     "", PULSAR_INVOKE_START_V4 " name=\"now\">\n" PULSAR_INVOKE_END_V4 "\n", PULSAR_TOOL_CALLS_END_V4},
+};
+
+/// @param srv  the server (its toy grammar)
+/// @param g    the generation state, its gate past a single-call turn's call
+/// @param v    the toy vocabulary
+/// @return true when the next draw may be the stop token and nothing else the tests try
+static bool l428_only_the_stop(server *srv, gen_state *g, const l303_vocab &v) {
+    if (!gen_constrain_live(g) || !l303_allows(srv, g, v.stop)) return false;
+    for (int t : {(int)'\n', (int)' ', (int)'a', (int)'<', v.id("<tool_call>"), v.id("\n\n"), v.id("</think>")})
+        if (l303_allows(srv, g, t)) return false;
+    return true;
+}
+
+/* L428: the gate's call region with and without the flag, every family.  Without it a second call follows the first
+ * (a new region, or the next invoke of DeepSeek's block) as before.  With it the region admits ONE call -- in
+ * DeepSeek's block the second invoke is refused at its first byte and only the block's close goes on -- and when it
+ * completes the gate is past the turn's call: the next draw is masked to the stop tokens, any other token is refused
+ * by name, a speculative round's rows past the close carry that mask, and a pending chain is cut at the first draft
+ * after the close.  The same holds for a forced call and for a response format's "or the turn's calls" alternative.
+ * A family whose calls share one block is constrained by the flag alone (no strict tool): its turn cannot be cut at
+ * the first call's close. */
+static void test_l428_gate_admits_one_call(void) {
+    l303_vocab v;
+    server srv;
+    l303_server(&srv, v);
+    for (const l428_fam &f : k_l428_fams) {
+        const std::string head = std::string(f.before) + f.open, one = head + f.call;
+        for (int single = 0; single < 2; single++) {
+            job j;
+            memset(&j, 0, sizeof j);
+            char err[300];
+            const char *body = single ? L303_BODY(",\"parallel_tool_calls\":false") : L303_BODY("");
+            TEST_ASSERT(l303_request(&srv, f.fmt, API_OPENAI, body, &j.req, err, sizeof err));
+            TEST_ASSERT(j.req.constrain != NULL && j.req.single_tool_call == (single == 1));
+            gen_state g;
+            TEST_ASSERT(l303_begin(&srv, &j, &g));
+            TEST_ASSERT(l303_feed(&srv, &g, one) == one.size());
+            const std::string more = std::string(f.tail()) + f.between + f.now + f.tail();
+            if (!single) {
+                /* today's region: the next call goes on, and the gate never says the turn is over */
+                TEST_ASSERT(l303_feed(&srv, &g, more) == more.size());
+                TEST_ASSERT(l303_feed(&srv, &g, f.close) == strlen(f.close));
+                TEST_ASSERT(!gen_constrain_live(&g) && !gen_constrain_turn_over(&g));
+                TEST_ASSERT(l303_feed(&srv, &g, "\nand text") == 9);
+            } else {
+                if (f.close[0]) {
+                    /* a block of calls: no second invoke (refused where its tag leaves the block close's, after
+                     * their common "<"), only the block's close */
+                    TEST_ASSERT(gen_constrain_live(&g) && !gen_constrain_turn_over(&g));
+                    const std::string rest = std::string(f.close).substr(1);
+                    TEST_ASSERT(f.now[0] == f.close[0] && l303_feed(&srv, &g, f.now) == 1);
+                    TEST_ASSERT(l303_feed(&srv, &g, rest) == rest.size());
+                    TEST_ASSERT(gen_constrain_turn_over(&g));
+                } else {
+                    TEST_ASSERT(l303_feed(&srv, &g, f.tail()) == strlen(f.tail()));
+                    TEST_ASSERT(gen_constrain_turn_over(&g));
+                }
+                l303_end(&j, &g);
+                /* the same turn again, to one byte before the call region completes */
+                memset(&j, 0, sizeof j);
+                TEST_ASSERT(l303_request(&srv, f.fmt, API_OPENAI, body, &j.req, err, sizeof err));
+                TEST_ASSERT(l303_begin(&srv, &j, &g));
+                const std::string whole = one + f.close + f.tail();   /* the region: the call, the template's bytes after it */
+                TEST_ASSERT(l303_feed(&srv, &g, whole.substr(0, whole.size() - 1)) == whole.size() - 1);
+                TEST_ASSERT(gen_constrain_live(&g) && !gen_constrain_turn_over(&g));
+                const TokId last{(int)(uint8_t)whole.back()};
+                const TokId round[3] = {last, TokId{(int)'\n'}, TokId{(int)'x'}};
+                const uint32_t *masks = NULL;
+                const uint32_t W = gen_constrain_words(&srv);
+                TEST_ASSERT(gen_constrain_round(&srv, &g, round, 3, false, &masks) == 3 && masks);
+                auto bit = [&](int row, int t) {
+                    return (masks[(size_t)row * W + ((uint32_t)t >> 5)] >> ((uint32_t)t & 31u)) & 1u;
+                };
+                TEST_ASSERT(bit(0, v.stop) && !bit(0, '\n') && !bit(0, 'x') && !bit(0, v.id("<tool_call>")));
+                TEST_ASSERT(!gen_constrain_turn_over(&g));   /* the walk was rolled back */
+                /* the pending chain: nothing after the token that completes the call, a stop excepted */
+                const TokId drafts[2] = {TokId{(int)'\n'}, TokId{(int)'x'}};
+                TEST_ASSERT(gen_constrain_draft_prefix(&srv, &g, last, drafts, 2) == 0);
+                const TokId ends[2] = {TokId{v.stop}, TokId{(int)'x'}};
+                TEST_ASSERT(gen_constrain_draft_prefix(&srv, &g, last, ends, 2) == 1);
+                TEST_ASSERT(!gen_constrain_turn_over(&g));
+                /* now emitted: past the turn's call */
+                TEST_ASSERT(l303_feed(&srv, &g, whole.substr(whole.size() - 1)) == 1);
+                TEST_ASSERT(gen_constrain_turn_over(&g) && gen_constrain_live(&g));
+                TEST_ASSERT(l428_only_the_stop(&srv, &g, v));
+                TEST_ASSERT(!gen_constrain_accept(&srv, &g, '\n'));
+                TEST_ASSERT(strstr(g.err, "follows the one tool call this turn may make"));
+                TEST_ASSERT(gen_constrain_turn_over(&g));   /* a refused token leaves the gate where it was */
+            }
+            l303_end(&j, &g);
+        }
+        /* no strict tool: only a family whose calls share a block is constrained by the flag */
+        for (int single = 0; single < 2; single++) {
+            job j;
+            memset(&j, 0, sizeof j);
+            char err[300];
+            const char *body = single ? L428_OA(",\"parallel_tool_calls\":false") : L428_OA("");
+            TEST_ASSERT(l303_request(&srv, f.fmt, API_OPENAI, body, &j.req, err, sizeof err));
+            const bool block = f.close[0] != '\0';
+            TEST_ASSERT((j.req.constrain != NULL) == (single && block));
+            if (j.req.constrain) {
+                gen_state g;
+                TEST_ASSERT(l303_begin(&srv, &j, &g));
+                const std::string rest = std::string(f.close).substr(1);   /* past the "<" both tags open with */
+                TEST_ASSERT(l303_feed(&srv, &g, one) == one.size());
+                TEST_ASSERT(l303_feed(&srv, &g, f.now) == 1);
+                TEST_ASSERT(l303_feed(&srv, &g, rest) == rest.size());
+                TEST_ASSERT(gen_constrain_turn_over(&g) && l428_only_the_stop(&srv, &g, v));
+                gen_constrain_end(&g);
+                buf_free(&g.text);
+            }
+            request_free(&j.req);
+        }
+    }
+    /* a forced call: the seed opens the region; with the flag the turn is over when it completes */
+    struct forced {
+        pulsar_chat_format fmt;
+        const char *rest;
+    };
+    static const forced fcs[] = {
+        {PULSAR_CHAT_QWEN, "=search>\n<parameter=q>\npulsars\n</parameter>\n</function>\n</tool_call>"},
+        {PULSAR_CHAT_NEMOTRON_H, "=search>\n<parameter=q>\npulsars\n</parameter>\n</function>\n</tool_call>"},
+        {PULSAR_CHAT_GEMMA4, "search{q:<|\"|>pulsars<|\"|>}<tool_call|>"},
+        {PULSAR_CHAT_DS4_V41, " name=\"search\">\n" PULSAR_PARAM_START " name=\"q\" string=\"true\">pulsars"
+                              PULSAR_PARAM_END "\n" PULSAR_INVOKE_END "\n" PULSAR_TOOL_CALLS_END},
+    };
+    for (const forced &fc : fcs) {
+        for (int single = 0; single < 2; single++) {
+            job j;
+            memset(&j, 0, sizeof j);
+            char err[300];
+            const char *body = single ? L303_BODY(",\"tool_choice\":\"required\",\"parallel_tool_calls\":false")
+                                      : L303_BODY(",\"tool_choice\":\"required\"");
+            TEST_ASSERT(l303_request(&srv, fc.fmt, API_OPENAI, body, &j.req, err, sizeof err));
+            TEST_ASSERT(j.req.force_tool_call && j.req.constrain);
+            gen_state g;
+            TEST_ASSERT(l303_begin(&srv, &j, &g));
+            TEST_ASSERT(l303_feed(&srv, &g, fc.rest) == strlen(fc.rest));
+            if (single) {
+                const char *tail = server_family_for_format(fc.fmt)->call_tail;
+                TEST_ASSERT(l303_feed(&srv, &g, tail) == strlen(tail));
+            }
+            TEST_ASSERT(gen_constrain_turn_over(&g) == (single == 1));
+            TEST_ASSERT(gen_constrain_live(&g) == (single == 1));
+            if (single) TEST_ASSERT(l428_only_the_stop(&srv, &g, v));
+            l303_end(&j, &g);
+        }
+    }
+    /* a response format with tools on offer: the turn answers in the format or with its calls -- one call with the
+     * flag (then the stop), a run of them without */
+    for (int single = 0; single < 2; single++) {
+        job j;
+        memset(&j, 0, sizeof j);
+        char err[300];
+        const char *body = single ? L303_BODY(",\"enable_thinking\":false,\"response_format\":{\"type\":"
+                                              "\"json_object\"},\"parallel_tool_calls\":false")
+                                  : L303_BODY(",\"enable_thinking\":false,\"response_format\":{\"type\":"
+                                              "\"json_object\"}");
+        TEST_ASSERT(l303_request(&srv, PULSAR_CHAT_QWEN, API_OPENAI, body, &j.req, err, sizeof err));
+        gen_state g;
+        TEST_ASSERT(l303_begin(&srv, &j, &g));
+        TEST_ASSERT(gen_constrain_live(&g));   /* the answer region, from the turn's first byte */
+        const std::string call = k_l428_fams[0].call;
+        TEST_ASSERT(l303_feed(&srv, &g, call) == call.size());
+        TEST_ASSERT(l303_allows(&srv, &g, v.stop));
+        TEST_ASSERT(l303_allows(&srv, &g, '\n') == (single == 0));
+        TEST_ASSERT(l303_allows(&srv, &g, v.id("<tool_call>")) == (single == 0));
+        l303_end(&j, &g);
+    }
+    l303_server_free(&srv);
+}
+
+/* What one simulated turn left (l428_turn). */
+struct l428_run {
+    std::string prompt;      /* the rendered prompt the turn continues */
+    std::string text;        /* the generated text the server kept (gen_state::text) */
+    std::string content, reasoning, finish, wire;
+    std::string name0, args0, id0;   /* the first call returned */
+    int calls = 0;
+    int completion = 0;      /* tokens the emit path counted (usage's completion tokens) */
+    int emitted = 0;         /* tokens handed to the emit path, the one that ended the turn included */
+    bool stopped = false;    /* the emit path ended the turn itself (not the model's stop token) */
+    bool gated = false;      /* the request had a grammar gate */
+    bool refused = false;    /* the gate refused a token (it was not emitted) */
+    bool agree = true;       /* at every token, the gate was past the turn's call exactly when the emit path stopped */
+    bool cut_short = false;  /* gen_state::turn_cut_short: the turn ended before its last token's last byte */
+};
+
+/* L428: one turn as the server decodes it, a token at a time: the request through its protocol's parser and the
+ * family's render, the decode attempt started as gen_decode_init starts it (the parser, a forced call's seed, the
+ * gate), then for each token what gen_emit_token does -- the gate's mask and accept, then the emit path itself
+ * (server::gen_emit_piece: usage, the stop strings' release, the family's parser, the turn's own end) -- until the
+ * emit path stops the decode or `toks` runs out (the model's stop token).  Then gen_step_finish's reading and
+ * response: the family's finish and the protocol's body or stream, into `wire`.  A token is one byte, or one of the
+ * toy vocabulary's whole tokens; without a gate any text is a token. */
+static l428_run l428_turn(server *srv, const l303_vocab &v, pulsar_chat_format fmt, api_style api,
+                          const std::string &body, const std::vector<std::string> &toks, bool stream = false,
+                          const char *stop_string = NULL) {
+    l428_run res;
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    job j;
+    memset(&j, 0, sizeof j);
+    j.fd = sv[0];
+    request *r = &j.req;
+    char err[300];
+    const bool ok = l303_request(srv, fmt, api, body.c_str(), r, err, sizeof err);
+    if (!ok) fprintf(stderr, "l428 turn: fmt %d refused: %s\n", (int)fmt, err);
+    TEST_ASSERT(ok);
+    if (!ok) {
+        close(sv[0]);
+        close(sv[1]);
+        return res;
+    }
+    r->stream = stream;
+    r->stream_include_usage = true;
+    if (stop_string) stop_list_push(&r->stops, server_xstrdup(stop_string));
+    res.prompt = r->prompt_text;
+    gen_state *g = new gen_state();
+    g->j = &j;
+    snprintf(g->id, sizeof g->id, "id_l428");
+    g->finish = "length";
+    g->next_decode_log = 1 << 30;   /* no progress lines */
+    g->thinking = thinking_state_from_prompt(r);
+    g->structured_stream = request_uses_structured_stream(r);
+    if (stream) {
+        if (api == API_ANTHROPIC) {
+            TEST_ASSERT(anthropic_sse_start_live(sv[0], r, g->id, 10, &g->anthropic_live));
+            anthropic_sink_init(&g->sink, sv[0], NULL, r, g->id, &g->anthropic_live);
+        } else if (api == API_RESPONSES) {
+            responses_stream_init(r, &g->responses_live);
+            g->responses_live.active = true;
+            TEST_ASSERT(responses_sse_created(sv[0], r, &g->responses_live, 1));
+            responses_sink_init(&g->sink, sv[0], NULL, r, g->id, &g->responses_live);
+        } else {
+            openai_stream_start(r, &g->openai_live);
+            openai_sink_init(&g->sink, sv[0], NULL, r, g->id, &g->openai_live);
+        }
+    }
+    g->parser = r->family->output;
+    g->parser_st = g->parser->create(srv, g, err, sizeof err);
+    TEST_ASSERT(g->parser_st != NULL);
+    if (r->force_tool_call && r->family->forced_call_seed) {
+        r->family->forced_call_seed(r, &g->text);
+        if (g->parser->seed) g->parser->seed(g->parser_st, g);
+        g->plain_stream_pos = g->text.len;
+    }
+    TEST_ASSERT(gen_constrain_begin(srv, g));
+    res.gated = g->gate != NULL;
+    for (const std::string &t : toks) {
+        const int tok = t.size() == 1 ? (int)(uint8_t)t[0] : v.id(t.c_str());
+        if (g->gate) {
+            TEST_ASSERT(tok >= 0);   /* a gated turn's tokens are the toy vocabulary's */
+            if (tok < 0 || !l303_allows(srv, g, tok) || !gen_constrain_accept(srv, g, tok)) {
+                res.refused = true;
+                break;
+            }
+        }
+        res.emitted++;
+        res.stopped = srv->gen_emit_piece(g, tok < 0 ? 0 : tok, t.data(), t.size());
+        if (g->gate && r->single_tool_call && gen_constrain_turn_over(g) != res.stopped) res.agree = false;
+        if (res.stopped) break;
+    }
+    if (!res.stopped) g->finish = "stop";   /* the model's own stop token ended the turn */
+    res.completion = g->completion;
+    res.cut_short = g->turn_cut_short;
+    server_turn turn;
+    memset(&turn, 0, sizeof turn);
+    turn.finish = g->finish;
+    const bool stream_ok = g->parser->finish(g->parser_st, srv, NULL, g, &turn);
+    TEST_ASSERT(stream_ok && !turn.retry);
+    res.text.assign(g->text.ptr ? g->text.ptr : "", g->text.len);
+    res.content = turn.content ? turn.content : "";
+    res.reasoning = turn.reasoning ? turn.reasoning : "";
+    res.finish = turn.finish;
+    res.calls = turn.calls.len;
+    if (turn.calls.len) {
+        res.name0 = turn.calls.v[0].name;
+        res.args0 = turn.calls.v[0].arguments ? turn.calls.v[0].arguments : "";
+        res.id0 = turn.calls.v[0].id ? turn.calls.v[0].id : "";
+    }
+    r->timings.valid = true;
+    if (stream) {
+        TEST_ASSERT(g->parser->feed(g->parser_st, srv, g, g->text.len, true));
+        if (api == API_ANTHROPIC)
+            TEST_ASSERT(anthropic_sse_finish(&g->sink, &turn.calls, turn.finish, g->stop_sequence, g->completion));
+        else if (api == API_RESPONSES)
+            TEST_ASSERT(responses_sse_finish(sv[0], r, &g->responses_live, turn.tail, turn.tail_len, &turn.calls,
+                                             turn.finish, 10, g->completion, 1));
+        else
+            TEST_ASSERT(openai_sse_finish(&g->sink, &turn.calls, turn.finish, 10, g->completion));
+    } else if (api == API_ANTHROPIC) {
+        TEST_ASSERT(anthropic_final_response(sv[0], r, g->id, turn.content, turn.reasoning, &turn.calls, turn.finish,
+                                             g->stop_sequence, 10, g->completion));
+    } else if (api == API_RESPONSES) {
+        TEST_ASSERT(responses_final_response(sv[0], r, g->id, turn.content, turn.reasoning, &turn.calls, turn.finish,
+                                             10, g->completion));
+    } else {
+        TEST_ASSERT(final_response(sv[0], r, g->id, turn.content, turn.reasoning, &turn.calls, turn.finish, 10,
+                                   g->completion, NULL));
+    }
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    res.wire = out ? out : "";
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+    gen_constrain_end(g);
+    g->parser->destroy(g->parser_st);
+    free(turn.content);
+    free(turn.reasoning);
+    tool_calls_free(&turn.calls);
+    if (stream && api == API_RESPONSES) responses_stream_free(&g->responses_live);
+    free(g->stop_sequence);
+    buf_free(&g->text);
+    delete g;
+    request_free(r);
+    return res;
+}
+
+/// @param text  a text
+/// @return its bytes as one-byte tokens
+static std::vector<std::string> l428_bytes(const std::string &text) {
+    std::vector<std::string> out;
+    for (char ch : text) out.push_back(std::string(1, ch));
+    return out;
+}
+
+/// @param hay     a text
+/// @param needle  a string
+/// @return how many times `needle` occurs in `hay`
+static int l428_count(const std::string &hay, const char *needle) {
+    int n = 0;
+    for (size_t at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + 1)) n++;
+    return n;
+}
+
+/* L428: a model that would write two calls, in a turn that may make one.  The decode stops at the token that closes
+ * the first call, on the unconstrained path (the output parser's reading) and under a grammar (where the gate says
+ * the same at the same token): one call comes back, the finish reason is the one a single-call turn has, the kept
+ * text is the turn through that call's close, and usage counts the tokens through it.  The content and the reasoning
+ * before the call stay.  A turn that makes no call, and a request without the flag, are what they were. */
+static void test_l428_turn_ends_at_its_first_call(void) {
+    l303_vocab v;
+    server srv;
+    l303_server(&srv, v);
+    for (const l428_fam &f : k_l428_fams) {
+        const bool block = f.close[0] != '\0';   /* the calls share one block: constrained by the flag */
+        const std::string thought = f.before;
+        const std::string say = f.fmt == PULSAR_CHAT_INKLING ? "" : "Checking.";
+        const std::string lead = thought + say + (say.empty() ? "" : f.gap);
+        const std::string first = lead + f.open + f.call;
+        const std::string whole = first + f.tail() + f.between + f.now + f.tail() + f.close;
+        for (int strict = 0; strict < 2; strict++) {
+            const std::string tools = strict ? L303_TOOLS : L428_TOOLS;
+            const std::string msgs = "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],";
+            /* without the flag: both calls, every token */
+            l428_run two = l428_turn(&srv, v, f.fmt, API_OPENAI, msgs + tools + "}", l428_bytes(whole));
+            TEST_ASSERT(two.gated == (strict == 1));
+            if (two.calls != 2) fprintf(stderr, "l428 fmt %d strict %d: %d calls without the flag\n", (int)f.fmt, strict, two.calls);
+            TEST_ASSERT(two.calls == 2 && two.finish == "tool_calls" && two.text == whole);
+            TEST_ASSERT(two.completion == (int)whole.size() && two.stopped == block);
+            /* with it: the first call, and nothing generated after it.  (A family whose calls share a block is
+             * under the grammar, which refuses a second invoke -- test_l428_gate_admits_one_call -- so its model
+             * closes the block and would go on after it.) */
+            const std::string kept = first + f.close + f.tail();
+            l428_run one = l428_turn(&srv, v, f.fmt, API_OPENAI, msgs + tools + ",\"parallel_tool_calls\":false}",
+                                     l428_bytes(block ? kept + "\n\nmore" : whole));
+            TEST_ASSERT(one.gated == (strict == 1 || block));
+            if (one.calls != 1 || one.text != kept)
+                fprintf(stderr, "l428 fmt %d strict %d: %d calls, kept %zu of %zu bytes, refused %d\n", (int)f.fmt,
+                        strict, one.calls, one.text.size(), kept.size(), (int)one.refused);
+            TEST_ASSERT(!one.refused && one.stopped && one.agree && !one.cut_short);
+            TEST_ASSERT(one.calls == 1 && one.finish == "tool_calls" && one.name0 == "search");
+            TEST_ASSERT(one.args0.find("pulsars") != std::string::npos);
+            TEST_ASSERT(one.text == kept);
+            TEST_ASSERT(one.completion == (int)kept.size() && one.emitted == (int)kept.size());   /* usage: through the close */
+            TEST_ASSERT(one.content == two.content && one.reasoning == two.reasoning);   /* what came before stays */
+            if (one.content != say) fprintf(stderr, "l428 fmt %d: content \"%s\"\n", (int)f.fmt, one.content.c_str());
+            TEST_ASSERT(one.content == say);
+            TEST_ASSERT(l428_count(one.wire, "\"finish_reason\":\"tool_calls\"") == 1);
+            TEST_ASSERT(l428_count(one.wire, "\"name\":\"search\"") == 1 && l428_count(one.wire, "\"name\":\"now\"") == 0);
+            TEST_ASSERT(l428_count(two.wire, "\"name\":\"now\"") == 1);
+            /* a turn that makes no call is the flagless turn */
+            const std::string prose = thought + "No tool is needed.";
+            l428_run p0 = l428_turn(&srv, v, f.fmt, API_OPENAI, msgs + tools + "}", l428_bytes(prose));
+            l428_run p1 = l428_turn(&srv, v, f.fmt, API_OPENAI, msgs + tools + ",\"parallel_tool_calls\":false}",
+                                    l428_bytes(prose));
+            TEST_ASSERT(!p1.stopped && p1.calls == 0 && p1.finish == "stop" && p1.text == prose);
+            TEST_ASSERT(p1.content == p0.content && p1.reasoning == p0.reasoning && p1.completion == p0.completion);
+            TEST_ASSERT(p1.wire == p0.wire);
+        }
+    }
+
+    /* the protocols: Anthropic's stop_reason and one tool_use block, the Responses object's echo of the value
+     * applied, whole and streamed; the cut is the same token on each */
+    const l428_fam &q = k_l428_fams[0];
+    const std::string qfirst = std::string(q.before) + "Checking.\n\n" + q.call;
+    const std::string qwhole = qfirst + q.between + q.now;
+    for (int stream = 0; stream < 2; stream++) {
+        l428_run an = l428_turn(&srv, v, PULSAR_CHAT_QWEN, API_ANTHROPIC,
+                                L428_AN(",\"tool_choice\":{\"type\":\"auto\",\"disable_parallel_tool_use\":true}"),
+                                l428_bytes(qwhole), stream == 1);
+        TEST_ASSERT(an.stopped && an.calls == 1 && an.text == qfirst && an.completion == (int)qfirst.size());
+        TEST_ASSERT(l428_count(an.wire, "\"stop_reason\":\"tool_use\"") == 1);
+        TEST_ASSERT(l428_count(an.wire, "\"type\":\"tool_use\"") == 1 && l428_count(an.wire, "\"name\":\"now\"") == 0);
+        TEST_ASSERT(an.content == "Checking." && an.reasoning == "plan");
+        l428_run an2 = l428_turn(&srv, v, PULSAR_CHAT_QWEN, API_ANTHROPIC, L428_AN(""), l428_bytes(qwhole), stream == 1);
+        TEST_ASSERT(!an2.stopped && an2.calls == 2 && l428_count(an2.wire, "\"type\":\"tool_use\"") == 2);
+
+        l428_run rs = l428_turn(&srv, v, PULSAR_CHAT_QWEN, API_RESPONSES, L428_RS(",\"parallel_tool_calls\":false"),
+                                l428_bytes(qwhole), stream == 1);
+        TEST_ASSERT(rs.stopped && rs.calls == 1 && rs.text == qfirst && rs.completion == (int)qfirst.size());
+        TEST_ASSERT(l428_count(rs.wire, "\"type\":\"function_call\",\"status\":\"completed\"") >= 1);
+        TEST_ASSERT(l428_count(rs.wire, "\"name\":\"now\"") == 0);
+        /* the object says what was applied: in the created event too when streamed */
+        TEST_ASSERT(l428_count(rs.wire, "\"parallel_tool_calls\":false") == (stream ? 2 : 1));
+        l428_run rt = l428_turn(&srv, v, PULSAR_CHAT_QWEN, API_RESPONSES, L428_RS(",\"parallel_tool_calls\":true"),
+                                l428_bytes(qwhole), stream == 1);
+        TEST_ASSERT(rt.calls == 2 && l428_count(rt.wire, "\"parallel_tool_calls\":true") == (stream ? 2 : 1));
+        l428_run rn = l428_turn(&srv, v, PULSAR_CHAT_QWEN, API_RESPONSES, L428_RS(""), l428_bytes(qwhole), stream == 1);
+        TEST_ASSERT(rn.calls == 2 && l428_count(rn.wire, "parallel_tool_calls") == 0);   /* no key sent: none echoed */
+
+        l428_run oa = l428_turn(&srv, v, PULSAR_CHAT_QWEN, API_OPENAI, L428_OA(",\"parallel_tool_calls\":false"),
+                                l428_bytes(qwhole), stream == 1);
+        TEST_ASSERT(oa.stopped && oa.calls == 1 && oa.text == qfirst);
+        TEST_ASSERT(l428_count(oa.wire, "\"finish_reason\":\"tool_calls\"") == 1);
+        TEST_ASSERT(l428_count(oa.wire, "\"name\":\"now\"") == 0 && oa.content == "Checking.");
+    }
+
+    /* tokens as a tokenizer cuts them, the unconstrained path: the decode stops at the token that holds the close's
+     * last byte.  A token that runs past the close is the turn's last, and its bytes past the close are not the
+     * turn's text. */
+    const std::vector<std::string> pieces = {"plan", "</think>", "\n\n", "Checking.", "\n\n", "<tool_call>",
+                                             "\n<function=search>\n", "<parameter=q>\n", "pulsars", "\n</parameter>\n",
+                                             "</function>\n", "</tool_call>", "\n", "<tool_call>", "\n<function=now>\n",
+                                             "</function>\n", "</tool_call>"};
+    {
+        l428_run t = l428_turn(&srv, v, PULSAR_CHAT_QWEN, API_OPENAI, L428_OA(",\"parallel_tool_calls\":false"), pieces);
+        TEST_ASSERT(t.stopped && t.emitted == 12 && t.completion == 12 && t.calls == 1 && t.text == qfirst);
+        std::vector<std::string> merged(pieces.begin(), pieces.begin() + 11);
+        merged.push_back("</tool_call>\n<tool_call>\n<fun");   /* one token across the close */
+        merged.push_back("ction=now>\n</function>\n</tool_call>");
+        t = l428_turn(&srv, v, PULSAR_CHAT_QWEN, API_OPENAI, L428_OA(",\"parallel_tool_calls\":false"), merged);
+        TEST_ASSERT(t.stopped && t.emitted == 12 && t.completion == 12 && t.calls == 1 && t.text == qfirst);
+        /* thinking off: the same cut */
+        std::vector<std::string> off(pieces.begin() + 3, pieces.end());
+        t = l428_turn(&srv, v, PULSAR_CHAT_QWEN, API_OPENAI,
+                      L428_OA(",\"enable_thinking\":false,\"parallel_tool_calls\":false"), off);
+        TEST_ASSERT(t.stopped && t.emitted == 9 && t.calls == 1 && t.reasoning.empty() && t.content == "Checking.");
+    }
+    /* a client stop string holds the last bytes back from the parser (here 24 of them): the turn still ends at the
+     * closing token, not 24 bytes later, and a stop string that does match still ends the turn where it matched */
+    {
+        l428_run t = l428_turn(&srv, v, PULSAR_CHAT_QWEN, API_OPENAI, L428_OA(",\"parallel_tool_calls\":false"), pieces,
+                               false, "0123456789012345678901234");
+        TEST_ASSERT(t.stopped && t.emitted == 12 && t.completion == 12 && t.calls == 1 && t.text == qfirst);
+        t = l428_turn(&srv, v, PULSAR_CHAT_QWEN, API_OPENAI, L428_OA(",\"parallel_tool_calls\":false"), pieces, true,
+                      "0123456789012345678901234");
+        TEST_ASSERT(t.stopped && t.emitted == 12 && t.calls == 1 && t.text == qfirst);
+        TEST_ASSERT(l428_count(t.wire, "\"name\":\"search\"") == 1 && l428_count(t.wire, "now") == 0);
+        t = l428_turn(&srv, v, PULSAR_CHAT_QWEN, API_OPENAI, L428_OA(",\"parallel_tool_calls\":false"), pieces, false,
+                      "Checking");
+        TEST_ASSERT(t.stopped && t.emitted == 4 && t.calls == 0 && t.finish == "stop");
+    }
+    /* the first call names no declared tool: it is dropped, and the turn's one call is the next */
+    {
+        std::string bad = std::string(q.before) + "<tool_call>\n<function=rm>\n</function>\n</tool_call>\n";
+        const std::string kept = bad + q.call;
+        l428_run t = l428_turn(&srv, v, PULSAR_CHAT_QWEN, API_OPENAI, L428_OA(",\"parallel_tool_calls\":false,\"stream\":true"),
+                               l428_bytes(kept + q.between + q.now), true);
+        TEST_ASSERT(t.stopped && t.calls == 1 && t.name0 == "search" && t.text == kept);
+    }
+    /* a family whose template writes bytes after a call (Nemotron-H's newline): the turn ends past them, the turn its
+     * template renders.  A model that writes its stop token there ends the turn itself, as ever.  One that writes
+     * anything else has left its template: the turn is still the one call, cut at the call's close -- and the token
+     * that said so is in the bank, so the turn is marked (no live continuation from that history). */
+    {
+        const l428_fam &n = k_l428_fams[1];
+        TEST_ASSERT(n.fmt == PULSAR_CHAT_NEMOTRON_H && !strcmp(n.tail(), "\n"));
+        const std::vector<std::string> head = {"plan", "</think>", "Checking.", "\n", "<tool_call>", "\n<function=now>\n",
+                                               "</function>\n", "</tool_call>"};
+        std::string through;
+        for (const std::string &t : head) through += t;
+        std::vector<std::string> toks = head;
+        toks.insert(toks.end(), {"\n", "<tool_call>", "\n<function=now>\n", "</function>\n", "</tool_call>", "\n"});
+        l428_run t = l428_turn(&srv, v, PULSAR_CHAT_NEMOTRON_H, API_OPENAI, L428_OA(",\"parallel_tool_calls\":false"), toks);
+        TEST_ASSERT(t.stopped && t.emitted == 9 && t.completion == 9 && t.calls == 1 && t.text == through + "\n");
+        TEST_ASSERT(!t.cut_short && t.finish == "tool_calls");
+        l428_run own = l428_turn(&srv, v, PULSAR_CHAT_NEMOTRON_H, API_OPENAI, L428_OA(",\"parallel_tool_calls\":false"), head);
+        TEST_ASSERT(!own.stopped && own.calls == 1 && own.finish == "tool_calls" && own.text == through);
+        toks = head;
+        toks.insert(toks.end(), {"<tool_call>", "\n<function=now>\n", "</function>\n", "</tool_call>", "\n"});
+        t = l428_turn(&srv, v, PULSAR_CHAT_NEMOTRON_H, API_OPENAI, L428_OA(",\"parallel_tool_calls\":false"), toks);
+        TEST_ASSERT(t.stopped && t.emitted == 9 && t.completion == 9 && t.calls == 1 && t.text == through);
+        TEST_ASSERT(t.cut_short && t.finish == "tool_calls");
+        /* a token that runs past the call's close (any family): the same mark */
+        std::vector<std::string> merged(pieces.begin(), pieces.begin() + 11);
+        merged.push_back("</tool_call>\n<tool_call>");
+        t = l428_turn(&srv, v, PULSAR_CHAT_QWEN, API_OPENAI, L428_OA(",\"parallel_tool_calls\":false"), merged);
+        TEST_ASSERT(t.stopped && t.cut_short && t.text == qfirst);
+    }
+    /* a forced call: the seed opens it, and with the flag the turn ends where it closes (without, the model may go
+     * on to another) */
+    for (int single = 0; single < 2; single++) {
+        const std::string rest = "=search>\n<parameter=q>\npulsars\n</parameter>\n</function>\n</tool_call>";
+        const std::string more = rest + "\n" + q.now;
+        const std::string body = std::string("{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]," L428_TOOLS
+                                             ",\"tool_choice\":\"required\"") +
+                                 (single ? ",\"parallel_tool_calls\":false}" : "}");
+        l428_run t = l428_turn(&srv, v, PULSAR_CHAT_QWEN, API_OPENAI, body, l428_bytes(more));
+        TEST_ASSERT(t.gated && !t.refused && t.agree && t.finish == "tool_calls");
+        TEST_ASSERT(t.calls == (single ? 1 : 2) && t.stopped == (single == 1));
+        TEST_ASSERT(t.completion == (int)(single ? rest.size() : more.size()));
+    }
+
+    /* the limit holds at the turn's finish too (parser_finish_turn): a reading neither the turn's end nor a grammar
+     * shaped -- here DeepSeek's block of two invokes on a server with no grammar compiler, the shape its recovery of
+     * a complete block from unclosed reasoning has in production -- returns the first call alone */
+    {
+        server bare;
+        memset(&bare, 0, sizeof bare);
+        pthread_mutex_init(&bare.tool_mu, NULL);
+        const l428_fam &d = k_l428_fams[4];
+        TEST_ASSERT(d.fmt == PULSAR_CHAT_DS4_V41);
+        const std::string block = std::string(d.before) + d.open + d.call + d.now + d.close;
+        l428_run t = l428_turn(&bare, v, PULSAR_CHAT_DS4_V41, API_OPENAI, L428_OA(",\"parallel_tool_calls\":false"),
+                               l428_bytes(block));
+        TEST_ASSERT(!t.gated && t.stopped && t.calls == 1 && t.name0 == "search" && t.finish == "tool_calls");
+        TEST_ASSERT(l428_count(t.wire, "\"name\":\"search\"") == 1 && l428_count(t.wire, "\"name\":\"now\"") == 0);
+        t = l428_turn(&bare, v, PULSAR_CHAT_DS4_V41, API_OPENAI, L428_OA(""), l428_bytes(block));
+        TEST_ASSERT(t.calls == 2 && l428_count(t.wire, "\"name\":\"now\"") == 1);
+        pthread_mutex_destroy(&bare.tool_mu);
+    }
+
+    /* a speculative round's chain ends with the token that closes the call (gen_turn_draft_prefix): read off a
+     * scratch copy, the attempt untouched */
+    {
+        job j;
+        memset(&j, 0, sizeof j);
+        char err[300];
+        TEST_ASSERT(l303_request(&srv, PULSAR_CHAT_QWEN, API_OPENAI, L428_OA(",\"parallel_tool_calls\":false"), &j.req,
+                                 err, sizeof err));
+        gen_state *g = new gen_state();
+        g->j = &j;
+        g->thinking = thinking_state_from_prompt(&j.req);
+        g->parser = j.req.family->output;
+        g->parser_st = g->parser->create(&srv, g, err, sizeof err);
+        TEST_ASSERT(g->parser_st != NULL);
+        for (int i = 0; i < 9; i++) TEST_ASSERT(!srv.gen_emit_piece(g, 0, pieces[(size_t)i].data(), pieces[(size_t)i].size()));
+        const char *chain[9];
+        size_t lens[9];
+        for (int i = 0; i < 8; i++) {
+            chain[i] = pieces[(size_t)(9 + i)].c_str();
+            lens[i] = pieces[(size_t)(9 + i)].size();
+        }
+        /* base "\n</parameter>\n", drafts "</function>\n", "</tool_call>", "\n", "<tool_call>", ...: two drafts stay */
+        TEST_ASSERT(gen_turn_draft_prefix_text(g, chain, lens, 7) == 2);
+        TEST_ASSERT(gen_turn_draft_prefix_text(g, chain, lens, 2) == 2);
+        TEST_ASSERT(gen_turn_draft_prefix_text(g, chain, lens, 1) == 1);   /* the chain ends before the close */
+        chain[1] = NULL;                                                    /* a stop token ends the walk */
+        TEST_ASSERT(gen_turn_draft_prefix_text(g, chain, lens, 7) == 7);
+        /* the base itself closes the call: no draft */
+        TEST_ASSERT(!srv.gen_emit_piece(g, 0, pieces[9].data(), pieces[9].size()));
+        TEST_ASSERT(!srv.gen_emit_piece(g, 0, pieces[10].data(), pieces[10].size()));
+        const char *chain2[3] = {pieces[11].c_str(), pieces[12].c_str(), pieces[13].c_str()};
+        const size_t lens2[3] = {pieces[11].size(), pieces[12].size(), pieces[13].size()};
+        TEST_ASSERT(gen_turn_draft_prefix_text(g, chain2, lens2, 2) == 0);
+        /* the walk left the attempt where it was: the call is still open, and its close still ends the turn */
+        size_t end = 0;
+        TEST_ASSERT(!g->parser->turn_complete(g->parser_st, g, &end));
+        TEST_ASSERT(srv.gen_emit_piece(g, 0, pieces[11].data(), pieces[11].size()));
+        TEST_ASSERT(!strcmp(g->finish, "tool_calls") && g->completion == 12);
+        /* a request without the flag keeps every draft */
+        j.req.single_tool_call = false;
+        TEST_ASSERT(gen_turn_draft_prefix_text(g, chain2, lens2, 2) == 2);
+        g->parser->destroy(g->parser_st);
+        buf_free(&g->text);
+        delete g;
+        request_free(&j.req);
+    }
+    l303_server_free(&srv);
+}
+
+/// @param s  a text
+/// @return it as a JSON string literal
+static std::string l428_json(const std::string &s) {
+    buf b = {0};
+    json_escape(&b, s.c_str());
+    std::string out(b.ptr, b.len);
+    buf_free(&b);
+    return out;
+}
+
+/* L428, the prefix: after a turn the server ended at its first call, the bank holds the prompt and the turn's tokens
+ * through the call's close -- gen_emit_token is the one place a decoded token reaches the client, and the lanes
+ * commit what it took (a speculative round's later drafts are cut before the round, gen_turn_draft_prefix, and a
+ * committed token the emit never took is rewound or costs the view, as after a stop string).  That is `prompt + text`
+ * here.  The client's next request replays the message it was sent -- the content, the reasoning, the ONE call with
+ * its id and arguments -- and the tool's result; its rendered prompt must extend those bytes exactly, and go on with
+ * the family's own end of an assistant turn that made a call (the tail every tool-call turn is joined with, L290: the
+ * bank is the one a turn whose stop token was never evaluated leaves).  Every family, thinking on (the reasoning
+ * replayed) and off, the unconstrained cut and the constrained one; the family's sampled-turn render (the canonical
+ * checkpoint's and the Responses memory's key) is the kept text byte for byte. */
+static void test_l428_next_prompt_extends_the_cut_turn(void) {
+    l303_vocab v;
+    server srv;
+    l303_server(&srv, v);
+    struct pfam {
+        pulsar_chat_format fmt;
+        const char *thought;   /* the reasoning and its close, thinking on */
+        const char *say;       /* content before the call */
+        const char *end;       /* how the next prompt goes on after the cut turn: the family's turn close */
+        bool can_think_off;
+    };
+    static const pfam fams[] = {
+        {PULSAR_CHAT_QWEN, "I should search.\n</think>\n\n", "Checking.", "<|im_end|>\n", true},
+        {PULSAR_CHAT_NEMOTRON_H, "I should search.</think>", "Checking.", "<|im_end|>\n", true},
+        /* Gemma 4: thinking off, the generation prompt closes an empty thought channel that no replayed turn
+         * carries (gemma4_chat.cpp), so no turn of any kind extends that prompt: thinking on only */
+        {PULSAR_CHAT_GEMMA4, "", "", "<|tool_response>", false},
+        {PULSAR_CHAT_INKLING, "", "", "", false},
+        {PULSAR_CHAT_DS4_V41, "I should search.</think>", "Checking.", "<\xef\xbd\x9c" "end\xe2\x96\x81of\xe2\x96\x81sentence\xef\xbd\x9c>", true},
+        {PULSAR_CHAT_DS4_V4, "I should search.</think>", "Checking.", "<\xef\xbd\x9c" "end\xe2\x96\x81of\xe2\x96\x81sentence\xef\xbd\x9c>", true},
+    };
+    for (size_t fi = 0; fi < sizeof fams / sizeof fams[0]; fi++) {
+        const pfam &p = fams[fi];
+        const l428_fam &f = k_l428_fams[fi];
+        TEST_ASSERT(f.fmt == p.fmt);
+        const bool block = f.close[0] != '\0';
+        for (int off = 0; off < (p.can_think_off ? 2 : 1); off++) {
+            for (int strict = 0; strict < 2; strict++) {
+                const std::string tools = strict ? L303_TOOLS : L428_TOOLS;
+                const std::string tail = std::string(off ? ",\"enable_thinking\":false" : "") +
+                                         ",\"parallel_tool_calls\":false}";
+                const std::string user = "{\"role\":\"user\",\"content\":\"x\"}";
+                const std::string kept = std::string(off ? "" : p.thought) + p.say + (p.say[0] ? f.gap : "") + f.open +
+                                         f.call + f.close + f.tail();
+                /* the model would go on: a second call (for DeepSeek more text, past its closed block) */
+                const std::string would = kept + (block ? std::string("\n\nmore") : std::string(f.between) + f.now);
+                l428_run t = l428_turn(&srv, v, p.fmt, API_OPENAI, "{\"messages\":[" + user + "]," + tools + tail,
+                                       l428_bytes(would));
+                if (!(t.stopped && t.calls == 1 && t.text == kept))
+                    fprintf(stderr, "l428 prefix fmt %d off %d strict %d: stopped %d calls %d kept %zu/%zu refused %d\n",
+                            (int)p.fmt, off, strict, (int)t.stopped, t.calls, t.text.size(), kept.size(), (int)t.refused);
+                TEST_ASSERT(t.stopped && t.agree && t.calls == 1 && t.text == kept && t.finish == "tool_calls");
+                TEST_ASSERT(t.completion == (int)kept.size());
+                const std::string bank = t.prompt + t.text;   /* what the bank holds */
+
+                /* the client's next request: the returned message, then the tool's result */
+                std::string assistant = "{\"role\":\"assistant\",\"content\":" + l428_json(t.content);
+                if (!t.reasoning.empty()) assistant += ",\"reasoning_content\":" + l428_json(t.reasoning);
+                assistant += ",\"tool_calls\":[{\"id\":" + l428_json(t.id0) + ",\"type\":\"function\",\"function\":{\"name\":" +
+                             l428_json(t.name0) + ",\"arguments\":" + l428_json(t.args0) + "}}]}";
+                const std::string result = "{\"role\":\"tool\",\"tool_call_id\":" + l428_json(t.id0) +
+                                           ",\"content\":\"three results\"}";
+                request next;
+                char err[300];
+                const std::string body2 = "{\"messages\":[" + user + "," + assistant + "," + result + "]," + tools + tail;
+                TEST_ASSERT(l303_request(&srv, p.fmt, API_OPENAI, body2.c_str(), &next, err, sizeof err));
+                const std::string np = next.prompt_text ? next.prompt_text : "";
+                const bool extends = np.size() > bank.size() && !np.compare(0, bank.size(), bank);
+                if (!extends) {
+                    size_t at = 0;
+                    while (at < np.size() && at < bank.size() && np[at] == bank[at]) at++;
+                    std::string a, b;
+                    pyjson_dump_string(bank.data() + at, std::min<size_t>(80, bank.size() - at), &a);
+                    pyjson_dump_string(np.data() + at, std::min<size_t>(80, np.size() - at), &b);
+                    fprintf(stderr, "l428 prefix fmt %d off %d strict %d: the next prompt leaves the bank at byte %zu of "
+                                    "%zu: bank %s next %s\n", (int)p.fmt, off, strict, at, bank.size(), a.c_str(), b.c_str());
+                }
+                TEST_ASSERT(extends);
+                /* ... and goes on with the family's end of the turn */
+                if (extends) TEST_ASSERT(!np.compare(bank.size(), strlen(p.end), p.end));
+
+                /* the server's own render of the turn as sampled is the kept text */
+                if (next.family->assistant_turn_sampled) {
+                    tool_calls calls = {0};
+                    tool_call tc = {0};
+                    tc.id = server_xstrdup(t.id0.c_str());
+                    tc.name = server_xstrdup(t.name0.c_str());
+                    tc.arguments = server_xstrdup(t.args0.c_str());
+                    tool_calls_push(&calls, tc);
+                    /* with the call's bytes as sampled (the tool memory's key, which the turn's finish remembered) */
+                    const char *raw_end = NULL;
+                    const char *raw = next.family->find_call_block(t.text.c_str(), &raw_end);
+                    TEST_ASSERT(raw != NULL);
+                    if (raw) calls.raw_calls = server_xstrndup(raw, (size_t)(raw_end - raw));
+                    const bool think = pulsar_think_mode_enabled(next.think_mode);
+                    char *sampled = next.family->assistant_turn_sampled(&next, think, think ? t.reasoning.c_str() : NULL,
+                                                                        t.content.c_str(), &calls, NULL, NULL);
+                    TEST_ASSERT(sampled != NULL);
+                    if (sampled && t.text != sampled) {
+                        std::string a, b;
+                        pyjson_dump_string(t.text.data(), t.text.size(), &a);
+                        pyjson_dump_string(sampled, strlen(sampled), &b);
+                        fprintf(stderr, "l428 prefix fmt %d off %d: sampled-turn render %s is not the kept text %s\n",
+                                (int)p.fmt, off, b.c_str(), a.c_str());
+                    }
+                    TEST_ASSERT(sampled && t.text == sampled);
+                    free(sampled);
+                    tool_calls_free(&calls);
+                }
+                request_free(&next);
+            }
+        }
     }
     l303_server_free(&srv);
 }
@@ -13275,6 +14181,7 @@ static void test_l325_deferred_tool_in_place(void) {
         TEST_ASSERT(def && use && def > use);                          /* in place, after the call that loaded it */
         TEST_ASSERT(def && !strstr(def + 1, "Stops a background task."));   /* once */
         TEST_ASSERT(strstr(t, "Loaded: ") && strstr(t, "[tool available: Bash]"));   /* the block renders Bash */
+        TEST_ASSERT(!strstr(t, "defer_loading"));   /* L428: the loading instruction is not part of the definition */
         /* the earlier render is a prefix of this one up to its last message (the generation prompt aside) */
         const char *m = strstr(text[0], "Stop task 7.");
         TEST_ASSERT(m && !strncmp(text[0], t, (size_t)(m - text[0]) + strlen("Stop task 7.")));
@@ -13337,10 +14244,123 @@ static void test_l326_responses_tool_search_in_place(void) {
         TEST_ASSERT(def && use && def > use);                               /* at the item, after the search */
         TEST_ASSERT(def && !strstr(def + 1, "Current weather for a city."));   /* once */
         TEST_ASSERT(!strstr(t, "defer_loading\": true}]}"));                /* not the item's raw JSON */
+        TEST_ASSERT(!strstr(t, "defer_loading"));                           /* L428: nor in the definition */
         const char *m = strstr(text[0], "Find the weather.");
         TEST_ASSERT(m && !strncmp(text[0], t, (size_t)(m - text[0]) + strlen("Find the weather.")));
         free(text[0]);
         free(text[1]);
+    }
+}
+
+/* L428: defer_loading is read beside a tool's definition and, in OpenAI's nested shape, inside its "function" object
+ * (vLLM c0d8697c5b), and the key reaches no schema in either spelling: not the tools block's lines, not the parser's
+ * tools, not a definition loaded in place.  Only the boolean true defers. */
+static void test_l428_defer_loading_nested_and_never_rendered(void) {
+    /* the tools array itself: which entries are deferred, and what their schema lines say */
+    struct tcase {
+        const char *tools;
+        bool deferred;
+    };
+    static const tcase cases[] = {
+        {"[{\"type\":\"function\",\"function\":{\"name\":\"stop\",\"description\":\"Stops a task.\",\"parameters\":"
+         "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}}},\"defer_loading\":true}}]", true},
+        {"[{\"type\":\"function\",\"function\":{\"defer_loading\":true,\"name\":\"stop\",\"description\":\"Stops a "
+         "task.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}}}}}]", true},
+        {"[{\"type\":\"function\",\"defer_loading\":true,\"function\":{\"name\":\"stop\",\"description\":\"Stops a "
+         "task.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}}}}}]", true},
+        {"[{\"type\":\"function\",\"function\":{\"name\":\"stop\",\"description\":\"Stops a task.\",\"parameters\":"
+         "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}}},\"defer_loading\":false}}]", false},
+        {"[{\"type\":\"function\",\"function\":{\"name\":\"stop\",\"description\":\"Stops a task.\",\"parameters\":"
+         "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}}},\"defer_loading\":\"true\"}}]", false},
+        {"[{\"type\":\"function\",\"name\":\"stop\",\"description\":\"Stops a task.\",\"parameters\":{\"type\":"
+         "\"object\",\"properties\":{\"id\":{\"type\":\"string\"}}},\"defer_loading\":true}]", true},
+        {"[{\"name\":\"stop\",\"description\":\"Stops a task.\",\"input_schema\":{\"type\":\"object\",\"properties\":"
+         "{\"id\":{\"type\":\"string\"}}},\"defer_loading\":true}]", true},
+        {"[{\"name\":\"stop\",\"description\":\"Stops a task.\",\"input_schema\":{\"type\":\"object\",\"properties\":"
+         "{\"id\":{\"type\":\"string\"}}},\"defer_loading\":false}]", false},
+        /* a parameter that happens to be called defer_loading is the schema's own */
+        {"[{\"type\":\"function\",\"function\":{\"name\":\"stop\",\"description\":\"Stops a task.\",\"parameters\":"
+         "{\"type\":\"object\",\"properties\":{\"defer_loading\":{\"type\":\"boolean\"}}}}}]", false},
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        const tcase &tc = cases[i];
+        const char *p = tc.tools;
+        char *lines = NULL, *deferred = NULL;
+        tool_schema_orders orders = {0};
+        char err[200] = "";
+        TEST_ASSERT(parse_tools_value(&p, &lines, &orders, &deferred, err, sizeof err));
+        const char *got = tc.deferred ? deferred : lines;
+        const char *other = tc.deferred ? lines : deferred;
+        TEST_ASSERT(got && strstr(got, "Stops a task.") && !(other && other[0]));
+        if (i + 1 < sizeof cases / sizeof cases[0]) {
+            TEST_ASSERT(got && !strstr(got, "defer_loading"));
+        } else {
+            TEST_ASSERT(got && strstr(got, "\"defer_loading\": {\"type\": \"boolean\"}"));
+        }
+        TEST_ASSERT(orders.len == 1 && !strcmp(orders.v[0].name, "stop"));   /* declared either way */
+        free(lines);
+        free(deferred);
+        tool_schema_orders_free(&orders);
+    }
+
+    /* OpenAI chat, the nested spelling, every family: the tool is declared (a call to it is read) and absent from
+     * the prompt; said false, it is in the tools block; the key is in neither prompt nor the parser's tools */
+    const pulsar_chat_format fmts[] = {PULSAR_CHAT_DS4_V41, PULSAR_CHAT_DS4_V4, PULSAR_CHAT_QWEN, PULSAR_CHAT_NEMOTRON_H,
+                                       PULSAR_CHAT_INKLING, PULSAR_CHAT_GEMMA4};
+    for (pulsar_chat_format fmt : fmts) {
+        for (int deferred = 0; deferred < 2; deferred++) {
+            const std::string body =
+                std::string("{\"messages\":[{\"role\":\"user\",\"content\":\"Stop task 7.\"}],\"tools\":[{\"type\":"
+                            "\"function\",\"function\":{\"name\":\"bash\",\"description\":\"Run a command.\","
+                            "\"parameters\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}}}}},"
+                            "{\"type\":\"function\",\"function\":{\"name\":\"TaskStop\",\"description\":\"Stops a "
+                            "background task.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"task_id\":{\"type\":"
+                            "\"string\"}}},\"defer_loading\":") + (deferred ? "true" : "false") + "}}]}";
+            request r;
+            char err[200];
+            const bool ok = l303_request(NULL, fmt, API_OPENAI, body.c_str(), &r, err, sizeof err);
+            if (!ok) fprintf(stderr, "l428 defer fmt %d: %s\n", (int)fmt, err);
+            TEST_ASSERT(ok);
+            if (!ok) continue;
+            TEST_ASSERT(strstr(r.prompt_text, "Run a command."));
+            TEST_ASSERT((strstr(r.prompt_text, "Stops a background task.") != NULL) == (deferred == 0));
+            TEST_ASSERT(!strstr(r.prompt_text, "defer_loading"));
+            TEST_ASSERT(!r.tools_json || !strstr(r.tools_json, "defer_loading"));
+            TEST_ASSERT(tool_call_declared(&r, "TaskStop", NULL, 0) && tool_call_declared(&r, "bash", NULL, 0));
+            request_free(&r);
+        }
+    }
+
+    /* the Responses API's tool search, the loaded tool in the nested spelling with the key inside "function": its
+     * definition renders at the item, once, without the key -- every family (DeepSeek's tools block is the schema
+     * lines as they are, where the key used to show) */
+    static const char *const kTools =
+        "\"tools\":[{\"type\":\"function\",\"name\":\"bash\",\"description\":\"Run a command.\",\"parameters\":"
+        "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"]}},"
+        "{\"type\":\"tool_search\",\"execution\":\"client\"}]";
+    const std::string u1 = "{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\","
+                           "\"text\":\"Find the weather.\"}]}";
+    const std::string search =
+        ",{\"type\":\"tool_search_call\",\"call_id\":\"call_s\",\"execution\":\"client\","
+        "\"arguments\":{\"query\":\"weather lookup\"}},"
+        "{\"type\":\"tool_search_output\",\"call_id\":\"call_s\",\"status\":\"completed\",\"execution\":\"client\","
+        "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Current weather "
+        "for a city.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}},"
+        "\"required\":[\"city\"]},\"defer_loading\":true}}]}";
+    for (pulsar_chat_format fmt : {PULSAR_CHAT_DS4_V41, PULSAR_CHAT_QWEN, PULSAR_CHAT_NEMOTRON_H, PULSAR_CHAT_INKLING}) {
+        const std::string body = std::string("{\"model\":\"m\",") + kTools + ",\"input\":[" + u1 + search + "]}";
+        request r;
+        char err[200];
+        const bool ok = l303_request(NULL, fmt, API_RESPONSES, body.c_str(), &r, err, sizeof err);
+        if (!ok) fprintf(stderr, "l428 defer load fmt %d: %s\n", (int)fmt, err);
+        TEST_ASSERT(ok);
+        if (!ok) continue;
+        const char *def = strstr(r.prompt_text, "Current weather for a city.");
+        const char *use = strstr(r.prompt_text, "weather lookup");
+        TEST_ASSERT(def && use && def > use && !strstr(def + 1, "Current weather for a city."));
+        TEST_ASSERT(!strstr(r.prompt_text, "defer_loading"));
+        TEST_ASSERT(tool_call_declared(&r, "get_weather", NULL, 0));
+        request_free(&r);
     }
 }
 
@@ -18540,6 +19560,11 @@ static void pulsar_server_unit_tests_run(void) {
     test_forced_call_names_a_declared_tool();
     test_l303_shapes_accept_rendered_calls();
     test_l419_gate_and_parser_agree_on_quoted_calls();
+    test_l428_defer_loading_nested_and_never_rendered();
+    test_l428_flag_parses_on_every_surface();
+    test_l428_gate_admits_one_call();
+    test_l428_turn_ends_at_its_first_call();
+    test_l428_next_prompt_extends_the_cut_turn();
     test_l420_stop_inside_reasoning_answers_with_it();
     test_l420_other_endings_are_unchanged();
     test_l420_request_records_its_response_format();

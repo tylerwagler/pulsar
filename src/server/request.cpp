@@ -968,8 +968,10 @@ static void json_prompt_escape_n(buf *b, const char *s, size_t n) {
 /// @param p the cursor; advanced past the value
 /// @param out the canonical spelling is appended here
 /// @param depth the nesting depth so far (refused at JSON_MAX_NESTING)
+/// @param drop a member of THIS object to leave out (L428: a tool entry's defer_loading); NULL = none.  Not passed
+///             down: a member of that name deeper in the value is the schema's own
 /// @return false on malformed JSON, too deep a nesting or a non-finite number
-static bool json_prompt_value_depth(const char **p, buf *out, int depth) {
+static bool json_prompt_value_depth(const char **p, buf *out, int depth, const char *drop) {
     if (depth >= JSON_MAX_NESTING) return false;
     json_ws(p);
 
@@ -996,15 +998,22 @@ static bool json_prompt_value_depth(const char **p, buf *out, int depth) {
             char *key = NULL;
             size_t key_len = 0;
             if (!json_string_n(p, &key, &key_len)) return false;
-            if (!first) buf_puts(out, ", ");
-            first = false;
-            json_prompt_escape_n(out, key, key_len);
+            const bool dropped = drop && key_len == strlen(drop) && !memcmp(key, drop, key_len);
+            if (!dropped) {
+                if (!first) buf_puts(out, ", ");
+                first = false;
+                json_prompt_escape_n(out, key, key_len);
+            }
             free(key);
             json_ws(p);
             if (**p != ':') return false;
             (*p)++;
-            buf_puts(out, ": ");
-            if (!json_prompt_value_depth(p, out, depth + 1)) return false;
+            if (dropped) {
+                if (!json_skip_value(p)) return false;
+            } else {
+                buf_puts(out, ": ");
+                if (!json_prompt_value_depth(p, out, depth + 1, NULL)) return false;
+            }
             json_ws(p);
             if (**p == '}') {
                 (*p)++;
@@ -1029,7 +1038,7 @@ static bool json_prompt_value_depth(const char **p, buf *out, int depth) {
         for (;;) {
             if (!first) buf_puts(out, ", ");
             first = false;
-            if (!json_prompt_value_depth(p, out, depth + 1)) return false;
+            if (!json_prompt_value_depth(p, out, depth + 1, NULL)) return false;
             json_ws(p);
             if (**p == ']') {
                 (*p)++;
@@ -1064,13 +1073,20 @@ static bool json_prompt_value_depth(const char **p, buf *out, int depth) {
     return true;
 }
 
-/// @brief The whole of `json` in the canonical prompt spelling (json_prompt_value_depth).
+/* L428: a tool's schema never carries `defer_loading`.  The key is the client's loading instruction to the server
+ * (tool_entry_deferred reads it), not part of the definition the model reads: it is left out wherever the entry
+ * spells it -- beside the definition (Anthropic's and the Responses API's flat entries, whose line is the entry) or
+ * inside OpenAI's nested "function" object (vLLM c0d8697c5b strips it there too).  Before, a deferred tool loaded in
+ * place rendered `"defer_loading": true` in its definition on the family whose tools block is the schema lines as
+ * they are (DeepSeek). */
+/// @brief The whole of `json` -- a tool's schema -- in the canonical prompt spelling (json_prompt_value_depth), its
+/// top-level `defer_loading` member left out.
 /// @param json one JSON value
 /// @return malloc'd text, or NULL when it does not convert (trailing bytes included)
 static char *json_prompt_value(const char *json) {
     const char *p = json;
     buf out = {0};
-    if (!json_prompt_value_depth(&p, &out, 0)) {
+    if (!json_prompt_value_depth(&p, &out, 0, "defer_loading")) {
         buf_free(&out);
         return NULL;
     }
@@ -1693,16 +1709,54 @@ char *tool_schema_lines_openai_tools(const char *lines, size_t len, char *err, s
     return buf_take(&out);
 }
 
-/* L325: the tool entry says defer_loading: true (Anthropic's tool search, Responses' too): declared, loaded later. */
-/// @param raw the tool entry's JSON
-/// @return true when its defer_loading is true
-static bool tool_entry_deferred(const char *raw) {
-    char *v = json_object_member_raw(raw, "defer_loading");
+/// @param obj a JSON object's text (NULL: false)
+/// @return true when its `defer_loading` member is the boolean true
+static bool object_defer_loading(const char *obj) {
+    char *v = obj ? json_object_member_raw(obj, "defer_loading") : NULL;
     const char *vp = v;
     bool deferred = false;
     if (vp && !json_bool(&vp, &deferred)) deferred = false;
     free(v);
     return deferred;
+}
+
+/* L325: the tool entry says defer_loading: true (Anthropic's tool search, Responses' too): declared, loaded later.
+ * L428: the key is read beside the definition and, for OpenAI's nested shape, inside its "function" object
+ * (`{"type": "function", "function": {..., "defer_loading": true}}`: vLLM c0d8697c5b reads both). */
+/// @param raw the tool entry's JSON
+/// @return true when its defer_loading, or its function's, is true
+static bool tool_entry_deferred(const char *raw) {
+    if (object_defer_loading(raw)) return true;
+    char *function = json_object_member_raw(raw, "function");
+    const bool nested = object_defer_loading(function);
+    free(function);
+    return nested;
+}
+
+/* L428: a template that takes the tools array as the client sent it (chat_openai_tools_json) would render the key
+ * with the rest of an entry: an array that spells it anywhere -- true or false, beside a definition or inside its
+ * "function" -- goes through the schema lines instead, which never carry it (json_prompt_value). */
+bool tools_array_says_defer_loading(const char *tools_json) {
+    const char *p = tools_json ? tools_json : "";
+    json_ws(&p);
+    if (*p != '[') return false;
+    p++;
+    for (;;) {
+        json_ws(&p);
+        char *raw = NULL;
+        if (*p == ']' || !*p || !json_raw_value(&p, &raw)) return false;
+        char *top = json_object_member_raw(raw, "defer_loading");
+        char *function = json_object_member_raw(raw, "function");
+        char *nested = function ? json_object_member_raw(function, "defer_loading") : NULL;
+        const bool says = top || nested;
+        free(top);
+        free(function);
+        free(nested);
+        free(raw);
+        if (says) return true;
+        json_ws(&p);
+        if (*p == ',') p++;
+    }
 }
 
 bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders, char **deferred, char *err,

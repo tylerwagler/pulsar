@@ -359,5 +359,6 @@ const server_family_ops k_family_nemotron_h = {
     /* .find_call_block       = */ nemotron_find_call_block,
     /* .tool_defs_text        = */ nemotron_tool_defs_text,
     /* .reasoning             = */ NULL,   /* <think> / </think> */
+    /* .call_tail             = */ "\n",   /* nemotron_chat.cpp: each call's </tool_call> and a newline */
 };
 SERVER_FAMILY(k_family_nemotron_h)

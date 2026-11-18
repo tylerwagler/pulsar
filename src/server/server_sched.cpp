@@ -4704,6 +4704,16 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 s->w_spec_grammar_cut_rows += np - (uint32_t)legal;
                 np = (uint32_t)legal;
             }
+            /* L428: a chain in a turn that may make one call ends with the token that closes that call */
+            if (np > 0) {
+                const int usable = gen_turn_draft_prefix(s, ag, pbase, ptok, (int)np);
+                if ((uint32_t)usable < np && !s->w_spec_turn_cut_said) {   /* rule 5: the cut ran */
+                    s->w_spec_turn_cut_said = true;
+                    server_log(PULSAR_LOG_DEFAULT, "pulsar-server: a turn limited to one tool call cut a pending "
+                               "chain: %d of %u drafts, the last closes the call (L428)", usable, np);
+                }
+                np = (uint32_t)usable;
+            }
             n_live_w++;
             float p = 1.0f;
             for (uint32_t j2 = 0; j2 < np; j2++) {

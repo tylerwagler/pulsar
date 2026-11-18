@@ -12,6 +12,13 @@
  *             opener (Inkling), the answer's opener.
  *   REGION -- a matcher is live: every draw is masked, every emitted token advances it.  A call region ends
  *             when its grammar is complete (back to FREE: another call may follow); the answer ends on a stop.
+ *   END    -- L428: the call region of a turn that may make ONE call (request::single_tool_call) completed.  That
+ *             region admitted one call (no repeat) and the bytes the family's template writes after a call, and
+ *             what may follow it is the family's end of turn alone: every draw is masked to the stop tokens, any
+ *             other token is refused.  The server ends the turn at the same
+ *             byte without the gate (gen_turn_complete: the output parser's reading, which the unconstrained path
+ *             shares), so no token after the call is ever emitted into this phase; its mask is what a speculative
+ *             round's rows past the call's close draw through.
  * Every advance is recorded, so a speculative round can walk the gate through its base and drafts to build
  * each verify row's mask and roll it back (gen_constrain_round): row i's mask is exactly the mask a plain lane
  * would apply after the same tokens, which is what keeps spec == plain.
@@ -151,6 +158,9 @@ struct constrain_plan {
     /// free text may open the block and close it again.  The gate follows both -- each starts a section of text,
     /// as it does in the family's output parser -- only to keep its Markdown code scanner on the parser's bytes.
     const server_reasoning_markers *reopens = nullptr;
+    /// L428: the turn may make one call (request::single_tool_call, with tools): `calls` admits one call, the
+    /// answer's alternative one call region, and the gate goes to GATE_END when the call region completes.
+    bool single = false;
 };
 
 void constrain_plan_free(constrain_plan *p) {
@@ -317,18 +327,25 @@ static std::string shape_schema(const std::string &schema, const server_grammar_
     return out;
 }
 
-/* One call region: call_trigger block_head (name_open NAME name_close ARGS call_close)[+] block_tail. */
-/// @param b      the format being built
-/// @param sh     the family's markup
-/// @param tools  the declared tools (each a name alternative with its arguments' schema)
-static void j_call_region(buf *b, const server_grammar_shape *sh, const std::vector<constrain_tool> &tools) {
+/* One call region: call_trigger block_head (name_open NAME name_close ARGS call_close)[+] block_tail.  L428: a
+ * turn that may make one call (`single_tail` set) gets one call in the block of a shape that repeats them, and the
+ * region goes on through the bytes the family's template writes after a call (server_family_ops::call_tail) -- so
+ * it completes where the output parser says that turn ends (parser_kit.cpp kit_read_ahead), and the gate is then
+ * past the turn's call. */
+/// @param b            the format being built
+/// @param sh           the family's markup
+/// @param tools        the declared tools (each a name alternative with its arguments' schema)
+/// @param single_tail  NULL: today's region.  Else the region admits exactly one call, then these bytes ("": none)
+static void j_call_region(buf *b, const server_grammar_shape *sh, const std::vector<constrain_tool> &tools,
+                          const char *single_tail) {
+    const bool repeat = sh->repeat && !single_tail;
     buf_puts(b, "{\"type\":\"sequence\",\"elements\":[");
     {
         std::string head = std::string(sh->call_trigger) + sh->block_head;
         j_const(b, head.c_str());
         buf_putc(b, ',');
     }
-    if (sh->repeat) buf_puts(b, "{\"type\":\"plus\",\"content\":");
+    if (repeat) buf_puts(b, "{\"type\":\"plus\",\"content\":");
     if (tools.size() > 1) buf_puts(b, "{\"type\":\"or\",\"elements\":[");
     for (size_t i = 0; i < tools.size(); i++) {
         if (i) buf_putc(b, ',');
@@ -344,10 +361,14 @@ static void j_call_region(buf *b, const server_grammar_shape *sh, const std::vec
         buf_puts(b, "]}");
     }
     if (tools.size() > 1) buf_puts(b, "]}");
-    if (sh->repeat) buf_putc(b, '}');
+    if (repeat) buf_putc(b, '}');
     if (sh->block_tail[0]) {
         buf_putc(b, ',');
         j_const(b, sh->block_tail);
+    }
+    if (single_tail && single_tail[0]) {
+        buf_putc(b, ',');
+        j_const(b, single_tail);
     }
     buf_puts(b, "]}");
 }
@@ -421,14 +442,24 @@ bool constrain_plan_build(pulsar_engine *e, server *s, const chat_conversation *
     bool any_strict = false;
     if (r->has_tools && !constrain_tools(c, &tools, &any_strict, err, errlen)) return false;
     const bool forced = r->force_tool_call && !tools.empty();
-    const bool want_calls = !tools.empty() && (forced || any_strict);
+    const server_grammar_shape *sh = r->family->grammar;
+    /* L428: a turn that may make one call.  Where each call is a block of its own, the server ends the turn at the
+     * first call's close with or without a grammar (gen_turn_complete), and a grammar only has to agree.  Where the
+     * turn's calls share ONE block (a shape with `repeat`: DeepSeek's DSML), the first call's close is inside the
+     * open block -- a turn cut there leaves the bank a history no render spells (the block never closed) -- so that
+     * turn's calls are constrained whether or not a tool is strict: the grammar admits one call and the block's
+     * close, and the turn ends at the closed block as it always does. */
+    const bool single = r->single_tool_call && !tools.empty();
+    const bool single_block = single && sh && sh->call_trigger && sh->repeat;
+    const bool want_calls = !tools.empty() && (forced || any_strict || single_block);
     /* a forced turn is its call: a response format would describe a turn that cannot happen */
     const bool want_answer = c->response_format.kind != RESPONSE_FORMAT_NONE && !forced;
     if (!want_calls && !want_answer) return true;
-    const server_grammar_shape *sh = r->family->grammar;
+    const char *const what = want_answer            ? "response_format"
+                             : forced || any_strict ? "strict tools"
+                                                    : "a turn limited to one tool call";
     if (!sh) {
-        snprintf(err, errlen, "%s: the %s family declares no grammar shape (L303)",
-                 want_answer ? "response_format" : "strict tools", r->family->name);
+        snprintf(err, errlen, "%s: the %s family declares no grammar shape (L303)", what, r->family->name);
         return false;
     }
     if (want_calls && !sh->call_trigger) {   /* a shape for response formats only (Gemma 4's until L396; none today) */
@@ -440,8 +471,7 @@ bool constrain_plan_build(pulsar_engine *e, server *s, const chat_conversation *
         if (!want_answer) return true;   /* a forced call, seeded with its opener (forced_call_seed): nothing to compile */
     }
     if (e && pulsar_engine_is_tp(e)) {
-        snprintf(err, errlen, "%s: constrained decoding does not cross a tensor-parallel pair (L303)",
-                 want_answer ? "response_format" : "strict tools");
+        snprintf(err, errlen, "%s: constrained decoding does not cross a tensor-parallel pair (L303)", what);
         return false;
     }
     /* the parse-without-engine shape (the renderer gate) compiles nothing; a server with a compiler but no
@@ -451,6 +481,7 @@ bool constrain_plan_build(pulsar_engine *e, server *s, const chat_conversation *
     if (!comp) return false;
     auto *plan = new constrain_plan();
     plan->shape = sh;
+    plan->single = single;
     const server_reasoning_markers *rm = r->family->reasoning;
     if (rm && sh->call_trigger)
         for (const char *const *m = rm->close; m < rm->close + 4 && *m; m++)
@@ -458,7 +489,7 @@ bool constrain_plan_build(pulsar_engine *e, server *s, const chat_conversation *
     if (rm && rm->open && rm->close[0]) plan->reopens = rm;
     if (want_calls) {
         buf f = {0};
-        j_call_region(&f, sh, tools);
+        j_call_region(&f, sh, tools, single ? r->family->call_tail : NULL);
         plan->calls = constrain_compile(comp, &f, "tool calls", err, errlen);
         buf_free(&f);
         if (!plan->calls) {
@@ -485,11 +516,13 @@ bool constrain_plan_build(pulsar_engine *e, server *s, const chat_conversation *
         }
         buf_puts(&f, "]}");
         if (or_calls) {
-            buf_puts(&f, ",{\"type\":\"plus\",\"content\":{\"type\":\"sequence\",\"elements\":[");
+            /* L428: one call region, not a run of them, in a turn that may make one call */
+            buf_puts(&f, single ? ",{\"type\":\"sequence\",\"elements\":["
+                                : ",{\"type\":\"plus\",\"content\":{\"type\":\"sequence\",\"elements\":[");
             j_ws(&f);
             buf_putc(&f, ',');
-            j_call_region(&f, sh, tools);
-            buf_puts(&f, "]}}]}");
+            j_call_region(&f, sh, tools, single ? r->family->call_tail : NULL);
+            buf_puts(&f, single ? "]}]}" : "]}}]}");
         }
         buf_puts(&f, "]}");
         plan->answer = constrain_compile(comp, &f, "response_format", err, errlen);
@@ -570,8 +603,9 @@ struct constrain_kmp {
     }
 };
 
-/// Where the gate stands: inside reasoning, in unconstrained text, or inside a grammar region.
-enum constrain_phase : uint8_t { GATE_THINK, GATE_FREE, GATE_REGION };
+/// Where the gate stands: inside reasoning, in unconstrained text, inside a grammar region, or (L428) past the one
+/// call of a turn that may make one, where only the end of the turn may follow.
+enum constrain_phase : uint8_t { GATE_THINK, GATE_FREE, GATE_REGION, GATE_END };
 
 /* What one advance changed, to undo it. */
 /// The gate state before one advance (gate_feed), kept in constrain_gate::hist so gate_rollback can undo it.
@@ -627,6 +661,9 @@ struct constrain_gate {
     std::vector<uint32_t> rows;   /* a round's masks */
     /// One draw's mask (`words` long), the buffer gen_constrain_base_mask hands out.
     std::vector<uint32_t> one;    /* a single draw's mask */
+    /// L428: GATE_END's mask, `words` long: the vocabulary's stop tokens and nothing else.  Built at the gate's start
+    /// for a plan that is `single` and has a call region; empty otherwise.
+    std::vector<uint32_t> stop_row;
     /** L419: the Markdown code state of the current section of free text or reasoning, so a call trigger quoted in
      *  an inline span or a fenced block opens no region -- the output parser reads it as text (out_parse_kit.h),
      *  and the two must agree on where a call starts.  It has read the section's bytes up to the call trigger's
@@ -690,7 +727,8 @@ static bool gate_open(constrain_gate *gt, const pulsar_grammar *gr, bool end_at_
 /// @param gt  the gate
 static void gate_region_done(constrain_gate *gt) {
     if (gt->phase == GATE_REGION && pulsar_grammar_matcher_terminated(gt->matchers[(size_t)gt->cur])) {
-        gt->phase = GATE_FREE;
+        /* L428: the one call of a turn that may make one: only the end of the turn may follow */
+        gt->phase = gt->stop_row.empty() ? GATE_FREE : GATE_END;
         gt->kmp_call = gt->kmp_answer = 0;
         /* L419: the call closed and content starts afresh (the output parser's CALL -> CONTENT) */
         gt->code.reset();
@@ -754,6 +792,11 @@ static bool gate_feed(constrain_gate *gt, int token, const char *b, size_t n) {
                          gt->code, gt->in_reason, gt->kmp_ropen, gt->kmp_rclose};
     const constrain_plan *p = gt->plan;
     gt->err[0] = '\0';
+    if (gt->phase == GATE_END) {   /* L428: a stop never reaches the gate, and nothing else may follow the call */
+        snprintf(gt->err, sizeof gt->err, "grammar: token %d (\"%.*s\") follows the one tool call this turn may make",
+                 token, (int)(n < 40 ? n : 40), b);
+        return false;
+    }
     bool ok = true;
     for (size_t i = 0; ok && i < n;) {
         if (gt->phase == GATE_REGION) {
@@ -859,11 +902,19 @@ static bool gate_rollback(constrain_gate *gt, int n) {
     return true;
 }
 
-/// @brief The current region's token mask.
-/// @param gt  the gate (in a region)
+/// @param gt  the gate
+/// @return true when the next draw is masked: inside a region, or (L428) past a single-call turn's call
+static bool gate_masked(const constrain_gate *gt) { return gt->phase == GATE_REGION || gt->phase == GATE_END; }
+
+/// @brief The next draw's token mask: the current region's, or (L428) past a single-call turn's call the stop tokens.
+/// @param gt  the gate (gate_masked)
 /// @param row  receives gen_constrain_words words, bit t = token t allowed
 /// @return false with gt->err set
 static bool gate_fill(constrain_gate *gt, uint32_t *row) {
+    if (gt->phase == GATE_END) {
+        memcpy(row, gt->stop_row.data(), (size_t)gt->words * sizeof(uint32_t));
+        return true;
+    }
     return pulsar_grammar_matcher_fill(gt->matchers[(size_t)gt->cur], row, gt->err, sizeof gt->err);
 }
 
@@ -905,6 +956,12 @@ bool gen_constrain_begin(server *s, gen_state *g) {
         gt->ropen.init(gt->plan->reopens->open);
         gt->rclose.init(gt->plan->reopens->close[0]);
     }
+    if (gt->plan->single && gt->plan->calls) {   /* L428: GATE_END's mask */
+        gt->stop_row.assign(gt->words, 0u);
+        const int vocab = pulsar_grammar_compiler_vocab(s->grammar);
+        for (int t = 0; t < vocab; t++)
+            if (pulsar_grammar_compiler_is_stop(s->grammar, t)) gt->stop_row[(uint32_t)t >> 5] |= 1u << ((uint32_t)t & 31u);
+    }
     g->gate = gt;
     /* where the turn starts: inside reasoning (the prompt left a think block open: the stop scan's authority),
      * in the answer when it opens at the think close, else free */
@@ -937,8 +994,13 @@ void gen_constrain_end(gen_state *g) {
 }
 
 /// @param g  the generation state
-/// @return true while the decode sits inside a grammar region
-bool gen_constrain_live(const gen_state *g) { return g->gate && g->gate->phase == GATE_REGION; }
+/// @return true while the next draw is masked: the decode sits inside a grammar region, or (L428) past the one call
+///         of a turn that may make one
+bool gen_constrain_live(const gen_state *g) { return g->gate && gate_masked(g->gate); }
+
+/// @param g  the generation state
+/// @return true once the call region of a turn that may make one call has completed (GATE_END)
+bool gen_constrain_turn_over(const gen_state *g) { return g->gate && g->gate->phase == GATE_END; }
 
 /// @param s  the server (grammar built)
 /// @return 32-bit words in one token mask row
@@ -1006,7 +1068,7 @@ int gen_constrain_round(server *s, gen_state *g, const TokId *toks, int n, bool 
     }
     for (int i = 0; ok && i < rows; i++) {
         uint32_t *row = gt->rows.data() + (size_t)i * W;
-        const bool live = walking && gt->phase == GATE_REGION;
+        const bool live = walking && gate_masked(gt);
         if (live) {
             ok = gate_fill(gt, row);
             any_live = true;
