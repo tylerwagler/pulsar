@@ -490,9 +490,17 @@ void state_free(g4_state *st) {
     free(st);
 }
 
-/* The device constants: the proportional rope's table (HF's _compute_proportional_rope_parameters: 64 of the 256 pairs
- * at 1 / theta^(2p / 512), the rest 0 -- computed in double, rounded once to f32), the ones weight, the f32
- * per_expert_scale of every layer (the bf16 weights widened, exact). */
+/* The device constants: the proportional rope's table (the layout of HF's _compute_proportional_rope_parameters: 64 of
+ * the 256 pairs at 1 / theta^(2p / 512), the rest 0), the ones weight, the f32 per_expert_scale of every layer (the
+ * bf16 weights widened, exact).
+ *
+ * The table's arithmetic is OURS, not HF's: each live word is computed in double and rounded once to f32.  HF
+ * (transformers modeling_rope_utils.py, read at 5.12.1) computes it in fp32 throughout --
+ * 1.0 / (base ** (arange(0, 2 * rope_angles, 2).float() / head_dim)) -- so three roundings (the exponent, the power,
+ * the reciprocal) against our one: some live words differ from HF's by 1 ulp (L418: 20 of the 64 at theta 1e6,
+ * head_dim 512, against torch's CPU fp32; never more than 1 ulp).  Kept on purpose: the table feeds every global
+ * layer's rotation, so moving it to HF's form moves Gemma's bytes.  tests/gqa_attn_gate.cu builds its table with this
+ * same one-rounding expression, so that gate grades the kernels on OUR table, not on HF's. */
 /** @param e   the engine (its model and weights)
  *  @param st  the state whose constants are written
  *  @return true = uploaded */

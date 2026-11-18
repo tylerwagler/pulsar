@@ -697,6 +697,11 @@ typedef struct server_family_ops {
 typedef struct server_reasoning_markers {
     const char *open;       ///< opens the block
     const char *close[4];   ///< end it, NULL-terminated; close[0] = the close token's text
+    /** L417: the MODEL writes `open`, and each one it writes starts a reasoning block (the family's output parser has
+     *  an edge from content into reasoning on it: Gemma 4 opens its thought channel itself, and may again after an
+     *  answer began).  false -- and every family without a table -- = only the prompt opens the block: an `open` in
+     *  generated text is the answer's own text, which the usage count leaves out (reasoning_usage_note). */
+    bool model_opens;
 } server_reasoning_markers;
 
 /* ---- L272 P3 steps 2-3: the family's OUTPUT PARSER ----------------------------------------------
@@ -1242,6 +1247,10 @@ typedef struct request {
     bool stream_include_usage;   ///< append a usage event to the stream
     int cache_read_tokens;       ///< prompt tokens served from cache (reported back as usage)
     int cache_write_tokens;      ///< prompt tokens written to cache (reported back as usage)
+    /** L417: generated tokens of this chat that were emitted inside a reasoning block, across decode attempts as the
+     *  reported completion tokens are (reasoning_usage_note counts them; reported back as usage: OpenAI's
+     *  completion_tokens_details / output_tokens_details). */
+    int reasoning_tokens;
     req_timings timings;         ///< per-phase timings for this request
     pulsar_think_mode think_mode;///< whether the model may emit reasoning, and how it is surfaced
     bool has_tools;              ///< the request declared tools
@@ -4628,6 +4637,11 @@ struct gen_state {
     /** L344: this attempt's reasoning block has closed -- latched: a literal \<think\> in the answer flips
      *  `thinking.inside` back, but the budget governs only the block the turn opened with. */
     bool think_closed;
+    /** L417: the block the tracker is in (or was last in) is one the family reads as reasoning, so its tokens count
+     *  toward request::reasoning_tokens: the block the attempt opened in, or one the model opened in a family whose
+     *  model opens them (server_reasoning_markers::model_opens).  Apart from the L344 budget's fields: the budget
+     *  governs the first block only, the usage report counts every one. */
+    bool reasoning_block;
     /** L344: the forced-close mask rows (gen_think_masks), rows x think_rows_words; owned, grown on demand. */
     uint32_t *think_rows;
     /// L344: uint32_t words think_rows holds
@@ -6002,6 +6016,13 @@ thinking_state thinking_state_from_prompt(const request *r);
 /// @param g the decode attempt (think_tokens, think_closed)
 /// @param was_inside the tracker's `inside` before the token's piece was fed
 void think_budget_note(gen_state *g, bool was_inside);
+/// @brief L417: count one emitted token toward the usage report's reasoning tokens (request::reasoning_tokens), after
+/// the tracker was fed its piece: a chat's token counts when the tracker was inside a reasoning block before it and
+/// still is after it, in a block the family reads as reasoning (gen_state::reasoning_block).  The markers themselves
+/// are not counted (the token that completes an open or a close marker), so with a budget the count never passes it.
+/// @param g the decode attempt (thinking, reasoning_block; its job's request takes the count)
+/// @param was_inside the tracker's `inside` before the token's piece was fed
+void reasoning_usage_note(gen_state *g, bool was_inside);
 char *build_tool_checkpoint_suffix(const request *r, const char *content,
                                           const char *reasoning, const tool_calls *calls);
 /** As above, plus the suffix's CLIENT-DATA ranges (L223): the sampled content

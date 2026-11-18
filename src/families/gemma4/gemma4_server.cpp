@@ -251,6 +251,7 @@ static const server_grammar_shape k_grammar_gemma4 = {
 static const server_reasoning_markers k_reasoning_gemma4 = {
     /* .open  = */ "<|channel>",
     /* .close = */ {"<channel|>", "<|tool_call>", "<|turn>", "<|tool_response>"},
+    /* .model_opens = */ true,   /* L417: gemma4_output_grammar's content -> reasoning edge on <|channel> */
 };
 
 /// Gemma 4's server table (registered below by SERVER_FAMILY; found by its chat format).

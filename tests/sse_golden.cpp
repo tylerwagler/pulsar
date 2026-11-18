@@ -18,7 +18,14 @@
  *
  * L294 E6: an INKLING leg after the Qwen one, the same sequence on a request Inkling's renderer prepared (the kit in
  * Inkling's configuration: typed content blocks, the shared JSON call body).  Appended: the earlier legs' bytes are
- * unchanged. */
+ * unchanged.
+ *
+ * L417: a USAGE leg after the Inkling one -- the final usage object with its reasoning tokens, on the two OpenAI
+ * surfaces (chat completions with stream_options.include_usage, Responses).  Each fed piece stands for one generated
+ * token and goes through the server's own count (reasoning_usage_note after the tracker, as gen_emit_token), and the
+ * completion tokens reported are the pieces fed, so reasoning_tokens is a subset of them as on the server.  It adds a
+ * Gemma 4 request (the model opens its thought channel itself, twice in one case).  Appended: the earlier legs never
+ * count (their usage keeps reasoning_tokens 0, and the chat stream sends no usage), so their bytes are unchanged. */
 #define PULSAR_SERVER_TEST
 #define PULSAR_SERVER_TEST_NO_MAIN
 #include "../src/server/util.cpp"
@@ -177,6 +184,27 @@ static const gcase ICASES[] = {
      "\"args\":[1, 2]}<|end_message|>", "stop"},
 };
 
+/* ---- L417: the usage leg ------------------------------------------------------------------------------ */
+
+/// One usage-leg case: a generation and the family whose request it answers.
+struct ucase { gcase c; pulsar_chat_format fmt; };
+static const ucase UCASES[] = {
+    {{"u-ds-think-answer", true, false, "Let me compute 17*23.</think>The answer is 391.", "stop"}, PULSAR_CHAT_DS4_V41},
+    {{"u-ds-no-think", false, false, "Plain answer with <think> not reasoning </think> text.", "stop"},
+     PULSAR_CHAT_DS4_V41},
+    {{"u-q-think-answer", true, false, "Let me compute 17*23.\n</think>\n\nThe answer is 391.", "stop"},
+     PULSAR_CHAT_QWEN},
+    {{"u-q-think-unclosed", true, false, "thinking on and on, never closing", "length"}, PULSAR_CHAT_QWEN},
+    {{"u-q-no-think", false, false, "Plain answer with <think> not reasoning </think> text.", "stop"}, PULSAR_CHAT_QWEN},
+    {{"u-q-literal-think-after-close", true, false, "a\n</think>\n\nThe tag <think> opens nothing here.", "stop"},
+     PULSAR_CHAT_QWEN},
+    {{"u-g-channel-answer", true, false, "<|channel>thought\nLet me compute 17*23.<channel|>The answer is 391.", "stop"},
+     PULSAR_CHAT_GEMMA4},
+    {{"u-g-two-channels", true, false, "<|channel>thought\nfirst<channel|>Partly. <|channel>thought\nsecond<channel|>Done.",
+     "stop"}, PULSAR_CHAT_GEMMA4},
+    {{"u-g-no-think", false, false, "Plain answer.", "stop"}, PULSAR_CHAT_GEMMA4},
+};
+
 /* the one tool, in each protocol's declaration shape (the renderer reads the request's) */
 #define QSCHEMA "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}}}"
 static const char *qtools_for(proto p) {
@@ -187,7 +215,16 @@ static const char *qtools_for(proto p) {
     }
 }
 
-static std::string run_family(const gcase &c, proto p, size_t piece, pulsar_chat_format fmt) {
+/// One run: the generation `c.raw` fed `piece` bytes at a time to protocol `p`'s live projection of a request family
+/// `fmt` rendered, then finished as the server finishes it.
+/// @param c      the case
+/// @param p      the protocol
+/// @param piece  bytes a feed (0: the whole text at once)
+/// @param fmt    the family's chat format
+/// @param usage  L417: the usage leg -- each piece is counted as one generated token (the server's reasoning count)
+///               and the chat stream is asked for its usage chunk
+/// @return the stream's bytes, ids and timestamps normalised
+static std::string run_family(const gcase &c, proto p, size_t piece, pulsar_chat_format fmt, bool usage = false) {
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return "(socketpair failed)\n";
     fcntl(sv[1], F_SETFL, O_NONBLOCK);
@@ -238,6 +275,7 @@ static std::string run_family(const gcase &c, proto p, size_t piece, pulsar_chat
     }
     chat_conversation_free(&conv);
     r->stream = true;
+    r->stream_include_usage = usage;
 
     server srv;
     memset(&srv, 0, sizeof srv);
@@ -246,6 +284,8 @@ static std::string run_family(const gcase &c, proto p, size_t piece, pulsar_chat
     memset(&g, 0, sizeof g);
     g.j = &j;
     g.thinking = thinking_state_from_prompt(r);   /* the server's gen_decode_init */
+    g.reasoning_block = g.thinking.inside;
+    int fed = 0;   /* L417: pieces fed = the usage leg's generated tokens */
     streams st;
     memset(&st, 0, sizeof(st));
     std::string out;
@@ -272,7 +312,10 @@ static std::string run_family(const gcase &c, proto p, size_t piece, pulsar_chat
     for (size_t at = 0; ok && at < n;) {
         const size_t to = piece ? std::min(n, at + piece) : n;
         buf_append(&g.text, c.raw + at, to - at);
+        const bool was_inside = g.thinking.inside;
         g.thinking.feed(c.raw + at, to - at);
+        if (usage) reasoning_usage_note(&g, was_inside);   /* gen_emit_token's count, a piece a token */
+        fed++;
         at = to;
         ok = ops->feed(ps, &srv, &g, g.text.len, false);
         drain(sv[1], &out);
@@ -286,11 +329,11 @@ static std::string run_family(const gcase &c, proto p, size_t piece, pulsar_chat
         if (ok) ok = stream_ok && ops->feed(ps, &srv, &g, g.text.len, true);
         if (ok) {
             switch (p) {
-            case P_OPENAI: ok = openai_sse_finish(&g.sink, &turn.calls, turn.finish, 10, 20); break;
+            case P_OPENAI: ok = openai_sse_finish(&g.sink, &turn.calls, turn.finish, 10, usage ? fed : 20); break;
             case P_ANTHROPIC: ok = anthropic_sse_finish(&g.sink, &turn.calls, turn.finish, NULL, 20); break;
             default:
-                ok = responses_sse_finish(sv[0], r, &st.rs, turn.tail, turn.tail_len, &turn.calls, turn.finish, 10, 20,
-                                          1700000000L);
+                ok = responses_sse_finish(sv[0], r, &st.rs, turn.tail, turn.tail_len, &turn.calls, turn.finish, 10,
+                                          usage ? fed : 20, 1700000000L);
             }
         }
         ops->destroy(ps);
@@ -334,6 +377,15 @@ int main(void) {
             for (size_t piece : {(size_t)1, (size_t)3, (size_t)7, (size_t)0}) {
                 printf("== %s [%s] piece %zu\n", c.name, PROTO_NAME[p], piece);
                 fputs(run_family(c, (proto)p, piece, PULSAR_CHAT_INKLING).c_str(), stdout);
+                n++;
+            }
+        }
+    }
+    for (const ucase &u : UCASES) {
+        for (proto p : {P_OPENAI, P_RESPONSES}) {
+            for (size_t piece : {(size_t)1, (size_t)7}) {
+                printf("== %s [%s] piece %zu\n", u.c.name, PROTO_NAME[p], piece);
+                fputs(run_family(u.c, p, piece, u.fmt, true).c_str(), stdout);
                 n++;
             }
         }

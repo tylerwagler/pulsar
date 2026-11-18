@@ -28,6 +28,11 @@
 {"name": "chat/effort-50", "endpoint": "chat", "family": "deepseek", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "reasoning_effort": 50}}
 {"name": "chat/effort-101", "endpoint": "chat", "family": "deepseek", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "reasoning_effort": 101}}
 {"name": "chat/effort-None", "endpoint": "chat", "family": "deepseek", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "reasoning_effort": null}}
+{"name": "chat/effort-1e+30", "endpoint": "chat", "family": "deepseek", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "reasoning_effort": 1e+30}}
+{"name": "chat/effort-nan", "endpoint": "chat", "family": "deepseek", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "reasoning_effort": NaN}}
+{"name": "chat/effort-inf", "endpoint": "chat", "family": "deepseek", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "reasoning_effort": Infinity}}
+{"name": "chat/effort--inf", "endpoint": "chat", "family": "deepseek", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "reasoning_effort": -Infinity}}
+{"name": "chat/effort-50.5", "endpoint": "chat", "family": "deepseek", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "reasoning_effort": 50.5}}
 {"name": "chat/effort-and-off", "endpoint": "chat", "family": "deepseek", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "reasoning_effort": "low", "think": false}}
 {"name": "chat/kwargs", "endpoint": "chat", "family": "deepseek", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "chat_template_kwargs": {"enable_thinking": false}}}
 {"name": "chat/kwargs-effort", "endpoint": "chat", "family": "deepseek", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "chat_template_kwargs": {"reasoning_effort": "low"}}}
@@ -77,6 +82,11 @@
 {"name": "chat/effort-50", "endpoint": "chat", "family": "qwen", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "reasoning_effort": 50}}
 {"name": "chat/effort-101", "endpoint": "chat", "family": "qwen", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "reasoning_effort": 101}}
 {"name": "chat/effort-None", "endpoint": "chat", "family": "qwen", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "reasoning_effort": null}}
+{"name": "chat/effort-1e+30", "endpoint": "chat", "family": "qwen", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "reasoning_effort": 1e+30}}
+{"name": "chat/effort-nan", "endpoint": "chat", "family": "qwen", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "reasoning_effort": NaN}}
+{"name": "chat/effort-inf", "endpoint": "chat", "family": "qwen", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "reasoning_effort": Infinity}}
+{"name": "chat/effort--inf", "endpoint": "chat", "family": "qwen", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "reasoning_effort": -Infinity}}
+{"name": "chat/effort-50.5", "endpoint": "chat", "family": "qwen", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "reasoning_effort": 50.5}}
 {"name": "chat/effort-and-off", "endpoint": "chat", "family": "qwen", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "reasoning_effort": "low", "think": false}}
 {"name": "chat/kwargs", "endpoint": "chat", "family": "qwen", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "chat_template_kwargs": {"enable_thinking": false}}}
 {"name": "chat/kwargs-effort", "endpoint": "chat", "family": "qwen", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "chat_template_kwargs": {"reasoning_effort": "low"}}}
@@ -254,6 +264,11 @@
 {"name": "chat/effort-50", "endpoint": "chat", "family": "inkling", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "reasoning_effort": 50}}
 {"name": "chat/effort-101", "endpoint": "chat", "family": "inkling", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "reasoning_effort": 101}}
 {"name": "chat/effort-None", "endpoint": "chat", "family": "inkling", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "reasoning_effort": null}}
+{"name": "chat/effort-1e+30", "endpoint": "chat", "family": "inkling", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "reasoning_effort": 1e+30}}
+{"name": "chat/effort-nan", "endpoint": "chat", "family": "inkling", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "reasoning_effort": NaN}}
+{"name": "chat/effort-inf", "endpoint": "chat", "family": "inkling", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "reasoning_effort": Infinity}}
+{"name": "chat/effort--inf", "endpoint": "chat", "family": "inkling", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "reasoning_effort": -Infinity}}
+{"name": "chat/effort-50.5", "endpoint": "chat", "family": "inkling", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "reasoning_effort": 50.5}}
 {"name": "chat/effort-and-off", "endpoint": "chat", "family": "inkling", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "reasoning_effort": "low", "think": false}}
 {"name": "chat/kwargs", "endpoint": "chat", "family": "inkling", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "chat_template_kwargs": {"enable_thinking": false}}}
 {"name": "chat/kwargs-effort", "endpoint": "chat", "family": "inkling", "body": {"messages": [{"role": "user", "content": "What is 17 * 23?"}], "chat_template_kwargs": {"reasoning_effort": "low"}}}

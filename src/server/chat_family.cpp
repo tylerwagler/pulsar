@@ -187,9 +187,11 @@ static bool effort_value(const char **p, const char *key, chat_effort_ask *a, ch
         a->value = 0;
         return true;
     }
+    /* L418: the range before the cast -- strtod reads 1e30, inf and nan, and a double outside int's range (or NaN,
+     * which fails this comparison) is an undefined conversion; within 1..100 the cast is exact */
     double v = 0.0;
-    if (!json_number(p, &v) || v != (double)(int)v || (int)v < PULSAR_THINK_EFFORT_MIN ||
-        (int)v > PULSAR_THINK_EFFORT_MAX) {
+    if (!json_number(p, &v) || !(v >= (double)PULSAR_THINK_EFFORT_MIN && v <= (double)PULSAR_THINK_EFFORT_MAX) ||
+        v != (double)(int)v) {
         snprintf(err, errlen, "%s: an effort is a name or an integer 1..100", key);
         return false;
     }

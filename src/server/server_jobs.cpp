@@ -1774,6 +1774,7 @@ void server::gen_decode_init(session_slot *sl) {
     g->last_decode_log_completion = 0;
     g->thinking = thinking_state_from_prompt(&j->req);
     g->think_closed = false;   /* L344: the attempt's own block (think_tokens spans attempts) */
+    g->reasoning_block = g->thinking.inside;   /* L417: a block the prompt opened is reasoning in every family */
     /* A logprobs request decodes WITHOUT speculation.  The fused DSpark step
      * verifies K drafts in one batch and keeps each position's target row only
      * inside that batch; by the time pulsar_session_generate_speculative
@@ -2051,6 +2052,7 @@ bool server::gen_emit_token(session_slot *sl, int token) {
                                           g->plain_stream_pos, &g->thinking, &g->stop_scan_from,
                                           &hit_stop, &stop_pos, &stop_len);
     think_budget_note(g, was_inside);
+    reasoning_usage_note(g, was_inside);   /* L417 */
 
     if (gen_streams_plain(g) && stream_len > g->plain_stream_pos) {
         char *delta = server_xstrndup(g->text.ptr + g->plain_stream_pos, stream_len - g->plain_stream_pos);

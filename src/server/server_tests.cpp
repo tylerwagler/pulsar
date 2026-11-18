@@ -1252,6 +1252,7 @@ static void test_openai_stream_usage_reports_cache_details(void) {
     r.stream_include_usage = true;
     r.cache_read_tokens = 7;
     r.cache_write_tokens = 3;
+    r.reasoning_tokens = 1;
 
     TEST_ASSERT(sse_done(sv[0], &r, "chatcmpl_usage", 10, 2));
     shutdown(sv[0], SHUT_WR);
@@ -1263,7 +1264,29 @@ static void test_openai_stream_usage_reports_cache_details(void) {
     TEST_ASSERT(strstr(out, "\"prompt_tokens_details\":{") != NULL);
     TEST_ASSERT(strstr(out, "\"cached_tokens\":7") != NULL);
     TEST_ASSERT(strstr(out, "\"cache_write_tokens\":3") != NULL);
+    /* L417: the whole object, in OpenAI's order */
+    TEST_ASSERT(strstr(out, "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12,"
+                            "\"prompt_tokens_details\":{\"cached_tokens\":7,\"cache_write_tokens\":3},"
+                            "\"completion_tokens_details\":{\"reasoning_tokens\":1}}") != NULL);
     TEST_ASSERT(strstr(out, "data: [DONE]") != NULL);
+
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+
+    /* L417: the non-streamed chat completion carries the same object */
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        request_free(&r);
+        return;
+    }
+    r.stream = false;
+    TEST_ASSERT(final_response(sv[0], &r, "chatcmpl_usage", "OK", "why", NULL, "stop", 10, 2, NULL));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12,"
+                            "\"prompt_tokens_details\":{\"cached_tokens\":7,\"cache_write_tokens\":3},"
+                            "\"completion_tokens_details\":{\"reasoning_tokens\":1}}") != NULL);
 
     free(out);
     request_free(&r);
@@ -1279,6 +1302,7 @@ static void test_responses_usage_reports_cache_details(void) {
     r.api = API_RESPONSES;
     r.cache_read_tokens = 7;
     r.cache_write_tokens = 3;
+    r.reasoning_tokens = 1;
 
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -1296,7 +1320,7 @@ static void test_responses_usage_reports_cache_details(void) {
     TEST_ASSERT(strstr(out, "\"input_tokens_details\":{") != NULL);
     TEST_ASSERT(strstr(out, "\"cached_tokens\":7") != NULL);
     TEST_ASSERT(strstr(out, "\"cache_write_tokens\":3") != NULL);
-    TEST_ASSERT(strstr(out, "\"output_tokens\":2") != NULL);
+    TEST_ASSERT(strstr(out, "\"output_tokens\":2,\"output_tokens_details\":{\"reasoning_tokens\":1},") != NULL);
     TEST_ASSERT(strstr(out, "\"total_tokens\":12") != NULL);
 
     free(out);
@@ -1321,7 +1345,7 @@ static void test_responses_usage_reports_cache_details(void) {
     TEST_ASSERT(strstr(out, "\"input_tokens_details\":{") != NULL);
     TEST_ASSERT(strstr(out, "\"cached_tokens\":7") != NULL);
     TEST_ASSERT(strstr(out, "\"cache_write_tokens\":3") != NULL);
-    TEST_ASSERT(strstr(out, "\"output_tokens\":2") != NULL);
+    TEST_ASSERT(strstr(out, "\"output_tokens\":2,\"output_tokens_details\":{\"reasoning_tokens\":1},") != NULL);
     TEST_ASSERT(strstr(out, "\"total_tokens\":12") != NULL);
 
     free(out);
@@ -2338,6 +2362,28 @@ static void test_effort_names_one_table(void) {
             TEST_ASSERT(err[0] != 0);
             request_free(&r);
         }
+        /* L418: a number is range-tested before it is cast -- one no int holds (1e30, inf), NaN, a negative, 0 and a
+         * non-integer are each the one refusal 101 gets, on every key that carries an effort; the ends 1 and 100 pass */
+        static const char *const not_effort[] = {"1e30", "-1e30", "1e999", "-1e999", "inf", "-inf", "Infinity", "nan",
+                                                 "NaN", "-nan", "2147483648", "4294967297", "0", "-1", "0.5", "100.5",
+                                                 "101"};
+        for (const char *v : not_effort) {
+            char body[160];
+            snprintf(body, sizeof body, EFFORT_BODY(",\"reasoning_effort\":%s"), v);
+            TEST_ASSERT(!effort_case(f, body, &r, err, sizeof err));
+            TEST_ASSERT(!strcmp(err, "reasoning_effort: an effort is a name or an integer 1..100"));
+            request_free(&r);
+            snprintf(body, sizeof body, EFFORT_BODY(",\"chat_template_kwargs\":{\"reasoning_effort\":%s}"), v);
+            TEST_ASSERT(!effort_case(f, body, &r, err, sizeof err));
+            TEST_ASSERT(!strcmp(err, "chat_template_kwargs.reasoning_effort: an effort is a name or an integer 1..100"));
+            request_free(&r);
+        }
+        for (const char *v : {"1", "100", "1e2", "50.0"}) {
+            char body[160];
+            snprintf(body, sizeof body, EFFORT_BODY(",\"reasoning_effort\":%s"), v);
+            TEST_ASSERT(effort_case(f, body, &r, err, sizeof err));
+            request_free(&r);
+        }
         /* deepseek-chat: thinking off by default on any family; an explicit switch wins */
         TEST_ASSERT(effort_case(f, EFFORT_BODY(",\"model\":\"deepseek-chat\""), &r, err, sizeof err));
         TEST_ASSERT(r.think_mode == PULSAR_THINK_NONE);
@@ -2517,6 +2563,125 @@ static void test_l398_gemma_reasoning_tracker(void) {
     TEST_ASSERT(qs.inside);
     qs.feed("</think>", 8);
     TEST_ASSERT(!qs.inside);
+}
+
+/* L417: one decode attempt of a rendered chat, a token at a time through the emit path's accounting (gen_emit_token:
+ * the tracker is fed the piece, then the budget's note and the usage note), started as gen_decode_init starts it. */
+/// @param g     the generation state (its job's request rendered: effort_case)
+/// @param turn  the attempt's tokens as text
+/// @param n     tokens at `turn`
+static void l417_attempt(gen_state *g, const char *const *turn, int n) {
+    g->thinking = thinking_state_from_prompt(&g->j->req);
+    g->think_closed = false;
+    g->reasoning_block = g->thinking.inside;
+    for (int i = 0; i < n; i++) {
+        const bool was = g->thinking.inside;
+        g->thinking.feed(turn[i], strlen(turn[i]));
+        think_budget_note(g, was);
+        reasoning_usage_note(g, was);
+    }
+}
+
+/// One attempt of the chat `body` renders for family `fmt` (l417_attempt).
+/// @param fmt   the family's chat format
+/// @param body  the OpenAI chat request
+/// @param turn  the generated tokens as text
+/// @param n     tokens at `turn`
+/// @param budget_out  receives the L344 budget counter after the turn (NULL: not wanted)
+/// @return the request's reasoning tokens after the turn; -1 when the request does not render
+static int l417_count(pulsar_chat_format fmt, const char *body, const char *const *turn, int n, int *budget_out) {
+    char err[256];
+    job j;
+    memset(&j, 0, sizeof j);
+    if (!effort_case(fmt, body, &j.req, err, sizeof err)) {
+        request_free(&j.req);
+        return -1;
+    }
+    gen_state g;
+    memset(&g, 0, sizeof g);
+    g.j = &j;
+    l417_attempt(&g, turn, n);
+    const int got = j.req.reasoning_tokens;
+    if (budget_out) *budget_out = g.think_tokens;
+    request_free(&j.req);
+    return got;
+}
+
+/// The token count of a string-literal array.
+#define L417_N(a) ((int)(sizeof(a) / sizeof((a)[0])))
+
+/* L417: usage's reasoning_tokens = the generated tokens emitted inside a reasoning block the family reads as
+ * reasoning (before and after the token: the markers are not counted), every block of every decode attempt -- not the
+ * L344 budget's counter, which stops at the first close and counts a literal <think> in an answer that started
+ * outside reasoning. */
+static void test_l417_reasoning_tokens_count(void) {
+    const char *on = EFFORT_BODY("");
+    const char *off = EFFORT_BODY(",\"enable_thinking\":false");
+    int budget = -1;
+
+    /* <think> families: the prompt opened the block; its tokens up to the close token count, the close does not */
+    static const char *const closed[] = {"Let", " me", " think", ".\n", "</think>", "\n\n", "391"};
+    for (pulsar_chat_format f : {PULSAR_CHAT_QWEN, PULSAR_CHAT_DS4_V41, PULSAR_CHAT_DS4_V4, PULSAR_CHAT_NEMOTRON_H}) {
+        TEST_ASSERT(l417_count(f, on, closed, L417_N(closed), &budget) == 4);
+        TEST_ASSERT(budget == 4);   /* one block: the budget's counter agrees */
+        /* thinking off: nothing, and a <think> block the ANSWER spells is its text (the families' parsers have no edge
+         * from content into reasoning) -- the budget's counter does count it, which is why usage has its own */
+        static const char *const literal[] = {"391", " and", " <think>", " not", " reasoning", "</think>", "."};
+        TEST_ASSERT(l417_count(f, off, literal, L417_N(literal), &budget) == 0);
+        TEST_ASSERT(budget == 2);
+        /* the turn ends inside the block (the cap cut it): every token was reasoning */
+        static const char *const unclosed[] = {"thinking", " on", " and", " on"};
+        TEST_ASSERT(l417_count(f, on, unclosed, L417_N(unclosed), NULL) == 4);
+        /* after the close, a <think> the answer writes opens nothing */
+        static const char *const second[] = {"a", "</think>", "x", "<think>", "y", "</think>", "z"};
+        TEST_ASSERT(l417_count(f, on, second, L417_N(second), NULL) == 1);
+        /* a close marker split across tokens: its leading piece is still inside (the tracker's boundary) */
+        static const char *const split[] = {"a", "</th", "ink>", "b"};
+        TEST_ASSERT(l417_count(f, on, split, L417_N(split), NULL) == 2);
+    }
+
+    /* Gemma 4: the MODEL opens the thought channel (server_reasoning_markers::model_opens); <|channel> and <channel|>
+     * are not counted, the "thought\n" label's tokens are (they are generated inside the block) */
+    static const char *const g_closed[] = {"<|channel>", "thought", "\n", "Let", " me", "<channel|>", "Hi"};
+    TEST_ASSERT(l417_count(PULSAR_CHAT_GEMMA4, on, g_closed, L417_N(g_closed), &budget) == 4);
+    TEST_ASSERT(budget == 4);
+    /* a second channel after the answer began is reasoning again (gemma4_output_grammar's content -> reasoning edge):
+     * usage counts both blocks, the budget's counter stays on the first */
+    static const char *const g_second[] = {"<|channel>", "thought", "\n", "Let", " me", "<channel|>", "Hi", "<|channel>",
+                                           "thought", "\n", "more", "<channel|>", " there"};
+    TEST_ASSERT(l417_count(PULSAR_CHAT_GEMMA4, on, g_second, L417_N(g_second), &budget) == 7);
+    TEST_ASSERT(budget == 4);
+    /* a call opened from the channel ends it: the call's tokens are not reasoning */
+    static const char *const g_call[] = {"<|channel>", "thought", "\n", "hm", "<|tool_call>", "call:f{}", "<tool_call|>"};
+    TEST_ASSERT(l417_count(PULSAR_CHAT_GEMMA4, on, g_call, L417_N(g_call), NULL) == 3);
+    /* the turn ends inside the channel */
+    static const char *const g_unclosed[] = {"<|channel>", "thought", "\n", "on", " and", " on"};
+    TEST_ASSERT(l417_count(PULSAR_CHAT_GEMMA4, on, g_unclosed, L417_N(g_unclosed), NULL) == 5);
+    /* thinking off (the prompt closes an empty channel) and the model answers: nothing; if it opens a channel anyway
+     * the parser reads reasoning, and so does the count */
+    static const char *const g_plain[] = {"Hi", " there"};
+    TEST_ASSERT(l417_count(PULSAR_CHAT_GEMMA4, off, g_plain, L417_N(g_plain), NULL) == 0);
+    TEST_ASSERT(l417_count(PULSAR_CHAT_GEMMA4, off, g_closed, L417_N(g_closed), NULL) == 4);
+
+    /* attempts: a tool-error retry's tokens are in the reported completion tokens (completion_total + completion), so
+     * its reasoning stays in the count; the retry starts where its own prompt leaves the tracker */
+    char err[256];
+    job j;
+    memset(&j, 0, sizeof j);
+    TEST_ASSERT(effort_case(PULSAR_CHAT_QWEN, on, &j.req, err, sizeof err));
+    gen_state g;
+    memset(&g, 0, sizeof g);
+    g.j = &j;
+    l417_attempt(&g, closed, L417_N(closed));
+    TEST_ASSERT(j.req.reasoning_tokens == 4);
+    static const char *const retry[] = {"again", "</think>", "ok"};
+    l417_attempt(&g, retry, L417_N(retry));
+    TEST_ASSERT(j.req.reasoning_tokens == 5);
+    /* a raw completion returns its text whole: no reasoning to report, whatever the tracker reads */
+    j.req.kind = REQ_COMPLETION;
+    l417_attempt(&g, closed, L417_N(closed));
+    TEST_ASSERT(j.req.reasoning_tokens == 5);
+    request_free(&j.req);
 }
 
 /* L335: a malformed effort string or a non-bool thinking switch refuses WITH its reason (both left err empty, so the
@@ -18220,6 +18385,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l344_thinking_budget_parse();
     test_l344_thinking_budget_close_row();
     test_l398_gemma_reasoning_tracker();
+    test_l417_reasoning_tokens_count();
     test_effort_controls_name_their_error();
     test_render_think_max_prompt_prefix();
     test_render_think_effort_prefixes();

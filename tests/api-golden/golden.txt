@@ -618,6 +618,16 @@
   anthropic_live_call_ids: []
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
+== chat/effort-1e+30 [chat/deepseek] REFUSED
+  error: "reasoning_effort: an effort is a name or an integer 1..100"
+== chat/effort-nan [chat/deepseek] REFUSED
+  error: "reasoning_effort: an effort is a name or an integer 1..100"
+== chat/effort-inf [chat/deepseek] REFUSED
+  error: "reasoning_effort: an effort is a name or an integer 1..100"
+== chat/effort--inf [chat/deepseek] REFUSED
+  error: "reasoning_effort: an effort is a name or an integer 1..100"
+== chat/effort-50.5 [chat/deepseek] REFUSED
+  error: "reasoning_effort: an effort is a name or an integer 1..100"
 == chat/effort-and-off [chat/deepseek] OK
   kind 0 api 0 chat_v41 1 chat_qwen 0
   model: null
@@ -1536,6 +1546,16 @@
   anthropic_live_call_ids: []
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
+== chat/effort-1e+30 [chat/qwen] REFUSED
+  error: "reasoning_effort: an effort is a name or an integer 1..100"
+== chat/effort-nan [chat/qwen] REFUSED
+  error: "reasoning_effort: an effort is a name or an integer 1..100"
+== chat/effort-inf [chat/qwen] REFUSED
+  error: "reasoning_effort: an effort is a name or an integer 1..100"
+== chat/effort--inf [chat/qwen] REFUSED
+  error: "reasoning_effort: an effort is a name or an integer 1..100"
+== chat/effort-50.5 [chat/qwen] REFUSED
+  error: "reasoning_effort: an effort is a name or an integer 1..100"
 == chat/effort-and-off [chat/qwen] OK
   kind 0 api 0 chat_v41 0 chat_qwen 1
   model: null
@@ -4970,6 +4990,16 @@
   anthropic_live_call_ids: []
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
+== chat/effort-1e+30 [chat/inkling] REFUSED
+  error: "reasoning_effort: an effort is a name or an integer 1..100"
+== chat/effort-nan [chat/inkling] REFUSED
+  error: "reasoning_effort: an effort is a name or an integer 1..100"
+== chat/effort-inf [chat/inkling] REFUSED
+  error: "reasoning_effort: an effort is a name or an integer 1..100"
+== chat/effort--inf [chat/inkling] REFUSED
+  error: "reasoning_effort: an effort is a name or an integer 1..100"
+== chat/effort-50.5 [chat/inkling] REFUSED
+  error: "reasoning_effort: an effort is a name or an integer 1..100"
 == chat/effort-and-off [chat/inkling] OK
   kind 0 api 0 chat_v41 0 chat_qwen 0
   model: null
