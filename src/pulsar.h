@@ -514,7 +514,10 @@ struct pulsar_segstore_ident;
 /** L280: the identity a disk-KV segment store is opened with (pulsar_segstore_ident, lib/pulsar_segstore.h): the model
  *  id, the routed experts' format and the rope the loaded positions run (the family's rope_id -- Qwen under YaRN),
  *  and (L386) the arithmetic this device runs them with (pulsar_gpu_arithmetic: compute capability, cuBLASLt and CUDA
- *  runtime versions).  The one answer every store opener asks; a store file of another identity is not indexed. */
+ *  runtime versions), and (L426) the weights that compute them -- a sampled digest of the container's content (every
+ *  tensor's first and last 4 KiB and one block every 64 MiB between; a tensor of up to two blocks whole), of the row
+ *  tables beside it and of an --expert-overlay donor -- and the tokenizer's vocabulary (every id's bytes).  The one
+ *  answer every store opener asks; a store file of another identity is not indexed. */
 /** @param e the engine
  *  @return the store identity */
 pulsar_segstore_ident pulsar_engine_kv_identity(pulsar_engine *e);

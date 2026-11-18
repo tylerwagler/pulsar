@@ -433,13 +433,25 @@ Format (`src/lib/pulsar_segstore.h`, `src/lib/pulsar_kvchain.h`):
   the request and whose last segment carries a state.
 - **Identity.** A store records the model, its routed-expert format and its rope,
   and (L386) the arithmetic that computed the bytes: the GPU's compute
-  capability, the cuBLASLt version and the CUDA runtime version. A server opened
-  on a store written under another identity (a CUDA or cuBLASLt upgrade, another
-  GPU) indexes none of those segments: it says so once at open, naming both
-  identities, and leaves the files alone. Files of an older store format
-  (`.seg` v6, `.rp` v4 since L386) are removed at open; payloads of another
-  engine version (segment v9, KV payload v8) are refused and rewritten, never
-  converted.
+  capability, the cuBLASLt version and the CUDA runtime version; and (L426)
+  which weights computed them and which tokenizer chose the ids. The weights
+  word is a digest of the container's content: every shard's header and size,
+  and a sample of every tensor's stored bytes (its first and last 4 KiB and one
+  block every 64 MiB between; a tensor of up to 8 KiB whole), plus the same
+  sample of a row table beside the shards and of an `--expert-overlay` donor.
+  The drafter and a runtime adapter are tensors of the container, so they are
+  in it. The tokenizer word is a digest of the vocabulary (every id's bytes).
+  A server opened on a store written under another identity (a CUDA or cuBLASLt
+  upgrade, another GPU, a re-quantised pack, another checkpoint, drafter or
+  adapter of the same model in a directory named by `--kv-disk-dir`) indexes
+  none of those segments: it says so once at open, naming the words that
+  differ and both identities, and leaves the files alone (they are outside the
+  budget: clear the directory to reclaim them). The digest is a sample, read
+  at every open (the load banner says what it cost): two containers that
+  differ only in bytes between the sampled blocks of a large tensor share an
+  identity. Files of an older store format (`.seg` v7, `.rp` v5 since L426)
+  are removed at open; payloads of another engine version (segment v9, KV
+  payload v8) are refused and rewritten, never converted.
 - **Restore.** A restore loads in slices between decode rounds, so other
   sessions keep decoding (L330). The chain is pinned against eviction while it
   loads. When the bank holds a history the request could resume from, every

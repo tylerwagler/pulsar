@@ -250,3 +250,9 @@ name = "segstore-tsan"
 tier = "check"
 overlap = true
 budget = 90
+
+[[test]]
+name = "kv-identity-gate"
+tier = "check"
+overlap = true
+budget = 60   # L426: synthetic containers in /tmp and store opens; seconds

@@ -689,6 +689,13 @@ tests/segstore_tsan: tests/segstore_tsan.cpp src/lib/pulsar_segstore.cpp src/lib
 .PHONY: segstore-tsan
 segstore-tsan: tests/segstore_tsan
 	TSAN_OPTIONS=halt_on_error=1 ./tests/segstore_tsan
+# L426: the disk KV identity's weights and tokenizer words (pulsar_test --kv-identity; host-only, no model): the
+# container content digest on synthetic containers (stable across opens and a copy, moved by a weight byte of the same
+# layout, its sampling limit), the engine's identity over it, and a store of another identity set aside and said once.
+# The same on each family's served container is the loader contract gate's leg 4.
+.PHONY: kv-identity-gate
+kv-identity-gate: pulsar_test
+	./pulsar_test --kv-identity
 tests/lt_picks: tests/lt_picks.cu src/cuda/pulsar_cuda_lt_fixed.o src/cuda/pulsar_cuda_lt_fixed.h Makefile
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/lt_picks.cu src/cuda/pulsar_cuda_lt_fixed.o $(CUDA_LDLIBS)
 # L381: does the fixed cuBLASLt GEMM still follow the accumulation order the EXL3 dense arm's in-place prompt kernel
@@ -3159,9 +3166,9 @@ tests/qwen_chat_smoke.o: tests/qwen_chat_smoke.cpp
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -Isrc/lib -c -o $@ $<
 tests/qwen_chat_smoke: tests/qwen_chat_smoke.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-tests/loader_open.o: tests/loader_open.cpp
+tests/loader_open.o: tests/loader_open.cpp src/pulsar.h src/lib/pulsar_segstore.h
 	$(CXX) $(CXXFLAGS) -Isrc -c -o $@ $<
-tests/loader_open: tests/loader_open.o $(CORE_OBJS)
+tests/loader_open: tests/loader_open.o src/lib/pulsar_segstore.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 # L414: the official-continuation scorer (tools/quality-testing/README.md), on any generative family through the
 # public API.  Not a gate: it needs a GPU, a container and a collected suite; --dry-run is host-only.

@@ -372,11 +372,42 @@ int pulsar_engine_collect_imatrix(pulsar_engine *e,
                                int max_tokens) { PULSAR_FAMILY_REQUIRES_E(e, PULSAR_FAMILY_CAP_IMATRIX, "imatrix collection", 1); return e ? e->collect_imatrix(dataset_path, output_path, ctx_size, max_prompts, max_tokens) : 1; }
 void pulsar_engine_dump_tokens(pulsar_engine *e, const pulsar_tokens *tokens) { PULSAR_FAMILY_REQUIRES_E(e, PULSAR_FAMILY_CAP_CHAT, "token dumps (no tokenizer)", (void)0); if (e->family->tokenizer) e->family->tokenizer->dump(e, stdout, tokens); }
 int pulsar_engine_routed_quant_bits(pulsar_engine *e) { return e ? e->routed_quant_bits() : 0; }
+void pulsar_engine_bind_kv_source(pulsar_engine *e, const char *what, uint64_t digest) {
+    pulsar_kvdigest d;
+    pulsar_kvdigest_init(&d);
+    pulsar_kvdigest_update(&d, &e->kv_sources, sizeof e->kv_sources);
+    pulsar_kvdigest_update(&d, what, strlen(what) + 1u);
+    pulsar_kvdigest_update(&d, &digest, sizeof digest);
+    e->kv_sources = pulsar_kvdigest_final(&d);
+}
 pulsar_segstore_ident pulsar_engine_kv_identity(pulsar_engine *e) {
     pulsar_segstore_ident id(pulsar_segstore_identity((uint32_t)pulsar_engine_model_id(e),
                                                       (uint32_t)pulsar_engine_routed_quant_bits(e),
                                                       e ? e->family->rope_id(e) : 0u));
     pulsar_gpu_arithmetic(&id.cc, &id.gemm_lib, &id.runtime);
+    if (!e) return id;
+    /* L426: the weights -- the container's content and what the load read beside it */
+    pulsar_kvdigest w;
+    pulsar_kvdigest_init(&w);
+    pulsar_kvdigest_update(&w, &e->model.content_digest, sizeof e->model.content_digest);
+    pulsar_kvdigest_update(&w, &e->kv_sources, sizeof e->kv_sources);
+    id.weights = pulsar_kvdigest_final(&w);
+    /* L426: the tokenizer -- every id's bytes, in id order (a family without a table: 0) */
+    const pulsar_family_tokenizer *tok = e->family->tokenizer;
+    if (tok && tok->n_tokens && tok->token_text) {
+        pulsar_kvdigest t;
+        pulsar_kvdigest_init(&t);
+        const int n = tok->n_tokens(e);
+        for (int i = 0; i < n; i++) {
+            size_t len = 0;
+            char *text = tok->token_text(e, TokId{i}, &len);
+            const uint64_t l = len;
+            pulsar_kvdigest_update(&t, &l, sizeof l);
+            if (text) pulsar_kvdigest_update(&t, text, len);
+            free(text);
+        }
+        id.tokenizer = pulsar_kvdigest_final(&t);
+    }
     return id;
 }
 bool pulsar_engine_has_spec_rounds(const pulsar_engine *e) { return e && e->drafter_ops && e->family->spec; }

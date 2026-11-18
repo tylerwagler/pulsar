@@ -29,19 +29,22 @@ namespace {
  *   0 magic, 4 version, 8 identity's model word, 12 flags, 16 key[40], 56 parent[40],
  *   96 G_prev, 100 G, 104 text_len u64, 112 payload_bytes u64,
  *   120 trailer_bytes u64, 128 hits u32, 132 identity's cc (v6; a pad before), 136 created u64,
- *   144 last_used u64, 152 identity's cuBLASLt | CUDA runtime << 32 (v6; v2's state_bytes, then 0)  -> 160 bytes. */
+ *   144 last_used u64, 152 identity's cuBLASLt | CUDA runtime << 32 (v6; v2's state_bytes, then 0), 160 identity's
+ *   weights u64 (v7), 168 identity's tokenizer u64 (v7)  -> 176 bytes. */
 /// Bytes of the fixed .seg header (layout above); the text starts at this offset.
-constexpr size_t HDR = 160;
+constexpr size_t HDR = 176;
 /* L347: a restore point file's header, little-endian:
  *   0 magic, 4 version, 8 identity's model word, 12 flags (PULSAR_SEGSTORE_RP_*, v2), 16 key[40], 56 payload_bytes
- *   u64, 64 identity's cc (v4), 68 pad, 72 identity's cuBLASLt | CUDA runtime << 32 (v4)  -> 80 bytes; the engine's
- *   restore point payload follows. */
+ *   u64, 64 identity's cc (v4), 68 pad, 72 identity's cuBLASLt | CUDA runtime << 32 (v4), 80 identity's weights u64
+ *   (v5), 88 identity's tokenizer u64 (v5)  -> 96 bytes; the engine's restore point payload follows. */
 /// Bytes of the fixed .rp header (layout above); the payload starts at this offset.
-constexpr size_t RP_HDR = 80;
-/// Where a .seg header's identity words sit (model word, cc, the two library versions as one u64).
-constexpr size_t SEG_ID_AT[3] = {8, 132, 152};
-/// Where a .rp header's identity words sit.
-constexpr size_t RP_ID_AT[3] = {8, 64, 72};
+constexpr size_t RP_HDR = 96;
+/// Fields an identity takes in a header: the model word, cc, the two library versions as one u64, weights, tokenizer.
+constexpr size_t ID_FIELDS = 5;
+/// Where a .seg header's identity fields sit.
+constexpr size_t SEG_ID_AT[ID_FIELDS] = {8, 132, 152, 160, 168};
+/// Where a .rp header's identity fields sit.
+constexpr size_t RP_ID_AT[ID_FIELDS] = {8, 64, 72, 80, 88};
 /** L347 I2: the bytes of a segment's text the index keeps (pulsar_segstore::heads), so pulsar_segstore_covers reads a
  *  segment's file only when they match: a store of one-shot prompts holds many root tails that share a template's
  *  first bytes and part soon after them. */
@@ -58,28 +61,56 @@ uint64_t get64(const uint8_t *p) { uint64_t v = 0; for (int i = 7; i >= 0; i--) 
 
 /** Write an identity into a header at `at` (SEG_ID_AT / RP_ID_AT).
  *  @param h  the header
- *  @param at where its three fields sit
+ *  @param at where its fields sit
  *  @param id the identity */
-void put_ident(uint8_t *h, const size_t at[3], const pulsar_segstore_ident &id) {
+void put_ident(uint8_t *h, const size_t at[ID_FIELDS], const pulsar_segstore_ident &id) {
     put32(h + at[0], id.model);
     put32(h + at[1], id.cc);
     put64(h + at[2], (uint64_t)id.gemm_lib | (uint64_t)id.runtime << 32);
+    put64(h + at[3], id.weights);
+    put64(h + at[4], id.tokenizer);
 }
 /** @param h  a header
- *  @param at where its identity's three fields sit (SEG_ID_AT / RP_ID_AT)
+ *  @param at where its identity's fields sit (SEG_ID_AT / RP_ID_AT)
  *  @return the identity it carries */
-pulsar_segstore_ident get_ident(const uint8_t *h, const size_t at[3]) {
+pulsar_segstore_ident get_ident(const uint8_t *h, const size_t at[ID_FIELDS]) {
     const uint64_t libs = get64(h + at[2]);
-    return pulsar_segstore_ident(get32(h + at[0]), get32(h + at[1]), (uint32_t)libs, (uint32_t)(libs >> 32));
+    return pulsar_segstore_ident(get32(h + at[0]), get32(h + at[1]), (uint32_t)libs, (uint32_t)(libs >> 32),
+                                 get64(h + at[3]), get64(h + at[4]));
 }
-/** An identity, word by word, for the open's line: the model word's fields and the arithmetic.
+/** An identity, word by word, for the open's line: the model word's fields, the arithmetic, the weights and the
+ *  tokenizer.
  *  @param id  the identity
  *  @param out receives the text
  *  @param n   bytes at `out` */
 void describe_ident(const pulsar_segstore_ident &id, char *out, size_t n) {
-    snprintf(out, n, "model id %u, routed bits %u, rope fold %u, cc %u.%u, cuBLASLt %u, CUDA runtime %u",
-             (id.model >> 8) & 0xffffu, id.model & 0xffu, id.model >> 24, id.cc / 10, id.cc % 10, id.gemm_lib,
-             id.runtime);
+    snprintf(out, n, "model id %u, routed bits %u, rope fold %u, cc %u.%u, cuBLASLt %u, CUDA runtime %u, weights "
+             "%016llx, tokenizer %016llx", (id.model >> 8) & 0xffffu, id.model & 0xffu, id.model >> 24, id.cc / 10,
+             id.cc % 10, id.gemm_lib, id.runtime, (unsigned long long)id.weights, (unsigned long long)id.tokenizer);
+}
+/** L426: which words of two identities differ, by name, for the open's line ("the weights, the tokenizer").
+ *  @param a   one identity
+ *  @param b   the other
+ *  @param out receives the comma-separated names (empty when none differ)
+ *  @param n   bytes at `out` */
+void describe_ident_diff(const pulsar_segstore_ident &a, const pulsar_segstore_ident &b, char *out, size_t n) {
+    const struct { bool differs; const char *name; } words[] = {
+        {((a.model >> 8) & 0xffffu) != ((b.model >> 8) & 0xffffu), "the model id"},
+        {(a.model & 0xffu) != (b.model & 0xffu), "the routed format"},
+        {a.model >> 24 != b.model >> 24, "the rope"},
+        {a.cc != b.cc, "the GPU's compute capability"},
+        {a.gemm_lib != b.gemm_lib, "the cuBLASLt version"},
+        {a.runtime != b.runtime, "the CUDA runtime version"},
+        {a.weights != b.weights, "the weights"},
+        {a.tokenizer != b.tokenizer, "the tokenizer"},
+    };
+    size_t at = 0;
+    out[0] = '\0';
+    for (const auto &w : words) {
+        if (!w.differs || at >= n) continue;
+        const int k = snprintf(out + at, n - at, "%s%s", at ? ", " : "", w.name);
+        if (k > 0) at += (size_t)k;
+    }
 }
 
 /** @param s at least 40 chars
@@ -761,7 +792,7 @@ pulsar_segstore *pulsar_segstore_open(const char *dir, uint64_t budget_bytes, co
             const bool ours = got >= 8 && get32(h) == PULSAR_SEGSTORE_MAGIC;
             older = ours && get32(h + 4) < PULSAR_SEGSTORE_VERSION;
             /* L386: this version's segment of another identity -- another model, or the same model's KV computed by
-             * other arithmetic -- is left alone, and said once below */
+             * other arithmetic, other weights or another tokenizer (L426) -- is left alone, and said once below */
             if (ours && got == HDR && get32(h + 4) == PULSAR_SEGSTORE_VERSION && get_ident(h, SEG_ID_AT) != identity &&
                 !foreign_n++)
                 foreign = get_ident(h, SEG_ID_AT);
@@ -784,11 +815,13 @@ pulsar_segstore *pulsar_segstore_open(const char *dir, uint64_t budget_bytes, co
         st->logf("segment store %s: removed %llu segments of an older store version (%llu MiB)", dir,
                  (unsigned long long)retired, (unsigned long long)(retired_bytes >> 20));
     if (foreign_n) {
-        char theirs[192], ours[192];
+        char theirs[256], ours[256], diff[192];
         describe_ident(foreign, theirs, sizeof theirs);
         describe_ident(identity, ours, sizeof ours);
+        describe_ident_diff(foreign, identity, diff, sizeof diff);
         st->logf("segment store %s: %llu segments of another identity set aside (not indexed, not removed): the "
-                 "first was written by [%s], this process is [%s]", dir, (unsigned long long)foreign_n, theirs, ours);
+                 "first differs from this process in %s -- it was written by [%s], this process is [%s]", dir,
+                 (unsigned long long)foreign_n, diff, theirs, ours);
     }
     /* L347: a restore point joins its indexed segment; one whose .seg file is gone, of an older store version, or not
      * readable beside an indexed segment can never load and is removed; one beside another identity's (or an
