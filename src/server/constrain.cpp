@@ -391,7 +391,18 @@ static void j_answer_format(buf *b, const response_format_spec *f) {
 /// @param b  the format being built
 static void j_ws(buf *b) { buf_puts(b, "{\"type\":\"regex\",\"pattern\":\"[ \\\\t\\\\r\\\\n]{0,8}\"}"); }
 
-/// @brief Compile `format` wrapped as a structural tag, within k_compile_deadline_s.
+/* L427: a waiting request holds its connection thread, one of PULSAR_SERVER_MAX_CLIENTS (it has no job, no bank
+ * and no decode slot yet: the plan is built at the parse).  Compile waits may take at most half of them, so /health,
+ * /metrics and unconstrained requests always find a connection. */
+static_assert(PULSAR_GRAMMAR_WAITERS_MAX * 2 <= PULSAR_SERVER_MAX_CLIENTS,
+              "grammar compile waiters may hold at most half of the client connections");
+
+/// @brief Compile `format` wrapped as a structural tag, within k_compile_deadline_s (slot wait included, L427).
+///        Called on the request's connection thread with no server lock held (it may sleep the whole deadline).
+///        A refusal that is the server's load, not the grammar -- no slot inside the deadline, too many waiting
+///        requests, no thread -- fails the parse as PARSE_REFUSED_BUSY (503 + Retry-After); an invalid grammar
+///        and a compile that itself outlasts the deadline stay the request's 400.  Says once a request what it
+///        met: a slot wait, a shared compile, a wait given up.
 /// @param c       the compiler
 /// @param format  the structural tag's format element
 /// @param what    the label for the error ("response_format", ...)
@@ -405,9 +416,22 @@ static pulsar_grammar *constrain_compile(pulsar_grammar_compiler *c, buf *format
     buf_append(&tag, format->ptr, format->len);
     buf_putc(&tag, '}');
     char cerr[400];
-    pulsar_grammar *g = pulsar_grammar_compile(c, tag.ptr, k_compile_deadline_s, cerr, sizeof cerr);
+    pulsar_grammar_compile_info met;
+    pulsar_grammar *g = pulsar_grammar_compile(c, tag.ptr, k_compile_deadline_s, &met, cerr, sizeof cerr);
     buf_free(&tag);
-    if (!g) snprintf(err, errlen, "%s: %s", what, cerr);
+    if (met.slot_wait_s > 0.0)
+        server_log(PULSAR_LOG_DEFAULT, "pulsar-server: grammar compile: %s waited %.3f s for a slot%s (L427)", what,
+                   met.slot_wait_s, met.shared ? ", sharing a pending compile" : "");
+    else if (met.shared)
+        server_log(PULSAR_LOG_DEFAULT, "pulsar-server: grammar compile: %s shared a pending compile (L427)", what);
+    if (!g) {
+        snprintf(err, errlen, "%s: %s", what, cerr);
+        if (met.end != PULSAR_GRAMMAR_INVALID)
+            server_log(PULSAR_LOG_WARNING, "pulsar-server: grammar compile: gave up: %s", err);
+        if (met.end == PULSAR_GRAMMAR_NO_SLOT || met.end == PULSAR_GRAMMAR_CROWDED ||
+            met.end == PULSAR_GRAMMAR_NO_THREAD)
+            parse_refusal_set(PARSE_REFUSED_BUSY);
+    }
     return g;
 }
 

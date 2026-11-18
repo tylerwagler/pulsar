@@ -50,6 +50,8 @@ __pycache__/
 /tests/lt_picks
 /tests/lt_order_probe
 /tests/segstore_tsan
+/tests/grammar_admit_test
+/tests/grammar_admit_tsan
 /tests/bf16_rows_gate
 /tests/nvfp4_rows_gate
 /tests/lilicorr_head_gate

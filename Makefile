@@ -696,6 +696,21 @@ segstore-tsan: tests/segstore_tsan
 .PHONY: kv-identity-gate
 kv-identity-gate: pulsar_test
 	./pulsar_test --kv-identity
+
+# L427: grammar compile admission (src/lib/pulsar_grammar_admit.h): the slot queue, shared pending compiles and
+# per-request deadlines, with compiles the test blocks and releases.  Host only, seconds.  Two programs from one
+# source: the plain one adds the legs through the real xgrammar boundary; the ThreadSanitizer one is the admission
+# alone, built from source with its own flags (it shares no objects with the server).
+tests/grammar_admit_test: tests/grammar_admit_test.cpp src/lib/pulsar_grammar_admit.h src/lib/pulsar_grammar.h \
+                          $(GRAMMAR_OBJS) Makefile
+	$(CXX) $(filter-out -ffast-math,$(CXXFLAGS)) -DGRAMMAR_ADMIT_REAL -Isrc -o $@ tests/grammar_admit_test.cpp \
+	  $(GRAMMAR_OBJS) -lpthread
+tests/grammar_admit_tsan: tests/grammar_admit_test.cpp src/lib/pulsar_grammar_admit.h src/lib/pulsar_grammar.h Makefile
+	$(CXX) -std=c++23 -O1 -g -Wall -Wextra -fsanitize=thread -D_GNU_SOURCE -Isrc -o $@ tests/grammar_admit_test.cpp -lpthread
+.PHONY: grammar-admit-gate
+grammar-admit-gate: tests/grammar_admit_test tests/grammar_admit_tsan
+	./tests/grammar_admit_test
+	TSAN_OPTIONS=halt_on_error=1 ./tests/grammar_admit_tsan
 tests/lt_picks: tests/lt_picks.cu src/cuda/pulsar_cuda_lt_fixed.o src/cuda/pulsar_cuda_lt_fixed.h Makefile
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/lt_picks.cu src/cuda/pulsar_cuda_lt_fixed.o $(CUDA_LDLIBS)
 # L381: does the fixed cuBLASLt GEMM still follow the accumulation order the EXL3 dense arm's in-place prompt kernel
@@ -2875,7 +2890,7 @@ src/vendor/%.o: src/vendor/%.cpp src/vendor/linenoise.h
 src/vendor/xgrammar/%.o: src/vendor/xgrammar/%.cc
 	$(CXX) $(GRAMMAR_CXXFLAGS) -Wno-unused-parameter $(XGRAMMAR_INC) -c -o $@ $<
 
-src/lib/pulsar_grammar.o: src/lib/pulsar_grammar.cpp src/lib/pulsar_grammar.h
+src/lib/pulsar_grammar.o: src/lib/pulsar_grammar.cpp src/lib/pulsar_grammar.h src/lib/pulsar_grammar_admit.h
 	$(CXX) $(GRAMMAR_CXXFLAGS) $(XGRAMMAR_INC) -c -o $@ $<
 
 tests/pulsar_test.o: tests/pulsar_test.cpp $(SERVER_SRCS) $(FAMILY_SERVERS_INC) $(SERVER_HDRS) src/pulsar.h $(LIB_HDRS) tests/sampler_host_ref.h

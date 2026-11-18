@@ -326,6 +326,39 @@ drafts are cut at the first token the grammar refuses, so constrained output
 equals plain constrained decoding. Compiled grammars are cached (256 MiB). The
 first constrained request pays the vocabulary compile.
 
+A grammar is compiled at the parse, on the request's connection thread, before
+the request is queued: a request waiting for its grammar holds that connection
+and nothing else (no bank, no decode slot). Each grammar of a request (its tool
+calls, its response format) waits at most 10 s in all:
+
+- At most 4 compiles run at once. A request that finds all four busy waits for
+  a slot, in arrival order, inside the same 10 s.
+- Requests for the same grammar (the same structural tag: the same strict tool
+  set or response format, on the same model) share one compile and one slot.
+  Each waits inside its own 10 s; one giving up does not stop the others.
+- A compile cannot be stopped. One that outlasts its requests finishes in the
+  background, keeps its slot until then, and lands in the cache, so the same
+  request sent again is served.
+- At most 32 requests wait at once; one more is refused at once.
+
+| Refusal | Status | Message |
+| --- | --- | --- |
+| the grammar is invalid | 400 | xgrammar's reason |
+| the compile itself outlasted the 10 s | 400 | `grammar compile: still running after 10.0 s (refused; the result is cached)` (with `, N s of it waiting for a slot` when it queued first) |
+| no slot came free inside the 10 s | 503 + `Retry-After` | `grammar compile: waited 10.0 s for one of 4 compile slots (refused; retry)` |
+| 32 requests already wait | 503 + `Retry-After` | `grammar compile: 32 requests already wait for a compile (refused; retry)` |
+
+The 503s count as `pulsar:refused_503_total{cause="parse_busy"}`. An invalid
+grammar is remembered by xgrammar's cache: the same invalid request is refused
+again without a compile. `/metrics`: `pulsar:grammar_compiles_running`,
+`pulsar:grammar_compile_waiters`, `pulsar:grammar_compile_requests_total{end}`
+(`compiled`, `invalid`, `deadline`, `slot_wait`, `waiters`, `no_thread`),
+`pulsar:grammar_compile_slot_waits_total`,
+`pulsar:grammar_compile_slot_wait_seconds_total` and
+`pulsar:grammar_compile_shared_total`. The log says once a request that it
+waited for a slot (and how long), that it shared a pending compile, or that it
+gave up (`pulsar-server: grammar compile: ...`).
+
 ### Images
 
 Images go in the protocol's own image part:
