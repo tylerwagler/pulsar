@@ -291,6 +291,15 @@ Nemotron and Inkling use their own templates' formats.
   disk KV segments. When a client sends the call back as JSON, the prompt uses the
   sampled bytes rather than a re-rendering, so the next turn still matches the
   live KV. A re-rendering is the fallback.
+- **Results in call order.** When a turn made two or more calls and the results
+  that directly follow it answer each call exactly once (by `tool_call_id`,
+  `tool_use_id` or `call_id`), they are rendered in the order of the calls,
+  whatever order the client sent them in: some templates write a result with no
+  id, so the model pairs results with calls by position. This holds on every
+  endpoint and for every family, and a replay of the history renders the same
+  bytes. An incomplete run (a missing result, an unknown, repeated or empty id,
+  another message between the results) is rendered as it arrived. Text blocks
+  beside the results in one Anthropic message keep their positions.
 - **Greedy syntax, sampled payload.** While the model writes a call's structure
   (tags, names, JSON punctuation), sampling is greedy. Argument payloads (string
   values, file contents) use the request's sampling. In a speculative round this

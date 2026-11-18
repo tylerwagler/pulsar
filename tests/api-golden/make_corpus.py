@@ -199,5 +199,36 @@ for c in [c for c in cases if c["endpoint"] in ("anthropic", "responses")]:
 for c in [c for c in cases if c["family"] == "deepseek"]:
     cases.append(dict(c, family="inkling"))
 
+# ---- L425: two parallel calls answered second-call-first -- the results render in call order (appended: the lines
+#      above are unchanged) ----------------------------------------------------------------------------------------
+PAR_OA = [{"role": "user", "content": "Weather in Paris and Rome?"},
+          {"role": "assistant", "content": "",
+           "tool_calls": [{"id": f"call_{k}", "type": "function",
+                           "function": {"name": "get_weather", "arguments": json.dumps({"city": city})}}
+                          for k, city in ((1, "Paris"), (2, "Rome"))]},
+          {"role": "tool", "tool_call_id": "call_2", "content": "Rome: 22C"},
+          {"role": "tool", "tool_call_id": "call_1", "content": "Paris: 18C"}]
+PAR_AN = [{"role": "user", "content": "Weather in Paris and Rome?"},
+          {"role": "assistant", "content": [{"type": "tool_use", "id": f"toolu_{k}", "name": "get_weather",
+                                             "input": {"city": city}} for k, city in ((1, "Paris"), (2, "Rome"))]}]
+PAR_AN_RESULTS = [{"type": "tool_result", "tool_use_id": "toolu_2", "content": "Rome: 22C"},
+                  {"type": "tool_result", "tool_use_id": "toolu_1", "content": "Paris: 18C"}]
+PAR_RS = [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Weather in Paris and Rome?"}]},
+          {"type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
+          {"type": "function_call", "call_id": "call_2", "name": "get_weather", "arguments": "{\"city\":\"Rome\"}"},
+          {"type": "function_call_output", "call_id": "call_2", "output": "Rome: 22C"},
+          {"type": "function_call_output", "call_id": "call_1", "output": "Paris: 18C"}]
+for fam in ("deepseek", "qwen", "inkling"):
+    add("chat/parallel-results-swapped", "chat", {"messages": PAR_OA, "tools": OA_TOOLS}, fam)
+    # one result short: not a bijection, rendered as it arrived
+    add("chat/parallel-results-missing", "chat", {"messages": PAR_OA[:3], "tools": OA_TOOLS}, fam)
+    add("an/parallel-results-swapped", "anthropic", {"max_tokens": 50, "tools": AN_TOOLS, "messages": PAR_AN + [
+        {"role": "user", "content": PAR_AN_RESULTS}]}, fam)
+    # a text block between the results keeps its place; the results trade theirs around it
+    add("an/parallel-results-text-between", "anthropic", {"max_tokens": 50, "tools": AN_TOOLS, "messages": PAR_AN + [
+        {"role": "user", "content": [PAR_AN_RESULTS[0], {"type": "text", "text": "(Rome came back first.)"},
+                                     PAR_AN_RESULTS[1]]}]}, fam)
+    add("rs/parallel-results-swapped", "responses", {"input": PAR_RS, "tools": RS_TOOLS}, fam)
+
 for c in cases:
     print(json.dumps(c, ensure_ascii=False))

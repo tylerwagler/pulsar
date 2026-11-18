@@ -835,6 +835,81 @@ const server_family_ops *server_tool_family(const server *s) {
     return s->family_no_engine;
 }
 
+/* L425: tool results in the order of the calls they answer.
+ *
+ * Two families' templates write each result as an anonymous block (Qwen's and Nemotron-H's <tool_response>), so the
+ * model pairs results with its calls by POSITION; a client that returns two parallel calls' results in another order
+ * had each call read with the other's result.  The ids say which is which on every protocol (OpenAI tool_call_id,
+ * Anthropic tool_use_id, Responses call_id: all chat_msg::tool_call_id), so the messages are put in call order before
+ * anything renders them.
+ *
+ * The rule is deliberately narrow.  After an assistant message with two or more calls, the results that directly
+ * follow it are permuted into its call order ONLY when they are a bijection onto its calls: as many results as
+ * calls, every call id non-blank and distinct, every result carrying exactly one id, each call answered once.
+ * Anything else (a missing result, an unknown, repeated or blank id, another message between the results) keeps
+ * arrival order: nothing is guessed.  "Directly follow" is a run of tool messages; an Anthropic message's parts
+ * (chat_msg::anthropic_continues) belong to it too, where only the result parts trade places and the text parts stay
+ * where the client put them.  A message keeps its slot's anthropic_continues: which part opens the client's message
+ * is the slot's fact, not the result's.
+ *
+ * One rule for every family, keyed on nothing: where a template names each result (Gemma, Inkling) the meaning
+ * does not change, DeepSeek's reference encoder sorts its results into call order itself (docs/MODEL_CARD.md), and
+ * one conversation renders to one byte string whatever order its results arrived in.  It runs in render_chat_conversation, ahead of the family's render, so the full prompt, the
+ * live tool-result tail (render_prelude) and every later replay of the same history read the same order: an
+ * out-of-order arrival prefilled in call order is found in call order again. */
+void chat_order_tool_results(chat_msgs *msgs) {
+    /* a tool result: role "tool", or OpenAI's legacy "function" (which carries no id, so never reorders) */
+    const auto is_result = [](const chat_msg *m) {
+        return m->role && (!strcmp(m->role, "tool") || !strcmp(m->role, "function"));
+    };
+    for (int i = 0; i < msgs->len; i++) {
+        const chat_msg *a = &msgs->v[i];
+        if (!a->role || strcmp(a->role, "assistant") || a->calls.len < 2) continue;
+        const int n = a->calls.len;
+        /* the messages that directly follow: results, and the other parts of an Anthropic message that holds them */
+        std::vector<int> slots;
+        int end = i + 1;
+        for (; end < msgs->len; end++) {
+            const chat_msg *m = &msgs->v[end];
+            if (is_result(m)) {
+                slots.push_back(end);
+                continue;
+            }
+            const bool part = m->anthropic_continues || (end + 1 < msgs->len && msgs->v[end + 1].anthropic_continues);
+            if (!part || !m->role || !strcmp(m->role, "assistant")) break;
+        }
+        i = end - 1;   /* the next assistant message is at or after `end` */
+        if ((int)slots.size() != n) continue;
+        /* from[k]: the slot holding call k's result; a bijection or nothing */
+        std::vector<int> from((size_t)n, -1);
+        bool bijection = true, in_order = true;
+        for (int k = 0; k < n && bijection; k++) {
+            const char *id = a->calls.v[k].id;
+            bijection = id && id[0];
+            for (int o = 0; o < k && bijection; o++) bijection = strcmp(a->calls.v[o].id, id) != 0;
+            for (int j = 0; j < n && bijection; j++) {
+                const chat_msg *m = &msgs->v[slots[(size_t)j]];
+                if (m->tool_call_ids_len > 1 || !m->tool_call_id || !m->tool_call_id[0]) bijection = false;
+                else if (!strcmp(m->tool_call_id, id)) {
+                    bijection = from[(size_t)k] < 0;   /* a second result for this call: not a bijection */
+                    from[(size_t)k] = j;
+                }
+            }
+            bijection = bijection && from[(size_t)k] >= 0;
+            in_order = in_order && from[(size_t)k] == k;
+        }
+        if (!bijection || in_order) continue;
+        std::vector<chat_msg> ordered((size_t)n);
+        for (int k = 0; k < n; k++) ordered[(size_t)k] = msgs->v[slots[(size_t)from[(size_t)k]]];
+        for (int k = 0; k < n; k++) {
+            chat_msg *slot = &msgs->v[slots[(size_t)k]];
+            const bool continues = slot->anthropic_continues;
+            *slot = ordered[(size_t)k];
+            slot->anthropic_continues = continues;
+        }
+    }
+}
+
 /* The loaded family's resolve and render around the protocol's tool-result checks (which read the
  * resolved mode).  The family follows the LOADED model (L218 s123): the renderer, the forced-prefill and
  * the KV-key suffix builders all read it from the request, so a 0731 artifact cannot be primed with
@@ -852,6 +927,8 @@ bool render_chat_conversation(pulsar_engine *e, pulsar_chat_format fmt, server *
         !s->responses_validate_tool_outputs(&c->msgs, r->think_mode, &r->responses_requires_live_tool_state,
                                             &r->responses_requires_live_reasoning, err, errlen))
         return false;
+    /* L425: parallel tool results in their calls' order, before any render (the prompt, a live tail) reads them */
+    chat_order_tool_results(&c->msgs);
     /* L325: tool_reference blocks become their tools' definitions (or notices) before any render reads the messages */
     if (!chat_expand_tool_refs(c, r, err, errlen)) return false;
     return r->family->render(e, s, c, r, err, errlen) && constrain_plan_build(e, s, c, r, err, errlen);

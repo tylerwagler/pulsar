@@ -4962,6 +4962,13 @@ void conversation_declared_tool_schema_lines(const struct chat_conversation *c, 
 /// @param errlen  size of `err`
 /// @return false when the family cannot encode the definitions
 bool chat_expand_tool_refs(struct chat_conversation *c, const struct request *r, char *err, size_t errlen);
+/** L425: the tool results that directly follow an assistant message with two or more calls, permuted into that
+ *  message's call order -- only when they are a bijection onto its calls (one result a call, every id non-blank and
+ *  distinct); any other run keeps arrival order.  An Anthropic message's text parts keep their slots.  Run by
+ *  render_chat_conversation before the family renders, for every protocol and family, so the full prompt, a live
+ *  tool-result tail and a later replay of the history all read one order (the rule: chat_family.cpp). */
+/// @param msgs  the conversation's messages, permuted in place
+void chat_order_tool_results(chat_msgs *msgs);
 /** L284: schema lines as an OpenAI tools array ([{"type":"function","function":{name, description, parameters}}]),
  *  for a template that renders OpenAI's shape (Qwen).  A line's parameters are `parameters` or, Anthropic-shaped,
  *  `input_schema`.  malloc'd; NULL + err when a line has no name. */
