@@ -45,10 +45,12 @@
 #include <time.h>
 #include <unistd.h>
 #include <functional>
+#include <vector>
 
 #include "pulsar.h"
 
 #include "pulsar_gpu.h"
+#include "lib/pulsar_kvdigest.h"   /* L426: the content digest's running state (pulsar_content_sample) */
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -641,6 +643,13 @@ int  pulsar_engram_table_open(pulsar_engram_table *t, const char *path, uint32_t
 int  pulsar_engram_table_open_parts(pulsar_engram_table *t, uint32_t layer, uint32_t n_parts,
                                     const char *const *paths, const uint64_t *bases,
                                     uint64_t rows_per_part, uint32_t row_bytes, uint64_t n_rows);
+/** L426: a digest of the table's rows -- its row count and record size, then each part's rows sampled
+ *  (pulsar_content_sample).  A row table is weights kept beside the container, so a family that opens one binds this
+ *  into the KV store identity (pulsar_engine_bind_kv_source).
+ *  @param t   the open table
+ *  @param out receives the digest
+ *  @return 1 = digested, 0 = a part could not be read (said) */
+int  pulsar_engram_table_digest(const pulsar_engram_table *t, uint64_t *out);
 /// Close a table's files (each shared fd once) and free its parts; leaves `t` zeroed.  NULL is a no-op.
 /// @param t  the table
 void pulsar_engram_table_close(pulsar_engram_table *t);
@@ -957,6 +966,13 @@ typedef struct {
      *  layout: every tensor's name, dtype, shape and offsets, and the metadata), in shard order.  What a cache of
      *  measurements taken on this container (the verify cost curve, verify_curve.cpp) is keyed by. */
     uint64_t container_digest;
+    /** L426: the container's CONTENT -- container_digest (the declared layout) extended by each shard's size and by
+     *  blocks of every tensor's stored bytes (pulsar_content_sample), in directory order.  What KV computed by these
+     *  weights is keyed by (pulsar_engine_kv_identity): two packs of one layout whose weight values differ -- a
+     *  re-quantisation, another checkpoint, another drafter or adapter in the same container -- have other content
+     *  digests.  It reads megabytes, not the container: a pack that differs from this one ONLY in bytes no sampled
+     *  block covers is not told apart (pulsar_content_sample says which bytes those are). */
+    uint64_t content_digest;
 } pulsar_model;
 
 /* The model-family interface (L251 S1): the family descriptor and the layer plan. */
@@ -2327,6 +2343,10 @@ struct pulsar_engine {
     bool vision_ready;          ///< the artifact carries a bound, layout-validated vision tower
     pulsar_model overlay_model; ///< donor GGUF for --expert-overlay, if any
     bool overlay_ready;         ///< overlay tensors resolved and swapped in
+    /** L426: the weights the load read from OUTSIDE the container's shards, folded in the load's own order
+     *  (pulsar_engine_bind_kv_source): a row table beside it, an --expert-overlay donor.  0 = none.  With
+     *  model.content_digest it is the weights word of the KV store identity (pulsar_engine_kv_identity). */
+    uint64_t kv_sources;
     /** Prometheus /metrics spec-decode counters (server /metrics endpoint via
      * pulsar_engine_spec_metrics). Incremented from the DSpark fused verify loop;
      * monotonic. GPU decode submission is single-threaded, so plain uint64 is
@@ -4060,6 +4080,46 @@ bool model_open(pulsar_model *m, const char *path, bool gpu_mapping);
 /// @param gpu_mapping  as model_open's
 /// @return true when open.
 bool safetensors_open(pulsar_model *m, const char *path, bool gpu_mapping);
+/** L426: bind weights read from outside the container's shards into the KV store identity (pulsar_engine::kv_sources):
+ *  what they are and a digest of their bytes.  Called by the load that reads them, once each, in a fixed order.
+ *  @param e      the engine being loaded
+ *  @param what   the source's kind ("row-table", "expert-overlay"): part of the fold
+ *  @param digest a digest of its bytes (pulsar_engram_table_digest, pulsar_model::content_digest) */
+void pulsar_engine_bind_kv_source(pulsar_engine *e, const char *what, uint64_t digest);
+/** Bytes of one sampled block (pulsar_content_sample). */
+#define PULSAR_CONTENT_SAMPLE_BLOCK 4096u
+/** One block is sampled for every this many bytes of a span, beside its first and last. */
+#define PULSAR_CONTENT_SAMPLE_STRIDE (64ull << 20)
+/** Threads a content sample is read on (pulsar_content_sample_fold): the reads are small and scattered, so they are
+ *  seek-bound on a disk array and latency-bound on NVMe -- either way they overlap. */
+#define PULSAR_CONTENT_SAMPLE_READERS 16u
+/** One read of a content sample: `bytes` (<= PULSAR_CONTENT_SAMPLE_BLOCK) at `off` of `fd`. */
+typedef struct pulsar_content_read {
+    int fd;          ///< the open file (borrowed)
+    uint64_t off;    ///< the read's first byte
+    uint32_t bytes;  ///< its length
+} pulsar_content_read;
+/** L426: the content sample of the file span [off, off + bytes), appended to `plan`: its first block, its last, and
+ *  one for every PULSAR_CONTENT_SAMPLE_STRIDE bytes spread evenly between them (blocks of PULSAR_CONTENT_SAMPLE_BLOCK
+ *  bytes at offsets the length alone decides) -- or every byte of a span of up to two blocks, so a norm, a bias or a
+ *  scalar is read whole.  The one sampling rule of the weights a KV store is keyed by: a tensor in a container
+ *  (safetensors.cpp), a row table beside it (pulsar_engram_table_digest).
+ *
+ *  What it tells apart: two spans that differ in any sampled byte -- so two quantisations, two checkpoints, two
+ *  trainings of one tensor, whose bytes differ throughout.  What it does not: two spans of one length that agree in
+ *  every sampled block and differ only between them (an edit inside a large tensor that leaves its first and last
+ *  4 KiB and each 64 MiB mark alone).
+ *  @param fd    the open file
+ *  @param off   the span's first byte
+ *  @param bytes the span's length
+ *  @param plan  receives the reads, in offset order */
+void pulsar_content_sample(int fd, uint64_t off, uint64_t bytes, std::vector<pulsar_content_read> *plan);
+/** L426: read a plan (pulsar_content_sample) with pread on PULSAR_CONTENT_SAMPLE_READERS threads -- no mapping is
+ *  touched and nothing is read ahead -- and fold each read's length and bytes into `d`, in plan order.
+ *  @param plan the reads
+ *  @param d    the running digest
+ *  @return false when a read failed or came back short (errno says why; `d` is then meaningless) */
+bool pulsar_content_sample_fold(const std::vector<pulsar_content_read> &plan, pulsar_kvdigest *d);
 /// Print the model's metadata summary (name, architecture, shape) to stderr.
 /// @param m  the model
 void model_summary(const pulsar_model *m);

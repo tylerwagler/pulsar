@@ -9098,7 +9098,7 @@ static void test_l338_segstore_reserve_commit(void) {
     TEST_ASSERT(access(path, F_OK) != 0);   /* its file is gone too */
     /* a pinned parent survives eviction: a leaf whose child is in flight */
     pulsar_segstore_close(st);
-    st = pulsar_segstore_open(dir, 3500, 7, NULL, NULL);   /* the root + child (2 x ~1.17 KB) stored */
+    st = pulsar_segstore_open(dir, 3600, 7, NULL, NULL);   /* the root + child (2 x ~1.18 KB) stored */
     pulsar_segstore_job *jx = NULL, *jy = NULL;
     char kx[41], ky[41];
     TEST_ASSERT(pulsar_segstore_reserve(st, child, TokPos{256}, TokPos{384}, " more", TextBytes{5}, 1000, 0, kx, &jx,
@@ -9285,6 +9285,8 @@ static void test_l386_kv_identity_arithmetic(void) {
         {pulsar_segstore_identity(2, 36, 0), 121, 130501, 13050},              /* another cuBLASLt */
         {pulsar_segstore_identity(2, 36, 0), 121, 130500, 13060},              /* another CUDA runtime */
     };
+    const char *const differs[] = {"the model id", "the routed format", "the rope", "the GPU's compute capability",
+                                   "the cuBLASLt version", "the CUDA runtime version"};
     TEST_ASSERT(base == same && !(base != same));
     for (const pulsar_segstore_ident &o : others) TEST_ASSERT(o != base && !(o == base));
     /* a bare model word is the identity with no arithmetic recorded, as the host tests' stores open */
@@ -9311,12 +9313,17 @@ static void test_l386_kv_identity_arithmetic(void) {
             said++;
             TEST_ASSERT(l.find(": 1 segments of another identity set aside") != std::string::npos);
             TEST_ASSERT(l.find("written by [model id 2, routed bits 36, rope fold 0, cc 12.1, cuBLASLt 130500, CUDA "
-                               "runtime 13050]") != std::string::npos);
-            char want[200];
+                               "runtime 13050, weights 0000000000000000, tokenizer 0000000000000000]") !=
+                        std::string::npos);
+            char want[256];
             snprintf(want, sizeof want, "this process is [model id %u, routed bits %u, rope fold %u, cc %u.%u, cuBLASLt "
-                     "%u, CUDA runtime %u]", (o.model >> 8) & 0xffffu, o.model & 0xffu, o.model >> 24, o.cc / 10,
-                     o.cc % 10, o.gemm_lib, o.runtime);
+                     "%u, CUDA runtime %u, weights 0000000000000000, tokenizer 0000000000000000]",
+                     (o.model >> 8) & 0xffffu, o.model & 0xffu, o.model >> 24, o.cc / 10, o.cc % 10, o.gemm_lib,
+                     o.runtime);
             TEST_ASSERT(l.find(want) != std::string::npos);
+            /* L426: and which word differs, by name */
+            TEST_ASSERT(l.find(std::string("the first differs from this process in ") + differs[&o - others] +
+                               " -- it was written by") != std::string::npos);
         }
         TEST_ASSERT(said == 1);
     }
@@ -9329,6 +9336,97 @@ static void test_l386_kv_identity_arithmetic(void) {
     pulsar_segstore_drop(st, root);
     pulsar_segstore_close(st);
     rmdir(dir);
+}
+
+/* L426: the store identity carries WHICH weights computed the bytes and which tokenizer chose the ids, beside the
+ * model word and the arithmetic.  Two containers of one family and bit rate -- a re-quantised pack, another
+ * checkpoint, another drafter or adapter -- share every other word; a server started on a directory the other one
+ * filled must index none of it (segments and restore points left alone, not removed), say so ONCE at the open naming
+ * the word that differs and both identities, and read its own store again unchanged.  A file of the store format
+ * before these words (.seg v6, .rp v4) is removed at the open, whatever wrote it.  The digests are injected here;
+ * what a container's digest is, pulsar_test --kv-identity and the loader contract gate grade on containers. */
+static void test_l426_kv_identity_weights(void) {
+    const uint64_t W = 0x1111222233334444ull, T = 0x5555666677778888ull;
+    const pulsar_segstore_ident base(pulsar_segstore_identity(2, 36, 0), 121, 130500, 13050, W, T);
+    const pulsar_segstore_ident same(pulsar_segstore_identity(2, 36, 0), 121, 130500, 13050, W, T);
+    const struct { pulsar_segstore_ident id; const char *differs; } others[] = {
+        {{pulsar_segstore_identity(2, 36, 0), 121, 130500, 13050, W + 1, T}, "the weights"},
+        {{pulsar_segstore_identity(2, 36, 0), 121, 130500, 13050, W, T ^ 1}, "the tokenizer"},
+        {{pulsar_segstore_identity(2, 36, 0), 121, 130500, 13050, ~W, ~T}, "the weights, the tokenizer"},
+        /* the store of a build that recorded neither (zeros) is another identity too */
+        {{pulsar_segstore_identity(2, 36, 0), 121, 130500, 13050}, "the weights, the tokenizer"},
+        {{pulsar_segstore_identity(2, 36, 0), 120, 130500, 13050, W ^ (1ull << 63), T}, "the GPU's compute capability, "
+                                                                                       "the weights"},
+    };
+    TEST_ASSERT(base == same && !(base != same));
+    for (const auto &o : others) TEST_ASSERT(o.id != base && !(o.id == base));
+
+    char tmpl[] = "/tmp/pulsar-seg-weights.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    char root[41], child[41], err[256];
+    pulsar_segstore *st = pulsar_segstore_open(dir, 0, base, NULL, NULL);
+    TEST_ASSERT(st && test_seg_put(st, "", 0, 128, "SYSTEM:", 100, 0x11, root) &&
+                test_seg_put(st, root, 128, 256, " user", 100, 0x22, child));
+    test_seg_payload rp = {64, 0x55};
+    TEST_ASSERT(pulsar_segstore_put_rp(st, child, 64, 0, test_seg_write, &rp, err, sizeof err));
+    pulsar_segstore_close(st);
+    char seg_path[4200], rp_path[4200];
+    snprintf(seg_path, sizeof seg_path, "%s/%s.seg", dir, root);
+    snprintf(rp_path, sizeof rp_path, "%s/%s.rp", dir, child);
+    for (const auto &o : others) {
+        std::vector<std::string> lines;
+        pulsar_segstore *other = pulsar_segstore_open(dir, 0, o.id, l386_log, &lines);
+        pulsar_segstore_seg chain[4];
+        TEST_ASSERT(other && pulsar_segstore_count(other) == 0 && !pulsar_segstore_contains(other, root) &&
+                    pulsar_segstore_lookup(other, "SYSTEM: user, hello", TextBytes{19}, NULL, chain, 4) == 0);
+        pulsar_segstore_close(other);
+        TEST_ASSERT(access(seg_path, F_OK) == 0 && access(rp_path, F_OK) == 0);   /* left alone */
+        int said = 0;
+        for (const std::string &l : lines) {
+            if (l.find("of another identity set aside") == std::string::npos) continue;
+            said++;
+            TEST_ASSERT(l.find(": 2 segments of another identity set aside (not indexed, not removed)") !=
+                        std::string::npos);
+            TEST_ASSERT(l.find(std::string("the first differs from this process in ") + o.differs +
+                               " -- it was written by [") != std::string::npos);
+            TEST_ASSERT(l.find("weights 1111222233334444, tokenizer 5555666677778888], this process is [") !=
+                        std::string::npos);
+            char want[96];
+            snprintf(want, sizeof want, "weights %016llx, tokenizer %016llx]", (unsigned long long)o.id.weights,
+                     (unsigned long long)o.id.tokenizer);
+            TEST_ASSERT(l.rfind(want) == l.size() - strlen(want));
+            if (l.rfind(want) != l.size() - strlen(want)) fprintf(stderr, "  the open said: %s\n", l.c_str());
+        }
+        TEST_ASSERT(said == 1);
+    }
+    /* the writer's identity -- the same container, opened again -- indexes its chain and the restore point, resumes
+     * it by text, and says nothing of another identity */
+    std::vector<std::string> lines;
+    st = pulsar_segstore_open(dir, 0, same, l386_log, &lines);
+    pulsar_segstore_seg e, chain[4];
+    TEST_ASSERT(st && pulsar_segstore_count(st) == 2 && pulsar_segstore_get(st, child, &e) && e.rp_bytes > 0);
+    TEST_ASSERT(pulsar_segstore_lookup(st, "SYSTEM: user, hello", TextBytes{19}, NULL, chain, 4) == 2 &&
+                !strcmp(chain[1].key, child));
+    for (const std::string &l : lines) TEST_ASSERT(l.find("another identity") == std::string::npos);
+    pulsar_segstore_close(st);
+
+    /* the format before these words: a .seg / .rp whose version is the previous one is removed at the open (it can
+     * never load), under any identity */
+    for (const char *path : {seg_path, rp_path}) {
+        FILE *fp = fopen(path, "r+b");
+        const uint32_t prev = (strstr(path, ".seg") ? PULSAR_SEGSTORE_VERSION : PULSAR_SEGSTORE_RP_VERSION) - 1u;
+        TEST_ASSERT(fp && fseek(fp, 4, SEEK_SET) == 0 && fwrite(&prev, 4, 1, fp) == 1);
+        if (fp) fclose(fp);
+    }
+    st = pulsar_segstore_open(dir, 0, base, NULL, NULL);
+    TEST_ASSERT(st && pulsar_segstore_count(st) == 0 && access(seg_path, F_OK) != 0 && access(rp_path, F_OK) != 0);
+    pulsar_segstore_close(st);
+    char child_path[4200];
+    snprintf(child_path, sizeof child_path, "%s/%s.seg", dir, child);
+    unlink(child_path);   /* its parent went: never indexed again */
+    TEST_ASSERT(rmdir(dir) == 0);
 }
 
 /* L323: where a persist ends segments -- the canonical grid.  Every multiple of the grid past the stored chain up to
@@ -18637,6 +18735,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l338_kv_writer_lifecycle();
     test_l280_kv_identity_rope();
     test_l386_kv_identity_arithmetic();
+    test_l426_kv_identity_weights();
     test_l323_kvchain_segment_ends();
     test_l323_grid_cut_dedupes_copies();
     test_l323_tail_supersession();

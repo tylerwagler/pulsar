@@ -4187,6 +4187,267 @@ static void test_st_exact_integers(void) {
     }
 }
 
+/* ---- L426: the container content digest and the KV store identity ---------------------------------------------- */
+
+/** One tensor of a synthetic container (l426_write_shard): its name, its bytes and the byte value that fills it. */
+struct l426_tensor {
+    const char *name;   ///< the tensor's name (its own gguf_name)
+    uint64_t bytes;     ///< stored bytes (bf16: an even count)
+    uint8_t fill;       ///< every byte's value
+};
+
+/** Write one shard of a synthetic container: a safetensors header declaring `ts` (bf16 vectors) with the pulsar
+ *  metadata the reader asks for, then each tensor's bytes.  Returns where the data region starts.
+ *  @param path    the shard file
+ *  @param ts      its tensors, in file order
+ *  @param primary carry pulsar.kv (one shard of a container does)
+ *  @return the data region's file offset, 0 on failure */
+static uint64_t l426_write_shard(const std::string &path, const std::vector<l426_tensor> &ts, bool primary) {
+    std::string decl = "{", hdr = "{\"__metadata__\":{";
+    if (primary)
+        hdr += "\"pulsar.kv\":\"[{\\\"key\\\":\\\"general.architecture\\\",\\\"type\\\":\\\"string\\\",\\\"value\\\":"
+               "\\\"l426\\\"}]\",";
+    std::string entries;
+    uint64_t off = 0;
+    for (const l426_tensor &t : ts) {
+        char b[512];
+        snprintf(b, sizeof b, "%s\\\"%s\\\":{\\\"dims_ne\\\":[%llu],\\\"gguf_name\\\":\\\"%s\\\",\\\"layout\\\":"
+                 "\\\"bf16\\\"}", decl.size() > 1 ? "," : "", t.name, (unsigned long long)(t.bytes / 2u), t.name);
+        decl += b;
+        snprintf(b, sizeof b, ",\"%s\":{\"dtype\":\"BF16\",\"shape\":[%llu],\"data_offsets\":[%llu,%llu]}", t.name,
+                 (unsigned long long)(t.bytes / 2u), (unsigned long long)off, (unsigned long long)(off + t.bytes));
+        entries += b;
+        off += t.bytes;
+    }
+    hdr += "\"pulsar.tensors\":\"" + decl + "}\"}" + entries + "}";
+    FILE *f = fopen(path.c_str(), "wb");
+    if (!f) return 0;
+    const uint64_t n = hdr.size();
+    bool ok = fwrite(&n, sizeof n, 1, f) == 1 && fwrite(hdr.data(), 1, hdr.size(), f) == hdr.size();
+    for (const l426_tensor &t : ts) {
+        const std::vector<uint8_t> bytes((size_t)t.bytes, t.fill);
+        ok = ok && fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
+    }
+    ok = fclose(f) == 0 && ok;
+    return ok ? 8u + n : 0u;
+}
+
+/** The content digest a container opens with (0 and a failed assertion when it does not open); the open's banner
+ *  lines are dropped, a refusal's are not.
+ *  @param dir the container directory  @return pulsar_model::content_digest */
+static uint64_t l426_digest(const std::string &dir) {
+    pulsar_model m;
+    memset(&m, 0, sizeof m);
+    fflush(stderr);
+    const int saved = dup(2), null = open("/dev/null", O_WRONLY);
+    if (saved >= 0 && null >= 0) dup2(null, 2);
+    bool opened = safetensors_open(&m, dir.c_str(), false);
+    fflush(stderr);
+    if (saved >= 0) { dup2(saved, 2); close(saved); }
+    if (null >= 0) close(null);
+    if (!opened) {   /* said where it can be read */
+        model_close(&m);
+        memset(&m, 0, sizeof m);
+        opened = safetensors_open(&m, dir.c_str(), false);
+    }
+    TEST_ASSERT(opened);
+    const uint64_t d = opened ? m.content_digest : 0u;
+    model_close(&m);
+    return d;
+}
+
+/** XOR one byte of a file in place.
+ *  @param path the file  @param at the byte's offset  @return true when written */
+static bool l426_flip(const std::string &path, uint64_t at) {
+    FILE *f = fopen(path.c_str(), "r+b");
+    uint8_t b = 0;
+    const bool ok = f && fseek(f, (long)at, SEEK_SET) == 0 && fread(&b, 1, 1, f) == 1 && fseek(f, (long)at, SEEK_SET) == 0 &&
+                    fputc(b ^ 0x5a, f) != EOF;
+    if (f) fclose(f);
+    return ok;
+}
+
+/** Copy a file's bytes (a new inode, a new mtime: what a copied container is).
+ *  @param from the source  @param to the destination  @return true when copied */
+static bool l426_copy(const std::string &from, const std::string &to) {
+    FILE *a = fopen(from.c_str(), "rb"), *b = fopen(to.c_str(), "wb");
+    bool ok = a && b;
+    char buf[1 << 16];
+    for (size_t k; ok && (k = fread(buf, 1, sizeof buf, a)) > 0;) ok = fwrite(buf, 1, k, b) == k;
+    if (a) fclose(a);
+    if (b) ok = fclose(b) == 0 && ok;
+    return ok;
+}
+
+/* L426: what the KV store identity's weights word is made of, on synthetic containers (host: files in /tmp).
+ *   - the sampling rule (pulsar_content_sample): a span of up to two blocks whole; else its first block, its last and
+ *     one per PULSAR_CONTENT_SAMPLE_STRIDE between, at offsets its length decides;
+ *   - a container's content digest is the same at every open and for a byte copy at another path (names, sizes and
+ *     bytes; no path, inode or mtime);
+ *   - it differs for a container of the SAME layout (headers byte-identical: the old container_digest cannot tell)
+ *     whose weight bytes differ: in a large tensor's first or last block, in a small tensor anywhere (an adapter
+ *     pair, a norm), in the drafter's shard;
+ *   - and its stated limit: a byte between a large tensor's sampled blocks is not seen. */
+static void test_l426_content_digest(void) {
+    const uint64_t B = PULSAR_CONTENT_SAMPLE_BLOCK, S = PULSAR_CONTENT_SAMPLE_STRIDE;
+    {   /* the rule, no I/O */
+        std::vector<pulsar_content_read> plan;
+        pulsar_content_sample(7, 1000, 2 * B, &plan);            /* two blocks: whole */
+        TEST_ASSERT(plan.size() == 2 && plan[0].off == 1000 && plan[0].bytes == B && plan[1].off == 1000 + B &&
+                    plan[1].bytes == B && plan[0].fd == 7);
+        plan.clear();
+        pulsar_content_sample(7, 0, B + 10, &plan);              /* a short tail is read to its end */
+        TEST_ASSERT(plan.size() == 2 && plan[1].off == B && plan[1].bytes == 10);
+        plan.clear();
+        pulsar_content_sample(7, 0, 0, &plan);
+        TEST_ASSERT(plan.empty());
+        pulsar_content_sample(7, 64, 2 * B + 1, &plan);          /* past two blocks: the first and the last */
+        TEST_ASSERT(plan.size() == 2 && plan[0].off == 64 && plan[1].off == 64 + B + 1 && plan[1].bytes == B);
+        plan.clear();
+        pulsar_content_sample(7, 0, 3 * S + 5, &plan);           /* and one per stride between, evenly */
+        TEST_ASSERT(plan.size() == 5 && plan[0].off == 0 && plan[4].off + B == 3 * S + 5);
+        for (size_t i = 1; i < plan.size(); i++) {
+            const uint64_t gap = plan[i].off - plan[i - 1].off;
+            TEST_ASSERT(plan[i].bytes == B && gap >= (3 * S + 5 - B) / 4 && gap <= (3 * S + 5 - B) / 4 + 1);
+        }
+    }
+    char tmpl[] = "/tmp/pulsar-l426-XXXXXX";
+    char *root = mkdtemp(tmpl);
+    TEST_ASSERT(root != NULL);
+    if (!root) return;
+    const std::string a = std::string(root) + "/a", b = std::string(root) + "/elsewhere";
+    TEST_ASSERT(mkdir(a.c_str(), 0700) == 0 && mkdir(b.c_str(), 0700) == 0);
+    /* a target shard (a large tensor of 64 blocks, a small adapter pair) and a drafter shard */
+    const std::vector<l426_tensor> target = {{"layers.0.weight", 64 * B, 0x11}, {"layers.0.lora_a", 900, 0x22},
+                                             {"layers.0.lora_b", 3 * B, 0x33}};
+    const std::vector<l426_tensor> drafter = {{"drafter.fc.weight", 8 * B, 0x44}, {"drafter.norm.weight", 64, 0x55}};
+    const char *const n1 = "/model-00001-of-00002.safetensors", *const n2 = "/model-00002-of-00002.safetensors";
+    const uint64_t d1 = l426_write_shard(a + n1, target, true), d2 = l426_write_shard(a + n2, drafter, false);
+    TEST_ASSERT(d1 && d2);
+    const uint64_t first = l426_digest(a);
+    TEST_ASSERT(first != 0 && l426_digest(a) == first);                       /* stable across opens */
+    TEST_ASSERT(l426_copy(a + n1, b + n1) && l426_copy(a + n2, b + n2));
+    TEST_ASSERT(l426_digest(b) == first);                                     /* and across a copy to another path */
+    /* same layout, other weights: one byte each (the headers stay byte-identical), restored after */
+    const struct { const char *shard; uint64_t at; bool seen; const char *what; } edits[] = {
+        {n1, d1 + 0, true, "a large tensor's first byte"},
+        {n1, d1 + B - 1, true, "its first block's last byte"},
+        {n1, d1 + 64 * B - 1, true, "its last byte"},
+        {n1, d1 + 63 * B, true, "its last block's first byte"},
+        {n1, d1 + 64 * B + 450, true, "an adapter tensor (read whole)"},
+        {n1, d1 + 64 * B + 900 + B + 7, false, "the middle block of a three-block tensor"},
+        {n1, d1 + 64 * B + 900 + 2 * B, true, "its last block"},
+        {n2, d2 + 5, true, "the drafter's Linear"},
+        {n2, d2 + 8 * B + 63, true, "the drafter's norm"},
+        {n1, d1 + 32 * B, false, "a byte between a large tensor's sampled blocks: the stated limit"},
+    };
+    for (const auto &e : edits) {
+        TEST_ASSERT(l426_flip(b + e.shard, e.at));
+        const uint64_t got = l426_digest(b);
+        TEST_ASSERT((got != first) == e.seen);
+        if ((got != first) != e.seen) fprintf(stderr, "  l426: %s: digest %s\n", e.what, got != first ? "moved" : "kept");
+        TEST_ASSERT(l426_flip(b + e.shard, e.at) && l426_digest(b) == first);
+    }
+    /* another shard size is another container even when no sampled byte moved */
+    TEST_ASSERT(truncate((b + n2).c_str(), (off_t)(d2 + 8 * B + 64 + 1)) == 0 && l426_digest(b) != first);
+    for (const std::string &d : {a, b}) {
+        unlink((d + n1).c_str());
+        unlink((d + n2).c_str());
+        rmdir(d.c_str());
+    }
+    TEST_ASSERT(rmdir(root) == 0);
+}
+
+/** The vocabulary of the L426 identity test's tokenizer: the engine under test reads it through its hooks. */
+static std::vector<std::string> g_l426_vocab;
+/** pulsar_family::model_id of the L426 test family.  @return 2 */
+static int l426_model_id(const pulsar_engine *) { return 2; }
+/** pulsar_family::quant_bits of the L426 test family.  @return 36 */
+static int l426_quant_bits(pulsar_engine *) { return 36; }
+/** pulsar_family::rope_id of the L426 test family.  @return 0 (the model's own rope) */
+static uint64_t l426_rope_id(const pulsar_engine *) { return 0; }
+/** pulsar_family_tokenizer::n_tokens over g_l426_vocab.  @return its ids */
+static int l426_n_tokens(pulsar_engine *) { return (int)g_l426_vocab.size(); }
+/** pulsar_family_tokenizer::token_text over g_l426_vocab.
+ *  @param token the id  @param len receives the bytes  @return the text, malloc'd */
+static char *l426_token_text(pulsar_engine *, TokId token, size_t *len) {
+    const std::string &t = g_l426_vocab[(size_t)token.raw()];
+    *len = t.size();
+    return strdup(t.c_str());
+}
+
+/* L426: what pulsar_engine_kv_identity makes of an engine -- on a host-built engine of a test family (no model, no
+ * device).  The weights word moves with the container's content digest and with every source the load bound beside
+ * it (a row table, an overlay donor: its kind, its digest, the order), and with nothing else; the tokenizer word
+ * moves with any id's bytes or the table's length, and is 0 for a family without a tokenizer. */
+static void test_l426_engine_identity(void) {
+    static pulsar_family fam{};
+    static pulsar_family_tokenizer tok{};
+    fam.name = "L426 identity test";
+    fam.model_id = l426_model_id;
+    fam.quant_bits = l426_quant_bits;
+    fam.rope_id = l426_rope_id;
+    tok.n_tokens = l426_n_tokens;
+    tok.token_text = l426_token_text;
+    fam.tokenizer = &tok;
+    pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
+    e->family = &fam;
+    e->model.content_digest = 0x0123456789abcdefull;
+    g_l426_vocab = {"<bos>", "a", "b", "ab"};
+    const pulsar_segstore_ident base = pulsar_engine_kv_identity(e);
+    TEST_ASSERT(base.model == pulsar_segstore_identity(2, 36, 0) && base.weights != 0 && base.tokenizer != 0);
+    TEST_ASSERT(pulsar_engine_kv_identity(e) == base);   /* the same engine, asked again */
+    /* the weights: the container's content */
+    e->model.content_digest ^= 1u;
+    pulsar_segstore_ident got = pulsar_engine_kv_identity(e);
+    TEST_ASSERT(got.weights != base.weights && got.tokenizer == base.tokenizer && got.model == base.model);
+    e->model.content_digest ^= 1u;
+    /* ... and what the load read beside it: the kind, the digest and the order all count */
+    pulsar_engine_bind_kv_source(e, "row-table", 0x1111);
+    const uint64_t one = pulsar_engine_kv_identity(e).weights;
+    pulsar_engine_bind_kv_source(e, "row-table", 0x2222);
+    const uint64_t two = pulsar_engine_kv_identity(e).weights;
+    e->kv_sources = 0;
+    pulsar_engine_bind_kv_source(e, "row-table", 0x2222);
+    pulsar_engine_bind_kv_source(e, "row-table", 0x1111);
+    const uint64_t swapped = pulsar_engine_kv_identity(e).weights;
+    e->kv_sources = 0;
+    pulsar_engine_bind_kv_source(e, "expert-overlay", 0x1111);
+    const uint64_t other_kind = pulsar_engine_kv_identity(e).weights;
+    e->kv_sources = 0;
+    pulsar_engine_bind_kv_source(e, "row-table", 0x1112);
+    const uint64_t other_rows = pulsar_engine_kv_identity(e).weights;
+    e->kv_sources = 0;
+    for (uint64_t w : {one, two, swapped, other_kind, other_rows}) TEST_ASSERT(w != base.weights);
+    TEST_ASSERT(one != two && two != swapped && one != other_kind && one != other_rows);
+    TEST_ASSERT(pulsar_engine_kv_identity(e) == base);
+    /* the tokenizer: an id's bytes, a split that concatenates the same, a longer table */
+    g_l426_vocab[2] = "c";
+    got = pulsar_engine_kv_identity(e);
+    TEST_ASSERT(got.tokenizer != base.tokenizer && got.weights == base.weights);
+    g_l426_vocab = {"<bos>", "ab", "", "ab"};
+    TEST_ASSERT(pulsar_engine_kv_identity(e).tokenizer != base.tokenizer);
+    g_l426_vocab = {"<bos>", "a", "b", "ab", "<extra>"};
+    TEST_ASSERT(pulsar_engine_kv_identity(e).tokenizer != base.tokenizer);
+    g_l426_vocab = {"<bos>", "a", "b", "ab"};
+    TEST_ASSERT(pulsar_engine_kv_identity(e) == base);
+    fam.tokenizer = NULL;   /* a family without one */
+    got = pulsar_engine_kv_identity(e);
+    TEST_ASSERT(got.tokenizer == 0 && got.weights == base.weights);
+    g_l426_vocab.clear();
+    free(e);
+}
+
+/* L426: the host-only group the check tier runs (make kv-identity-gate): the content digest on synthetic containers,
+ * the engine's identity over it, then the store's side -- another weights or tokenizer word is another identity, set
+ * aside and said once (server_tests.cpp), and the arithmetic words as before (L386). */
+static void test_kv_identity(void) {
+    test_l426_content_digest();
+    test_l426_engine_identity();
+    test_l426_kv_identity_weights();
+    test_l386_kv_identity_arithmetic();
+}
+
 /* L335: a bank carry's restore is all or nothing -- a live row that does not restore (here: a bank past the device
  * rows, the copy's host-side refusal) leaves the host view exactly as it was; it used to take the bank's checkpoint
  * first and return false half-restored.  Host only: no device row is touched. */
@@ -6552,6 +6813,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--driver-head-rows", "driver-head-rows", "the step's head list and its crossings: a span heads consecutive rows, a verify's head row is its step row by name, a run maps rows to positions (L334 P2b S7b)", test_driver_head_rows},
     {"--driver-context-bound", "driver-context-bound", "the driver's one context bound: a decode, eval or verify row at or past the pool's capacity is refused before the family's trunk (L375)", test_driver_context_bound},
     {"--spec-env", "spec-env", "PULSAR_SPEC_DEPTH / PULSAR_SPEC_TAU: one parse, an unparsable value refused by name at the open (L375)", test_spec_env},
+    {"--kv-identity", "kv-identity", "the disk KV identity's weights and tokenizer words: the container content digest (stable across opens and copies, moved by a weight byte of the same layout, its sampling limit) and a store of another identity set aside and said once (L426)", test_kv_identity},
     {"--st-integers", "st-integers", "the safetensors header's integers are exact: a fractional or past-2^53 shape is refused (L335)", test_st_exact_integers},
     {"--bank-carry-restore", "bank-carry-restore", "a bank carry's restore is all or nothing: a live row that fails leaves the host view untouched (L335)", test_bank_carry_restore},
     {"--multiseq-view", "multiseq-view", "a DeepSeek batch step drops the installed bank's view only when it moved that bank (a row of it, or a failed sweep); a dirty view is read, never continued (L380)", test_multiseq_step_view},

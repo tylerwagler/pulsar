@@ -735,6 +735,14 @@ bool pulsar_qwen_s4_load(pulsar_engine *e, const pulsar_engine_options *opt) {
         free(io);
         return false;
     }
+    /* L426: the rows are weights outside the shards: bound into the KV store identity */
+    uint64_t rows_digest = 0;
+    if (!pulsar_engram_table_digest(&io->table, &rows_digest)) {
+        pulsar_engram_table_close(&io->table);
+        free(io);
+        return false;
+    }
+    pulsar_engine_bind_kv_source(e, "row-table", rows_digest);
     /* L329 (b2): the next prompt chunk's rows read ahead (prefill_loop.cpp); PULSAR_PLE_READ_AHEAD=0 is the A/B's off
      * arm -- a diagnostic switch, no byte changes either way -- and any other value but 1 refuses the load */
     const char *ra = getenv("PULSAR_PLE_READ_AHEAD");

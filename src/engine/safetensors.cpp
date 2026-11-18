@@ -1004,6 +1004,43 @@ static int st_cmp_tensor_name(const void *a, const void *b) {
     return memcmp(x->name.ptr, y->name.ptr, x->name.len);
 }
 
+/** L426: pulsar_model::content_digest -- the layout digest, every shard's size, then a sample of every directory
+ *  entry's stored bytes (pulsar_content_sample), in directory order.  An entry is a declared tensor or a routed
+ *  projection's whole expert stack, so each norm, router, adapter pair and drafter tensor is sampled on its own and a
+ *  stack along its length.  Read through the shards' descriptors, not their mappings: a few thousand 4 KiB reads of
+ *  bytes the load reads anyway, with no read-ahead of weights nobody asked for.  Refuses (by longjmp) a shard that
+ *  cannot be read, and says what the sample cost (it is paid at every open).
+ *  @param[in,out] m the model: shards, directory and container_digest set; content_digest is written */
+static void st_content_digest(pulsar_model *m) {
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    uint64_t bytes = 0;
+    bool placed = true, read = false;
+    {   /* the plan's storage is released before a refusal's longjmp */
+        std::vector<pulsar_content_read> plan;
+        uint64_t at = 0;   /* the shard the last entry sat in: a shard's entries are adjacent in the directory */
+        for (uint64_t i = 0; placed && i < m->n_tensors; i++) {
+            const pulsar_tensor *t = &m->tensors[i];
+            for (uint64_t k = 0; k < m->n_shards && m->shard_map[at] != t->ext_map; k++) at = (at + 1u) % m->n_shards;
+            placed = m->shard_map[at] == t->ext_map;
+            if (placed) pulsar_content_sample(m->shard_fd[at], t->abs_offset, t->bytes, &plan);
+        }
+        pulsar_kvdigest d;
+        pulsar_kvdigest_init(&d);
+        pulsar_kvdigest_update(&d, &m->container_digest, sizeof m->container_digest);
+        pulsar_kvdigest_update(&d, m->shard_size, m->n_shards * sizeof *m->shard_size);
+        read = placed && pulsar_content_sample_fold(plan, &d);
+        m->content_digest = pulsar_kvdigest_final(&d);
+        for (const pulsar_content_read &r : plan) bytes += r.bytes;
+    }
+    if (!placed) st_die("safetensors: a tensor lies in no shard of the container");
+    if (!read) st_die("safetensors: cannot read the container's bytes for its content digest: %s", strerror(errno));
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    fprintf(stderr, "pulsar: container content digest %016llx: %.1f MiB of %llu tensors sampled in %.0f ms\n",
+            (unsigned long long)m->content_digest, (double)bytes / 1048576.0, (unsigned long long)m->n_tensors,
+            (double)(t1.tv_sec - t0.tv_sec) * 1e3 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6);
+}
+
 /// Open a shard directory or single file into m (refuses by longjmp).
 /// @param[out] m the model
 /// @param path the directory or file
@@ -1156,6 +1193,7 @@ static void st_open(pulsar_model *m, const char *path, bool gpu_mapping) {
     }
     m->mapped_bytes = 0;
     for (uint64_t i = 0; i < m->n_shards; i++) m->mapped_bytes += m->shard_size[i];
+    st_content_digest(m);
     fprintf(stderr, "pulsar: safetensors model: %llu shards, %llu tensors, "
                     "%.2f GiB mapped, %llu metadata keys\n",
             (unsigned long long)m->n_shards, (unsigned long long)m->n_tensors,

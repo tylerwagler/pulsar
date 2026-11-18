@@ -68,13 +68,13 @@
 /// Magic of a .seg file's header: "PSG1".
 #define PULSAR_SEGSTORE_MAGIC   0x31475350u   /* "PSG1" */
 /// Store format version; v3 (L347): rows-only payloads, the state in the key's .rp.  Older versions are removed at open.
-#define PULSAR_SEGSTORE_VERSION 6u            /* v5 (L353): a key covers the span's image content hashes; v2 (L323): the header carries the payload's state bytes; v3 (L347): no state part (the word is 0), the state at G is the key's .rp; v4 (L347 I3a): the payloads' digest is pulsar_kvdigest v2, sealed and checked by the store; v6 (L386): the header carries the writer's arithmetic (pulsar_segstore_ident) */
+#define PULSAR_SEGSTORE_VERSION 7u            /* v5 (L353): a key covers the span's image content hashes; v2 (L323): the header carries the payload's state bytes; v3 (L347): no state part (the word is 0), the state at G is the key's .rp; v4 (L347 I3a): the payloads' digest is pulsar_kvdigest v2, sealed and checked by the store; v6 (L386): the header carries the writer's arithmetic (pulsar_segstore_ident); v7 (L426): and its weights and tokenizer words */
 /// Magic of a .rp file's header: "PRP1" (L347).
 #define PULSAR_SEGSTORE_RP_MAGIC   0x31505250u   /* "PRP1" */
 /// Restore point file format version; v2 (L347 I2): the header's word at 12 is the restore point's flags; v3 (L347
 /// I3a): the payload's digest is pulsar_kvdigest v2; v4 (L386): the header carries the writer's arithmetic
-/// (pulsar_segstore_ident).  Older versions are removed at open.
-#define PULSAR_SEGSTORE_RP_VERSION 4u
+/// (pulsar_segstore_ident); v5 (L426): and its weights and tokenizer words.  Older versions are removed at open.
+#define PULSAR_SEGSTORE_RP_VERSION 5u
 /// L375 (O25): a part whose file read fails this many times in a row with a persistent errno (EIO, EACCES, EISDIR,
 /// ...; never ENOENT, which is a fault at once, and never a passing shortage -- EMFILE, ENFILE, ENOMEM, ENOBUFS,
 /// EAGAIN -- which counts nothing: L353 no. 13) is reported as a content fault and dropped by its reader.
@@ -186,30 +186,45 @@ static inline uint32_t pulsar_segstore_identity(uint32_t model_id, uint32_t rout
  * capability, the cuBLASLt version, the CUDA runtime version).  A prefill's bytes depend on all of them: the fixed
  * GEMM's algorithm picks are keyed by (compute capability, cuBLASLt version), and a shape with no recorded pick takes
  * cuBLASLt's first suggestion, which another library may change; another architecture runs other kernels.  So a
- * resume of KV written by other arithmetic would not equal the cold prefill.  Every .seg and .rp header carries all
- * four words; the store indexes only files whose four match its own.
+ * resume of KV written by other arithmetic would not equal the cold prefill.
+ *
+ * L426: AND the weights that computed them, and the tokenizer that chose the ids.  The model word names a family's
+ * shape and bit rate, not a container: a re-quantised pack, another checkpoint, another drafter or adapter have the
+ * same one, and a server started on a directory another of them filled would resume state those other weights
+ * computed.  `weights` is the engine's digest of everything it read weights from (pulsar_engine_kv_identity: the
+ * container's content digest, sampled, plus the row tables and overlay donors beside it); `tokenizer` its digest of
+ * the vocabulary (a chain is found by its TEXT and resumed with its stored ids, so the ids must be this tokenizer's).
+ *
+ * Every .seg and .rp header carries every word; the store indexes only files whose words all match its own.
  *
  * What does NOT belong here: anything that does not change bytes (the git sha, the version string, a timestamp),
  * since each value is a store wiped.  The engine's own numerics need no word of their own: a numerics change bumps
  * PULSAR_SESSION_SEGMENT_VERSION and PULSAR_SESSION_KV_PAYLOAD_VERSION (pulsar.h; L292 and L370 did, with no format
  * change), which every load checks.
  *
- * A bare model word converts to an identity with no arithmetic recorded (zeros): the host tests' stores. */
+ * A bare model word converts to an identity with no arithmetic, weights or tokenizer recorded (zeros): the host
+ * tests' stores. */
 struct pulsar_segstore_ident {
     uint32_t model = 0;      ///< pulsar_segstore_identity: model id, routed-expert format, rope
     uint32_t cc = 0;         ///< the device's compute capability, major * 10 + minor
     uint32_t gemm_lib = 0;   ///< cublasLtGetVersion()
     uint32_t runtime = 0;    ///< cudaRuntimeGetVersion()
+    uint64_t weights = 0;    ///< L426: the weights' digest (the container's content, row tables, overlay donors)
+    uint64_t tokenizer = 0;  ///< L426: the tokenizer's vocabulary digest
     pulsar_segstore_ident() = default;
     /** @param model_word pulsar_segstore_identity
      *  @param cc_        the compute capability, major * 10 + minor
      *  @param lt         the cuBLASLt version
-     *  @param rt         the CUDA runtime version */
-    pulsar_segstore_ident(uint32_t model_word, uint32_t cc_ = 0, uint32_t lt = 0, uint32_t rt = 0)
-        : model(model_word), cc(cc_), gemm_lib(lt), runtime(rt) {}
+     *  @param rt         the CUDA runtime version
+     *  @param w          the weights' digest
+     *  @param tok        the tokenizer's vocabulary digest */
+    pulsar_segstore_ident(uint32_t model_word, uint32_t cc_ = 0, uint32_t lt = 0, uint32_t rt = 0, uint64_t w = 0,
+                          uint64_t tok = 0)
+        : model(model_word), cc(cc_), gemm_lib(lt), runtime(rt), weights(w), tokenizer(tok) {}
     /** @param o another identity @return true when every word matches */
     bool operator==(const pulsar_segstore_ident &o) const {
-        return model == o.model && cc == o.cc && gemm_lib == o.gemm_lib && runtime == o.runtime;
+        return model == o.model && cc == o.cc && gemm_lib == o.gemm_lib && runtime == o.runtime &&
+               weights == o.weights && tokenizer == o.tokenizer;
     }
     /** @param o another identity @return true when any word differs */
     bool operator!=(const pulsar_segstore_ident &o) const { return !(*this == o); }
@@ -225,8 +240,9 @@ struct pulsar_segstore_ident {
  * Segments of another identity (pulsar_segstore_ident), of another format,
  * or unreadable are skipped and left alone -- except a segment of an OLDER store
  * version, which no build of this format reads: it is removed (L323).  L386: the
- * segments of another identity are said once at the open (to `log`): how many, and
- * the first one's identity beside this store's, word by word. */
+ * segments of another identity are said once at the open (to `log`): how many, which
+ * words of the first one's identity differ from this store's (L426), and both
+ * identities word by word. */
 pulsar_segstore *pulsar_segstore_open(const char *dir, uint64_t budget_bytes, const pulsar_segstore_ident &identity,
                                       pulsar_segstore_log_fn log, void *log_ud);
 /** Close the store and free its index and its RAM copies (no job may be out); the segment files stay on disk.

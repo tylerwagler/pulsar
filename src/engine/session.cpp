@@ -413,11 +413,24 @@ bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt) 
         }
         fprintf(stderr, "pulsar: expert overlay: %u tensors swapped in from %s (prefixes %s)\n",
                 swapped, overlay_path, sep + 1);
+        /* L426: the donor's weights now serve the swapped stacks: the donor and which stacks (the prefix list),
+         * bound into the KV store identity */
+        pulsar_kvdigest donor;
+        pulsar_kvdigest_init(&donor);
+        pulsar_kvdigest_update(&donor, &e->overlay_model.content_digest, sizeof e->overlay_model.content_digest);
+        pulsar_kvdigest_update(&donor, sep + 1, plist_len);
+        pulsar_engine_bind_kv_source(e, "expert-overlay", pulsar_kvdigest_final(&donor));
     }
     weights_bind(&e->weights, &e->model);
     if (!ds4_load_stage_ok("the weights")) return false;
     /* L242 slice 5: V4.1's Engram layers (layout, row tables, wkv / q / k) */
     if (!engram_bind(&e->weights, &e->model, opt->model_path)) return false;
+    /* L426: each row table is weights outside the shards: bound into the KV store identity */
+    for (uint32_t l = 0; e->weights.engram && l < e->weights.engram->n_layers; l++) {
+        uint64_t rows_digest = 0;
+        if (!pulsar_engram_table_digest(&e->weights.engram->table[l], &rows_digest)) return false;
+        pulsar_engine_bind_kv_source(e, "row-table", rows_digest);
+    }
     /* the drafter binds before the inspect-only exit so --inspect proves the
      * whole artifact binds, drafter included */
     if (!opt->dspark_disable && model_find_tensor(&e->model, "dspark.main_proj.weight")) {

@@ -31,6 +31,16 @@ the layer count -- refused by validate_reap_metadata / validate_swiglu_clamp_met
 The targets (which tensor, which key, which stack) are the family's row in FAMILIES below -- the only family
 knowledge here.  A family adds a row; a family-only fault (Qwen's PLE row file) is an extra in its row.
 
+  4. the KV STORE IDENTITY (L426), on the same clones: the disk KV store a server opens is keyed by which weights
+     wrote it (pulsar_engine_kv_identity: a sampled digest of the container's content and of the row tables beside
+     it).  tests/loader_open, given a store directory, opens one under the opened model's identity as a server does:
+       - the clean clone, twice: the same weights word, and the second open indexes the segment the first wrote;
+       - a second clone at another path (other inodes, other mtimes): the same word, the same store indexed;
+       - that clone with ONE weight byte changed and every header byte the same -- in the target (the row's
+         `tensor`), in the drafter, in the runtime adapter, in a row table, whichever the container holds -- must be
+         another identity: the store indexes nothing and says once that the weights differ; with the byte put back
+         it indexes its segment again.
+
   loader_contract.py --open tests/loader_open --work DIR MODEL [MODEL ...]
 """
 import argparse
@@ -279,13 +289,115 @@ def write_clone(src, shards, out):
                 f.truncate(size)
 
 
-def open_model(probe, model, lock):
-    """(returned: the open came back, rc, the log, seconds)"""
+def open_model(probe, model, lock, store=()):
+    """(returned: the open came back, rc, the log, seconds); with `store` (a directory, then 'write' to add a
+    segment), the probe also opens a KV segment store there under the model's identity"""
     env = dict(os.environ, PULSAR_LOCK_FILE=lock)
     t0 = time.time()
-    p = subprocess.run([probe, model], capture_output=True, text=True, env=env, timeout=600)
+    p = subprocess.run([probe, model, *store], capture_output=True, text=True, env=env, timeout=600)
     log = p.stdout + p.stderr
     return 'LOADER_OPEN_RETURNED' in log, p.returncode, log, time.time() - t0
+
+
+# L426: the weights a container may hold beside the target's, by the prefix of their engine names -- a family's drafter
+# or adapter tensors are found by it, and a container without them skips that leg
+IDENTITY_EXTRA = (('drafter', ('drafter.', 'dspark.')), ('adapter', ('adapter.',)))
+
+
+def store_probe(probe, model, lock, store, write=False):
+    """open `model` and a KV store at `store` under its identity (`write`: and add a segment): (the identity's weights
+    word or None, segments the store indexed, whether it wrote one, the store's log lines)"""
+    _, rc, log, _ = open_model(probe, model, lock, (store, 'write') if write else (store,))
+    weights = indexed = wrote = None
+    said = []
+    for line in log.splitlines():
+        if line.startswith('LOADER_OPEN_IDENTITY '):
+            weights = dict(x.split('=') for x in line.split()[1:])['weights']
+        elif line.startswith('LOADER_OPEN_STORE_LOG '):
+            said.append(line[len('LOADER_OPEN_STORE_LOG '):])
+        elif line.startswith('LOADER_OPEN_STORE '):
+            f = dict(x.split('=') for x in line.split()[1:])
+            indexed, wrote = int(f['indexed']), int(f['wrote'])
+    return (weights if rc == 0 else None), indexed, wrote, said
+
+
+def poke(path, at, value=None):
+    """set (or, value None, flip) one byte of a file in place; returns the byte it held"""
+    with open(path, 'r+b') as f:
+        f.seek(at)
+        old = f.read(1)[0]
+        f.seek(at)
+        f.write(bytes([old ^ 0x5a if value is None else value]))
+    return old
+
+
+def identity_targets(shards, row, clone):
+    """the weight bytes the identity legs change, one a kind the container holds: (kind, what, file, offset) -- the
+    first stored byte of the row's target tensor, of a drafter tensor, of an adapter tensor, and a byte of a row
+    table's first rows"""
+    out = []
+    for kind, names in (('target', None),) + IDENTITY_EXTRA:
+        hit = None
+        if names is None:
+            hit = find_tensor(shards, row['tensor']) + (row['tensor'],)
+        else:
+            for i, s in enumerate(shards):
+                for cname, d in json.loads(s['header'].get('__metadata__', {}).get('pulsar.tensors', '{}')).items():
+                    if hit is None and d.get('gguf_name', '').startswith(names):
+                        hit = (i, cname, d['gguf_name'])
+        if hit is None or hit[0] is None:
+            continue
+        path = os.path.join(clone, shards[hit[0]]['name'])
+        _, data_off = read_header(path)
+        out.append((kind, hit[2], path, data_off + shards[hit[0]]['header'][hit[1]]['data_offsets'][0]))
+    for name in sorted(os.listdir(clone)):
+        if name.endswith('.rows'):   # a row table: a 64-byte header, then the rows
+            out.append(('row table', name, os.path.join(clone, name), 2048))
+    return out
+
+
+def identity_legs(probe, src, shards, row, family, tag, clean, work, lock):
+    """leg 4 (L426, the module comment); returns the failures"""
+    fails = 0
+    store = os.path.join(work, f'{tag}-kvstore')
+    moved = os.path.join(work, f'{tag}-moved', 'elsewhere')
+    for d in (store, os.path.dirname(moved)):
+        if os.path.exists(d):
+            shutil.rmtree(d)
+    os.makedirs(os.path.dirname(moved))
+
+    def check(ok, what, detail=''):
+        nonlocal fails
+        print(f"  {'ok  ' if ok else 'FAIL'}  {family} kv-identity: {what}" + (f' -- {detail}' if detail and not ok else ''))
+        fails += 0 if ok else 1
+
+    w1, indexed, wrote, _ = store_probe(probe, clean, lock, store, write=True)
+    check(w1 is not None and indexed == 0 and wrote == 1, 'the clean clone opens an empty store and writes a segment',
+          f'weights {w1}, indexed {indexed}, wrote {wrote}')
+    w2, indexed, _, said = store_probe(probe, clean, lock, store)
+    check(w2 == w1 and indexed == 1 and not any('another identity' in x for x in said),
+          f'opened again: the same weights word ({w1}), its segment indexed', f'weights {w2}, indexed {indexed}; {said}')
+    write_clone(src, shards, moved)
+    w3, indexed, _, said = store_probe(probe, moved, lock, store)
+    check(w3 == w1 and indexed == 1 and not any('another identity' in x for x in said),
+          'a copy at another path: the same weights word, the same store indexed', f'weights {w3}, indexed {indexed}; {said}')
+    for kind, what, path, at in identity_targets(shards, row, moved):
+        old = poke(path, at)
+        w, indexed, wrote, said = store_probe(probe, moved, lock, store)
+        aside = [x for x in said if 'of another identity set aside' in x]
+        ok = (w is not None and w != w1 and indexed == 0 and wrote == 0 and len(aside) == 1 and
+              'differs from this process in the weights --' in aside[0] and
+              f'weights {w1},' in aside[0].split('this process is [')[0] and
+              f'weights {w},' in aside[0].split('this process is [')[-1])
+        check(ok, f'one byte of the {kind} changed ({what}, headers identical): another identity, the store indexes '
+                  f'nothing and says the weights differ', f'weights {w} (clean {w1}), indexed {indexed}, wrote {wrote}; {said}')
+        poke(path, at, old)
+        w, indexed, _, said = store_probe(probe, moved, lock, store)
+        check(w == w1 and indexed == 1, f'the {kind} byte put back: the store is indexed again',
+              f'weights {w}, indexed {indexed}; {said}')
+    shutil.rmtree(os.path.dirname(moved))
+    shutil.rmtree(store)
+    return fails
 
 
 def main():
@@ -315,6 +427,7 @@ def main():
             fails += 1
             continue
         print(f'  ok    {family} {tag}: the clean header clone opens ({dt:.1f} s)')
+        fails += identity_legs(a.open, src, shards, row, family, tag, clean, a.work, lock)
         for what in MUTATIONS + tuple(x[0] for x in row.get('extras', ())):
             m = load_container(src)
             desc, names = mutate(m, family, row, what)
