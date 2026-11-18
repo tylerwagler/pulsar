@@ -13129,6 +13129,323 @@ static void test_l311_route_header_anchor(void) {
     pulsar_tokens_free(&b);
 }
 
+/* ---- L425: parallel tool results render in their calls' order (chat_order_tool_results) --------------------------
+ * Qwen's and Nemotron-H's templates write each result as an anonymous <tool_response>, read by position; the ids say
+ * which call each answers on every protocol, so render_chat_conversation puts a complete run in call order before
+ * any family renders it.  The rule on bare messages, then through each protocol's parser and each family's render,
+ * then the replay: the bytes a live continuation appended are the bytes every later replay renders. */
+
+/// A tool result for the rule's tests.
+static chat_msg l425_result(const char *id, const char *text, bool continues = false) {
+    chat_msg m = qwen_test_msg("tool", text);
+    chat_msg_add_tool_call_id(&m, id);
+    m.anthropic_continues = continues;
+    return m;
+}
+
+/// An assistant message calling read_file once an id.
+static chat_msg l425_assistant(std::initializer_list<const char *> ids) {
+    chat_msg m = qwen_test_msg("assistant", "");
+    for (const char *id : ids) qwen_test_call(&m, id, "read_file", "{}");
+    return m;
+}
+
+/// The messages as "role[(id)]:content[+]" joined by '|' ('+': the entry continues an Anthropic message).
+static std::string l425_seq(const chat_msgs *msgs) {
+    std::string s;
+    for (int i = 0; i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (i) s += "|";
+        s += m->role;
+        if (m->tool_call_id) s += std::string("(") + m->tool_call_id + ")";
+        s += std::string(":") + (m->content ? m->content : "") + (m->anthropic_continues ? "+" : "");
+    }
+    return s;
+}
+
+/// Order `list` (taken) and return its sequence.
+static std::string l425_ordered(std::initializer_list<chat_msg> list) {
+    chat_msgs msgs = {0};
+    for (const chat_msg &m : list) chat_msgs_push(&msgs, m);
+    chat_order_tool_results(&msgs);
+    const std::string s = l425_seq(&msgs);
+    chat_msgs_free(&msgs);
+    return s;
+}
+
+static void test_l425_order_rule(void) {
+    const auto u = [](const char *t, bool continues = false) {
+        chat_msg m = qwen_test_msg("user", t);
+        m.anthropic_continues = continues;
+        return m;
+    };
+    /* in call order: untouched; swapped: call order; three, permuted: call order */
+    TEST_ASSERT(l425_ordered({u("q"), l425_assistant({"a", "b"}), l425_result("a", "RA"), l425_result("b", "RB")}) ==
+                "user:q|assistant:|tool(a):RA|tool(b):RB");
+    TEST_ASSERT(l425_ordered({u("q"), l425_assistant({"a", "b"}), l425_result("b", "RB"), l425_result("a", "RA")}) ==
+                "user:q|assistant:|tool(a):RA|tool(b):RB");
+    TEST_ASSERT(l425_ordered({l425_assistant({"a", "b", "c"}), l425_result("c", "RC"), l425_result("a", "RA"),
+                              l425_result("b", "RB"), u("next")}) ==
+                "assistant:|tool(a):RA|tool(b):RB|tool(c):RC|user:next");
+    /* not a bijection: arrival order.  A missing result, an unknown id, a repeated id, a blank id */
+    TEST_ASSERT(l425_ordered({l425_assistant({"a", "b", "c"}), l425_result("c", "R1"), l425_result("a", "R2")}) ==
+                "assistant:|tool(c):R1|tool(a):R2");
+    TEST_ASSERT(l425_ordered({l425_assistant({"a", "b", "c"}), l425_result("c", "R1"), l425_result("a", "R2"),
+                              l425_result("z", "R3")}) == "assistant:|tool(c):R1|tool(a):R2|tool(z):R3");
+    TEST_ASSERT(l425_ordered({l425_assistant({"a", "b", "c"}), l425_result("c", "R1"), l425_result("a", "R2"),
+                              l425_result("c", "R3")}) == "assistant:|tool(c):R1|tool(a):R2|tool(c):R3");
+    TEST_ASSERT(l425_ordered({l425_assistant({"a", "b", "c"}), l425_result("c", "R1"), l425_result("a", "R2"),
+                              l425_result("", "R3")}) == "assistant:|tool(c):R1|tool(a):R2|tool:R3");
+    /* more results than calls (the extra one a repeat), and calls that share an id */
+    TEST_ASSERT(l425_ordered({l425_assistant({"a", "b"}), l425_result("b", "R1"), l425_result("a", "R2"),
+                              l425_result("b", "R3")}) == "assistant:|tool(b):R1|tool(a):R2|tool(b):R3");
+    TEST_ASSERT(l425_ordered({l425_assistant({"a", "a"}), l425_result("a", "R1"), l425_result("a", "R2")}) ==
+                "assistant:|tool(a):R1|tool(a):R2");
+    /* a result naming two calls (a folded turn) answers neither alone */
+    {
+        chat_msg two = l425_result("b", "R1");
+        chat_msg_add_tool_call_id(&two, "c");
+        TEST_ASSERT(l425_ordered({l425_assistant({"a", "b"}), two, l425_result("a", "R2")}) ==
+                    "assistant:|tool(b):R1|tool(a):R2");
+    }
+    /* one call: never touched; no calls: nothing to order by */
+    TEST_ASSERT(l425_ordered({l425_assistant({"a"}), l425_result("a", "R1"), l425_result("b", "R2")}) ==
+                "assistant:|tool(a):R1|tool(b):R2");
+    TEST_ASSERT(l425_ordered({u("q"), l425_result("b", "R1"), l425_result("a", "R2")}) ==
+                "user:q|tool(b):R1|tool(a):R2");
+    /* another message between the results: the run that directly follows is one result short */
+    TEST_ASSERT(l425_ordered({l425_assistant({"a", "b"}), l425_result("b", "RB"), u("note"), l425_result("a", "RA")}) ==
+                "assistant:|tool(b):RB|user:note|tool(a):RA");
+    /* two turns, each its own run; and a run follows the assistant message it directly follows, only */
+    TEST_ASSERT(l425_ordered({l425_assistant({"a", "b"}), l425_result("b", "RB"), l425_result("a", "RA"),
+                              l425_assistant({"c", "d"}), l425_result("d", "RD"), l425_result("c", "RC")}) ==
+                "assistant:|tool(a):RA|tool(b):RB|assistant:|tool(c):RC|tool(d):RD");
+    TEST_ASSERT(l425_ordered({l425_assistant({"a", "b"}), l425_assistant({"c", "d"}), l425_result("d", "RD"),
+                              l425_result("c", "RC")}) == "assistant:|assistant:|tool(c):RC|tool(d):RD");
+    TEST_ASSERT(l425_ordered({l425_assistant({"a", "b"}), l425_assistant({"c", "d"}), l425_result("b", "RB"),
+                              l425_result("a", "RA")}) == "assistant:|assistant:|tool(b):RB|tool(a):RA");
+    /* an Anthropic message's parts: the results trade places among themselves, the text keeps its slot, and which
+     * part opens the message stays the slot's fact */
+    TEST_ASSERT(l425_ordered({l425_assistant({"a", "b"}), l425_result("b", "RB"), u("note", true),
+                              l425_result("a", "RA", true)}) == "assistant:|tool(a):RA|user:note+|tool(b):RB+");
+    TEST_ASSERT(l425_ordered({l425_assistant({"a", "b"}), u("pre"), l425_result("b", "RB", true),
+                              l425_result("a", "RA", true), u("post", true)}) ==
+                "assistant:|user:pre|tool(a):RA+|tool(b):RB+|user:post+");
+    /* a second Anthropic message of text ends the run */
+    TEST_ASSERT(l425_ordered({l425_assistant({"a", "b"}), l425_result("b", "RB"), u("note"),
+                              l425_result("a", "RA")}) == "assistant:|tool(b):RB|user:note|tool(a):RA");
+}
+
+/// One assistant turn of read_file calls and the results the client returned for it, in arrival order.
+struct l425_turn {
+    std::vector<const char *> calls;                             ///< the call ids, in call order
+    std::vector<std::pair<const char *, const char *>> results;  ///< (id, text), in arrival order
+    const char *between = NULL;   ///< text after the first result: an Anthropic text block, else a user message
+};
+
+/// A request body for `api`: a user question, then each turn's calls and results; `last_user` adds a user turn.
+static std::string l425_body(api_style api, const std::vector<l425_turn> &turns, const char *last_user = NULL) {
+    std::string b;
+    const auto arg = [](const char *id) { return std::string("{\\\"path\\\":\\\"") + id + ".toml\\\"}"; };
+    if (api == API_RESPONSES) {
+        b = "{\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":"
+            "\"Read the files.\"}]}";
+        for (const l425_turn &t : turns) {
+            for (const char *id : t.calls)
+                b += std::string(",{\"type\":\"function_call\",\"call_id\":\"") + id +
+                     "\",\"name\":\"read_file\",\"arguments\":\"" + arg(id) + "\"}";
+            for (size_t k = 0; k < t.results.size(); k++) {
+                b += std::string(",{\"type\":\"function_call_output\",\"call_id\":\"") + t.results[k].first +
+                     "\",\"output\":\"" + t.results[k].second + "\"}";
+                if (k == 0 && t.between)
+                    b += std::string(",{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\","
+                                     "\"text\":\"") + t.between + "\"}]}";
+            }
+        }
+        if (last_user)
+            b += std::string(",{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"") +
+                 last_user + "\"}]}";
+        return b + "]}";
+    }
+    const bool an = api == API_ANTHROPIC;
+    b = std::string(an ? "{\"max_tokens\":64," : "{") + "\"messages\":[{\"role\":\"user\",\"content\":\"Read the files.\"}";
+    for (const l425_turn &t : turns) {
+        b += an ? ",{\"role\":\"assistant\",\"content\":[" : ",{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[";
+        for (size_t k = 0; k < t.calls.size(); k++) {
+            const char *id = t.calls[k];
+            if (k) b += ",";
+            if (an)
+                b += std::string("{\"type\":\"tool_use\",\"id\":\"") + id + "\",\"name\":\"read_file\",\"input\":{\"path\":\"" +
+                     id + ".toml\"}}";
+            else
+                b += std::string("{\"id\":\"") + id + "\",\"type\":\"function\",\"function\":{\"name\":\"read_file\","
+                     "\"arguments\":\"" + arg(id) + "\"}}";
+        }
+        b += "]}";
+        if (an) b += ",{\"role\":\"user\",\"content\":[";
+        for (size_t k = 0; k < t.results.size(); k++) {
+            if (an) {
+                if (k) b += ",";
+                b += std::string("{\"type\":\"tool_result\",\"tool_use_id\":\"") + t.results[k].first +
+                     "\",\"content\":\"" + t.results[k].second + "\"}";
+                if (k == 0 && t.between) b += std::string(",{\"type\":\"text\",\"text\":\"") + t.between + "\"}";
+            } else {
+                b += std::string(",{\"role\":\"tool\",\"tool_call_id\":\"") + t.results[k].first + "\",\"content\":\"" +
+                     t.results[k].second + "\"}";
+                if (k == 0 && t.between) b += std::string(",{\"role\":\"user\",\"content\":\"") + t.between + "\"}";
+            }
+        }
+        if (an) b += "]}";
+    }
+    if (last_user) b += std::string(",{\"role\":\"user\",\"content\":\"") + last_user + "\"}";
+    return b + "]}";
+}
+
+/// `body` through `api`'s parser and `fmt`'s render (no engine, no server): the prompt, and with `tail` the live
+/// tool-result tail the protocol prepared ("" when none).
+static std::string l425_render(pulsar_chat_format fmt, api_style api, const std::string &body, std::string *tail = NULL) {
+    request r;
+    test_request_init(&r, REQ_CHAT, 64);
+    r.api = api;
+    chat_conversation c;
+    memset(&c, 0, sizeof c);
+    char err[256] = {0};
+    const bool ok = (api == API_RESPONSES   ? parse_chat_conversation_responses(body.c_str(), &c, &r, err, sizeof err)
+                     : api == API_ANTHROPIC ? parse_chat_conversation_anthropic(body.c_str(), &c, &r, err, sizeof err)
+                                            : parse_chat_conversation_openai(body.c_str(), &c, &r, err, sizeof err)) &&
+                    render_chat_conversation(NULL, fmt, NULL, &c, &r, err, sizeof err);
+    if (!ok) fprintf(stderr, "L425 render refused (format %d, api %d): %s\n", (int)fmt, (int)api, err);
+    TEST_ASSERT(ok);
+    const std::string text = ok && r.prompt_text ? r.prompt_text : "";
+    if (tail) {
+        const char *t = api == API_ANTHROPIC ? r.anthropic_live_suffix_text : r.responses_live_suffix_text;
+        *tail = ok && t ? t : "";
+    }
+    chat_conversation_free(&c);
+    if (ok) request_free(&r);
+    return text;
+}
+
+/// Whether every one of `parts` is in `text`, each after the one before.
+static bool l425_in_order(const std::string &text, std::initializer_list<const char *> parts) {
+    size_t at = 0;
+    for (const char *p : parts) {
+        const size_t f = text.find(p, at);
+        if (f == std::string::npos) return false;
+        at = f + strlen(p);
+    }
+    return true;
+}
+
+/* Every protocol's ids reach the rule, on the two families that render results by position: the swapped and the
+ * permuted run render the in-order bytes, an incomplete run renders as it arrived. */
+static void test_l425_every_protocol_renders_call_order(void) {
+    for (pulsar_chat_format fmt : {PULSAR_CHAT_QWEN, PULSAR_CHAT_NEMOTRON_H}) {
+        for (api_style api : {API_OPENAI, API_ANTHROPIC, API_RESPONSES}) {
+            const auto render = [&](const std::vector<l425_turn> &t, const char *last_user = NULL) {
+                return l425_render(fmt, api, l425_body(api, t, last_user));
+            };
+            /* in call order: the template's own bytes, the two results in one user turn */
+            const std::string ab = render({{{"a", "b"}, {{"a", "RES-A"}, {"b", "RES-B"}}}});
+            TEST_ASSERT(ab.find(fmt == PULSAR_CHAT_QWEN
+                                    ? "<|im_start|>user\n<tool_response>\nRES-A\n</tool_response>\n<tool_response>\n"
+                                      "RES-B\n</tool_response><|im_end|>\n"
+                                    : "<|im_start|>user\n<tool_response>\nRES-A\n</tool_response>\n<tool_response>\n"
+                                      "RES-B\n</tool_response>\n<|im_end|>\n") != std::string::npos);
+            /* swapped: the same bytes */
+            TEST_ASSERT(render({{{"a", "b"}, {{"b", "RES-B"}, {"a", "RES-A"}}}}) == ab);
+            /* the ids decide, not the texts: the same arrival with the ids exchanged is the other pairing */
+            TEST_ASSERT(l425_in_order(render({{{"a", "b"}, {{"b", "RES-A"}, {"a", "RES-B"}}}}), {"RES-B", "RES-A"}));
+            /* three calls, every permutation of the results */
+            const std::string abc = render({{{"a", "b", "c"}, {{"a", "RES-A"}, {"b", "RES-B"}, {"c", "RES-C"}}}});
+            TEST_ASSERT(l425_in_order(abc, {"RES-A", "RES-B", "RES-C"}));
+            const std::pair<const char *, const char *> res[3] = {{"a", "RES-A"}, {"b", "RES-B"}, {"c", "RES-C"}};
+            int at[3] = {0, 1, 2}, perms = 0;
+            do {
+                TEST_ASSERT(render({{{"a", "b", "c"}, {res[at[0]], res[at[1]], res[at[2]]}}}) == abc);
+                perms++;
+            } while (std::next_permutation(at, at + 3));
+            TEST_ASSERT(perms == 6);
+            /* not a bijection: as it arrived.  A missing result, an unknown id, a repeated id, a blank id */
+            TEST_ASSERT(l425_in_order(render({{{"a", "b", "c"}, {{"c", "RES-1"}, {"a", "RES-2"}}}}), {"RES-1", "RES-2"}));
+            TEST_ASSERT(l425_in_order(render({{{"a", "b", "c"}, {{"c", "RES-1"}, {"a", "RES-2"}, {"z", "RES-3"}}}}),
+                                      {"RES-1", "RES-2", "RES-3"}));
+            TEST_ASSERT(l425_in_order(render({{{"a", "b", "c"}, {{"c", "RES-1"}, {"a", "RES-2"}, {"c", "RES-3"}}}}),
+                                      {"RES-1", "RES-2", "RES-3"}));
+            TEST_ASSERT(l425_in_order(render({{{"a", "b", "c"}, {{"c", "RES-1"}, {"a", "RES-2"}, {"", "RES-3"}}}}),
+                                      {"RES-1", "RES-2", "RES-3"}));
+            /* one call: nothing to order */
+            TEST_ASSERT(l425_in_order(render({{{"a"}, {{"a", "RES-1"}}}}), {"RES-1"}));
+            /* two turns of parallel calls, each swapped: both in call order, the bytes of the in-order conversation */
+            const std::string two = render({{{"a", "b"}, {{"a", "RES-A"}, {"b", "RES-B"}}},
+                                            {{"c", "d"}, {{"c", "RES-C"}, {"d", "RES-D"}}}}, "Thanks.");
+            TEST_ASSERT(l425_in_order(two, {"RES-A", "RES-B", "RES-C", "RES-D", "Thanks."}));
+            TEST_ASSERT(render({{{"a", "b"}, {{"b", "RES-B"}, {"a", "RES-A"}}},
+                                {{"c", "d"}, {{"d", "RES-D"}, {"c", "RES-C"}}}}, "Thanks.") == two);
+            /* text between the results: an Anthropic message's text block keeps its place and the results trade
+             * theirs around it; on the other protocols it is another message, and the run is left as it arrived */
+            const std::string mid = render({{{"a", "b"}, {{"b", "RES-B"}, {"a", "RES-A"}}, "NOTE"}});
+            if (api == API_ANTHROPIC) {
+                TEST_ASSERT(mid == render({{{"a", "b"}, {{"a", "RES-A"}, {"b", "RES-B"}}, "NOTE"}}));
+                TEST_ASSERT(l425_in_order(mid, {"RES-A", "NOTE", "RES-B"}));
+            } else {
+                TEST_ASSERT(l425_in_order(mid, {"RES-B", "NOTE", "RES-A"}));
+            }
+        }
+    }
+    /* one rule for every family: a template that names its results (Gemma, Inkling) or folds them into the user turn
+     * (DeepSeek) renders the swapped run to the in-order conversation's bytes too */
+    for (pulsar_chat_format fmt : {PULSAR_CHAT_DS4_V4, PULSAR_CHAT_DS4_V41, PULSAR_CHAT_INKLING, PULSAR_CHAT_GEMMA4}) {
+        for (api_style api : {API_OPENAI, API_ANTHROPIC, API_RESPONSES}) {
+            const std::string ab = l425_render(fmt, api, l425_body(api, {{{"a", "b"}, {{"a", "RES-A"}, {"b", "RES-B"}}}}));
+            TEST_ASSERT(l425_in_order(ab, {"RES-A", "RES-B"}));
+            TEST_ASSERT(l425_render(fmt, api, l425_body(api, {{{"a", "b"}, {{"b", "RES-B"}, {"a", "RES-A"}}}})) == ab);
+        }
+    }
+}
+
+/* The replay.  Turn N: the model calls a then b and the client answers b first.  The server renders the results in
+ * call order and that is what the bank prefills -- as the whole prompt, or as the live tool-result tail appended to
+ * the sampled turn (the same messages, so the same bytes: the prompt ends with the tail).  Turn N+1: the client
+ * replays the history, b first again (or a first: a client need not be consistent), and the render must reproduce
+ * turn N's bytes through the end of the results or the bank re-prefills the conversation. */
+static void test_l425_replay_renders_the_prefilled_bytes(void) {
+    for (pulsar_chat_format fmt : {PULSAR_CHAT_QWEN, PULSAR_CHAT_NEMOTRON_H}) {
+        for (api_style api : {API_OPENAI, API_ANTHROPIC, API_RESPONSES}) {
+            const l425_turn arrived = {{"a", "b"}, {{"b", "RES-B"}, {"a", "RES-A"}}};
+            const l425_turn in_order = {{"a", "b"}, {{"a", "RES-A"}, {"b", "RES-B"}}};
+            /* turn N: the request that brings the results, out of order */
+            std::string tail_n, tail_ref;
+            const std::string turn_n = l425_render(fmt, api, l425_body(api, {arrived}), &tail_n);
+            TEST_ASSERT(turn_n == l425_render(fmt, api, l425_body(api, {in_order}), &tail_ref));
+            TEST_ASSERT(l425_in_order(turn_n, {"RES-A", "RES-B"}));
+            if (api != API_OPENAI) {
+                /* the live continuation appends exactly the bytes the full render ends with: call order in both */
+                TEST_ASSERT(!tail_n.empty() && tail_n == tail_ref && l425_in_order(tail_n, {"RES-A", "RES-B"}));
+                TEST_ASSERT(turn_n.size() > tail_n.size() &&
+                            !turn_n.compare(turn_n.size() - tail_n.size(), tail_n.size(), tail_n));
+            }
+            /* what the bank holds for the history: turn N's prompt up to its generation prompt */
+            const size_t history = turn_n.rfind("<|im_end|>\n") + strlen("<|im_end|>\n");
+            TEST_ASSERT(history <= turn_n.size() && turn_n.find("RES-B") < history);
+            /* turn N+1, still in the tool loop: the model called c, the client replays and answers it */
+            const l425_turn next = {{"c"}, {{"c", "RES-C"}}};
+            for (const l425_turn &replayed : {arrived, in_order}) {
+                std::string tail_n1;
+                const std::string loop = l425_render(fmt, api, l425_body(api, {replayed, next}), &tail_n1);
+                TEST_ASSERT(loop.size() > history && !loop.compare(0, history, turn_n, 0, history));
+                if (api != API_OPENAI)
+                    TEST_ASSERT(!tail_n1.empty() && loop.size() > tail_n1.size() &&
+                                !loop.compare(loop.size() - tail_n1.size(), tail_n1.size(), tail_n1));
+                /* turn N+1 after the loop ended: a new user turn */
+                const std::string user = l425_render(fmt, api, l425_body(api, {replayed}, "And the third?"));
+                TEST_ASSERT(user.size() > history && !user.compare(0, history, turn_n, 0, history));
+            }
+        }
+    }
+}
+
+
 /* L351: an agent loop's tool results are rendered as user turns ("<|im_start|>user\n<tool_response>"), and the work
  * box's opencode / Nemotron conversation (2026-11-04) took a fresh bank every user turn: the bank's last-turn anchor
  * was its last TOOL result, inside the turn that the next prompt re-renders (truncate_history_thinking drops the
@@ -18448,6 +18765,9 @@ static void pulsar_server_unit_tests_run(void) {
     test_l275_route_in_place_through_last_turn();
     test_l311_route_header_anchor();
     test_l351_tool_turns();
+    test_l425_order_rule();
+    test_l425_every_protocol_renders_call_order();
+    test_l425_replay_renders_the_prefilled_bytes();
     test_l322_route_side_call();
     test_l325_deferred_tool_in_place();
     test_l326_responses_tool_search_in_place();

@@ -33,6 +33,10 @@ Shapes:
   nemotron-truncate-thinking      opencode on Nemotron: reasoning in history, truncate_history_thinking (L311)
   codex-tool-search               synthetic Responses (Codex): a client tool_search loads a tool through
                                   tool_search_output's `tools`, then it is called (L326)
+  parallel-results-{anthropic,openai,responses}
+                                  two parallel calls answered second-call-first: the results render in call order
+                                  (chat_order_tool_results), so the replay extends the request that brought them
+                                  whichever order it replays them in (L425)
 
 Exit status non-zero on any violation or refusal."""
 import argparse, copy, json, os, subprocess, sys, tempfile
@@ -194,6 +198,75 @@ def shape_codex_tool_search():
     return {"api": "responses", "requests": [{"body": resp(i1)}, {"body": resp(i2)}, {"body": resp(i3)}]}
 
 
+def shape_parallel_results(api):
+    """L425: the model calls a then b; the client returns b's result first.  The request that brings the results
+    (1) is what the bank prefills; the next turn's replay must extend it through the results -- replayed in the
+    same arrival order (2) or in call order (3: a client need not be consistent, and before L425 this one diverged
+    at the first result)."""
+    ids = ["toolu_a", "toolu_b", "toolu_c"]
+    path = {"toolu_a": "defaults.toml", "toolu_b": "production.toml", "toolu_c": "local.toml"}
+    text = {"toolu_a": "port = 8080", "toolu_b": "port = 9137", "toolu_c": "port = 3000"}
+    props = {"path": {"type": "string", "description": "The file."}}
+
+    if api == "anthropic":
+        tools = [tool("read_file", "Read a file.", props)]
+        first = [{"role": "user", "content": "Read both config files."}]
+
+        def calls(cs):
+            return [{"role": "assistant", "content": [{"type": "tool_use", "id": c, "name": "read_file",
+                                                       "input": {"path": path[c]}} for c in cs]}]
+
+        def results(rs):
+            return [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": r, "content": text[r]}
+                                                 for r in rs]}]
+
+        def body(msgs):
+            return anth(with_cc_last(msgs), tools)
+    elif api == "openai":
+        tools = [{"type": "function", "function": {"name": "read_file", "description": "Read a file.",
+                                                   "parameters": {"type": "object", "properties": props,
+                                                                  "required": ["path"]}}}]
+        first = [{"role": "user", "content": "Read both config files."}]
+
+        def calls(cs):
+            return [{"role": "assistant", "content": "",
+                     "tool_calls": [{"id": c, "type": "function",
+                                     "function": {"name": "read_file", "arguments": json.dumps({"path": path[c]})}}
+                                    for c in cs]}]
+
+        def results(rs):
+            return [{"role": "tool", "tool_call_id": r, "content": text[r]} for r in rs]
+
+        def body(msgs):
+            return {"model": "m", "messages": msgs, "tools": tools, "stream": True}
+    else:
+        tools = [{"type": "function", "name": "read_file", "description": "Read a file.",
+                  "parameters": {"type": "object", "properties": props, "required": ["path"]}}]
+        first = [{"type": "message", "role": "user", "content": [{"type": "input_text",
+                                                                  "text": "Read both config files."}]}]
+
+        def calls(cs):
+            return [{"type": "function_call", "call_id": c, "name": "read_file",
+                     "arguments": json.dumps({"path": path[c]})} for c in cs]
+
+        def results(rs):
+            return [{"type": "function_call_output", "call_id": r, "output": text[r]} for r in rs]
+
+        def body(msgs):
+            return {"model": "m", "input": msgs, "tools": tools, "stream": True}
+
+    ab = first + calls(ids[:2])
+    arrived = ab + results([ids[1], ids[0]])
+    more = calls(ids[2:]) + results(ids[2:])
+    # The stable point is the end of the result that RENDERS last, b's.  An Anthropic body's results are one message
+    # (the default: its end); an OpenAI / Responses run is a message a result, and b's arrived first.
+    through = {} if api == "anthropic" else {"stable_through": len(ab)}
+    return {"api": api, "requests": [{"body": body(first)},
+                                     {"body": body(arrived)},
+                                     dict({"body": body(arrived + more), "parent": 1}, **through),
+                                     dict({"body": body(ab + results(ids[:2]) + more), "parent": 1}, **through)]}
+
+
 def shape_captures(name):
     d = os.path.join(FIXTURES, name)
     files = sorted(f for f in os.listdir(d) if f.endswith(".json"))
@@ -208,6 +281,9 @@ SHAPES = {
     "suggestion-side-call": shape_suggestion_side_call,
     "nemotron-truncate-thinking": shape_nemotron_truncate_thinking,
     "codex-tool-search": shape_codex_tool_search,
+    "parallel-results-anthropic": lambda: shape_parallel_results("anthropic"),
+    "parallel-results-openai": lambda: shape_parallel_results("openai"),
+    "parallel-results-responses": lambda: shape_parallel_results("responses"),
 }
 
 
