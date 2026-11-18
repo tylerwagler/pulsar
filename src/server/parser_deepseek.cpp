@@ -90,10 +90,14 @@ static void ds_parser_probe_feed(void *probe, const gen_state *g, const char *te
 /// @param probe  the probe
 static void ds_parser_probe_free(void *probe) { free(probe); }
 
-/* A closed DSML block ends the turn (finish "tool_calls"). */
+/* A closed DSML block ends the turn (finish "tool_calls"): the text is kept whole (`end` untouched).  L428: the
+ * block holds every call of the turn, so a turn that may make one call (request::single_tool_call) cannot be ended
+ * at its first invoke's close -- the block would be left open, and the bank a history no render spells.  That turn
+ * is constrained instead: its call grammar admits one invoke and the block's close (constrain_plan_build, a shape
+ * with `repeat`), and the turn ends here as every DeepSeek turn does. */
 /// @param st  the parser state (a deepseek_parser, from ds_parser_create)
 /// @return true once a DSML block has closed
-static bool ds_parser_turn_complete(const void *st, const gen_state *) {
+static bool ds_parser_turn_complete(const void *st, const gen_state *, size_t *) {
     return ((const deepseek_parser *)st)->saw_tool_end;
 }
 

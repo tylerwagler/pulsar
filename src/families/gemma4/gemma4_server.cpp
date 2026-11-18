@@ -272,5 +272,6 @@ const server_family_ops k_family_gemma4 = {
     /* .find_call_block       = */ NULL,
     /* .tool_defs_text        = */ NULL,
     /* .reasoning             = */ &k_reasoning_gemma4,
+    /* .call_tail             = */ "",   /* <tool_call|> ends a call */
 };
 SERVER_FAMILY(k_family_gemma4)

@@ -365,5 +365,6 @@ const server_family_ops k_family_inkling = {
     /* .find_call_block       = */ inkling_find_call_block,
     /* .tool_defs_text        = */ inkling_tool_defs_text,
     /* .reasoning             = */ NULL,   /* <think> / </think> */
+    /* .call_tail             = */ "",   /* <|end_message|> ends a call's message */
 };
 SERVER_FAMILY(k_family_inkling)

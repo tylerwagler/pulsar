@@ -688,6 +688,14 @@ typedef struct server_family_ops {
      *  tracker (thinking_state: the stop scan, the grammar gate's start, the L344 budget).  NULL = "<think>" /
      *  "</think>" (DeepSeek, Qwen, Nemotron-H). */
     const struct server_reasoning_markers *reasoning;
+    /** L428: the bytes the family's template writes after a call's closing marker, each call of a turn, before the
+     *  next call or the turn's close: "\n" for Nemotron-H (its render: every `</tool_call>` and a newline, then
+     *  `<|im_end|>`), "" where the closing marker ends the call.  A turn the server ends at its first call
+     *  (request::single_tool_call) ends past these bytes -- the turn as the template renders one call, so the
+     *  family's tail (tool_result_tail) joins the bank as it joins a turn the model ended -- and a call grammar that
+     *  admits one call admits them after it.  Never NULL.  The unit tests hold it to the family's own render
+     *  (test_l428_next_prompt_extends_the_cut_turn). */
+    const char *call_tail;
 } server_family_ops;
 
 /** L398: a family's reasoning block as text: the marker that opens it and every marker that ends it.  close[0] is
@@ -751,8 +759,12 @@ typedef struct server_output_parser_ops {
     /** The decode sits on a tool call's STRUCTURE: greedy.  A call's payload -- a string-typed value, or a
      *  JSON string inside any other value -- is sampled (L284 P6: one rule, every family). */
     bool (*in_tool_call)(const void *st, const struct gen_state *g);
-    /** The turn is complete before the stop token (DeepSeek: a closed DSML block). */
-    bool (*turn_complete)(const void *st, const struct gen_state *g);
+    /** The turn is complete before the stop token (DeepSeek: a closed DSML block; L428, a kit family: the first
+     *  call of a turn that may make one, request::single_tool_call, and what the family's template writes after
+     *  a call).  `*end` then receives the bytes of g->text the turn keeps (gen_turn_complete cuts the text there);
+     *  a parser whose turn is its whole text leaves it as passed.  Reads a probe too (probe_new / probe_feed),
+     *  where `*end` is an offset in the text the probe was fed. */
+    bool (*turn_complete)(const void *st, const struct gen_state *g, size_t *end);
     /** Optional, diagnostics: a call has opened / closed in this attempt. */
     void (*tool_progress)(const void *st, bool *opened, bool *closed);
     /** The turn's final reading (repair, parse, ids, the family's own retry and memory).  false = a
@@ -1284,6 +1296,15 @@ typedef struct request {
     /** L420: the request asked for a response format (structured output), whether or not this server compiled a
      *  grammar for it: prose cannot answer it.  Set by constrain_plan_build. */
     bool response_format_set;
+    /** L428: the turn may make at most ONE tool call (OpenAI chat / Responses `parallel_tool_calls: false`, Anthropic
+     *  `tool_choice.disable_parallel_tool_use: true`).  The server ends the turn where its first call closes
+     *  (gen_turn_complete, every decode lane), a call grammar admits one call and then only the end of the turn
+     *  (constrain.cpp), and a speculative round's chain ends at the token that closes the call
+     *  (gen_turn_draft_prefix).  A turn that makes no call is untouched; false = any number of calls. */
+    bool single_tool_call;
+    /** L428: the request carried `parallel_tool_calls` (a boolean, not null): the Responses object echoes the value
+     *  applied (`!single_tool_call`); a request without the key gets the object it always got. */
+    bool parallel_tool_calls_sent;
     char *forced_tool_name;    ///< force this specific tool; NULL = any, owned
     /** The replayed prompt still contains the model's prior reasoning. When
      * false the reasoning was stripped by the client, and the server must not
@@ -2888,6 +2909,8 @@ struct server {
     uint64_t w_spec_grammar_cut_rows;
     /// published copy of w_spec_grammar_cut_rows (under mu)
     uint64_t m_spec_grammar_cut_rows;
+    /** L428: rule 5 -- the first pending chain a single-call turn cut (gen_turn_draft_prefix) was said in the log. */
+    bool w_spec_turn_cut_said;
     /** L312: the fused lane's round selection -- rule 5's announcements (priced / unpriced, once each), the
      *  unpriced rule's probe alternation, and the round counter riders are ordered by.  Worker-owned. */
     bool w_sched_announced[2];
@@ -3567,6 +3590,16 @@ struct server {
     /// @param token  the decoded token id
     /// @return true when the decode loop must stop after this token (g->finish set)
     bool gen_emit_token(session_slot *sl, int token);
+    /** L428: gen_emit_token past its engine reads (the stop set, the gate's accept, the token's text): `piece` joins
+     *  the generated text and goes through the release, the stream, the family's parser, the stop strings and the
+     *  turn's own end (gen_turn_complete).  No engine call unless the request asked for logprobs, so the unit tests
+     *  drive a turn through it a token at a time. */
+    /// @param g          the job's generation state
+    /// @param token      the decoded token id (the logprobs ledger's)
+    /// @param piece      the token's text
+    /// @param piece_len  its length, bytes
+    /// @return true when the decode loop must stop after this token (g->finish set)
+    bool gen_emit_piece(gen_state *g, int token, const char *piece, size_t piece_len);
     /** Post-decode epilogue: tool repair/recovery, final parse, protocol live
      * state, checkpoints, the final response, and logging. Recovery paths loop
      * back to GEN_DECODE_INIT (the old goto decode_again).  The turn is read through the decode attempt's parser
@@ -4503,7 +4536,21 @@ struct kit_gen {
     bool open_args = false;          ///< its argument object's "{" went out
     int wire_open = -1;              ///< its index on the stream
     int wire_n = 0;                  ///< calls announced on the stream (a broken one keeps its index)
-    ~kit_gen();                      ///< frees `calls` and the parser (parser_kit.cpp)
+    /** L428: a turn that may make one call (request::single_tool_call) reads AHEAD of the stop-string scan's release:
+     *  a copy of `parser` fed every byte of g->text as it is generated, so the turn's end is known at the token that
+     *  closes its first call and not `stops.max_len - 1` bytes later.  NULL until that turn's first feed. */
+    out_parser *ahead = nullptr;
+    size_t ahead_fed = 0;            ///< bytes of g->text `ahead` has read
+    /** L428: the turn's first call closed -- well formed, naming a declared tool -- at `call_end`; the family's
+     *  call_tail is read from there. */
+    bool call_closed = false;
+    size_t call_end = 0;             ///< one past that call's closing marker in g->text
+    size_t tail_at = 0;              ///< bytes of the family's call_tail read after it
+    /** L428: the turn ends at `cut_at`: past the call and the family's call_tail, or at the call's close when the
+     *  model wrote something else there. */
+    bool cut = false;
+    size_t cut_at = 0;               ///< where the turn's text ends in g->text; `parser` reads no further
+    ~kit_gen();                      ///< frees `calls` and the parsers (parser_kit.cpp)
 };
 /** The kit's server_output_parser_ops hooks (parser_kit.cpp): a family whose parser is a kit configuration
  *  fills its table with these and its own `create`, which builds the configured parser (per request: its
@@ -4519,19 +4566,22 @@ bool parser_kit_feed(void *st, server *s, struct gen_state *g, size_t upto, bool
 /// @param g   unused
 /// @return true when the next draw is greedy
 bool parser_kit_in_tool_call(const void *st, const struct gen_state *g);
-/// server_output_parser_ops::turn_complete: a kit turn ends only at the stop token.
-/// @param st  unused
-/// @param g   unused
-/// @return false, always
-bool parser_kit_turn_complete(const void *st, const struct gen_state *g);
+/// server_output_parser_ops::turn_complete: a kit turn ends at the stop token, or (L428) past the first call of a
+/// turn that may make one.
+/// @param st   the kit state, or a probe (parser_kit_probe_new)
+/// @param g    unused
+/// @param end  receives the offset where that turn ends: past the call and the family's call_tail
+/// @return true once that turn has ended
+bool parser_kit_turn_complete(const void *st, const struct gen_state *g, size_t *end);
 void parser_kit_tool_progress(const void *st, bool *opened, bool *closed);
 bool parser_kit_finish(void *st, server *s, struct session_slot *sl, struct gen_state *g, server_turn *out);
 void *parser_kit_probe_new(const void *st);
-/// server_output_parser_ops::probe_feed: feed the probe the text it has not read, up to `upto`.
+/// server_output_parser_ops::probe_feed: feed the probe the text it has not read, up to `upto` (L428: and its
+/// read-ahead copy, in a turn that may make one call, up to `len`).
 /// @param probe  the probe (parser_kit_probe_new)
-/// @param g      unused
+/// @param g      the attempt (its request: single_tool_call, the declared tools)
 /// @param text   the generated text with the round's tokens so far
-/// @param len    its length (unused)
+/// @param len    its length
 /// @param upto   bytes the stop-string scan released
 void parser_kit_probe_feed(void *probe, const struct gen_state *g, const char *text, size_t len, size_t upto);
 void parser_kit_probe_free(void *probe);
@@ -4633,6 +4683,11 @@ struct gen_state {
      *  and the turn is neither observed in the request histograms nor given a terminal checkpoint. */
     bool abandoned;
     char *stop_sequence;      ///< the client stop sequence that ended generation, when one did; owned
+    /** L428: the family's parser ended the turn (gen_turn_complete) before the last emitted token's last byte -- a
+     *  token ran past the call's close, or the model left its template after it -- so the bank holds bytes the turn
+     *  does not.  The protocols' live continuations (a tail appended to the bank's history) are not remembered for
+     *  such a turn: the next request renders in full and its sync resumes where the two part. */
+    bool turn_cut_short;
     int completion;           ///< tokens generated this attempt
     int max_tokens;           ///< cap for this attempt
     int next_decode_log;      ///< token count at which to write the next decode log line
@@ -5478,6 +5533,11 @@ bool request_apply_forced_tool_prefill(request *r, char *err, size_t errlen);
 /// @return false when refused
 bool constrain_plan_build(pulsar_engine *e, struct server *s, const chat_conversation *c, request *r, char *err,
                           size_t errlen);
+/** L428: some entry of a tools array spells `defer_loading`, beside its definition or inside its "function" object,
+ *  whatever the value (request.cpp). */
+/// @param tools_json  the tools array's JSON as sent (NULL or not an array: false)
+/// @return true when an entry carries the key
+bool tools_array_says_defer_loading(const char *tools_json);
 /** The gate for one decode attempt (gen_decode_init), after the parser's seed: the seed's bytes go through it as
  *  if sampled.  false = g->err says why (the request fails). */
 /// @param s  the server
@@ -5489,6 +5549,13 @@ void gen_constrain_end(struct gen_state *g);
 /// @param g  the request's generation state
 /// @return true when the next draw is masked
 bool gen_constrain_live(const struct gen_state *g);
+/** L428: the gate of a turn that may make one call (request::single_tool_call) saw that call's region complete: what
+ *  may follow is the end of the turn alone -- every draw is masked to the stop tokens (gen_constrain_live stays
+ *  true) and any other token is refused.  Where the output parser says the turn's first call closed
+ *  (server_output_parser_ops::turn_complete), which is where the server ends the turn. */
+/// @param g  the request's generation state
+/// @return true once the turn's one call region has completed
+bool gen_constrain_turn_over(const struct gen_state *g);
 /** Mask words per row (the device sampler's mask layout over the logits width, pulsar_row_draw.mask). */
 /// @param s  the server
 /// @return 32-bit words per mask row
@@ -6104,6 +6171,32 @@ uint32_t gen_spec_greedy_rows(server *s, const gen_state *g, const TokId *toks, 
 /// @return the greedy-row bit set
 uint32_t gen_spec_greedy_rows_text(const gen_state *g, const char *const *pieces, const size_t *piece_lens, int n,
                                    bool base_emitted);
+/** L428: the family's turn ended before its stop token (server_output_parser_ops::turn_complete -- DeepSeek's closed
+ *  DSML block; the first call of a turn that may make one, request::single_tool_call): g->text is cut where the
+ *  turn ends and g->finish is "tool_calls".  The emit path's last check (gen_emit_piece), host-only. */
+/// @param g  the request's generation state, the token just emitted already read by its parser
+/// @return true when the decode stops here
+bool gen_turn_complete(struct gen_state *g);
+/** L428: how many of a pending chain's `n` drafts (after the not yet emitted `base`) a turn that may make one call
+ *  (request::single_tool_call) can use: the chain ends with the token that closes the turn's first call -- the emit
+ *  path stops there (gen_turn_complete), so a draft past it would be verified, committed to the bank and then have
+ *  to be rewound, or on a family whose state cannot rewind cost the bank its view.  Read off a scratch copy of the
+ *  decode-time state, as gen_spec_greedy_rows reads its rows.  `n` for any other request, and for a chain that
+ *  closes no call. */
+/// @param s  the server
+/// @param g  the request's generation state
+/// @param base_id  the round's base token (not yet emitted)
+/// @param drafts  the pending drafts
+/// @param n  how many
+/// @return the usable prefix length, 0..n
+int gen_turn_draft_prefix(server *s, const gen_state *g, TokId base_id, const TokId *drafts, int n);
+/** The same over the tokens' texts (NULL = a stop token), pieces[0] the base: the probe itself, engine-free. */
+/// @param g  the request's generation state
+/// @param pieces  the base's text, then each draft's (NULL = a stop token)
+/// @param piece_lens  their lengths, bytes
+/// @param n  the drafts (pieces holds n + 1)
+/// @return the usable prefix length, 0..n
+int gen_turn_draft_prefix_text(const gen_state *g, const char *const *pieces, const size_t *piece_lens, int n);
 /** The emit path's byte release (gen_emit_token's; the probe's on copies): returns the bytes of `text` the
  *  stop-string scan releases after `text` grew by `piece`. */
 /// @param stops  the request's stop strings

@@ -80,6 +80,16 @@ static bool responses_sse_emit_event(int fd, responses_stream *st, const char *b
 
 
 
+/* L428: the Response object echoes `parallel_tool_calls` as applied -- false when the turn was allowed one tool call
+ * (request::single_tool_call), true when the request said so -- on a request that sent the key; one that did not
+ * gets the object it always got. */
+/// Append the Response object's "parallel_tool_calls" member, when the request sent the key.
+/// @param b  the Response object being built, past its "model" member
+/// @param r  the request
+static void append_responses_parallel_tool_calls(buf *b, const request *r) {
+    if (r->parallel_tool_calls_sent) buf_printf(b, ",\"parallel_tool_calls\":%s", r->single_tool_call ? "false" : "true");
+}
+
 /// Send response.created (status in_progress, empty output).
 /// @param fd          the client socket
 /// @param r           the request (its model)
@@ -94,6 +104,7 @@ bool responses_sse_created(int fd, const request *r, responses_stream *st,
         "\"object\":\"response\",\"created_at\":%ld,\"status\":\"in_progress\","
         "\"model\":", st->response_id, created_at);
     json_escape(&b, r->model);
+    append_responses_parallel_tool_calls(&b, r);
     buf_puts(&b, ",\"output\":[]}}");
     bool ok = responses_sse_emit_event(fd, st, b.ptr);
     buf_free(&b);
@@ -599,6 +610,7 @@ bool responses_sse_completed(int fd, const request *r,
         "\"object\":\"response\",\"created_at\":%ld,\"status\":\"%s\",\"model\":",
         event_type, st->response_id, created_at, status);
     json_escape(&b, r->model);
+    append_responses_parallel_tool_calls(&b, r);
     if (!strcmp(event_type, "response.failed")) {
         buf_puts(&b, ",\"error\":{\"code\":\"server_error\","
                      "\"message\":\"generation failed\"}");
@@ -829,6 +841,7 @@ bool responses_final_response(int fd,
         "\"model\":",
         response_id, now, status);
     json_escape(&b, r->model);
+    append_responses_parallel_tool_calls(&b, r);
     if (finish && !strcmp(finish, "error")) {
         buf_puts(&b, ",\"error\":{\"code\":\"server_error\","
                      "\"message\":\"generation failed\"}");

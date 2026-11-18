@@ -230,5 +230,49 @@ for fam in ("deepseek", "qwen", "inkling"):
                                      PAR_AN_RESULTS[1]]}]}, fam)
     add("rs/parallel-results-swapped", "responses", {"input": PAR_RS, "tools": RS_TOOLS}, fam)
 
+# ---- L428: at most one tool call a turn, and a nested defer_loading (appended: the lines above are unchanged) -----
+# OpenAI chat / Responses `parallel_tool_calls`, Anthropic tool_choice.disable_parallel_tool_use: the request's
+# single_tool_call (api_golden prints its line only for a request that says something about parallel calls).
+DEFER_NESTED = [{"type": "function", "function": WEATHER},
+                {"type": "function", "function": dict(SEARCH, defer_loading=True)}]
+DEFER_TOP = [{"type": "function", "function": WEATHER},
+             {"type": "function", "function": SEARCH, "defer_loading": True}]
+for fam in ("deepseek", "qwen", "inkling"):
+    for v in (False, True, None, "no", 0):
+        add(f"chat/parallel-{json.dumps(v)}", "chat", {"messages": USER, "tools": OA_TOOLS, "parallel_tool_calls": v}, fam)
+    add("chat/parallel-false-no-tools", "chat", {"messages": USER, "parallel_tool_calls": False}, fam)
+    add("chat/parallel-false-none", "chat", {"messages": USER, "tools": OA_TOOLS, "tool_choice": "none",
+                                             "parallel_tool_calls": False}, fam)
+    add("chat/parallel-false-required", "chat", {"messages": USER, "tools": OA_TOOLS, "tool_choice": "required",
+                                                 "parallel_tool_calls": False}, fam)
+    add("chat/parallel-false-named", "chat", {"messages": USER, "tools": OA_TOOLS, "parallel_tool_calls": False,
+                                              "tool_choice": {"type": "function", "function": {"name": "search"}}}, fam)
+    add("chat/parallel-false-tool-turns", "chat", {"messages": OA_TOOL_TURNS, "tools": OA_TOOLS,
+                                                   "parallel_tool_calls": False}, fam)
+    for choice in ({"type": "auto", "disable_parallel_tool_use": True},
+                   {"type": "any", "disable_parallel_tool_use": True},
+                   {"type": "tool", "name": "search", "disable_parallel_tool_use": True},
+                   {"type": "none", "disable_parallel_tool_use": True},
+                   {"type": "auto", "disable_parallel_tool_use": False},
+                   {"type": "auto", "disable_parallel_tool_use": None},
+                   {"type": "auto", "disable_parallel_tool_use": "yes"}):
+        add(f"an/disable-parallel-{choice['type']}-{json.dumps(choice['disable_parallel_tool_use'])}", "anthropic",
+            {"max_tokens": 50, "messages": USER, "tools": AN_TOOLS, "tool_choice": choice}, fam)
+    add("an/disable-parallel-turns", "anthropic", {"max_tokens": 50, "messages": AN_MSGS, "tools": AN_TOOLS,
+                                                   "tool_choice": {"type": "auto", "disable_parallel_tool_use": True}}, fam)
+    for v in (False, True, None, []):
+        add(f"rs/parallel-{json.dumps(v)}", "responses", {"input": "x", "tools": RS_TOOLS, "parallel_tool_calls": v}, fam)
+    add("rs/parallel-false-required", "responses", {"input": "x", "tools": RS_TOOLS, "tool_choice": "required",
+                                                    "parallel_tool_calls": False}, fam)
+    add("rs/parallel-false-turns", "responses", {"input": RS_INPUT, "tools": RS_TOOLS, "parallel_tool_calls": False}, fam)
+    # defer_loading inside OpenAI's "function" object and beside it: the tool is declared, not in the tools block,
+    # and the key is not in any schema
+    add("chat/tools-defer-nested", "chat", {"messages": USER, "tools": DEFER_NESTED}, fam)
+    add("chat/tools-defer-top", "chat", {"messages": USER, "tools": DEFER_TOP}, fam)
+    add("rs/tools-defer-nested", "responses", {"input": "x", "tools": DEFER_NESTED}, fam)
+    add("rs/tools-defer-flat", "responses", {"input": "x", "tools": [RS_TOOLS[0], dict(RS_TOOLS[1], defer_loading=True)]}, fam)
+    add("an/tools-defer", "anthropic", {"max_tokens": 50, "messages": USER,
+                                        "tools": [AN_TOOLS[0], dict(AN_TOOLS[1], defer_loading=True)]}, fam)
+
 for c in cases:
     print(json.dumps(c, ensure_ascii=False))

@@ -7,8 +7,10 @@
  * events become the response: reasoning and content deltas into the protocol sink, and each call as it is
  * read (L284 P5) through the generic tool events -- announced when its name is complete and declared, its
  * argument fragments as the parser releases them, the object's close at the call's close (a protocol
- * without live events sends the calls with the finish).  A kit turn ends at the family's stop token, so it
- * never ends at a closed call.  A broken call (malformed, cut by the cap, or naming an undeclared tool)
+ * without live events sends the calls with the finish).  A kit turn ends at the family's stop token -- or, when
+ * the request allows the turn one call (L428, request::single_tool_call), where its first call closes: a copy of
+ * the parser reads ahead of the stop-string scan (kit_read_ahead), the hook turn_complete reports the close and
+ * its offset, and the parser itself is fed no byte past it.  A broken call (malformed, cut by the cap, or naming an undeclared tool)
  * takes the rule every family shares (L284 P4, turn_tool_retry_allowed): an announced one is closed on the
  * stream as sent, the finish drops it, and a turn left with no valid call retries through the
  * model-visible tool error when allowed, else it is text.  The turn's calls as sampled (the parser's raw
@@ -22,6 +24,72 @@
 kit_gen::~kit_gen() {
     tool_calls_free(&calls);
     delete parser;
+    delete ahead;
+}
+
+/* L428: a turn that may make one call ends where its first call closes -- a well-formed call naming a declared
+ * tool, the call the finish keeps (a malformed or undeclared one is dropped, and the turn goes on to its next) --
+ * and the family's template has written what it writes after a call (server_family_ops::call_tail: Nemotron-H's
+ * newline).  The kept text is then the turn as the template renders it with that one call, short of the turn's
+ * close: what the bank holds after a turn the model ended itself, so the family's tail joins it the same way.
+ * Where the model writes something else after the close (its stop token aside: that ends the turn as always), the
+ * turn ends at the close, and gen_turn_complete says the bank holds more than the turn.
+ *
+ * The stop-string scan holds the last `stops.max_len - 1` bytes back from the parser, so a second reader -- a copy
+ * of the parser taken at the turn's first feed, before the two can differ -- is fed every byte as it is generated, a
+ * byte at a time, up to that close.  Bytes it reads that a stop string later takes back were never past a call's
+ * close (a match is found the moment its last byte arrives, and the text is cut then), so the two readers agree on
+ * every byte both read. */
+/// @param q     the kit state (the attempt's, or a probe's)
+/// @param g     the attempt (its request: single_tool_call, the declared tools, the family's call_tail)
+/// @param text  the generated text
+/// @param len   its length
+static void kit_read_ahead(kit_gen *q, const gen_state *g, const char *text, size_t len) {
+    const request *r = &g->j->req;
+    if (!r->single_tool_call || r->kind != REQ_CHAT || !r->has_tools || q->cut) return;
+    if (!q->ahead) {
+        q->ahead = q->parser->clone();
+        q->ahead_fed = q->fed;
+    }
+    const char *tail = r->family->call_tail;
+    std::vector<out_event> ev;
+    while (!q->cut && (q->ahead_fed < len || (q->call_closed && !tail[q->tail_at]))) {
+        if (q->call_closed) {
+            if (!tail[q->tail_at]) {   /* the call and the template's bytes after it: the turn */
+                q->cut = true;
+                q->cut_at = q->ahead_fed;
+            } else if (text[q->ahead_fed] == tail[q->tail_at]) {
+                q->ahead_fed++;
+                q->tail_at++;
+            } else {                   /* not the template's bytes: the turn is the call */
+                q->cut = true;
+                q->cut_at = q->call_end;
+            }
+            continue;
+        }
+        ev.clear();
+        q->ahead->feed(text + q->ahead_fed, 1, &ev);
+        q->ahead_fed++;
+        for (const out_event &e : ev) {
+            char undeclared[512];
+            if (e.kind != out_event::TOOL_END ||
+                !tool_call_declared(r, e.name.c_str(), undeclared, sizeof(undeclared)))
+                continue;
+            q->call_closed = true;
+            q->call_end = q->ahead_fed;
+        }
+    }
+}
+
+/// @param q      the kit state (the attempt's, or a probe's), kit_read_ahead run
+/// @param upto   bytes of the text the stop-string scan released
+/// @param final  the turn's end is being fed
+/// @return how many of them the parser reads: none past the turn's end (L428), nor -- while the turn goes on -- past
+///         its first call's close until the bytes after it say where the turn ends
+static size_t kit_read_limit(const kit_gen *q, size_t upto, bool final) {
+    if (q->cut) return upto < q->cut_at ? upto : q->cut_at;
+    if (q->call_closed && !final && upto > q->call_end) return q->call_end;
+    return upto;
 }
 
 void *parser_kit_start(out_parser *p) {
@@ -68,15 +136,27 @@ void *parser_kit_probe_new(const void *st) {
     kit_gen *p = new kit_gen();
     p->parser = q->parser->clone();
     p->fed = q->fed;
+    /* L428: the read-ahead with it, so the probe says where the turn ends as the state will (turn_complete) */
+    if (q->ahead) p->ahead = q->ahead->clone();
+    p->ahead_fed = q->ahead_fed;
+    p->call_closed = q->call_closed;
+    p->call_end = q->call_end;
+    p->tail_at = q->tail_at;
+    p->cut = q->cut;
+    p->cut_at = q->cut_at;
     return p;
 }
 
 /// server_output_parser_ops::probe_feed: feed the probe text[fed, upto).
 /// @param probe  the probe
+/// @param g      the attempt (L428: its request says whether the turn may make one call)
 /// @param text   the generated text with the round's tokens so far
+/// @param len    its length (L428: the read-ahead's bytes)
 /// @param upto   bytes the stop-string scan released (nothing is fed at or below what the probe already read)
-void parser_kit_probe_feed(void *probe, const gen_state *, const char *text, size_t, size_t upto) {
+void parser_kit_probe_feed(void *probe, const gen_state *g, const char *text, size_t len, size_t upto) {
     kit_gen *p = (kit_gen *)probe;
+    kit_read_ahead(p, g, text, len);
+    upto = kit_read_limit(p, upto, false);
     if (upto <= p->fed) return;
     p->ev.clear();
     p->parser->feed(text + p->fed, upto - p->fed, &p->ev);
@@ -87,9 +167,16 @@ void parser_kit_probe_feed(void *probe, const gen_state *, const char *text, siz
 /// @param probe  the probe (parser_kit_probe_new)
 void parser_kit_probe_free(void *probe) { delete (kit_gen *)probe; }
 
-/// server_output_parser_ops::turn_complete: a kit turn ends only at the stop token.
-/// @return false, always
-bool parser_kit_turn_complete(const void *, const gen_state *) { return false; }
+/// server_output_parser_ops::turn_complete: a kit turn ends at the stop token, or (L428) past the first call of a
+/// turn that may make one (kit_read_ahead).
+/// @param st   the kit state, or a probe
+/// @param end  receives the offset where that turn ends: past the call and the family's call_tail
+/// @return true once that turn has ended
+bool parser_kit_turn_complete(const void *st, const gen_state *, size_t *end) {
+    const kit_gen *q = (const kit_gen *)st;
+    if (q->cut) *end = q->cut_at;
+    return q->cut;
+}
 
 /// server_output_parser_ops::tool_progress (diagnostics).
 /// @param st  the kit state (a kit_gen, from parser_kit_start)
@@ -128,6 +215,9 @@ bool parser_kit_feed(void *st, server *s, gen_state *g, size_t upto, bool final)
     if (q->finished) return q->stream_ok;   /* the finish fed the end of the turn already */
     q->ev.swap(q->pending);                 /* a seed's announcement goes out with the first feed */
     q->pending.clear();
+    /* L428: a turn that may make one call ends at its first call; the parser reads nothing past the turn's end */
+    kit_read_ahead(q, g, g->text.ptr, g->text.len);
+    upto = kit_read_limit(q, upto, final);
     if (upto > q->fed) {
         q->parser->feed(g->text.ptr + q->fed, upto - q->fed, &q->ev);
         q->fed = upto;

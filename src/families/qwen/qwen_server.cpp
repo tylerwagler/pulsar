@@ -370,5 +370,6 @@ static const server_family_ops k_family_qwen = {
     /* .find_call_block       = */ qwen_find_call_block,
     /* .tool_defs_text        = */ qwen_tool_defs_text,
     /* .reasoning             = */ NULL,   /* <think> / </think> */
+    /* .call_tail             = */ "",   /* </tool_call> ends a call (the "\n" between two opens the next) */
 };
 SERVER_FAMILY(k_family_qwen)
