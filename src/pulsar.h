@@ -1297,6 +1297,76 @@ void pulsar_tokens_prefix_match_with(pulsar_token_text_fn text, void *ud,
 /** @return the prompt tokens held */
 PromptToks pulsar_tokens_prompt_held_with(pulsar_token_text_fn text, void *ud, const TokId *live, TokPos at,
                                           const TokId *prompt, int prompt_len);
+/** L434: one rendering unit of a token sequence for the text walks -- what pulsar_history_text appends for the token
+ *  at `i`: its text, or for an image block its placeholder's text once, the block's tokens spanned.
+ *  @param ud the vocabulary's context
+ *  @param tokens the sequence
+ *  @param len its length
+ *  @param i the unit's first token (< len)
+ *  @param n receives the piece's bytes
+ *  @param span receives the tokens the piece stands for (1; an image block's extent; 0 for a malformed block)
+ *  @return the malloc'd piece (the caller frees), NULL for a malformed block or no vocabulary */
+typedef char *(*pulsar_token_piece_fn)(void *ud, const TokId *tokens, int len, int i, size_t *n, int *span);
+/** L434: how many leading tokens of `tokens` the text below byte `end` holds -- the conversion from a TEXT position
+ *  to a position on one tokenisation of that text.  A stored chain is found by its text (pulsar_segstore.h) and ends
+ *  at a byte of the request's rendered prompt; its own depth counts the tokens its WRITER spent on those bytes, which
+ *  is no count of the request's (L115: sampled turns come back re-spelled).  This walk counts on the sequence asked:
+ *  the tokens whose pieces, laid end to end from byte 0, equal `text` there and END at or before `end`.  A token that
+ *  straddles `end` is not held, a piece that differs from the text stops the count, and a piece with no bytes (a
+ *  control token) counts only strictly inside (at `end` nothing says which side it is on).  The unit of the answer is
+ *  the sequence's: the typed entries below name it.
+ *  @param piece the sequence's rendering (pulsar_history_text's, for an engine)
+ *  @param ud its context
+ *  @param tokens the sequence
+ *  @param len its length
+ *  @param text the rendered text the position is on (at least `end` bytes)
+ *  @param end the text position
+ *  @return the tokens held, 0..len */
+int pulsar_tokens_in_text_with(pulsar_token_piece_fn piece, void *ud, const TokId *tokens, int len, const char *text,
+                               TextBytes end);
+/** L434: the REQUEST's tokens a state covering text[0, end) serves (pulsar_tokens_in_text_with over the prompt): the
+ *  prompt-side depth of a stored chain that ends at byte `end` of the prompt's text -- what ranks it against the
+ *  memory tiers and what a cache read of it counts.
+ *  @param piece the vocabulary's rendering
+ *  @param ud its context
+ *  @param prompt the request's tokens
+ *  @param prompt_len their count
+ *  @param text the request's rendered text
+ *  @param end the text position
+ *  @return the prompt tokens held */
+static inline PromptToks pulsar_prompt_held_by_text_with(pulsar_token_piece_fn piece, void *ud, const TokId *prompt,
+                                                         int prompt_len, const char *text, TextBytes end) {
+    return PromptToks{pulsar_tokens_in_text_with(piece, ud, prompt, prompt_len, text, end)};
+}
+/** L434: the position on a LIVE history that byte `end` of its rendered text is (pulsar_tokens_in_text_with over the
+ *  history; the deepest token boundary at or below `end`): where a chain found by this history's text, but written
+ *  from another spelling of it, ends on THIS history's tokens.
+ *  @param piece the vocabulary's rendering
+ *  @param ud its context
+ *  @param history the live tokens
+ *  @param len their count
+ *  @param text the history's rendered text
+ *  @param end the text position
+ *  @return the live position */
+static inline TokPos pulsar_history_pos_at_text_with(pulsar_token_piece_fn piece, void *ud, const TokId *history,
+                                                     int len, const char *text, TextBytes end) {
+    return TokPos{pulsar_tokens_in_text_with(piece, ud, history, len, text, end)};
+}
+/** L434: pulsar_prompt_held_by_text_with with the engine's rendering (an image block as its placeholder, as
+ *  pulsar_history_text renders it).
+ *  @param e the engine; NULL holds nothing
+ *  @param prompt the request's tokens
+ *  @param text the request's rendered text
+ *  @param end the text position
+ *  @return the prompt tokens held */
+PromptToks pulsar_prompt_held_by_text(pulsar_engine *e, const pulsar_tokens *prompt, const char *text, TextBytes end);
+/** L434: pulsar_history_pos_at_text_with with the engine's rendering.
+ *  @param e the engine; NULL gives position 0
+ *  @param history the live tokens
+ *  @param text the history's rendered text
+ *  @param end the text position
+ *  @return the live position */
+TokPos pulsar_history_pos_at_text(pulsar_engine *e, const pulsar_tokens *history, const char *text, TextBytes end);
 /** pulsar_tokens_prefix_match of the INSTALLED bank's history against `prompt`.
  *  @param s the session; NULL gives an empty match
  *  @param prompt the request

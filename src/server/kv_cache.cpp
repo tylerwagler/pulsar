@@ -871,8 +871,12 @@ bool server::kv_rp_writes_for_end(kv_persist_trigger why, unsigned kv_flags, uns
      * overstated the gain and logged a warning a persist */
     uint64_t hashes[PULSAR_IMAGE_BLOCKS_MAX];
     const int n_hashes = pulsar_session_span_image_hashes(s->sess, TokPos{0}, E, hashes, PULSAR_IMAGE_BLOCKS_MAX);
-    const TokPos D =
-        text ? kv_cache_find(text, n_hashes > 0 ? hashes : NULL, n_hashes > 0 ? n_hashes : 0, &hit) : TokPos{0};
+    if (text) (void)kv_cache_find(text, n_hashes > 0 ? hashes : NULL, n_hashes > 0 ? n_hashes : 0, &hit);
+    /* L434: where that chain ends on THIS bank's tokens -- the position of its text end on the history it was
+     * found by.  Its own end counts its writer's tokens: the same bytes, written from another spelling (the bank
+     * that sampled the turn this one was re-sent), end at another position, and E - that end priced the wrong rows */
+    const TokPos D = text && hit.n > 0 ? pulsar_history_pos_at_text(s->engine, &head, text, hit.chain[hit.n - 1].text_end)
+                                       : TokPos{0};
     free(text);
     const uint32_t gain = E > D ? (uint32_t)(E - D).raw() : 0u;
     uint64_t rp = pulsar_session_restore_point_bytes(s->sess, E);
@@ -1079,19 +1083,31 @@ bool kv_read_cost_ms(const kv_read_cost *c, uint64_t bytes, uint64_t cached, dou
 TokPos server::kv_cache_try_load_text(session_slot *sl, const char *prompt_text,
                                      const pulsar_text_span *prompt_spans,
                                      uint32_t prompt_n_spans,
-                                     const uint64_t *image_hashes, int n_images, TokPos base,
+                                     const uint64_t *image_hashes, int n_images, const pulsar_tokens *prompt,
+                                     pulsar_bank_resume own,
                                      pulsar_tokens *effective_prompt,
                                      char **loaded_key_out,
                                      bool responses_protocol) {
     (void)sl;   /* the caller installed the slot's bank */
     if (loaded_key_out) *loaded_key_out = NULL;
     kv_chain_hit hit;
-    const TokPos G = kv_cache_find(prompt_text, image_hashes, n_images, &hit);
-    if (G <= base) return TokPos{0};   /* nothing past what the bank serves: no read is priced */
-    if (kv_cache_price(&hit, base) == KV_RESTORE_RECOMPUTE) return TokPos{0};
-    return kv_cache_load(&hit, prompt_text, prompt_spans, prompt_n_spans, base, effective_prompt, loaded_key_out,
-                         responses_protocol);
+    (void)kv_cache_find(prompt_text, image_hashes, n_images, &hit);
+    /* L434: ranked and priced by the prompt's tokens the chain holds, the currency of own.served -- not by the
+     * chain's end, which counts its writer's tokens */
+    const PromptToks served = kv_chain_served(&hit, prompt, prompt_text);
+    if (served <= own.served) return TokPos{0};   /* nothing past what the bank serves: no read is priced */
+    const PromptToks gained = served - own.served;
+    if (kv_cache_price(&hit, gained, own.at) == KV_RESTORE_RECOMPUTE) return TokPos{0};
+    return kv_cache_load(&hit, prompt_text, prompt_spans, prompt_n_spans, gained, own.served > PromptToks{0},
+                         effective_prompt, loaded_key_out, responses_protocol);
 }
+
+PromptToks server::kv_chain_served(const kv_chain_hit *hit, const pulsar_tokens *prompt, const char *prompt_text) {
+    if (!hit || hit->n <= 0 || !prompt || !prompt_text) return PromptToks{0};
+    return pulsar_prompt_held_by_text(engine, prompt, prompt_text, hit->chain[hit->n - 1].text_end);
+}
+
+bool server_chain_ends_at_text_end(TextBytes chain_text_end, TextBytes text_len) { return chain_text_end >= text_len; }
 
 /* ===== L318: one resume decision, the deepest valid state ================== */
 
@@ -1137,23 +1153,29 @@ TokPos server::kv_cache_find_req(const request *req, kv_chain_hit *hit) {
     const TokPos G = kv_cache_find(req->prompt_text, hashes, n_images, hit);
     /* L353 no. 15: a chain ending at the prompt's end can't be resumed (a load leaves no record there, and a resume stops short
      * of the last row).  The next stored point below it can: look again without the last segment's last byte.
-     * L334 P7: the chain's live-side end against the request's prompt length -- the P1 mix-up of kv_cache_find's
-     * depth, kept as it was (raw) */
-    if (G.raw() < req->prompt.len || G.raw() <= 0) return G;
+     * L434: "at the prompt's end" is asked of the TEXT, the one position the chain and the request share -- the
+     * chain's end counts its writer's tokens and was compared with the request's token count (a re-spelled chain
+     * one token longer than the prompt's share of its bytes was taken for the whole prompt and given up; one a token
+     * shorter that did cover the whole prompt was loaded, and resumed from nothing) */
+    if (hit->n <= 0 ||
+        !server_chain_ends_at_text_end(hit->chain[hit->n - 1].text_end, TextBytes{strlen(req->prompt_text)}))
+        return G;
     const TextBytes cut = hit->chain[hit->n - 1].text_end;
     if (cut == TextBytes{0}) return TokPos{0};
     std::string shorter(req->prompt_text, (size_t)cut.raw() - 1u);
     return kv_cache_find(shorter.c_str(), hashes, n_images, hit);
 }
 
-kv_restore_verdict server::kv_cache_price(const kv_chain_hit *hit, TokPos base_at) {
+kv_restore_verdict server::kv_cache_price(const kv_chain_hit *hit, PromptToks gained_toks, TokPos base_at) {
     auto *s = this;
-    /* L310: price the read against the prefill of what the chain adds past `base` */
+    /* L310: price the read against the prefill of what the chain adds past `base`.  L434: what it adds is the
+     * caller's count of the REQUEST's tokens (the chain's end minus a memory depth mixed the writer's tokens with
+     * the request's); the prefill it saves runs those tokens, one row each, from the live position `base` */
     const TokPos chain_G = hit->chain[hit->n - 1].G;
     const uint64_t bytes = hit->bytes;
     const int n = hit->n;
     const TokPos base = base_at.raw() < 0 ? TokPos{0} : base_at;
-    const uint32_t gained = chain_G > base ? (uint32_t)(chain_G - base).raw() : 0u;
+    const uint32_t gained = gained_toks > PromptToks{0} ? (uint32_t)gained_toks.raw() : 0u;
     double prefill_ms = 0.0, transfer_ms = 0.0;
     const int cap = s->sess ? pulsar_session_prefill_cap(s->sess).raw() : 0;
     const bool priced = pulsar_engine_prefill_ms(s->engine, gained, (uint32_t)base.raw(), cap > 0 ? (uint32_t)cap : 0u,
@@ -1170,7 +1192,7 @@ kv_restore_verdict server::kv_cache_price(const kv_chain_hit *hit, TokPos base_a
     pthread_mutex_unlock(&s->mu);
     server_log(PULSAR_LOG_KVCACHE,
                "pulsar-server: kv cache restore-vs-recompute: chain to %d (%d segments, %.1f MiB, %.1f MiB in RAM) "
-               "adds %u tokens past %d: read %.1f ms%s vs prefill %.1f ms%s -> %s",
+               "adds %u of the request's tokens, prefilled from %d: read %.1f ms%s vs prefill %.1f ms%s -> %s",
                chain_G.raw(), n, (double)bytes / (1024.0 * 1024.0), (double)hit->cached / (1024.0 * 1024.0), gained,
                base.raw(),
                transfer_ms, measured ? "" : " (unmeasured)", prefill_ms, priced ? "" : " (no fit)",
@@ -1223,11 +1245,11 @@ static int server_restore_slice_segments(const double *pred_ms, int next, int n,
  *   the RAM copy the load reads.  A failure after the first write (a transient one) leaves the bank invalid: the
  *   request then resumes from another bank's adopt if one serves, else from 0 (server::gen_step_restore). */
 
-void server::kv_restore_begin(kv_restore *r, const kv_chain_hit *hit, TokPos base, bool sliced, bool verify) {
+void server::kv_restore_begin(kv_restore *r, const kv_chain_hit *hit, PromptToks gained, bool sliced, bool verify) {
     auto *s = this;
     r->hit = hit;
     r->next = 0;
-    r->base = base.raw() < 0 ? TokPos{0} : base;
+    r->gained = gained > PromptToks{0} ? gained : PromptToks{0};
     r->read_ms = 0.0;
     r->slice_max_ms = 0.0;
     r->slices = 0;
@@ -1349,7 +1371,7 @@ TokPos server::kv_restore_finish(kv_restore *r, const char *text, const pulsar_t
     /* L353 no. 16: a checked restore read the chain twice unless the check's read stayed as the RAM copy; the time is both */
     const uint64_t reads = kv_restore_reads(r->verify, pulsar_segstore_retains(s->kv.st));
     kv_read_cost_observe(&s->kv.meter.read, r->hit->bytes * reads, r->hit->cached * reads, r->read_ms, server_now_sec());
-    s->kv.meter.restored_tokens += G > r->base ? (uint64_t)(G - r->base).raw() : 0u;
+    s->kv.meter.restored_tokens += (uint64_t)r->gained.raw();   /* L434: the tokens the verdict priced */
     pthread_mutex_unlock(&s->mu);
     const pulsar_tokens *loaded = pulsar_session_tokens(s->sess);
     const TextBytes text_end = chain[n - 1].text_end;
@@ -1389,14 +1411,14 @@ TokPos server::kv_restore_finish(kv_restore *r, const char *text, const pulsar_t
 }
 
 TokPos server::kv_cache_load(const kv_chain_hit *hit, const char *prompt_text, const pulsar_text_span *prompt_spans,
-                             uint32_t prompt_n_spans, TokPos base, pulsar_tokens *effective_prompt,
-                             char **loaded_key_out, bool responses_protocol) {
+                             uint32_t prompt_n_spans, PromptToks gained, bool verify,
+                             pulsar_tokens *effective_prompt, char **loaded_key_out, bool responses_protocol) {
     if (loaded_key_out) *loaded_key_out = NULL;
     /* the one-shot load: the whole chain as one slice (canonicalize_tool_checkpoint's rebuild, the one caller, runs to
      * completion inside its quantum like the sync it serves -- and reads only what L310 prices under half the
      * prefill it saves, so the read never stalls longer than that sync would) */
     kv_restore r;
-    kv_restore_begin(&r, hit, base, false, base.raw() > 0);   /* L347 I3b: checked first when the bank serves some */
+    kv_restore_begin(&r, hit, gained, false, verify);   /* L347 I3b: checked first when the bank serves some */
     int rc = 0;
     while (rc == 0) rc = kv_restore_slice(&r, hit->n);   /* the check (when it runs), then the load */
     const TokPos G = rc == 1 ? kv_restore_finish(&r, prompt_text, prompt_spans, prompt_n_spans, effective_prompt,

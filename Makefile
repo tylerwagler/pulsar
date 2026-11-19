@@ -697,6 +697,14 @@ segstore-tsan: tests/segstore_tsan
 kv-identity-gate: pulsar_test
 	./pulsar_test --kv-identity
 
+# L434: a stored chain's depth against the request's own tokens (pulsar_test --disk-depth; host-only, no model): the
+# text walk, the lookup on a real store behind a toy vocabulary, the resume pick, usage, the prefill progress line and
+# the kv req fields, each on a case where the chain's writer and the request spell the same bytes in another number
+# of tokens.
+.PHONY: disk-depth-gate
+disk-depth-gate: pulsar_test
+	./pulsar_test --disk-depth
+
 # L430: the generation path's host work against its earlier reading (pulsar_test --gen-host; host-only, no model): a
 # speculative round's look ahead -- which rows are a call's structure, where a single-call turn's chain ends -- on
 # thousands of random turns of every family, against the walks as they were (tests/gen_host_ref.h); and (L431) the

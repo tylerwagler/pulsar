@@ -1013,28 +1013,56 @@ int pulsar_image_block_starts(pulsar_engine *e, const pulsar_tokens *tokens, int
     return n;
 }
 
+/** L434: the engine's rendering unit (pulsar_token_piece_fn): a token's text, an image block once as its family's
+ *  placeholder -- the ONE definition pulsar_history_text and the text walks read.
+ *  @param ud the engine  @param tokens the sequence  @param len its length  @param i the unit's first token
+ *  @param n receives the piece's bytes  @param span receives the tokens it stands for (0: a malformed block)
+ *  @return the malloc'd piece, NULL for a malformed block or a family without a tokenizer */
+static char *engine_history_piece(void *ud, const TokId *tokens, int len, int i, size_t *n, int *span) {
+    pulsar_engine *e = (pulsar_engine *)ud;
+    TokId id = tokens[i];
+    *span = 1;
+    *n = 0;
+    if (pulsar_image_is_sentinel(e, id.raw())) {   /* the family's geometry: the block stands for its placeholder */
+        int blk = 0;
+        if (!pulsar_image_block_extent(e, tokens, len, i, &blk) || blk <= 0) {
+            *span = 0;   /* a sentinel id that belongs to no well-formed block */
+            return NULL;
+        }
+        id = TokId{e->family->vision->placeholder_id(e)};
+        *span = blk;
+    }
+    return pulsar_token_text(e, id, n);
+}
+
 char *pulsar_history_text(pulsar_engine *e, const pulsar_tokens *tokens, size_t *out_len) {
     if (out_len) *out_len = 0;
     if (!e || !tokens) return NULL;
     std::string out;
-    for (int i = 0; i < tokens->len; i++) {
-        TokId id = tokens->v[i];
-        int blk = 1;
-        if (pulsar_image_is_sentinel(e, id.raw())) {   /* the family's geometry: the block stands for its placeholder */
-            if (!pulsar_image_block_extent(e, tokens->v, tokens->len, i, &blk) || blk <= 0) return NULL;
-            id = TokId{e->family->vision->placeholder_id(e)};
-        }
+    for (int i = 0; i < tokens->len; ) {
         size_t n = 0;
-        char *piece = pulsar_token_text(e, id, &n);
-        out.append(piece, n);
+        int span = 1;
+        char *piece = engine_history_piece(e, tokens->v, tokens->len, i, &n, &span);
+        if (span <= 0) return NULL;
+        if (piece) out.append(piece, n);
         free(piece);
-        i += blk - 1;
+        i += span;
     }
     if (out_len) *out_len = out.size();
     char *r = (char *)xmalloc(out.size() + 1);
     memcpy(r, out.data(), out.size());
     r[out.size()] = '\0';
     return r;
+}
+
+PromptToks pulsar_prompt_held_by_text(pulsar_engine *e, const pulsar_tokens *prompt, const char *text, TextBytes end) {
+    if (!e || !prompt || !text) return PromptToks{0};
+    return pulsar_prompt_held_by_text_with(engine_history_piece, e, prompt->v, prompt->len, text, end);
+}
+
+TokPos pulsar_history_pos_at_text(pulsar_engine *e, const pulsar_tokens *history, const char *text, TextBytes end) {
+    if (!e || !history || !text) return TokPos{0};
+    return pulsar_history_pos_at_text_with(engine_history_piece, e, history->v, history->len, text, end);
 }
 
 uint64_t pulsar_image_hash(const pulsar_image_ref *img) { return pulsar_image_content_hash(img); }

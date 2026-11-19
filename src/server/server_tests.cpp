@@ -1050,8 +1050,8 @@ static void test_anthropic_usage_reports_cache_details(void) {
     request r;
     test_request_init(&r, REQ_CHAT, 128);
     r.api = API_ANTHROPIC;
-    r.cache_read_tokens = 7;
-    r.cache_write_tokens = 3;
+    r.cache_read_tokens = PromptToks{7};
+    r.cache_write_tokens = PromptToks{3};
 
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -1250,8 +1250,8 @@ static void test_openai_stream_usage_reports_cache_details(void) {
     r.api = API_OPENAI;
     r.stream = true;
     r.stream_include_usage = true;
-    r.cache_read_tokens = 7;
-    r.cache_write_tokens = 3;
+    r.cache_read_tokens = PromptToks{7};
+    r.cache_write_tokens = PromptToks{3};
     r.reasoning_tokens = 1;
 
     TEST_ASSERT(sse_done(sv[0], &r, "chatcmpl_usage", 10, 2));
@@ -1300,8 +1300,8 @@ static void test_responses_usage_reports_cache_details(void) {
     request r;
     test_request_init(&r, REQ_CHAT, 128);
     r.api = API_RESPONSES;
-    r.cache_read_tokens = 7;
-    r.cache_write_tokens = 3;
+    r.cache_read_tokens = PromptToks{7};
+    r.cache_write_tokens = PromptToks{3};
     r.reasoning_tokens = 1;
 
     int sv[2];
@@ -20235,7 +20235,7 @@ static void test_l347_i3b_failure_rules(void) {
             hit->n = n;
             memcpy(hit->chain, chain, sizeof(pulsar_segstore_seg) * (size_t)n);
             kv_restore r;
-            s.kv_restore_begin(&r, hit, TokPos{0}, false, true);
+            s.kv_restore_begin(&r, hit, PromptToks{0}, false, true);
             for (int i = 0; i < n; i++) TEST_ASSERT(pulsar_segstore_is_pinned(st, chain[i].key));
             l347_ckpts ck;
             pulsar_kvchain_persist_result pr;
@@ -20968,6 +20968,343 @@ static void test_l334_prompt_held_across_a_seam(void) {
     TEST_ASSERT(pulsar_tokens_prompt_held_with(l334_text, NULL, live3, TokPos{3}, prompt3, 4) == PromptToks{2});
 }
 
+/* ---- L434: the disk-depth family ----------------------------------------------------------------------------------
+ * A stored chain's depth counts the tokens its WRITER spent on its text; a request's prompt spends its own number on
+ * the same bytes (L115: a sampled turn comes back re-spelled).  The fixtures below are the toy vocabulary's two
+ * spellings of "abcd": a|b|cd (three tokens, the sampled one) and abc|d (two, the canonical one). */
+
+/** The toy vocabulary as a rendering (pulsar_token_piece_fn): one token, its text. */
+static char *l434_piece(void *, const TokId *tokens, int, int i, size_t *n, int *span) {
+    *span = 1;
+    return l334_text(NULL, tokens[i], n);
+}
+/** X, then `k` stretches "abcd" in the sampled spelling (a|b|cd) or the canonical one (abc|d), then `tail`.
+ *  @param sampled which spelling  @param k the stretches  @param tail ids appended  @param n_tail their count
+ *  @return the tokens */
+static std::vector<TokId> l434_spell(bool sampled, int k, const int *tail, int n_tail) {
+    std::vector<TokId> t = {l334_id(L334_X)};
+    for (int i = 0; i < k; i++) {
+        if (sampled) { t.push_back(l334_id(L334_A)); t.push_back(l334_id(L334_B)); t.push_back(l334_id(L334_CD)); }
+        else { t.push_back(l334_id(L334_ABC)); t.push_back(l334_id(L334_D)); }
+    }
+    for (int i = 0; i < n_tail; i++) t.push_back(l334_id(tail[i]));
+    return t;
+}
+/** The text a toy sequence renders to.  @param t the tokens  @return the bytes */
+static std::string l434_render(const std::vector<TokId> &t) {
+    std::string out;
+    for (TokId id : t) out += id.raw() == L334_CTL ? "" : l334_vocab[id.raw()];
+    return out;
+}
+
+/** Does the resume pick take this type for the disk chain's depth? */
+template <class D> concept l434_picks_by = requires(D d) {
+    server_resume_pick(PromptToks{0}, PromptToks{0}, d, KV_RESTORE_LOAD);
+};
+/** Does the chain's price take this type for what the chain adds? */
+template <class G> concept l434_prices_by = requires(server s, const kv_chain_hit *h, G g) {
+    s.kv_cache_price(h, g, TokPos{0});
+};
+/** Does a restore begin with this type for what the chain adds? */
+template <class G> concept l434_restores_by = requires(server s, kv_restore *r, const kv_chain_hit *h, G g) {
+    s.kv_restore_begin(r, h, g, false, false);
+};
+/** Does the usage split take these types? */
+template <class P, class C> concept l434_splits = requires(P p, C c) { server_usage_split(p, c); };
+/** Does the progress line take these types (start, position, total)? */
+template <class A, class B, class C> concept l434_displays = requires(A a, B b, C c) { server_prefill_display(a, b, c); };
+/* The mix-up no longer type-checks: a chain's end (TokPos), a live count (TokCount) or a bare int is no depth for the
+ * pick, no "gained" for the price or the restore meter, no cache read; and the carriers that let it through are typed. */
+static_assert(l434_picks_by<PromptToks> && !l434_picks_by<TokPos> && !l434_picks_by<TokCount> && !l434_picks_by<int>,
+              "the resume pick ranks the request's tokens: a chain's own end does not compile as its depth");
+static_assert(l434_prices_by<PromptToks> && !l434_prices_by<TokPos> && !l434_prices_by<TokCount> && !l434_prices_by<int>,
+              "a chain is priced on the request's tokens it adds, not on a position");
+static_assert(l434_restores_by<PromptToks> && !l434_restores_by<TokPos> && !l434_restores_by<int>,
+              "the restored-tokens counter is the request's tokens the chain added");
+static_assert(l434_splits<PromptToks, PromptToks> && !l434_splits<PromptToks, TokCount> &&
+                  !l434_splits<PromptToks, TokPos> && !l434_splits<TokCount, PromptToks> && !l434_splits<int, int>,
+              "usage is counted on one prompt: a live-side count is no cache read of it");
+static_assert(l434_displays<TokPos, TokPos, TokCount> && !l434_displays<TokPos, TokPos, PromptToks> &&
+                  !l434_displays<PromptToks, TokPos, TokCount>,
+              "the progress line is live-side: the request's prompt length is no total for its positions");
+static_assert(std::is_same_v<decltype(gen_resolution::cached), PromptToks> &&
+                  std::is_same_v<decltype(gen_resolution::sync_held), PromptToks> &&
+                  std::is_same_v<decltype(gen_resolution::disk_cached), PromptToks> &&
+                  std::is_same_v<decltype(gen_resolution::resumed_at), TokPos> &&
+                  std::is_same_v<decltype(gen_restore::disk_served), PromptToks> &&
+                  std::is_same_v<decltype(kv_restore::gained), PromptToks> &&
+                  std::is_same_v<decltype(request::cache_read_tokens), PromptToks> &&
+                  std::is_same_v<decltype(request::cache_write_tokens), PromptToks> &&
+                  std::is_same_v<decltype(gen_state::prefill_end), TokPos>,
+              "the carriers are typed: the cache read is the prompt's tokens, where the sync computes a position");
+static_assert(std::is_same_v<decltype(std::declval<server>().kv_chain_served(nullptr, nullptr, nullptr)), PromptToks> &&
+                  std::is_same_v<decltype(std::declval<server>().kv_cache_find(nullptr, nullptr, 0, nullptr)), TokPos> &&
+                  std::is_same_v<decltype(std::declval<server>().gen_adopt_depth(nullptr, 0)), pulsar_bank_resume> &&
+                  !std::is_convertible_v<TokPos, PromptToks> && !std::is_constructible_v<PromptToks, TokPos> &&
+                  !std::is_constructible_v<PromptToks, TokCount> && !std::is_constructible_v<TokPos, PromptToks>,
+              "a chain's end and the request's tokens it holds are two types with no conversion, explicit or not");
+
+/* L434: the text walk -- a text position as a count on one tokenisation of that text.  The differing case: the chain's
+ * writer sampled X + 100 x (a|b|cd) + Y, 302 tokens; the request spells the same 402 bytes X + 100 x (abc|d) + Y in
+ * 202 tokens and goes on with Z. */
+static void test_l434_text_position_on_each_spelling(void) {
+    const int y[] = {L334_Y}, yz[] = {L334_Y, L334_Z};
+    const std::vector<TokId> stored = l434_spell(true, 100, y, 1), prompt = l434_spell(false, 100, yz, 2);
+    const std::string chain_text = l434_render(stored), text = l434_render(prompt);
+    TEST_ASSERT(stored.size() == 302 && prompt.size() == 203 && chain_text.size() == 402 && text.size() == 403);
+    TEST_ASSERT(!text.compare(0, chain_text.size(), chain_text));   /* the chain's text is a byte prefix: it is found */
+    const TextBytes end{chain_text.size()};
+    /* the request's tokens the chain holds: 202 -- the chain's own end says 302, more than the whole prompt */
+    const PromptToks served = pulsar_prompt_held_by_text_with(l434_piece, NULL, prompt.data(), (int)prompt.size(),
+                                                              text.data(), end);
+    TEST_ASSERT(served == PromptToks{202});
+    /* the same text position on the writer's own tokens is its end: there the two currencies are one */
+    TEST_ASSERT(pulsar_history_pos_at_text_with(l434_piece, NULL, stored.data(), (int)stored.size(), text.data(), end) ==
+                TokPos{302});
+    /* it agrees with the post-load authority (the request's tokens the loaded history holds at its end) */
+    TEST_ASSERT(pulsar_tokens_prompt_held_with(l334_text, NULL, stored.data(), TokPos{302}, prompt.data(),
+                                               (int)prompt.size()) == served);
+    /* every text position: tokens ending at or before it, never one that straddles it, monotonic, bounded */
+    int last = 0;
+    for (size_t e = 0; e <= text.size(); e++) {
+        const int n = pulsar_tokens_in_text_with(l434_piece, NULL, prompt.data(), (int)prompt.size(), text.data(),
+                                                 TextBytes{e});
+        size_t bytes = 0;
+        for (int i = 0; i < n; i++) bytes += strlen(l334_vocab[prompt[(size_t)i].raw()]);
+        TEST_ASSERT(n >= last && bytes <= e && n <= (int)prompt.size());
+        if (n < (int)prompt.size()) TEST_ASSERT(bytes + strlen(l334_vocab[prompt[(size_t)n].raw()]) > e);
+        last = n;
+    }
+    TEST_ASSERT(last == 203);
+    /* a chain cut inside a request token (a grid point falls mid-text): "Xab" holds X only -- abc straddles it */
+    TEST_ASSERT(pulsar_tokens_in_text_with(l434_piece, NULL, prompt.data(), 203, text.data(), TextBytes{3}) == 1);
+    /* tokens that do not render to the text there hold nothing past the difference */
+    const TokId other[] = {l334_id(L334_X), l334_id(L334_ABC), l334_id(L334_Y)};
+    TEST_ASSERT(pulsar_tokens_in_text_with(l434_piece, NULL, other, 3, text.data(), TextBytes{20}) == 2);
+    /* a control token (no bytes) counts strictly inside the text, not at its end (nothing says which side) */
+    const TokId ctl[] = {l334_id(L334_X), l334_id(L334_CTL), l334_id(L334_ABC), l334_id(L334_CTL)};
+    TEST_ASSERT(pulsar_tokens_in_text_with(l434_piece, NULL, ctl, 4, "Xabc", TextBytes{4}) == 3);
+    TEST_ASSERT(pulsar_tokens_in_text_with(l434_piece, NULL, ctl, 4, "Xabc", TextBytes{1}) == 1);
+    /* an image block is one piece (its placeholder) standing for its tokens: all of them or none */
+    struct blocks {
+        static char *piece(void *, const TokId *t, int len, int i, size_t *n, int *span) {
+            if (t[i].raw() != L334_Y) return l434_piece(NULL, t, len, i, n, span);
+            int b = 0;
+            while (i + b < len && t[i + b].raw() == L334_Y) b++;
+            *span = b;
+            *n = 5;
+            return server_xstrdup("<img>");
+        }
+    };
+    const TokId img[] = {l334_id(L334_X), l334_id(L334_Y), l334_id(L334_Y), l334_id(L334_Y), l334_id(L334_A)};
+    TEST_ASSERT(pulsar_tokens_in_text_with(blocks::piece, NULL, img, 5, "X<img>a", TextBytes{7}) == 5);
+    TEST_ASSERT(pulsar_tokens_in_text_with(blocks::piece, NULL, img, 5, "X<img>a", TextBytes{6}) == 4);
+    TEST_ASSERT(pulsar_tokens_in_text_with(blocks::piece, NULL, img, 5, "X<img>a", TextBytes{5}) == 1);
+    /* nothing to walk */
+    TEST_ASSERT(pulsar_tokens_in_text_with(NULL, NULL, img, 5, "X", TextBytes{1}) == 0);
+    TEST_ASSERT(pulsar_tokens_in_text_with(l434_piece, NULL, img, 0, "X", TextBytes{1}) == 0);
+    TEST_ASSERT(pulsar_prompt_held_by_text(NULL, NULL, "X", TextBytes{1}) == PromptToks{0});
+    TEST_ASSERT(pulsar_history_pos_at_text(NULL, NULL, "X", TextBytes{1}) == TokPos{0});
+}
+
+/* L434: the pick ranks the request's tokens.  The differing case against a bank whose own state serves 250 of a
+ * longer request's tokens: the chain's end (302) outranked it and a read was paid to serve 202; the other way round
+ * (the writer's spelling the shorter one) a chain serving 302 lost to 250 and 52 tokens were prefilled again. */
+static void test_l434_pick_ranks_the_requests_tokens(void) {
+    const int y[] = {L334_Y}, more[] = {L334_Y, L334_Z, L334_Z, L334_Z};
+    struct { bool stored_sampled; int chain_end, served; resume_pick before, after; } cases[] = {
+        {true, 302, 202, RESUME_DISK, RESUME_OWN},    /* the chain looked deeper than it is */
+        {false, 202, 302, RESUME_OWN, RESUME_DISK},   /* the chain looked shallower than it is */
+    };
+    for (const auto &c : cases) {
+        const std::vector<TokId> stored = l434_spell(c.stored_sampled, 100, y, 1);
+        const std::vector<TokId> prompt = l434_spell(!c.stored_sampled, 100, more, 4);
+        const std::string chain_text = l434_render(stored), text = l434_render(prompt);
+        TEST_ASSERT((int)stored.size() == c.chain_end);
+        const PromptToks served = pulsar_prompt_held_by_text_with(l434_piece, NULL, prompt.data(), (int)prompt.size(),
+                                                                  text.data(), TextBytes{chain_text.size()});
+        TEST_ASSERT(served == PromptToks{c.served});
+        const PromptToks own{250}, none{0};
+        /* before: the chain's end, re-labelled (the crossing L334 P7 marked) */
+        TEST_ASSERT(server_resume_pick(own, none, PromptToks{c.chain_end}, KV_RESTORE_LOAD) == c.before);
+        TEST_ASSERT(server_resume_pick(own, none, served, KV_RESTORE_LOAD) == c.after);
+        /* the pick is the candidate that leaves the fewest of the prompt's tokens to prefill */
+        const int left_own = (int)prompt.size() - own.raw(), left_disk = (int)prompt.size() - served.raw();
+        TEST_ASSERT((c.after == RESUME_DISK) == (left_disk < left_own));
+        /* what the chain adds over the memory tier, the price's and the meter's count: the request's tokens */
+        const PromptToks gained = served > own ? served - own : PromptToks{0};
+        TEST_ASSERT(gained.raw() == (c.after == RESUME_DISK ? 52 : 0));
+        kv_restore r;
+        memset(&r, 0, sizeof r);
+        server s;
+        memset(&s, 0, sizeof s);
+        pthread_mutex_init(&s.mu, NULL);
+        kv_chain_hit *hit = (kv_chain_hit *)calloc(1, sizeof(kv_chain_hit));
+        TEST_ASSERT(hit != NULL);
+        if (!hit) continue;
+        s.kv_restore_begin(&r, hit, gained, false, false);
+        TEST_ASSERT(r.gained == gained);
+        s.kv_restore_begin(&r, hit, PromptToks{-3}, false, false);   /* never negative */
+        TEST_ASSERT(r.gained == PromptToks{0});
+        free(hit);
+    }
+    /* "the chain ends at the prompt's end" is asked of the text: equal token counts say nothing either way */
+    TEST_ASSERT(server_chain_ends_at_text_end(TextBytes{403}, TextBytes{403}));
+    TEST_ASSERT(!server_chain_ends_at_text_end(TextBytes{402}, TextBytes{403}));
+}
+
+/* L434: usage is counted on one prompt.  The differing case as a byte-only disk match: the sync runs the chain's 302
+ * tokens + "Z" re-tokenised (303), the request's own prompt is 203 tokens of which the chain holds 202. */
+static void test_l434_usage_is_one_prompts(void) {
+    const int y[] = {L334_Y}, yz[] = {L334_Y, L334_Z};
+    const std::vector<TokId> stored = l434_spell(true, 100, y, 1), prompt = l434_spell(false, 100, yz, 2);
+    std::vector<TokId> effective = stored;
+    effective.push_back(l334_id(L334_Z));
+    const std::string chain_text = l434_render(stored), text = l434_render(prompt);
+    const PromptToks served = pulsar_prompt_held_by_text_with(l434_piece, NULL, prompt.data(), (int)prompt.size(),
+                                                              text.data(), TextBytes{chain_text.size()});
+    /* after: the request's own tokens, the numbers a cold prefill of it reports for its prompt */
+    const usage_split u = server_usage_split(PromptToks{(int)prompt.size()}, served);
+    TEST_ASSERT(u.prompt == PromptToks{203} && u.cached == PromptToks{202} && u.written == PromptToks{1});
+    TEST_ASSERT(u.cached + u.written == u.prompt && u.cached <= u.prompt);
+    /* before: prompt_tokens = the effective prompt's length, cached = the chain's end -- 303 / 302 for a request
+     * that reports 203 cold; and against the request's own length the cache read exceeded the prompt */
+    TEST_ASSERT((int)effective.size() == 303 && (int)stored.size() > (int)prompt.size());
+    TEST_ASSERT(l334_aborts([&] { l334_sink = server_usage_split(PromptToks{203}, PromptToks{302}).cached.raw(); }));
+    TEST_ASSERT(l334_aborts([&] { l334_sink = server_usage_split(PromptToks{203}, PromptToks{-1}).cached.raw(); }));
+    TEST_ASSERT(server_usage_split(PromptToks{0}, PromptToks{0}).written == PromptToks{0});
+    TEST_ASSERT(server_usage_split(PromptToks{203}, PromptToks{203}).written == PromptToks{0});
+    /* the tokens of the SYNC's prompt the state holds (what indexes the effective prompt: the cold cut, an image
+     * continuation): the chain's own tokens, by id -- checked */
+    const pulsar_tokens hist = {const_cast<TokId *>(stored.data()), (int)stored.size(), (int)stored.size()};
+    const pulsar_tokens eff = {effective.data(), (int)effective.size(), (int)effective.size()};
+    const pulsar_tokens req = {const_cast<TokId *>(prompt.data()), (int)prompt.size(), (int)prompt.size()};
+    TEST_ASSERT(server_effective_prefix(&hist, TokPos{302}, &eff) == PromptToks{302});
+    TEST_ASSERT(server_effective_prefix(&hist, TokPos{0}, &eff) == PromptToks{0});
+    /* a prompt that does not open with the history is no effective prompt of it: fatal, not a count */
+    TEST_ASSERT(l334_aborts([&] { l334_sink = server_effective_prefix(&hist, TokPos{302}, &req).raw(); }));
+    TEST_ASSERT(l334_aborts([&] { l334_sink = server_effective_prefix(&hist, TokPos{303}, &eff).raw(); }));
+    TEST_ASSERT(l334_aborts([&] { l334_sink = server_effective_prefix(&hist, TokPos::none(), &eff).raw(); }));
+    TEST_ASSERT(l334_aborts([&] { l334_sink = server_effective_prefix(NULL, TokPos{1}, &eff).raw(); }));
+    /* a chain whose tokens are the request's own (by id): its end is a count of the request's tokens, and the depth
+     * the pick ranked must be the same number -- checked, and said when it is not */
+    const pulsar_tokens self = {const_cast<TokId *>(prompt.data()), 150, 150};
+    const PromptToks own_prefix = server_effective_prefix(&self, TokPos{150}, &req);
+    TEST_ASSERT(own_prefix == PromptToks{150});
+    TEST_ASSERT(pulsar_prompt_held_by_text_with(l434_piece, NULL, prompt.data(), (int)prompt.size(), text.data(),
+                                                TextBytes{l434_render({prompt.begin(), prompt.begin() + 150}).size()}) ==
+                own_prefix);
+    TEST_ASSERT(server_disk_depths_agree(PromptToks{150}, own_prefix));
+    TEST_ASSERT(!server_disk_depths_agree(PromptToks{149}, own_prefix));
+}
+
+/* L434: the prefill progress line is on one side.  A bank holding the sampled spelling to 302 serves a request that
+ * re-spells it in 202 tokens and adds 501: the request is 703 tokens, the sync runs the stitch, 302 + 501 = 803, from
+ * live position 302. */
+static void test_l434_progress_line_is_live_side(void) {
+    pulsar_prefix_match m;
+    m.live_cut = TokCount{302};
+    m.prompt_cut = PromptToks{202};
+    m.seamed = true;
+    const TokCount total = pulsar_prefix_match_stitched_len(&m, PromptToks{703});
+    TEST_ASSERT(total == TokCount{803});
+    const TokPos start{302};
+    /* the line as it was: the request's length as the total of live positions */
+    auto before = [](int prompt_total, int start_raw, int current, int total_raw, int *of) {
+        int display_start = start_raw;
+        if (display_start < 0 || display_start > prompt_total) display_start = 0;
+        int display_total = prompt_total - display_start;
+        if (display_total <= 0) {
+            display_start = 0;
+            display_total = prompt_total > total_raw ? prompt_total : total_raw;
+        }
+        int display_current = current - display_start;
+        if (display_current < 0) display_current = 0;
+        if (display_current > display_total) display_current = display_total;
+        *of = display_total;
+        return display_current;
+    };
+    int of = 0;
+    /* 100 rows before the end the old line already said 401/401 (100%); the new one 401/501 */
+    TEST_ASSERT(before(703, 302, 703, 803, &of) == 401 && of == 401);
+    prefill_display d = server_prefill_display(start, TokPos{703}, total);
+    TEST_ASSERT(d.done == TokCount{401} && d.of == TokCount{501});
+    d = server_prefill_display(start, TokPos{803}, total);
+    TEST_ASSERT(d.done == TokCount{501} && d.of == TokCount{501});
+    d = server_prefill_display(start, start, total);
+    TEST_ASSERT(d.done == TokCount{0} && d.of == TokCount{501});
+    /* a request shorter in its own tokens than the live position it resumes at (253 < 302): the old line dropped
+     * the start and showed 253/253 from the first chunk; the stitch is 302 + 51 = 353, 51 rows to compute */
+    TEST_ASSERT(before(253, 302, 310, 353, &of) == 253 && of == 253);
+    d = server_prefill_display(start, TokPos{310}, TokCount{353});
+    TEST_ASSERT(d.done == TokCount{8} && d.of == TokCount{51});
+    /* no seam: the line is what it was, for every position */
+    for (int cur = 0; cur <= 5000; cur += 257) {
+        const int was = before(5000, 4096, cur, 5000, &of);
+        d = server_prefill_display(TokPos{4096}, TokPos{cur}, TokCount{5000});
+        TEST_ASSERT(d.done.raw() == was && d.of.raw() == of);
+    }
+    /* a start outside the prompt, or at its end: the whole prompt from 0, as before */
+    d = server_prefill_display(TokPos{900}, TokPos{400}, TokCount{803});
+    TEST_ASSERT(d.done == TokCount{400} && d.of == TokCount{803});
+    d = server_prefill_display(TokPos::none(), TokPos{400}, TokCount{803});
+    TEST_ASSERT(d.done == TokCount{400} && d.of == TokCount{803});
+    d = server_prefill_display(TokPos{803}, TokPos{803}, TokCount{803});
+    TEST_ASSERT(d.done == TokCount{803} && d.of == TokCount{803});
+    d = server_prefill_display(TokPos{0}, TokPos::none(), TokCount{803});
+    TEST_ASSERT(d.done == TokCount{0} && d.of == TokCount{803});
+}
+
+/* L434: the `kv req:` line of the same request: prompt and reused are the request's tokens (reused <= prompt), at
+ * and prefilled_now the live side (at + prefilled_now = where the prefill ended).  prefilled_now was the request's
+ * length minus the live position: 703 - 302 = 401 for 501 rows computed. */
+static void test_l434_kv_req_fields_are_consistent(void) {
+    server s;
+    memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.mu, NULL);
+    job j;
+    memset(&j, 0, sizeof j);
+    session_slot sl;
+    memset(&sl, 0, sizeof sl);
+    gen_state g;
+    memset(&g, 0, sizeof g);
+    sl.gen = &g;
+    sl.bank = BankId{0};
+    j.kvr.ep = "chat";
+    j.kvr.cls = "";
+    j.kvr.prompt = 703;
+    j.kvr.reused = 202;
+    j.kvr.at = 302;
+    j.kvr.common = 302;
+    j.kvr.frontier = 302;
+    g.prompt_tokens = 703;
+    g.prefill_end = TokPos{803};
+    g.t0 = 1.0;
+    g.decode_t0 = 2.0;
+    s.kv_req_log(&j, &sl, "stop");
+    TEST_ASSERT(j.kvr.prefilled_now == 501);
+    TEST_ASSERT(j.kvr.at + j.kvr.prefilled_now == g.prefill_end.raw());   /* the live side adds up */
+    TEST_ASSERT(j.kvr.reused <= j.kvr.prompt);                             /* the request side holds */
+    char line[KV_REQ_LINE_MAX];
+    kv_req_format(&j.kvr, line, sizeof line);
+    TEST_ASSERT(strstr(line, " prompt=703 ") && strstr(line, " at=302 ") && strstr(line, " reused=202 ") &&
+                strstr(line, " prefilled_now=501 "));
+    /* a prefill that stopped: to its last chunk (the L114 watermark, live-side as before) */
+    g.decode_t0 = 0.0;
+    sl.prefill_counted = 600;
+    s.kv_req_log(&j, &sl, "failed");
+    TEST_ASSERT(j.kvr.prefilled_now == 298);
+    /* no seam: prefill_end is the prompt's length and the line is what it was */
+    j.kvr.prompt = 5000;
+    j.kvr.reused = 4096;
+    j.kvr.at = 4096;
+    g.prompt_tokens = 5000;
+    g.prefill_end = TokPos{5000};
+    g.decode_t0 = 2.0;
+    s.kv_req_log(&j, &sl, "stop");
+    TEST_ASSERT(j.kvr.prefilled_now == 904 && j.kvr.reused + j.kvr.prefilled_now == j.kvr.prompt);
+}
+
 static void pulsar_server_unit_tests_run(void) {
     test_l333_kv_units();
     test_l334_p2b_crossings();
@@ -20980,6 +21317,11 @@ static void pulsar_server_unit_tests_run(void) {
     test_l334_server_positions();
     test_l353_image_keys();
     test_l334_prompt_held_across_a_seam();
+    test_l434_text_position_on_each_spelling();
+    test_l434_pick_ranks_the_requests_tokens();
+    test_l434_usage_is_one_prompts();
+    test_l434_progress_line_is_live_side();
+    test_l434_kv_req_fields_are_consistent();
     test_mem_floor_is_derived_from_the_watermarks();
     test_guard_budget_reads_live_memavailable();
     test_guard_discrete_reads_the_device();
