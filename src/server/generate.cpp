@@ -366,7 +366,7 @@ bool turn_stream_reasoning_answer(gen_state *g, const server_turn *turn) {
 }
 
 bool parser_finish_turn(server *s, session_slot *sl, gen_state *g, server_turn *out, bool broken,
-                        const char *why, bool logged, size_t tail_from, bool ok, const char *open_reasoning) {
+                        const char *why, bool logged, GenOff tail_from, bool ok, const char *open_reasoning) {
     const request *r = &g->j->req;
     const char *detail = why;
     char dropped[512];
@@ -429,10 +429,11 @@ bool parser_finish_turn(server *s, session_slot *sl, gen_state *g, server_turn *
         out->content = out->reasoning = NULL;
         if (turn_tool_retry_allowed(g)) return turn_tool_retry(s, sl, g, detail, out);
         turn_as_text(g, out);
-        if (tail_from < g->text.len) {
+        const GenOff text_end = gen_text_end(g->text.len);
+        if (!tail_from.is_none() && tail_from < text_end) {
             /* the stream stopped at the call; the rest goes out as text at the finish */
-            out->tail = g->text.ptr + tail_from;
-            out->tail_len = g->text.len - tail_from;
+            out->tail = gen_text_at(g->text.ptr, tail_from);
+            out->tail_len = (text_end - tail_from).raw();
         }
         return ok;
     }

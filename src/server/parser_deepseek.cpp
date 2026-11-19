@@ -81,7 +81,7 @@ static void *ds_parser_probe_new(void *st) {
 /// @param g      the attempt (its request)
 /// @param text   the generated text with the round's tokens so far
 /// @param len    bytes at `text`
-static void ds_parser_probe_feed(void *probe, const gen_state *g, const char *text, size_t len, size_t) {
+static void ds_parser_probe_feed(void *probe, const gen_state *g, const char *text, size_t len, GenOff) {
     if (g->j->req.kind == REQ_CHAT && g->j->req.has_tools)
         dsml_decode_tracker_update(&((deepseek_parser *)probe)->tracker, text, len);
 }
@@ -97,7 +97,7 @@ static void ds_parser_probe_free(void *probe) { free(probe); }
  * with `repeat`), and the turn ends here as every DeepSeek turn does. */
 /// @param st  the parser state (a deepseek_parser, from ds_parser_create)
 /// @return true once a DSML block has closed
-static bool ds_parser_turn_complete(const void *st, const gen_state *, size_t *) {
+static bool ds_parser_turn_complete(const void *st, const gen_state *, GenOff *) {
     return ((const deepseek_parser *)st)->saw_tool_end;
 }
 
@@ -119,7 +119,7 @@ static void ds_parser_tool_progress(const void *st, bool *opened, bool *closed) 
 /// @param upto   bytes of g->text the stop-string scan released
 /// @param final  the finish's last flush (only the walk runs)
 /// @return false when a client write failed
-static bool ds_parser_feed(void *st, server *s, gen_state *g, size_t upto, bool final) {
+static bool ds_parser_feed(void *st, server *s, gen_state *g, GenOff upto, bool final) {
     deepseek_parser *ps = (deepseek_parser *)st;
     job *j = g->j;
     if (final) {
@@ -129,7 +129,9 @@ static bool ds_parser_feed(void *st, server *s, gen_state *g, size_t upto, bool 
     if (j->req.kind == REQ_CHAT && j->req.has_tools)
         dsml_decode_tracker_update(&ps->tracker, g->text.ptr, g->text.len);
     /* DeepSeek's one walk over its raw text (L267) */
-    if (ps->walk_on && !deepseek_stream_update(&ps->walk, &g->sink, g->text.ptr, upto, false)) return false;
+    /* L437: the walk reads (raw, raw_len): the released bytes are the text's first upto.before() */
+    if (ps->walk_on && !deepseek_stream_update(&ps->walk, &g->sink, g->text.ptr, upto.before().raw(), false))
+        return false;
 
     if (j->req.kind != REQ_CHAT || !j->req.has_tools) return true;
     if (ps->thinking_gates_tool_markers && g->thinking.inside) {
@@ -231,7 +233,8 @@ static bool ds_parser_finish(void *st, server *s, session_slot *sl, gen_state *g
     }
     if (out->calls.len && ps->walk_on) apply_stream_tool_ids(&out->calls, &ps->walk.tool);
     /* as text, the walk stopped at the block's marker: the rest goes out at the finish */
-    const size_t tail_from = ps->walk_on ? ps->walk.emit_pos : SIZE_MAX;
+    /* L437: the walk's cursor is an offset of g->text by identity (it is given g->text from its first byte, above) */
+    const GenOff tail_from = ps->walk_on ? GenOff{ps->walk.emit_pos} : GenOff::none();
     /* L420: thinking on and no </think> in the text (parse_generated_message_ex's test): the turn ended inside its
      * reasoning, which the content path would report verbatim */
     const bool open = pulsar_think_mode_enabled(j->req.think_mode) && out->reasoning &&

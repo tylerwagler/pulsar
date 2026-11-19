@@ -1747,8 +1747,8 @@ void server::gen_decode_init(session_slot *sl) {
     gen_state *g = sl->gen;
     job *j = g->j;
     buf_free(&g->text);
-    g->plain_stream_pos = 0;
-    g->stop_scan_from = 0;
+    g->plain_stream_pos = GenOff{0};
+    g->stop_scan_from = GenOff{0};
     g->finish = "length";
     g->abandoned = false;
     g->turn_cut_short = false;
@@ -1808,7 +1808,7 @@ void server::gen_decode_init(session_slot *sl) {
     if (j->req.kind == REQ_CHAT && j->req.force_tool_call && j->req.family->forced_call_seed) {
         j->req.family->forced_call_seed(&j->req, &g->text);
         if (g->parser->seed) g->parser->seed(g->parser_st, g);
-        g->plain_stream_pos = g->text.len;
+        g->plain_stream_pos = gen_text_end(g->text.len);
     }
     /* L303: the turn's grammar gate, past the seed (an unnamed forced call's name and arguments are the
      * grammar's from here: the seed ends before the name's opener) */
@@ -1888,9 +1888,9 @@ void gen_resolve_sampling_decode(const gen_state *g, float *temperature,
  * scan's resume point advance, and the return is how many bytes of `text` the stop-string scan releases (what the
  * client stream and the output parser are given).  A client stop sequence that matched sets *hit_stop, *stop_pos and
  * *stop_len. */
-size_t gen_release(const stop_list *stops, const char *text, size_t len, const char *piece, size_t piece_len,
-                   size_t plain_stream_pos, thinking_state *thinking, size_t *stop_scan_from,
-                   bool *hit_stop, size_t *stop_pos, size_t *stop_len) {
+GenOff gen_release(const stop_list *stops, const char *text, size_t len, const char *piece, size_t piece_len,
+                   GenOff plain_stream_pos, thinking_state *thinking, GenOff *stop_scan_from,
+                   bool *hit_stop, GenOff *stop_pos, size_t *stop_len) {
     const bool was_thinking = thinking->inside;
     thinking->feed(piece, piece_len);
     /* L077 (stop-in-reasoning): client stop sequences describe the VISIBLE
@@ -1902,13 +1902,16 @@ size_t gen_release(const stop_list *stops, const char *text, size_t len, const c
      * byte offset, so at most the think-tail bytes of that one piece stay
      * scannable -- the conservative side of the boundary). */
     if (was_thinking && !thinking->inside) {
-        const size_t close_base = len - piece_len;
+        const GenOff close_base = gen_text_end(len - piece_len);
         if (*stop_scan_from < close_base) *stop_scan_from = close_base;
     }
-    *hit_stop = !thinking->inside && stop_list_find_from(stops, text, *stop_scan_from, stop_pos, stop_len);
-    size_t stream_len = *hit_stop ? *stop_pos : stop_list_stream_safe_len(stops, len);
+    /* L437: the stop list's and the UTF-8 hold's helpers read any (text, offset) pair: the offsets cross raw here */
+    size_t hit_at = 0;
+    *hit_stop = !thinking->inside && stop_list_find_from(stops, text, stop_scan_from->raw(), &hit_at, stop_len);
+    if (*hit_stop) *stop_pos = GenOff{hit_at};
+    size_t stream_len = *hit_stop ? hit_at : stop_list_stream_safe_len(stops, len);
     if (stream_len > len) stream_len = len;
-    stream_len = utf8_stream_safe_len(text, plain_stream_pos, stream_len, *hit_stop);
+    stream_len = utf8_stream_safe_len(text, plain_stream_pos.raw(), stream_len, *hit_stop);
     /* The next scan resumes where a stop string could still start: one of length L completed by a later token starts
      * at most L - 1 bytes before this text's end, and every earlier start was looked at by this scan or an earlier
      * one (or lay in reasoning, which no scan reads).  L431: for every list, also one whose strings are all one
@@ -1916,9 +1919,9 @@ size_t gen_release(const stop_list *stops, const char *text, size_t len, const c
      * longest string was longer than a byte, so `"stop": ["\n"]` searched the whole text at every token. */
     if (!*hit_stop && stops->len) {
         const size_t hold = stops->max_len - 1;
-        *stop_scan_from = len > hold ? len - hold : 0;
+        *stop_scan_from = gen_text_end(len > hold ? len - hold : 0);
     }
-    return stream_len;
+    return GenOff{stream_len};
 }
 
 /* The request streams g->text as it is released (plain_stream_pos follows the release). */
@@ -1955,8 +1958,8 @@ struct gen_walk {
     gen_state *g;              ///< the attempt (its text is appended to, then cut back)
     void *probe;               ///< the parser's probe (in_tool_call and turn_complete read it)
     thinking_state thinking;   ///< the reasoning tracker's copy
-    size_t stop_scan_from;     ///< the stop scan's resume point, a copy
-    size_t plain_stream_pos;   ///< the streamed prefix, a copy
+    GenOff stop_scan_from;     ///< the stop scan's resume point, a copy
+    GenOff plain_stream_pos;   ///< the streamed prefix, a copy
     size_t len0;               ///< g->text's length before the walk
     bool had_text;             ///< g->text held a buffer before the walk
 
@@ -1982,9 +1985,10 @@ struct gen_walk {
     /// @return false when a stop string ends the stream at this token (the probe was fed nothing)
     bool step(const char *piece, size_t n) {
         buf_append(&g->text, piece, n);
-        size_t stop_pos = 0, stop_len = 0;
+        GenOff stop_pos{0};
+        size_t stop_len = 0;
         bool hit_stop = false;
-        const size_t upto = gen_release(&g->j->req.stops, g->text.ptr, g->text.len, piece, n, plain_stream_pos,
+        const GenOff upto = gen_release(&g->j->req.stops, g->text.ptr, g->text.len, piece, n, plain_stream_pos,
                                         &thinking, &stop_scan_from, &hit_stop, &stop_pos, &stop_len);
         if (hit_stop) return false;
         if (gen_streams_plain(g) && upto > plain_stream_pos) plain_stream_pos = upto;
@@ -2052,7 +2056,7 @@ int gen_turn_draft_prefix_text(gen_state *g, const char *const *pieces, const si
     if (n <= 0 || !req->single_tool_call || req->kind != REQ_CHAT || !req->has_tools || !g->parser_st) return n;
     gen_walk w(g);
     for (int i = 0; i <= n; i++) {   /* pieces[0] is the base, pieces[i] draft i - 1 */
-        size_t end = 0;
+        GenOff end{0};
         if (!pieces[i] || !w.step(pieces[i], piece_lens[i])) break;
         if (g->parser->turn_complete(w.probe, g, &end)) return i;
     }
@@ -2130,17 +2134,19 @@ bool server::gen_emit_piece(gen_state *g, int token, const char *piece, size_t p
                    "distribution after %d tokens; logprobs dropped for this request",
                    g->ctx_span, g->completion);
     }
-    size_t stop_pos = 0, stop_len = 0;
+    GenOff stop_pos{0};
+    size_t stop_len = 0;
     bool hit_stop = false;
     const bool was_inside = g->thinking.inside;   /* L344: the token's side of the block */
-    const size_t stream_len = gen_release(&j->req.stops, g->text.ptr, g->text.len, piece, piece_len,
+    const GenOff stream_len = gen_release(&j->req.stops, g->text.ptr, g->text.len, piece, piece_len,
                                           g->plain_stream_pos, &g->thinking, &g->stop_scan_from,
                                           &hit_stop, &stop_pos, &stop_len);
     think_budget_note(g, was_inside);
     reasoning_usage_note(g, was_inside);   /* L417 */
 
     if (gen_streams_plain(g) && stream_len > g->plain_stream_pos) {
-        char *delta = server_xstrndup(g->text.ptr + g->plain_stream_pos, stream_len - g->plain_stream_pos);
+        char *delta = server_xstrndup(gen_text_at(g->text.ptr, g->plain_stream_pos),
+                                      (stream_len - g->plain_stream_pos).raw());
         bool ok = sse_chunk(j->fd, &j->req, g->id, delta, NULL);
         free(delta);
         if (!ok) {
@@ -2174,9 +2180,9 @@ bool server::gen_emit_piece(gen_state *g, int token, const char *piece, size_t p
 
     if (hit_stop) {
         free(g->stop_sequence);
-        g->stop_sequence = server_xstrndup(g->text.ptr + stop_pos, stop_len);
+        g->stop_sequence = server_xstrndup(gen_text_at(g->text.ptr, stop_pos), stop_len);
         g->finish = "stop";
-        g->text.len = stop_pos;
+        g->text.len = stop_pos.raw();
         g->text.ptr[g->text.len] = '\0';
         /* L372: no invalidate here.  The bank keeps the tokens through the stop string; the next request's sync
          * matches its prompt against them and resumes below where they part, as after any turn.  The call acted on
@@ -2198,12 +2204,13 @@ bool server::gen_emit_piece(gen_state *g, int token, const char *piece, size_t p
  * and the turn is marked (gen_state::turn_cut_short) so that nothing is appended to that history blind. */
 bool gen_turn_complete(gen_state *g) {
     const request *r = &g->j->req;
-    size_t end = g->text.len;
+    const GenOff text_end = gen_text_end(g->text.len);
+    GenOff end = text_end;
     if (r->kind != REQ_CHAT || !r->has_tools || !g->parser->turn_complete(g->parser_st, g, &end)) return false;
-    if (end > g->text.len) pulsar_die("output parser: the turn ends past its text");
-    if (end < g->text.len) {
-        g->text.len = end;
-        g->text.ptr[end] = '\0';
+    if (end > text_end) pulsar_die("output parser: the turn ends past its text");
+    if (end < text_end) {
+        g->text.len = end.raw();
+        g->text.ptr[end.raw()] = '\0';
         g->turn_cut_short = true;   /* the bank holds this token whole: no live continuation from it (gen_step_finish) */
     }
     g->finish = "tool_calls";
@@ -2308,8 +2315,9 @@ void server::gen_step_finish(session_slot *sl) {
                             &g->last_decode_log_completion);
     }
 
-    if (j->req.stream && !g->structured_stream && g->text.len > g->plain_stream_pos) {
-        char *tail = server_xstrndup(g->text.ptr + g->plain_stream_pos, g->text.len - g->plain_stream_pos);
+    if (j->req.stream && !g->structured_stream && gen_text_end(g->text.len) > g->plain_stream_pos) {
+        char *tail = server_xstrndup(gen_text_at(g->text.ptr, g->plain_stream_pos),
+                                     (gen_text_end(g->text.len) - g->plain_stream_pos).raw());
         if (!sse_chunk(j->fd, &j->req, g->id, tail, NULL)) g->finish = "error";
         free(tail);
     }
@@ -2450,7 +2458,7 @@ void server::gen_step_finish(session_slot *sl) {
              * flushes what it held back; a Qwen turn's parser already did -- then
              * the protocol's finish, which sends any calls not yet streamed. */
             const int completion = g->completion_total + g->completion;
-            response_ok = stream_ok && g->parser->feed(g->parser_st, s, g, g->text.len, true);
+            response_ok = stream_ok && g->parser->feed(g->parser_st, s, g, gen_text_end(g->text.len), true);
             /* L420: a turn that answers with its reasoning sends it once more, as content */
             response_ok = response_ok && turn_stream_reasoning_answer(g, &turn);
             if (response_ok && j->req.api == API_ANTHROPIC) {

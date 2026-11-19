@@ -1592,8 +1592,8 @@ static void test_tool_call_quality_one(void) {
         buf_append(&g.text, piece, piece_len);
         g.thinking.feed(piece, piece_len);
         free(piece);
-        if (!ops->feed(ps, &srv, &g, g.text.len, false)) { decode_ok = false; break; }
-        size_t turn_end = g.text.len;   /* L428: where the turn ends (its whole text: no single-call request here) */
+        if (!ops->feed(ps, &srv, &g, gen_text_end(g.text.len), false)) { decode_ok = false; break; }
+        GenOff turn_end = gen_text_end(g.text.len);   /* L428: where the turn ends (its whole text: no single-call request here) */
         if (ops->turn_complete(ps, &g, &turn_end)) {
             g.finish = "stop";
             break;

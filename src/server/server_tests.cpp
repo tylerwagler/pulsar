@@ -2142,8 +2142,9 @@ static void greedy_rows_run(const greedy_rows_case &c, bool with_stop) {
     auto emit = [&](gen_state *g, int k) {
         buf_append(&g->text, pieces[(size_t)k].data(), pieces[(size_t)k].size());
         bool hit = false;
-        size_t sp = 0, sl = 0;
-        const size_t upto = gen_release(&j.req.stops, g->text.ptr, g->text.len, pieces[(size_t)k].data(),
+        GenOff sp{0};
+        size_t sl = 0;
+        const GenOff upto = gen_release(&j.req.stops, g->text.ptr, g->text.len, pieces[(size_t)k].data(),
                                         pieces[(size_t)k].size(), g->plain_stream_pos, &g->thinking,
                                         &g->stop_scan_from, &hit, &sp, &sl);
         TEST_ASSERT(!hit);
@@ -3238,7 +3239,7 @@ static void test_broken_call_one_rule_every_family(void) {
         for (const char *p = c.raw; *p; p++) {   /* a token at a time */
             buf_append(&g.text, p, 1);
             g.thinking.feed(p, 1);
-            r->family->output->feed(ps, &srv, &g, g.text.len, false);
+            r->family->output->feed(ps, &srv, &g, gen_text_end(g.text.len), false);
         }
         g.finish = c.gen_finish;
         server_turn turn;
@@ -5039,7 +5040,7 @@ static l428_run l428_turn(server *srv, const l303_vocab &v, pulsar_chat_format f
     if (r->force_tool_call && r->family->forced_call_seed) {
         r->family->forced_call_seed(r, &g->text);
         if (g->parser->seed) g->parser->seed(g->parser_st, g);
-        g->plain_stream_pos = g->text.len;
+        g->plain_stream_pos = gen_text_end(g->text.len);
     }
     TEST_ASSERT(gen_constrain_begin(srv, g));
     res.gated = g->gate != NULL;
@@ -5077,7 +5078,7 @@ static l428_run l428_turn(server *srv, const l303_vocab &v, pulsar_chat_format f
     }
     r->timings.valid = true;
     if (stream) {
-        TEST_ASSERT(g->parser->feed(g->parser_st, srv, g, g->text.len, true));
+        TEST_ASSERT(g->parser->feed(g->parser_st, srv, g, gen_text_end(g->text.len), true));
         if (api == API_ANTHROPIC)
             TEST_ASSERT(anthropic_sse_finish(&g->sink, &turn.calls, turn.finish, g->stop_sequence, g->completion));
         else if (api == API_RESPONSES)
@@ -5363,7 +5364,7 @@ static void test_l428_turn_ends_at_its_first_call(void) {
         const size_t lens2[3] = {pieces[11].size(), pieces[12].size(), pieces[13].size()};
         TEST_ASSERT(gen_turn_draft_prefix_text(g, chain2, lens2, 2) == 0);
         /* the walk left the attempt where it was: the call is still open, and its close still ends the turn */
-        size_t end = 0;
+        GenOff end{0};
         TEST_ASSERT(!g->parser->turn_complete(g->parser_st, g, &end));
         TEST_ASSERT(srv.gen_emit_piece(g, 0, pieces[11].data(), pieces[11].size()));
         TEST_ASSERT(!strcmp(g->finish, "tool_calls") && g->completion == 12);
@@ -5679,7 +5680,7 @@ static bool l430_start(l430_side *s, server *srv, const l430_cfg &c, const std::
     if (r->force_tool_call && r->family->forced_call_seed) {
         r->family->forced_call_seed(r, &g->text);
         if (g->parser->seed) g->parser->seed(g->parser_st, g);
-        g->plain_stream_pos = g->text.len;
+        g->plain_stream_pos = gen_text_end(g->text.len);
     }
     return true;
 }
@@ -5717,19 +5718,21 @@ static l430_state l430_read(l430_side *s) {
     st.finish = g->finish;
     st.think_tail.assign(g->thinking.tail, (size_t)g->thinking.tail_len);
     st.stop_sequence = g->stop_sequence ? g->stop_sequence : "";
-    st.plain_stream_pos = g->plain_stream_pos;
+    st.plain_stream_pos = g->plain_stream_pos.raw();   /* L437: the state compares the raw values, as before */
     st.completion = g->completion;
     st.stopped = s->stopped;
     st.cut_short = g->turn_cut_short;
     st.thinking = g->thinking.inside;
     st.in_tool_call = g->parser->in_tool_call(g->parser_st, g);
-    st.turn_complete = g->parser->turn_complete(g->parser_st, g, &st.end);
+    GenOff end{0};
+    st.turn_complete = g->parser->turn_complete(g->parser_st, g, &end);
+    st.end = end.raw();
     st.wire = s->wire.size();
     if (g->parser->probe_new == parser_kit_probe_new) {
         const kit_gen *q = (const kit_gen *)g->parser_st;
-        st.fed = q->fed;
+        st.fed = q->fed.raw();
         st.cut = q->cut;
-        st.cut_at = q->cut_at;
+        st.cut_at = q->cut_at.raw();
         st.calls = q->calls.len;
         st.errors = q->parser->errors();
         st.in_call = q->parser->in_tool_call();
@@ -5774,7 +5777,7 @@ static void l430_finish(l430_side *s, server *srv, std::string *out) {
                 (turn.calls.v[i].arguments ? turn.calls.v[i].arguments : "(null)");
     r->timings.valid = true;
     if (g->structured_stream) {
-        TEST_ASSERT(g->parser->feed(g->parser_st, srv, g, g->text.len, true));
+        TEST_ASSERT(g->parser->feed(g->parser_st, srv, g, gen_text_end(g->text.len), true));
         TEST_ASSERT(openai_sse_finish(&g->sink, &turn.calls, turn.finish, 10, g->completion));
     } else if (!r->stream) {
         TEST_ASSERT(final_response(s->sv[0], r, g->id, turn.content, turn.reasoning, &turn.calls, turn.finish, 10,
@@ -5841,7 +5844,7 @@ static bool l430_one_turn(server *srv, l430_rng *r, const l430_cfg &c, l430_coun
         return false;
     };
     bool ok = true;
-    size_t a_from = a.g->stop_scan_from;   /* where side A's next stop scan starts */
+    size_t a_from = a.g->stop_scan_from.raw();   /* where side A's next stop scan starts */
     if (!(l430_read(&a) == l430_read(&b))) ok = differ("the two sides start apart", 0);
     for (int pos = 0; ok && pos < nt && !a.stopped;) {
         /* the round: its tokens not yet streamed -- the base unless it went out before the forward, then drafts */
@@ -5933,17 +5936,17 @@ static bool l430_one_turn(server *srv, l430_rng *r, const l430_cfg &c, l430_coun
             std::string grown(b.g->text.ptr ? b.g->text.ptr : "", b.g->text.len);
             grown += t;
             thinking_state think = b.g->thinking;
-            size_t from = b.g->stop_scan_from, sp = 0, sl = 0;
+            size_t from = b.g->stop_scan_from.raw(), sp = 0, sl = 0;
             bool hit = false;
             if (b.j.req.stops.len) {
                 n->scanned_old += (long)(grown.size() - std::min(from, grown.size()));
                 n->scanned_new += (long)(grown.size() - std::min(a_from, grown.size()));
             }
-            gen_release_ref(&b.j.req.stops, grown.c_str(), grown.size(), t.data(), t.size(), b.g->plain_stream_pos,
-                            &think, &from, &hit, &sp, &sl);
+            gen_release_ref(&b.j.req.stops, grown.c_str(), grown.size(), t.data(), t.size(),
+                            b.g->plain_stream_pos.raw(), &think, &from, &hit, &sp, &sl);
             b.stopped = srv->gen_emit_piece(b.g, 0, t.data(), t.size());
-            b.g->stop_scan_from = from;
-            a_from = a.g->stop_scan_from;
+            b.g->stop_scan_from = GenOff{from};
+            a_from = a.g->stop_scan_from.raw();
             n->tokens++;
             const bool b_hit = b.stopped && !strcmp(b.g->finish, "stop");
             if (hit != b_hit || (hit && (b.g->text.len != sp || grown.substr(sp, sl) != b.g->stop_sequence)))
@@ -6113,8 +6116,8 @@ static bool l431_one_stream(l430_rng *r, l431_counts *n, std::string *why) {
         }
         const size_t up_old = gen_release_ref(&stops, sofar.c_str(), sofar.size(), toks[k].data(), toks[k].size(), sent_old,
                                               &t_old, &from_old, &hit_old, &pos_old, &len_old);
-        const size_t up_new = gen_release(&stops, sofar.c_str(), sofar.size(), toks[k].data(), toks[k].size(), sent_new,
-                                          &t_new, &from_new, &hit_new, &pos_new, &len_new);
+        const size_t up_new = gen_release_bare(&stops, sofar.c_str(), sofar.size(), toks[k].data(), toks[k].size(),
+                                               sent_new, &t_new, &from_new, &hit_new, &pos_new, &len_new);
         n->tokens++;
         was_inside = was_inside || t_new.inside;
         n->closes += inside_before && !t_new.inside;
@@ -6170,8 +6173,8 @@ static void test_l431_stop_scan_matches_reference(void) {
             const size_t up_old = gen_release_ref(&stops, sofar.c_str(), sofar.size(), "word ", 5, 0, &t_old, &from_old,
                                                   &hit, &pos, &len);
             TEST_ASSERT(!hit && up_old == sofar.size());
-            const size_t up_new = gen_release(&stops, sofar.c_str(), sofar.size(), "word ", 5, 0, &t_new, &from_new, &hit,
-                                              &pos, &len);
+            const size_t up_new = gen_release_bare(&stops, sofar.c_str(), sofar.size(), "word ", 5, 0, &t_new, &from_new,
+                                                   &hit, &pos, &len);
             TEST_ASSERT(!hit && up_new == sofar.size());
         }
         TEST_ASSERT(from_old == 0);                 /* the old resume point never moved: every scan read the turn */
@@ -6182,7 +6185,7 @@ static void test_l431_stop_scan_matches_reference(void) {
         size_t pos_new = 0, len_new = 0;
         bool hit_new = false;
         gen_release_ref(&stops, sofar.c_str(), sofar.size(), "end.", 4, 0, &t_old, &from_old, &hit, &pos, &len);
-        gen_release(&stops, sofar.c_str(), sofar.size(), "end.", 4, 0, &t_new, &from_new, &hit_new, &pos_new, &len_new);
+        gen_release_bare(&stops, sofar.c_str(), sofar.size(), "end.", 4, 0, &t_new, &from_new, &hit_new, &pos_new, &len_new);
         TEST_ASSERT(hit && hit_new && pos == sofar.size() - 1 && pos_new == pos && len == 1 && len_new == 1);
         stop_list_clear(&stops);
         free(stops.v);
@@ -6213,6 +6216,39 @@ static std::string l428_json(const std::string &s) {
     std::string out(b.ptr, b.len);
     buf_free(&b);
     return out;
+}
+
+/* L437: the types are the size_t they replaced -- every operation computes what the raw expression did. */
+static void test_l437_offset_units(void) {
+    const size_t vals[] = {0, 1, 2, 7, 4096, 1u << 20, (size_t)1 << 40, SIZE_MAX / 2};
+    for (size_t a : vals) {
+        TEST_ASSERT(GenOff{a}.raw() == a && StreamOff{a}.raw() == a && GenBytes{a}.raw() == a);
+        TEST_ASSERT(GenOff::after(GenBytes{a}).raw() == a && GenOff{a}.before().raw() == a);
+        for (size_t b : vals) {
+            const GenOff x{a}, y{b};
+            TEST_ASSERT((x < y) == (a < b) && (x <= y) == (a <= b) && (x > y) == (a > b) && (x >= y) == (a >= b));
+            TEST_ASSERT((x == y) == (a == b) && (x != y) == (a != b));
+            if (a + b != SIZE_MAX) {   /* a sum that would be none() is fatal by design */
+                TEST_ASSERT((x + GenBytes{b}).raw() == a + b);
+                GenOff z = x;
+                z += GenBytes{b};
+                TEST_ASSERT(z.raw() == a + b);
+                z -= GenBytes{b};
+                TEST_ASSERT(z == x);
+                StreamOff st{a};
+                st += GenBytes{b};
+                TEST_ASSERT(st.raw() == a + b && (st - StreamOff{a}).raw() == b);
+            }
+            if (a >= b) TEST_ASSERT((x - y).raw() == a - b && (x - GenBytes{b}).raw() == a - b);
+            TEST_ASSERT((GenBytes{a} + GenBytes{b}).raw() == a + b && (GenBytes{a} < GenBytes{b}) == (a < b));
+        }
+    }
+    TEST_ASSERT(GenOff{}.raw() == 0 && StreamOff{}.raw() == 0 && GenBytes{}.raw() == 0);   /* value-initialised: zero */
+    gen_state g;
+    memset((void *)&g, 0, sizeof g);   /* a zeroed attempt's cursors are offset 0, as the size_t fields were */
+    TEST_ASSERT(g.plain_stream_pos == GenOff{0} && g.stop_scan_from == GenOff{0});
+    const char text[] = "0123456789";
+    TEST_ASSERT(gen_text_end(10) == GenOff{10} && gen_text_at(text, GenOff{4}) == text + 4);
 }
 
 /* L428, the prefix: after a turn the server ended at its first call, the bank holds the prompt and the turn's tokens
@@ -6401,7 +6437,7 @@ static l420_result l420_run(const l420_case &c) {
     for (const char *p = c.raw; *p; p++) {   /* a token at a time */
         buf_append(&g->text, p, 1);
         g->thinking.feed(p, 1);
-        TEST_ASSERT(r->family->output->feed(ps, &srv, g, g->text.len, false));
+        TEST_ASSERT(r->family->output->feed(ps, &srv, g, gen_text_end(g->text.len), false));
     }
     g->finish = c.gen_finish;
     g->abandoned = c.abandoned;
@@ -6419,7 +6455,7 @@ static l420_result l420_run(const l420_case &c) {
     r->timings.valid = true;
     r->timings.reasoning_as_content = turn.reasoning_answer;
     if (c.stream) {
-        TEST_ASSERT(r->family->output->feed(ps, &srv, g, g->text.len, true));
+        TEST_ASSERT(r->family->output->feed(ps, &srv, g, gen_text_end(g->text.len), true));
         TEST_ASSERT(turn_stream_reasoning_answer(g, &turn));
         if (c.api == API_ANTHROPIC)
             TEST_ASSERT(anthropic_sse_finish(&g->sink, &turn.calls, turn.finish, g->stop_sequence, 5));
@@ -21044,33 +21080,12 @@ static_assert(std::is_same_v<decltype(GenOff{}.raw()), size_t> && std::is_same_v
                   (StreamOff{9} - GenBytes{4}).raw() == 5 && GenOff::after(GenBytes{7}).raw() == 7 &&
                   GenOff{7}.before().raw() == 7,
               "constexpr, size_t's arithmetic; none() is the SIZE_MAX / npos the size_t fields carried");
-/* L437: the types are the size_t they replaced -- every operation computes what the raw expression did. */
-static void test_l437_offset_units(void) {
-    const size_t vals[] = {0, 1, 2, 7, 4096, 1u << 20, (size_t)1 << 40, SIZE_MAX / 2};
-    for (size_t a : vals) {
-        TEST_ASSERT(GenOff{a}.raw() == a && StreamOff{a}.raw() == a && GenBytes{a}.raw() == a);
-        TEST_ASSERT(GenOff::after(GenBytes{a}).raw() == a && GenOff{a}.before().raw() == a);
-        for (size_t b : vals) {
-            const GenOff x{a}, y{b};
-            TEST_ASSERT((x < y) == (a < b) && (x <= y) == (a <= b) && (x > y) == (a > b) && (x >= y) == (a >= b));
-            TEST_ASSERT((x == y) == (a == b) && (x != y) == (a != b));
-            if (a + b != SIZE_MAX) {   /* a sum that would be none() is fatal by design */
-                TEST_ASSERT((x + GenBytes{b}).raw() == a + b);
-                GenOff z = x;
-                z += GenBytes{b};
-                TEST_ASSERT(z.raw() == a + b);
-                z -= GenBytes{b};
-                TEST_ASSERT(z == x);
-                StreamOff st{a};
-                st += GenBytes{b};
-                TEST_ASSERT(st.raw() == a + b && (st - StreamOff{a}).raw() == b);
-            }
-            if (a >= b) TEST_ASSERT((x - y).raw() == a - b && (x - GenBytes{b}).raw() == a - b);
-            TEST_ASSERT((GenBytes{a} + GenBytes{b}).raw() == a + b && (GenBytes{a} < GenBytes{b}) == (a < b));
-        }
-    }
-    TEST_ASSERT(GenOff{}.raw() == 0 && StreamOff{}.raw() == 0 && GenBytes{}.raw() == 0);   /* value-initialised: zero */
-}
+static_assert(std::is_same_v<decltype(gen_state{}.plain_stream_pos), GenOff> &&
+                  std::is_same_v<decltype(gen_state{}.stop_scan_from), GenOff> &&
+                  std::is_same_v<decltype(kit_gen{}.fed), GenOff> && std::is_same_v<decltype(kit_gen{}.cut_at), GenOff> &&
+                  std::is_same_v<decltype(kit_gen{}.call_end), GenOff> &&
+                  std::is_same_v<decltype(kit_gen{}.tail_at), GenBytes>,
+              "the turn's cursors and the kit's are offsets of the turn's text, the call_tail's is a length");
 
 /* L334 fix: what a state at live position G serves of the request across a token seam -- the conversion both the
  * bank's own resume (pulsar_session_bank_resume_at) and an adopt's rank (pulsar_session_bank_adopt_score) now read.
