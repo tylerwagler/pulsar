@@ -135,7 +135,7 @@ Chat models (`src/server/http_server.cpp`):
 | `GET /version` | `{version, engine, cuda_arch, model, model_name, context}` |
 | `GET /` | `{service, version, status, endpoints[]}` |
 | `GET /metrics` | Prometheus text. |
-| `GET /metrics/stream` | SSE. Each event carries only a generation number; fetch `/metrics` when it moves. At most 8 subscribers. |
+| `GET /metrics/stream` | SSE change feed. Each event carries only a generation number; fetch `/metrics` when one arrives. At most 5 events a second, a change framed within 200 ms, a refresh every 5 s while quiet; at most 8 subscribers. See [The metrics stream](#the-metrics-stream-get-metricsstream). |
 | `OPTIONS *` | 204 |
 
 The encoder and Parse families serve a different surface
@@ -776,8 +776,71 @@ Everything else is in the `pulsar:` namespace. The main groups:
   calibration), and the round phase timers.
 - **Qwen PLE read-ahead:** `pulsar:ple_read_ahead_*`.
 
-`/metrics` and `/health` read a snapshot the worker publishes once per round.
-They never call into the engine.
+`/metrics` and `/health` read a snapshot the worker publishes after a bind,
+once per round, per prefill chunk and after each `/v1/systemone` step. They
+never call into the engine.
+
+### The metrics stream (`GET /metrics/stream`)
+
+A Server-Sent Events feed that tells a client when to read `/metrics`, so a
+dashboard does not poll (a poll here is a connection and a thread). Every frame
+is the same shape and carries no metric:
+
+```
+event: metrics
+data: {"generation":4127,"t":1712345678.912}
+```
+
+`generation` is a counter that moves when something `/metrics` reports has
+changed; `t` is the server's wall clock when the frame was written. The stream
+sends nothing else: no comments, no other event.
+
+**What moves the generation.** Every request kind, not only chat generations:
+
+- the worker's snapshot: after a request binds to a bank, once per decode round,
+  per prefill chunk, after a terminal checkpoint, and after every step of a
+  `/v1/systemone` request (each chunk it prefills, its end, its refusal);
+- every counter bumped off the worker's rounds: each `pulsar:refused_503_total`
+  cause on whichever thread refuses (the connection cap on the accept thread,
+  a busy parse, shutdown, a `/v1/systemone` refusal), the per-class request
+  count at acceptance, spills, restores and preemptions;
+- a request entering the queue, and a queued request being refused admission
+  (`pulsar:admission_refusals_total`, `pulsar:queue_blocked_reason`) when the
+  refusal or the reason is new, not on each retry;
+- the end of every `POST`, whatever its answer (200, 4xx, 503);
+- a stall beginning or ending (`pulsar:worker_stalled_seconds`).
+
+A `GET` moves nothing.
+
+**When a frame is sent.** Per subscriber:
+
+- The first frame is sent on connect, with the current generation.
+- **Rate bound:** two frames are at least 200 ms apart, so a subscriber is sent
+  at most 5 frames a second under any load (40 a second across the 8
+  subscribers). Changes inside a window coalesce into one frame, which carries
+  the newest generation.
+- **Staleness bound:** a change is followed within 200 ms by a frame whose
+  generation includes it. The frame after a burst is the final state: read
+  `/metrics` on it and no counter is behind. (The bound is the server's
+  decision to write; a client that is not reading its socket delays only
+  itself.)
+- **Refresh:** a subscriber sent nothing for 5 s is sent a frame with the
+  generation unchanged and a new `t`. Nothing was counted in between, but some
+  gauges are sampled when `/metrics` is read and drift with no request
+  (`pulsar:mem_reconcile_residual_bytes`, the seconds of a stall), so a client
+  that shows those reads again; a client that only tracks counters may skip a
+  frame whose generation it has seen. The refresh is also the proof of life: a
+  stream silent for much longer than 5 s is a dead connection. An idle server
+  therefore sends one frame every 5 s and nothing else.
+
+A client needs two reads of `/metrics` before it can show a rate. On an idle
+server the second read comes with the first refresh, 5 s after connecting.
+
+The stream ends when the server shuts down. A ninth subscriber is refused with
+503 and should poll `/metrics` instead.
+
+The encoder and Parse server (`/v1/embeddings`, `/v1/rerank`, `/v1/parse`)
+serves neither `/metrics` nor `/metrics/stream`; its state is `GET /health`.
 
 ## Tensor parallelism
 

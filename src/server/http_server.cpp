@@ -1445,83 +1445,55 @@ bool server::send_metrics(int fd) {
  * thread per connection against a client cap shared with real requests, so a
  * 20 Hz scraper costs twenty handshakes and twenty thread creations per second
  * on the machine it is measuring. One stream subscriber costs one thread for
- * the life of the subscription and nothing at all in between.
+ * the life of the subscription and, in between, a look at one counter five
+ * times a second.
  *
  * The event carries the generation and nothing else. Shipping the exposition
  * body on every publish would be ~12 KiB per event, worse than the polling it
- * replaces, so the client fetches /metrics itself when the generation moves —
- * once per publish instead of twenty times per publish. */
+ * replaces, so the client fetches /metrics itself when a frame arrives.
+ *
+ * L432: when a frame is sent is lib/pulsar_metrics_stream.h's rule, not this
+ * loop's. Before it the stream sent one frame per snapshot publish and nothing
+ * else, and only a chat generation published: a server that answered
+ * /v1/systemone requests or refusals all day sent its subscribers one frame at
+ * connect and keepalive comments after it. Now every change marks the feed, a
+ * subscriber is sent at most five frames a second with the last change never
+ * left unframed, and a quiet one is sent a refresh frame instead of a comment. */
 
-/// The /metrics/stream loop: one "event: metrics" frame per new generation, an SSE keepalive comment after
-/// `keepalive_ms` without one.  Client thread; waits on `cv` under `mu`, writes with `mu` released.
-/// @param fd            the client socket
-/// @param mu            the mutex guarding `generation` and `stop` (server::mu)
-/// @param cv            broadcast on every publish and at shutdown (server::stream_cv)
-/// @param generation    the publish counter (server::metrics_generation)
-/// @param stop          set at shutdown (server::stopping)
-/// @param keepalive_ms  the idle interval before a keepalive, ms
+/// The /metrics/stream loop: an "event: metrics" frame when the generation moved (rate-bounded) and one with the
+/// generation unchanged after `pace->refresh_ms` of quiet.  Client thread; waits on `cv` under `mu`
+/// (pulsar_metrics_stream_next), writes with `mu` released.
+/// @param fd          the client socket
+/// @param mu          the mutex guarding `stop` (server::mu)
+/// @param cv          broadcast on every snapshot publish and at shutdown (server::stream_cv)
+/// @param generation  the feed's counter (server::metrics_generation)
+/// @param stop        set at shutdown (server::stopping)
+/// @param pace        the frames' pace
 /// @return true when `stop` ended the stream, false when a write failed (the client went away)
 bool metrics_stream_pump(int fd, pthread_mutex_t *mu, pthread_cond_t *cv,
                          const unsigned long long *generation, const bool *stop,
-                         int keepalive_ms) {
-    unsigned long long last = 0;
-    bool sent = false;
+                         const pulsar_metrics_stream_pace *pace) {
+    pulsar_metrics_stream_cursor cur = {};
 
     for (;;) {
-        bool keepalive = false;
-        unsigned long long gen;
-
-        pthread_mutex_lock(mu);
-        if (*stop) {
-            pthread_mutex_unlock(mu);
+        unsigned long long gen = 0;
+        if (pulsar_metrics_stream_next(&cur, mu, cv, generation, stop, pace, &gen) == PULSAR_METRICS_STREAM_STOP)
             return true;
-        }
-        gen = *generation;
-
-        if (sent && gen == last) {
-            /* Nothing published since the last frame. Wait for the worker to
-             * publish, or for long enough that the connection has to be
-             * proved still alive — whichever comes first. */
-            struct timespec deadline;
-            clock_gettime(CLOCK_REALTIME, &deadline);
-            deadline.tv_sec += keepalive_ms / 1000;
-            deadline.tv_nsec += (long)(keepalive_ms % 1000) * 1000000L;
-            if (deadline.tv_nsec >= 1000000000L) {
-                deadline.tv_sec += 1;
-                deadline.tv_nsec -= 1000000000L;
-            }
-            pthread_cond_timedwait(cv, mu, &deadline);
-
-            if (*stop) {
-                pthread_mutex_unlock(mu);
-                return true;
-            }
-            gen = *generation;
-            keepalive = (gen == last);
-        }
-        pthread_mutex_unlock(mu);
 
         /* The write happens with mu released, and that is the whole of the
          * no-backpressure argument: send_all bounds itself with its own
          * deadline and returns false for a wedged reader, and while it is
          * waiting no lock is held, so the worker publishing the next snapshot
-         * never queues behind a slow client. */
+         * never queues behind a slow client. A change and a refresh are the
+         * same frame: the refresh repeats the generation with a new `t`. */
         buf b = {0};
-        if (keepalive) {
-            /* An SSE comment: every parser skips it, and it keeps the socket
-             * warm through proxy idle timeouts. */
-            buf_puts(&b, ": keepalive\n\n");
-        } else {
-            struct timespec now;
-            clock_gettime(CLOCK_REALTIME, &now);
-            buf_puts(&b, "event: metrics\ndata: {\"generation\":");
-            buf_printf(&b, "%llu", gen);
-            buf_puts(&b, ",\"t\":");
-            buf_printf(&b, "%.3f", (double)now.tv_sec + (double)now.tv_nsec / 1e9);
-            buf_puts(&b, "}\n\n");
-            last = gen;
-            sent = true;
-        }
+        struct timespec now;
+        clock_gettime(CLOCK_REALTIME, &now);
+        buf_puts(&b, "event: metrics\ndata: {\"generation\":");
+        buf_printf(&b, "%llu", gen);
+        buf_puts(&b, ",\"t\":");
+        buf_printf(&b, "%.3f", (double)now.tv_sec + (double)now.tv_nsec / 1e9);
+        buf_puts(&b, "}\n\n");
         bool ok = send_all(fd, b.ptr, b.len);
         buf_free(&b);
         if (!ok) return false;   /* client gone, or shutdown: send_all checks */
@@ -1548,9 +1520,10 @@ bool server::send_metrics_stream(int fd) {
 
     bool ok = sse_headers(fd);
     if (ok) {
+        static const pulsar_metrics_stream_pace pace = {PULSAR_METRICS_STREAM_MIN_INTERVAL_MS,
+                                                        PULSAR_METRICS_STREAM_REFRESH_MS};
         ok = metrics_stream_pump(fd, &s->mu, &s->stream_cv,
-                                 &s->metrics_generation, &s->stopping,
-                                 PULSAR_METRICS_STREAM_KEEPALIVE_MS);
+                                 &s->metrics_generation, &s->stopping, &pace);
     }
 
     pthread_mutex_lock(&s->mu);
@@ -1585,10 +1558,16 @@ void *client_main(void *arg) {
     free(ca);
 
     http_request hr = {0};
+    /* L432: a POST may move what /metrics reports off the worker's quantum and off count_metric -- a grammar
+     * compile's counters, the X-Pulsar-KV counts, a /v1/systemone answer after the worker's own publish -- so each one
+     * marks the stream's feed as its thread leaves.  A GET changes nothing; a GET /metrics that marked would have
+     * every subscriber read /metrics again for ever. */
+    bool posted = false;
     if (!read_http_request(fd, &hr)) {
         http_error(fd, 400, "bad HTTP request");
         goto done;
     }
+    posted = !strcmp(hr.method, "POST");
 
     if (!strcmp(hr.method, "OPTIONS")) {
         http_response(fd, 204, NULL, "");
@@ -1844,6 +1823,7 @@ void *client_main(void *arg) {
     request_free(&j.req);
 done:
     close(fd);
+    if (posted) s->metrics_mark();
     s->client_done();
     return NULL;
 }

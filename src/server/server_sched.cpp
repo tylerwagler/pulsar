@@ -47,6 +47,7 @@ bool server::enqueue(job *j) {
     s->n_queued++;
     pthread_cond_signal(&s->cv);
     pthread_mutex_unlock(&s->mu);
+    s->metrics_mark();   /* L432: num_requests_waiting moved, and a head the worker cannot bind publishes nothing */
     return true;
 }
 
@@ -2023,8 +2024,10 @@ void server::publish_metrics_snapshot() {
      * rather than a payload comparison on purpose: "did anything move" over a
      * dozen fields is exactly the check pulsar-gui got wrong, because the
      * derived rates are window-relative and differ on every sample even when
-     * nothing happened. The worker already knows when it published. */
-    s->metrics_generation++;
+     * nothing happened. The worker already knows when it published. The wake
+     * only makes the frame prompt: a subscriber inside its rate window goes
+     * back to waiting, one that is not sends now (L432). */
+    s->metrics_mark();
     pthread_cond_broadcast(&s->stream_cv);
     pthread_mutex_unlock(&s->mu);
 }
@@ -2060,12 +2063,15 @@ void server::observe_request_timings(const req_timings *t, double e2e_s) {
 /* Bump a /metrics counter under mu: the lock is what keeps the value coherent
  * for send_metrics reading on a client thread (a client thread may bump one too,
  * L249 D's per-class counts at acceptance).  Never called with mu already held —
- * the mutex is not recursive. */
+ * the mutex is not recursive.  L432: and mark the stream's feed -- a counter
+ * bumped off the worker's quantum (a 503 on a client or the accept thread, a
+ * spill for a /v1/systemone chunk) reached no subscriber before. */
 void server::count_metric(uint64_t *counter) {
     auto *s = this;
     pthread_mutex_lock(&s->mu);
     (*counter)++;
     pthread_mutex_unlock(&s->mu);
+    s->metrics_mark();
 }
 
 
@@ -2441,12 +2447,18 @@ void server::note_provision_refusal(job *j, provision_refusal refusal) {
     pthread_mutex_lock(&s->mu);
     /* Waiting on a busy owner slot is not an admission refusal, so report the
      * queue as unblocked rather than leaving the previous reason standing. */
-    s->m_queue_block_reason = countable ? (int)refusal + 1 : 0;
+    const int reason = countable ? (int)refusal + 1 : 0;
+    bool moved = s->m_queue_block_reason != reason;
+    s->m_queue_block_reason = reason;
     if (countable && j->refusal_counted != refusal) {
         j->refusal_counted = refusal;
         s->m_refusals[refusal]++;
+        moved = true;
     }
     pthread_mutex_unlock(&s->mu);
+    /* L432: with nothing running the worker retries the head without publishing, so the refusal marks the stream's
+     * feed itself -- when the gauge or the count moved, not on each retry */
+    if (moved) s->metrics_mark();
 }
 
 

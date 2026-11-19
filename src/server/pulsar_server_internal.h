@@ -20,6 +20,7 @@
 #include "pulsar_dsml.h"
 #include "pulsar_utf8.h"
 #include "pulsar_stall.h"
+#include "pulsar_metrics_stream.h"
 /* The JSON scanner is shared with the engine's safetensors reader, so it lives
  * in src/lib and is declared there. */
 #include "pulsar_json.h"
@@ -103,11 +104,18 @@
 /// Concurrent /metrics/stream subscribers; past it a stream is refused 503.
 #define PULSAR_SERVER_MAX_STREAMS 8
 
-/* Silence on the stream for this long means the connection is unverified, so
- * the pump sends an SSE comment. Comfortably inside the idle timeouts of the
- * proxies and NATs this is expected to run behind. */
-/// Silence on /metrics/stream after which the pump sends an SSE comment, ms.
-#define PULSAR_METRICS_STREAM_KEEPALIVE_MS 15000
+/* L432: the pace of one subscriber's frames (lib/pulsar_metrics_stream.h has the rule).  200 ms is five frames a
+ * second at most -- a subscriber answers each frame with a GET /metrics, a connection and a thread here -- and the
+ * longest a change waits for its frame; pulsar-gui's history series samples every 250 ms. */
+/// Two /metrics/stream frames to one subscriber are at least this far apart, and a change is framed within it, ms.
+#define PULSAR_METRICS_STREAM_MIN_INTERVAL_MS 200
+/* A subscriber sent nothing for this long is sent the unchanged generation again: the gauges /metrics samples as it
+ * is read (memory, disk space, a stall's seconds) drift with no request, and the frame is the connection's proof
+ * of life.  Comfortably inside the idle timeouts of the proxies and NATs this is expected to run behind. */
+/// Quiet on /metrics/stream after which a subscriber is sent a refresh frame, ms.
+#define PULSAR_METRICS_STREAM_REFRESH_MS 5000
+static_assert(PULSAR_METRICS_STREAM_REFRESH_MS >= PULSAR_METRICS_STREAM_MIN_INTERVAL_MS &&
+              PULSAR_METRICS_STREAM_MIN_INTERVAL_MS > 0, "the stream's pace: refresh >= min interval > 0");
 
 /* Multi-session serving increment 2: the worker steps each job as a resumable
  * state machine in bounded quanta instead of running it to completion. A
@@ -2852,10 +2860,12 @@ struct server {
     pthread_mutex_t mu;          ///< guards the queue, client count, and every published metric
     pthread_cond_t cv;           ///< wakes the worker when a job is enqueued or state changes
     pthread_cond_t clients_cv;   ///< signals shutdown waiters as clients drain
-    /** Broadcast on every metrics publish and once at shutdown, waking
+    /** Broadcast on every snapshot publish and once at shutdown, waking
      * /metrics/stream waiters. Separate from `cv` on purpose: `cv` wakes the
      * single worker thread, and waking it on every metrics publish would spin
-     * it against an empty queue for no reason. */
+     * it against an empty queue for no reason.  A metrics_mark() does not
+     * broadcast: the waiters look at the generation every
+     * PULSAR_METRICS_STREAM_MIN_INTERVAL_MS on their own (L432). */
     pthread_cond_t stream_cv;
     job *head;                   ///< queue head; the next job to bind
     job *tail;                   ///< queue tail; where enqueue appends
@@ -2868,10 +2878,13 @@ struct server {
     time_t started;  ///< wall-clock when the listener came up (uptime for /health)
     int clients;                 ///< connected clients, for the shutdown drain
     int stream_clients;          ///< live /metrics/stream subscribers (under mu)
-    /** Bumped by publish_metrics_snapshot on every publish. A stream client
+    /** The /metrics/stream feed (lib/pulsar_metrics_stream.h): bumped by
+     * publish_metrics_snapshot on every publish and by metrics_mark() wherever
+     * else something /metrics reports has changed (L432). A stream client
      * waits for this to change rather than for anything in the payload: the
      * snapshot is a dozen fields, and comparing it to decide "did anything
-     * move" is exactly the mistake pulsar-gui made and had to undo. */
+     * move" is exactly the mistake pulsar-gui made and had to undo.
+     * Atomic (any thread, no lock): read it with pulsar_metrics_feed_read. */
     unsigned long long metrics_generation;
     /** /metrics scheduler + prefill gauges (all under mu). n_queued = jobs
      * enqueued not yet bound to a slot; n_generating = jobs bound to slots
@@ -3140,6 +3153,10 @@ struct server {
     /// @param fd the client socket
     /// @return false when the client went away or PULSAR_SERVER_MAX_STREAMS streams were already open (503 sent)
     bool send_metrics_stream(int fd);
+    /** L432: say that something /metrics reports has changed, so /metrics/stream subscribers are sent a frame
+     *  (within PULSAR_METRICS_STREAM_MIN_INTERVAL_MS).  One relaxed atomic add: any thread, `mu` held or not, no
+     *  wake.  Call it AFTER the change.  The worker's snapshot (publish_metrics_snapshot) marks by itself. */
+    void metrics_mark() { pulsar_metrics_feed_mark(&metrics_generation); }
     /** Drop the connected-client count and signal anyone waiting on the
      * shutdown drain. Called from client threads. */
     void client_done();
@@ -3948,9 +3965,10 @@ struct server {
     /// @param j        the head job
     /// @param refusal  why it could not bind (PROVISION_OK: the queue is reported unblocked)
     void note_provision_refusal(job *j, provision_refusal refusal);
-    /** Bump a /metrics counter under mu. Worker-thread callers only; the lock is
-     * what keeps the value coherent for send_metrics reading on a client thread.
-     * Never called with mu already held — the mutex is not recursive.
+    /** Bump a /metrics counter under mu, and mark the stream's feed (L432). Any
+     * thread; the lock is what keeps the value coherent for send_metrics reading
+     * on a client thread. Never called with mu already held — the mutex is not
+     * recursive.
      */
     /// @param counter  the server counter to increment
     void count_metric(uint64_t *counter);
@@ -5395,18 +5413,20 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
                                      request *r, char *err, size_t errlen);
 bool send_all(int fd, const void *p, size_t n);
 
-/* Emit one `event: metrics` frame per change of *generation, plus a `: keepalive`
- * comment whenever nothing has changed for keepalive_ms, until the client goes
- * away or *stop becomes true. Return false only when a write failed (the
- * client is gone); a shutdown-driven exit returns true.
+/* Emit `event: metrics` frames as *generation changes -- at the pace's rate at
+ * most, the last change never left unframed -- plus a frame with the unchanged
+ * generation whenever nothing was sent for pace->refresh_ms, until the client
+ * goes away or *stop becomes true (lib/pulsar_metrics_stream.h has the rule).
+ * Return false only when a write failed (the client is gone); a
+ * shutdown-driven exit returns true.
  *
  * Deliberately a free function taking no server and no engine: it is the part
- * with the interesting failure modes — a missed wakeup, a keepalive that never
- * fires, a shutdown that hangs the drain — and this signature is what lets all
- * three be tested over a socketpair without a GPU. */
+ * with the interesting failure modes — a missed change, a quiet connection
+ * never proved alive, a shutdown that hangs the drain — and this signature is
+ * what lets all three be tested over a socketpair without a GPU. */
 bool metrics_stream_pump(int fd, pthread_mutex_t *mu, pthread_cond_t *cv,
                          const unsigned long long *generation, const bool *stop,
-                         int keepalive_ms);
+                         const pulsar_metrics_stream_pace *pace);
 void json_escape(buf *b, const char *s);
 void json_escape_n(buf *b, const char *s, size_t n);
 void json_escape_fragment_n(buf *b, const char *s, size_t n);

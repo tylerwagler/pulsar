@@ -18898,13 +18898,13 @@ typedef struct {
     bool stop;
     bool result;
     bool done;
-    int keepalive_ms;
+    pulsar_metrics_stream_pace pace;
 } stream_fixture;
 
 static void *stream_pump_thread(void *arg) {
     stream_fixture *f = (stream_fixture *)arg;
     bool r = metrics_stream_pump(f->fd, &f->mu, &f->cv, &f->generation, &f->stop,
-                                 f->keepalive_ms);
+                                 &f->pace);
     pthread_mutex_lock(&f->mu);
     f->result = r;
     f->done = true;
@@ -18912,13 +18912,16 @@ static void *stream_pump_thread(void *arg) {
     return NULL;
 }
 
-static void stream_fixture_init(stream_fixture *f, int fds[2], int keepalive_ms) {
+/* `refresh_ms` is the quiet after which the unchanged generation is sent again; the rate window is 20 ms here (the
+ * server's is PULSAR_METRICS_STREAM_MIN_INTERVAL_MS), short enough that a test waits on states, not on the pace. */
+static void stream_fixture_init(stream_fixture *f, int fds[2], int refresh_ms) {
     memset(f, 0, sizeof(*f));
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
     pthread_mutex_init(&f->mu, NULL);
     pthread_cond_init(&f->cv, NULL);
     f->fd = fds[0];
-    f->keepalive_ms = keepalive_ms;
+    f->pace.min_interval_ms = 20;
+    f->pace.refresh_ms = refresh_ms;
 }
 
 static void stream_fixture_free(stream_fixture *f, int fds[2]) {
@@ -18942,9 +18945,26 @@ static int stream_read_within(int fd, char *out, size_t cap, int ms) {
 
 static void stream_bump(stream_fixture *f, unsigned long long gen) {
     pthread_mutex_lock(&f->mu);
-    f->generation = gen;
+    __atomic_store_n(&f->generation, gen, __ATOMIC_RELAXED);
     pthread_cond_broadcast(&f->cv);
     pthread_mutex_unlock(&f->mu);
+}
+
+/* The last "generation" a read of the stream carries, 0 when it carries no frame. */
+static unsigned long long stream_last_generation(const char *text) {
+    unsigned long long gen = 0;
+    for (const char *p = text; (p = strstr(p, "\"generation\":")) != NULL;) {
+        p += strlen("\"generation\":");
+        gen = strtoull(p, NULL, 10);
+    }
+    return gen;
+}
+
+/* How many frames a read of the stream carries. */
+static int stream_count_frames(const char *text) {
+    int n = 0;
+    for (const char *p = text; (p = strstr(p, "event: metrics")) != NULL; p++) n++;
+    return n;
 }
 
 static void stream_stop(stream_fixture *f) {
@@ -19005,12 +19025,12 @@ static void test_metrics_stream_emits_one_frame_per_publish(void) {
     stream_fixture_free(&f, fds);
 }
 
-/* A publish that does not advance the generation must not produce a frame:
+/* A wake that does not advance the generation must not produce a frame:
  * otherwise a client would refetch /metrics for nothing. */
 static void test_metrics_stream_ignores_a_redundant_wakeup(void) {
     stream_fixture f;
     int fds[2];
-    stream_fixture_init(&f, fds, 5000);
+    stream_fixture_init(&f, fds, 60000);
 
     pthread_t th;
     TEST_ASSERT(pthread_create(&th, NULL, stream_pump_thread, &f) == 0);
@@ -19018,28 +19038,29 @@ static void test_metrics_stream_ignores_a_redundant_wakeup(void) {
     char buf[1024];
     TEST_ASSERT(stream_read_within(fds[1], buf, sizeof buf, 2000) > 0);
 
-    /* Wake the waiter without changing anything. */
-    pthread_mutex_lock(&f.mu);
-    pthread_cond_broadcast(&f.cv);
-    pthread_mutex_unlock(&f.mu);
-
-    /* The next thing on the wire should be a keepalive, not an event. */
-    int n = stream_read_within(fds[1], buf, sizeof buf, 3000);
-    TEST_ASSERT(n > 0);
-    TEST_ASSERT(strncmp(buf, ":", 1) == 0);
-    TEST_ASSERT(strstr(buf, "event: metrics") == NULL);
+    /* Wake the waiter without changing anything, well past its rate window. */
+    for (int i = 0; i < 5; i++) {
+        struct timespec nap = {.tv_sec = 0, .tv_nsec = 30000000L};
+        nanosleep(&nap, NULL);
+        pthread_mutex_lock(&f.mu);
+        pthread_cond_broadcast(&f.cv);
+        pthread_mutex_unlock(&f.mu);
+    }
+    TEST_ASSERT(stream_read_within(fds[1], buf, sizeof buf, 300) < 0);   /* nothing on the wire */
 
     stream_stop(&f);
     pthread_join(th, NULL);
     stream_fixture_free(&f, fds);
 }
 
-/* Silence has to be broken periodically or proxies reap the connection and
- * the client cannot tell a quiet server from a dead one. */
-static void test_metrics_stream_keepalives_when_quiet(void) {
+/* L432: quiet has to be broken periodically -- proxies reap a silent connection, the client cannot tell a quiet
+ * server from a dead one, and the gauges /metrics samples as it is read drift with no request.  The refresh is a
+ * frame like any other, its generation unchanged: no SSE comment, nothing a parser has to skip. */
+static void test_metrics_stream_refreshes_when_quiet(void) {
     stream_fixture f;
     int fds[2];
     stream_fixture_init(&f, fds, 150);
+    f.generation = 5;
 
     pthread_t th;
     TEST_ASSERT(pthread_create(&th, NULL, stream_pump_thread, &f) == 0);
@@ -19048,14 +19069,105 @@ static void test_metrics_stream_keepalives_when_quiet(void) {
     TEST_ASSERT(stream_read_within(fds[1], buf, sizeof buf, 2000) > 0);
     TEST_ASSERT(strstr(buf, "event: metrics") != NULL);
 
-    int n = stream_read_within(fds[1], buf, sizeof buf, 2000);
-    TEST_ASSERT(n > 0);
-    TEST_ASSERT(strncmp(buf, ":", 1) == 0);
-    TEST_ASSERT(strstr(buf, "keepalive") != NULL);
+    for (int i = 0; i < 2; i++) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        int n = stream_read_within(fds[1], buf, sizeof buf, 2000);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        TEST_ASSERT(n > 0);
+        TEST_ASSERT(strncmp(buf, "event: metrics\ndata: {\"generation\":5,", 37) == 0);
+        TEST_ASSERT(strstr(buf, ": keepalive") == NULL);
+        /* not before its time: a refresh that came early would be a frame storm on an idle server */
+        TEST_ASSERT((t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6 > 100.0);
+    }
 
     stream_stop(&f);
     pthread_join(th, NULL);
     stream_fixture_free(&f, fds);
+}
+
+/* L432: the feed's writers do not wake the pump -- a mark is one atomic add (server::metrics_mark) -- so the pump
+ * finds the change by looking, within its rate window.  The frame carries the generation read when it is sent. */
+static void test_metrics_stream_frames_a_mark_nobody_broadcast(void) {
+    stream_fixture f;
+    int fds[2];
+    stream_fixture_init(&f, fds, 60000);
+    f.pace.min_interval_ms = 100;
+
+    pthread_t th;
+    TEST_ASSERT(pthread_create(&th, NULL, stream_pump_thread, &f) == 0);
+
+    char buf[1024];
+    TEST_ASSERT(stream_read_within(fds[1], buf, sizeof buf, 2000) > 0);
+    TEST_ASSERT(stream_last_generation(buf) == 0 && stream_count_frames(buf) == 1);
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    pulsar_metrics_feed_mark(&f.generation);   /* no lock, no broadcast */
+    TEST_ASSERT(stream_read_within(fds[1], buf, sizeof buf, 2000) > 0);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    TEST_ASSERT(stream_last_generation(buf) == 1);
+    /* the bound is the window (100 ms); the margin is the machine's, for a loaded check run */
+    TEST_ASSERT((t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6 < 100.0 + 400.0);
+
+    stream_stop(&f);
+    pthread_join(th, NULL);
+    stream_fixture_free(&f, fds);
+}
+
+/* L432: a burst -- a thousand marks as fast as a thread can make them, with a wake each (the worker's publishes)
+ * and without (every other writer) -- is a handful of frames, at least a window apart, and the last frame carries
+ * the last mark: the subscriber is never left on an earlier state. */
+static void test_metrics_stream_coalesces_a_burst_and_ends_on_the_last_state(void) {
+    for (const bool wake : {false, true}) {
+        stream_fixture f;
+        int fds[2];
+        stream_fixture_init(&f, fds, 60000);
+        f.pace.min_interval_ms = 100;
+
+        pthread_t th;
+        TEST_ASSERT(pthread_create(&th, NULL, stream_pump_thread, &f) == 0);
+
+        char all[8192] = {0};
+        size_t used = 0;
+        TEST_ASSERT(stream_read_within(fds[1], all, sizeof all, 2000) > 0);
+        used = strlen(all);
+
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int i = 0; i < 1000; i++) {
+            if (wake) {
+                pthread_mutex_lock(&f.mu);
+                pulsar_metrics_feed_mark(&f.generation);
+                pthread_cond_broadcast(&f.cv);
+                pthread_mutex_unlock(&f.mu);
+            } else {
+                pulsar_metrics_feed_mark(&f.generation);
+            }
+            if (i % 100 == 99) {   /* the burst lasts ~50 ms: inside one window, across a look or two */
+                struct timespec nap = {.tv_sec = 0, .tv_nsec = 5000000L};
+                nanosleep(&nap, NULL);
+            }
+        }
+        /* read until the final state has arrived, then a little longer: nothing may follow it */
+        for (int i = 0; i < 40 && stream_last_generation(all) != 1000; i++) {
+            int n = stream_read_within(fds[1], all + used, sizeof all - used, 100);
+            if (n > 0) used += (size_t)n;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        TEST_ASSERT(stream_last_generation(all) == 1000);
+        TEST_ASSERT(stream_read_within(fds[1], all + used, sizeof all - used, 250) < 0);
+        /* the bound: one frame a window, so 1 (the first) + elapsed / window + 1 at the very most */
+        const double elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        const int frames = stream_count_frames(all);
+        TEST_ASSERT(frames >= 2);
+        TEST_ASSERT(frames <= 2 + (int)(elapsed_ms / 100.0));
+        TEST_ASSERT(frames <= 12);   /* and nothing like a thousand, however slow the machine */
+
+        stream_stop(&f);
+        pthread_join(th, NULL);
+        stream_fixture_free(&f, fds);
+    }
 }
 
 /* Shutdown sets `stopping` and broadcasts. The pump must return promptly
@@ -19155,22 +19267,32 @@ static void test_metrics_stream_write_does_not_hold_the_metrics_lock(void) {
     setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof small);
     setsockopt(fds[1], SOL_SOCKET, SO_RCVBUF, &small, sizeof small);
 
+    /* Fill the socket and read none of it, so the pump's first frame has
+     * nowhere to go and it ends up wedged in a blocked write — the state a
+     * dead dashboard leaves it in. (L432: the pump no longer writes a frame per
+     * publish, so a storm of publishes cannot fill the buffer; the test does.) */
+    char filler[1024];
+    memset(filler, 'x', sizeof filler);
+    int filled = 0;
+    while (filled < 4096 && send(fds[0], filler, sizeof filler, MSG_DONTWAIT) > 0) filled++;
+    TEST_ASSERT(filled > 0 && filled < 4096);   /* it filled: the next write blocks */
+
     pthread_t th;
     TEST_ASSERT(pthread_create(&th, NULL, stream_pump_thread, &f) == 0);
 
-    /* Feed publishes and read none of them, so the pump ends up wedged in a
-     * blocked write — the state a dead dashboard leaves it in. */
+    /* Publishes meanwhile, as the worker would make them. */
     for (unsigned long long gen = 1; gen <= 8000 && !f.done; gen++) {
         pthread_mutex_lock(&f.mu);
-        f.generation = gen;
+        __atomic_store_n(&f.generation, gen, __ATOMIC_RELAXED);
         pthread_cond_broadcast(&f.cv);
         pthread_mutex_unlock(&f.mu);
     }
 
     struct timespec nap = {.tv_sec = 0, .tv_nsec = 300000000L};
     nanosleep(&nap, NULL);
-    /* If this trips the buffer never filled and the test proves nothing, which
-     * is worth knowing rather than passing vacuously. */
+    /* If this trips the pump is not inside its write (send_all gave up early)
+     * and the test proves nothing, which is worth knowing rather than passing
+     * vacuously. */
     TEST_ASSERT(!f.done);
 
     /* The lock must still be free: the pump is inside send_all right now. */
@@ -19337,6 +19459,217 @@ static void test_metrics_stream_handler_refuses_past_its_own_cap(void) {
     close(fds[1]);
     pthread_cond_destroy(&s.stream_cv);
     pthread_mutex_destroy(&s.mu);
+}
+
+
+/* ── L432: what marks the feed ─────────────────────────────────────────────
+ *
+ * Before L432 only publish_metrics_snapshot moved the generation, and only a
+ * chat generation reached it (after a bind, once a quantum, per prefill chunk).
+ * A server that served /v1/systemone or refused requests moved its counters and
+ * told no subscriber.  These drive the real handler (send_metrics_stream at the
+ * production pace) on a bare `server` and make each kind of change the way its
+ * own code path makes it. */
+
+/* A subscribed handler and the client's end of its socket. */
+typedef struct {
+    server s;
+    int fds[2];
+    stream_handler_arg a;
+    pthread_t th;
+} stream_server_fixture;
+
+static void stream_server_start(stream_server_fixture *x) {
+    memset(&x->s, 0, sizeof x->s);
+    pthread_mutex_init(&x->s.mu, NULL);
+    pthread_cond_init(&x->s.stream_cv, NULL);
+    x->s.live_bank = BankId::none();
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, x->fds) == 0);
+    x->a.s = &x->s;
+    x->a.fd = x->fds[0];
+    x->a.result = false;
+    TEST_ASSERT(pthread_create(&x->th, NULL, stream_handler_thread, &x->a) == 0);
+    /* the headers and the first frame */
+    char all[4096] = {0};
+    size_t used = 0;
+    for (int i = 0; i < 4 && !strstr(all, "event: metrics"); i++) {
+        int n = stream_read_within(x->fds[1], all + used, sizeof all - used, 1500);
+        if (n <= 0) break;
+        used += (size_t)n;
+    }
+    TEST_ASSERT(stream_count_frames(all) == 1);
+}
+
+static void stream_server_stop(stream_server_fixture *x) {
+    pthread_mutex_lock(&x->s.mu);
+    x->s.stopping = true;
+    pthread_cond_broadcast(&x->s.stream_cv);
+    pthread_mutex_unlock(&x->s.mu);
+    pthread_join(x->th, NULL);
+    close(x->fds[0]);
+    close(x->fds[1]);
+    pthread_cond_destroy(&x->s.stream_cv);
+    pthread_mutex_destroy(&x->s.mu);
+}
+
+/* The subscriber is sent a frame carrying the feed's current generation, within the production bound (the window,
+ * PULSAR_METRICS_STREAM_MIN_INTERVAL_MS, plus the machine's margin) of `t0`, the moment after the change. */
+static void stream_server_expect_frame(stream_server_fixture *x, const struct timespec *t0) {
+    char buf[1024];
+    const int n = stream_read_within(x->fds[1], buf, sizeof buf, 3000);
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    TEST_ASSERT(n > 0);
+    if (n <= 0) return;
+    TEST_ASSERT(stream_count_frames(buf) == 1);
+    TEST_ASSERT(stream_last_generation(buf) == x->s.metrics_generation);
+    TEST_ASSERT((t1.tv_sec - t0->tv_sec) * 1000.0 + (t1.tv_nsec - t0->tv_nsec) / 1e6 <
+                PULSAR_METRICS_STREAM_MIN_INTERVAL_MS + 400.0);
+}
+
+/* L432: a /v1/systemone request.  The worker's judge step publishes the snapshot as it leaves -- here the step that
+ * ends a request whose client is gone, the one a server with no engine can take -- and a refusal's 503 is counted
+ * on the request's own thread AFTER the worker is done with it (server_judge_http), which marks the feed again. */
+static void test_l432_a_systemone_request_reaches_the_stream(void) {
+    stream_server_fixture x;
+    stream_server_start(&x);
+    server_judge *J = new server_judge();
+    J->bank = BankId{1};
+    x.s.judge = J;
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    close(sv[1]);
+    judge_job jb;
+    pthread_mutex_init(&jb.mu, NULL);
+    pthread_cond_init(&jb.cv, NULL);
+    jb.fd = sv[0];
+    pulsar_tokens prompt = {0};
+    pulsar_tokens_push(&prompt, TokId{1});
+    jb.prompts.push_back(prompt);
+    {
+        pulsar::ScopedLock lk(&x.s.mu);
+        J->head = J->tail = &jb;
+    }
+    const unsigned long long gen0 = pulsar_metrics_feed_read(&x.s.metrics_generation);
+    TEST_ASSERT(server_judge_step(&x.s));   /* the worker's turn */
+    TEST_ASSERT(jb.done);
+    TEST_ASSERT(pulsar_metrics_feed_read(&x.s.metrics_generation) == gen0 + 1);
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    stream_server_expect_frame(&x, &t0);
+
+    /* a step with no request waiting is no step: nothing published, no frame owed */
+    TEST_ASSERT(!server_judge_step(&x.s));
+    TEST_ASSERT(pulsar_metrics_feed_read(&x.s.metrics_generation) == gen0 + 1);
+
+    /* the request's thread counts its 503 */
+    x.s.count_503(SERVER_503_SYSTEMONE);
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    TEST_ASSERT(x.s.m_kvl.refused[SERVER_503_SYSTEMONE] == 1);
+    stream_server_expect_frame(&x, &t0);
+
+    pulsar_tokens_free(&jb.prompts[0]);
+    pthread_cond_destroy(&jb.cv);
+    pthread_mutex_destroy(&jb.mu);
+    close(sv[0]);
+    stream_server_stop(&x);
+    server_judge_close(&x.s);
+}
+
+/* L432: refusals and acceptance.  Every 503 is counted by cause through count_metric, on whichever thread refuses
+ * (the accept loop's connection cap, a client thread's parse or shutdown refusal, the worker's admission); the
+ * per-class count is a client thread's at acceptance; a head the worker cannot bind is counted by the worker with
+ * nothing running, so with no quantum to publish it. */
+static void test_l432_refusals_and_counters_reach_the_stream(void) {
+    stream_server_fixture x;
+    stream_server_start(&x);
+    struct timespec t0;
+
+    for (int cause = 0; cause < SERVER_503_CAUSES; cause++) {
+        x.s.count_503((server_503_cause)cause);
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        stream_server_expect_frame(&x, &t0);
+    }
+
+    x.s.count_metric(&x.s.m_req_class[0]);
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    stream_server_expect_frame(&x, &t0);
+
+    job j;
+    memset(&j, 0, sizeof j);
+    x.s.note_provision_refusal(&j, PROVISION_REFUSED_KV_TOUCHED);
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    TEST_ASSERT(x.s.m_refusals[PROVISION_REFUSED_KV_TOUCHED] == 1);
+    stream_server_expect_frame(&x, &t0);
+    /* the worker retries that head a hundred times a second: the retries change nothing and mark nothing */
+    const unsigned long long gen = pulsar_metrics_feed_read(&x.s.metrics_generation);
+    for (int i = 0; i < 50; i++) x.s.note_provision_refusal(&j, PROVISION_REFUSED_KV_TOUCHED);
+    TEST_ASSERT(pulsar_metrics_feed_read(&x.s.metrics_generation) == gen);
+    char buf[256];
+    TEST_ASSERT(stream_read_within(x.fds[1], buf, sizeof buf, PULSAR_METRICS_STREAM_MIN_INTERVAL_MS + 150) < 0);
+
+    stream_server_stop(&x);
+}
+
+/* L432: the encoder and parse engines' calls run on their own GPU threads (enc_executor), a request's bookkeeping on
+ * its connection thread; neither is the worker and neither holds server::mu.  That server publishes no /metrics
+ * today (encode_server.cpp: /health and /v1/models only), so what is pinned here is the mechanism such a thread
+ * would use: a mark from a thread that takes no lock and wakes nobody reaches the subscriber within the bound. */
+static void *l432_mark_thread(void *arg) {
+    ((server *)arg)->metrics_mark();
+    return NULL;
+}
+
+static void test_l432_a_mark_from_any_thread_reaches_the_stream(void) {
+    stream_server_fixture x;
+    stream_server_start(&x);
+    for (int i = 0; i < 3; i++) {
+        pthread_t th;
+        TEST_ASSERT(pthread_create(&th, NULL, l432_mark_thread, &x.s) == 0);
+        pthread_join(th, NULL);
+        struct timespec t0;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        stream_server_expect_frame(&x, &t0);
+    }
+    stream_server_stop(&x);
+}
+
+/* L432: an idle server.  Nothing is marked, so no frame claims a change: the subscriber is sent the same generation
+ * again once a refresh interval, and nothing in between. */
+static void test_l432_an_idle_server_sends_only_the_refresh(void) {
+    stream_fixture f;
+    int fds[2];
+    stream_fixture_init(&f, fds, 300);
+    f.generation = 41;
+
+    pthread_t th;
+    TEST_ASSERT(pthread_create(&th, NULL, stream_pump_thread, &f) == 0);
+
+    char all[4096] = {0};
+    size_t used = 0;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        const double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        if (ms >= 1000.0) break;
+        int n = stream_read_within(fds[1], all + used, sizeof all - used, (int)(1000.0 - ms) + 1);
+        if (n > 0) used += (size_t)n;
+    }
+    /* one second at a 300 ms refresh: the first frame and three refreshes (four when the last lands on the edge) */
+    const int frames = stream_count_frames(all);
+    TEST_ASSERT(frames >= 3 && frames <= 5);
+    TEST_ASSERT(stream_last_generation(all) == 41);
+    TEST_ASSERT(strstr(all, "\"generation\":42") == NULL && strstr(all, ": keepalive") == NULL);
+    /* every frame is the same generation: nothing but frames on the wire, each "generation":41 */
+    int same = 0;
+    for (const char *p = all; (p = strstr(p, "\"generation\":41,")) != NULL; p++) same++;
+    TEST_ASSERT(same == frames);
+
+    stream_stop(&f);
+    pthread_join(th, NULL);
+    stream_fixture_free(&f, fds);
 }
 
 
@@ -20978,13 +21311,19 @@ static void pulsar_server_unit_tests_run(void) {
     test_metrics_stream_sends_the_current_generation_first();
     test_metrics_stream_emits_one_frame_per_publish();
     test_metrics_stream_ignores_a_redundant_wakeup();
-    test_metrics_stream_keepalives_when_quiet();
+    test_metrics_stream_refreshes_when_quiet();
+    test_metrics_stream_frames_a_mark_nobody_broadcast();
+    test_metrics_stream_coalesces_a_burst_and_ends_on_the_last_state();
     test_metrics_stream_exits_promptly_on_shutdown();
     test_metrics_stream_reports_a_departed_client();
     test_metrics_stream_write_does_not_hold_the_metrics_lock();
     test_send_all_gives_up_on_a_wedged_socket();
     test_metrics_stream_handler_speaks_sse();
     test_metrics_stream_handler_refuses_past_its_own_cap();
+    test_l432_a_systemone_request_reaches_the_stream();
+    test_l432_refusals_and_counters_reach_the_stream();
+    test_l432_a_mark_from_any_thread_reaches_the_stream();
+    test_l432_an_idle_server_sends_only_the_refresh();
     test_health_reports_pool_capacity_apart_from_provisioned();
     test_health_capacity_is_one_in_classic_mode();
 }

@@ -147,7 +147,9 @@ void *watchdog_main(void *arg) {
             pthread_mutex_unlock(&s->mu);
         }
         const int64_t stalled = server_stall_seconds(now, beat_ms, busy, s->stall_limit_s);
-        __atomic_store_n(&s->stall_s, stalled, __ATOMIC_RELAXED);
+        /* L432: a stall beginning or ending marks the stream's feed (a stalled worker publishes nothing); the
+         * seconds in between reach a subscriber with its refresh frame */
+        if ((__atomic_exchange_n(&s->stall_s, stalled, __ATOMIC_RELAXED) > 0) != (stalled > 0)) s->metrics_mark();
         if (stalled > 0 && !dumped) {
             dumped = true;
             s->watchdog_dump(stalled);

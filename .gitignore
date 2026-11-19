@@ -52,6 +52,8 @@ __pycache__/
 /tests/segstore_tsan
 /tests/grammar_admit_test
 /tests/grammar_admit_tsan
+/tests/metrics_stream_test
+/tests/metrics_stream_tsan
 /tests/bf16_rows_gate
 /tests/nvfp4_rows_gate
 /tests/lilicorr_head_gate

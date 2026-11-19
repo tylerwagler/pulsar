@@ -719,6 +719,18 @@ tests/grammar_admit_tsan: tests/grammar_admit_test.cpp src/lib/pulsar_grammar_ad
 grammar-admit-gate: tests/grammar_admit_test tests/grammar_admit_tsan
 	./tests/grammar_admit_test
 	TSAN_OPTIONS=halt_on_error=1 ./tests/grammar_admit_tsan
+# L432: the /metrics/stream change feed (src/lib/pulsar_metrics_stream.h): the rule's two bounds -- frames a second,
+# and how long a mark waits for its frame -- on a clock the test owns, then marks racing subscribers' waits with real
+# threads.  Host only, seconds.  Two programs from one source, plain and under ThreadSanitizer, each built from source
+# with its own flags (the header is the whole unit: no server object).
+tests/metrics_stream_test: tests/metrics_stream_test.cpp src/lib/pulsar_metrics_stream.h Makefile
+	$(CXX) -std=c++23 -O2 -g -Wall -Wextra -Werror -D_GNU_SOURCE -Isrc -o $@ tests/metrics_stream_test.cpp -lpthread
+tests/metrics_stream_tsan: tests/metrics_stream_test.cpp src/lib/pulsar_metrics_stream.h Makefile
+	$(CXX) -std=c++23 -O1 -g -Wall -Wextra -Werror -fsanitize=thread -D_GNU_SOURCE -Isrc -o $@ tests/metrics_stream_test.cpp -lpthread
+.PHONY: metrics-stream-gate
+metrics-stream-gate: tests/metrics_stream_test tests/metrics_stream_tsan
+	./tests/metrics_stream_test
+	TSAN_OPTIONS=halt_on_error=1 ./tests/metrics_stream_tsan
 tests/lt_picks: tests/lt_picks.cu src/cuda/pulsar_cuda_lt_fixed.o src/cuda/pulsar_cuda_lt_fixed.h Makefile
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/lt_picks.cu src/cuda/pulsar_cuda_lt_fixed.o $(CUDA_LDLIBS)
 # L381: does the fixed cuBLASLt GEMM still follow the accumulation order the EXL3 dense arm's in-place prompt kernel

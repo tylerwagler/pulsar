@@ -353,6 +353,14 @@ bool server_judge_step(server *s) {
         jb = J->head;
     }
     if (!jb) return false;
+    /** L432: whatever this step does -- a chunk prefilled into the judge bank, a spill made for it, a request ended
+     *  -- the worker publishes the snapshot as it leaves, as it does after a chat quantum.  Before, a server that
+     *  answered only /v1/systemone never published: /metrics kept the KV gauges of the last chat turn and
+     *  /metrics/stream sent no frame. */
+    struct publish_at_exit {
+        server *s;   ///< the server whose snapshot is published
+        ~publish_at_exit() { s->publish_metrics_snapshot(); }
+    } publish{s};
     auto pop = [&]() {
         pulsar::ScopedLock lk(&s->mu);
         J->head = jb->next;
