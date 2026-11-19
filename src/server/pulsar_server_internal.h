@@ -6298,8 +6298,18 @@ int kv_cache_chat_anchor_pos(const kv_disk_cache *kc, const pulsar_tokens *promp
  *  @return the marker's position, -1 when there is none or it sits below min_tokens */
 int kv_cache_preamble_pos(const kv_disk_cache *kc, const pulsar_tokens *prompt, const pulsar_turn_markers *m);
 /* Trivial-match classifier for the memory-token resolver (defined in
- * server_sched.cpp; unit-tested in server_tests.cpp). */
-bool server_slot_match_is_trivial(TokCount common, TokPos slot_pos, PromptToks share_ceiling, TokCount protect_floor);
+ * server_sched.cpp; unit-tested in server_tests.cpp).  L441: it takes the match, which holds both sides of it. */
+bool server_slot_match_is_trivial(const pulsar_prefix_match &m, TokPos slot_pos, PromptToks share_ceiling,
+                                  TokCount protect_floor);
+/** L441: does routing wait for a busy bank whose client is gone (choose_slot_for_job, L261)?  When its match is
+ *  deeper than the best free bank's and at least the shared-prefix ceiling -- both in the JOB's tokens: how much of
+ *  the request each bank holds (the matches' prompt_cut), not each bank's own count of it (live_cut), which across a
+ *  token seam is another number on each bank.
+ *  @param gone_shared   the request's tokens the gone bank's match holds
+ *  @param best_shared   the request's tokens the best free bank's match holds (-1: no free bank)
+ *  @param share_ceiling the trivial-match ceiling, the request's tokens
+ *  @return true when the job waits for the gone bank's abandon */
+bool server_route_waits_for_gone(PromptToks gone_shared, PromptToks best_shared, PromptToks share_ceiling);
 /* L275: the position of the bank's last user marker among its prefilled tokens
  * when a completed exchange precedes it; -1 otherwise (defined in
  * server_sched.cpp; unit-tested in server_tests.cpp). */

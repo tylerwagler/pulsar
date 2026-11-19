@@ -1222,7 +1222,7 @@ void server::gen_begin(session_slot *sl) {
          * threshold keeps one authority for "is this match worth keeping".
          * Accounting takes the PROMPT-side count. */
         const bool trivial =
-            server_slot_match_is_trivial(pm.live_cut, TokPos{old_pos},
+            server_slot_match_is_trivial(pm, TokPos{old_pos},
                                          PromptToks{s->slot_trivial_common_tokens},
                                          TokCount{s->slot_trivial_common_tokens});
         /* L266/L284: the byte match is what the bank's tokens re-spell; the count is where the sync actually

@@ -727,15 +727,24 @@ int server::provision_ctx_for_job(const job *j) const {
  * holding only a sub-threshold warm tail past the match is now reused
  * (clobbered) rather than protected by a fresh provisioning — protecting
  * <threshold tokens of KV is never worth seconds of session create. */
-/// @param common the slot's tokens the job's text shares (the live side of the match)
+/// @param m the slot's token-seam match with the job's prompt (slot_prefix_match): `prompt_cut` the job's tokens it
+///        holds, `live_cut` the slot's
 /// @param slot_pos the slot's frontier position
 /// @param share_ceiling the trivial-match threshold, the job's prompt tokens (the template header plus allowance,
 ///        lifted per job to its chat anchor)
 /// @param protect_floor the warm tail past the match that is worth protecting, the slot's tokens
 /// @return true when the match is trivial and the slot holds a warm tail worth protecting
-bool server_slot_match_is_trivial(TokCount common, TokPos slot_pos, PromptToks share_ceiling, TokCount protect_floor) {
-    /* L439 (typing; value unchanged): the ceiling is a count of the JOB's prompt tokens, `common` of the slot's */
-    return seam_unconverted_prompt(common) < share_ceiling && slot_pos - TokPos::after(common) >= protect_floor;
+bool server_slot_match_is_trivial(const pulsar_prefix_match &m, TokPos slot_pos, PromptToks share_ceiling,
+                                  TokCount protect_floor) {
+    /* L441: the depth against the ceiling in the job's tokens (prompt_cut), the warm tail past it in the slot's
+     * (live_cut).  L439 left the ceiling compared with the slot's count (a marked crossing): across a token seam a bank
+     * holding a sampled spelling of the job's shared header counted more of its own tokens than the job's, and the
+     * same match was trivial on one spelling and not on the other */
+    return m.prompt_cut < share_ceiling && slot_pos - TokPos::after(m.live_cut) >= protect_floor;
+}
+
+bool server_route_waits_for_gone(PromptToks gone_shared, PromptToks best_shared, PromptToks share_ceiling) {
+    return gone_shared > best_shared && gone_shared >= share_ceiling;
 }
 
 
@@ -915,6 +924,7 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
     session_slot *best = NULL;
     /* L439: the match in the bank's tokens, the score in the job's; -1 = no bank yet (below every real count) */
     TokCount best_common{-1};
+    PromptToks best_shared{-1};                            /* L441: the best bank's match in the job's tokens */
     PromptToks best_score{-1};
     TokPos best_at{0};                                     /* L439: where the best bank's resume starts, on it */
     TokCount deep{-1};                                     /* L378: the deepest match any free bank has */
@@ -923,7 +933,9 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
     for (SlotIdx i : s->n_slots.slots()) {
         session_slot *sl = &s->slots[i];
         if (sl->active_job || !sl->provisioned || sl->ctx_size < needed) continue;
-        const TokCount common = s->slot_common_prefix(sl, &j->req.prompt);
+        pulsar_prefix_match m;   /* L441: both sides of the match (slot_common_prefix is its live_cut) */
+        s->slot_prefix_match(sl, &j->req.prompt, &m);
+        const TokCount common = m.live_cut;
         /* L325: the bank scores where its sync resumes -- pulsar_session_bank_resume_at, the one resume rule over the
          * token-seam stitch that the bank's own resume reads and an adopt (bank_adopt_point, L322) reads too: its grid
          * checkpoints AND its records (prompt end, message endpoint) within the match and its prefill frontier, or
@@ -941,6 +953,7 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
         if (score > best_score || (score == best_score && common > best_common)) {
             best_score = score;
             best_common = common;
+            best_shared = m.prompt_cut;
             best_at = resume.at;
             best = sl;
             best_why = resume.why;
@@ -978,6 +991,7 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
     {
         session_slot *gone = NULL;
         TokCount gone_common{-1};
+        PromptToks gone_shared{-1};   /* L441: its match in the job's tokens */
         for (SlotIdx i : s->n_slots.slots()) {
             session_slot *sl = &s->slots[i];
             if (!sl->active_job || !sl->provisioned || sl->ctx_size < needed) continue;
@@ -987,15 +1001,18 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
             if (sl->preempted) continue;
             const bool writer_failed = sl->gen->writer.failed;
             if (!writer_failed && !gen_client_disconnected(sl->active_job->fd)) continue;
-            const TokCount common = s->slot_common_prefix(sl, &j->req.prompt);
-            if (common > gone_common) {
-                gone_common = common;
+            pulsar_prefix_match m;
+            s->slot_prefix_match(sl, &j->req.prompt, &m);
+            if (m.prompt_cut > gone_shared) {   /* L441: the deepest in the job's tokens */
+                gone_common = m.live_cut;
+                gone_shared = m.prompt_cut;
                 gone = sl;
             }
         }
-        /* L439 (typing; value unchanged): the gone bank's match, in ITS tokens, against the best free bank's in its
-         * own, and against the ceiling in the job's */
-        if (gone && gone_common > best_common && seam_unconverted_prompt(gone_common) >= share_ceiling) {
+        /* L441: the gone bank's match against the best free bank's and against the ceiling, all three in the job's
+         * tokens (L439 left the two banks' own counts compared, each in its own spelling, and the ceiling with the
+         * gone bank's count: marked crossings) */
+        if (gone && server_route_waits_for_gone(gone_shared, best_shared, share_ceiling)) {
             server_log(PULSAR_LOG_KVCACHE,
                        "pulsar-server: slot routing: deepest match is busy bank %d whose client "
                        "is gone (common=%d, best free %d); waiting for it to abandon",

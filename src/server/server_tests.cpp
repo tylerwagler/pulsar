@@ -65,7 +65,8 @@ static bool unseamed_route_in_place(int common, int score, int frontier, int pre
  *  @param common tokens shared  @param slot_pos the slot's frontier  @param share_ceiling the ceiling
  *  @param protect_floor the floor  @return the verdict */
 static bool unseamed_match_is_trivial(int common, int slot_pos, int share_ceiling, int protect_floor) {
-    return server_slot_match_is_trivial(TokCount{common}, TokPos{slot_pos}, PromptToks{share_ceiling},
+    const pulsar_prefix_match m = {TokCount{common}, PromptToks{common}, false};   /* no seam: one number, both sides */
+    return server_slot_match_is_trivial(m, TokPos{slot_pos}, PromptToks{share_ceiling},
                                         TokCount{protect_floor});
 }
 /** server_slot_is_scratch on raw numbers.  @param sl the slot  @param frontier its frontier
@@ -22674,7 +22675,8 @@ static_assert(std::is_same_v<decltype(request_prompt_toks(nullptr)), PromptToks>
                   !std::is_constructible_v<fuse_witness, const pulsar_tokens *> &&
                   l439_ctx_takes<TokCount> && !l439_ctx_takes<int> && !l439_ctx_takes<PromptToks>,
               "a prompt is read by its own index; a bank position reaches it only through the fused lanes' witness");
-static_assert(std::is_same_v<decltype(&server_slot_match_is_trivial), bool (*)(TokCount, TokPos, PromptToks, TokCount)> &&
+static_assert(std::is_same_v<decltype(&server_slot_match_is_trivial),
+                             bool (*)(const pulsar_prefix_match &, TokPos, PromptToks, TokCount)> &&
                   std::is_same_v<decltype(&server_slot_is_scratch), bool (*)(const session_slot *, TokPos, TokCount)> &&
                   std::is_same_v<decltype(&kv_cache_anchor_cut), PromptToks (*)(const kv_disk_cache *, int, TokCount)> &&
                   std::is_same_v<decltype(&server_prefix_wait_pick),
@@ -23267,6 +23269,68 @@ static void test_l439_fused_lane_refuses_a_seam(void) {
     TEST_ASSERT(!fuse_witness_of_history(slot_tokens{&all, NULL}, prompt_view_of(&prompt), TokPos{204}));
 }
 
+/* L441 (a): the trivial-match ceiling and the gone-bank wait, on the seamed pair.  The ceiling is a count of the JOB's
+ * tokens (its header plus allowance, lifted to its chat anchor); L439 left it compared with the bank's own count of
+ * the match.  (i) The bank sampled the shared stretches (302 of its tokens to Y), the request spells them canonically
+ * (202): with a ceiling of 250 the match is the request's shared header -- trivial -- where the old reading saw 302
+ * of the bank's and called it a conversation.  (ii) The reverse spelling (the bank 202, the request 302): not trivial,
+ * where the old reading said trivial.  (iii) The gone-bank wait compares the two banks' matches in the request's
+ * tokens: a gone bank with the sampled spelling holds MORE of its own tokens (302) than a free bank holding the
+ * canonical spelling and 40 tokens more (242), but less of the request (202 against 242) -- no wait, where the old
+ * reading waited.  No seam: every verdict as before. */
+static void test_l441_trivial_ceiling_is_the_jobs(void) {
+    const int dd[] = {L334_D, L334_D, L334_D, L334_D, L334_D, L334_D, L334_D, L334_D, L334_D, L334_D};
+    const int z[] = {L334_Z};
+    const PromptToks ceiling{250};
+    const TokCount floor_{5};
+    {
+        const l439_seam f = l439_make(true, false, dd, 10, z, 1);
+        TEST_ASSERT(f.m.seamed && f.m.live_cut == TokCount{302} && f.m.prompt_cut == PromptToks{202});
+        const TokPos slot_pos{312};
+        /* the old reading: the bank's 302 against the job's ceiling -- not trivial */
+        TEST_ASSERT(!(seam_unconverted_prompt(f.m.live_cut) < ceiling));
+        TEST_ASSERT(server_slot_match_is_trivial(f.m, slot_pos, ceiling, floor_));
+        /* the warm tail is the bank's own (312 - 302 = 10): under a floor of 11 nothing is worth protecting */
+        TEST_ASSERT(!server_slot_match_is_trivial(f.m, slot_pos, ceiling, TokCount{11}));
+    }
+    {
+        const l439_seam f = l439_make(false, true, dd, 10, z, 1);
+        TEST_ASSERT(f.m.seamed && f.m.live_cut == TokCount{202} && f.m.prompt_cut == PromptToks{302});
+        TEST_ASSERT(seam_unconverted_prompt(f.m.live_cut) < ceiling);   /* the old reading: trivial */
+        TEST_ASSERT(!server_slot_match_is_trivial(f.m, TokPos{212}, ceiling, floor_));
+    }
+    {
+        /* (iii) the gone bank sampled (302 / 202); the free bank canonical, 40 tokens past Y (242 / 242) */
+        const l439_seam gone = l439_make(true, false, NULL, 0, z, 1);
+        std::vector<int> more(40, L334_Z);
+        const l439_seam free_ = l439_make(false, false, more.data(), (int)more.size(), more.data(), (int)more.size());
+        TEST_ASSERT(gone.m.live_cut == TokCount{302} && gone.m.prompt_cut == PromptToks{202});
+        TEST_ASSERT(!free_.m.seamed && free_.m.live_cut == TokCount{242} && free_.m.prompt_cut == PromptToks{242});
+        const PromptToks low{100};
+        /* the old reading: 302 > 242 and 302 >= 100 -- wait */
+        TEST_ASSERT(gone.m.live_cut > free_.m.live_cut && seam_unconverted_prompt(gone.m.live_cut) >= low);
+        TEST_ASSERT(!server_route_waits_for_gone(gone.m.prompt_cut, free_.m.prompt_cut, low));
+        /* with no free bank, or a shallower one, it waits; under the ceiling it never does */
+        TEST_ASSERT(server_route_waits_for_gone(gone.m.prompt_cut, PromptToks{-1}, low));
+        TEST_ASSERT(!server_route_waits_for_gone(gone.m.prompt_cut, PromptToks{-1}, ceiling));
+        /* the old reading against the ceiling: the gone bank's 302 passed it */
+        TEST_ASSERT(seam_unconverted_prompt(gone.m.live_cut) >= ceiling);
+    }
+    /* no seam: the unseamed tables decide as before (one number is both sides) */
+    {
+        const l439_seam u = l439_make(false, false, dd, 10, z, 1);
+        TEST_ASSERT(!u.m.seamed && u.m.live_cut == TokCount{202} && u.m.prompt_cut == PromptToks{202});
+        for (int c = 195; c <= 210; c++)
+            TEST_ASSERT(server_slot_match_is_trivial(u.m, TokPos{212}, PromptToks{c}, floor_) ==
+                        (seam_unconverted_prompt(u.m.live_cut) < PromptToks{c} &&
+                         TokPos{212} - TokPos::after(u.m.live_cut) >= floor_));
+        for (int c = 195; c <= 210; c++)
+            for (int b = 190; b <= 215; b += 5)
+                TEST_ASSERT(server_route_waits_for_gone(u.m.prompt_cut, PromptToks{b}, PromptToks{c}) ==
+                            (u.m.live_cut > TokCount{b} && seam_unconverted_prompt(u.m.live_cut) >= PromptToks{c}));
+    }
+}
+
 /* ---- L441: the pool's two index spaces, their count, and the ids of the server's work --------------------------- */
 /** True when `T` takes a subscript of type `I`. */
 template <class T, class I, class = void>
@@ -23405,6 +23469,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l439_prefix_wait_seamed_leader();
     test_l439_fused_lane_refuses_a_seam();
     test_l441_pool_spaces();
+    test_l441_trivial_ceiling_is_the_jobs();
     test_mem_floor_is_derived_from_the_watermarks();
     test_guard_budget_reads_live_memavailable();
     test_guard_discrete_reads_the_device();
