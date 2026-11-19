@@ -699,7 +699,8 @@ kv-identity-gate: pulsar_test
 
 # L430: the generation path's host work against its earlier reading (pulsar_test --gen-host; host-only, no model): a
 # speculative round's look ahead -- which rows are a call's structure, where a single-call turn's chain ends -- on
-# thousands of random turns of every family, against the walks as they were (tests/gen_host_ref.h).
+# thousands of random turns of every family, against the walks as they were (tests/gen_host_ref.h); and (L431) the
+# stop-string scan against the scan as it was, on thousands of random streams and through those turns' emit path.
 .PHONY: gen-host-gate
 gen-host-gate: pulsar_test
 	./pulsar_test --gen-host
@@ -3440,7 +3441,8 @@ tests/grammar_bench: tests/grammar_bench.o src/lib/pulsar_help.o src/lib/pulsar_
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 # L430: what a speculative round's look ahead costs on the host, by the text generated so far: the walks before L430
-# (tests/gen_host_ref.h) against the live ones.  It prints; it does not grade.  No model, no GPU.
+# (tests/gen_host_ref.h) against the live ones; and (L431) a turn's stop-string scans, the release before L431 against
+# the live one.  It prints; it does not grade.  No model, no GPU.
 tests/gen_host_bench.o: tests/gen_host_bench.cpp tests/gen_host_ref.h $(SERVER_SRCS) $(FAMILY_SERVERS_INC) $(SERVER_HDRS) src/pulsar.h $(LIB_HDRS)
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ tests/gen_host_bench.cpp
 tests/gen_host_bench: tests/gen_host_bench.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS) $(GRAMMAR_OBJS)

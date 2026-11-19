@@ -1,8 +1,11 @@
 /** @file
- *  The speculative lane's per-round look ahead as it read before L430, kept for the differential test and the bench. */
-/* gen_host_ref.h -- the host side of a speculative round as it stood at b1a217d6, the commit before L430 made its
- * cost independent of the text generated so far:
+ *  The generation path's host work as it read before L430 and L431, kept for the differential tests and the bench. */
+/* gen_host_ref.h -- host work of the generation path as it stood at b1a217d6, the commit before L430 and L431 made
+ * its cost independent of the text generated so far:
  *
+ *   gen_release_ref                 server_jobs.cpp's gen_release (L431): the stop-string scan's resume point moved
+ *                                   only when the longest stop string was longer than one byte, so a list of
+ *                                   one-byte strings searched the whole text at every token
  *   gen_spec_greedy_rows_text_ref   server_jobs.cpp's gen_spec_greedy_rows_text: every round it copied all of g->text
  *   gen_turn_draft_prefix_text_ref  and gen_turn_draft_prefix_text            and asked the parser for a probe that
  *   kit_probe_*_ref                 parser_kit.cpp's probe: a clone() of the output parser -- the turn's reported
@@ -11,13 +14,15 @@
  *
  * The code is that commit's, but for the names (`_ref`), `inline`, and the dispatch a renamed copy needs: a kit
  * family's probe is the three kit_probe_*_ref here, any other parser's (DeepSeek's tracker copy, which L430 did not
- * touch) is the family's own.
+ * touch) is the family's own.  The walks release bytes by gen_release_ref, as they did.
  *
  * It is the REFERENCE of two instruments and is not to be edited with the live code:
  *   src/server/server_tests.cpp  test_l430_round_walks_match_reference: the live walks must give this one's answers
  *                                at every round of thousands of random turns, and leave the attempt as it was;
- *   tests/gen_host_bench.cpp     what a round's copies cost.
- * Delete it with those two when the walks' answers change on purpose (the reference would then be wrong).
+ *                                test_l431_stop_scan_matches_reference: the live release must give this one's at
+ *                                every token of thousands of random streams;
+ *   tests/gen_host_bench.cpp     what a round's copies and a token's scan cost.
+ * Delete it with those when the walks' or the release's answers change on purpose (the reference would then be wrong).
  *
  * Included after the server's sources by a unit that compiles the server whole (pulsar_test.cpp, gen_host_bench.cpp). */
 #pragma once
@@ -25,6 +30,40 @@
 #include <string.h>
 
 #include <vector>
+
+/// server_jobs.cpp's gen_release at b1a217d6: the emit path's byte release -- the reasoning tracker fed, the stop
+/// strings looked for from the resume point, the bytes the stream may send.
+/// @param stops             the request's stop strings
+/// @param text              the generated text, `piece` already appended (NUL-terminated)
+/// @param len               its length, bytes
+/// @param piece             the token's bytes
+/// @param piece_len         their length
+/// @param plain_stream_pos  bytes already released
+/// @param thinking          the reasoning tracker, fed `piece`
+/// @param stop_scan_from    the stop scan's resume offset, advanced (only when the longest stop is longer than a byte)
+/// @param hit_stop          set when a stop string matched
+/// @param stop_pos          receives its offset
+/// @param stop_len          receives its length
+/// @return how far into `text` the stream may send, bytes
+inline size_t gen_release_ref(const stop_list *stops, const char *text, size_t len, const char *piece, size_t piece_len,
+                              size_t plain_stream_pos, thinking_state *thinking, size_t *stop_scan_from,
+                              bool *hit_stop, size_t *stop_pos, size_t *stop_len) {
+    const bool was_thinking = thinking->inside;
+    thinking->feed(piece, piece_len);
+    if (was_thinking && !thinking->inside) {
+        const size_t close_base = len - piece_len;
+        if (*stop_scan_from < close_base) *stop_scan_from = close_base;
+    }
+    *hit_stop = !thinking->inside && stop_list_find_from(stops, text, *stop_scan_from, stop_pos, stop_len);
+    size_t stream_len = *hit_stop ? *stop_pos : stop_list_stream_safe_len(stops, len);
+    if (stream_len > len) stream_len = len;
+    stream_len = utf8_stream_safe_len(text, plain_stream_pos, stream_len, *hit_stop);
+    if (!*hit_stop && stops->max_len > 1) {
+        const size_t hold = stops->max_len - 1;
+        *stop_scan_from = len > hold ? len - hold : 0;
+    }
+    return stream_len;
+}
 
 /// parser_kit.cpp's kit_read_ahead at b1a217d6 (L428: the read-ahead copy, fed a byte at a time up to the first
 /// declared call's close and the family's call_tail).
@@ -185,9 +224,9 @@ inline uint32_t gen_spec_greedy_rows_text_ref(const gen_state *g, const char *co
             buf_append(&text, pieces[i], piece_lens[i]);
             size_t stop_pos = 0, stop_len = 0;
             bool hit_stop = false;
-            const size_t upto = gen_release(&req->stops, text.ptr, text.len, pieces[i], piece_lens[i],
-                                            plain_stream_pos, &thinking, &stop_scan_from, &hit_stop, &stop_pos,
-                                            &stop_len);
+            const size_t upto = gen_release_ref(&req->stops, text.ptr, text.len, pieces[i], piece_lens[i],
+                                                plain_stream_pos, &thinking, &stop_scan_from, &hit_stop, &stop_pos,
+                                                &stop_len);
             if (hit_stop) {
                 live = false;
             } else {
@@ -226,8 +265,9 @@ inline int gen_turn_draft_prefix_text_ref(const gen_state *g, const char *const 
         buf_append(&text, pieces[i], piece_lens[i]);
         size_t stop_pos = 0, stop_len = 0, end = 0;
         bool hit_stop = false;
-        const size_t upto = gen_release(&req->stops, text.ptr, text.len, pieces[i], piece_lens[i], plain_stream_pos,
-                                        &thinking, &stop_scan_from, &hit_stop, &stop_pos, &stop_len);
+        const size_t upto = gen_release_ref(&req->stops, text.ptr, text.len, pieces[i], piece_lens[i],
+                                            plain_stream_pos, &thinking, &stop_scan_from, &hit_stop, &stop_pos,
+                                            &stop_len);
         if (hit_stop) break;
         if (gen_streams_plain(g) && upto > plain_stream_pos) plain_stream_pos = upto;
         gen_probe_feed_ref(probe, g, text.ptr, text.len, upto);

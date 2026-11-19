@@ -1,6 +1,6 @@
 /** @file
- *  What the generation path's host work costs by the amount of text generated so far, before and after L430. */
-/* gen_host_bench.cpp -- L430: host work on the scheduler's worker thread that grew with the turn's text.
+ *  What the generation path's host work costs by the amount of text generated so far, before and after L430 / L431. */
+/* gen_host_bench.cpp -- L430, L431: host work on the scheduler's worker thread that grew with the turn's text.
  *
  * Tokens are emitted on the one thread that launches every model forward, so host time per token or per speculative
  * round delays the next token of every live session.  This prints, for a sampled chat with tools at a point where
@@ -12,6 +12,10 @@
  *   whose string value is that long and after plain content of that length, with a two-tool schema and with a
  *   30-tool one; the walks as they were (tests/gen_host_ref.h: a copy of the text and a clone of the parser a
  *   round) against the live ones (read ahead in place).
+ *
+ *   the stop-string scan (L431) -- gen_release, every token: the total over a turn of 10 KB .. 1 MB that no stop
+ *   string ends (4-byte tokens, one line of words), for the stop lists ["\n"], ["\n", "."], ["STOP"] and none; the
+ *   release as it was (the resume point of a one-byte list never moved) against the live one.
  *
  * "before" is the reference header's code run in THIS tree.  One of the costs L430 removed is not in it: the parser's
  * clone copied the request's parsed tools, which the bodies now share, so the reference's clone is cheaper here than
@@ -219,6 +223,48 @@ void walk_row(const char *what, const std::string &tools, const std::string &tex
     fflush(stdout);
 }
 
+/// One row of the stop-scan table: a turn's releases under one stop list, the release as it was and the live one.
+/// @param what   the row's label
+/// @param stops  the stop strings
+/// @param n      the turn's length, bytes
+void stop_row(const char *what, const std::vector<std::string> &stops, size_t n) {
+    const std::string text = some_text(n, false);
+    stop_list list;
+    memset(&list, 0, sizeof list);
+    for (const std::string &s : stops) stop_list_push(&list, server_xstrdup(s.c_str()));
+    double total[2], last[2];
+    size_t released[2];
+    for (int live = 0; live < 2; live++) {
+        thinking_state thinking;
+        memset(&thinking, 0, sizeof thinking);
+        size_t from = 0, sent = 0, pos = 0, len = 0, up = 0;
+        bool hit = false;
+        buf b;
+        memset(&b, 0, sizeof b);
+        double in_release = 0, t_last = 0;
+        for (size_t at = 0; at < text.size(); at += 4) {
+            const size_t k = std::min<size_t>(4, text.size() - at);
+            buf_append(&b, text.data() + at, k);
+            const double t0 = cpu_s();
+            up = live ? gen_release(&list, b.ptr, b.len, text.data() + at, k, sent, &thinking, &from, &hit, &pos, &len)
+                      : gen_release_ref(&list, b.ptr, b.len, text.data() + at, k, sent, &thinking, &from, &hit, &pos, &len);
+            t_last = cpu_s() - t0;
+            in_release += t_last;
+            if (hit) bench_die("a stop string ended the turn that was to be timed whole");
+        }
+        total[live] = in_release;
+        last[live] = t_last;
+        released[live] = up;
+        buf_free(&b);
+    }
+    if (released[0] != released[1]) bench_die("the release as it was and the live one released different text");
+    printf("%-36s %9zu %12.2f %12.2f %14.2f %12.2f\n", what, (n + 3) / 4, total[0] * 1e3, total[1] * 1e3, last[0] * 1e6,
+           last[1] * 1e6);
+    fflush(stdout);
+    stop_list_clear(&list);
+    free(list.v);
+}
+
 }  // namespace
 
 int main(void) {
@@ -246,5 +292,18 @@ int main(void) {
     for (size_t n : {(size_t)10 << 10, (size_t)1 << 20})
         walk_row(("open call, value of " + std::to_string(n >> 10) + " KB, 30 tools").c_str(), large,
                  open_call + some_text(n, true));
+
+    printf("\nthe stop-string scan over a whole turn that no stop string ends, 4-byte tokens (L431).  The clock is read "
+           "around each release:\nboth columns carry that, about 0.3 us a token (the rows with no stop string are it)\n");
+    printf("%-36s %9s %12s %12s %14s %12s\n", "", "", "turn, ms", "turn, ms", "last token,", "last token,");
+    printf("%-36s %9s %12s %12s %14s %12s\n", "stop strings, the turn's length", "tokens", "before", "after", "us before",
+           "us after");
+    const struct {
+        const char *name;
+        std::vector<std::string> stops;
+    } lists[] = {{"[\"\\n\"]", {"\n"}}, {"[\"\\n\", \".\"]", {"\n", "."}}, {"[\"STOP\"]", {"STOP"}}, {"none", {}}};
+    for (const auto &l : lists)
+        for (size_t n : {(size_t)10 << 10, (size_t)100 << 10, (size_t)1 << 20})
+            stop_row((std::string(l.name) + ", " + std::to_string(n >> 10) + " KB").c_str(), l.stops, n);
     return 0;
 }

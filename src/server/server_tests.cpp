@@ -5392,6 +5392,8 @@ static void test_l428_turn_ends_at_its_first_call(void) {
  *
  * So: thousands of random turns, each decoded twice through the production emit path (server::gen_emit_piece) -- side
  * A with the live walks, side B with the walks as they were (tests/gen_host_ref.h), which never touch the attempt.
+ * (L431: side B also keeps the stop-string scan's old resume rule, so the two sides are the generation path before
+ * both rows and after: a stop string must end both turns at the same token, at the same byte.)
  * A turn is random text in its family's own markup -- reasoning, content with Markdown code and UTF-8, tool calls
  * well formed and broken, declared and not, values that spell the call's closers, or marker soup -- cut into random
  * tokens (mid-marker, mid-UTF-8), for the kit's families (Qwen, Nemotron-H, Gemma 4, Inkling) and DeepSeek, with
@@ -5695,6 +5697,7 @@ struct l430_state {
     std::string text;            ///< gen_state::text
     std::string finish;          ///< gen_state::finish
     std::string think_tail;      ///< the reasoning tracker's tail
+    std::string stop_sequence;   ///< the stop string that ended the turn
     std::string content, reasoning;   ///< the kit parser's reported text so far
     size_t plain_stream_pos = 0, fed = 0, cut_at = 0, end = 0, wire = 0;   ///< offsets
     int completion = 0, calls = 0, errors = 0;                             ///< counts
@@ -5713,6 +5716,7 @@ static l430_state l430_read(l430_side *s) {
     st.text.assign(g->text.ptr ? g->text.ptr : "", g->text.len);
     st.finish = g->finish;
     st.think_tail.assign(g->thinking.tail, (size_t)g->thinking.tail_len);
+    st.stop_sequence = g->stop_sequence ? g->stop_sequence : "";
     st.plain_stream_pos = g->plain_stream_pos;
     st.completion = g->completion;
     st.stopped = s->stopped;
@@ -5801,6 +5805,9 @@ struct l430_counts {
     long stopped_stop = 0, stopped_call = 0;   ///< turns a stop string ended, turns the single-call rule ended
     long with_calls = 0;     ///< turns whose reading returned a call
     long refused = 0;        ///< request shapes a family refused (not decoded)
+    /** L431: bytes of text from the stop scan's resume point to the text's end, summed over the emitted tokens --
+     *  what the scan as it was (side B) and the live one (side A) had to read. */
+    long scanned_old = 0, scanned_new = 0;
     long by_fam[8] = {0};    ///< turns per family
 };
 
@@ -5834,6 +5841,7 @@ static bool l430_one_turn(server *srv, l430_rng *r, const l430_cfg &c, l430_coun
         return false;
     };
     bool ok = true;
+    size_t a_from = a.g->stop_scan_from;   /* where side A's next stop scan starts */
     if (!(l430_read(&a) == l430_read(&b))) ok = differ("the two sides start apart", 0);
     for (int pos = 0; ok && pos < nt && !a.stopped;) {
         /* the round: its tokens not yet streamed -- the base unless it went out before the forward, then drafts */
@@ -5919,9 +5927,29 @@ static bool l430_one_turn(server *srv, l430_rng *r, const l430_cfg &c, l430_coun
         for (int k = 0; ok && k < take && pos < nt && !a.stopped; k++, pos++) {
             const std::string &t = toks[(size_t)pos];
             a.stopped = srv->gen_emit_piece(a.g, 0, t.data(), t.size());
+            /* L431: side B stays on the stop scan's old rule.  The release as it was (gen_release_ref) runs beside
+             * the emit, from B's resume point; the emit's own release starts from that same point, so it finds what
+             * the old scan found, and B's resume point is then put back where the old rule leaves it. */
+            std::string grown(b.g->text.ptr ? b.g->text.ptr : "", b.g->text.len);
+            grown += t;
+            thinking_state think = b.g->thinking;
+            size_t from = b.g->stop_scan_from, sp = 0, sl = 0;
+            bool hit = false;
+            if (b.j.req.stops.len) {
+                n->scanned_old += (long)(grown.size() - std::min(from, grown.size()));
+                n->scanned_new += (long)(grown.size() - std::min(a_from, grown.size()));
+            }
+            gen_release_ref(&b.j.req.stops, grown.c_str(), grown.size(), t.data(), t.size(), b.g->plain_stream_pos,
+                            &think, &from, &hit, &sp, &sl);
             b.stopped = srv->gen_emit_piece(b.g, 0, t.data(), t.size());
+            b.g->stop_scan_from = from;
+            a_from = a.g->stop_scan_from;
             n->tokens++;
-            if (!(l430_read(&a) == l430_read(&b))) ok = differ("the two sides part after a token", pos);
+            const bool b_hit = b.stopped && !strcmp(b.g->finish, "stop");
+            if (hit != b_hit || (hit && (b.g->text.len != sp || grown.substr(sp, sl) != b.g->stop_sequence)))
+                ok = differ("the emit path and the stop scan as it was disagree", pos);
+            else if (!(l430_read(&a) == l430_read(&b)))
+                ok = differ("the two sides part after a token", pos);
         }
     }
     if (a.stopped) {
@@ -5985,15 +6013,196 @@ static void test_l430_round_walks_match_reference(void) {
             "  L430 round walks vs their pre-L430 reading: %ld turns (qwen %ld, nemotron-h %ld, gemma4 %ld, inkling %ld, "
             "deepseek %ld; %ld shapes refused), %ld tokens, %ld rounds: %ld cross structure, %ld with wrong drafts, "
             "%ld with a stop token, %ld from inside a call (%ld close it and open another), %ld chains cut; turns "
-            "ended by a stop string %ld, by the one-call rule %ld; %ld turns returned calls\n",
+            "ended by a stop string %ld, by the one-call rule %ld; %ld turns returned calls; the stop scans read "
+            "%ld bytes on the old rule, %ld on the live one\n",
             n.turns, n.by_fam[0], n.by_fam[1], n.by_fam[2], n.by_fam[3], n.by_fam[4], n.refused, n.tokens, n.rounds,
             n.crossing, n.rejected, n.stop_token, n.in_call, n.reopened, n.prefix_cut, n.stopped_stop, n.stopped_call,
-            n.with_calls);
+            n.with_calls, n.scanned_old, n.scanned_new);
     /* the generator reached the cases */
     for (int i = 0; i < 5; i++) TEST_ASSERT(n.by_fam[i] > 300);
     TEST_ASSERT(n.rounds > 50000 && n.crossing > 3000 && n.rejected > 10000 && n.in_call > 8000);
     TEST_ASSERT(n.reopened > 100 && n.prefix_cut > 300 && n.stop_token > 1000);
     TEST_ASSERT(n.stopped_stop > 300 && n.stopped_call > 300 && n.with_calls > 1000);
+}
+
+/* ==== L431: the stop-string scan against its reading before L431 ======================================== */
+
+/* L431: gen_release looks for the request's stop strings in the text after every token, from a resume point.  The
+ * point used to move only when the longest stop string was longer than one byte; a request whose stop strings are
+ * all ONE byte long (`"stop": ["\n"]`) searched its whole text at every token -- quadratic in the turn.  It now
+ * resumes max_len - 1 bytes before the text's end for every list.
+ *
+ * First the reading that was confirmed: on a turn of one-byte stops the old resume point never leaves 0 and the
+ * bytes offered to the search are the square of the turn; the live one's are the turn.  Then the differential: the
+ * release as it was (tests/gen_host_ref.h) against the live one, token by token, over thousands of random streams
+ * -- text with UTF-8 and reasoning blocks opened and closed (the default markers and Gemma's), random tokens, stop
+ * lists of one-byte strings, several lengths, overlapping strings, pieces of the stream itself, a byte inside a UTF-8
+ * sequence, with and without a raw stream following the release -- each side with its own tracker and resume point.
+ * After every token: the same release length, the same hit, the same stop at the same offset, the same tracker.  (A
+ * turn's end -- the hold-back's release, the one-call rule, a tool call -- is the emit path's:
+ * test_l430_round_walks_match_reference runs it on the old rule and the live one.)  The streams hold no NUL byte:
+ * the search is strstr, and past a NUL the old rule's point at 0 saw nothing, where a list with a longer string --
+ * and now every list -- goes on. */
+
+/// What one run of the stop-scan differential counted.
+struct l431_counts {
+    long streams = 0, tokens = 0;        ///< streams read, tokens released
+    long hits = 0;                       ///< streams a stop string ended
+    long hits_one_byte = 0;              ///< of those, by a one-byte string
+    long hits_straddle = 0;              ///< of those, a string that began in an earlier token
+    long one_byte_lists = 0;             ///< streams whose stop strings are all one byte long
+    long reasoning = 0;                  ///< streams with a token inside reasoning (no scan)
+    long closes = 0;                     ///< reasoning blocks closed (the resume point jumps)
+    /// bytes from the resume point to the text's end, summed over the tokens of the streams with stop strings
+    long scanned_old = 0, scanned_new = 0;
+};
+
+/// Release one random stream through the release as it was and the live one.
+/// @param r    the generator
+/// @param n    the counters
+/// @param why  receives the first difference
+/// @return false on a difference
+static bool l431_one_stream(l430_rng *r, l431_counts *n, std::string *why) {
+    const std::vector<l430_fam> &fams = l430_fams();
+    const l430_fam &f = fams[r->below(3)];   /* Qwen, Nemotron-H (the default markers), Gemma 4 (its own) */
+    const server_reasoning_markers *markers = server_family_for_format(f.fmt)->reasoning;
+    std::string text;
+    for (uint32_t k = 1 + r->below(60); k > 0; k--) {
+        const uint32_t what = r->below(100);
+        if (what < 6) text += markers ? markers->open : "<think>";
+        else if (what < 14) text += markers ? markers->close[0] : "</think>";
+        else if (what < 22) text += r->pick(f.soup);
+        else text += r->pick(k_l430_text);
+    }
+    const std::vector<std::string> toks = l430_tokens(r, text);
+    stop_list stops;
+    memset(&stops, 0, sizeof stops);
+    const uint32_t kind = r->below(10);
+    if (kind < 3) {   /* pieces of the stream itself: 1..3 strings of 1..4 bytes (a cut may fall inside a sequence) */
+        for (uint32_t k = 1 + r->below(3); k > 0 && !text.empty(); k--) {
+            const size_t at = r->below((uint32_t)text.size());
+            stop_list_push(&stops, server_xstrdup(text.substr(at, 1 + r->below(r->chance(50) ? 1 : 4)).c_str()));
+        }
+    } else if (kind < 5) {   /* one-byte strings */
+        static const std::vector<std::string> one = {"\n", ".", ">", "<", "}", "z", " ", "\xa9", "S", "1"};
+        for (uint32_t k = 1 + r->below(3); k > 0; k--) stop_list_push(&stops, server_xstrdup(r->pick(one).c_str()));
+    } else if (kind < 9) {
+        for (const std::string &st : r->pick(k_l430_stops)) stop_list_push(&stops, server_xstrdup(st.c_str()));
+    }
+    bool all_one = stops.len > 0;
+    for (int i = 0; i < stops.len; i++) all_one = all_one && strlen(stops.v[i]) == 1;
+    n->streams++;
+    n->one_byte_lists += all_one;
+    thinking_state t_old;
+    memset(&t_old, 0, sizeof t_old);
+    t_old.markers = markers;
+    t_old.inside = r->chance(40);   /* the prompt left the turn in its reasoning */
+    thinking_state t_new = t_old;
+    const bool raw = r->chance(50);   /* a raw stream: the streamed prefix follows the release */
+    size_t from_old = 0, from_new = 0, sent_old = 0, sent_new = 0;
+    std::string sofar;
+    bool ok = true, was_inside = false;
+    for (size_t k = 0; ok && k < toks.size(); k++) {
+        sofar += toks[k];
+        size_t pos_old = 0, len_old = 0, pos_new = 0, len_new = 0;
+        bool hit_old = false, hit_new = false;
+        const bool inside_before = t_new.inside;
+        if (stops.len) {
+            n->scanned_old += (long)(sofar.size() - std::min(from_old, sofar.size()));
+            n->scanned_new += (long)(sofar.size() - std::min(from_new, sofar.size()));
+        }
+        const size_t up_old = gen_release_ref(&stops, sofar.c_str(), sofar.size(), toks[k].data(), toks[k].size(), sent_old,
+                                              &t_old, &from_old, &hit_old, &pos_old, &len_old);
+        const size_t up_new = gen_release(&stops, sofar.c_str(), sofar.size(), toks[k].data(), toks[k].size(), sent_new,
+                                          &t_new, &from_new, &hit_new, &pos_new, &len_new);
+        n->tokens++;
+        was_inside = was_inside || t_new.inside;
+        n->closes += inside_before && !t_new.inside;
+        if (up_old != up_new || hit_old != hit_new || (hit_old && (pos_old != pos_new || len_old != len_new)) ||
+            t_old.inside != t_new.inside || t_old.tail_len != t_new.tail_len ||
+            memcmp(t_old.tail, t_new.tail, (size_t)t_old.tail_len) || from_new < from_old) {
+            char where[200];
+            snprintf(where, sizeof where,
+                     "token %zu of %zu: old release %zu hit %d at %zu+%zu from %zu; live release %zu hit %d at %zu+%zu "
+                     "from %zu; stops:", k, toks.size(), up_old, hit_old, pos_old, len_old, from_old, up_new, hit_new,
+                     pos_new, len_new, from_new);
+            *why = where;
+            for (int i = 0; i < stops.len; i++) *why += std::string(" [") + stops.v[i] + "]";
+            *why += "\n--- the stream ---\n" + sofar + "\n---";
+            ok = false;
+        }
+        if (hit_new) {
+            n->hits++;
+            n->hits_one_byte += len_new == 1;
+            n->hits_straddle += pos_new < sofar.size() - toks[k].size();
+            break;
+        }
+        if (raw) {
+            sent_old = std::max(sent_old, up_old);
+            sent_new = std::max(sent_new, up_new);
+        }
+    }
+    n->reasoning += was_inside;
+    stop_list_clear(&stops);
+    free(stops.v);
+    return ok;
+}
+
+static void test_l431_stop_scan_matches_reference(void) {
+    /* the reading, confirmed: one-byte stop strings, a turn that never matches them */
+    {
+        stop_list stops;
+        memset(&stops, 0, sizeof stops);
+        stop_list_push(&stops, server_xstrdup("\n"));
+        stop_list_push(&stops, server_xstrdup("."));
+        thinking_state t_old, t_new;
+        memset(&t_old, 0, sizeof t_old);
+        t_new = t_old;
+        size_t from_old = 0, from_new = 0, pos = 0, len = 0;
+        long scanned_old = 0, scanned_new = 0;
+        std::string sofar;
+        bool hit = false;
+        const int tokens = 4000;
+        for (int k = 0; k < tokens; k++) {
+            sofar += "word ";
+            scanned_old += (long)(sofar.size() - from_old);
+            scanned_new += (long)(sofar.size() - from_new);
+            const size_t up_old = gen_release_ref(&stops, sofar.c_str(), sofar.size(), "word ", 5, 0, &t_old, &from_old,
+                                                  &hit, &pos, &len);
+            TEST_ASSERT(!hit && up_old == sofar.size());
+            const size_t up_new = gen_release(&stops, sofar.c_str(), sofar.size(), "word ", 5, 0, &t_new, &from_new, &hit,
+                                              &pos, &len);
+            TEST_ASSERT(!hit && up_new == sofar.size());
+        }
+        TEST_ASSERT(from_old == 0);                 /* the old resume point never moved: every scan read the turn */
+        TEST_ASSERT(from_new == sofar.size());      /* the live one waits at the next token */
+        TEST_ASSERT(scanned_old == 5L * tokens * (tokens + 1) / 2 && scanned_new == 5L * tokens);
+        /* a stop in the next token is found by both, at the same byte */
+        sofar += "end.";
+        size_t pos_new = 0, len_new = 0;
+        bool hit_new = false;
+        gen_release_ref(&stops, sofar.c_str(), sofar.size(), "end.", 4, 0, &t_old, &from_old, &hit, &pos, &len);
+        gen_release(&stops, sofar.c_str(), sofar.size(), "end.", 4, 0, &t_new, &from_new, &hit_new, &pos_new, &len_new);
+        TEST_ASSERT(hit && hit_new && pos == sofar.size() - 1 && pos_new == pos && len == 1 && len_new == 1);
+        stop_list_clear(&stops);
+        free(stops.v);
+    }
+    l431_counts n;
+    std::string why;
+    l430_rng r = {0x4c343331ull};
+    bool ok = true;
+    for (int i = 0; ok && i < 40000; i++) ok = l431_one_stream(&r, &n, &why);
+    if (!ok) fprintf(stderr, "L431: %s\n", why.c_str());
+    TEST_ASSERT(ok);
+    fprintf(stderr,
+            "  L431 stop scan vs its pre-L431 reading: %ld streams (%ld with one-byte stops only, %ld through "
+            "reasoning, %ld blocks closed), %ld tokens, %ld stops found (%ld one byte long, %ld begun in an earlier "
+            "token); the scans read %ld bytes on the old rule, %ld on the live one\n",
+            n.streams, n.one_byte_lists, n.reasoning, n.closes, n.tokens, n.hits, n.hits_one_byte, n.hits_straddle,
+            n.scanned_old, n.scanned_new);
+    TEST_ASSERT(n.one_byte_lists > 4000 && n.reasoning > 10000 && n.closes > 10000);
+    TEST_ASSERT(n.hits > 10000 && n.hits_one_byte > 3000 && n.hits_straddle > 1500);
+    TEST_ASSERT(n.scanned_old > 2 * n.scanned_new);
 }
 
 /// @param s  a text
@@ -20601,6 +20810,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l428_gate_admits_one_call();
     test_l428_turn_ends_at_its_first_call();
     test_l430_round_walks_match_reference();
+    test_l431_stop_scan_matches_reference();
     test_l428_next_prompt_extends_the_cut_turn();
     test_l420_stop_inside_reasoning_answers_with_it();
     test_l420_other_endings_are_unchanged();

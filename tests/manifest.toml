@@ -261,7 +261,7 @@ budget = 60   # L426: synthetic containers in /tmp and store opens; seconds
 name = "gen-host-gate"
 tier = "check"
 overlap = true
-budget = 120   # L430: thousands of random turns decoded twice on the host; seconds
+budget = 120   # L430 / L431: thousands of random turns decoded twice on the host, and random stop scans; seconds
 
 [[test]]
 name = "grammar-admit-gate"

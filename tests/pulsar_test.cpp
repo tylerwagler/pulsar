@@ -4451,10 +4451,12 @@ static void test_kv_identity(void) {
 
 /* L430: the host-only group the check tier runs (make gen-host-gate): the generation path's host work that must not
  * change a decision -- a speculative round's look ahead against its reading before L430 on thousands of random turns
- * (server_tests.cpp), and the per-position rule it implements against the plain lane's (L296). */
+ * (server_tests.cpp), the per-position rule it implements against the plain lane's (L296), and (L431) the
+ * stop-string scan against its reading before L431 on thousands of random streams. */
 static void test_gen_host(void) {
     test_spec_greedy_rows_per_position();
     test_l430_round_walks_match_reference();
+    test_l431_stop_scan_matches_reference();
 }
 
 /* L335: a bank carry's restore is all or nothing -- a live row that does not restore (here: a bank past the device
@@ -6822,7 +6824,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--driver-head-rows", "driver-head-rows", "the step's head list and its crossings: a span heads consecutive rows, a verify's head row is its step row by name, a run maps rows to positions (L334 P2b S7b)", test_driver_head_rows},
     {"--driver-context-bound", "driver-context-bound", "the driver's one context bound: a decode, eval or verify row at or past the pool's capacity is refused before the family's trunk (L375)", test_driver_context_bound},
     {"--spec-env", "spec-env", "PULSAR_SPEC_DEPTH / PULSAR_SPEC_TAU: one parse, an unparsable value refused by name at the open (L375)", test_spec_env},
-    {"--gen-host", "gen-host", "the generation path's host work against its earlier reading, on random turns of every family: a speculative round's look ahead (greedy rows, the usable chain) answers the same and leaves the attempt as it was (L430)", test_gen_host},
+    {"--gen-host", "gen-host", "the generation path's host work against its earlier reading, on random turns of every family: a speculative round's look ahead (greedy rows, the usable chain) answers the same and leaves the attempt as it was (L430); the stop-string scan finds the same stop at the same byte and releases the same text (L431)", test_gen_host},
     {"--kv-identity", "kv-identity", "the disk KV identity's weights and tokenizer words: the container content digest (stable across opens and copies, moved by a weight byte of the same layout, its sampling limit) and a store of another identity set aside and said once (L426)", test_kv_identity},
     {"--st-integers", "st-integers", "the safetensors header's integers are exact: a fractional or past-2^53 shape is refused (L335)", test_st_exact_integers},
     {"--bank-carry-restore", "bank-carry-restore", "a bank carry's restore is all or nothing: a live row that fails leaves the host view untouched (L335)", test_bank_carry_restore},

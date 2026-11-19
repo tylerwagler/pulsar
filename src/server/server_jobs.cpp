@@ -1909,7 +1909,12 @@ size_t gen_release(const stop_list *stops, const char *text, size_t len, const c
     size_t stream_len = *hit_stop ? *stop_pos : stop_list_stream_safe_len(stops, len);
     if (stream_len > len) stream_len = len;
     stream_len = utf8_stream_safe_len(text, plain_stream_pos, stream_len, *hit_stop);
-    if (!*hit_stop && stops->max_len > 1) {
+    /* The next scan resumes where a stop string could still start: one of length L completed by a later token starts
+     * at most L - 1 bytes before this text's end, and every earlier start was looked at by this scan or an earlier
+     * one (or lay in reasoning, which no scan reads).  L431: for every list, also one whose strings are all one
+     * byte long (hold = 0: the next scan starts at the next token).  The resume point used to move only when the
+     * longest string was longer than a byte, so `"stop": ["\n"]` searched the whole text at every token. */
+    if (!*hit_stop && stops->len) {
         const size_t hold = stops->max_len - 1;
         *stop_scan_from = len > hold ? len - hold : 0;
     }
