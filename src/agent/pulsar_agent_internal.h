@@ -361,7 +361,7 @@ typedef struct {
     bool more_valid;            ///< the cursor above refers to a real truncated read
 
     agent_bash_job *bash_jobs;  ///< linked list of background shell jobs
-    int next_bash_job_id;       ///< id handed to the next background job
+    AgentJobId next_bash_job_id;  ///< id handed to the next background job (none() before the first: it is 1)
     bool raw_mode_needs_restore;///< the terminal is in raw mode and must be restored on exit
 } agent_worker;
 
@@ -788,7 +788,7 @@ typedef struct {
  * model is shown a bounded head or tail and the path to the rest.
  */
 struct agent_bash_job {
-    int id;         ///< job id shown to the model (bash_status job=N)
+    AgentJobId id;  ///< job id shown to the model (bash_status job=N), from 1
     pid_t pid;      ///< child process id
     int pipe_fd;    ///< read end of the child's output pipe; -1 once closed
     int tmp_fd;     ///< write end into the temp output file; -1 once closed
@@ -1794,10 +1794,10 @@ void agent_bash_jobs_free(agent_worker *w);
 bool agent_bash_jobs_poll(agent_worker *w);
 /** Find a job by id, or by pid when id <= 0.
  *  @param w   the worker
- *  @param id  the job id; <= 0 = match by pid
- *  @param pid the process id; used when id <= 0 (> 0 to match)
+ *  @param id  the job id; none() = match by pid
+ *  @param pid the process id; used when id is none() (> 0 to match)
  *  @return the job (owned by the list), or NULL */
-agent_bash_job *agent_bash_find_job(agent_worker *w, int id, pid_t pid);
+agent_bash_job *agent_bash_find_job(agent_worker *w, AgentJobId id, pid_t pid);
 /** Unlink a job from the list and free it.
  *  @param w      the worker
  *  @param target the job; no-op when not in the list */

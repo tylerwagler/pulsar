@@ -250,7 +250,7 @@ void server::watchdog_dump(int64_t stalled_s) {
                    (double)s->m_kv_reserved.raw() / gib, (double)s->m_kv_budget.raw() / gib,
                    (double)s->guard_touched_ceiling.raw() / gib, (double)avail.raw() / gib,
                    (double)server_mem_floor().raw() / gib, swap);
-        for (int i = 0; i < s->n_slots; i++) {
+        for (int i = 0; i < s->n_slots.raw(); i++) {   /* L441: the published snapshot, by the slot's number */
             const int ph = s->m_slot_phase[i];
             if (ph == 0 && s->m_slot_pos[i] == 0) continue;   /* idle and empty */
             server_log(PULSAR_LOG_DEFAULT,

@@ -1227,7 +1227,7 @@ bool server_terminal_arms(bool wants, const terminal_evidence *ev, bool called);
  *  worker_evict_one, the pick in gen_begin_plan, the times and counts at its end (server::kv_req_log).  An int of
  *  -1 and an empty string are "absent" and print as `-`. */
 typedef struct {
-    uint64_t id;         ///< the job's number (job::seq, given at enqueue)
+    JobId id;            ///< the job's number (job::seq, given at enqueue)
     const char *ep;      ///< the endpoint: chat, completions, responses, messages
     const char *cls;     ///< the x-claude-code-request-class name ("" = no header)
     bool ro;             ///< X-Pulsar-KV: read-only
@@ -1537,7 +1537,9 @@ inline PromptToks id_prefix_as_prompt(TokCount common_by_id) { return PromptToks
 
 /* L439: the MARKED crossings.  A typing commit changes no value: where the code it types reads a count or a position
  * of one side of a token seam as the other's, the read goes through one of these four, unconverted, and is fixed in
- * a commit of its own (with a test on a seamed case).  A caller of them is a wrong-meaning site still open. */
+ * a commit of its own (with a test on a seamed case).  A caller of them is a wrong-meaning site still open.  (L441:
+ * the last two production callers, routing's ceiling and the KV admission price, are fixed; the seam tests read the
+ * old values through them.) */
 /** A prompt-side count read as a live-side one, unconverted (a marked crossing: see above).
  *  @param n the prompt's tokens */
 /// @return the same number as live tokens
@@ -2026,8 +2028,8 @@ bool server_chain_ends_at_text_end(TextBytes chain_text_end, TextBytes text_len)
 /** A queued job's wait for another prompt's prefill (job::pw).  Worker-thread state only. */
 typedef struct {
     bool decided;           ///< the wait was decided for this job (it waits at most once)
-    uint64_t leader;        ///< the bound job it waits on (job::seq), 0 = not waiting
-    int slot;               ///< that job's slot (server::slots index)
+    JobId leader;           ///< the bound job it waits on (job::seq), none() = not waiting
+    SlotIdx slot;           ///< that job's slot
     PromptPos mark;         ///< the cut the leader's prefill is to stand at: an index into both prompts (shared by id)
     PromptToks have;        ///< the request's tokens served when it started waiting (the gain is mark - have)
     double since;           ///< server_now_sec() when it started waiting
@@ -2400,6 +2402,24 @@ typedef struct {
  * (convs < banks) until the victim policy is smarter than LRU. */
 /// The bank pool's hard bound: slots (banks) per server; sizes every per-slot array.
 #define PULSAR_SESSION_POOL_CAP 16
+/** L441: a per-slot table of flags (protect, dominated, scratch, taken): subscripted by a SlotIdx only. */
+typedef pulsar_indexed<bool, SlotIdx, PULSAR_SESSION_POOL_CAP> slot_flags;
+/** L441: a per-bank table of flags (a bank's residency): subscripted by a BankId only. */
+typedef pulsar_indexed<bool, BankId, PULSAR_SESSION_POOL_CAP> bank_flags;
+/** L441: a per-slot table of ints (a slot's history length). */
+typedef pulsar_indexed<int, SlotIdx, PULSAR_SESSION_POOL_CAP> slot_ints;
+/** L441: a slot x slot table (the common-prefix matrix of two slots' histories). */
+typedef pulsar_indexed<slot_ints, SlotIdx, PULSAR_SESSION_POOL_CAP> slot_matrix;
+/** L441: a per-slot word whose bit b names slot b (the census's deep pairs). */
+typedef pulsar_indexed<uint32_t, SlotIdx, PULSAR_SESSION_POOL_CAP> slot_bits;
+/** L441: the bit of slot `b` in a slot_bits word.  @param b the slot (fatal past 31 or none())  @return 1 << b */
+inline uint32_t slot_bit(SlotIdx b) {
+    if (!b.below(32u)) pulsar_index_fail("slot_bit");
+    return 1u << b.raw();
+}
+static_assert(PULSAR_SESSION_POOL_CAP <= 32, "a slot_bits word holds a bit for every slot");
+/** L441: the pool's hard bound as a count (every slot a slot table holds). */
+constexpr BankCount session_pool_cap{PULSAR_SESSION_POOL_CAP};
 /* Auto-sizing cap: raised 8 -> 16 on 2026-09-11 after the re-measure the old
  * comment asked for (L219).  The 2026-08-10 measurement (N=12 aggregate held
  * 29.2 tok/s at 8 banks vs 21.9 at 12) predated the row-neutral lanes; the
@@ -2716,6 +2736,9 @@ typedef struct session_slot {
     bool         hint_dead;
 } session_slot;
 
+/** L441: the server's slots, subscripted by a SlotIdx only (server::slots; a test's own pool). */
+typedef pulsar_indexed<session_slot, SlotIdx, PULSAR_SESSION_POOL_CAP> slot_table;
+
 /* Forward declarations / relocated types referenced by struct server's member
  * methods (C++ port) whose full definitions appear later in this header or (for
  * provision_refusal) in server_sched.cpp. Pointer params only need a forward
@@ -2917,8 +2940,8 @@ bool kv_ledger_due(int64_t now_s, int64_t last_s);
 /// @param page_bytes  KV bytes per grid page
 /// @param out         receives the census
 /// @param deep        receives the deep-pair bits per slot (NULL: not wanted)
-void kv_dup_census_core(int n, const int *hist_len, const bool *resident, const int *const *common, int grid,
-                        KvBytes page_bytes, kv_dup_census *out, uint32_t *deep);
+void kv_dup_census_core(BankCount n, const slot_ints &hist_len, const slot_flags &resident, const slot_matrix &common,
+                        int grid, KvBytes page_bytes, kv_dup_census *out, slot_bits *deep);
 
 /** L433: how a /v1/systemone request ended, as /metrics labels it (`pulsar:systemone_requests_total{outcome}`). */
 enum server_systemone_outcome {
@@ -2970,16 +2993,16 @@ struct server {
     /** Session pool. slots[0..n_slots) are provisioned; the worker thread is
      * the only mutator of slot fields and n_slots (n_slots additionally
      * published under mu for readers on client threads). */
-    session_slot slots[PULSAR_SESSION_POOL_CAP];
-    int          n_slots;  ///< provisioned slots (worker-owned; published under mu)
+    slot_table   slots;
+    BankCount    n_slots;  ///< provisioned slots' high-water (worker-owned; published under mu)
     /** L334 P4: THE slot <-> bank crossing.  Slot i holds bank i by construction (cli_main sets slots[i].bank = i,
      *  admission sets sl->bank = idx); every slots[] lookup by a bank goes through here, which checks the identity
      *  (fae579f0 broke on it) and aborts when it does not hold.
      *  @param b the bank (fatal on none())
      *  @return the slot that holds bank `b` */
     session_slot *slot_of_bank(BankId b) {
-        const uint32_t i = pulsar_bank_index(b);
-        if (i >= (uint32_t)PULSAR_SESSION_POOL_CAP || (slots[i].provisioned && slots[i].bank != b)) {
+        const SlotIdx i{pulsar_bank_index(b)};   /* the identity's one entry from a bank */
+        if (!i.below(PULSAR_SESSION_POOL_CAP) || (slots[i].provisioned && slots[i].bank != b)) {
             fprintf(stderr, "pulsar-server: bank %d has no slot of its own (slot i == bank i broken) -- refusing\n",
                     b.raw());
             abort();
@@ -2990,6 +3013,36 @@ struct server {
      *  @param b the bank
      *  @return the slot that holds bank `b` */
     const session_slot *slot_of_bank(BankId b) const { return const_cast<server *>(this)->slot_of_bank(b); }
+    /** L441: THE slot -> bank crossing, slot_of_bank's reverse: slot i holds bank i.  The one way a SlotIdx becomes a
+     *  BankId (`BankId{slot}` does not compile); it checks the identity on a provisioned slot as slot_of_bank does
+     *  (aborts when it does not hold) and sets nothing.
+     *  @param i the slot (fatal past the pool's bound or none())
+     *  @return the bank it holds */
+    BankId bank_of_slot(SlotIdx i) const {
+        if (!i.below(PULSAR_SESSION_POOL_CAP)) {
+            fprintf(stderr, "pulsar-server: slot %u is past the pool (%d slots) -- refusing\n", i.raw(),
+                    PULSAR_SESSION_POOL_CAP);
+            abort();
+        }
+        const BankId b{i.raw()};   /* the identity's one entry from a slot */
+        if (slots[i].provisioned && slots[i].bank != b) {
+            fprintf(stderr, "pulsar-server: slot %u does not hold bank %d (slot i == bank i broken) -- refusing\n",
+                    i.raw(), b.raw());
+            abort();
+        }
+        return b;
+    }
+    /** L441: a slot's index in the pool -- the one reading of a slot pointer's position (it was `sl - slots`).
+     *  @param sl a slot of this server's pool (fatal otherwise)
+     *  @return its index */
+    SlotIdx slot_index(const session_slot *sl) const {
+        const ptrdiff_t d = sl - slots.data();
+        if (d < 0 || d >= (ptrdiff_t)PULSAR_SESSION_POOL_CAP) {
+            fprintf(stderr, "pulsar-server: a slot outside the pool -- refusing\n");
+            abort();
+        }
+        return SlotIdx{(uint32_t)d};
+    }
     /** Tier-2 bank-pool state (worker thread only). `pool_banks` > 0 means the
      * shared-pool flip is active: all live slots share server.sess and each
      * owns one bank; `live_bank` is the bank whose device views + host carry are
@@ -2997,7 +3050,7 @@ struct server {
      * old and restores the new). L118: the three-way scheduler's spec_max_live
      * knob and the classic decode lane are deleted — decode runs through the
      * batched quanta at every n >= 1. */
-    int          pool_banks;  ///< banks in the shared pool; >0 means the pool flip is active
+    BankCount    pool_banks;  ///< banks in the shared pool; any() means the pool flip is active
     BankId       live_bank;   ///< bank whose device views + host carry are installed (none(): nothing, L334 P4)
     /** plan-34 phase-2 inc 5: fused mixed-batch lane (PULSAR_MIXED_BATCH, default OFF,
      * read once at startup). When ON, the worker folds ONE prefilling slot's next
@@ -3074,7 +3127,7 @@ struct server {
     /** L357: PULSAR_SERVER_TEST_ROUTES=1 at startup -- the /test/ routes answer; otherwise they are unknown paths. */
     bool         test_routes;
     /** L362: when spill_bank last said "nowhere to park the pool" for each bank (server_now_sec; once per 10 s) */
-    double       park_refused_said[PULSAR_SESSION_POOL_CAP];
+    pulsar_indexed<double, BankId, PULSAR_SESSION_POOL_CAP> park_refused_said;
     /** The stall watchdog (watchdog.cpp).  `stall_s` is written by the watchdog and read by /health (__atomic);
      *  For the dump, `worker_tid` is set by server_worker_main and `worker_thread` by cli_main after pthread_create. */
     int          stall_limit_s;          ///< PULSAR_STALL_WATCHDOG_S (0 = off)
@@ -3115,7 +3168,7 @@ struct server {
     pthread_cond_t stream_cv;
     job *head;                   ///< queue head; the next job to bind
     job *tail;                   ///< queue tail; where enqueue appends
-    uint64_t job_seq;            ///< L329 (a): the last job::seq enqueue gave (under mu)
+    JobId job_seq;               ///< L329 (a): the last job::seq enqueue gave (under mu)
     /** L329 (a): PULSAR_SERVER_PREFIX_WAIT_MS -- how long a queued request may wait for a cut another prompt's
      *  prefill is filling (0: never; set at startup, read by the worker only). */
     int prefix_wait_ms;
@@ -3319,7 +3372,7 @@ struct server {
     int m_queue_block_reason;  ///< provision_refusal + 1 of a stuck head; 0 = not blocked
     FILE *trace;               ///< trace sink, or NULL when tracing is off
     pthread_mutex_t trace_mu;  ///< serialises trace writes across threads
-    uint64_t trace_seq;        ///< monotonic trace event counter, for ordering
+    TraceId trace_seq;         ///< the last trace id trace_begin gave (monotonic, under trace_mu)
     FILE *capture;             ///< --capture-requests sink (append), or NULL
     pthread_mutex_t capture_mu;///< serialises capture writes across client threads
 
@@ -3743,7 +3796,7 @@ struct server {
     /// @param content    the turn's parsed content (may be NULL)
     /// @param reasoning  the turn's parsed reasoning (may be NULL)
     /// @param calls      the turn's calls (none: nothing to do)
-    void canonicalize_tool_checkpoint(session_slot *sl, const job *j, const char *ctx, uint64_t trace_id, const char *content, const char *reasoning, const tool_calls *calls);
+    void canonicalize_tool_checkpoint(session_slot *sl, const job *j, const char *ctx, TraceId trace_id, const char *content, const char *reasoning, const tool_calls *calls);
     /** The failure epilogue of a job that has no decode attempt yet -- both prefill phases (the old duplicated blocks
      * after each pulsar_session_sync failure), the restore, a bank that cannot be installed, a decode init that
      * could not start (L372): the client is answered and the job is GEN_DONE.  Token vectors and the disk path are
@@ -3764,10 +3817,10 @@ struct server {
      *  T, pulsar_session_bank_adopt_score), 0 when it may not be adopted from (not resident, spilled, preempted,
      *  mid-restore, the slot's own) -- the resume pick's scan, and a failed restore's look again.
      *  @param sl  the slot whose job resumes
-     *  @param src the bank (-1: none)
+     *  @param src the bank (none(): none)
      *  @return what it serves: `served` the request's tokens (the rank), `at` its T on the source's history (L434:
      *          both, typed -- it returned the rank as an int its callers re-wrapped) */
-    pulsar_bank_resume gen_adopt_depth(const session_slot *sl, int src);
+    pulsar_bank_resume gen_adopt_depth(const session_slot *sl, BankId src);
     /** L318 / L347 I3b: copy bank `src`'s published state into the slot's installed bank (the caller picked it) and say
      *  where the sync then resumes in `res` (cached, resumed_at, cache_source; a refused adopt leaves the bank invalid
      *  and `res` at 0).
@@ -3775,7 +3828,7 @@ struct server {
      *  @param src the bank to copy from
      *  @param res the resolution to update
      *  @return true when the bank adopted */
-    bool gen_resume_adopt(session_slot *sl, int src, gen_resolution *res);
+    bool gen_resume_adopt(session_slot *sl, BankId src, gen_resolution *res);
     /** L318: the prefill's client hung up (both lanes' one abandon).  The computed prefix is persisted first -- the
      * chain closed at the bank's deepest grid checkpoint, the last grid point the prefill reached -- so the re-send
      * (a Stop and re-send, a client timeout) resumes there instead of re-prefilling it; then gen_prefill_fail. */
@@ -4065,11 +4118,11 @@ struct server {
     /// @param id     the request's trace id (0: ignored)
     /// @param piece  the bytes
     /// @param len    bytes at `piece`
-    void trace_piece(uint64_t id, const char *piece, size_t len);
+    void trace_piece(TraceId id, const char *piece, size_t len);
     /** Write a formatted event line into the trace for request `id`. */
     /// @param id   the request's trace id (0: ignored)
     /// @param fmt  printf format, then its arguments
-    void trace_event(uint64_t id, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+    void trace_event(TraceId id, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
     /** Record how the prompt was resolved: what the caches supplied, what the
      * tool replay matched, and which file was used. This is the record that
      * explains a cold prefill after the fact. */
@@ -4090,7 +4143,7 @@ struct server {
     /// @param disk_cached              the request's tokens a disk chain loaded
     /// @param disk_path                the loaded chain's segment key (may be NULL)
     /// @return 0 when tracing is off
-    uint64_t trace_begin(const job *j, PromptToks cached, PromptToks effective_prompt_tokens,
+    TraceId trace_begin(const job *j, PromptToks cached, PromptToks effective_prompt_tokens,
                          const trace_cache_diag *cache_diag, const char *cache_source, PromptToks disk_cached,
                          const char *disk_path);
     /** Close the trace: outcome, token counts, what the final parse produced. */
@@ -4104,7 +4157,7 @@ struct server {
     /// @param parsed_reasoning  the final parse's reasoning (may be NULL)
     /// @param parsed_calls      the final parse's calls (may be NULL)
     /// @param elapsed           the request's wall time, seconds
-    void trace_finish(uint64_t id, const request *r, const char *final_finish, int completion, bool saw_tool_start, bool saw_tool_end, const char *parsed_content, const char *parsed_reasoning, const tool_calls *parsed_calls, double elapsed);
+    void trace_finish(TraceId id, const request *r, const char *final_finish, int completion, bool saw_tool_start, bool saw_tool_end, const char *parsed_content, const char *parsed_reasoning, const tool_calls *parsed_calls, double elapsed);
     /** @} */
     /** Append `j` to the queue and wake the worker. Takes `mu`.
      * @return false when the server is stopping and the job was not queued. */
@@ -4150,12 +4203,12 @@ struct server {
      * dominated bank before any LRU choice.  Pure host reads (server::slot_history, the read routing uses; no CUDA,
      * no install); all false off the bank pool. */
     /// @param dominated  receives, per slot index, whether that slot is dominated
-    void dominated_slots(bool dominated[PULSAR_SESSION_POOL_CAP]);
+    void dominated_slots(slot_flags &dominated);
     /** L324: take the duplicate-prefix census of the resident banks (kv_dup_census_core over the host carries; no
      * CUDA) and publish it for /metrics; log, once per pair, a resident pair that shares more than the preamble
      * (PULSAR_KV_DUP_DEEP_TOKENS).  Worker thread, at each request's end.  No-op off the bank pool. */
     void kv_dup_census_update();
-    uint32_t w_dup_deep[PULSAR_SESSION_POOL_CAP];  ///< L324: the deep pairs the last census logged (bit b of slot a)
+    slot_bits w_dup_deep;  ///< L324: the deep pairs the last census logged (bit b of slot a)
     /** Spill one idle bank: install it, snapshot its KV to disk, save its host carry,
      * repoint AWAY (free_physical refuses the cur bank), then cudaFree its physical.
      */
@@ -4177,15 +4230,16 @@ struct server {
     bool worker_readmit_preempted();
     /** LRU-idle smallest-frontier victim: NOT in the live decode set, no active job, not
      * already spilled; L328: bank 0 is one like any other (the pool parks elsewhere,
-     * park_bank). -1 if none.  L323: a slot `dominated` marks (dominated_slots; NULL =
+     * park_bank). none() if none.  L323: a slot `dominated` marks (dominated_slots; NULL =
      * none) goes first.
      */
     /// @param dec        the live decode set (never picked)
     /// @param n          its length
     /// @param dominated  per slot index: dominated slots go first (NULL = none)
     /// @param scratch    per slot index: scratch slots go next (L379; NULL = none)
-    /// @return the victim's slot index, or -1
-    int guard_pick_victim(session_slot **dec, int n, const bool *dominated = nullptr, const bool *scratch = nullptr);
+    /// @return the victim's slot index, or none()
+    SlotIdx guard_pick_victim(session_slot **dec, int n, const slot_flags *dominated = nullptr,
+                              const slot_flags *scratch = nullptr);
     /** Proactive-eviction guard: spill banks to disk until resident KV is back
      * under guard_touched_budget; L328 (5): with every idle bank spilled and the breach standing, preempt the
      * newest decoders (L314) while one makes the rest fit.  @param dec the decode set that must be kept
@@ -4202,7 +4256,8 @@ struct server {
     /// @param n_spill  receives how many of `order` to spill
     /// @param need     receives the bank's KV growth in bytes
     /// @return the verdict (FITS when the guard is off or off the bank pool)
-    prompt_kv_verdict prompt_kv_check(const session_slot *sl, const job *j, int *order, int *n_spill, KvBytes *need);
+    prompt_kv_verdict prompt_kv_check(const session_slot *sl, const job *j, SlotIdx *order, BankCount *n_spill,
+                                      KvBytes *need);
     /** L326: the base every KV admission decision (a prompt's, a preemption's fit, a readmission's) reads: the
      *  pool's touched KV plus what each job bound to a slot other than `except` still adds before its prompt is in
      *  its bank (its growth to the prompt's length past what the bank holds; parked decoders excluded).  Worker
@@ -4280,7 +4335,7 @@ struct server {
      * miss a slot provisioned this instant, whose bindings are still empty.
      */
     /// @return n_slots, read under mu
-    int n_slots_snapshot();
+    BankCount n_slots_snapshot();
     /** Mark slots some QUEUED live-tool-state continuation still needs: that KV
      * frontier exists only on its owner slot, so evicting it would turn the
      * queued job into a 409 the moment it binds. The queue is snapshotted under
@@ -4290,7 +4345,7 @@ struct server {
      * locks are never nested.
      */
     /// @param protect  receives, per slot index, whether a queued continuation owns it (cleared first)
-    void worker_protect_queued_owner_slots(bool protect[PULSAR_SESSION_POOL_CAP]);
+    void worker_protect_queued_owner_slots(slot_flags &protect);
     /** Soft eviction protection: OR into protect[] every bank that is some QUEUED
      * job's best USABLE warm match. Without this the fresh-path domino recurs:
      * job A's eviction lands on job B's warm trunk, and B — often the very next
@@ -4302,7 +4357,7 @@ struct server {
      * (slot_common_prefix reads engine host carries).
      */
     /// @param protect  per slot index; the warm matches are OR-ed in
-    void worker_protect_queued_warm_matches(bool protect[PULSAR_SESSION_POOL_CAP]);
+    void worker_protect_queued_warm_matches(slot_flags &protect);
     /** Pointless-eviction guard #2: evicting is only worth its cost if releasing
      * idle sessions can actually admit the provisioning the head job needs.
      * If even reclaiming EVERY unprotected idle slot leaves admission refusing,
@@ -4314,21 +4369,21 @@ struct server {
      */
     /// @param protect  per slot index: slots that must not be evicted
     /// @return true when evicting the unprotected idle slots could admit a bank's provision
-    bool worker_eviction_could_help(const bool *protect);
+    bool worker_eviction_could_help(const slot_flags *protect);
     /** L379: the victim classes of every slot, the facts both victim orders rank by (server_victim_rank): the
      *  make-room eviction's (server_evict_pick_victim) and the guard's spill order (guard_pick_victim). */
     /// @param dominated  receives, per slot index: dominated (dominated_slots) or a dead prefix (hint_dead)
     /// @param scratch    receives, per slot index: scratch (server_slot_is_scratch over its frontier and the disk
     ///                   tier's min_tokens)
-    void victim_facts(bool dominated[PULSAR_SESSION_POOL_CAP], bool scratch[PULSAR_SESSION_POOL_CAP]);
+    void victim_facts(slot_flags &dominated, slot_flags &scratch);
     /** L379: which bank a make-room eviction would free now, and what to do about it (server_make_room over the
      *  queued live-tool owners, the queued jobs' warm matches and victim_facts).  The ONE pick of the fresh path
      *  (choose_slot_for_job) and the bind loop (worker_try_bind).  Evicts nothing.  Worker thread only. */
     /// @param best    the requester's own best-matching bank (NULL: none)
-    /// @param victim  receives the slot index that would go (-1: none)
+    /// @param victim  receives the slot index that would go (none(): none)
     /// @param rank    receives its server_victim_rank (-1: none)
     /// @return MAKE_ROOM_EVICT to evict `victim`, MAKE_ROOM_IN_PLACE when it is `best`, MAKE_ROOM_NONE
-    make_room_verdict make_room(const session_slot *best, int *victim, int *rank);
+    make_room_verdict make_room(const session_slot *best, SlotIdx *victim, int *rank);
     /** Evict one idle slot, make_room's victim: snapshot to the disk kv cache when
      * possible, release the ledger, and leave the slot entry
      * (provisioned == false) for provision_slot to reuse. Failure honesty: a failed or
@@ -4339,7 +4394,7 @@ struct server {
     /// @param vi       the slot to evict (provisioned, idle)
     /// @param rank     its server_victim_rank, for the log line
     /// @param for_job  the request the eviction is for (its `kv req:` line and the ledger record it, L378)
-    void worker_evict(int vi, int rank, job *for_job);
+    void worker_evict(SlotIdx vi, int rank, job *for_job);
     /** Bind the head job to a slot if routing allows it. Strict FIFO: when the
      * head must wait (its owner slot is busy, or no fitting slot is free), later
      * jobs wait behind it — simple and starvation-free.  L329 (a): the "head" is
@@ -4565,6 +4620,14 @@ struct server {
      *  @param p  the prompt a sync is handed */
     /// @return the stitched length, rows of the bank
     TokCount slot_sync_len(const session_slot *sl, prompt_view p) const;
+    /** L441: the rows the slot's bank holds once job `j`'s prompt is in -- what a KV admission prices the prompt at
+     *  (kv_reserved_bytes, prompt_kv_check): server_prompt_rows over the slot's gen (when it is `j`'s) and the stitch
+     *  of `j`'s prompt onto the bank's history as it stands (slot_sync_len; an empty bank, or NULL: the prompt's own
+     *  tokens).
+     *  @param sl the slot the job is bound or would bind to (NULL: an empty bank)
+     *  @param j  the job */
+    /// @return the rows, a length on the bank
+    TokCount prompt_rows_on(const session_slot *sl, const job *j) const;
     /** L115: the one prefix-reuse question, asked of a slot.  Callers that need
      * the request-side count (accounting, prefill bounds) read `prompt_cut`;
      * callers that need KV rows or a cut point read `live_cut`.  Across a seam
@@ -4654,7 +4717,7 @@ struct job {
     uint64_t route_logged;
     /** L329 (a): the job's number, given at enqueue from 1: a waiter names its leader by it (a later job at the
      *  freed address is not the leader). */
-    uint64_t seq;
+    JobId seq;
     prefix_wait pw;   ///< L329 (a): its wait for another prompt's prefill while queued
     kv_req_line kvr;  ///< L378: what its `kv req:` line will print, filled as it becomes known (worker thread)
     /** L249 D: the early stream.  A streaming request the worker has not started writing to gets its SSE head and
@@ -4771,7 +4834,7 @@ struct gen_restore {
     PromptToks own;
     /** L434: the request's tokens the chain holds (server::kv_chain_served at the pick): the cache read once it is in */
     PromptToks disk_served;
-    int adopt_src;           ///< the bank adopt would copy from (-1: none)
+    BankId adopt_src;        ///< the bank adopt would copy from (none(): none)
     kv_chain_hit hit;        ///< the chain
     kv_restore r;            ///< its load
     gen_resolution res;      ///< GEN_RESTORE_RESUME: the resolution the plan continues
@@ -5000,7 +5063,7 @@ struct gen_state {
     TokPos sync_end;
     double t0;                        ///< wall time the request began, for latency accounting
     double first_token_t;  ///< wall time the first output token was produced (TTFT); 0 until set. Request-lifetime: survives decode_again so it reflects the genuinely first token emitted.
-    uint64_t trace_id;   ///< correlates every trace event for this request
+    TraceId trace_id;    ///< correlates every trace event for this request (none(): tracing off)
     char ctx_span[48];   ///< human-readable context span, for logs ("1234-5678")
     char req_flags[64];  ///< compact flag string describing the request, for logs
     server_prefill_progress progress;  ///< stable address: callback userdata
@@ -5865,7 +5928,7 @@ bool http_response(int fd, int code, const char *type, const char *body);
  *  @param err           receives the reason on false
  *  @param errlen        size of `err`
  *  @return false (said in err) when the container cannot serve it */
-bool server_judge_open(struct server *s, const char *container_dir, int bank, char *err, size_t errlen);
+bool server_judge_open(struct server *s, const char *container_dir, BankId bank, char *err, size_t errlen);
 /** Free the judge (its queue drained by the worker before shutdown).
  *  @param s the server (s->judge freed, NULL after) */
 void server_judge_close(struct server *s);
@@ -6245,8 +6308,27 @@ int kv_cache_chat_anchor_pos(const kv_disk_cache *kc, const pulsar_tokens *promp
  *  @return the marker's position, -1 when there is none or it sits below min_tokens */
 int kv_cache_preamble_pos(const kv_disk_cache *kc, const pulsar_tokens *prompt, const pulsar_turn_markers *m);
 /* Trivial-match classifier for the memory-token resolver (defined in
- * server_sched.cpp; unit-tested in server_tests.cpp). */
-bool server_slot_match_is_trivial(TokCount common, TokPos slot_pos, PromptToks share_ceiling, TokCount protect_floor);
+ * server_sched.cpp; unit-tested in server_tests.cpp).  L441: it takes the match, which holds both sides of it. */
+bool server_slot_match_is_trivial(const pulsar_prefix_match &m, TokPos slot_pos, PromptToks share_ceiling,
+                                  TokCount protect_floor);
+/** L441: does routing wait for a busy bank whose client is gone (choose_slot_for_job, L261)?  When its match is
+ *  deeper than the best free bank's and at least the shared-prefix ceiling -- both in the JOB's tokens: how much of
+ *  the request each bank holds (the matches' prompt_cut), not each bank's own count of it (live_cut), which across a
+ *  token seam is another number on each bank.
+ *  @param gone_shared   the request's tokens the gone bank's match holds
+ *  @param best_shared   the request's tokens the best free bank's match holds (-1: no free bank)
+ *  @param share_ceiling the trivial-match ceiling, the request's tokens
+ *  @return true when the job waits for the gone bank's abandon */
+bool server_route_waits_for_gone(PromptToks gone_shared, PromptToks best_shared, PromptToks share_ceiling);
+/** L441: the rows a bank holds once a prompt is in, the one rule a KV admission prices by.  Once the job's plan ran
+ *  (a prefill phase: gen_begin_plan set gen_state::sync_end, and again when its cold phase ended) its sync's end on
+ *  the bank; before it (bound with no gen yet, or restoring a chain) the stitch of the request's prompt onto the
+ *  bank's history now.  Rows of the bank -- a token-seam stitch's, not the request's own count, which across a seam
+ *  is another number.
+ *  @param g           the job's generation (NULL: none yet)
+ *  @param stitch_now  the stitch of the request's prompt onto the bank as it stands (server::slot_sync_len) */
+/// @return the rows
+TokCount server_prompt_rows(const gen_state *g, TokCount stitch_now);
 /* L275: the position of the bank's last user marker among its prefilled tokens
  * when a completed exchange precedes it; -1 otherwise (defined in
  * server_sched.cpp; unit-tested in server_tests.cpp). */
@@ -6444,7 +6526,7 @@ bool server_watchdog_busy(const server *s);
  * ledger commits (the actual); 0 when they differ -- the price is the
  * allocator run dry, so a difference is an accounting hole and the caller
  * refuses to start (defined in server_sched.cpp). */
-KvBytes server_reconciled_session_cost(int slot_idx, int ctx, KvBytes est_bytes, KvBytes actual_bytes);
+KvBytes server_reconciled_session_cost(SlotIdx slot_idx, int ctx, KvBytes est_bytes, KvBytes actual_bytes);
 /* Eviction ledger release: subtract an evicted slot's committed bytes from
  * the admission ledger total, warning loudly (and clamping to 0, which fails
  * toward over-admission being caught by the MemAvailable floor rather than
@@ -6558,16 +6640,14 @@ usage_split server_usage_split(PromptToks prompt, PromptToks cached);
 /* LRU eviction victim: least-recently-serviced idle provisioned slot,
  * tie-broken by smallest committed bytes; slot 0 pinned; protect[i] (may be
  * NULL) marks slots a queued live continuation still needs. Returns a slot
- * index or -1. Pure selection over host fields — never touches the session
+ * index or none(). Pure selection over host fields — never touches the session
  * (defined in server_sched.cpp; unit-tested in server_tests.cpp).  L323: a slot
  * `dominated` marks (server::dominated_slots; NULL = none) goes before any LRU
  * choice.  L379: then a slot `scratch` marks (server_slot_is_scratch; NULL =
  * none), before any LRU choice among conversations. */
-int server_evict_pick_victim(const session_slot *slots, int n_slots,
-                                    const bool *protect,
-                                    bool allow_slot0 = false,
-                                    const bool *dominated = nullptr,
-                                    const bool *scratch = nullptr);
+SlotIdx server_evict_pick_victim(const slot_table &slots, BankCount n_slots, const slot_flags *protect,
+                                 bool allow_slot0 = false, const slot_flags *dominated = nullptr,
+                                 const slot_flags *scratch = nullptr);
 /** L379: a SCRATCH bank -- an idle provisioned bank whose history was last taken by a read-only request
  *  (session_slot::kv_flags, X-Pulsar-KV: the gate's judge), or whose frontier is under the disk tier's minimum (a
  *  history the tier itself does not save).  Never preserved for its own sake: the first victim after dominated and
@@ -6603,12 +6683,12 @@ void server_slot_take_history(session_slot *sl, const request *r);
  *  @param allow_slot0  slot 0 may go (pool mode)
  *  @param dominated    per slot: dominated or dead (NULL: none)
  *  @param scratch      per slot: scratch (NULL: none)
- *  @param best         the requester's own best-matching slot (-1: none)
- *  @param victim       receives the slot that would go (-1: none)
+ *  @param best         the requester's own best-matching slot (none(): none)
+ *  @param victim       receives the slot that would go (none(): none)
  *  @return the verdict */
-make_room_verdict server_make_room(const session_slot *slots, int n_slots, const bool *owners, const bool *warm,
-                                   bool allow_slot0, const bool *dominated, const bool *scratch, int best,
-                                   int *victim);
+make_room_verdict server_make_room(const slot_table &slots, BankCount n_slots, const slot_flags *owners,
+                                   const slot_flags *warm, bool allow_slot0, const slot_flags *dominated,
+                                   const slot_flags *scratch, SlotIdx best, SlotIdx *victim);
 void trace_cache_capture(
         trace_cache_diag *d,
         const pulsar_tokens *live,

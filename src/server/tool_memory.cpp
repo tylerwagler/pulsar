@@ -416,10 +416,10 @@ void server::anthropic_live_clear(session_slot *sl) {
  * published under mu (its owning lock) — take mu for the snapshot rather than
  * asserting cross-lock visibility. A momentarily stale snapshot would only
  * miss a slot provisioned this instant, whose bindings are still empty. */
-int server::n_slots_snapshot() {
+BankCount server::n_slots_snapshot() {
     auto *s = this;
     pulsar::ScopedLock lk(&s->mu);
-    const int n = s->n_slots;
+    const BankCount n = s->n_slots;
     return n;
 }
 
@@ -428,10 +428,10 @@ int server::n_slots_snapshot() {
 bool server::responses_live_has_call_id(const char *id) {
     auto *s = this;
     if (!s || !id || !id[0]) return false;
-    const int n = s->n_slots_snapshot();
+    const BankCount n = s->n_slots_snapshot();
     pulsar::ScopedLock lk(&s->tool_mu);
     bool found = false;
-    for (int i = 0; i < n && !found; i++) {
+    for (SlotIdx i{0u}; n.covers(i) && !found; ++i) {
         const live_tool_state *st = &s->slots[i].responses_live;
         found = st->valid && id_list_contains(&st->call_ids, id);
     }
@@ -443,10 +443,10 @@ bool server::responses_live_has_call_id(const char *id) {
 bool server::anthropic_live_has_call_id(const char *id) {
     auto *s = this;
     if (!s || !id || !id[0]) return false;
-    const int n = s->n_slots_snapshot();
+    const BankCount n = s->n_slots_snapshot();
     pulsar::ScopedLock lk(&s->tool_mu);
     bool found = false;
-    for (int i = 0; i < n && !found; i++) {
+    for (SlotIdx i{0u}; n.covers(i) && !found; ++i) {
         const live_tool_state *st = &s->slots[i].anthropic_live;
         found = st->valid && id_list_contains(&st->call_ids, id);
     }
@@ -510,7 +510,7 @@ session_slot *server::live_slot_for_ids(const stop_list *ids,
     if (!s || !ids || ids->len == 0) return NULL;
     session_slot *found = NULL;
     pthread_mutex_lock(&s->tool_mu);
-    for (int i = 0; i < s->n_slots && !found; i++) {
+    for (SlotIdx i{0u}; s->n_slots.covers(i) && !found; ++i) {
         session_slot *sl = &s->slots[i];
         const live_tool_state *st = anthropic ? &sl->anthropic_live
                                               : &sl->responses_live;

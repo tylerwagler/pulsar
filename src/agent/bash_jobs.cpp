@@ -122,9 +122,9 @@ bool agent_bash_jobs_poll(agent_worker *w) {
 
 
 
-agent_bash_job *agent_bash_find_job(agent_worker *w, int id, pid_t pid) {
+agent_bash_job *agent_bash_find_job(agent_worker *w, AgentJobId id, pid_t pid) {
     for (agent_bash_job *job = w->bash_jobs; job; job = job->next) {
-        if ((id > 0 && job->id == id) || (id <= 0 && pid > 0 && job->pid == pid))
+        if ((!id.is_none() && job->id == id) || (id.is_none() && pid > 0 && job->pid == pid))
             return job;
     }
     return NULL;
@@ -330,8 +330,9 @@ agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
 
     agent_bash_job *job = (agent_bash_job *)agent_xmalloc(sizeof(*job));
     memset(job, 0, sizeof(*job));
-    if (w->next_bash_job_id <= 0) w->next_bash_job_id = 1;
-    job->id = w->next_bash_job_id++;
+    if (w->next_bash_job_id.is_none()) w->next_bash_job_id = AgentJobId{1};
+    job->id = w->next_bash_job_id;
+    w->next_bash_job_id = w->next_bash_job_id.next();
     job->pid = pid;
     job->live_slot = slot;
     job->pipe_fd = pipefd[0];
@@ -466,11 +467,11 @@ char *agent_bash_job::observation(bool mark_observed) {
     if (job->running) {
         snprintf(line, sizeof(line),
             "bash job=%d pid=%ld status=running elapsed_sec=%.1f timeout_sec=%.0f\n",
-            job->id, (long)job->pid, elapsed, job->timeout_sec);
+            job->id.raw(), (long)job->pid, elapsed, job->timeout_sec);
     } else {
         snprintf(line, sizeof(line),
             "bash job=%d pid=%ld status=done elapsed_sec=%.1f timed_out=%d\n",
-            job->id, (long)job->pid, elapsed, job->timed_out ? 1 : 0);
+            job->id.raw(), (long)job->pid, elapsed, job->timed_out ? 1 : 0);
     }
     agent_buf_puts(&out, line);
     if (!job->running) {
@@ -526,7 +527,7 @@ char *agent_bash_job::observation(bool mark_observed) {
     if (job->running) {
         snprintf(line, sizeof(line),
             "\nUse bash_status job=%d to get info before refresh time; use bash_stop job=%d to stop execution\n",
-            job->id, job->id);
+            job->id.raw(), job->id.raw());
         agent_buf_puts(&out, line);
     }
 

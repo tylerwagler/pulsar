@@ -220,9 +220,9 @@ void judge_finish(judge_job *jb, const char *why) {
 
 }  // namespace
 
-bool server_judge_open(server *s, const char *container_dir, int bank, char *err, size_t errlen) {
+bool server_judge_open(server *s, const char *container_dir, BankId bank, char *err, size_t errlen) {
     server_judge *J = new server_judge();
-    J->bank = BankId{bank};
+    J->bank = bank;
     J->slots = pulsar_engine_decision_head(s->engine, &J->w, &J->b, &J->width);
     if (!J->slots) {
         snprintf(err, errlen, "the container carries no decision head");
@@ -274,24 +274,24 @@ bool server_judge_open(server *s, const char *container_dir, int bank, char *err
     }
     /* the bank: empty, the adapter on, saved -- nothing installed after (the worker installs what it serves) */
     pulsar_session *pool = s->sess;
-    if (!pulsar_session_bank_state_restore(pool, BankId{bank})) {
-        snprintf(err, errlen, "bank %d could not be installed", bank);
+    if (!pulsar_session_bank_state_restore(pool, bank)) {
+        snprintf(err, errlen, "bank %d could not be installed", bank.raw());
         delete J;
         return false;
     }
     pulsar_session_invalidate(pool);
-    if (!pulsar_session_set_bank_adapter(pool, BankId{bank}, true)) {
-        snprintf(err, errlen, "bank %d refused the adapter", bank);
+    if (!pulsar_session_set_bank_adapter(pool, bank, true)) {
+        snprintf(err, errlen, "bank %d refused the adapter", bank.raw());
         delete J;
         return false;
     }
-    pulsar_session_bank_state_save(pool, BankId{bank});
+    pulsar_session_bank_state_save(pool, bank);
     s->live_bank = BankId::none();
     s->judge = J;
     server_log(PULSAR_LOG_DEFAULT,
                "pulsar-server: /v1/systemone on bank %d (reserved, the adapter on): decision head %u slots over %u, "
                "soft-cap %.0f, %zu kinds, bare-v1 (L338 P2.4)",
-               bank, J->slots, J->width, J->softcap, J->kinds.size());
+               bank.raw(), J->slots, J->width, J->softcap, J->kinds.size());
     return true;
 }
 

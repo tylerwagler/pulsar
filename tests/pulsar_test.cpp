@@ -4656,6 +4656,9 @@ static void test_disk_depth(void) {
     test_l439_prefix_wait_seamed_leader();
     test_l439_prefill_bounds_are_live_side();
     test_l439_fused_lane_refuses_a_seam();
+    test_l441_pool_spaces();   /* L441: the pool's slot / bank spaces and their count */
+    test_l441_trivial_ceiling_is_the_jobs();   /* L441 (a): the trivial-match ceiling in the job's tokens */
+    test_l441_admission_prices_the_stitch();   /* L441 (b): the KV admission at the stitch's rows */
 }
 
 /* L440: the host-only group the check tier runs (make prompt-offsets-gate): the rendered prompt's offsets and spans
@@ -4914,13 +4917,13 @@ static void test_batch_history(void) {
     pthread_mutex_init(&s.tool_mu, NULL);
     s.sess = fs;
     s.engine = e;
-    s.pool_banks = 4;
-    s.n_slots = 4;
+    s.pool_banks = BankCount{4};
+    s.n_slots = BankCount{4};
     s.pool_ctx_size = 4096;
     s.slot_trivial_common_tokens = 64;
     s.prefix_wait_ms = 1000;
-    for (int i = 0; i < 4; i++) {
-        s.slots[i].bank = BankId{i};
+    for (SlotIdx i : s.n_slots.slots()) {
+        s.slots[i].bank = s.bank_of_slot(i);
         s.slots[i].provisioned = true;
         s.slots[i].ctx_size = 4096;
     }
@@ -4928,12 +4931,12 @@ static void test_batch_history(void) {
     memset(&dec_job, 0, sizeof dec_job);
     memset(&lead_job, 0, sizeof lead_job);
     dec_job.fd = lead_job.fd = -1;
-    dec_job.seq = 11;
-    lead_job.seq = 12;
+    dec_job.seq = JobId{11};
+    lead_job.seq = JobId{12};
     gen_state g, lg;
     memset(&g, 0, sizeof g);
     memset(&lg, 0, sizeof lg);
-    session_slot &dec = s.slots[1];
+    session_slot &dec = s.slots[SlotIdx{1u}];
     dec.active_job = &dec_job;
     dec.gen = &g;
     g.j = &dec_job;
@@ -4943,7 +4946,7 @@ static void test_batch_history(void) {
     g.batch_feed_pos = TokPos{603};
     for (int t : {5001, 5002, 5003}) pulsar_tokens_push(&g.batch_pending, TokId{t});
     pulsar_tokens lead_t = {lead.data(), (int)lead.size(), (int)lead.size()};
-    session_slot &ld = s.slots[2];
+    session_slot &ld = s.slots[SlotIdx{2u}];
     ld.active_job = &lead_job;
     ld.gen = &lg;
     lg.j = &lead_job;
@@ -4956,7 +4959,7 @@ static void test_batch_history(void) {
     TEST_ASSERT(slot_tokens_len(h) == s.slot_frontier_pos(&dec).raw());
     pulsar_tokens resend_t = {resend.data(), (int)resend.size(), (int)resend.size()};
     TEST_ASSERT(s.slot_common_prefix(&dec, &resend_t) == TokCount{600});
-    TEST_ASSERT(s.slot_common_prefix(&s.slots[0], &resend_t) == TokCount{300} && s.slot_history(&s.slots[0]).tail == NULL);
+    TEST_ASSERT(s.slot_common_prefix(&s.slots[SlotIdx{0u}], &resend_t) == TokCount{300} && s.slot_history(&s.slots[SlotIdx{0u}]).tail == NULL);
 
     /* (1) the L261 wait: the decoder's client is gone and the re-send extends its prompt -- wait for its abandon */
     {
@@ -4977,18 +4980,19 @@ static void test_batch_history(void) {
     /* (2) dominance and the census.  Slot 0 holds a prefix of the decoder's history at entry; slot 3 holds that
      * history and two of the batch's commits, so only the commits make the decoder reach past it */
     {
-        bool dom[PULSAR_SESSION_POOL_CAP];
+        const SlotIdx s0{0u}, s1{1u}, s2{2u}, s3{3u};
+        slot_flags dom;
         s.dominated_slots(dom);
-        TEST_ASSERT(dom[0] && !dom[1] && dom[3]);
-        int hist_len[PULSAR_SESSION_POOL_CAP];
-        int common_rows[PULSAR_SESSION_POOL_CAP][PULSAR_SESSION_POOL_CAP];
+        TEST_ASSERT(dom[s0] && !dom[s1] && dom[s3]);
+        slot_ints hist_len;
+        slot_matrix common_rows;
         bank_common_matrix(&s, hist_len, common_rows);
-        TEST_ASSERT(hist_len[0] == 300 && hist_len[1] == 603 && hist_len[2] == 128 && hist_len[3] == 602);
-        TEST_ASSERT(common_rows[0][1] == 300 && common_rows[3][1] == 602 && common_rows[1][3] == -1);
+        TEST_ASSERT(hist_len[s0] == 300 && hist_len[s1] == 603 && hist_len[s2] == 128 && hist_len[s3] == 602);
+        TEST_ASSERT(common_rows[s0][s1] == 300 && common_rows[s3][s1] == 602 && common_rows[s1][s3] == -1);
         /* another third token on the idle bank: not the decoder's history any more */
         fs->bank_carry[3].checkpoint.v[601] = TokId{9999};
         s.dominated_slots(dom);
-        TEST_ASSERT(dom[0] && !dom[1] && !dom[3]);
+        TEST_ASSERT(dom[s0] && !dom[s1] && !dom[s3]);
         fs->bank_carry[3].checkpoint.v[601] = TokId{5002};
         /* the census: 3 + 6 + 1 + 6 pages of 100 held, 6 distinct (the decoder's six), the deepest pair 602 */
         s.kv_dup_census_update();
@@ -5006,11 +5010,11 @@ static void test_batch_history(void) {
         j.fd = -1;
         j.req.prompt = wait_t;
         TEST_ASSERT(s.slot_resume_at(&dec, &wait_t, NULL, 0).served == PromptToks{600});
-        TEST_ASSERT(!s.prefix_wait_decide(&j) && j.pw.decided && j.pw.leader == 0);
+        TEST_ASSERT(!s.prefix_wait_decide(&j) && j.pw.decided && j.pw.leader.is_none());
         s.head = &j;
-        bool protect[PULSAR_SESSION_POOL_CAP] = {false};
+        slot_flags protect = {};
         s.worker_protect_queued_warm_matches(protect);
-        TEST_ASSERT(protect[1] && !protect[0] && !protect[2] && !protect[3]);
+        TEST_ASSERT(protect[SlotIdx{1u}] && !protect[SlotIdx{0u}] && !protect[SlotIdx{2u}] && !protect[SlotIdx{3u}]);
         s.head = NULL;
     }
 
@@ -5026,14 +5030,14 @@ static void test_batch_history(void) {
     g.batch_active = false;
     TEST_ASSERT(s.slot_history(&dec).base == NULL && s.slot_common_prefix(&dec, &resend_t) == TokCount{0});
     {
-        bool dom[PULSAR_SESSION_POOL_CAP];
+        slot_flags dom;
         s.dominated_slots(dom);
-        TEST_ASSERT(dom[0] && !dom[1] && !dom[3]);   /* slot 0 by slot 3 alone; nothing reaches past slot 3 */
+        TEST_ASSERT(dom[SlotIdx{0u}] && !dom[SlotIdx{1u}] && !dom[SlotIdx{3u}]);   /* slot 0 by slot 3 alone; nothing reaches past slot 3 */
         job j;
         memset(&j, 0, sizeof j);
         j.fd = -1;
         j.req.prompt = wait_t;
-        TEST_ASSERT(s.prefix_wait_decide(&j) && j.pw.leader == 12 && j.pw.mark == PromptPos{768} &&
+        TEST_ASSERT(s.prefix_wait_decide(&j) && j.pw.leader == JobId{12} && j.pw.mark == PromptPos{768} &&
                     j.pw.have == PromptToks{300});
         lg.share_mark = PromptPos{0};
     }

@@ -405,7 +405,7 @@ struct sync_hooks {
  * the short suffix in place or reloads an older disk checkpoint before replay. */
 void server::canonicalize_tool_checkpoint(session_slot *sl,
                                          const job *j, const char *ctx,
-                                         uint64_t trace_id, const char *content,
+                                         TraceId trace_id, const char *content,
                                          const char *reasoning, const tool_calls *calls) {
     auto *s = this;
     if (!calls || calls->len == 0 || !j->req.prompt_text) return;
@@ -865,7 +865,7 @@ static bool gen_restore_spilled_start(server *s, session_slot *sl, spilled_histo
     gr->kind = GEN_RESTORE_SPILLED;
     gr->text = was->text;
     was->text = NULL;
-    gr->adopt_src = -1;
+    gr->adopt_src = BankId::none();
     s->kv_restore_begin(&gr->r, &gr->hit, gained, true, false);   /* the bank came back empty: nothing to keep */
     gen_restore_start(sl, gr);
     return true;
@@ -918,7 +918,7 @@ void server::gen_step_restore(session_slot *sl) {
     const bool bank_kept = !r->touched;
     const PromptToks own = gr->own;
     const PromptToks disk_served = gr->disk_served;
-    const int adopt_src = gr->adopt_src;
+    const BankId adopt_src = gr->adopt_src;
     free(gr);
     if (G <= 0) {
         const PromptToks adopt_at = s->gen_adopt_depth(sl, adopt_src).served;   /* again: slices ran since the pick */
@@ -972,11 +972,11 @@ void server::gen_step_restore(session_slot *sl) {
     s->gen_begin_plan(sl, &res);
 }
 
-pulsar_bank_resume server::gen_adopt_depth(const session_slot *sl, int src) {
+pulsar_bank_resume server::gen_adopt_depth(const session_slot *sl, BankId src) {
     auto *s = this;
     const session_slot *o = NULL;
-    for (int i = 0; src >= 0 && i < s->n_slots; i++)
-        if (s->slots[i].bank == BankId{src}) o = &s->slots[i];
+    for (SlotIdx i{0u}; src.is_token() && s->n_slots.covers(i); ++i)
+        if (s->slots[i].bank == src) o = &s->slots[i];
     /* L330: nor a bank mid-restore -- its rows describe no state until its chain's last segment */
     if (!o || o == sl || !o->provisioned || o->spilled || o->preempted || (o->gen && o->gen->phase == GEN_RESTORE))
         return pulsar_bank_resume{TokPos{0}, PromptToks{0}, PULSAR_RESUME_WHY_NONE};
@@ -985,7 +985,7 @@ pulsar_bank_resume server::gen_adopt_depth(const session_slot *sl, int src) {
     return pulsar_session_bank_adopt_score(s->sess, o->bank, &sl->gen->j->req.prompt);
 }
 
-bool server::gen_resume_adopt(session_slot *sl, int src, gen_resolution *res) {
+bool server::gen_resume_adopt(session_slot *sl, BankId src, gen_resolution *res) {
     auto *s = this;
     gen_state *g = sl->gen;
     job *j = g->j;
@@ -993,21 +993,21 @@ bool server::gen_resume_adopt(session_slot *sl, int src, gen_resolution *res) {
     const double t_a = server_now_sec();
     g->bank_written = true;   /* adopted or, refused, invalidated: either way no longer the history it held */
     const pulsar_bank_adopt_result ad =
-        pulsar_session_bank_adopt(s->sess, BankId{src}, &j->req.prompt, aerr, sizeof(aerr));
+        pulsar_session_bank_adopt(s->sess, src, &j->req.prompt, aerr, sizeof(aerr));
     if (ad.status == PULSAR_ADOPT_ADOPTED) {
         /* L334: the bank stands at T on src's tokens; the cache read is what they hold of the request */
         res->cached = pulsar_session_bank_prompt_held(s->sess, sl->bank, &j->req.prompt, ad.at);
         res->sync_held = res->cached;   /* the sync is handed the request's prompt */
         res->resumed_at = ad.at;
         res->cache_source = "bank-adopt";
-        j->kvr.from = BankId{src};   /* L378 */
+        j->kvr.from = src;   /* L378 */
         server_log(PULSAR_LOG_KVCACHE, "pulsar-server: bank %d adopted bank %d's state at %d of %d (%.1f ms)",
-                   sl->bank.raw(), src, ad.at.raw(), request_prompt_toks(&j->req).raw(), (server_now_sec() - t_a) * 1e3);
+                   sl->bank.raw(), src.raw(), ad.at.raw(), request_prompt_toks(&j->req).raw(), (server_now_sec() - t_a) * 1e3);
         return true;
     }
     if (ad.status == PULSAR_ADOPT_REFUSED) {
         server_log(PULSAR_LOG_WARNING, "pulsar-server: bank %d could not adopt bank %d's state: %s", sl->bank.raw(),
-                   src, aerr);
+                   src.raw(), aerr);
         pulsar_session_invalidate(s->sess);   /* the bank describes no position: the sync rebuilds it */
         res->cached = PromptToks{0};
         res->sync_held = PromptToks{0};
@@ -1222,7 +1222,7 @@ void server::gen_begin(session_slot *sl) {
          * threshold keeps one authority for "is this match worth keeping".
          * Accounting takes the PROMPT-side count. */
         const bool trivial =
-            server_slot_match_is_trivial(pm.live_cut, TokPos{old_pos},
+            server_slot_match_is_trivial(pm, TokPos{old_pos},
                                          PromptToks{s->slot_trivial_common_tokens},
                                          TokCount{s->slot_trivial_common_tokens});
         /* L266/L284: the byte match is what the bank's tokens re-spell; the count is where the sync actually
@@ -1262,7 +1262,7 @@ void server::gen_begin(session_slot *sl) {
      * exact frontier; nothing serves it deeper. */
     kv_chain_hit *disk_hit = NULL;   /* heap: PULSAR_KVCHAIN_MAX segments */
     resume_pick pick = RESUME_OWN;
-    int adopt_src = -1;
+    BankId adopt_src = BankId::none();
     /* L434: every candidate's depth is the REQUEST's tokens its state holds (the bank's own and an adopt's `served`,
      * the chain's kv_chain_served) -- one currency, so the deepest is the one that saves the most of the prompt.  The
      * chain was ranked by its own end, a count of its writer's tokens on the same bytes; and the memory depth went to
@@ -1273,13 +1273,13 @@ void server::gen_begin(session_slot *sl) {
     if (prompt_for_sync.is(&j->req.prompt)) {
         own = cached > memory_resume.served ? cached : memory_resume.served;
         TokPos adopt_pos{0};
-        if (s->pool_banks > 1 && !image_request) {
-            for (int i = 0; i < s->n_slots; i++) {
-                const pulsar_bank_resume T = s->gen_adopt_depth(sl, s->slots[i].bank.raw());
+        if (s->pool_banks > BankCount{1} && !image_request) {
+            for (SlotIdx i : s->n_slots.slots()) {
+                const pulsar_bank_resume T = s->gen_adopt_depth(sl, s->slots[i].bank);
                 if (T.served > adopt_at) {
                     adopt_at = T.served;
                     adopt_pos = T.at;
-                    adopt_src = s->slots[i].bank.raw();
+                    adopt_src = s->slots[i].bank;
                 }
             }
         }
@@ -1304,7 +1304,7 @@ void server::gen_begin(session_slot *sl) {
          * its own end (its writer's tokens: the position the bank stands at after a load) */
         server_log(PULSAR_LOG_KVCACHE,
                    "pulsar-server: resume: bank %d own %d adopt %d%s disk %d of %d (match %d) -> %s (chain to %d)",
-                   sl->bank.raw(), own.raw(), adopt_at.raw(), adopt_src >= 0 ? "" : " (none)", disk_served.raw(),
+                   sl->bank.raw(), own.raw(), adopt_at.raw(), adopt_src.is_token() ? "" : " (none)", disk_served.raw(),
                    request_prompt_toks(&j->req).raw(), pm.prompt_cut.raw(), resume_pick_names[pick], disk_at.raw());
     }
     /* L334: a miss is a sync from token 0 -- the live side (`cached` counts the request's tokens) */
@@ -2805,7 +2805,7 @@ static int terminal_turn_end(pulsar_engine *e, const pulsar_tokens *h) {
 bool server::slot_turn_reply(session_slot *sl, bool wants, bool called) {
     auto *s = this;
     sl->reply = slot_reply{};
-    if (!wants || s->pool_banks <= 0) return wants;
+    if (!wants || !s->pool_banks.any()) return wants;
     const pulsar_tokens *h = pulsar_session_bank_tokens(s->sess, sl->bank);
     const int pf = pulsar_session_bank_prefill_frontier(s->sess, sl->bank).raw();
     const int C = h && h->len > 0 ? terminal_turn_end(s->engine, h) : 0;
@@ -2849,8 +2849,8 @@ const pulsar_tokens *server::slot_interrupted_turn(const session_slot *sl) const
 double server::terminal_wait_s(double now_sec) const {
     const auto *s = this;
     double wait = -1.0;
-    if (s->pool_banks <= 0) return wait;
-    for (int i = 0; i < s->n_slots; i++) {
+    if (!s->pool_banks.any()) return wait;
+    for (SlotIdx i : s->n_slots.slots()) {
         const session_slot *sl = &s->slots[i];
         if (!sl->terminal_pending || !terminal_slot_applies(sl)) continue;
         const double left = server_terminal_grace_left_s(now_sec, sl->turn_ended_at);
@@ -2892,9 +2892,9 @@ static bool terminal_cancel_cb(void *ud) {
 
 bool server::terminal_checkpoint_step(double now_sec, bool grace_waived) {
     auto *s = this;
-    if (s->pool_banks <= 0) return false;
+    if (!s->pool_banks.any()) return false;
     session_slot *pick = NULL;
-    for (int i = 0; i < s->n_slots; i++) {
+    for (SlotIdx i : s->n_slots.slots()) {
         session_slot *sl = &s->slots[i];
         if (!sl->terminal_pending) continue;
         if (!terminal_slot_applies(sl)) {
