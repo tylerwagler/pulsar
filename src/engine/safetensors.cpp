@@ -685,11 +685,10 @@ static void dir_push(st_dir *d, const char *gguf_name, uint32_t type,
     t->ndim = nd;
     for (uint32_t i = 0; i < nd; i++) t->dim[i] = dim[i];
     t->type = type;
-    t->rel_offset = 0;
     t->abs_offset = pulsar_map_off_of_file(at);   /* the shard is mapped whole (st_shard::map) */
     t->elements = 1;
     for (uint32_t i = 0; i < nd; i++) t->elements = st_mul(t->elements, dim[i]);
-    t->bytes = bytes.raw();   /* pulsar_tensor::bytes stays a bare count (read in ~90 places, L438's left-raw list) */
+    t->bytes = bytes;
     t->ext_map = base;
     t->ext_size = shard_size;
 }
@@ -1184,11 +1183,6 @@ static void st_open(pulsar_model *m, const char *path, bool gpu_mapping) {
      * tensor has no ext_map; every tensor built above sets one. */
     m->map = m->shard_map[0];
     m->size = m->shard_size[0];
-    for (uint64_t i = 0; i < m->n_tensors; i++) {
-        if (m->tensors[i].bytes > m->max_tensor_bytes) {
-            m->max_tensor_bytes = m->tensors[i].bytes;
-        }
-    }
     m->mapped_bytes = 0;
     for (uint64_t i = 0; i < m->n_shards; i++) m->mapped_bytes += m->shard_size[i];
     st_content_digest(m);
@@ -1213,13 +1207,13 @@ static void st_open(pulsar_model *m, const char *path, bool gpu_mapping) {
             const uint8_t *base = (const uint8_t *)tensor_map_base(m, t);
             const uint8_t *p = pulsar_map_at(base, t->abs_offset);
             uint64_t h = 0xcbf29ce484222325ull;
-            for (uint64_t b = 0; b < t->bytes; b++) {
+            for (uint64_t b = 0; b < t->bytes.raw(); b++) {   /* raw: a byte walk over the mapping */
                 h ^= (uint64_t)p[b];
                 h *= 0x100000001b3ull;
             }
             printf("VERIFY %.*s %016llx %llu\n",
                    (int)t->name.len, t->name.ptr, (unsigned long long)h,
-                   (unsigned long long)t->bytes);
+                   (unsigned long long)t->bytes.raw());
         }
         fflush(stdout);
     }

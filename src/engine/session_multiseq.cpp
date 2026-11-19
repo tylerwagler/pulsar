@@ -109,7 +109,7 @@ static int ds4_batch_step(pulsar_session *s, const pulsar_multiseq_req *reqs, ui
     /* L302: the headed rows are the session's step rows, in spec_logits (a fused step's prompt heads after its
      * decode rows) */
     s->dev.step_rows = rc == 1 ? s->graph->spec_logits : NULL;
-    s->dev.step_n = rc == 1 ? (shape ? shape->n_dec + pulsar_fused_shape_heads(shape) : headed) : 0u;
+    s->dev.step_n = rc == 1 ? (shape ? (uint32_t)shape->n_dec.raw() /* raw: the device step's row count */ + pulsar_fused_shape_heads(shape) : headed) : 0u;
     /* The batch call consumed the descriptor synchronously (tokens copied to a stack row, pos/seq uploaded
      * to device in step_begin); the host scratch is dead now regardless of rc. */
     free(pos); free(bank); free(tokens);
@@ -212,8 +212,8 @@ int pulsar_session::decode_fused(const pulsar_multiseq_req *reqs, uint32_t n_row
         return 1;
     }
     const uint32_t heads = pulsar_fused_shape_heads(shape);
-    if (logits && (logits_cap < 0 || (uint64_t)logits_cap < (uint64_t)(shape->n_dec + heads) * PULSAR_N_VOCAB)) {
-        PULSAR_MULTISEQ_ERR("fused step: logits capacity %d < %u rows x %u", logits_cap, shape->n_dec + heads,
+    if (logits && (logits_cap < 0 || (uint64_t)logits_cap < (uint64_t)((uint32_t)shape->n_dec.raw() /* raw: logits rows */ + heads) * PULSAR_N_VOCAB)) {
+        PULSAR_MULTISEQ_ERR("fused step: logits capacity %d < %u rows x %u", logits_cap, (uint32_t)shape->n_dec.raw() + heads,
                          (unsigned)PULSAR_N_VOCAB);
         return 1;
     }
@@ -230,7 +230,7 @@ int pulsar_session_fused_local(pulsar_session *s, const pulsar_multiseq_req *req
                                                             err, errlen);
     if (rc == 0) {
         s->fused_valid = true;
-        s->fused_n_dec = shape->n_dec;
+        s->fused_n_dec = (uint32_t)shape->n_dec.raw();   /* raw: the session's fused-step record (uint32) */
         s->fused_heads = pulsar_fused_shape_heads(shape);
     }
     return rc;

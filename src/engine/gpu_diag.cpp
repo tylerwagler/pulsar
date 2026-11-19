@@ -1520,7 +1520,7 @@ bool gpu_graph_alloc_raw_cap(
     const uint64_t context_bytes =
         gpu_graph_context_bytes_for_kv_policy(ctx_size, raw_cap, prefill_cap, &kv_cache_bytes);
     const bool managed_kv_cache =
-        pulsar_gpu_should_use_managed_kv_cache(kv_cache_bytes, context_bytes) != 0;
+        pulsar_gpu_should_use_managed_kv_cache(TensorBytes{kv_cache_bytes}, TensorBytes{context_bytes}) != 0;
     if (managed_kv_cache) {
         /*
          * CUDA device allocations are fastest, but a million-token KV cache is

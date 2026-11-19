@@ -3823,7 +3823,7 @@ static void test_l301_verify_curve_correction(void) {
     for (uint32_t i = 0; i < 400; i++) {
         const uint32_t rows = 4u + i % 9u;
         const double fwd = base[rows] + 0.5 * rows + (i % 7u == 3u ? 200.0 : 0.0);
-        pulsar_engine_verify_curve_observe(e, 4u, rows, fwd, 6.0 + (i % 2u), 3.0);
+        pulsar_engine_verify_curve_observe(e, BankCount{4u}, StepRows{rows}, fwd, 6.0 + (i % 2u), 3.0);
     }
     pulsar_engine_verify_curve_view(e, &v);
     TEST_ASSERT(v.line_valid && fabsf(v.line_a_ms) < 1e-3f && fabsf(v.line_b_ms - 0.5f) < 1e-3f);
@@ -3842,11 +3842,11 @@ static void test_l301_verify_curve_correction(void) {
     for (int i = 0; i < 4; i++) got += k_alloc[i];
     TEST_ASSERT(got == (int)l301_brute(surv, npend, 4, 4, (int)PULSAR_SPEC_LOGITS_ROWS, round_ms));
     /* L338: rounds at 20K tokens: the forward 3 ms + 8 ms a row past the profile, the stalls again */
-    pulsar_engine_verify_curve_depth(e, 20000u);
+    pulsar_engine_verify_curve_depth(e, TokCount{20000u});
     for (uint32_t i = 0; i < 400; i++) {
         const uint32_t rows = 4u + i % 9u;
         const double fwd = base[rows] + 3.0 + 8.0 * rows + (i % 7u == 3u ? 200.0 : 0.0);
-        pulsar_engine_verify_curve_observe(e, 4u, rows, fwd, 6.0 + (i % 2u), 3.0);
+        pulsar_engine_verify_curve_observe(e, BankCount{4u}, StepRows{rows}, fwd, 6.0 + (i % 2u), 3.0);
     }
     pulsar_engine_verify_curve_view(e, &v);
     TEST_ASSERT(v.line_valid && v.depth == 20000u && fabsf(v.line_a_ms - 3.0f) < 1e-3f &&
@@ -3858,10 +3858,10 @@ static void test_l301_verify_curve_correction(void) {
     for (int i = 0; i < 4; i++) deep += k_alloc[i];
     TEST_ASSERT(deep == (int)l301_brute(surv, npend, 4, 4, (int)PULSAR_SPEC_LOGITS_ROWS, deep_ms) && deep < got);
     /* an unseen depth (100K) prices on the nearest bucket's line (20K's); the profile's depth keeps its own */
-    pulsar_engine_verify_curve_depth(e, 100000u);
+    pulsar_engine_verify_curve_depth(e, TokCount{100000u});
     pulsar_engine_verify_curve_view(e, &v);
     TEST_ASSERT(v.line_valid && fabsf(v.line_b_ms - 8.0f) < 1e-3f);
-    pulsar_engine_verify_curve_depth(e, 0u);
+    pulsar_engine_verify_curve_depth(e, TokCount{0u});
     pulsar_engine_verify_curve_view(e, &v);
     TEST_ASSERT(v.line_valid && fabsf(v.line_b_ms - 0.5f) < 1e-3f);
     (void)spec_pick_rows(e, surv, npend, 4, 4, (int)PULSAR_SPEC_LOGITS_ROWS, k_alloc, &overflow);
@@ -3905,7 +3905,7 @@ static void test_l315_tp_pick(void) {
     TEST_ASSERT(got == (int)l301_brute(surv, npend, 4, 4, (int)PULSAR_SPEC_LOGITS_ROWS, base));
     TEST_ASSERT(got < 28);   /* priced: the row budget alone would verify 28 (the four weakest of 32 go) */
     /* the leader's rounds correct its curve */
-    for (uint32_t i = 0; i < 40; i++) pulsar_engine_verify_curve_observe(e, 4u, 4u + i % 4u, base[4u + i % 4u] + 2.0,
+    for (uint32_t i = 0; i < 40; i++) pulsar_engine_verify_curve_observe(e, BankCount{4u}, StepRows{4u + i % 4u}, base[4u + i % 4u] + 2.0,
                                                                           5.0, 2.0);
     pulsar_verify_curve_view v;
     pulsar_engine_verify_curve_view(e, &v);
@@ -4415,7 +4415,7 @@ static void test_l438_byte_offsets(void) {
     memset((void *)&t, 0, sizeof t);
     TEST_ASSERT(t.abs_offset == MapOff{0});                 /* a zeroed directory entry: offset 0, as before */
     t.abs_offset = MapOff{4096};
-    t.bytes = 300;
+    t.bytes = TensorBytes{300u};
     TEST_ASSERT(pulsar_tensor_file_off(&t) == FileOff{4096} && pulsar_tensor_stored_bytes(&t) == TensorBytes{300});
     TEST_ASSERT(pulsar_tp_kslice_key_offset(&t).raw() == (uint64_t)(uintptr_t)&t);   /* the TP keys, as before */
     pulsar_model m;
@@ -4505,12 +4505,48 @@ static void test_l426_engine_identity(void) {
     free(e);
 }
 
+/* L445: the series' last bare engine quantities -- the pricing API's banks / rows / depth, the fused shape's decode
+ * rows, a directory entry's stored bytes, the Engram tables by their ordinal -- typed, and nothing else passes */
+static_assert(std::is_same_v<decltype(&pulsar_engine_lane_cost_observe),
+                             void (*)(pulsar_engine *, pulsar_decode_lane, StepRows, double)> &&
+                  std::is_same_v<decltype(&pulsar_engine_verify_curve_observe),
+                                 void (*)(pulsar_engine *, BankCount, StepRows, double, double, double)> &&
+                  std::is_same_v<decltype(&pulsar_engine_verify_round_ms),
+                                 double (*)(const pulsar_engine *, BankCount, StepRows, double *)> &&
+                  std::is_same_v<decltype(&pulsar_engine_verify_curve_depth), void (*)(pulsar_engine *, TokCount)> &&
+                  std::is_same_v<decltype(pulsar_fused_shape{}.n_dec), StepRows> &&
+                  std::is_same_v<decltype(pulsar_tensor{}.bytes), TensorBytes> &&
+                  std::is_same_v<decltype(pulsar_engram_model{}.block[KindOrd{0u}]), TrunkLayer &> &&
+                  !std::is_invocable_v<decltype(&pulsar_engine_verify_round_ms), const pulsar_engine *, uint32_t,
+                                       uint32_t, double *> &&
+                  !std::is_invocable_v<decltype(&pulsar_engine_verify_round_ms), const pulsar_engine *, BankCount,
+                                       TokCount, double *> &&
+                  !std::is_convertible_v<uint32_t, StepRows> && sizeof(pulsar_fused_shape) == 24 &&
+                  offsetof(pulsar_fused_shape, n_dec) == 0 && offsetof(pulsar_fused_shape, n_pf) == 4,
+              "L445: the pricing API takes banks, step rows and a depth in tokens; the fused shape's wire layout holds");
+/** L445: the Qwen staged tail row is the block's bytes over idx_block, as the division it replaced computed. */
+static void test_l445_qwen_tail_row(void) {
+    for (uint32_t blk : {1u, 4u, 8u, 64u})
+        for (uint32_t kv : {1u, 2u, 8u})
+            for (uint32_t hd : {64u, 128u, 192u}) {
+                pulsar_qwen_shape s;
+                memset((void *)&s, 0, sizeof s);
+                s.idx_block = blk;
+                s.idx_n_head_kv = kv;
+                s.idx_head_dim = hd;
+                const uint64_t old_tail = (uint64_t)blk * kv * hd * sizeof(float);
+                TEST_ASSERT(pulsar_qwen_index_tail_bytes(&s).raw() == old_tail);
+                TEST_ASSERT(pulsar_qwen_index_tail_row_bytes(&s).raw() == old_tail / blk);
+            }
+}
+
 /* L426: the host-only group the check tier runs (make kv-identity-gate): the content digest on synthetic containers,
  * the engine's identity over it, then the store's side -- another weights or tokenizer word is another identity, set
  * aside and said once (server_tests.cpp), and the arithmetic words as before (L386); first (L438) the slab and file
  * offsets the layouts and the content sample are typed with. */
 static void test_kv_identity(void) {
     test_l438_byte_offsets();
+    test_l445_qwen_tail_row();
     test_l426_content_digest();
     test_l426_engine_identity();
     test_l426_kv_identity_weights();
@@ -5790,9 +5826,9 @@ static void test_fused_cost(void) {
     double ms = 1.0, out = 1.0, pms = -1.0;
     const uint32_t q1 = 512u, c1 = 0u;
     TEST_ASSERT(!pulsar_engine_fused_prompt_ms(e, 1u, &q1, &c1, &ms) && ms == 0.0);
-    TEST_ASSERT(pulsar_engine_verify_round_ms(e, 4u, 8u, &out) == 0.0 && out == 0.0);
+    TEST_ASSERT(pulsar_engine_verify_round_ms(e, BankCount{4u}, StepRows{8u}, &out) == 0.0 && out == 0.0);
     TEST_ASSERT(!pulsar_engine_prefill_ms(e, 4096u, 0u, 4096u, &pms) && pms == 0.0);
-    pulsar_engine_fused_cost_observe(e, 1u, &q1, &c1, 8u, 300.0);   /* no curve: no observation */
+    pulsar_engine_fused_cost_observe(e, 1u, &q1, &c1, StepRows{8u}, 300.0);   /* no curve: no observation */
     TEST_ASSERT(e->prefill_cost.n == 0u);
     /* solo chunks only */
     l326_solo(e, 120.0, 64u);
@@ -5819,8 +5855,8 @@ static void test_fused_cost(void) {
     double base[PULSAR_SPEC_LOGITS_ROWS + 1];
     l301_staircase(base, PULSAR_SPEC_LOGITS_ROWS);
     pulsar_engine *v = l301_engine(base, PULSAR_SPEC_LOGITS_ROWS);
-    for (uint32_t i = 0; i < 20; i++) pulsar_engine_verify_curve_observe(v, 4u, 8u, base[8] + 4.0, 6.0, 3.0);
-    for (uint32_t i = 0; i < 20; i++) pulsar_engine_verify_curve_observe(v, 4u, 20u, base[20] + 10.0, 6.0, 3.0);
+    for (uint32_t i = 0; i < 20; i++) pulsar_engine_verify_curve_observe(v, BankCount{4u}, StepRows{8u}, base[8] + 4.0, 6.0, 3.0);
+    for (uint32_t i = 0; i < 20; i++) pulsar_engine_verify_curve_observe(v, BankCount{4u}, StepRows{20u}, base[20] + 10.0, 6.0, 3.0);
     l326_solo(v, 120.0, 24u);
     for (uint32_t i = 0; i < 64; i++) {
         /* a kind is priced from its 4th chunk, not off one chunk's noise (the solo kind armed long before) */
@@ -5831,7 +5867,7 @@ static void test_fused_cost(void) {
         const uint32_t n = i % 3u == 0u ? 2u : 1u, rows = i % 2u ? 8u : 20u;
         double y = base[rows] + 0.5 * rows + 30.0;
         for (uint32_t r = 0; r < n; r++) y += 0.4 * q[r] + 2e-6 * q[r] * (c[r] + 0.5 * q[r]);
-        pulsar_engine_fused_cost_observe(v, n, q, c, rows, y);
+        pulsar_engine_fused_cost_observe(v, n, q, c, StepRows{rows}, y);
     }
     {
         const pulsar_prefill_cost_fit &f = v->prefill_cost;
@@ -5920,13 +5956,13 @@ static void test_fused_cost(void) {
     unlink(path);
     rmdir(dir);
 
-    TEST_ASSERT(fabs(pulsar_engine_verify_round_ms(v, 4u, 8u, &out) - (base[8] + 4.0 + 9.0)) < 1e-9 && out == 9.0);
-    TEST_ASSERT(fabs(pulsar_engine_verify_round_ms(v, 4u, 99u, &out) -
+    TEST_ASSERT(fabs(pulsar_engine_verify_round_ms(v, BankCount{4u}, StepRows{8u}, &out) - (base[8] + 4.0 + 9.0)) < 1e-9 && out == 9.0);
+    TEST_ASSERT(fabs(pulsar_engine_verify_round_ms(v, BankCount{4u}, StepRows{99u}, &out) -
                      (base[PULSAR_SPEC_LOGITS_ROWS] + 0.5 * PULSAR_SPEC_LOGITS_ROWS + 9.0)) < 1e-9);
     v->tp = (struct pulsar_tp *)v;   /* never dereferenced: a pair's leader prices its round selection (L315) */
-    TEST_ASSERT(fabs(pulsar_engine_verify_round_ms(v, 4u, 8u, &out) - (base[8] + 4.0 + 9.0)) < 1e-9 && out == 9.0);
+    TEST_ASSERT(fabs(pulsar_engine_verify_round_ms(v, BankCount{4u}, StepRows{8u}, &out) - (base[8] + 4.0 + 9.0)) < 1e-9 && out == 9.0);
     const uint32_t n_before = v->prefill_cost.n;
-    pulsar_engine_fused_cost_observe(v, 1u, &q1, &c1, 8u, 300.0);   /* ... and fits nothing */
+    pulsar_engine_fused_cost_observe(v, 1u, &q1, &c1, StepRows{8u}, 300.0);   /* ... and fits nothing */
     pulsar_engine_prefill_chunk_observe(v, 4096u, 0u, 2000.0);
     TEST_ASSERT(v->prefill_cost.n == n_before);
     v->tp = NULL;
@@ -5981,11 +6017,11 @@ static stats run(int ndec, prompt *P, int np, double horizon_ms, bool warm, cons
     double base[PULSAR_SPEC_LOGITS_ROWS + 1];
     for (uint32_t r = 1; r <= PULSAR_SPEC_LOGITS_ROWS; r++) base[r] = dec_fwd(r);
     pulsar_engine *e = l301_engine(base, PULSAR_SPEC_LOGITS_ROWS);
-    for (int i = 0; i < 20; i++) pulsar_engine_verify_curve_observe(e, 4u, 16u, base[16], 12.0, 16.0);
+    for (int i = 0; i < 20; i++) pulsar_engine_verify_curve_observe(e, BankCount{4u}, StepRows{16u}, base[16], 12.0, 16.0);
     /* the short prompts a server has seen before: the fit's evidence at shallow context */
     for (uint32_t i = 0; warm && i < 12u; i++) {
         const uint32_t q = 32u + 37u * i, c = 0u;
-        pulsar_engine_fused_cost_observe(e, 1u, &q, &c, 16u,
+        pulsar_engine_fused_cost_observe(e, 1u, &q, &c, StepRows{16u},
                                          (dec_fwd(16u) + FWD_A + FWD_ROW * q + FWD_PAIR * q * q / 2.0) * g->noise());
     }
     const uint32_t heads_max = 32u, prefill_cap = 4096u, fuse_rows = prefill_cap - heads_max;
@@ -6050,11 +6086,11 @@ static stats run(int ndec, prompt *P, int np, double horizon_ms, bool warm, cons
             TEST_ASSERT(pf_rows <= fuse_rows);
             if (nr) {
                 fwd *= g->noise();
-                pulsar_engine_fused_cost_observe(e, nr, q, c, rows, fwd);
+                pulsar_engine_fused_cost_observe(e, nr, q, c, StepRows{rows}, fwd);
                 st.fused++;
             } else {
                 fwd = dec_fwd(rows) * g->noise();
-                pulsar_engine_verify_curve_observe(e, (uint32_t)ndec, rows, fwd, 12.0, 16.0);
+                pulsar_engine_verify_curve_observe(e, BankCount{(uint32_t)ndec}, StepRows{rows}, fwd, 12.0, 16.0);
                 st.decode_only++;
             }
             const double wall = fwd + OUTSIDE;
@@ -6100,10 +6136,10 @@ static void test_fused_sched(void) {
         double base[PULSAR_SPEC_LOGITS_ROWS + 1];
         l301_staircase(base, PULSAR_SPEC_LOGITS_ROWS);
         pulsar_engine *e = l301_engine(base, PULSAR_SPEC_LOGITS_ROWS);
-        for (int i = 0; i < 20; i++) pulsar_engine_verify_curve_observe(e, 2u, 6u, base[6], 5.0, 4.0);
+        for (int i = 0; i < 20; i++) pulsar_engine_verify_curve_observe(e, BankCount{2u}, StepRows{6u}, base[6], 5.0, 4.0);
         for (uint32_t i = 0; i < 12u; i++) {
             const uint32_t q = 64u + 100u * i, c = 0u;
-            pulsar_engine_fused_cost_observe(e, 1u, &q, &c, 6u, base[6] + 150.0 + 0.5 * q);
+            pulsar_engine_fused_cost_observe(e, 1u, &q, &c, StepRows{6u}, base[6] + 150.0 + 0.5 * q);
         }
         sched_round sr;
         memset(&sr, 0, sizeof sr);

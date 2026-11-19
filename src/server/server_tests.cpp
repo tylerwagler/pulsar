@@ -2649,7 +2649,7 @@ static void test_l398_gemma_reasoning_tracker(void) {
     gen_state g;
     memset(&g, 0, sizeof g);
     g.j = &j;
-    j.req.think_budget = 4;
+    j.req.think_budget = TokCount{4};
     g.thinking = thinking_state_from_prompt(&r);
     TEST_ASSERT(!g.thinking.inside);
     const TokId close{106};   /* stands for <channel|>: think_close_row only compares ids */
@@ -2665,7 +2665,7 @@ static void test_l398_gemma_reasoning_tracker(void) {
         if (i == 0) TEST_ASSERT(g.thinking.inside);   /* the open marker turns it on */
     }
     TEST_ASSERT(forced_at == 5);           /* thought, \n, Let, me = 4 spent: the draw after them is forced */
-    TEST_ASSERT(g.think_tokens == 5);      /* this unforced run also spent " think" */
+    TEST_ASSERT(g.think_tokens == TokCount{5});      /* this unforced run also spent " think" */
     TEST_ASSERT(g.think_closed && !g.thinking.inside);
     request_free(&r);
 
@@ -2743,7 +2743,7 @@ static int l417_count(pulsar_chat_format fmt, const char *body, const char *cons
     g.j = &j;
     l417_attempt(&g, turn, n);
     const int got = j.req.reasoning_tokens;
-    if (budget_out) *budget_out = g.think_tokens;
+    if (budget_out) *budget_out = g.think_tokens.raw();
     request_free(&j.req);
     return got;
 }
@@ -5157,7 +5157,7 @@ static l428_run l428_turn(server *srv, const l303_vocab &v, pulsar_chat_format f
     g->j = &j;
     snprintf(g->id, sizeof g->id, "id_l428");
     g->finish = "length";
-    g->next_decode_log = 1 << 30;   /* no progress lines */
+    g->next_decode_log = TokCount{1 << 30};   /* no progress lines */
     g->thinking = thinking_state_from_prompt(r);
     g->structured_stream = request_uses_structured_stream(r);
     if (stream) {
@@ -5199,7 +5199,7 @@ static l428_run l428_turn(server *srv, const l303_vocab &v, pulsar_chat_format f
         if (res.stopped) break;
     }
     if (!res.stopped) g->finish = "stop";   /* the model's own stop token ended the turn */
-    res.completion = g->completion;
+    res.completion = g->completion.raw();
     res.cut_short = g->turn_cut_short;
     server_turn turn;
     memset(&turn, 0, sizeof turn);
@@ -5220,21 +5220,21 @@ static l428_run l428_turn(server *srv, const l303_vocab &v, pulsar_chat_format f
     if (stream) {
         TEST_ASSERT(g->parser->feed(g->parser_st, srv, g, gen_text_end(g->text.len), true));
         if (api == API_ANTHROPIC)
-            TEST_ASSERT(anthropic_sse_finish(&g->sink, &turn.calls, turn.finish, g->stop_sequence, g->completion));
+            TEST_ASSERT(anthropic_sse_finish(&g->sink, &turn.calls, turn.finish, g->stop_sequence, g->completion.raw()));
         else if (api == API_RESPONSES)
             TEST_ASSERT(responses_sse_finish(sv[0], r, &g->responses_live, turn.tail, turn.tail_len, &turn.calls,
-                                             turn.finish, 10, g->completion, 1));
+                                             turn.finish, 10, g->completion.raw(), 1));
         else
-            TEST_ASSERT(openai_sse_finish(&g->sink, &turn.calls, turn.finish, 10, g->completion));
+            TEST_ASSERT(openai_sse_finish(&g->sink, &turn.calls, turn.finish, 10, g->completion.raw()));
     } else if (api == API_ANTHROPIC) {
         TEST_ASSERT(anthropic_final_response(sv[0], r, g->id, turn.content, turn.reasoning, &turn.calls, turn.finish,
-                                             g->stop_sequence, 10, g->completion));
+                                             g->stop_sequence, 10, g->completion.raw()));
     } else if (api == API_RESPONSES) {
         TEST_ASSERT(responses_final_response(sv[0], r, g->id, turn.content, turn.reasoning, &turn.calls, turn.finish,
-                                             10, g->completion));
+                                             10, g->completion.raw()));
     } else {
         TEST_ASSERT(final_response(sv[0], r, g->id, turn.content, turn.reasoning, &turn.calls, turn.finish, 10,
-                                   g->completion, NULL));
+                                   g->completion.raw(), NULL));
     }
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
@@ -5507,7 +5507,7 @@ static void test_l428_turn_ends_at_its_first_call(void) {
         GenOff end{0};
         TEST_ASSERT(!g->parser->turn_complete(g->parser_st, g, &end));
         TEST_ASSERT(srv.gen_emit_piece(g, TokId{0}, pieces[11].data(), pieces[11].size()));
-        TEST_ASSERT(!strcmp(g->finish, "tool_calls") && g->completion == 12);
+        TEST_ASSERT(!strcmp(g->finish, "tool_calls") && g->completion == TokCount{12});
         /* a request without the flag keeps every draft */
         j.req.single_tool_call = false;
         TEST_ASSERT(gen_turn_draft_prefix_text(g, chain2, lens2, TokCount{2}).raw() == 2);
@@ -5806,7 +5806,7 @@ static bool l430_start(l430_side *s, server *srv, const l430_cfg &c, const std::
     g->j = &s->j;
     snprintf(g->id, sizeof g->id, "id_l430");
     g->finish = "length";
-    g->next_decode_log = 1 << 30;   /* no progress lines */
+    g->next_decode_log = TokCount{1 << 30};   /* no progress lines */
     g->recovery_attempted = true;   /* no model-visible retry: it needs a live session */
     g->thinking = thinking_state_from_prompt(r);
     g->structured_stream = mode == 1 && request_uses_structured_stream(r);
@@ -5859,7 +5859,7 @@ static l430_state l430_read(l430_side *s) {
     st.think_tail.assign(g->thinking.tail, (size_t)g->thinking.tail_len);
     st.stop_sequence = g->stop_sequence ? g->stop_sequence : "";
     st.plain_stream_pos = g->plain_stream_pos.raw();   /* L437: the state compares the raw values, as before */
-    st.completion = g->completion;
+    st.completion = g->completion.raw();
     st.stopped = s->stopped;
     st.cut_short = g->turn_cut_short;
     st.thinking = g->thinking.inside;
@@ -5918,10 +5918,10 @@ static void l430_finish(l430_side *s, server *srv, std::string *out) {
     r->timings.valid = true;
     if (g->structured_stream) {
         TEST_ASSERT(g->parser->feed(g->parser_st, srv, g, gen_text_end(g->text.len), true));
-        TEST_ASSERT(openai_sse_finish(&g->sink, &turn.calls, turn.finish, 10, g->completion));
+        TEST_ASSERT(openai_sse_finish(&g->sink, &turn.calls, turn.finish, 10, g->completion.raw()));
     } else if (!r->stream) {
         TEST_ASSERT(final_response(s->sv[0], r, g->id, turn.content, turn.reasoning, &turn.calls, turn.finish, 10,
-                                   g->completion, NULL));
+                                   g->completion.raw(), NULL));
     }
     l430_drain(s);
     close(s->sv[0]);
@@ -6847,7 +6847,7 @@ static l437_run l437_turn(server *srv, pulsar_chat_format fmt, const std::string
     g->j = &j;
     snprintf(g->id, sizeof g->id, "id_l437");
     g->finish = "length";
-    g->next_decode_log = 1 << 30;   /* no progress lines */
+    g->next_decode_log = TokCount{1 << 30};   /* no progress lines */
     g->thinking = thinking_state_from_prompt(r);
     g->recovery_attempted = retry_spent;
     g->parser = r->family->output;
@@ -6981,7 +6981,7 @@ static std::vector<l437_chunk> l437_logprob_stream(server *srv, pulsar_chat_form
     g->j = &j;
     snprintf(g->id, sizeof g->id, "id_l437");
     g->finish = "length";
-    g->next_decode_log = 1 << 30;
+    g->next_decode_log = TokCount{1 << 30};
     g->thinking = thinking_state_from_prompt(r);
     g->structured_stream = request_uses_structured_stream(r);
     TEST_ASSERT(g->structured_stream);
@@ -7006,7 +7006,7 @@ static std::vector<l437_chunk> l437_logprob_stream(server *srv, pulsar_chat_form
     turn.finish = g->finish;
     TEST_ASSERT(g->parser->finish(g->parser_st, srv, NULL, g, &turn) && !turn.retry);
     TEST_ASSERT(g->parser->feed(g->parser_st, srv, g, gen_text_end(g->text.len), true));
-    TEST_ASSERT(openai_sse_finish(&g->sink, &turn.calls, turn.finish, 10, g->completion));
+    TEST_ASSERT(openai_sse_finish(&g->sink, &turn.calls, turn.finish, 10, g->completion.raw()));
     TEST_ASSERT(g->logprobs.len == (int)toks.size() && g->logprobs.streamed == g->logprobs.len);
     shutdown(sv[0], SHUT_WR);
     char *wire = read_socket_text(sv[1]);
@@ -11988,7 +11988,7 @@ static void test_l338_kv_writer_lifecycle(void) {
     TEST_ASSERT(dir != NULL);
     if (!dir) return;
     kv_disk_cache kc;
-    const kv_ram_plan ram = { 64ull << 20, true };
+    const kv_ram_plan ram = { HostBytes{64ull << 20}, true };
     TEST_ASSERT(kv_cache_open(&kc, dir, 64, 0, kv_cache_default_options(), ram));
     TEST_ASSERT(kc.ram != NULL && kc.ram_retain);
     TEST_ASSERT(kc.writer != NULL);
@@ -13005,7 +13005,7 @@ static void test_l338_host_mem_total(void) {
     auto put = [](const std::string &p, const char *text) { FILE *f = fopen(p.c_str(), "w"); if (f) { fputs(text, f); fclose(f); } };
     const uint64_t GiB = 1ull << 30, host = 125ull * GiB;
     put(d + "/meminfo", "MemTotal:       33554432 kB\nMemFree:  1 kB\n");   /* LXCFS: the CT's 32 GiB */
-    TEST_ASSERT(kv_host_mem_total_from(host, (d + "/meminfo").c_str(), NULL, NULL) == 32ull * GiB);
+    TEST_ASSERT(kv_host_mem_total_from(HostBytes{host}, (d + "/meminfo").c_str(), NULL, NULL) == HostBytes{32ull * GiB});
     /* a cgroup path whose parent caps it at 20 GiB, itself unlimited */
     mkdir((d + "/cg").c_str(), 0700);
     mkdir((d + "/cg/lxc").c_str(), 0700);
@@ -13013,36 +13013,38 @@ static void test_l338_host_mem_total(void) {
     put(d + "/cg/lxc/130/memory.max", "max\n");
     put(d + "/cg/lxc/memory.max", "21474836480\n");
     put(d + "/self", "0::/lxc/130\n");
-    TEST_ASSERT(kv_host_mem_total_from(host, (d + "/meminfo").c_str(), (d + "/cg").c_str(), (d + "/self").c_str()) ==
-                20ull * GiB);
+    TEST_ASSERT(kv_host_mem_total_from(HostBytes{host}, (d + "/meminfo").c_str(), (d + "/cg").c_str(), (d + "/self").c_str()) ==
+                HostBytes{20ull * GiB});
     /* nothing readable: the physical pages; physical unknown and a limit: the limit */
-    TEST_ASSERT(kv_host_mem_total_from(host, (d + "/none").c_str(), (d + "/none").c_str(), (d + "/none").c_str()) == host);
-    TEST_ASSERT(kv_host_mem_total_from(0, NULL, (d + "/cg").c_str(), (d + "/self").c_str()) == 20ull * GiB);
+    TEST_ASSERT(kv_host_mem_total_from(HostBytes{host}, (d + "/none").c_str(), (d + "/none").c_str(), (d + "/none").c_str()) ==
+                HostBytes{host});
+    TEST_ASSERT(kv_host_mem_total_from(HostBytes{0u}, NULL, (d + "/cg").c_str(), (d + "/self").c_str()) ==
+                HostBytes{20ull * GiB});
     /* the default plan over CT 130's shape: 25 % of 32 GiB, not the 16 GiB cap of the host's 125 */
-    uint64_t bytes = 0;
+    HostBytes bytes{0u};
     bool retain = false;
-    kv_ram_plan_for(0, kv_host_mem_total_from(host, (d + "/meminfo").c_str(), NULL, NULL), -1, &bytes, &retain);
-    TEST_ASSERT(retain && bytes == 8ull * GiB);
+    kv_ram_plan_for(0, kv_host_mem_total_from(HostBytes{host}, (d + "/meminfo").c_str(), NULL, NULL), -1, &bytes, &retain);
+    TEST_ASSERT(retain && bytes == HostBytes{8ull * GiB});
     char cmd[4300];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
     TEST_ASSERT(system(cmd) == 0);
 }
 
 static void test_l347_i3a_ram_plan(void) {
-    uint64_t bytes = 0;
+    HostBytes bytes{0u};
     bool retain = true;
-    kv_ram_plan_for(1, 128ull << 30, -1, &bytes, &retain);
-    TEST_ASSERT(!retain && bytes == (uint64_t)KV_RAM_RING_MB << 20);
-    kv_ram_plan_for(1, 128ull << 30, 2048, &bytes, &retain);
-    TEST_ASSERT(!retain && bytes == 2048ull << 20);
-    kv_ram_plan_for(-1, 128ull << 30, -1, &bytes, &retain);   /* the device did not answer: no tier */
+    kv_ram_plan_for(1, HostBytes{128ull << 30}, -1, &bytes, &retain);
+    TEST_ASSERT(!retain && bytes == HostBytes{(uint64_t)KV_RAM_RING_MB << 20});
+    kv_ram_plan_for(1, HostBytes{128ull << 30}, 2048, &bytes, &retain);
+    TEST_ASSERT(!retain && bytes == HostBytes{2048ull << 20});
+    kv_ram_plan_for(-1, HostBytes{128ull << 30}, -1, &bytes, &retain);   /* the device did not answer: no tier */
     TEST_ASSERT(!retain);
-    kv_ram_plan_for(0, 32ull << 30, -1, &bytes, &retain);
-    TEST_ASSERT(retain && bytes == 8ull << 30);
-    kv_ram_plan_for(0, 256ull << 30, -1, &bytes, &retain);
-    TEST_ASSERT(retain && bytes == (uint64_t)KV_RAM_DEFAULT_CAP_MB << 20);
-    kv_ram_plan_for(0, 256ull << 30, 512, &bytes, &retain);
-    TEST_ASSERT(retain && bytes == 512ull << 20);
+    kv_ram_plan_for(0, HostBytes{32ull << 30}, -1, &bytes, &retain);
+    TEST_ASSERT(retain && bytes == HostBytes{8ull << 30});
+    kv_ram_plan_for(0, HostBytes{256ull << 30}, -1, &bytes, &retain);
+    TEST_ASSERT(retain && bytes == HostBytes{(uint64_t)KV_RAM_DEFAULT_CAP_MB << 20});
+    kv_ram_plan_for(0, HostBytes{256ull << 30}, 512, &bytes, &retain);
+    TEST_ASSERT(retain && bytes == HostBytes{512ull << 20});
 }
 
 /* (5) O_DIRECT on a real directory: a file whose size is not a multiple of the granule is written whole and cut to
@@ -14013,9 +14015,9 @@ static void test_l372_abandoned_decode_is_not_a_turn(void) {
                 gen_turn_is_measured(false, "tool_calls"));
     TEST_ASSERT(!gen_turn_is_measured(false, "error") && !gen_turn_is_measured(true, "length") &&
                 !gen_turn_is_measured(true, "error"));
-    TEST_ASSERT(gen_turn_wants_terminal(false, "length", 5) && gen_turn_wants_terminal(false, "stop", 1));
-    TEST_ASSERT(!gen_turn_wants_terminal(true, "length", 5));
-    TEST_ASSERT(!gen_turn_wants_terminal(false, "error", 5) && !gen_turn_wants_terminal(false, "stop", 0));
+    TEST_ASSERT(gen_turn_wants_terminal(false, "length", TokCount{5}) && gen_turn_wants_terminal(false, "stop", TokCount{1}));
+    TEST_ASSERT(!gen_turn_wants_terminal(true, "length", TokCount{5}));
+    TEST_ASSERT(!gen_turn_wants_terminal(false, "error", TokCount{5}) && !gen_turn_wants_terminal(false, "stop", TokCount{0}));
     gen_state g;
     memset(&g, 0, sizeof g);
     g.finish = "length";
@@ -14833,7 +14835,7 @@ static void test_l372_judge_bank_floor_and_release(void) {
         TEST_ASSERT(!server_judge_queued(&s) && !J->released && s.live_bank == BankId::none());
         TEST_ASSERT(s.floor_admits_chunk(KvRows{1024}, err, sizeof err));   /* the real floor admits a chunk here */
         /* the budget's half prices the bank's growth by the session: a host-only server has none to hold */
-        TEST_ASSERT(s.budget_admits_growth(BankId{1}, 1024, err, sizeof err));
+        TEST_ASSERT(s.budget_admits_growth(BankId{1}, TokCount{1024}, err, sizeof err));
         pulsar_tokens_free(&jb.prompts[0]);
         pthread_cond_destroy(&jb.cv);
         pthread_mutex_destroy(&jb.mu);
@@ -15347,7 +15349,7 @@ static void test_kv_tool_map_restores_before_prompt_render(void) {
     server dst = {0};
     dst.family_no_engine = server_family_for_format(PULSAR_CHAT_DS4_V41);
     pthread_mutex_init(&dst.tool_mu, NULL);
-    TEST_ASSERT(kv_cache_open(&dst.kv, dir, 0, 0, kv_cache_default_options(), kv_ram_plan{16ull << 20, false}));
+    TEST_ASSERT(kv_cache_open(&dst.kv, dir, 0, 0, kv_cache_default_options(), kv_ram_plan{HostBytes{16ull << 20}, false}));
 
     chat_msgs msgs = {0};
     chat_msg a = {0};
@@ -17226,7 +17228,7 @@ static void test_kv_cache_open_unusable_dir_disables(void) {
     /* Uncreatable path: open fails, cache stays disabled, no crash. */
     kv_disk_cache kc = {0};
     TEST_ASSERT(!kv_cache_open(&kc, "/proc/ds4-kvtest-nope/kv", 64, 0,
-                               kv_cache_default_options(), kv_ram_plan{16ull << 20, false}));
+                               kv_cache_default_options(), kv_ram_plan{HostBytes{16ull << 20}, false}));
     TEST_ASSERT(!kc.enabled);
     kv_cache_close(&kc);
 
@@ -17239,7 +17241,7 @@ static void test_kv_cache_open_unusable_dir_disables(void) {
         TEST_ASSERT(chmod(dir, 0500) == 0);
         kv_disk_cache ro = {0};
         bool opened = kv_cache_open(&ro, dir, 64, 0,
-                                    kv_cache_default_options(), kv_ram_plan{16ull << 20, false});
+                                    kv_cache_default_options(), kv_ram_plan{HostBytes{16ull << 20}, false});
         if (geteuid() == 0) {
             TEST_ASSERT(opened);
         } else {
@@ -18192,8 +18194,8 @@ static void test_l293_batch_leave_stops_at_the_budget(void) {
         g.j = &j;
         g.finish = "length";
         g.phase = GEN_DECODE;
-        g.max_tokens = max_tokens;
-        g.completion = completion;
+        g.max_tokens = TokCount{max_tokens};
+        g.completion = TokCount{completion};
         g.batch_active = true;
         g.batch_feed_valid = true;   /* the last step sampled the next feed token */
         g.batch_feed_token = TokId{42};
@@ -18206,7 +18208,7 @@ static void test_l293_batch_leave_stops_at_the_budget(void) {
     plain_quantum_left(max_tokens);
     TEST_ASSERT(slot_is_batchable_decode(&sl));
     TEST_ASSERT(s.batch_leave(&sl));
-    TEST_ASSERT(g.completion == max_tokens && sl.tokens_emitted == (uint64_t)max_tokens);
+    TEST_ASSERT(g.completion == TokCount{max_tokens} && sl.tokens_emitted == (uint64_t)max_tokens);
     TEST_ASSERT(g.phase == GEN_FINISH && !g.batch_feed_valid && !g.batch_active);
     TEST_ASSERT(g.finish && !strcmp(g.finish, "length") && g.err[0] == '\0');
     TEST_ASSERT(!slot_is_batchable_decode(&sl));   /* the spec lane never sees it */
@@ -18215,7 +18217,7 @@ static void test_l293_batch_leave_stops_at_the_budget(void) {
     g_stop_requested = 1;
     TEST_ASSERT(s.batch_leave(&sl));
     g_stop_requested = 0;
-    TEST_ASSERT(g.completion == max_tokens - 8 && g.phase == GEN_FINISH && !g.batch_feed_valid);
+    TEST_ASSERT(g.completion == TokCount{max_tokens - 8} && g.phase == GEN_FINISH && !g.batch_feed_valid);
     /* one token of budget left: the leave still commits the carried token (here the absent session refuses it) */
     plain_quantum_left(max_tokens - 1);
     TEST_ASSERT(!s.batch_leave(&sl));
@@ -18267,70 +18269,70 @@ static void test_l284_lane_price_pick(void) {
     pulsar_lane_cost spec = l284_cost(25000, 7700, true, 400u, 4.0f, 55.8f);
     pulsar_lane_cost plain = l284_cost(20000, 7700, true, 400u, 3.0f, 43.1f);
     /* nothing measured: the spec lane runs, measuring itself, whatever plain predicts */
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, 0u) == 3 && lp.t_spec == 0.0 && lp.t_plain > 0.0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, TokCount{0}) == 3 && lp.t_spec == 0.0 && lp.t_plain > 0.0);
     TEST_ASSERT(lp.held_n0 == 400u && !lp.meas_spec && !lp.meas_plain);
     /* one decoder, 32 rounds of 2 tokens over 4 rows in 50 ms: spec measured 40 tok/s against plain predicted
      * 1 / 27.7 ms = 36.1 -- spec holds, nothing to measure */
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 1, 2, 4, 50.0);
     TEST_ASSERT(fabsf(lp.tau - 2.0f) < 1e-4f && fabsf(lp.rho - 4.0f) < 1e-4f);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, 0u) == 3 && lp.meas_spec && !lp.meas_plain);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, TokCount{0}) == 3 && lp.meas_spec && !lp.meas_plain);
     TEST_ASSERT(fabs(lp.t_spec - 40.0) < 1e-6 && lp.t_plain > 36.0 && lp.t_plain < 36.3 && lp.probe == 0);
     /* six decoders, nothing measured at six: plain PREDICTED 6 / 66.2 ms = 90.6 tok/s against spec predicted 63.0
      * (24 rows rationed to 16: 9.3 tokens a 148 ms round) -- the better-predicted lane is measured there first */
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, StepRows{16}, 0u) == 2 && lp.lane == 2 && lp.probe == 0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, StepRows{16}, TokCount{0}) == 2 && lp.lane == 2 && lp.probe == 0);
     TEST_ASSERT(!lp.meas_spec && !lp.meas_plain && lp.t_spec > 62.5 && lp.t_spec < 63.5 && lp.held_n0 == 400u);
     /* plain measured at six: 6 tokens a 80 ms step = 75 tok/s (its fit overpriced it); spec's 63.0 is no faster */
     l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, LANE_PRICE_PROBE_STEPS, 6, 6, 6, 80.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, StepRows{16}, 0u) == 2 && lp.lane == 2 && lp.probe == 0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, StepRows{16}, TokCount{0}) == 2 && lp.lane == 2 && lp.probe == 0);
     TEST_ASSERT(lp.meas_plain && !lp.meas_spec && fabs(lp.t_plain - 75.0) < 1e-6);
     /* ...until the plain lane has run LANE_PRICE_REPROBE_STEPS steps: the spec lane is measured */
     l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, LANE_PRICE_REPROBE_STEPS - LANE_PRICE_PROBE_STEPS - 1u, 6, 6, 6, 80.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, StepRows{16}, 0u) == 2 && lp.probe == 0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, StepRows{16}, TokCount{0}) == 2 && lp.probe == 0);
     l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, 1u, 6, 6, 6, 80.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, StepRows{16}, 0u) == 3 && lp.probe == 3 && lp.lane == 2);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, StepRows{16}, 0u) == 3 && lp.probe == 3);   /* its steps are not in */
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, StepRows{16}, TokCount{0}) == 3 && lp.probe == 3 && lp.lane == 2);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, StepRows{16}, TokCount{0}) == 3 && lp.probe == 3);   /* its steps are not in */
     /* measured at 13 tokens a 148 ms round (87.8 tok/s), past the margin over 75: the decoders move */
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 6, 13, 16, 148.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, StepRows{16}, 0u) == 3 && lp.lane == 3 && lp.probe == 0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, StepRows{16}, TokCount{0}) == 3 && lp.lane == 3 && lp.probe == 0);
     TEST_ASSERT(lp.meas_plain && lp.meas_spec && lp.t_spec > 87.0 && lp.t_spec < 88.5 && lp.held_n0 == spec.n);
     /* held, then priced on both measured numbers: no flap */
     for (uint32_t k = 0; k < 2u * LANE_PRICE_HOLD_STEPS; k++) {
         l284_steps(&lp, &spec, PULSAR_LANE_SPEC, 1u, 6, 13, 16, 148.0);
-        TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, StepRows{16}, 0u) == 3 && lp.probe == 0);
+        TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, StepRows{16}, TokCount{0}) == 3 && lp.probe == 0);
     }
     /* DeepSeek at N8: the fits, extrapolated past the rows they saw, predict plain 8 / 72 ms = 111 tok/s against
      * the spec lane's measured 99.5 -- the probe measures plain at 80 and the decoders stay */
     memset(&lp, 0, sizeof lp);
     spec = l284_cost(53700, 5570, true, 1000u, 8.0f, 98.3f);
     plain = l284_cost(16000, 7000, true, 1000u, 3.0f, 37.0f);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, StepRows{32}, 0u) == 3 && lp.held_n0 == 1000u);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, StepRows{32}, TokCount{0}) == 3 && lp.held_n0 == 1000u);
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 8, 10, 16, 100.5);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, StepRows{32}, 0u) == 2 && lp.probe == 2 && lp.t_plain > 110.0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, StepRows{32}, TokCount{0}) == 2 && lp.probe == 2 && lp.t_plain > 110.0);
     l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, LANE_PRICE_PROBE_STEPS, 8, 8, 8, 100.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, StepRows{32}, 0u) == 3 && lp.lane == 3 && lp.probe == 0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, StepRows{32}, TokCount{0}) == 3 && lp.lane == 3 && lp.probe == 0);
     TEST_ASSERT(fabs(lp.t_plain - 80.0) < 1e-6 && lp.t_spec > 99.0 && lp.t_spec < 100.0);
     /* and a probe whose lane measures inside the margin hands the decoders back too, without re-probing until the
      * re-probe is due (both measured: no prediction left to chase) */
     for (uint32_t k = 0; k < 2u * LANE_PRICE_HOLD_STEPS; k++) {
         l284_steps(&lp, &spec, PULSAR_LANE_SPEC, 1u, 8, 10, 16, 100.5);
-        TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, StepRows{32}, 0u) == 3 && lp.probe == 0);
+        TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, StepRows{32}, TokCount{0}) == 3 && lp.probe == 0);
     }
     /* a new decoder count drops what was measured: nothing is measured at nine, and the better-predicted lane (plain
      * 9 / 79 ms = 114 against spec 11.25 tokens a 154 ms round = 73) is measured there first */
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 9, StepRows{32}, 0u) == 2 && lp.lane == 2 && !lp.meas_spec && !lp.meas_plain);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 9, StepRows{32}, TokCount{0}) == 2 && lp.lane == 2 && !lp.meas_spec && !lp.meas_plain);
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, 1u, 9, 11, 18, 105.0);
     TEST_ASSERT(lp.meas_n == 9 && lp.meas_steps[PULSAR_LANE_PLAIN] == 0u && lp.meas_steps[PULSAR_LANE_SPEC] == 1u);
     /* L338: the context's band drops them too -- a spec price measured at 26K tokens (67 tok/s, Gemma) priced the
      * next short request onto the plain lane; within a band (a short request's 0 .. 2K) they hold */
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 9, 11, 18, 105.0);
-    (void)lane_price_pick(&lp, &plain, &spec, 9, StepRows{32}, 1500u);
+    (void)lane_price_pick(&lp, &plain, &spec, 9, StepRows{32}, TokCount{1500});
     TEST_ASSERT(lp.meas_spec);
-    (void)lane_price_pick(&lp, &plain, &spec, 9, StepRows{32}, 26000u);
+    (void)lane_price_pick(&lp, &plain, &spec, 9, StepRows{32}, TokCount{26000});
     TEST_ASSERT(!lp.meas_spec && lp.meas_steps[PULSAR_LANE_SPEC] == 0u);
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 9, 7, 18, 105.0);
-    (void)lane_price_pick(&lp, &plain, &spec, 9, StepRows{32}, 30000u);   /* still [8K, 32K) */
+    (void)lane_price_pick(&lp, &plain, &spec, 9, StepRows{32}, TokCount{30000});   /* still [8K, 32K) */
     TEST_ASSERT(lp.meas_spec);
-    (void)lane_price_pick(&lp, &plain, &spec, 9, StepRows{32}, 40u);
+    (void)lane_price_pick(&lp, &plain, &spec, 9, StepRows{32}, TokCount{40});
     TEST_ASSERT(!lp.meas_spec);
 }
 
@@ -18343,32 +18345,32 @@ static void test_l289_lane_reprobe_evidence(void) {
     memset(&lp, 0, sizeof lp);
     pulsar_lane_cost spec = l284_cost(34400, 4150, true, 100u, 4.0f, 51.0f);
     pulsar_lane_cost plain = l284_cost(28000, 1000, true, 100u, 1.0f, 29.0f);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, 0u) == 3);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, TokCount{0}) == 3);
     /* spec: 3.8 tokens a 50.7 ms round = 75 tok/s; plain probed and measured: 1 token a 28.6 ms step = 35 */
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 1, 4, 5, 53.3);
     lp.probe = 2;
     lp.probe_n0 = plain.n;
     l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, LANE_PRICE_PROBE_STEPS, 1, 1, 1, 28.6);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, 0u) == 3 && lp.probe == 0 && lp.meas_plain && lp.meas_spec);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, TokCount{0}) == 3 && lp.probe == 0 && lp.meas_plain && lp.meas_spec);
     TEST_ASSERT(lp.held_n0 == spec.n && lp.deferral == 0);
     /* the 512-step clock passes: x2.1 clears, no probe, the deferral is flagged for its one announce */
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_REPROBE_STEPS, 1, 4, 5, 53.3);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, 0u) == 3 && lp.probe == 0 && lp.deferral == 1);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, TokCount{0}) == 3 && lp.probe == 0 && lp.deferral == 1);
     lp.deferral = 2;   /* the caller announced it */
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_REPROBE_STEPS * (LANE_PRICE_CLEAR_SPAN - 1u) - 1u, 1, 4, 5,
                53.3);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, 0u) == 3 && lp.probe == 0 && lp.deferral == 2);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, TokCount{0}) == 3 && lp.probe == 0 && lp.deferral == 2);
     /* ...until the measurement is LANE_PRICE_CLEAR_SPAN re-probes old: it is taken again */
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, 1u, 1, 4, 5, 53.3);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, 0u) == 2 && lp.probe == 2 && lp.lane == 3);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, TokCount{0}) == 2 && lp.probe == 2 && lp.lane == 3);
     l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, LANE_PRICE_PROBE_STEPS, 1, 1, 1, 28.6);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, 0u) == 3 && lp.probe == 0 && lp.deferral == 0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, TokCount{0}) == 3 && lp.probe == 0 && lp.deferral == 0);
     /* hard content: spec falls to 2 tokens a 50 ms round (40 tok/s, x1.14) -- inside the clearance, so the plain
      * 512-step schedule re-measures */
     for (uint32_t k = 0; k < 64u; k++) l284_steps(&lp, &spec, PULSAR_LANE_SPEC, 1u, 1, 2, 5, 50.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, 0u) == 3 && lp.t_spec < 35.0 * LANE_PRICE_CLEAR);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, TokCount{0}) == 3 && lp.t_spec < 35.0 * LANE_PRICE_CLEAR);
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_REPROBE_STEPS - 64u, 1, 2, 5, 50.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, 0u) == 2 && lp.probe == 2 && lp.deferral == 0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, TokCount{0}) == 2 && lp.probe == 2 && lp.deferral == 0);
     /* eight decoders, plain in force at 105 against spec measured 100 (L288): no clearance either way, the plain
      * schedule re-measures spec at 512 */
     memset(&lp, 0, sizeof lp);
@@ -18376,28 +18378,28 @@ static void test_l289_lane_reprobe_evidence(void) {
     lp.held_n0 = plain.n;
     l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, LANE_PRICE_PROBE_STEPS, 8, 8, 8, 76.2);
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 8, 10, 16, 100.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, StepRows{16}, 0u) == 2 && lp.meas_plain && lp.meas_spec);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, StepRows{16}, TokCount{0}) == 2 && lp.meas_plain && lp.meas_spec);
     l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, LANE_PRICE_REPROBE_STEPS, 8, 8, 8, 76.2);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, StepRows{16}, 0u) == 3 && lp.probe == 3 && lp.lane == 2);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, StepRows{16}, TokCount{0}) == 3 && lp.probe == 3 && lp.lane == 2);
     /* L288: the other lane PREDICTED (a moving decoder count drops the measurements) and cleared by the measured
      * lane in force: the re-measure waits the same way.  Four Qwen decoders: spec 13 tokens a 80 ms round = 162.5
      * tok/s measured, plain predicted 4 / 44 ms = 90.9 -- x1.79 */
     memset(&lp, 0, sizeof lp);
     plain = l284_cost(20000, 6000, true, 100u, 4.0f, 44.0f);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, StepRows{16}, 0u) == 3);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, StepRows{16}, TokCount{0}) == 3);
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 4, 13, 16, 80.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, StepRows{16}, 0u) == 3 && lp.meas_spec && !lp.meas_plain && lp.probe == 0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, StepRows{16}, TokCount{0}) == 3 && lp.meas_spec && !lp.meas_plain && lp.probe == 0);
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_REPROBE_STEPS, 4, 13, 16, 80.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, StepRows{16}, 0u) == 3 && lp.probe == 0 && lp.deferral == 1);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, StepRows{16}, TokCount{0}) == 3 && lp.probe == 0 && lp.deferral == 1);
     lp.deferral = 2;
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_REPROBE_STEPS * (LANE_PRICE_CLEAR_SPAN - 1u), 4, 13, 16, 80.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, StepRows{16}, 0u) == 2 && lp.probe == 2 && lp.lane == 3);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, StepRows{16}, TokCount{0}) == 2 && lp.probe == 2 && lp.lane == 3);
     /* ...and a prediction inside the clearance keeps the 512-step clock: plain predicted 4 / 30 ms = 133 */
     memset(&lp, 0, sizeof lp);
     plain = l284_cost(10000, 5000, true, 100u, 4.0f, 30.0f);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, StepRows{16}, 0u) == 3);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, StepRows{16}, TokCount{0}) == 3);
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS + LANE_PRICE_REPROBE_STEPS, 4, 13, 16, 80.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, StepRows{16}, 0u) == 2 && lp.probe == 2 && lp.deferral == 0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, StepRows{16}, TokCount{0}) == 2 && lp.probe == 2 && lp.deferral == 0);
 }
 
 /* L380: the terminal checkpoint waits out an idle grace and yields to a queued request.  The decisions are host
@@ -18685,34 +18687,34 @@ static void test_l380_lane_probe_key(void) {
     pulsar_lane_cost plain = l284_cost(28000, 1000, true, 100u, 1.0f, 29.0f);
     const uint32_t cleared = LANE_PRICE_REPROBE_STEPS * LANE_PRICE_CLEAR_SPAN;
     /* (c) spec measured, plain predicted and cleared x2.2: no probe, request after request, until the cleared clock */
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, 0u) == 3);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, TokCount{0}) == 3);
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 1, 4, 5, 53.3);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, 0u) == 3 && lp.meas_spec && !lp.meas_plain);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, TokCount{0}) == 3 && lp.meas_spec && !lp.meas_plain);
     TEST_ASSERT(lp.t_spec >= lp.t_plain * LANE_PRICE_CLEAR && lp.t_plain > 34.0 && lp.t_plain < 35.0);
     TEST_ASSERT(!strcmp(lp.why, "priced: clears the other lane"));
     for (uint32_t k = LANE_PRICE_PROBE_STEPS; k + 16u < cleared; k += 16u) {
         l284_steps(&lp, &spec, PULSAR_LANE_SPEC, 16u, 1, 4, 5, 53.3);
-        TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, 0u) == 3 && lp.probe == 0);
+        TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, TokCount{0}) == 3 && lp.probe == 0);
     }
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, 16u, 1, 4, 5, 53.3);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, 0u) == 2 && lp.probe == 2 && lp.lane == 3);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, TokCount{0}) == 2 && lp.probe == 2 && lp.lane == 3);
     TEST_ASSERT(!strcmp(lp.why, "re-measuring"));
     /* (a) 11 plain steps and the request ends; nothing runs while the decoders idle, and the next request's first
      * pick carries the probe on with spec's price still measured */
     l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, 11u, 1, 1, 1, 29.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, 0u) == 2 && lp.probe == 2 && lp.meas_spec && !lp.meas_plain);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, TokCount{0}) == 2 && lp.probe == 2 && lp.meas_spec && !lp.meas_plain);
     TEST_ASSERT(lp.meas_steps[PULSAR_LANE_PLAIN] == 11u && !strcmp(lp.why, "measuring"));
     l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, LANE_PRICE_PROBE_STEPS - 12u, 1, 1, 1, 29.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, 0u) == 2 && lp.probe == 2);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, TokCount{0}) == 2 && lp.probe == 2);
     l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, 1u, 1, 1, 1, 29.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, 0u) == 3 && lp.probe == 0 && lp.meas_plain && lp.lane == 3);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, TokCount{0}) == 3 && lp.probe == 0 && lp.meas_plain && lp.lane == 3);
     TEST_ASSERT(!strcmp(lp.why, "measured: the lane in force holds") && lp.held_n0 == spec.n);
     /* (b) the next cleared re-measure is 11 steps in when a request arrives in another depth band: the probe ends
      * with the prices it was started on, and the lane in force is measured there -- no plain step */
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, cleared, 1, 4, 5, 53.3);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, 0u) == 2 && lp.probe == 2);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, TokCount{0}) == 2 && lp.probe == 2);
     l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, 11u, 1, 1, 1, 29.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, 26000u) == 3 && lp.probe == 0 && lp.lane == 3);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, TokCount{26000}) == 3 && lp.probe == 0 && lp.lane == 3);
     TEST_ASSERT(!lp.meas_spec && !lp.meas_plain && lp.meas_steps[PULSAR_LANE_PLAIN] == 0u && lp.rekeyed);
     TEST_ASSERT(!strcmp(lp.why, "depth band 0 -> 2, the probe ends: measuring the lane in force"));
     /* (c) spec only predicted there (its yield over its fit, 72.5) against plain predicted: still no probe, and the
@@ -18720,48 +18722,48 @@ static void test_l380_lane_probe_key(void) {
     TEST_ASSERT(lp.t_spec >= lp.t_plain * LANE_PRICE_CLEAR);
     for (uint32_t k = 1u; k < LANE_PRICE_PROBE_STEPS; k++) {
         l284_steps(&lp, &spec, PULSAR_LANE_SPEC, 1u, 1, 4, 5, 53.3);
-        TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, 26000u) == 3 && lp.probe == 0 && !lp.meas_spec);
+        TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, TokCount{26000}) == 3 && lp.probe == 0 && !lp.meas_spec);
         TEST_ASSERT(!strcmp(lp.why, "measuring the lane in force") && !lp.rekeyed);
     }
     /* ...and once spec is measured in the band, the re-measure the probe did not finish is still owed: the cleared
      * clock ran out before it began and nothing has been weighed since */
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, 1u, 1, 4, 5, 53.3);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, 26000u) == 2 && lp.probe == 2 && lp.meas_spec);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, TokCount{26000}) == 2 && lp.probe == 2 && lp.meas_spec);
     TEST_ASSERT(!strcmp(lp.why, "re-measuring"));
     /* (b) a second decoder joins five plain steps in: the count ends the probe the same way, whether the pick sees
      * the new count first... */
     l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, 5u, 1, 1, 1, 29.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 2, StepRows{16}, 26000u) == 3 && lp.probe == 0 && lp.meas_n == 2);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 2, StepRows{16}, TokCount{26000}) == 3 && lp.probe == 0 && lp.meas_n == 2);
     TEST_ASSERT(!strcmp(lp.why, "decoders 1 -> 2, the probe ends: measuring the lane in force"));
     TEST_ASSERT(lp.meas_steps[PULSAR_LANE_PLAIN] == 0u);
     /* ...or a step does, inside a quantum (the decoder finishes: one left) */
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 2, 8, 10, 76.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 2, StepRows{16}, 26000u) == 2 && lp.probe == 2);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 2, StepRows{16}, TokCount{26000}) == 2 && lp.probe == 2);
     l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, 5u, 2, 2, 2, 30.0);
     l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, 1u, 1, 1, 1, 29.0);
     TEST_ASSERT(lp.probe == 0 && lp.meas_n == 1 && lp.meas_steps[PULSAR_LANE_PLAIN] == 1u);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, 26000u) == 3 && lp.rekeyed);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, TokCount{26000}) == 3 && lp.rekeyed);
     TEST_ASSERT(!strcmp(lp.why, "decoders 2 -> 1, the probe ends: measuring the lane in force"));
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, 26000u) == 3 && !lp.rekeyed &&
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, TokCount{26000}) == 3 && !lp.rekeyed &&
                 !strcmp(lp.why, "measuring the lane in force"));
     /* no probe in flight: the move is named all the same, both parts when both moved, and the start state (nothing
      * measured for any count) names none */
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 3, StepRows{16}, 100u) == 3 && lp.rekeyed);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 3, StepRows{16}, TokCount{100}) == 3 && lp.rekeyed);
     TEST_ASSERT(!strcmp(lp.why, "decoders 1 -> 3, depth band 2 -> 0: measuring the lane in force"));
     /* (d) a plain lane with no price at all (no fit yet) is probed once spec is measured and held, however fast
      * spec is, and that probe keeps its steps over an idle gap as well */
     memset(&lp, 0, sizeof lp);
     spec = l284_cost(34400, 4150, true, 100u, 4.0f, 51.0f);
     plain = l284_cost(0, 0, false, 0u, 0.0f, 0.0f);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, 0u) == 3 && lp.t_plain == 0.0 && !lp.rekeyed);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, TokCount{0}) == 3 && lp.t_plain == 0.0 && !lp.rekeyed);
     TEST_ASSERT(!strcmp(lp.why, "measuring the lane in force"));
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 1, 4, 5, 53.3);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, 0u) == 2 && lp.probe == 2 && lp.t_plain == 0.0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, TokCount{0}) == 2 && lp.probe == 2 && lp.t_plain == 0.0);
     TEST_ASSERT(!strcmp(lp.why, "no price here: measuring"));
     l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, 20u, 1, 1, 1, 29.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, 0u) == 2 && lp.probe == 2);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, TokCount{0}) == 2 && lp.probe == 2);
     l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, LANE_PRICE_PROBE_STEPS - 20u, 1, 1, 1, 29.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, 0u) == 3 && lp.probe == 0 && lp.meas_plain);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, TokCount{0}) == 3 && lp.probe == 0 && lp.meas_plain);
     TEST_ASSERT(fabs(lp.t_plain - 1000.0 / 29.0) < 1e-6);
 }
 
@@ -18832,22 +18834,22 @@ static void test_l380_batch_frontier(void) {
     sl.active_job = NULL;
 
     /* the lane prices' depth is that read: band 3 on either lane */
-    TEST_ASSERT(lane_depth_band((uint32_t)s.slot_frontier_pos(&sl).raw()) == 3);
+    TEST_ASSERT(lane_depth_band(s.slot_frontier_pos(&sl).before()) == 3);
     /* so a plain probe's steps count over its quanta: band 3 at every pick */
     lane_price lp;
     memset(&lp, 0, sizeof lp);
     pulsar_lane_cost spec = l284_cost(34400, 4150, true, 100u, 4.0f, 51.0f);
     pulsar_lane_cost plain = l284_cost(0, 0, false, 0u, 0.0f, 0.0f);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, 36600u) == 3);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, TokCount{36600}) == 3);
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 1, 4, 5, 53.3);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, 36632u) == 2 && lp.probe == 2);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, TokCount{36632}) == 2 && lp.probe == 2);
     for (uint32_t k = 0; k < 4u; k++) {   /* four quanta of eight plain steps */
-        TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, (uint32_t)s.slot_frontier_pos(&sl).raw()) == 2 &&
+        TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, s.slot_frontier_pos(&sl).before()) == 2 &&
                     !lp.rekeyed);
         l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, 8u, 1, 1, 1, 29.0);
         g.batch_feed_pos += TokCount{8};
     }
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, (uint32_t)s.slot_frontier_pos(&sl).raw()) == 3 &&
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, StepRows{16}, s.slot_frontier_pos(&sl).before()) == 3 &&
                 lp.probe == 0);
     TEST_ASSERT(lp.meas_plain && lp.meas_spec && !strcmp(lp.why, "measured: the lane in force holds"));
 
@@ -22525,11 +22527,25 @@ static_assert(std::is_same_v<decltype(&server::floor_admits_chunk), bool (server
                   std::is_same_v<decltype(&lane_price_observe_spec), void (*)(lane_price *, TokCount, StepRows, int, double)> &&
                   std::is_same_v<decltype(&lane_price_pick),
                                  int (*)(lane_price *, const pulsar_lane_cost *, const pulsar_lane_cost *, int, StepRows,
-                                         uint32_t)> &&
+                                         TokCount)> &&
                   std::is_same_v<decltype(&server_pick_decode_lane),
                                  int (*)(BankCount, bool, StepRows, session_slot *const *, int, int)> &&
                   !l334_passes<bool, StepRows> && !l334_passes<uint32_t, StepRows> && !l334_passes<int, KvRows>,
               "rows by their unit: no decoder count, token count or bool passes for a width");
+/* L445: the generation's counts are live-side tokens, the judge's growth a token count, the RAM tier host memory */
+static_assert(std::is_same_v<decltype(gen_state{}.completion), TokCount> &&
+                  std::is_same_v<decltype(gen_state{}.max_tokens), TokCount> &&
+                  std::is_same_v<decltype(gen_state{}.completion_total), TokCount> &&
+                  std::is_same_v<decltype(gen_state{}.think_tokens), TokCount> &&
+                  std::is_same_v<decltype(gen_state{}.next_decode_log), TokCount> &&
+                  std::is_same_v<decltype(request{}.think_budget), TokCount> &&
+                  std::is_same_v<decltype(&server::budget_admits_growth),
+                                 bool (server::*)(BankId, TokCount, char *, size_t)> &&
+                  std::is_same_v<decltype(kv_ram_plan{}.bytes), HostBytes> &&
+                  std::is_same_v<decltype(&kv_host_mem_total), HostBytes (*)(void)> &&
+                  std::is_same_v<decltype(&lane_depth_band), int (*)(TokCount)> &&
+                  !l334_passes<int, TokCount> && !l334_passes<uint64_t, HostBytes> && !l334_passes<KvRows, TokCount>,
+              "L445: counts by their unit -- no bare int for a generation count, no uint64 for host memory");
 /* L443: token ids and the walks' counts at the server's emit boundary -- an id is a TokId, a chain's length a TokCount */
 static_assert(std::is_same_v<decltype(&server::gen_emit_token), bool (server::*)(session_slot *, TokId)> &&
                   std::is_same_v<decltype(&server::gen_emit_piece),

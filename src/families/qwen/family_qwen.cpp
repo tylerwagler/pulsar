@@ -1175,7 +1175,7 @@ void qwen_state_plan(pulsar_engine *e) {
     d[PULSAR_QWEN_STATE_IDX_KEYS] = {"idx_keys", PULSAR_STATE_POOL, PULSAR_STATE_CAPTURE_NONE, false, false,
                                      s->idx_block, pulsar_qwen_index_row_bytes(s), TensorBytes{}, SlabOff{}, NULL, NULL, NULL};
     d[PULSAR_QWEN_STATE_IDX_TAIL] = {"idx_tail", PULSAR_STATE_STAGED, PULSAR_STATE_CAPTURE_STAGE, false, false,
-                                     s->idx_block, TensorBytes{pulsar_qwen_index_tail_bytes(s).raw() / s->idx_block},   /* one of the block's rows */
+                                     s->idx_block, pulsar_qwen_index_tail_row_bytes(s),   /* one of the block's rows */
                                      bytes_of<float>(PULSAR_QSA_IDX_IN),
                                      SlabOff::after(bytes_of<float>((uint64_t)PULSAR_QSA_IDX_HEADS * PULSAR_QSA_IDX_DIM)), NULL,
                                      NULL, NULL};

@@ -426,7 +426,7 @@ bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt) 
     /* L242 slice 5: V4.1's Engram layers (layout, row tables, wkv / q / k) */
     if (!engram_bind(&e->weights, &e->model, opt->model_path)) return false;
     /* L426: each row table is weights outside the shards: bound into the KV store identity */
-    for (uint32_t l = 0; e->weights.engram && l < e->weights.engram->n_layers; l++) {
+    for (KindOrd l{0u}; e->weights.engram && l.below(e->weights.engram->n_layers); ++l) {
         uint64_t rows_digest = 0;
         if (!pulsar_engram_table_digest(&e->weights.engram->table[l], &rows_digest)) return false;
         pulsar_engine_bind_kv_source(e, "row-table", rows_digest);
@@ -802,7 +802,7 @@ static bool open_map(pulsar_engine *e) {
         }
         /* the fd names its mapping (a group's later member must not re-key the first's) */
         (void)pulsar_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
-        const int model_map_ok = pulsar_gpu_set_model_map(e->model.map, e->model.size);
+        const int model_map_ok = pulsar_gpu_set_model_map(e->model.map, TensorBytes{e->model.size});
         if (!model_map_ok) {
             fprintf(stderr,
                     "pulsar: %s failed to map model views; aborting startup. "
@@ -811,7 +811,7 @@ static bool open_map(pulsar_engine *e) {
             return false;
         }
         if (e->dspark_ready && e->dspark_external &&
-            !pulsar_gpu_set_model_map(e->dspark_model.map, e->dspark_model.size))
+            !pulsar_gpu_set_model_map(e->dspark_model.map, TensorBytes{e->dspark_model.size}))
         {
             fprintf(stderr,
                     "pulsar: %s failed to map DSpark model views; aborting startup. "

@@ -1099,7 +1099,7 @@ static int spec_single_round(pulsar_session *s, int first_token,
         free(r.snap);
         return -1;
     }
-    const uint32_t n_rows = (uint32_t)pulsar_spec_round_n_rows(&r).raw();   /* the lane-cost fit's rows */
+    const StepRows n_rows = pulsar_spec_round_n_rows(&r);   /* the lane-cost fit's rows */
     const int na = spec_round_end(s, &r, first_token,
                                   temperature, top_k, top_p, min_p, 0u /* the caller's params at every row */,
                                   NULL, 0u, rng,

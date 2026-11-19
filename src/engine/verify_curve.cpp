@@ -361,7 +361,9 @@ uint32_t pulsar_engine_verify_pick(const pulsar_engine *e, uint32_t n_seqs, cons
     return pulsar_verify_curve_pick(vc_leader(e), n_seqs, surv, m, cap_rows, 0.0, &ratio);
 }
 
-double pulsar_engine_verify_round_ms(const pulsar_engine *e, uint32_t n_seqs, uint32_t rows, double *outside_ms) {
+double pulsar_engine_verify_round_ms(const pulsar_engine *e, BankCount n_seqs_c, StepRows rows_r, double *outside_ms) {
+    const uint32_t n_seqs = (uint32_t)n_seqs_c.raw(); /* raw: the curve's bank axis */
+    uint32_t rows = (uint32_t)rows_r.raw();           /* raw: the curve's row axis */
     const pulsar_verify_curve *c = vc_leader(e);   /* the server's round selection: on a pair the leader's (L315) */
     *outside_ms = 0.0;
     if (!c || n_seqs == 0u || rows == 0u) return 0.0;
@@ -458,12 +460,14 @@ uint32_t pulsar_spec_chain_step(const pulsar_session *s, uint32_t n_chains, cons
 
 /* ---- the online correction --------------------------------------------------------------------------------- */
 
-void pulsar_engine_verify_curve_depth(pulsar_engine *e, uint32_t depth) {
-    if (e && e->verify_curve) e->verify_curve->depth = depth;
+void pulsar_engine_verify_curve_depth(pulsar_engine *e, TokCount depth) {
+    if (e && e->verify_curve) e->verify_curve->depth = (uint32_t)depth.raw();   /* raw: the curve's depth buckets */
 }
 
-void pulsar_engine_verify_curve_observe(pulsar_engine *e, uint32_t n_seqs, uint32_t rows, double forward_ms,
+void pulsar_engine_verify_curve_observe(pulsar_engine *e, BankCount n_seqs_c, StepRows rows_r, double forward_ms,
                                         double host_ms, double draft_ms) {
+    const uint32_t n_seqs = (uint32_t)n_seqs_c.raw(); /* raw: the curve's bank axis */
+    const uint32_t rows = (uint32_t)rows_r.raw();     /* raw: the curve's row axis */
     pulsar_verify_curve *c = e ? e->verify_curve : NULL;
     /* L315: on a pair, the leader's (a worker has no curve) */
     if (!c || n_seqs == 0u || rows == 0u || rows > c->rows_max || !(forward_ms > 0.0)) return;
@@ -1043,7 +1047,8 @@ static void pf_observe(pulsar_engine *e, int kind, uint32_t n_runs, const uint32
 }
 
 void pulsar_engine_fused_cost_observe(pulsar_engine *e, uint32_t n_runs, const uint32_t *q, const uint32_t *c,
-                                      uint32_t verify_rows, double forward_ms) {
+                                      StepRows verify_rows_r, double forward_ms) {
+    const uint32_t verify_rows = (uint32_t)verify_rows_r.raw();   /* raw: the curve's row axis */
     const pulsar_verify_curve *vc = vc_leader(e);
     if (!e || e->tp || !vc || n_runs == 0u || !(forward_ms > 0.0)) return;
     pf_observe(e, PULSAR_CHUNK_FUSED, n_runs, q, c, forward_ms - (verify_rows ? vc_forward_ms(vc, verify_rows) : 0.0));

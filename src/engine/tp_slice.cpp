@@ -127,7 +127,7 @@ static pulsar_tp_op plan_op(const pulsar_tp_slice *s, pulsar_act_kind kind) {
     const pulsar_tensor *t = s->t;
     const bool rows = kind == PULSAR_ACT_KIND_ROWS, out = s->axis == PULSAR_TP_AXIS_OUT;
     if (s->axis == PULSAR_TP_AXIS_EXPERTS)
-        return rows && t->ndim == 3 && t->bytes % t->dim[2] == 0 ? PULSAR_TP_OP_EXPERTS : PULSAR_TP_OP_NONE;
+        return rows && t->ndim == 3 && t->bytes.raw() % t->dim[2] == 0 /* raw: whole expert slices */ ? PULSAR_TP_OP_EXPERTS : PULSAR_TP_OP_NONE;
     if (t->type == PULSAR_TENSOR_MXFP8_LT && t->ndim == 2)
         return rows ? PULSAR_TP_OP_NONE : out ? PULSAR_TP_OP_FP8_ROWS : PULSAR_TP_OP_FP8_K;
     if (exl3_type_k2(t->type) && t->ndim == 2)
@@ -206,7 +206,7 @@ bool pulsar_tp_plan_build(pulsar_engine *e) {
             /* the residency rule: the model that holds the tensor (a merged drafter aliases the main model) */
             pulsar_model *owner = s.t >= e->model.tensors && s.t < e->model.tensors + e->model.n_tensors ? &e->model : s.m;
             if (!owner->tp_unstaged) owner->tp_unstaged = (uint8_t *)xcalloc((size_t)owner->n_tensors, 1);
-            if (!owner->tp_unstaged[s.t - owner->tensors]) unstaged += s.t->bytes;
+            if (!owner->tp_unstaged[s.t - owner->tensors]) unstaged += s.t->bytes.raw();   /* raw: the plan's uint64 total */
             owner->tp_unstaged[s.t - owner->tensors] = 1;
         }
     }
@@ -264,7 +264,7 @@ static bool exl3_slice(const uint8_t *src, const pulsar_tp_slice *s, std::vector
     for (uint32_t i = 0; i < s->n; i++) {
         exl3_cut c;
         if (!exl3_expert_cut(s->t->dim[0], s->t->dim[1], k2, in_axis, s->lo[i], s->hi[i], at, ext, &c) ||
-            c.src_stride != s->t->bytes)
+            TensorBytes{c.src_stride} != s->t->bytes)   /* the cut's stride, entered as bytes */
             return false;
         out.resize(c.dst_stride);
         exl3_expert_cut_apply(&c, src, out.data());
@@ -352,7 +352,7 @@ static bool run_slice(pulsar_engine *e, pulsar_tp_plan *p, const pulsar_tp_slice
     }
     case PULSAR_TP_OP_GATHER: {
         /* rows of the outermost dim, each t->bytes / full long */
-        const uint64_t row = t->bytes / axis_full(t, s->axis);
+        const uint64_t row = t->bytes.raw() / axis_full(t, s->axis);   /* raw: a row's bytes, for the byte model */
         const uint8_t *src = (const uint8_t *)tensor_data(m, t);
         std::vector<uint8_t> b;
         for (uint32_t i = 0; i < s->n; i++) b.insert(b.end(), src + s->lo[i] * row, src + s->hi[i] * row);
@@ -390,7 +390,7 @@ static bool run_slice(pulsar_engine *e, pulsar_tp_plan *p, const pulsar_tp_slice
         const uint32_t n_exp = (uint32_t)t->dim[2];
         const int k2 = exl3_type_k2(t->type);
         exl3_cut c;
-        if (!exl3_expert_cut(k, n, k2, k_half, lo, hi, 0, hi - lo, &c) || c.src_stride * n_exp != t->bytes) {
+        if (!exl3_expert_cut(k, n, k2, k_half, lo, hi, 0, hi - lo, &c) || TensorBytes{c.src_stride * n_exp} != t->bytes) {   /* the cut's stride, entered as bytes */
             fprintf(stderr, "pulsar: TP: %s is not %u EXL3 experts of %llu x %llu cut at [%llu,%llu) -- refusing\n", nm,
                     n_exp, (unsigned long long)k, (unsigned long long)n, lo, hi);
             return false;
@@ -408,7 +408,7 @@ static bool run_slice(pulsar_engine *e, pulsar_tp_plan *p, const pulsar_tp_slice
                                                     t->abs_offset, n_exp, k, n, k2, k_half ? 1 : 0, lo, hi) != 0;
     }
     case PULSAR_TP_OP_EXPERTS: {
-        const uint64_t stride = t->bytes / t->dim[2], rel = lo * stride, n = (hi - lo) * stride;
+        const uint64_t stride = t->bytes.raw() / t->dim[2], rel = lo * stride, n = (hi - lo) * stride;   /* raw: the expert byte model */
         *bytes += n;
         if (g_tp_record) {
             fprintf(g_tp_record, "stage_range %s off %llu +%llu bytes %llu\n", nm, off, (unsigned long long)rel,

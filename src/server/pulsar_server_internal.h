@@ -1471,7 +1471,7 @@ typedef struct request {
     /** L344: the reasoning budget (Anthropic thinking.budget_tokens), tokens; 0 = none.  A decode whose open
      *  reasoning block reaches it draws the family's close token next (gen_think_close_row); set by
      *  chat_resolve_thinking only with thinking on and a family with one close token. */
-    int think_budget;
+    TokCount think_budget;
     /** L251: the request's tools array in OpenAI's shape (JSON text) for a family that renders it as JSON
      * and reads arguments by its schema (Qwen's template and output parser); owned, NULL = no tools. */
     char *tools_json;
@@ -2146,7 +2146,7 @@ struct kv_writer;
 #define KV_RAM_RING_MB 1024
 /** L347 I3a: the disk cache's host memory pool, decided once at startup (kv_ram_plan_for). */
 typedef struct {
-    uint64_t bytes;   ///< the pool's size (pinned at kv_cache_open)
+    HostBytes bytes;  ///< the pool's size (pinned at kv_cache_open; L445: host memory)
     bool retain;      ///< the RAM tier is on: written entries stay resident (never on a unified-memory host)
 } kv_ram_plan;
 /** L347 I3a (plans/124 D9): the pool's plan, pure -- the one place the RAM tier is decided.  On a unified-memory host
@@ -2158,7 +2158,7 @@ typedef struct {
  *  @param ram_mb     --kv-ram-mb (< 0: not given)
  *  @param bytes      receives the pool's size
  *  @param retain     receives whether the RAM tier is on */
-void kv_ram_plan_for(int integrated, uint64_t mem_total, int64_t ram_mb, uint64_t *bytes, bool *retain);
+void kv_ram_plan_for(int integrated, HostBytes mem_total, int64_t ram_mb, HostBytes *bytes, bool *retain);
 /* meminfo_kib and meminfo_read: lib/pulsar_meminfo.h (the one /proc/meminfo reader, L442) */
 /** L338 (CT 130, 2026-11-03): a cgroup v2 memory.max value in bytes -- 0 for "max" (no limit) or anything unreadable.
  *  @param text the file's contents  @return the limit in bytes, 0 for none */
@@ -2172,9 +2172,9 @@ uint64_t kv_cgroup_limit_parse(const char *text);
  *  @param cgroup_root the cgroup v2 mount (/sys/fs/cgroup), or NULL
  *  @param self_cgroup a /proc/self/cgroup-format file, or NULL
  *  @return the least of them in bytes (0 when none is known) */
-uint64_t kv_host_mem_total_from(uint64_t phys, const char *meminfo, const char *cgroup_root, const char *self_cgroup);
+HostBytes kv_host_mem_total_from(HostBytes phys, const char *meminfo, const char *cgroup_root, const char *self_cgroup);
 /** L338: kv_host_mem_total_from over this host's /proc and /sys.  @return bytes */
-uint64_t kv_host_mem_total(void);
+HostBytes kv_host_mem_total(void);
 
 /** L264 S4: the disk KV cache -- the segment store (lib/pulsar_segstore.h). */
 typedef struct {
@@ -3861,11 +3861,11 @@ struct server {
      *  prompt admission's arithmetic, server_prompt_kv_verdict); short of it the idle chat banks the plan names are
      *  spilled.  No decoder is preempted and no busy bank is waited for. */
     /// @param bank       the bank that grows (the judge's)
-    /// @param end_rows   the tokens it will hold (the prompt's length)
+    /// @param end_rows   the tokens it will hold (the prompt's length: the bank's history once prefilled)
     /// @param err        receives the refusal (the numbers, and how many banks were spilled)
     /// @param errlen     its size
     /// @return true when the prefill may run; false = the budget still stands (the caller answers 503)
-    bool budget_admits_growth(BankId bank, int end_rows, char *err, size_t errlen);
+    bool budget_admits_growth(BankId bank, TokCount end_rows, char *err, size_t errlen);
     /** The fused / mixed lanes' form: no remedy (banks would move under the step being assembled) and no refusal --
      *  short of the floor the prompt leaves the fused lane (gen->no_fuse) and its classic quantum decides. */
     /// @param sl the slot whose job this is (its gen_state; its bank installed by the caller unless said)
@@ -5104,7 +5104,7 @@ struct gen_state {
     /** Request-lifetime token count: accumulates across decode attempts (the
      * tool-error recovery continuation) so continued generations spend ONE
      * shared max_tokens budget. */
-    int completion_total;    ///< tokens generated across ALL attempts; the shared max_tokens budget
+    TokCount completion_total;    ///< tokens generated across ALL attempts; the shared max_tokens budget
     uint64_t rng;            ///< sampler state; per-request so concurrency cannot perturb a seeded run
 
     /** decode attempt state (reset by GEN_DECODE_INIT) */
@@ -5128,9 +5128,9 @@ struct gen_state {
      *  does not.  The protocols' live continuations (a tail appended to the bank's history) are not remembered for
      *  such a turn: the next request renders in full and its sync resumes where the two part. */
     bool turn_cut_short;
-    int completion;           ///< tokens generated this attempt
-    int max_tokens;           ///< cap for this attempt
-    int next_decode_log;      ///< token count at which to write the next decode log line
+    TokCount completion;      ///< tokens generated this attempt (L445: a count on the bank's live side)
+    TokCount max_tokens;      ///< cap for this attempt
+    TokCount next_decode_log;      ///< token count at which to write the next decode log line
     double decode_t0;         ///< wall time decoding began, for tokens/s
     /* L119: request-scoped DSpark counters, accumulated by the spec-batched
      * lane per round (the ONLY decode lane that speculates post-L118). The
@@ -5144,11 +5144,11 @@ struct gen_state {
     uint64_t req_spec_rounds;  ///< spec rounds (incl. base-only quenched), this request
     uint64_t req_spec_gen;  ///< tokens emitted by spec rounds, this request
     double last_decode_log_t;          ///< wall time of the last decode log line, for interval rates
-    int last_decode_log_completion;    ///< token count at that line, for interval rates
+    TokCount last_decode_log_completion;    ///< token count at that line, for interval rates
     thinking_state thinking;           ///< reasoning-block tracking (the stop-string scan waits outside it)
     /** L344: reasoning tokens emitted against request::think_budget, across attempts (a tool-error retry spends
      *  the request's one budget, as completion_total does max_tokens). */
-    int think_tokens;
+    TokCount think_tokens;
     /** L344: this attempt's reasoning block has closed -- latched: a literal \<think\> in the answer flips
      *  `thinking.inside` back, but the budget governs only the block the turn opened with. */
     bool think_closed;
@@ -5209,6 +5209,10 @@ struct gen_state {
     /** deferred, non-blocking client writes (installed for send_all) */
     slot_writer writer;  ///< queues bytes so a slow client cannot block the worker
 };
+/** The completion tokens a response reports: every attempt's (completion_total + this attempt's; L445).
+ *  @param g the generation
+ *  @return the count */
+static inline TokCount gen_completion_reported(const gen_state *g) { return g->completion_total + g->completion; }
 
 /* Emit the surface-appropriate keepalive if this slot has gone quiet (see
  * PULSAR_SERVER_HEARTBEAT_MS). Returns true if one was written. Non-blocking
@@ -6717,12 +6721,12 @@ void request_ctx_span(char *buf, size_t len, int cached, int prompt);
 void log_flags(char *buf, size_t len, bool responses_protocol,
                       bool tools, bool thinking,
                       bool tool_start, bool tool_end);
-void log_decode_progress(req_kind kind, int prompt_tokens, int completion,
+void log_decode_progress(req_kind kind, int prompt_tokens, TokCount completion,
                                 bool responses_protocol,
                                 bool tools, bool thinking,
                                 bool tool_start, bool tool_end,
                                 double decode_t0,
-                                double *last_t, int *last_completion);
+                                double *last_t, TokCount *last_completion);
 thinking_state thinking_state_from_prompt(const request *r);
 /// @brief L344: account one emitted token against the reasoning budget, after the tracker was fed its piece: a
 /// token inside the turn's first block spends one, the one that closes it latches the block closed.

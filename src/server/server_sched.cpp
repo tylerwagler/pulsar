@@ -2455,7 +2455,7 @@ void server::kv_req_log(job *j, const session_slot *sl, const char *finish) {
         r->bank = sl->bank;
         if (g->decode_t0 > 0.0 && g->t0 > 0.0) r->prefill_ms = pulsar_ms_of_sec(g->decode_t0 - g->t0);
         if (g->first_token_t > 0.0) r->ttft_ms = pulsar_ms_of_sec(g->first_token_t - j->accepted_at);
-        r->out = g->completion_total + g->completion;
+        r->out = gen_completion_reported(g).raw();   /* raw: the kv req: line's int field (printed) */
         if (!r->at.is_none()) {
             /* a prefill that ran to its end computed the prompt past `at`; one that stopped, to its last chunk */
             /* L434: both live-side, as `at` is -- where the prefill ended on the bank's history (the stitch's end).
@@ -2725,9 +2725,9 @@ VerifyRow think_close_row(TokCount budget, bool open, TokCount think_tokens, Tok
 /// @param base_pending  toks[0] is the base
 /// @return the row to force, or none()
 VerifyRow gen_think_close_row(server *s, const gen_state *g, const TokId *toks, TokCount n, bool base_pending) {
-    const int budget = g->j->req.think_budget;
-    if (budget <= 0) return VerifyRow::none();
-    return think_close_row(TokCount{budget}, g->thinking.inside && !g->think_closed, TokCount{g->think_tokens},
+    const TokCount budget = g->j->req.think_budget;
+    if (budget <= TokCount{0}) return VerifyRow::none();
+    return think_close_row(budget, g->thinking.inside && !g->think_closed, g->think_tokens,
                            pulsar_token_think_close(s->engine), toks, n, base_pending);
 }
 
@@ -3054,9 +3054,9 @@ static double lane_price_measured(const lane_price *lp, int li, int n) {
  * what a decode step costs moves with the context it attends, and a short request never leaves its band. */
 /// @param depth the decoders' mean frontier, tokens
 /// @return its band
-static int lane_depth_band(uint32_t depth) {
+static int lane_depth_band(TokCount depth) {
     int b = 0;
-    for (uint32_t d = depth >> 11; d; d >>= 2) b++;
+    for (uint32_t d = (uint32_t)depth.raw() >> 11; d; d >>= 2) b++;   /* raw: the band is the bit length's half */
     return b;
 }
 
@@ -3160,7 +3160,7 @@ static int lane_price_weigh(lane_price *lp, const pulsar_lane_cost *plain, const
 /// @param depth the decoders' mean depth, tokens (server::slot_frontier_pos; a new band drops the measured prices)
 /// @return the lane: 2 plain or 3 spec
 static int lane_price_pick(lane_price *lp, const pulsar_lane_cost *plain, const pulsar_lane_cost *spec, int n,
-                           StepRows verify_rows, uint32_t depth) {
+                           StepRows verify_rows, TokCount depth) {
     const int band = lane_depth_band(depth);
     if (n != lp->meas_n || band != lp->meas_depth) lane_price_rekey(lp, n, band);
     const int lane = lane_price_weigh(lp, plain, spec, n, verify_rows);
@@ -3567,7 +3567,7 @@ bool server::preempt_newest_decoder(const session_slot *keep, KvBytes need) {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: PREEMPTED bank %d's decoder at %d tokens (%d generated): terminal checkpoint "
                    "%.1f MiB in %.1f ms, physical freed (%.2f GiB)", v->bank.raw(),
-                   server_bank_pos(pool, v->bank).raw(), g->completion_total + g->completion,
+                   server_bank_pos(pool, v->bank).raw(), gen_completion_reported(g).raw(),
                    (double)payload_bytes / 1048576.0,
                    pulsar_ms_of_sec(pulsar_mono_sec() - t0), pulsar_gib(bytes));
         return true;
@@ -4049,12 +4049,13 @@ bool server::floor_admits_chunk(KvRows rows, char *err, size_t errlen) {
     return false;
 }
 
-bool server::budget_admits_growth(BankId bank, int end_rows, char *err, size_t errlen) {
+bool server::budget_admits_growth(BankId bank, TokCount end_rows, char *err, size_t errlen) {
     auto *s = this;
     /* no guard, no chat pool, or a host-only server (no session to price a row by): no budget to hold */
     if (!s->guard_enabled || !s->pool_banks.any() || !s->sess) return true;
     pulsar_session *pool = s->sess;
-    const KvBytes want = pulsar_session_quantum_growth_bytes_per_bank(pool, KvRows{(uint32_t)(end_rows > 0 ? end_rows : 0)});
+    const KvBytes want = pulsar_session_quantum_growth_bytes_per_bank(
+            pool, pulsar_kv_rows(end_rows > TokCount{0} ? end_rows : TokCount{0}));
     KvBytes need{}, base{};
     int spilled = 0;
     for (int round = 0; round < 2; round++) {
@@ -4074,7 +4075,7 @@ bool server::budget_admits_growth(BankId bank, int end_rows, char *err, size_t e
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: kv admission: bank %d's prompt of %d tokens adds %.2f GiB of KV (resident %.2f + "
                    "%.2f > budget %.2f GiB): spilling %d idle bank(s) first",
-                   bank.raw(), end_rows, pulsar_gib(need), pulsar_gib(base), pulsar_gib(need),
+                   bank.raw(), end_rows.raw(), pulsar_gib(need), pulsar_gib(base), pulsar_gib(need),
                    pulsar_gib(s->guard_budget()), n_spill.raw());
         for (int k : n_spill.positions()) {
             if (!s->spill_bank(&s->slots[order[k]])) break;
@@ -4085,7 +4086,7 @@ bool server::budget_admits_growth(BankId bank, int end_rows, char *err, size_t e
     snprintf(err, errlen,
              "not enough KV memory for this prompt now: its %d tokens need %.2f GiB of KV beside %.2f GiB the server "
              "keeps resident (budget %.2f GiB), after %d spill(s); retry later",
-             end_rows, pulsar_gib(need), pulsar_gib(base), pulsar_gib(s->guard_budget()),
+             end_rows.raw(), pulsar_gib(need), pulsar_gib(base), pulsar_gib(s->guard_budget()),
              spilled);
     return false;
 }
@@ -4331,7 +4332,7 @@ static void lane_abandon(gen_state *g, bool drop_feed) {
     server_log(PULSAR_LOG_DEFAULT,
                "pulsar-server: %s, abandoning generation after %d tokens",
                g->writer.failed ? "client stream failed" : "client disconnected",
-               g->completion);
+               g->completion.raw());
     if (drop_feed) g->batch_feed_valid = false;
     g->abandoned = true;   /* L372: not a "length" turn in the server's records (gen_step_finish) */
     g->phase = GEN_FINISH;
@@ -4548,7 +4549,7 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n, int quantu
          * carried against the step's wall, sampling and emission included -- into the same fit structure
          * (pulsar_engine_lane_cost), so the lane choice weighs one clock against the other */
         const double step_ms = pulsar_ms_of_sec(pulsar_mono_sec() - step_t0);
-        pulsar_engine_lane_cost_observe(s->engine, PULSAR_LANE_PLAIN, (uint32_t)m, step_ms);
+        pulsar_engine_lane_cost_observe(s->engine, PULSAR_LANE_PLAIN, lane_base_rows(m), step_ms);
         lane_price_observe_plain(&s->w_lane_price, m, step_ms);
     }
     const uint64_t now_us = (uint64_t)pulsar_us_of_sec(pulsar_mono_sec());
@@ -4939,7 +4940,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                     dsum += (uint64_t)server_bank_pos(pool, dec[i]->bank).raw();
                     dn++;
                 }
-            pulsar_engine_verify_curve_depth(s->engine, dn ? (uint32_t)(dsum / dn) : 0u);
+            pulsar_engine_verify_curve_depth(s->engine, TokCount{dn ? (int)(dsum / dn) : 0});   /* a mean of positions < 2^31 */
         }
         bool overflow = false;
         int pick_cut =
@@ -5078,7 +5079,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                     continue;
                 }
             }
-            st->max_tokens = TokCount{g->max_tokens - g->completion};   /* the request's tokens still to generate */
+            st->max_tokens = g->max_tokens - g->completion;   /* the request's tokens still to generate */
             /* accepted_cap = allocated K + the base token: round_begin's own
              * trim (K <= accepted_cap-1) enforces the allocation, and its
              * validity checks may trim further -- the allocation is an
@@ -5178,7 +5179,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             memcpy(fused_reqs, reqs, (size_t)rows * sizeof(*reqs));
             pulsar_fused_shape shape;
             memset(&shape, 0, sizeof shape);
-            shape.n_dec = rows;
+            shape.n_dec = step_rows;
             shape.n_pf = (uint32_t)n_fr;
             uint32_t at = rows;
             for (int r = 0; r < n_fr; r++) {
@@ -5258,7 +5259,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 fq[r] = (uint32_t)fr[r].k;
                 fc[r] = (uint32_t)fr[r].p0;
             }
-            pulsar_engine_fused_cost_observe(s->engine, (uint32_t)n_fr, fq, fc, rows, pulsar_ms_of_sec(fwd_t1 - fwd_t0));
+            pulsar_engine_fused_cost_observe(s->engine, (uint32_t)n_fr, fq, fc, step_rows, pulsar_ms_of_sec(fwd_t1 - fwd_t0));
         }
 
         /* ---- L260 fusion: each riding chunk joins its bank (checkpoint +
@@ -5547,13 +5548,13 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             s->w_spec_syncs[3] += sync1.h2d - sync0.h2d;
             const double round_ms = pulsar_ms_of_sec(round_t1 - round_t0), fwd_ms = pulsar_ms_of_sec(fwd_t1 - fwd_t0),
                          draft_ms = pulsar_ms_of_sec(draft_t1 - draft_t0);
-            pulsar_engine_lane_cost_observe(s->engine, PULSAR_LANE_SPEC, rows, round_ms);
+            pulsar_engine_lane_cost_observe(s->engine, PULSAR_LANE_SPEC, step_rows, round_ms);
             /* L284 lane cost: the same round's yield, per bank -- what the lane choice prices the spec lane's
              * rows by (lane_price_pick) */
             lane_price_observe_spec(&s->w_lane_price, TokCount{emitted_total - round_emitted0}, step_rows, m, round_ms);
             /* L301: and the verify curve's online correction -- the forward against its profile, the rest of the
              * round outside the forward and the drafting, the drafting */
-            pulsar_engine_verify_curve_observe(s->engine, (uint32_t)m, rows, fwd_ms, round_ms - fwd_ms - draft_ms,
+            pulsar_engine_verify_curve_observe(s->engine, BankCount{m}, step_rows, fwd_ms, round_ms - fwd_ms - draft_ms,
                                                draft_ms);
             if (!s->w_spec_pick_announced) {   /* rule 5: the pick ran, with the curve it priced on */
                 s->w_spec_pick_announced = true;
@@ -6243,7 +6244,7 @@ void *server_worker_main(void *arg) {
             uint64_t dsum = 0;   /* L338: the decoders' mean depth: the depth band the prices are measured in */
             for (int i = 0; i < n_dec; i++) dsum += (uint64_t)s->slot_frontier_pos(dec[i]).raw();
             priced = lane_price_pick(&s->w_lane_price, &plain_cost, &spec_cost, n_dec, verify_rows,
-                                     (uint32_t)(dsum / (uint64_t)n_dec));
+                                     TokCount{(int)(dsum / (uint64_t)n_dec)});   /* a mean of positions < 2^31 */
         }
         if (priced == 3 && n_batched > 0) {
             for (int i = 0; i < n_dec; i++)

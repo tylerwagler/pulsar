@@ -477,8 +477,8 @@ uint64_t kv_cgroup_limit_parse(const char *text) {
     return end && end != text ? (uint64_t)v : 0u;
 }
 
-uint64_t kv_host_mem_total_from(uint64_t phys, const char *meminfo, const char *cgroup_root, const char *self_cgroup) {
-    uint64_t best = phys;
+HostBytes kv_host_mem_total_from(HostBytes phys, const char *meminfo, const char *cgroup_root, const char *self_cgroup) {
+    uint64_t best = phys.raw();   /* raw: the least of /proc and cgroup file readings, taken raw below */
     auto take = [&best](uint64_t v) { if (v && (!best || v < best)) best = v; };
     uint64_t kib = 0;
     if (meminfo && meminfo_kib(meminfo, "MemTotal:", &kib) == MEMINFO_FOUND) take(kib << 10);   /* LXCFS: the CT's */
@@ -507,28 +507,29 @@ uint64_t kv_host_mem_total_from(uint64_t phys, const char *meminfo, const char *
             path = slash == 0 || slash == std::string::npos ? "/" : path.substr(0, slash);
         }
     }
-    return best;
+    return HostBytes{best};
 }
 
-uint64_t kv_host_mem_total(void) {
+HostBytes kv_host_mem_total(void) {
     const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGE_SIZE);
-    const uint64_t phys = pages > 0 && page > 0 ? (uint64_t)pages * (uint64_t)page : 0u;
+    const HostBytes phys{pages > 0 && page > 0 ? (uint64_t)pages * (uint64_t)page : 0u};   /* sysconf's reading */
     return kv_host_mem_total_from(phys, "/proc/meminfo", "/sys/fs/cgroup", "/proc/self/cgroup");
 }
 
-void kv_ram_plan_for(int integrated, uint64_t mem_total, int64_t ram_mb, uint64_t *bytes, bool *retain) {
+void kv_ram_plan_for(int integrated, HostBytes mem_total, int64_t ram_mb, HostBytes *bytes, bool *retain) {
     /* D9: the RAM tier exists only where host RAM is not the GPU's -- on a unified host an L2 copy would duplicate KV
      * in the pool the banks need; there the pool is only the copy-out ring */
     *retain = integrated == 0;
     if (ram_mb >= 0) {
-        *bytes = (uint64_t)ram_mb << 20;
+        *bytes = HostBytes{(uint64_t)ram_mb << 20};   /* --kv-ram-mb, configured */
         return;
     }
     if (integrated != 0) {
-        *bytes = (uint64_t)KV_RAM_RING_MB << 20;
+        *bytes = HostBytes{(uint64_t)KV_RAM_RING_MB << 20};
         return;
     }
-    const uint64_t quarter = mem_total / 4u, cap = (uint64_t)KV_RAM_DEFAULT_CAP_MB << 20;
+    const HostBytes quarter{mem_total.raw() / 4u} /* raw: a quarter, as uint64 division */,
+            cap{(uint64_t)KV_RAM_DEFAULT_CAP_MB << 20};
     *bytes = quarter < cap ? quarter : cap;
 }
 
@@ -549,14 +550,14 @@ bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb, const
     if (!kc->st) return false;
     /* L347 I3a: the pool, pinned once (a DMA target for the copy-out and a DMA source for a restore), sized at startup:
      * on a unified host its pages are the GPU's, so the guard and admission read them as taken (MemAvailable) */
-    kc->ram_base = ram.bytes ? pulsar_gpu_host_alloc(TensorBytes{ram.bytes}) : NULL;
+    kc->ram_base = ram.bytes.raw() ? pulsar_gpu_host_alloc(TensorBytes{ram.bytes.raw()} /* raw: a host pool pinned through the GPU allocator */) : NULL;
     /* L347: touch every page now -- a unified host's allocator backs pages on first touch, and the pool must be out of
      * MemAvailable before the warmup reading (cli_main opens the cache before it), not at the first copy-out */
-    if (kc->ram_base) memset(kc->ram_base, 0, (size_t)ram.bytes);
-    kc->ram = kc->ram_base ? pulsar_kvpool_create(kc->ram_base, ram.bytes) : NULL;
+    if (kc->ram_base) memset(kc->ram_base, 0, (size_t)ram.bytes.raw());   /* raw: memset length */
+    kc->ram = kc->ram_base ? pulsar_kvpool_create(kc->ram_base, ram.bytes.raw() /* raw: the pool allocator's length */) : NULL;
     if (!kc->ram) {
         server_log(PULSAR_LOG_ERROR, "pulsar-server: kv cache: the %.0f MiB host pool (--kv-ram-mb) could not be %s",
-                   (double)ram.bytes / PULSAR_MIB, kc->ram_base ? "carved" : "pinned");
+                   (double)ram.bytes.raw() / PULSAR_MIB, kc->ram_base ? "carved" : "pinned");
         pulsar_gpu_host_free(kc->ram_base);
         pulsar_segstore_close(kc->st);
         memset(kc, 0, sizeof(*kc));

@@ -236,7 +236,7 @@ bool pulsar_moe_routed_rows(const pulsar_moe_rows_call *c) {
      * (routed_expert_side_layout: EXL3's [trellis | scales], BF16's [out][in] rows) */
     auto stack = [&](const pulsar_tensor *t, const char *what, uint64_t *stride, uint64_t *split) -> const void * {
         if (t->ndim != 3 || t->dim[2] != n_expert || !routed_expert_side_layout(t->type, t->dim[0], t->dim[1], stride, split) ||
-            t->bytes != *stride * n_expert) {
+            t->bytes != TensorBytes{*stride * n_expert}) {   /* the byte model's stride, entered as bytes */
             fprintf(stderr, "pulsar: routed MoE: %.*s is not %llu %s expert slices -- refusing\n", (int)t->name.len,
                     t->name.ptr, (unsigned long long)n_expert, tensor_type_name(t->type));
             return NULL;

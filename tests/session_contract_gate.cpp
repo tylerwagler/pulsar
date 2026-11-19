@@ -570,7 +570,7 @@ static std::vector<float> fused_step(pulsar_engine *e, const pulsar_tokens *A, c
         for (int j = 0; j < m; j++) q.push_back({BankId{1}, TokPos{pre->len + j}, chunk[j]});
         pulsar_fused_shape sh;
         memset(&sh, 0, sizeof sh);
-        sh.n_dec = (uint32_t)nr;
+        sh.n_dec = StepRows{nr};
         sh.n_pf = 1;
         sh.head_last[0] = 1;
         out.resize((size_t)(nr + 1) * W);
@@ -781,7 +781,7 @@ static void part_fused_runs(pulsar_engine *e, int W) {
         }
         pulsar_fused_shape sh;
         memset(&sh, 0, sizeof sh);
-        sh.n_dec = (uint32_t)nr;
+        sh.n_dec = StepRows{nr};
         sh.n_pf = 2;
         sh.head_last[0] = sh.head_last[1] = 1;
         std::vector<float> out((size_t)(nr + 2) * W);

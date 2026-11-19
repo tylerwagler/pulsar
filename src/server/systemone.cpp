@@ -387,7 +387,7 @@ bool server_judge_step(server *s) {
      * with the guard's spills as its relief; short of either the request is answered 503 with the retry hint.  Before
      * anything is installed: the bank stays valid where it stands, and the next request resumes on it. */
     if (!s->floor_admits_chunk(pulsar_kv_rows(TokCount{JUDGE_CHUNK_TOKENS}), err_floor, sizeof err_floor) ||
-        !s->budget_admits_growth(J->bank, jb->prompts[jb->at].len, err_floor, sizeof err_floor)) {
+        !s->budget_admits_growth(J->bank, TokCount{jb->prompts[jb->at].len}, err_floor, sizeof err_floor)) {
         server_log(PULSAR_LOG_WARNING, "pulsar-server: /v1/systemone REFUSED (503): %s", err_floor);
         pop();
         jb->busy = true;

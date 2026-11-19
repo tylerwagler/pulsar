@@ -1105,7 +1105,7 @@ int vision_forward(const pulsar_vision_weights *w, const pulsar_model *m,
         o.block[i.raw()].w1        = w->block[i].w1->abs_offset;
         o.block[i.raw()].w2        = w->block[i].w2->abs_offset;
     }
-    return pulsar_cuda_vision_forward(&o, m->map, m->size, patches, n_h, n_w,
+    return pulsar_cuda_vision_forward(&o, m->map, patches, n_h, n_w,
                                       out, out_cap, out_rows, dbg, dbg_blocks);
 }
 

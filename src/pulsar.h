@@ -1645,8 +1645,8 @@ int pulsar_session_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *re
 #define PULSAR_FUSED_PF_MAX 16u
 /** The row layout of one pulsar_session_decode_fused step (see the L260 fusion note above). */
 typedef struct {
-    /** Decode / verify rows, rows [0, n_dec) of the step; every one is headed. */
-    uint32_t n_dec;
+    /** Decode / verify rows, rows [0, n_dec) of the step; every one is headed (L445: step rows, the uint32 it was). */
+    StepRows n_dec;
     /** Prefill runs after the decode rows, one bank each, in order; <= PULSAR_FUSED_PF_MAX. */
     uint32_t n_pf;
     /** Per prefill run r: nonzero heads run r's last row into the next logits row after the decode rows. */
@@ -2429,7 +2429,7 @@ typedef struct {
  *  @param lane the lane
  *  @param rows rows the forward carried
  *  @param ms the step's wall, ms */
-void pulsar_engine_lane_cost_observe(pulsar_engine *e, pulsar_decode_lane lane, uint32_t rows, double ms);
+void pulsar_engine_lane_cost_observe(pulsar_engine *e, pulsar_decode_lane lane, StepRows rows, double ms);
 /** A lane's current step-cost fit (above).
  *  @param e the engine
  *  @param lane the lane
@@ -2475,13 +2475,13 @@ int pulsar_session_verify_curve_open(pulsar_session *s, const char *cache_dir, c
  *  @param forward_ms the forward's wall, ms
  *  @param host_ms the rest outside forward and drafting, ms
  *  @param draft_ms the drafting, ms */
-void pulsar_engine_verify_curve_observe(pulsar_engine *e, uint32_t n_seqs, uint32_t rows, double forward_ms,
+void pulsar_engine_verify_curve_observe(pulsar_engine *e, BankCount n_seqs, StepRows rows, double forward_ms,
                                         double host_ms, double draft_ms);
 /** L338: the depth the round in progress runs at -- its live banks' mean frontier, tokens; 0 = the profile's.  Every
  *  price the round takes (the verify pick, the round selection, a drafter's keep) and its observation read it.
  *  @param e the engine (no curve: nothing)
  *  @param depth tokens */
-void pulsar_engine_verify_curve_depth(pulsar_engine *e, uint32_t depth);
+void pulsar_engine_verify_curve_depth(pulsar_engine *e, TokCount depth);
 /** The verify pick: of m drafts with survivals `surv` sorted DESCENDING, how many a round of n_seqs base rows
  *  verifies within cap_rows rows (the best ratio on the curve; no curve: as many as the rows hold).  The SERVER'S
  *  pick: on a tensor-parallel group it runs on the leader, on the leader's curve (L315), and its choice reaches the
@@ -2501,7 +2501,7 @@ uint32_t pulsar_engine_verify_pick(const pulsar_engine *e, uint32_t n_seqs, cons
  *  @param rows verify rows
  *  @param outside_ms receives the part outside the forward
  *  @return the predicted wall, ms */
-double pulsar_engine_verify_round_ms(const pulsar_engine *e, uint32_t n_seqs, uint32_t rows, double *outside_ms);
+double pulsar_engine_verify_round_ms(const pulsar_engine *e, BankCount n_seqs, StepRows rows, double *outside_ms);
 /** The curve as /metrics shows it (valid false: none). */
 typedef struct {
     /** A curve exists (profiled or loaded); false = none, the other fields zero. */
@@ -2568,7 +2568,7 @@ void pulsar_engine_spec_calibration(const pulsar_engine *e, pulsar_spec_calibrat
  *  @param verify_rows the step's verify rows
  *  @param forward_ms the step's forward wall, ms */
 void pulsar_engine_fused_cost_observe(pulsar_engine *e, uint32_t n_runs, const uint32_t *q, const uint32_t *c,
-                                      uint32_t verify_rows, double forward_ms);
+                                      StepRows verify_rows, double forward_ms);
 /** What n_runs prompt runs add to a fused round's forward (the L304 / L327 fit above).
  *  @param e the engine
  *  @param n_runs the runs

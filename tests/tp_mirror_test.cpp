@@ -167,7 +167,7 @@ static int run_leader(pulsar_tp *tp) {
     {
         pulsar_fused_shape shape;
         std::memset(&shape, 0, sizeof shape);
-        shape.n_dec = 1;
+        shape.n_dec = StepRows{1};
         shape.n_pf = 1;
         shape.head_last[0] = 1;
         CHECK(pulsar_tp_send_fused_batch(tp, items, 2, &shape) != 0, "send_fused_batch must report success as nonzero");

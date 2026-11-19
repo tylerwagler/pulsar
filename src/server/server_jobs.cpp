@@ -1936,16 +1936,16 @@ void server::gen_decode_init(session_slot *sl) {
     g->finish = "length";
     g->abandoned = false;
     g->turn_cut_short = false;
-    g->completion = 0;
+    g->completion = TokCount{0};
     /* Continued attempts (tool-error recovery) spend the request's ONE
      * max_tokens budget: completion_total holds what earlier attempts already
      * generated. */
-    g->max_tokens = j->req.max_tokens - g->completion_total;
-    int room = (pulsar_session_ctx(s->sess) - pulsar_session_pos(s->sess).before()).raw();
-    g->next_decode_log = 50;
-    if (g->max_tokens < 0) g->max_tokens = 0;
+    g->max_tokens = TokCount{j->req.max_tokens} - g->completion_total;   /* the request's cap: the parsed int */
+    const TokCount room = pulsar_session_ctx(s->sess) - pulsar_session_pos(s->sess).before();
+    g->next_decode_log = TokCount{50};
+    if (g->max_tokens < TokCount{0}) g->max_tokens = TokCount{0};
     if (g->max_tokens > room) g->max_tokens = room;
-    s->trace_event(g->trace_id, "prefill done; decode_max=%d ctx_room=%d", g->max_tokens, room);
+    s->trace_event(g->trace_id, "prefill done; decode_max=%d ctx_room=%d", g->max_tokens.raw(), room.raw());
     g->decode_t0 = pulsar_mono_sec();
     /* L119: reset the request-scoped DSpark accumulators (decode_again also
      * lands here, keeping them consistent with the reset completion/decode_t0
@@ -1956,7 +1956,7 @@ void server::gen_decode_init(session_slot *sl) {
     g->req_spec_rounds = 0;
     g->req_spec_gen = 0;
     g->last_decode_log_t = g->decode_t0;
-    g->last_decode_log_completion = 0;
+    g->last_decode_log_completion = TokCount{0};
     g->thinking = thinking_state_from_prompt(&j->req);
     g->think_closed = false;   /* L344: the attempt's own block (think_tokens spans attempts) */
     g->reasoning_block = g->thinking.inside;   /* L417: a block the prompt opened is reasoning in every family */
@@ -2308,7 +2308,7 @@ bool server::gen_emit_token(session_slot *sl, TokId token) {
 bool server::gen_emit_piece(gen_state *g, TokId token, const char *piece, size_t piece_len) {
     auto *s = this;
     job *j = g->j;
-    g->completion++;
+    g->completion += TokCount{1};
     /* Lane-independent generation counter: every decode lane funnels its
      * accepted tokens through here, so this is the one place that sees them
      * all. EOS returned above, so this counts emitted tokens only. */
@@ -2320,7 +2320,7 @@ bool server::gen_emit_piece(gen_state *g, TokId token, const char *piece, size_t
         server_log(PULSAR_LOG_WARNING,
                    "pulsar-server: chat ctx=%s emitted a token with no captured "
                    "distribution after %d tokens; logprobs dropped for this request",
-                   g->ctx_span, g->completion);
+                   g->ctx_span, g->completion.raw());
     }
     GenOff stop_pos{0};
     size_t stop_len = 0;
@@ -2363,7 +2363,7 @@ bool server::gen_emit_piece(gen_state *g, TokId token, const char *piece, size_t
                             g->decode_t0,
                             &g->last_decode_log_t,
                             &g->last_decode_log_completion);
-        g->next_decode_log += 50;
+        g->next_decode_log += TokCount{50};
     }
 
     if (hit_stop) {
@@ -2452,8 +2452,8 @@ static bool gen_turn_is_measured(bool abandoned, const char *final_finish) {
 /// @param generated     tokens the request generated, every attempt
 /// @return true when the idle worker should prefill the turn's reply (L311): it decoded, did not fail and its client
 ///         heard it out
-static bool gen_turn_wants_terminal(bool abandoned, const char *final_finish, int generated) {
-    return !abandoned && strcmp(final_finish, "error") != 0 && generated > 0;
+static bool gen_turn_wants_terminal(bool abandoned, const char *final_finish, TokCount generated) {
+    return !abandoned && strcmp(final_finish, "error") != 0 && generated > TokCount{0};
 }
 
 /* Post-decode epilogue: tool repair/recovery, final parse, protocol live
@@ -2532,7 +2532,7 @@ void server::gen_step_finish(session_slot *sl) {
         t->decode_s = finish_t > g->decode_t0 ? finish_t - g->decode_t0 : 0.0;
         t->prompt_n = g->prompt_tokens.raw();
         t->cached_n = j->req.cache_read_tokens.raw();
-        t->decode_n = g->completion_total + g->completion;
+        t->decode_n = gen_completion_reported(g).raw();   /* raw: the timings record's int (printed, /metrics) */
         /* L119: request-scoped accumulators from the spec-batched lane — NOT
          * shared-session counter deltas, which bank save/restore rolls and
          * concurrent banks mix (the response reported impossible values). */
@@ -2553,7 +2553,7 @@ void server::gen_step_finish(session_slot *sl) {
 
     bool tool_open = false, tool_closed = false;
     if (g->parser->tool_progress) g->parser->tool_progress(g->parser_st, &tool_open, &tool_closed);
-    s->trace_finish(g->trace_id, &j->req, said_finish, g->completion,
+    s->trace_finish(g->trace_id, &j->req, said_finish, g->completion.raw() /* raw: the trace's JSON */,
                  tool_open, tool_closed,
                  parsed_content ? parsed_content : (g->text.ptr ? g->text.ptr : ""),
                  parsed_reasoning, &parsed_calls, pulsar_mono_sec() - g->t0);
@@ -2645,7 +2645,7 @@ void server::gen_step_finish(session_slot *sl) {
             /* L267: the family's last text into the sink -- DeepSeek's walk
              * flushes what it held back; a Qwen turn's parser already did -- then
              * the protocol's finish, which sends any calls not yet streamed. */
-            const int completion = g->completion_total + g->completion;
+            const int completion = gen_completion_reported(g).raw();   /* raw: the usage block's wire integer */
             response_ok = stream_ok && g->parser->feed(g->parser_st, s, g, gen_text_end(g->text.len), true);
             /* L420: a turn that answers with its reasoning sends it once more, as content */
             response_ok = response_ok && turn_stream_reasoning_answer(g, &turn);
@@ -2664,7 +2664,7 @@ void server::gen_step_finish(session_slot *sl) {
         } else {
             response_ok = sse_chunk(j->fd, &j->req, g->id, NULL, final_finish) &&
                           sse_done(j->fd, &j->req, g->id, g->prompt_tokens.raw(),
-                                   g->completion_total + g->completion);
+                                   gen_completion_reported(g).raw());   /* raw: usage on the wire */
         }
         if (!response_ok) {
             server_log(PULSAR_LOG_DEFAULT,
@@ -2680,21 +2680,21 @@ void server::gen_step_finish(session_slot *sl) {
                                  parsed_reasoning,
                                  &parsed_calls, final_finish, g->stop_sequence,
                                  g->prompt_tokens.raw(),
-                                 g->completion_total + g->completion);
+                                 gen_completion_reported(g).raw());   /* raw: usage on the wire */
     } else if (j->req.api == API_RESPONSES) {
         responses_final_response(j->fd, &j->req, g->id,
                                  parsed_content ? parsed_content : (g->text.ptr ? g->text.ptr : ""),
                                  parsed_reasoning,
                                  &parsed_calls, final_finish,
                                  g->prompt_tokens.raw(),
-                                 g->completion_total + g->completion);
+                                 gen_completion_reported(g).raw());   /* raw: usage on the wire */
     } else {
         final_response(j->fd, &j->req, g->id,
                        parsed_content ? parsed_content : (g->text.ptr ? g->text.ptr : ""),
                        parsed_reasoning,
                        &parsed_calls, final_finish,
                        g->prompt_tokens.raw(),
-                       g->completion_total + g->completion,
+                       gen_completion_reported(g).raw(),   /* raw: usage on the wire */
                        &g->logprobs);
     }
     /* L420: the finish line says so when the turn's content is its reasoning (the Anthropic and Responses bodies
@@ -2712,7 +2712,7 @@ void server::gen_step_finish(session_slot *sl) {
             server_log(PULSAR_LOG_GENERATION,
                        "pulsar-server: chat ctx=%s gen=%d%s%s finish=%s%s error=\"%s\" %.3fs",
                        g->ctx_span,
-                       g->completion,
+                       g->completion.raw(),
                        flags[0] ? " " : "",
                        flags,
                        said_finish,
@@ -2723,7 +2723,7 @@ void server::gen_step_finish(session_slot *sl) {
             server_log(PULSAR_LOG_GENERATION,
                        "pulsar-server: chat ctx=%s gen=%d%s%s finish=%s%s %.3fs",
                        g->ctx_span,
-                       g->completion,
+                       g->completion.raw(),
                        flags[0] ? " " : "",
                        flags,
                        said_finish,
@@ -2743,7 +2743,7 @@ void server::gen_step_finish(session_slot *sl) {
                        "pulsar-server: %s ctx=%s gen=%d%s%s finish=%s%s error=\"%s\" %.3fs",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
                        g->ctx_span,
-                       g->completion,
+                       g->completion.raw(),
                        flags[0] ? " " : "",
                        flags,
                        said_finish,
@@ -2755,7 +2755,7 @@ void server::gen_step_finish(session_slot *sl) {
                        "pulsar-server: %s ctx=%s gen=%d%s%s finish=%s%s %.3fs",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
                        g->ctx_span,
-                       g->completion,
+                       g->completion.raw(),
                        flags[0] ? " " : "",
                        flags,
                        said_finish,
@@ -2771,7 +2771,7 @@ void server::gen_step_finish(session_slot *sl) {
     /* L372: not an abandoned one -- its partial reply is no turn the client will send back */
     /* L380: nor when this conversation's requests leave replies of this kind behind (slot_turn_reply) */
     sl->terminal_pending = s->slot_turn_reply(
-        sl, gen_turn_wants_terminal(g->abandoned, final_finish, g->completion_total + g->completion), called);
+        sl, gen_turn_wants_terminal(g->abandoned, final_finish, gen_completion_reported(g)), called);
     sl->turn_ended_at = pulsar_mono_sec();   /* L380: the checkpoint's idle grace runs from here */
     gen_kv_finish(g, said_finish);   /* L378 */
     g->phase = GEN_DONE;

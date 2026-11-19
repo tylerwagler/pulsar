@@ -150,7 +150,7 @@ struct attempt {
         g = new gen_state();
         g->j = &j;
         g->finish = "length";
-        g->next_decode_log = 1 << 30;
+        g->next_decode_log = TokCount{1 << 30};
         g->thinking = thinking_state_from_prompt(r);
         g->parser = r->family->output;
         g->parser_st = g->parser->create(&srv, g, err, sizeof err);

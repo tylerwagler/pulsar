@@ -236,7 +236,7 @@ static bool fused(int K, int order, float *lg, uint32_t *nr, ring *r2, ring *r3)
     }
     pulsar_fused_shape sh;
     memset(&sh, 0, sizeof sh);
-    sh.n_dec = 4;
+    sh.n_dec = StepRows{4};
     sh.n_pf = 2;
     sh.head_last[0] = 1;
     sh.head_last[1] = 1;
@@ -276,7 +276,7 @@ static bool fused_long(float *lg, uint32_t *nr, ring *r2) {
     }
     pulsar_fused_shape sh;
     memset(&sh, 0, sizeof sh);
-    sh.n_dec = 4;
+    sh.n_dec = StepRows{4};
     sh.n_pf = 1;
     sh.head_last[0] = 1;
     char e[256];

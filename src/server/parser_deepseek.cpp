@@ -149,10 +149,10 @@ static bool ds_parser_feed(void *st, server *s, gen_state *g, GenOff upto, bool 
                        g->ctx_span,
                        g->req_flags[0] ? " " : "",
                        g->req_flags,
-                       g->completion);
+                       g->completion.raw());
             s->trace_event(g->trace_id,
                         "recovered complete tool call from unclosed reasoning after %d generated tokens",
-                        g->completion);
+                        g->completion.raw());
         } else {
             ps->tool_scan_waiting_for_think_close = true;
             ps->tool_scan_from = gen_text_end(g->text.len);
@@ -179,24 +179,24 @@ static bool ds_parser_feed(void *st, server *s, gen_state *g, GenOff upto, bool 
                    g->ctx_span,
                    g->req_flags[0] ? " " : "",
                    g->req_flags,
-                   g->completion);
+                   g->completion.raw());
         s->trace_event(g->trace_id,
                     "ignored orphan tool-call end marker after %d generated tokens",
-                    g->completion);
+                    g->completion.raw());
     }
     if (ps->saw_tool_start && !old_start) {
-        s->trace_event(g->trace_id, "entered tool-call block after %d generated tokens", g->completion);
+        s->trace_event(g->trace_id, "entered tool-call block after %d generated tokens", g->completion.raw());
     }
     if (ps->saw_tool_end && !old_end) {
-        s->trace_event(g->trace_id, "closed tool-call block after %d generated tokens", g->completion);
+        s->trace_event(g->trace_id, "closed tool-call block after %d generated tokens", g->completion.raw());
     }
     const size_t marker_hold = 80;
     const GenOff hold_from = gen_text_end(g->text.len > marker_hold ? g->text.len - marker_hold : 0);
     if (hold_from > ps->tool_scan_from) ps->tool_scan_from = hold_from;
-    if (s->trace && g->completion >= ps->next_tool_progress) {
+    if (s->trace && g->completion.raw() >= ps->next_tool_progress) {   /* raw: the parser's int trace cadence */
         s->trace_event(g->trace_id,
                     "progress gen=%d tool_start=%d tool_end=%d",
-                    g->completion, ps->saw_tool_start ? 1 : 0, ps->saw_tool_end ? 1 : 0);
+                    g->completion.raw(), ps->saw_tool_start ? 1 : 0, ps->saw_tool_end ? 1 : 0);
         ps->next_tool_progress += 128;
     }
     return true;

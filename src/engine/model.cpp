@@ -354,7 +354,7 @@ void model_summary(const pulsar_model *m) {
     uint32_t n_expert_used = 0;
     uint32_t n_expert_groups = 0;
     uint32_t n_group_used = 0;
-    uint64_t tensor_bytes = 0;
+    TensorBytes tensor_bytes{0u};
     uint64_t params = 0;
 
     model_get_string(m, "general.name", &name);
@@ -405,14 +405,14 @@ void model_summary(const pulsar_model *m) {
     print_size(m->mapped_bytes);
     printf("\n");
     printf("tensor bytes described by the directory: ");
-    print_size(tensor_bytes);
+    print_size(tensor_bytes.raw());   /* raw: printed */
     printf("\n");
     printf("logical parameters: %.2f B\n", (double)params / 1000000000.0);
 
     printf("tensor types:\n");
     for (uint32_t type = 0; type < PULSAR_TENSOR_TYPE_COUNT; type++) {
         uint64_t count = 0;
-        uint64_t bytes = 0;
+        TensorBytes bytes{0u};
         for (uint64_t i = 0; i < m->n_tensors; i++) {
             if (m->tensors[i].type == type) {
                 count++;
@@ -421,7 +421,7 @@ void model_summary(const pulsar_model *m) {
         }
         if (count != 0) {
             printf("  %-8s %5" PRIu64 " tensors, ", tensor_type_name(type), count);
-            print_size(bytes);
+            print_size(bytes.raw());   /* raw: printed */
             printf("\n");
         }
     }
@@ -525,12 +525,12 @@ uint64_t model_unload_prefix(pulsar_model *m, const char *prefix) {
 
 uint64_t pulsar_model_unstaged_expert_bytes(const pulsar_model *m) {
     if (!m || m->tp_n_ranks <= 1) return 0;
-    uint64_t unstaged = 0;
+    TensorBytes unstaged{0u};
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const pulsar_tensor *t = &m->tensors[i];
         if (model_tensor_unstaged(m, t)) unstaged += t->bytes;
     }
-    return unstaged;
+    return unstaged.raw();   /* raw: this function's uint64 return, printed by its one caller */
 }
 
 /// Stage the model's tensors to the device as merged spans of the mapping.
@@ -565,7 +565,7 @@ static bool accelerator_prepare_model_tensor_spans(const pulsar_model *m,
     }
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const pulsar_tensor *t = &m->tensors[i];
-        if (t->bytes == 0) continue;
+        if (t->bytes == TensorBytes{0u}) continue;
         /* A model plus --expert-overlay: swapped tensors live in the DONOR's
          * mapping with donor-relative offsets, and are prepared separately by
          * accelerator_prepare_expert_overlay.  A safetensors model ALSO sets
@@ -578,11 +578,12 @@ static bool accelerator_prepare_model_tensor_spans(const pulsar_model *m,
         const uint8_t *base = t->ext_map ? t->ext_map : m->map;
         const uint64_t map_size = t->ext_map ? t->ext_size : m->size;
         const uint64_t at = t->abs_offset.raw();   /* checked raw: against the mapping's size and the filter's spans */
-        if (at > map_size || t->bytes > map_size - at) {
+        const uint64_t tb = t->bytes.raw();   /* raw: checked beside the raw offset, against the mapping's size */
+        if (at > map_size || tb > map_size - at) {
             free(spans);
             return false;
         }
-        if (!accelerator_span_filter_contains(at, t->bytes,
+        if (!accelerator_span_filter_contains(at, tb,
                                               span_offsets, span_sizes, span_count)) {
             continue;
         }
@@ -640,7 +641,7 @@ static bool accelerator_prepare_model_tensor_spans(const pulsar_model *m,
         }
         char label[96];
         snprintf(label, sizeof(label), "tensor-span:%" PRIu64, merged);
-        if (pulsar_gpu_cache_model_range(base, map_size, off, (end - off).raw(), label) == 0) {
+        if (pulsar_gpu_cache_model_range(base, TensorBytes{map_size}, off, end - off, label) == 0) {
             if (tty) fputc('\n', stderr);
             fprintf(stderr,
                     "pulsar: accelerator failed to prepare model tensor span %" PRIu64
@@ -756,10 +757,10 @@ bool accelerator_prepare_expert_overlay(pulsar_backend backend,
                                         const pulsar_model *base,
                                         const pulsar_model *overlay) {
     if (backend != PULSAR_BACKEND_CUDA) return true;
-    uint64_t prepared = 0;
+    TensorBytes prepared{0u};
     for (uint64_t i = 0; i < base->n_tensors; i++) {
         const pulsar_tensor *t = &base->tensors[i];
-        if (t->ext_map != overlay->map || t->bytes == 0) continue;
+        if (t->ext_map != overlay->map || t->bytes == TensorBytes{0u}) continue;
         char label[96];
         snprintf(label, sizeof(label), "overlay:%.*s",
                  (int)(t->name.len < 80 ? t->name.len : 80), t->name.ptr);
@@ -772,7 +773,7 @@ bool accelerator_prepare_expert_overlay(pulsar_backend backend,
         prepared += t->bytes;
     }
     fprintf(stderr, "pulsar: expert overlay prepared %.2f GiB for device access\n",
-            (double)prepared / PULSAR_GIB);
+            (double)prepared.raw() / PULSAR_GIB);
     return true;
 }
 
@@ -842,13 +843,11 @@ uint32_t model_apply_expert_overlay(pulsar_model *base, const pulsar_model *over
             return 0;
         }
         t->type = ov->type;
-        t->rel_offset = ov->rel_offset;
         t->abs_offset = ov->abs_offset;
         t->elements = ov->elements;
         t->bytes = ov->bytes;
         t->ext_map = overlay->map;
         t->ext_size = overlay->size;
-        if (t->bytes > base->max_tensor_bytes) base->max_tensor_bytes = t->bytes;
         swapped++;
     }
     return swapped;

@@ -324,7 +324,7 @@ static bool chat_resolve_thinking(pulsar_engine *e, const server *s, const chat_
     const server_effort_map *m = r->family->effort;
     r->think_mode = PULSAR_THINK_NONE;
     r->family_effort = m->named[k_effort_row_none];
-    r->think_budget = 0;
+    r->think_budget = TokCount{0};
     if (!on) return true;
     /* L344: a budget closes the block with the family's ONE close token; a family without one refuses it.  A
      * render with no engine (the parse/render tests) has no decode to budget and no tokenizer to ask. */
@@ -334,7 +334,7 @@ static bool chat_resolve_thinking(pulsar_engine *e, const server *s, const chat_
                                   "it with; send thinking without a budget");
             return false;
         }
-        r->think_budget = a.budget;
+        r->think_budget = TokCount{a.budget};   /* the parsed budget_tokens */
     }
     const int level = a.level >= 0 ? m->named[a.level]
                       : a.value   ? (m->integer ? m->integer(a.value) : m->named[effort_row_nearest(a.value)])

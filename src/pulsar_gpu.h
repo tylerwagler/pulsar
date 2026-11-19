@@ -569,7 +569,7 @@ void pulsar_gpu_scratch_poison_counts(uint64_t *steps, uint64_t *bytes);
  *  @param model_map  the host mapping of the model file
  *  @param model_size its size in bytes
  *  @return 1 on success, 0 when it cannot be served (said) */
-int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size);
+int pulsar_gpu_set_model_map(const void *model_map, TensorBytes model_size);
 /** @brief Register the file descriptor behind a mapping, for staged span reads (an O_DIRECT twin is opened when the
  *  filesystem allows).  The fd stays the caller's.
  *  @param fd        the open model file, or -1 to clear
@@ -583,7 +583,7 @@ int pulsar_gpu_set_model_fd_for_map(int fd, const void *model_map);
  *  @param bytes      the span's size in bytes
  *  @param label      a name for diagnostics, or NULL
  *  @return 1 when the span is device-ready, 0 on a bad range or failure */
-int pulsar_gpu_cache_model_range(const void *model_map, uint64_t model_size, MapOff offset, uint64_t bytes, const char *label);
+int pulsar_gpu_cache_model_range(const void *model_map, TensorBytes model_size, MapOff offset, TensorBytes bytes, const char *label);
 /** @brief Device-cache a span of a second GGUF (the --expert-overlay donor): pread from `fd` into device memory,
  *  registered under `host_base_key` so lookups resolve it like a model span.  Startup only, synchronous.
  *  @param host_base_key the donor's host mapping (the lookup key)
@@ -592,13 +592,13 @@ int pulsar_gpu_cache_model_range(const void *model_map, uint64_t model_size, Map
  *  @param bytes         the span's size in bytes
  *  @param label         a name for diagnostics, or NULL
  *  @return 1 on success, 0 on failure or when it would pass the weight-cache limit (said) */
-int pulsar_gpu_cache_external_range(const void *host_base_key, int fd, FileOff offset, uint64_t bytes, const char *label);
+int pulsar_gpu_cache_external_range(const void *host_base_key, int fd, FileOff offset, TensorBytes bytes, const char *label);
 /** @brief Whether the KV cache should be managed memory: always at >= 8 GiB, else when an >= 8 GiB context would
  *  leave free memory under the reserve (a quarter of total, clamped to 8..40 GiB).
  *  @param kv_cache_bytes the KV cache's size in bytes
  *  @param context_bytes  the whole context's device footprint in bytes
  *  @return 1 = allocate it managed, 0 = device memory */
-int pulsar_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
+int pulsar_gpu_should_use_managed_kv_cache(TensorBytes kv_cache_bytes, TensorBytes context_bytes);
 /** @brief Print the device's free / total memory to stderr.
  *  @param label prefix for the line, or NULL */
 void pulsar_gpu_print_memory_report(const char *label);
@@ -4241,9 +4241,9 @@ int pulsar_gpu_rows_digest(const pulsar_gpu_tensor *rows, TensorBytes offset_byt
  *  @return 1 on success, 0 on a bad argument or failure */
 int pulsar_gpu_dspark_markov_chain_banks_model(
         pulsar_gpu_tensor *refined_logits, pulsar_gpu_tensor *ids_dev, uint32_t ids_stride,
-        const pulsar_gpu_tensor *base_logits, uint64_t base_row_stride_bytes,
+        const pulsar_gpu_tensor *base_logits, TensorBytes base_row_stride_bytes,
         const pulsar_gpu_tensor *base_row_dev,
-        const void *dspark_model_map, uint64_t dspark_model_size,
+        const void *dspark_model_map, TensorBytes dspark_model_size,
         MapOff markov_w1_offset, MapOff markov_w2_offset,
         uint32_t n_banks, uint32_t n_draft, uint32_t vocab_size, uint32_t embed_dim,
         int w1_bf16, int w2_fmt);
@@ -4268,9 +4268,9 @@ int pulsar_gpu_dspark_markov_chain_banks_model(
  *  @return 1 on success, 0 on a bad argument or failure */
 int pulsar_gpu_dspark_markov_step_banks_model(
         pulsar_gpu_tensor *refined_logits, pulsar_gpu_tensor *ids_dev, uint32_t ids_stride,
-        const pulsar_gpu_tensor *base_logits, uint64_t base_row_stride_bytes,
+        const pulsar_gpu_tensor *base_logits, TensorBytes base_row_stride_bytes,
         const pulsar_gpu_tensor *base_row_dev, const pulsar_gpu_tensor *prev_dev,
-        const void *dspark_model_map, uint64_t dspark_model_size,
+        const void *dspark_model_map, TensorBytes dspark_model_size,
         MapOff markov_w1_offset, MapOff markov_w2_offset,
         uint32_t n_banks, uint32_t pos, uint32_t vocab_size, uint32_t embed_dim,
         int w1_bf16, int w2_fmt);
@@ -4510,7 +4510,6 @@ typedef struct {
  * tests/vision_tower_gate.cpp localises a mismatch instead of guessing. */
 /** @param o          the tower's tensor offsets
  *  @param map        the model mapping
- *  @param map_size   its size in bytes
  *  @param patches    HOST bf16 patches, (n_h * n_w, 3, PATCH, PATCH)
  *  @param n_h        patch rows
  *  @param n_w        patch columns
@@ -4521,7 +4520,7 @@ typedef struct {
  *  @param dbg_blocks blocks dumped into dbg
  *  @return 1 on success, 0 on refusal or failure */
 int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
-                               const void *map, uint64_t map_size,
+                               const void *map,
                                const uint16_t *patches, int n_h, int n_w,
                                uint16_t *out, int out_cap, int *out_rows,
                                uint16_t *dbg, uint32_t dbg_blocks);

@@ -1279,7 +1279,7 @@ int pulsar_session_decode_fused(pulsar_session *s, const pulsar_multiseq_req *re
     char peer_err[256];
     peer_err[0] = '\0';
     if (!pulsar_tp_wait_command_ack_digest(tp, s->tp_session_id, "fused batch",
-                                           pulsar_session_fused_digest(s, shape->n_dec, got - shape->n_dec),
+                                           pulsar_session_fused_digest(s, (uint32_t)shape->n_dec.raw(), got - (uint32_t)shape->n_dec.raw()), /* raw: digest rows */
                                            peer_err, sizeof(peer_err))) {
         if (err) snprintf(err, errlen, "tp: a worker failed the mirrored fused batch: %s", peer_err);
         return 1;
@@ -2051,7 +2051,8 @@ void pulsar_session_invalidate(pulsar_session *s) {
                         pulsar_tp_send_invalidate(tp, s->tp_session_id), NULL, 0)) return;
     pulsar_session_family_invalidate(s);
 }
-void pulsar_engine_lane_cost_observe(pulsar_engine *e, pulsar_decode_lane lane, uint32_t rows, double ms) {
+void pulsar_engine_lane_cost_observe(pulsar_engine *e, pulsar_decode_lane lane, StepRows rows_r, double ms) {
+    const uint32_t rows = (uint32_t)rows_r.raw();   /* raw: the fit's row axis (a regression in doubles) */
     if (!e || (unsigned)lane >= (unsigned)PULSAR_LANE_COUNT) return;
     pulsar_lane_cost_fit *f = &e->lane_cost[lane];
     lane_cost_fit_observe(f, rows, ms);

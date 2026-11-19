@@ -418,11 +418,10 @@ static size_t vattention_entries(int n_tok) {
 }
 
 int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
-                               const void *map, uint64_t map_size,
+                               const void *map,
                                const uint16_t *patches_host, int n_h, int n_w,
                                uint16_t *out_host, int out_cap, int *out_rows,
                                uint16_t *dbg, uint32_t dbg_blocks) {
-    (void)map_size;
     if (!o || !map || o->n_layers != PULSAR_VISION_LAYERS) return 0;
     const int P = (int)PULSAR_VISION_PATCH;
     const int D = (int)PULSAR_VISION_DIM;

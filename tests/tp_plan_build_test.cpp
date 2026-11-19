@@ -83,7 +83,7 @@ static pulsar_tensor bf16_tensor(const char *name) {
     t.dim[1] = 128;
     t.type = PULSAR_TENSOR_BF16;
     t.elements = 64u * 128u;
-    t.bytes = t.elements * 2u;
+    t.bytes = bytes_of<uint16_t>(t.elements);
     return t;
 }
 

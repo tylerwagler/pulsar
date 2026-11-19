@@ -1298,10 +1298,11 @@ static void e8m0_scan_blocks(
         const char      *what) {
     if (nblocks == 0 || block_len == 0) return;
     const uint64_t base = t->abs_offset.raw();   /* the checks below are raw: against the mapping's size */
+    const uint64_t tb = t->bytes.raw();          /* raw: checked with the raw block offsets below */
     /* off + (nblocks-1)*stride + block_len, overflow-checked. */
-    if (off > t->bytes || block_len > t->bytes - off) return;
+    if (off > tb || block_len > tb - off) return;
     const uint64_t last = off + (nblocks - 1u) * stride;
-    if (last < off || last > t->bytes || block_len > t->bytes - last) return;
+    if (last < off || last > tb || block_len > tb - last) return;
     const uint8_t *map = t->ext_map ? t->ext_map : m->map;
     const uint64_t map_size = t->ext_map ? t->ext_size : m->size;
     if (base > map_size || last > map_size - base || block_len > map_size - base - last) return;
@@ -1339,11 +1340,12 @@ static void exl3_scan_scales(const pulsar_model *m, const pulsar_tensor *t) {
                      : !exl3_linear_layout(t->dim[0], t->dim[1], k2, &trellis, &scales, &stride))
         return;
     const uint64_t n_exp = t->ndim >= 3 ? t->dim[2] : 1;   /* a dense Linear is one slice (its svh stored padded) */
-    if (n_exp == 0 || stride > t->bytes / n_exp) return;
+    const uint64_t tb = t->bytes.raw();   /* raw: checked against the byte model's stride and the mapping's size */
+    if (n_exp == 0 || stride > tb / n_exp) return;
     const uint8_t *map = t->ext_map ? t->ext_map : m->map;
     const uint64_t map_size = t->ext_map ? t->ext_size : m->size;
     const uint64_t at = t->abs_offset.raw();   /* the checks below are raw: against the mapping's size */
-    if (at > map_size || t->bytes > map_size - at) return;
+    if (at > map_size || tb > map_size - at) return;
     for (uint64_t e = 0; e < n_exp; e++) {
         const uint16_t *p = (const uint16_t *)(map + at + e * stride + trellis);
         for (uint64_t i = 0; i < scales / 2; i++) {
@@ -1370,8 +1372,8 @@ void weights_reject_bad_e8m0(const pulsar_model *m) {
         case PULSAR_TENSOR_MXFP8_LT:
             /* One E4M3 byte per element, then the scale plane; do not restate
              * the swizzle geometry here. */
-            if (t->elements > t->bytes) break;
-            e8m0_scan_blocks(m, t, t->elements, t->bytes - t->elements, 0, 1, "MXFP8");
+            if (t->elements > t->bytes.raw()) break;   /* raw: one byte an element */
+            e8m0_scan_blocks(m, t, t->elements, t->bytes.raw() - t->elements, 0, 1, "MXFP8");   /* raw: the scale plane */
             break;
         case PULSAR_TENSOR_CUTLASS_MXFP4: {
             uint64_t data = 0, sf = 0, stride = 0;

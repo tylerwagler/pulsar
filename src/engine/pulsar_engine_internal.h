@@ -737,7 +737,9 @@ void pulsar_engram_read_ahead_stats(pulsar_engram_io *io, pulsar_read_ahead_stat
  * cuda-engram-gate. */
 typedef struct pulsar_engram_model {
     uint32_t n_layers;                               ///< Engram layers in this artifact (V4.1: 2; a fixture may keep fewer)
-    TrunkLayer block[PULSAR_ENGRAM_MAX_LAYERS];      ///< the block each serves (the artifact's index)
+    /// The block each Engram layer serves (the artifact's index).  L445: this and the other per-Engram-layer tables
+    /// take only the layer's ordinal among the Engram layers (KindOrd, pulsar_layer_weights::engram_slot).
+    pulsar_indexed<TrunkLayer, KindOrd, PULSAR_ENGRAM_MAX_LAYERS> block;
     pulsar_engram_layout layout;                     ///< the hash, over the arrays below (owned)
     /// Owned storage behind layout.token_map: [layout.n_vocab] token id -> compressed id.
     int32_t *token_map;
@@ -748,11 +750,12 @@ typedef struct pulsar_engram_model {
     /// Owned storage behind layout.offsets: [n_layers][PULSAR_ENGRAM_N_COLS] bucket base row per column.
     uint64_t *offsets;
     /// Storage behind layout.num_embeddings: rows in each layer's table.
-    uint64_t num_embeddings[PULSAR_ENGRAM_MAX_LAYERS];
+    pulsar_indexed<uint64_t, KindOrd, PULSAR_ENGRAM_MAX_LAYERS> num_embeddings;
     /// Each Engram layer's row table, opened at bind.
-    pulsar_engram_table table[PULSAR_ENGRAM_MAX_LAYERS];
+    pulsar_indexed<pulsar_engram_table, KindOrd, PULSAR_ENGRAM_MAX_LAYERS> table;
     pulsar_engram_io *io;                            ///< the pread pool every table's gathers go through
-    pulsar_gpu_tensor *qk[PULSAR_ENGRAM_MAX_LAYERS]; ///< f32 [n_hc][dim]: q_weight * k_weight, resident
+    /// f32 [n_hc][dim]: q_weight * k_weight, resident, per Engram layer.
+    pulsar_indexed<pulsar_gpu_tensor *, KindOrd, PULSAR_ENGRAM_MAX_LAYERS> qk;
 } pulsar_engram_model;
 
 /** IQ2_XXS weight block: 2-bit quants addressed through a shared codebook.
@@ -871,10 +874,9 @@ typedef struct {
     uint32_t ndim;        ///< number of used entries in dim[]
     uint64_t dim[PULSAR_MAX_DIMS];  ///< extents, fastest-varying first
     uint32_t type;        ///< storage type (see the PULSAR_TENSOR_* family)
-    uint64_t rel_offset;  ///< offset from the file's tensor-data section start
     MapOff abs_offset;    ///< offset from the start of the mapping -- what the kernels take (L438: a map offset)
     uint64_t elements;    ///< product of dim[0..ndim)
-    uint64_t bytes;       ///< on-disk size, quantisation included
+    TensorBytes bytes;    ///< on-disk size, quantisation included (L445: typed; was the bare count L438 left)
     /** Set only when this entry was swapped in from an overlay GGUF
      * (--expert-overlay): the payload lives at ext_map + abs_offset inside
      * the overlay file's mapping instead of the owning model's map. */
@@ -920,10 +922,10 @@ static inline FileOff pulsar_tensor_file_off(const pulsar_tensor *t) { return pu
 static inline const uint8_t *pulsar_map_at(const void *map, MapOff off) {
     return static_cast<const uint8_t *>(map) + off.before().raw();
 }
-/** L438: tensor t's stored bytes, as the one byte unit (pulsar_tensor::bytes is a bare count, read in ~90 places).
+/** L438: tensor t's stored bytes, as the one byte unit (L445: pulsar_tensor::bytes is TensorBytes itself now).
  *  @param t the directory entry */
 /// @return its bytes on disk, quantisation included
-static inline TensorBytes pulsar_tensor_stored_bytes(const pulsar_tensor *t) { return TensorBytes{t->bytes}; }
+static inline TensorBytes pulsar_tensor_stored_bytes(const pulsar_tensor *t) { return t->bytes; }
 
 /** A memory-mapped GGUF file plus its parsed directory.
  *
@@ -970,7 +972,6 @@ typedef struct {
     uint64_t n_tensors;     ///< tensor directory entry count
     uint64_t alignment;     ///< tensor data alignment declared by the file
     uint64_t tensor_data_pos;   ///< byte offset where the tensor data section starts
-    uint64_t max_tensor_bytes;  ///< largest single tensor, for staging-buffer sizing
 
     pulsar_kv *kv;             ///< parsed metadata pairs, n_kv entries
     pulsar_tensor *tensors;    ///< parsed tensor directory, n_tensors entries
@@ -1943,9 +1944,12 @@ typedef struct {
         pulsar_gpu_tensor *rows;             ///< [cap][24][264] the gathered records, uploaded per layer
         pulsar_gpu_tensor *x_key;            ///< f32 [cap][24*256]: the MX slot's key (never written)
         pulsar_gpu_tensor *kv;               ///< f32 [cap][(n_hc+1)*dim]: the `wkv` output
-        unsigned char *host_rows[PULSAR_ENGRAM_MAX_LAYERS];   ///< [cap][24][264] gather targets
-        uint64_t *ids[PULSAR_ENGRAM_MAX_LAYERS];              ///< [cap][24] the staged row ids
-        pulsar_engram_gather *pending[PULSAR_ENGRAM_MAX_LAYERS];   ///< the staged step's gathers, per layer
+        /// [cap][24][264] gather targets, per Engram layer (by its ordinal, KindOrd).
+        pulsar_indexed<unsigned char *, KindOrd, PULSAR_ENGRAM_MAX_LAYERS> host_rows;
+        /// [cap][24] the staged row ids, per Engram layer.
+        pulsar_indexed<uint64_t *, KindOrd, PULSAR_ENGRAM_MAX_LAYERS> ids;
+        /// The staged step's gathers, per Engram layer.
+        pulsar_indexed<pulsar_engram_gather *, KindOrd, PULSAR_ENGRAM_MAX_LAYERS> pending;
         uint32_t pending_n;                  ///< rows of the staged step (0 = none)
         uint32_t cap;                        ///< rows a step holds
         uint32_t n_banks;                    ///< banks the rings cover

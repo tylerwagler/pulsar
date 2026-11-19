@@ -292,8 +292,8 @@ static inline const void *dspark_map(const pulsar_engine *e, const pulsar_tensor
 /// @param e the engine
 /// @param t a drafter tensor
 /// @return the size of that mapping, bytes
-static inline uint64_t dspark_map_size(const pulsar_engine *e, const pulsar_tensor *t) {
-    return tensor_map_size(&e->dspark_model, t);
+static inline TensorBytes dspark_map_size(const pulsar_engine *e, const pulsar_tensor *t) {
+    return TensorBytes{tensor_map_size(&e->dspark_model, t)};   /* the mapping's length */
 }
 
 /* The drafting pass (L150; the single lane's draft since L284): one group of records qs[0..n_sel), greedy
@@ -406,7 +406,7 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
     }
     /* spec_logits rows are PULSAR_N_VOCAB wide: the row stride is the TARGET vocab, vocab_size the LENGTH the
      * markov step consumes (equal on the shipped drafter; dspark_weights_validate_layout pins it at load) */
-    const uint64_t spec_row_bytes = (uint64_t)PULSAR_N_VOCAB * sizeof(float);
+    const TensorBytes spec_row_bytes = bytes_of<float>((uint64_t)PULSAR_N_VOCAB);
     const int w1_bf16 = w->markov_w1->type == PULSAR_TENSOR_BF16;
     const int w2_fmt = pulsar_markov_w2_fmt(w->markov_w2->type);
 
@@ -524,7 +524,7 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
                  : pulsar_gpu_tensor_write(g->dspark_conf_tokens, TensorBytes{0}, toks,
                                            bytes_of<int32_t>(n_rows)) != 0) &&
             pulsar_gpu_dspark_confidence_score_model(g->dspark_conf_scores, g->batch_ffn_cur,
-                                                     g->dspark_conf_tokens, dspark_map(e, w->markov_w1), dspark_map_size(e, w->markov_w1),
+                                                     g->dspark_conf_tokens, dspark_map(e, w->markov_w1), dspark_map_size(e, w->markov_w1).raw() /* raw: a launcher's model_size */,
                                                      w->markov_w1->abs_offset,
                                                      w->confidence_proj->abs_offset,
                                                      n_rows, PULSAR_N_EMBD, embed_dim, vocab_size,

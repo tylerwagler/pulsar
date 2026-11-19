@@ -1219,13 +1219,13 @@ int main(int argc, char **argv) {
      * allocates (and touches) when it opens, after the post-warmup MemAvailable reading the admission budget and the 2b
      * guard's ceiling are cut from -- so that reading charges it (kv_pool_charge below).  Uncharged, the 1 GiB ring came
      * out of the guard's headroom and MemAvailable fell 1.02 GiB, below the floor. */
-    kv_ram_plan ram = {0, false};
+    kv_ram_plan ram = {HostBytes{0u}, false};
     {
-        const uint64_t mem_total = kv_host_mem_total();   /* a container's limit, not the host's RAM (L338, CT 130) */
+        const HostBytes mem_total = kv_host_mem_total();   /* a container's limit, not the host's RAM (L338, CT 130) */
         kv_ram_plan_for(pulsar_gpu_integrated(), mem_total, cfg.kv_ram_mb, &ram.bytes, &ram.retain);
     }
     /* the host pool the cache opens with */
-    const HostBytes kv_pool_charge{cfg.kv_disk_dir && cfg.kv_disk_dir[0] ? ram.bytes : 0u};
+    const HostBytes kv_pool_charge = cfg.kv_disk_dir && cfg.kv_disk_dir[0] ? ram.bytes : HostBytes{0u};
     if (!server_warmup_generation(engine, session, cfg.ctx_size)) {
         pulsar_session_free(session);
         pulsar_engine_close(engine);

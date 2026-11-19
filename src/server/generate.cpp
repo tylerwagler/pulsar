@@ -229,7 +229,7 @@ void thinking_state::feed(const char *p, size_t len) {
 /* L344: a token inside the block spends the budget; the one that closes it latches the block closed */
 void think_budget_note(gen_state *g, bool was_inside) {
     if (was_inside && !g->think_closed) {
-        if (g->thinking.inside) g->think_tokens++;
+        if (g->thinking.inside) g->think_tokens += TokCount{1};
         else g->think_closed = true;
     }
 }

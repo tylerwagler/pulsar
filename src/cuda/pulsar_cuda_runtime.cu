@@ -1619,7 +1619,8 @@ static uint64_t cuda_managed_kv_reserve_bytes(uint64_t total_bytes) {
 
 
 
-int pulsar_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes) {
+int pulsar_gpu_should_use_managed_kv_cache(TensorBytes kv_cache_b, TensorBytes context_b) {
+    const uint64_t kv_cache_bytes = kv_cache_b.raw(), context_bytes = context_b.raw();   /* L445: raw at the policy */
     if (kv_cache_bytes == 0) return 0;
 
     /* Very large KV caches are where device-only cudaMalloc() can make a
@@ -2854,7 +2855,8 @@ static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {
 
 
 
-int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size) {
+int pulsar_gpu_set_model_map(const void *model_map, TensorBytes model_size_b) {
+    const uint64_t model_size = model_size_b.raw();   /* L445: the mapping's size, raw at the runtime */
     if (!cuda_model_set_host_map(model_map, model_size)) return 0;
 
     /* One load strategy (L030, 2026-08-13): register the mapping if the platform
@@ -2983,8 +2985,10 @@ int pulsar_gpu_set_model_fd_for_map(int fd, const void *model_map) {
 
 
 
-int pulsar_gpu_cache_model_range(const void *model_map, uint64_t model_size, MapOff offset_m, uint64_t bytes, const char *label) {
+int pulsar_gpu_cache_model_range(const void *model_map, TensorBytes model_size_b, MapOff offset_m, TensorBytes bytes_b,
+                                 const char *label) {
     const uint64_t offset = offset_m.raw();   /* L438: MapOff ends at the launch */
+    const uint64_t model_size = model_size_b.raw(), bytes = bytes_b.raw();   /* L445: likewise the sizes */
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
     if (cuda_model_range_is_cached(model_map, offset, bytes)) return 1;
@@ -3010,10 +3014,11 @@ int pulsar_gpu_cache_model_range(const void *model_map, uint64_t model_size, Map
  * the overlay's host map so cuda_model_range_ptr resolves them like any other
  * cached range. Runs at startup only (synchronous). */
 int pulsar_gpu_cache_external_range(const void *host_base_key, int fd,
-                                            FileOff offset_f, uint64_t bytes,
+                                            FileOff offset_f, TensorBytes bytes_b,
                                             const char *label) {
     /* L438: a FileOff ends here -- the donor is mapped whole, so it is the span's key offset too */
     const uint64_t offset = offset_f.raw();
+    const uint64_t bytes = bytes_b.raw();   /* L445: likewise the span's size */
     if (!host_base_key || fd < 0 || bytes == 0) return 0;
 
     /* L217 / PLAN 94 s2.5: the overlay is a SECOND allocation route into the

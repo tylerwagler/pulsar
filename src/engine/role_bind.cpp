@@ -181,7 +181,7 @@ pulsar_tensor *pulsar_role_bind_n(pulsar_role_binder *b, pulsar_role_key k, cons
     }
     auto &p = b->price[k.role];
     p.first++;
-    p.second += t->bytes;
+    p.second += t->bytes.raw();   /* raw: the price table's uint64 (printed) */
     return t;
 }
 
@@ -209,10 +209,10 @@ bool pulsar_role_binder_close(pulsar_role_binder *b, pulsar_role_census *out) {
         const pulsar_tensor &t = m->tensors[i];
         if (b->bound[i] == 3) continue;   /* not this binder's (pulsar_role_binder_open_blocks) */
         in_scope++;
-        c.directory_bytes += t.bytes;
+        c.directory_bytes += t.bytes.raw();   /* raw: the census's uint64 (printed) */
         if (b->bound[i] == 2) {
             c.unloaded++;
-            c.unloaded_bytes += t.bytes;
+            c.unloaded_bytes += t.bytes.raw();   /* raw: the census's uint64 (printed) */
             continue;
         }
         if (b->bound[i] || t.bind_role.len == 0) continue;   /* a roleless entry was refused at the open */

@@ -566,8 +566,8 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             return worker_ack(e, c->session_id, rc, err, errlen);
         }
         if (pulsar_tp_send_command_ack_digest(e->tp, c->session_id, 0,
-                                              pulsar_session_fused_digest(slot->s, shape->n_dec,
-                                                                          out_rows - shape->n_dec)) != 0)
+                                              pulsar_session_fused_digest(slot->s, (uint32_t)shape->n_dec.raw(), /* raw: digest rows */
+                                                                          out_rows - (uint32_t)shape->n_dec.raw()) /* raw: digest rows */) != 0)
             return 1;
         snprintf(err, errlen, "tp: could not ack the leader (control channel gone)");
         return -1;

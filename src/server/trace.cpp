@@ -375,22 +375,22 @@ void log_flags(char *buf, size_t len, bool responses_protocol,
 /// @param decode_t0           when decoding started (pulsar_mono_sec)
 /// @param last_t              in: the last line's time; out: now
 /// @param last_completion     in: the last line's count; out: `completion`
-void log_decode_progress(req_kind kind, int prompt_tokens, int completion,
+void log_decode_progress(req_kind kind, int prompt_tokens, TokCount completion,
                                 bool responses_protocol,
                                 bool tools, bool thinking,
                                 bool tool_start, bool tool_end,
                                 double decode_t0,
-                                double *last_t, int *last_completion) {
+                                double *last_t, TokCount *last_completion) {
     const double now = pulsar_mono_sec();
     const double elapsed = now - decode_t0;
     const double interval_s = now - *last_t;
-    const int interval_tokens = completion - *last_completion;
-    const double chunk_tps = interval_s > 0.0 ? (double)interval_tokens / interval_s : 0.0;
-    const double avg_tps = elapsed > 0.0 ? (double)completion / elapsed : 0.0;
+    const TokCount interval_tokens = completion - *last_completion;
+    const double chunk_tps = interval_s > 0.0 ? (double)interval_tokens.raw() / interval_s : 0.0;
+    const double avg_tps = elapsed > 0.0 ? (double)completion.raw() / elapsed : 0.0;
     char ctx[48];
     request_ctx_span(ctx, sizeof(ctx),
-                     prompt_tokens + *last_completion,
-                     prompt_tokens + completion);
+                     prompt_tokens + last_completion->raw(),   /* raw: the log's ctx span, printed */
+                     prompt_tokens + completion.raw());        /* raw: the log's ctx span, printed */
     char flags[80];
     log_flags(flags, sizeof(flags), responses_protocol,
               tools, thinking, tool_start, tool_end);
@@ -398,7 +398,7 @@ void log_decode_progress(req_kind kind, int prompt_tokens, int completion,
                "pulsar-server: %s ctx=%s gen=%d%s%s decoding chunk=%.2f t/s avg=%.2f t/s %.3fs",
                kind == REQ_CHAT ? "chat" : "completion",
                ctx,
-               completion,
+               completion.raw(),
                flags[0] ? " " : "",
                flags,
                chunk_tps,

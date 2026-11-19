@@ -34,7 +34,7 @@ static void say_no_arm(const pulsar_tensor *w, const char *against) {
 const void *pulsar_weight_device_ptr(const pulsar_model *m, const pulsar_tensor *t, const char *what) {
     if (const void *slice = pulsar_tp_built_ptr(m, t)) return slice;   /* the rank's TP slice (tp_slice.cpp) */
     /* the kernel modules' lookup (pulsar_cuda_rows.h) takes the raw map offset */
-    const void *p = pulsar_gpu_weight_range_ptr(tensor_map_base(m, t), t->abs_offset.raw(), t->bytes, what);
+    const void *p = pulsar_gpu_weight_range_ptr(tensor_map_base(m, t), t->abs_offset.raw(), t->bytes.raw() /* raw: the extern "C" lookup */, what);
     if (!p) fprintf(stderr, "pulsar: no device copy of %.*s (%s) -- refusing\n", (int)t->name.len, t->name.ptr, what);
     return p;
 }

@@ -1021,16 +1021,17 @@ int gpu_graph_decode_multiseq_batch(
      * fused->n_pf prefill runs -- is the caller's; refuse a shape that does not
      * match the rows before anything is armed (recoverable). */
     const uint32_t fused_heads = fused ? pulsar_fused_shape_heads(fused) : 0u;
+    const uint32_t fused_dec = fused ? (uint32_t)fused->n_dec.raw() : 0u;   /* raw: the forward's row layout (uint32) */
     if (fused) {
         uint32_t runs = 0;
-        for (uint32_t t = fused->n_dec; t < n_active; t++)
-            if (t == fused->n_dec || bank[t] != bank[t - 1]) runs++;
-        if (fused->n_dec == 0 || fused->n_dec >= n_active || fused->n_pf == 0 || fused->n_pf > PULSAR_MSEQ_MAX ||
-            runs != fused->n_pf || fused->n_dec > PULSAR_SPEC_ROW_BUDGET ||
-            fused->n_dec + fused_heads > PULSAR_SPEC_LOGITS_ROWS) {
+        for (uint32_t t = fused_dec; t < n_active; t++)
+            if (t == fused_dec || bank[t] != bank[t - 1]) runs++;
+        if (fused_dec == 0 || fused_dec >= n_active || fused->n_pf == 0 || fused->n_pf > PULSAR_MSEQ_MAX ||
+            runs != fused->n_pf || fused_dec > PULSAR_SPEC_ROW_BUDGET ||
+            fused_dec + fused_heads > PULSAR_SPEC_LOGITS_ROWS) {
             fprintf(stderr, "pulsar: fused step rejected: shape (n_dec %u, %u prefill runs, %u headed) does not "
                             "fit %u rows holding %u prefill runs (decode rows <= %u, headed rows <= %u)\n",
-                    fused->n_dec, fused->n_pf, fused_heads, n_active, runs,
+                    fused_dec, fused->n_pf, fused_heads, n_active, runs,
                     (unsigned)PULSAR_SPEC_ROW_BUDGET, (unsigned)PULSAR_SPEC_LOGITS_ROWS);
             return 0;
         }
@@ -1039,7 +1040,7 @@ int gpu_graph_decode_multiseq_batch(
      * leaves the graph untouched — recoverable). */
     /* The spec lane's verify step (every row read back) is all decode rows; it
      * declares them so their multi-row verify runs are not read as prefill. */
-    const int32_t n_dec_declared = fused ? (int32_t)fused->n_dec
+    const int32_t n_dec_declared = fused ? (int32_t)fused_dec
                                  : max_head_runs == PULSAR_MSEQ_HEAD_ALL_ROWS ? (int32_t)n_active : -1;
     /* L242 slice 5: the rows' Engram hashes from each bank's history ring, and their gathers.  Before the step
      * is armed, so a refusal (a history the ring does not hold) is the recoverable kind: the ring's writes are
@@ -1051,8 +1052,8 @@ int gpu_graph_decode_multiseq_batch(
     /* A fused step's prefill rows feed their banks' drafter prompt rings, as a
      * classic chunk does: arm the bulk anchor capture past the decode rows. */
     if (fused && g->dspark_bulk_h[0]) {
-        g->dspark_bulk_n = n_active - fused->n_dec;
-        g->dspark_bulk_row0 = fused->n_dec;
+        g->dspark_bulk_n = n_active - fused_dec;
+        g->dspark_bulk_row0 = fused_dec;
     }
 
     /* plan-34 inc 3: emit logits only for the LAST ROW OF EACH per-bank RUN.
@@ -1090,7 +1091,7 @@ int gpu_graph_decode_multiseq_batch(
      * batch (rows [0, n_active) head in place, no last-of-run gather), which
      * is what the batched speculative verify's accept walk consumes. */
     const bool head_all_rows = fused || (max_head_runs == PULSAR_MSEQ_HEAD_ALL_ROWS);
-    uint32_t head_runs = fused ? fused->n_dec + fused_heads
+    uint32_t head_runs = fused ? fused_dec + fused_heads
                        : head_all_rows ? n_active
                        : (max_head_runs == 0u || max_head_runs > n_runs)
                        ? n_runs : max_head_runs;
@@ -1100,9 +1101,9 @@ int gpu_graph_decode_multiseq_batch(
     int head_src[PULSAR_SPEC_LOGITS_ROWS];
     if (fused) {
         uint32_t k = 0;
-        for (; k < fused->n_dec; k++) head_src[k] = (int)k;
+        for (; k < fused_dec; k++) head_src[k] = (int)k;
         uint32_t r = 0;
-        for (uint32_t t = fused->n_dec; t < n_active; t++) {
+        for (uint32_t t = fused_dec; t < n_active; t++) {
             if (t + 1 == n_active || bank[t + 1] != bank[t]) {
                 if (fused->head_last[r]) head_src[k++] = (int)t;
                 r++;
@@ -1168,7 +1169,7 @@ int gpu_graph_decode_multiseq_batch(
      * so a skipped-head run's KV frontier is still validated. */
     const bool end_ok = gpu_graph_multiseq_step_end(g);
     if (fused) {
-        if (ok && end_ok) dspark_bulk_drain_runs(g, pos, bank, fused->n_dec, n_active);
+        if (ok && end_ok) dspark_bulk_drain_runs(g, pos, bank, fused_dec, n_active);
         g->dspark_bulk_n = 0;
         g->dspark_bulk_row0 = 0;
     }
@@ -1176,7 +1177,7 @@ int gpu_graph_decode_multiseq_batch(
     /* The decode / verify rows read back like PULSAR_MSEQ_HEAD_ALL_ROWS; a
      * fused step's headed prefill rows always come back whole (the sampler
      * draws the prompt's first token from them), after the decode rows. */
-    const uint32_t fused_read_dec = fused ? fused->n_dec : 0u;
+    const uint32_t fused_read_dec = fused ? fused_dec : 0u;
 
     /* Logits readback: head_runs rows (one per emitted run, in run order = ascending
      * first-appearance). Decode-only => head_runs == n_runs == n_active, row k ==
@@ -1189,8 +1190,8 @@ int gpu_graph_decode_multiseq_batch(
         ok = pulsar_gpu_tensor_read(g->spec_logits, TensorBytes{0}, logits,
                                     bytes_of<float>((uint64_t)head_runs * PULSAR_N_VOCAB)) != 0;
     if (ok && logits && fused && fused_heads > 0)
-        ok = pulsar_gpu_tensor_read(g->spec_logits, bytes_of<float>((uint64_t)fused->n_dec * PULSAR_N_VOCAB),
-                                    logits + (size_t)fused->n_dec * PULSAR_N_VOCAB,
+        ok = pulsar_gpu_tensor_read(g->spec_logits, bytes_of<float>((uint64_t)fused_dec * PULSAR_N_VOCAB),
+                                    logits + (size_t)fused_dec * PULSAR_N_VOCAB,
                                     bytes_of<float>((uint64_t)fused_heads * PULSAR_N_VOCAB)) != 0;
     /* The banks' KV/frontiers committed correctly (step_end passed); a
      * readback failure still leaves the caller without this step's logits,

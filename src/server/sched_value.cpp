@@ -101,7 +101,9 @@ double sched_prompt_rate_max(const pulsar_engine *e, const sched_round *r, const
     if (k == 0) return 0.0;
     double outside = 0.0;
     const double base =
-            pulsar_engine_verify_round_ms(e, r->n_live ? r->n_live : 1u, r->n_live ? r->n_live : 1u, &outside);
+            pulsar_engine_verify_round_ms(e, BankCount{r->n_live ? r->n_live : 1u},
+                                          StepRows{r->n_live ? r->n_live : 1u} /* the base rows: a row per live bank */,
+                                          &outside);
     if (!(base > 0.0)) return 0.0;
     const uint32_t q = c[k - 1].q, at = pr->p0;
     double ms = 0.0;
@@ -111,7 +113,7 @@ double sched_prompt_rate_max(const pulsar_engine *e, const sched_round *r, const
 
 double sched_decode_rate_max(const pulsar_engine *e, double tokens, uint32_t rows) {
     double outside = 0.0;
-    const double t = pulsar_engine_verify_round_ms(e, 1u, rows ? rows : 1u, &outside);
+    const double t = pulsar_engine_verify_round_ms(e, BankCount{1}, StepRows{rows ? rows : 1u}, &outside);
     return t > 0.0 ? tokens / t : 0.0;
 }
 
@@ -131,7 +133,7 @@ void sched_choose(const pulsar_engine *e, const sched_prefs *p, const sched_roun
     if (n > SCHED_PROMPTS_MAX) n = SCHED_PROMPTS_MAX;
     const uint32_t max_fins = r->heads_max > r->n_dec ? r->heads_max - r->n_dec : 0u;
     double outside = 0.0;
-    const double t_dec = r->n_live ? pulsar_engine_verify_round_ms(e, r->n_live, r->rows, &outside) : 0.0;
+    const double t_dec = r->n_live ? pulsar_engine_verify_round_ms(e, BankCount{r->n_live}, StepRows{r->rows}, &outside) : 0.0;
     double probe_ms = 0.0;
     const uint32_t zq = 0u, zc = 0u;
     out->priced = t_dec > 0.0 && pulsar_engine_fused_prompt_ms(e, 1u, &zq, &zc, &probe_ms);

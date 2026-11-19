@@ -787,7 +787,7 @@ int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *req
                           s->driver->max_rows);
         return 1;
     }
-    const uint32_t n_dec = shape->n_dec, heads = pulsar_fused_shape_heads(shape);
+    const uint32_t n_dec = (uint32_t)shape->n_dec.raw() /* raw: the forward's row layout */, heads = pulsar_fused_shape_heads(shape);
     if (n_dec >= n_rows || shape->n_pf == 0 || shape->n_pf > PULSAR_FUSED_PF_MAX) {
         if (err) snprintf(err, errlen, "%s: a fused step is a verify and 1..%u prompt runs (n_dec %u of %u rows, %u "
                           "prompt runs)", ARCH(e), PULSAR_FUSED_PF_MAX, n_dec, n_rows, shape->n_pf);

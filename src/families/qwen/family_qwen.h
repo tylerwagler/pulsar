@@ -426,11 +426,18 @@ static inline TensorBytes pulsar_qwen_kv_row_bytes(const pulsar_qwen_shape *s) {
 static inline TensorBytes pulsar_qwen_index_row_bytes(const pulsar_qwen_shape *s) {
     return bytes_of<uint16_t>((uint64_t)s->idx_n_head_kv * s->idx_head_dim);
 }
+/** S3: one token row of the partial tail block's raw (pre-pool) index keys, f32 [idx_n_head_kv * idx_head_dim]
+ *  (L445: the row the staged state declares; it was the block's bytes divided back by idx_block). */
+/// @param s the loaded (rank's) shape
+/// @return bytes per tail row
+static inline TensorBytes pulsar_qwen_index_tail_row_bytes(const pulsar_qwen_shape *s) {
+    return bytes_of<float>((uint64_t)s->idx_n_head_kv * s->idx_head_dim);
+}
 /** S3: the partial tail block's raw (pre-pool) index keys, f32 [idx_block][idx_n_head_kv * idx_head_dim]. */
 /// @param s the loaded (rank's) shape
 /// @return bytes per QSA layer per bank
 static inline TensorBytes pulsar_qwen_index_tail_bytes(const pulsar_qwen_shape *s) {
-    return bytes_of<float>((uint64_t)s->idx_block * s->idx_n_head_kv * s->idx_head_dim);
+    return pulsar_qwen_index_tail_row_bytes(s).times(s->idx_block);
 }
 /** S4: the PLE dilated-conv history, f32 [conv_state_len][n_hc * n_embd] per bank. */
 /// @param s the loaded (rank's) shape

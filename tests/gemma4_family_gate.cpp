@@ -75,7 +75,7 @@ int main(int argc, char **argv) {
     /* every tensor bound, every byte priced, the price is what is staged and charged */
     uint64_t dir_bytes = 0, roleless = 0;
     for (uint64_t i = 0; i < e->model.n_tensors; i++) {
-        dir_bytes += e->model.tensors[i].bytes;
+        dir_bytes += e->model.tensors[i].bytes.raw();
         roleless += e->model.tensors[i].bind_role.len == 0;
     }
     const pulsar_role_census &c = w->census;

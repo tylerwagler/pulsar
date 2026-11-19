@@ -124,18 +124,19 @@ bool engram_bind(pulsar_weights *w, const pulsar_model *m, const char *model_pat
     if (!ok) return false;
     /* the layout's own invariants (pulsar_engram_hash_pos): odd multipliers below INT64_MAX / compressed_vocab,
      * every bucket inside its table */
-    for (uint64_t l = 0; l < n; l++) {
+    for (KindOrd l{0u}; l.below((uint32_t)n); ++l) {
+        const uint64_t at = l.raw();   /* raw: the artifact's metadata arrays, flat by Engram layer */
         for (uint32_t i = 0; i < PULSAR_ENGRAM_MAX_NGRAM; i++) {
-            const int64_t mu = em->multipliers[l * PULSAR_ENGRAM_MAX_NGRAM + i];
+            const int64_t mu = em->multipliers[at * PULSAR_ENGRAM_MAX_NGRAM + i];
             if (mu <= 0 || (mu & 1) == 0 || mu > INT64_MAX / (int64_t)cv)
                 return engram_refuse("a hash multiplier breaks the layout's no-overflow invariant");
         }
         for (uint32_t c = 0; c < PULSAR_ENGRAM_N_COLS; c++) {
-            const uint64_t i = l * PULSAR_ENGRAM_N_COLS + c;
-            if (rows[l] <= 0 || em->offsets[i] + em->primes[i] > (uint64_t)rows[l])
+            const uint64_t i = at * PULSAR_ENGRAM_N_COLS + c;
+            if (rows[at] <= 0 || em->offsets[i] + em->primes[i] > (uint64_t)rows[at])
                 return engram_refuse("a hash bucket runs past its table");
         }
-        em->num_embeddings[l] = (uint64_t)rows[l];
+        em->num_embeddings[l] = (uint64_t)rows[at];
     }
     em->layout.n_vocab = (uint32_t)n_vocab;
     em->layout.compressed_vocab = cv;
@@ -145,7 +146,7 @@ bool engram_bind(pulsar_weights *w, const pulsar_model *m, const char *model_pat
     em->layout.multipliers = em->multipliers;
     em->layout.primes = em->primes;
     em->layout.offsets = em->offsets;
-    em->layout.num_embeddings = em->num_embeddings;
+    em->layout.num_embeddings = em->num_embeddings.data();   /* the layout's flat view (its hash reads it) */
 
     /* the container's directory: the row tables live beside it (kv.py names them) */
     char dir[4096];
@@ -157,15 +158,16 @@ bool engram_bind(pulsar_weights *w, const pulsar_model *m, const char *model_pat
         const char *slash = strrchr(mp, '/');
         snprintf(dir, sizeof dir, "%.*s", slash ? (int)(slash - mp + 1) : 0, mp);
     }
-    for (uint64_t l = 0; l < n; l++) {
-        const TrunkLayer il{(uint32_t)blocks[l]};   /* the artifact names its Engram layers by block */
-        if (blocks[l] < 0 || !il.below(PULSAR_N_LAYER) || (l && blocks[l] <= blocks[l - 1]))
+    for (KindOrd l{0u}; l.below((uint32_t)n); ++l) {
+        const uint64_t at = l.raw();   /* raw: the artifact's `layers` metadata array */
+        const TrunkLayer il{(uint32_t)blocks[at]};   /* the artifact names its Engram layers by block */
+        if (blocks[at] < 0 || !il.below(PULSAR_N_LAYER) || (at && blocks[at] <= blocks[at - 1]))
             return engram_refuse("deepseek4.engram.layers is not ascending blocks of this model");
         const uint32_t src = pulsar_layer_source(il).raw();   /* the row table and its tensors are named by the source layer */
         em->block[l] = il;
         char key[96], name[128], path[4096 + 256];
         pulsar_str file = {NULL, 0};
-        snprintf(key, sizeof key, "deepseek4.engram.rows_file.%llu", (unsigned long long)l);
+        snprintf(key, sizeof key, "deepseek4.engram.rows_file.%llu", (unsigned long long)at);
         if (!model_get_string(m, key, &file)) return engram_refuse("a row table is not named (deepseek4.engram.rows_file.N)");
         snprintf(path, sizeof path, "%s%.*s", dir, (int)file.len, file.ptr);
         if (!pulsar_engram_table_open(&em->table[l], path, src, em->num_embeddings[l]))
@@ -188,11 +190,11 @@ bool engram_bind(pulsar_weights *w, const pulsar_model *m, const char *model_pat
                 return engram_refuse("a block's q_weight / k_weight is missing or not [n_hc][dim] f32 / bf16");
         if (tensor_map_base(m, wkv) != tensor_map_base(m, L->attn_norm))
             return engram_refuse("a block's `wkv` is not in its layer's mapping");
-        L->engram_slot = KindOrd{(uint32_t)l};
+        L->engram_slot = l;
     }
     em->io = pulsar_engram_io_create(PULSAR_ENGRAM_IO_THREADS);
     if (!em->io) return engram_refuse("the row reader pool did not start");
-    for (uint64_t l = 0; l < n; l++)
+    for (KindOrd l{0u}; l.below((uint32_t)n); ++l)
         fprintf(stderr, "pulsar: engram: block %u (source layer %u): %s, %llu rows, %u pread threads\n", em->block[l].raw(),
                 pulsar_layer_source(em->block[l]).raw(), em->table[l].path, (unsigned long long)em->table[l].n_rows,
                 PULSAR_ENGRAM_IO_THREADS);
@@ -205,7 +207,7 @@ bool engram_upload(pulsar_weights *w, const pulsar_model *m) {
     const uint64_t hd = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
     float *qk = (float *)xmalloc(hd * sizeof(float));
     bool ok = true;
-    for (uint32_t l = 0; ok && l < em->n_layers; l++) {
+    for (KindOrd l{0u}; ok && l.below(em->n_layers); ++l) {
         const uint32_t src = pulsar_layer_source(em->block[l]).raw();
         char name[128];
         snprintf(name, sizeof name, "layers.%u.engram.q_weight", src);
@@ -227,7 +229,7 @@ void engram_model_free(pulsar_weights *w) {
     pulsar_engram_model *em = w ? w->engram : NULL;
     if (!em) return;
     pulsar_engram_io_destroy(em->io);
-    for (uint32_t l = 0; l < PULSAR_ENGRAM_MAX_LAYERS; l++) {
+    for (KindOrd l{0u}; l.below(PULSAR_ENGRAM_MAX_LAYERS); ++l) {
         pulsar_engram_table_close(&em->table[l]);
         pulsar_gpu_tensor_free(em->qk[l]);
     }
@@ -253,7 +255,7 @@ bool gpu_graph_engram_alloc(pulsar_gpu_graph *g, const pulsar_weights *w, uint32
     g->engram.rows = pulsar_gpu_tensor_alloc(rec.times(cap));
     g->engram.x_key = pulsar_gpu_tensor_alloc(bytes_of<float>((uint64_t)cap * ENGRAM_IN));
     g->engram.kv = pulsar_gpu_tensor_alloc(bytes_of<float>((uint64_t)cap * (PULSAR_N_HC + 1u) * PULSAR_N_EMBD));
-    for (uint32_t l = 0; l < em->n_layers; l++) {
+    for (KindOrd l{0u}; l.below(em->n_layers); ++l) {
         g->engram.host_rows[l] = (unsigned char *)xmalloc(rec.times(cap).raw());
         g->engram.ids[l] = (uint64_t *)xmalloc((size_t)cap * PULSAR_ENGRAM_N_COLS * sizeof(uint64_t));
     }
@@ -267,7 +269,7 @@ bool gpu_graph_engram_alloc(pulsar_gpu_graph *g, const pulsar_weights *w, uint32
 /// Wait out every pending per-layer gather.
 /// @param g the graph
 static void engram_drain(pulsar_gpu_graph *g) {
-    for (uint32_t l = 0; l < PULSAR_ENGRAM_MAX_LAYERS; l++) {
+    for (KindOrd l{0u}; l.below(PULSAR_ENGRAM_MAX_LAYERS); ++l) {
         if (g->engram.pending[l]) (void)pulsar_engram_gather_wait(g->engram.pending[l]);
         g->engram.pending[l] = NULL;
     }
@@ -279,7 +281,7 @@ void gpu_graph_engram_release(pulsar_gpu_graph *g) {
     pulsar_gpu_tensor_free(g->engram.rows);
     pulsar_gpu_tensor_free(g->engram.x_key);
     pulsar_gpu_tensor_free(g->engram.kv);
-    for (uint32_t l = 0; l < PULSAR_ENGRAM_MAX_LAYERS; l++) {
+    for (KindOrd l{0u}; l.below(PULSAR_ENGRAM_MAX_LAYERS); ++l) {
         free(g->engram.host_rows[l]);
         free(g->engram.ids[l]);
     }
@@ -341,14 +343,14 @@ bool gpu_graph_engram_stage(pulsar_gpu_graph *g, const TokId *tok, const int32_t
             }
             win[i] = g->engram.ring_tok[at];
         }
-        for (uint32_t l = 0; l < em->n_layers; l++) {
+        for (KindOrd l{0u}; l.below(em->n_layers); ++l) {
             uint32_t cols[PULSAR_ENGRAM_N_COLS];
-            pulsar_engram_hash_pos(&em->layout, l, win, back + 1u, back, cols);
+            pulsar_engram_hash_pos(&em->layout, l.raw() /* raw: the layout's flat arrays */, win, back + 1u, back, cols);
             for (uint32_t c = 0; c < PULSAR_ENGRAM_N_COLS; c++)
                 g->engram.ids[l][(size_t)r * PULSAR_ENGRAM_N_COLS + c] = cols[c];
         }
     }
-    for (uint32_t l = 0; l < em->n_layers; l++) {
+    for (KindOrd l{0u}; l.below(em->n_layers); ++l) {
         g->engram.pending[l] = pulsar_engram_gather_start(em->io, &em->table[l], g->engram.ids[l],
                                                           n * PULSAR_ENGRAM_N_COLS, g->engram.host_rows[l]);
         if (!g->engram.pending[l]) {
@@ -364,8 +366,8 @@ bool gpu_graph_engram_apply(pulsar_gpu_graph *g, const pulsar_model *model, cons
                             TrunkLayer il, uint32_t n_tokens) {
     if (!layer->engram_wkv) return true;
     const pulsar_engram_model *em = g->engram.model;
-    const uint32_t l = layer->engram_slot.raw();   /* the layer's ordinal among the Engram layers: its table's index */
-    if (!em || l >= em->n_layers || em->block[l] != il || !g->engram.pending[l] || g->engram.pending_n != n_tokens) {
+    const KindOrd l = layer->engram_slot;   /* the layer's ordinal among the Engram layers: its tables' index */
+    if (!em || !l.below(em->n_layers) || em->block[l] != il || !g->engram.pending[l] || g->engram.pending_n != n_tokens) {
         fprintf(stderr, "pulsar: engram: block %u has no staged gather for this %u-row step -- refusing\n", il.raw(),
                 n_tokens);
         return false;

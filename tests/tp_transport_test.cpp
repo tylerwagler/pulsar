@@ -264,7 +264,7 @@ static void frames_phase(pulsar_tp *tp, int rank) {
         pulsar_tp_batch_item f[3] = { {3001, 1, 50, 81, 0}, {3001, 2, 0, 82, 0}, {3001, 2, 1, 83, 0} };
         pulsar_fused_shape shape;
         std::memset(&shape, 0, sizeof shape);
-        shape.n_dec = 1;
+        shape.n_dec = StepRows{1};
         shape.n_pf = 1;
         shape.head_last[0] = 1;
         CHECK(pulsar_tp_send_fused_batch(tp, f, 3, &shape) == 1, "leader send_fused_batch");
@@ -371,7 +371,7 @@ static void frames_phase(pulsar_tp *tp, int rank) {
         CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)),
               "worker recv fused_batch: %s", err);
         CHECK(cmd.type == PULSAR_TP_FRAME_FUSED_BATCH, "worker fused_batch type %d", (int)cmd.type);
-        CHECK(cmd.n_items == 3 && cmd.session_id == 3001 && cmd.fused.n_dec == 1 &&
+        CHECK(cmd.n_items == 3 && cmd.session_id == 3001 && cmd.fused.n_dec == StepRows{1} &&
               cmd.fused.n_pf == 1 && cmd.fused.head_last[0] == 1 && cmd.fused.head_last[1] == 0,
               "worker fused_batch shape");
         CHECK(cmd.items && cmd.items[0].bank == 1 && cmd.items[0].pos == 50 && cmd.items[0].token == 81 &&
