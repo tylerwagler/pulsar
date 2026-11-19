@@ -71,7 +71,7 @@ struct ne_scratch {
                                          ///< | up); the linears' workspace at NE_CHUNK rows; the attention's at `rows`;
                                          ///< pooled f32 [NE_SEQS_MAX][n_embd]
     /// Each buffer's allocated size in bytes (0 = not allocated)
-    uint64_t bytes[B_COUNT];
+    TensorBytes bytes[B_COUNT];
 };
 
 /// The process's one scratch, created by the first run_create and freed (NULL again) by the last run_free.
@@ -155,7 +155,7 @@ bool linears(const pulsar_engine *e, const pulsar_nemotron_enc_run *r, int n, co
         st[j] = stage;
         stage += (size_t)rows * (size_t)out[j];
     }
-    return pulsar_rows_linear_multi_bf16_launch(lp, n, x, (int)rows, st, yb, dp(r->sc->t[B_LWS]), r->sc->bytes[B_LWS],
+    return pulsar_rows_linear_multi_bf16_launch(lp, n, x, (int)rows, st, yb, dp(r->sc->t[B_LWS]), r->sc->bytes[B_LWS].raw(),
                                                 0) == 0;
 }
 
@@ -210,7 +210,7 @@ bool forward(pulsar_engine *e, const pulsar_tokens *in, uint32_t n, uint32_t row
     io.out_bf16 = a;
     io.ld_out = Q;
     io.workspace = dp(r->sc->t[B_AWS]);
-    io.workspace_bytes = r->sc->bytes[B_AWS];
+    io.workspace_bytes = r->sc->bytes[B_AWS].raw();
     for (TrunkLayer il{0u}; il.below(s.n_layer); ++il) {
         const pulsar_nemotron_enc_layer &L = w->layer[il];
         const uint16_t *next = il.next().below(s.n_layer) ? wp(w->layer[il.next()].attn_norm, "nemotron_enc attn_norm")
@@ -450,26 +450,26 @@ bool pulsar_nemotron_enc_run_create(pulsar_engine *e) {
     }
     /* this engine's need of every buffer; the process's scratch grows to it (the engines open as one group, before
      * any of them encodes, so nothing reads a buffer while it is replaced) */
-    uint64_t need[B_COUNT] = {};
-    need[B_IDS] = R * 4u;
-    need[B_H] = need[B_XN] = R * E * 2u;
-    need[B_Q] = need[B_A] = R * Q * 2u;
-    need[B_K] = need[B_V] = R * KV * 2u;
-    need[B_G] = need[B_U] = need[B_S] = C * F * 2u;
-    need[B_DELTA] = C * E * 2u;
-    need[B_STAGE] = C * 2u * F * 4u;
-    need[B_LWS] = lws ? lws : 256u;
-    need[B_AWS] = pulsar_gqa_workspace_bytes(&A, (uint32_t)R, (uint32_t)R);
-    need[B_POOLED] = (uint64_t)NE_SEQS_MAX * E * 4u;
+    TensorBytes need[B_COUNT] = {};
+    need[B_IDS] = elt_bytes(R, 4u);
+    need[B_H] = need[B_XN] = elt_bytes(R * E, 2u);
+    need[B_Q] = need[B_A] = elt_bytes(R * Q, 2u);
+    need[B_K] = need[B_V] = elt_bytes(R * KV, 2u);
+    need[B_G] = need[B_U] = need[B_S] = elt_bytes(C * F, 2u);
+    need[B_DELTA] = elt_bytes(C * E, 2u);
+    need[B_STAGE] = elt_bytes(C * 2u * F, 4u);
+    need[B_LWS] = TensorBytes{lws ? lws : 256u};   /* the launchers' sizing, raw at their boundary */
+    need[B_AWS] = TensorBytes{pulsar_gqa_workspace_bytes(&A, (uint32_t)R, (uint32_t)R)};
+    need[B_POOLED] = elt_bytes((uint64_t)NE_SEQS_MAX * E, 4u);
     if (!g_scratch) g_scratch = new ne_scratch();
     r->sc = g_scratch;
     r->sc->refs++;
-    uint64_t grown = 0, total = 0;
+    TensorBytes grown{}, total{};
     for (int b = 0; b < B_COUNT; b++) {
         if (need[b] > r->sc->bytes[b]) {
             pulsar_gpu_tensor_free(r->sc->t[b]);
-            r->sc->t[b] = pulsar_gpu_tensor_alloc(TensorBytes{need[b]});
-            r->sc->bytes[b] = r->sc->t[b] ? need[b] : 0;
+            r->sc->t[b] = pulsar_gpu_tensor_alloc(need[b]);
+            r->sc->bytes[b] = r->sc->t[b] ? need[b] : TensorBytes{};
             if (!r->sc->t[b]) {
                 fprintf(stderr, "pulsar: %s: the forward's scratch did not fit the device -- refusing\n", ARCH);
                 return false;
@@ -481,7 +481,7 @@ bool pulsar_nemotron_enc_run_create(pulsar_engine *e) {
     const double mib = 1.0 / 1048576.0;
     fprintf(stderr, "pulsar: %s: forward scratch %.0f MiB, shared by the process's %u encoder(s) (%.0f MiB allocated "
                     "for this one; rows %llu, linears at %llu rows, attention workspace %.0f MiB)\n", ARCH,
-            (double)total * mib, r->sc->refs, (double)grown * mib, (unsigned long long)R, (unsigned long long)C,
-            (double)r->sc->bytes[B_AWS] * mib);
+            (double)total.raw() * mib, r->sc->refs, (double)grown.raw() * mib, (unsigned long long)R, (unsigned long long)C,
+            (double)r->sc->bytes[B_AWS].raw() * mib);
     return true;
 }

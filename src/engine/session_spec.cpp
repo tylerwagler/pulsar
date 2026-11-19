@@ -578,10 +578,10 @@ static bool spec_walk_rounds(pulsar_session *s, const spec_walk_round *w, uint32
             m++;
         }
     }
-    const uint64_t walk_off = (uint64_t)PULSAR_GPU_SAMPLE_ROWS_MAX * sizeof(pulsar_gpu_sample_out);
+    const SlabOff walk_off = SlabOff::after(bytes_of<pulsar_gpu_sample_out>(PULSAR_GPU_SAMPLE_ROWS_MAX));
     if (!s->draw_rows_dev(s->dev.step_rows, rows, m, reqs, masks) ||
-        !pulsar_gpu_spec_walk(s->dev.out, 0, m, runs, n, s->dev.out, walk_off) ||
-        !pulsar_gpu_tensor_read(s->dev.out, TensorBytes{walk_off}, out, TensorBytes{sizeof(*out)}.times(n))) {
+        !pulsar_gpu_spec_walk(s->dev.out, 0, m, runs, n, s->dev.out, walk_off.raw()) ||   /* raw at the launcher */
+        !pulsar_gpu_tensor_read(s->dev.out, walk_off.before(), out, TensorBytes{sizeof(*out)}.times(n))) {
         snprintf(err, errlen, "spec walk: the device sampler failed over %u rows", m);
         return false;
     }

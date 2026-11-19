@@ -62,8 +62,8 @@ typedef struct {
     struct pulsar_gpu_tensor *rows;
     /// tokens one row holds; divides pulsar_kv_state_ops::resume_grid (L334 P2b S9: a factor, not a count)
     TokPerRow tokens_per_row;
-    /// bytes of one row; row r sits at r * row_bytes in `rows`
-    uint64_t row_bytes;
+    /// bytes of one row; row r sits at r * row_bytes in `rows` (L438: tensor bytes, scaled by rows with .times)
+    TensorBytes row_bytes;
     /** A row is written once, when its last token lands (DeepSeek's compressor emit: the open group is the
      *  slot's lanes), so a frontier T holds rows [0, T / tokens_per_row); false = the open row is written as
      *  its tokens arrive and a payload carries it too.  A grid span ends on whole rows either way. */
@@ -98,8 +98,8 @@ typedef struct pulsar_kv_state_ops {
      *  point -- a superset of the grid slot where the model holds state a grid point has canonical or
      *  rebuilds (DeepSeek: its coff-1 lanes and its drafter's rings).  Sized when a payload is (a
      *  drafter may load after the store).  Device copies on the session stream; false on a failed copy. */
-    bool (*walk)(void *state, int dir, bool frontier, struct pulsar_gpu_tensor *slab, uint64_t off, TokPos G,
-                 uint64_t *bytes);
+    bool (*walk)(void *state, int dir, bool frontier, struct pulsar_gpu_tensor *slab, SlabOff off, TokPos G,
+                 TensorBytes *bytes);
     /** The smallest G a checkpoint can describe (DeepSeek: the raw window). */
     TokPos (*min_checkpoint)(void *state);
     /** Does the installed bank stand exactly at prefill point G -- every pool's frontier at
@@ -168,7 +168,7 @@ typedef struct pulsar_ckpt_record {
     uint64_t used;                     ///< the pool's clock at its capture or last restore (the eviction order)
     struct pulsar_gpu_tensor *slab;    ///< the frontier walk's bytes (device tier; NULL on the host tier)
     uint8_t *host;                     ///< L347 I4: the frontier walk's bytes, pinned (host tier; NULL on the device tier)
-    uint64_t cap;                      ///< the record's bytes (it grows when a drafter loads after the store)
+    TensorBytes cap;                   ///< the record's bytes (it grows when a drafter loads after the store)
     float *logits;                     ///< host, end_width floats: a prompt end's next-token row (NULL otherwise)
     /** host: the T token ids the record's state is the prefill of -- the match authority at a resume (a history
      *  rewound inside T's last compressor group and re-prefilled with other ids keeps the record's rows, not its
@@ -212,12 +212,12 @@ typedef struct pulsar_ckpt_store {
     uint8_t *host_slab[PULSAR_MSEQ_MAX];
     /// host tier: the staging buffers a capture / restore cycles through (device memory, priced with the session)
     struct pulsar_gpu_tensor *stage[PULSAR_CKPT_STAGES];
-    uint64_t stage_bytes;                   ///< host tier: each staging buffer's bytes (>= slot_bytes, >= a record)
+    TensorBytes stage_bytes;                ///< host tier: each staging buffer's bytes (>= slot_bytes, >= a record)
     uint32_t stage_next;                    ///< host tier: the staging buffer the next copy takes (round robin)
     /// host tier: the copy lane (pulsar_gpu.h); tickets per pulsar_ckpt_ticket_*.  NULL on the device tier
     struct pulsar_gpu_lane *lane;
     /// bytes of one checkpoint slot (the grid walk's size, rounded up to 256)
-    uint64_t slot_bytes;
+    TensorBytes slot_bytes;
     /// per bank, the grid point (tokens) each slot holds; 0 = empty
     uint32_t pos[PULSAR_MSEQ_MAX][PULSAR_CKPT_SLOTS_MAX];
     /** L289 / L311: the RECORDS, one pool every bank draws from -- each the state a prefill left at an EXACT
@@ -296,7 +296,7 @@ void pulsar_ckpt_drop_bank(pulsar_ckpt_store *st, BankId bank);
 /** L347 I4: where a checkpoint slot's bytes are: the device tier's slab and offset, or the host tier's pinned bytes. */
 typedef struct pulsar_ckpt_slot_at {
     struct pulsar_gpu_tensor *slab;   ///< device tier: the bank's slab (NULL on the host tier)
-    uint64_t off;                     ///< device tier: the slot's byte offset in `slab`
+    SlabOff off;                      ///< device tier: the slot's byte offset in `slab`
     uint8_t *host;                    ///< host tier: the slot's slot_bytes, pinned (NULL on the device tier)
     uint32_t slot;                    ///< the slot index (pulsar_ckpt_commit's)
 } pulsar_ckpt_slot_at;
@@ -350,8 +350,8 @@ void pulsar_ckpt_commit(pulsar_ckpt_store *st, BankId bank, uint32_t slot, TokPo
 int pulsar_ckpt_host_tier(void);
 /** L347 I4: the pinned host bytes the store's checkpoints hold (0 on the device tier).
  *  @param st the store
- *  @return bytes */
-uint64_t pulsar_ckpt_host_bytes(const pulsar_ckpt_store *st);
+ *  @return bytes (slot and record bytes: kv_bytes_of crosses them into the session's price) */
+TensorBytes pulsar_ckpt_host_bytes(const pulsar_ckpt_store *st);
 /** The grid G <= pos at which a resume of a history prefilled to `pos` starts. */
 /// @param st  the store (its ops' resume_grid)
 /// @param pos the prefilled history's end (not none())

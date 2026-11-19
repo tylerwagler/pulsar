@@ -345,7 +345,7 @@ static void refusal_checks(void) {
     /* a drafter's slot has no verify capture: the offset is fatal, never the first trunk slot's */
     pulsar_state_set ss{};
     ss.plan = &a;
-    check(pulsar_state_capture_offset(&ss, LayerSlot{5u}, 0u) == 0u, "a trunk slot's capture offset is read (ordinal 0 here)");
+    check(pulsar_state_capture_offset(&ss, LayerSlot{5u}, 0u) == SlabOff{}, "a trunk slot's capture offset is read (ordinal 0 here)");
     fflush(stderr);
     const pid_t pid = fork();
     if (pid == 0) {

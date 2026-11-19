@@ -1278,7 +1278,7 @@ int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size)
     const TensorBytes alloc_before = pulsar_gpu_tensor_alloc_bytes_current();
     pulsar_session *s = session_build(e, ctx_size, gpu_graph_bank_pool_n());
     if (!s) return 1;
-    s->resident_bytes = (pulsar_gpu_tensor_alloc_bytes_current() - alloc_before).raw();
+    s->resident_bytes = pulsar_gpu_tensor_alloc_bytes_current() - alloc_before;
     /* the kv-state payload staging buffer, pinned once (pulsar_session::io_buf): a session that cannot have it does not open */
     s->io_buf = (uint8_t *)pulsar_gpu_host_alloc(TensorBytes{PULSAR_SESSION_IO_CHUNK});
     if (!s->io_buf) {
@@ -1350,7 +1350,7 @@ int pulsar_ds4_session_create(pulsar_session *s, uint32_t n_banks) {
 
 
 KvBytes pulsar_session_resident_bytes(const pulsar_session *s) {
-    return KvBytes{s ? s->resident_bytes : 0};
+    return kv_bytes_of(s ? s->resident_bytes : TensorBytes{});   /* L438: the named crossing, not KvBytes{raw} */
 }
 
 

@@ -82,10 +82,10 @@ bool gpu_graph_apply_directional_steering_ffn(
  * allocator.  Three readers: the KV-policy sizing below, the overcommit
  * split (gpu_graph_demand_paged_bytes_per_bank) and the boot-line estimate
  * (pulsar_context_memory_estimate). */
-uint64_t gpu_graph_comp_index_bytes_for_context(uint32_t ctx_size) {
-    const uint64_t attn_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP);
-    const uint64_t idx_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX);
-    uint64_t bytes = 0;
+TensorBytes gpu_graph_comp_index_bytes_for_context(uint32_t ctx_size) {
+    const TensorBytes attn_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP);
+    const TensorBytes idx_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX);
+    TensorBytes bytes{};
     /* CSA2 (L218): one comp pool per kv SOURCE, and one index-K pool beside it
      * only where that source runs an indexer -- 0731's ratio-128 HCA layers
      * publish none, so pricing one for them would overshoot the real allocation
@@ -94,18 +94,18 @@ uint64_t gpu_graph_comp_index_bytes_for_context(uint32_t ctx_size) {
     for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const uint64_t comp_cap = gpu_graph_comp_cap(ctx_size, pulsar_layer_compress_ratio(il));
-        bytes += comp_cap * attn_row;
-        if (gpu_graph_layer_has_index_pool(il)) bytes += comp_cap * idx_row;
+        bytes += attn_row.times(comp_cap);
+        if (gpu_graph_layer_has_index_pool(il)) bytes += idx_row.times(comp_cap);
     }
     return bytes;
 }
 
-uint64_t gpu_graph_raw_ring_bytes_for_context(uint32_t raw_cap) {
+TensorBytes gpu_graph_raw_ring_bytes_for_context(uint32_t raw_cap) {
     /* Stored formats, not f32 upper bounds: an f32-priced size overshoots ~3x
      * and trips the managed-KV (demand-paged) policy at the 512k+ contexts
      * where performance matters most.  The raw ring is WINDOW rows,
      * as gpu_graph_bank_slabs_alloc sizes it (raw_bank_bytes). */
-    return (uint64_t)PULSAR_N_LAYER * raw_cap * pulsar_kv_row_bytes(PULSAR_KV_ROW_RING);
+    return pulsar_kv_row_bytes(PULSAR_KV_ROW_RING).times((uint64_t)PULSAR_N_LAYER * raw_cap);
 }
 
 uint32_t gpu_graph_comp_cap_max(uint32_t ctx_size) {
@@ -132,8 +132,9 @@ uint64_t gpu_graph_context_bytes_for_kv_policy(
         uint32_t  prefill_cap,
         uint64_t *kv_cache_bytes_out) {
     const uint64_t comp_cap = gpu_graph_comp_cap_max(ctx_size);
-    const uint64_t kv_cache_bytes = gpu_graph_raw_ring_bytes_for_context(raw_cap) +
-                                    gpu_graph_comp_index_bytes_for_context(ctx_size);
+    /* the policy's total is raw: KV tensors plus scratch formulas, one number for the sizing and the boot line */
+    const uint64_t kv_cache_bytes = (gpu_graph_raw_ring_bytes_for_context(raw_cap) +
+                                     gpu_graph_comp_index_bytes_for_context(ctx_size)).raw();
     if (kv_cache_bytes_out) *kv_cache_bytes_out = kv_cache_bytes;
     /* indexer_scores token rows shrink to the slice size under
      * PULSAR_PREFILL_SLICE (see gpu_graph_prefill_slice / the gpu_diag alloc). */

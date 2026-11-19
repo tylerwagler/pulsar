@@ -47,7 +47,7 @@ struct pulsar_qwen_ple_io {
 namespace {
 
 /// bytes of one row's GR inject output: PULSAR_QWEN_HC f32
-constexpr uint64_t kGrInjStride = (uint64_t)PULSAR_QWEN_HC * sizeof(float);   /* inj per row */
+constexpr TensorBytes kGrInjStride = bytes_of<float>(PULSAR_QWEN_HC);   /* inj per row */
 
 /// @param st the step
 /// @param il the layer's slot (a trunk layer's, or the MTP layer's)
@@ -131,13 +131,12 @@ namespace {
 
 /// @param x a byte count
 /// @return x rounded up to a multiple of 256
-uint64_t a256(uint64_t x) { return (x + 255u) & ~(uint64_t)255u; }
+TensorBytes a256(TensorBytes x) { return pulsar_bytes_align(x, 256u); }
 
 /* key / value: the op's f32 projections the launcher reads (L284 #2: run through the row-kind segments);
  * lin_ws the dense-arm workspace the two share (they serialize on the stream) */
 /** The PLE op's scratch layout (ple_layout): byte offsets into scratch[PULSAR_QWEN_OP_PLE]; `total` is its size. */
-struct ple_scratch { uint64_t emb, key, value, lin_ws, lin_ws_bytes, row_seq, row_j, seq_first, seq_rows, seq_bank, ws,
-                     ws_bytes, total; };
+struct ple_scratch { SlabOff emb, key, value, lin_ws; TensorBytes lin_ws_bytes; SlabOff row_seq, row_j, seq_first, seq_rows, seq_bank, ws; TensorBytes ws_bytes, total; };
 /** @var ple_scratch::emb
  *  byte offset in the op's scratch tensor: the gathered PLE rows, [rows][hidden] bf16 */
 /** @var ple_scratch::key
@@ -168,29 +167,29 @@ struct ple_scratch { uint64_t emb, key, value, lin_ws, lin_ws_bytes, row_seq, ro
 /// @return the layout
 ple_scratch ple_layout(uint32_t rows) {
     ple_scratch p{};
-    uint64_t o = 0;
-    p.emb = o;       o += a256((uint64_t)rows * PULSAR_QWEN_HIDDEN * 2u);
-    p.key = o;       o += a256((uint64_t)rows * PULSAR_QWEN_HC_HIDDEN * sizeof(float));
-    p.value = o;     o += a256((uint64_t)rows * PULSAR_QWEN_HIDDEN * sizeof(float));
+    SlabOff o{};
+    p.emb = o;       o += a256(bytes_of<uint16_t>((uint64_t)rows * PULSAR_QWEN_HIDDEN));
+    p.key = o;       o += a256(bytes_of<float>((uint64_t)rows * PULSAR_QWEN_HC_HIDDEN));
+    p.value = o;     o += a256(bytes_of<float>((uint64_t)rows * PULSAR_QWEN_HIDDEN));
     for (const int out : {PULSAR_QWEN_HC_HIDDEN, PULSAR_QWEN_HIDDEN}) {
         pulsar_rows_linear l{};
         l.in = PULSAR_QWEN_HIDDEN; l.out = out;
-        const uint64_t b = a256(pulsar_rows_linear_workspace_bytes(&l, (int)rows));
+        const TensorBytes b = a256(TensorBytes{pulsar_rows_linear_workspace_bytes(&l, (int)rows)});
         if (b > p.lin_ws_bytes) p.lin_ws_bytes = b;
     }
     p.lin_ws = o;    o += p.lin_ws_bytes;
-    p.row_seq = o;   o += a256((uint64_t)rows * 4u);
-    p.row_j = o;     o += a256((uint64_t)rows * 4u);
-    p.seq_first = o; o += a256((uint64_t)rows * 4u);
-    p.seq_rows = o;  o += a256((uint64_t)rows * 4u);
-    p.seq_bank = o;  o += a256((uint64_t)rows * 4u);
+    p.row_seq = o;   o += a256(bytes_of<int32_t>(rows));
+    p.row_j = o;     o += a256(bytes_of<int32_t>(rows));
+    p.seq_first = o; o += a256(bytes_of<int32_t>(rows));
+    p.seq_rows = o;  o += a256(bytes_of<int32_t>(rows));
+    p.seq_bank = o;  o += a256(bytes_of<int32_t>(rows));
     p.ws = o;
-    p.ws_bytes = pulsar_qwen_ple_workspace_bytes((int)rows);
-    p.total = o + p.ws_bytes;
+    p.ws_bytes = TensorBytes{pulsar_qwen_ple_workspace_bytes((int)rows)};
+    p.total = (o + p.ws_bytes).before();
     return p;
 }
 /** The GR read op's scratch layout (gr_layout): byte offsets into scratch[PULSAR_QWEN_OP_GR_READ]. */
-struct gr_scratch { uint64_t ws, ws_bytes, inj[2], total; };
+struct gr_scratch { SlabOff ws; TensorBytes ws_bytes; SlabOff inj[2]; TensorBytes total; };
 /** @var gr_scratch::ws
  *  byte offset in the op's scratch tensor: the GR read's workspace (0) */
 /** @var gr_scratch::ws_bytes
@@ -203,11 +202,11 @@ struct gr_scratch { uint64_t ws, ws_bytes, inj[2], total; };
 /// @return the layout
 gr_scratch gr_layout(uint32_t rows) {
     gr_scratch g{};
-    g.ws = 0;
-    g.ws_bytes = a256(pulsar_qwen_gr_workspace_bytes((int)rows));
-    g.inj[0] = g.ws_bytes;
-    g.inj[1] = g.inj[0] + a256((uint64_t)rows * kGrInjStride);
-    g.total = g.inj[1] + a256((uint64_t)rows * kGrInjStride);
+    g.ws = SlabOff{};
+    g.ws_bytes = a256(TensorBytes{pulsar_qwen_gr_workspace_bytes((int)rows)});
+    g.inj[0] = g.ws + g.ws_bytes;
+    g.inj[1] = g.inj[0] + a256(kGrInjStride.times(rows));
+    g.total = (g.inj[1] + a256(kGrInjStride.times(rows))).before();
     return g;
 }
 /* L295 F2: the MoE block as the shared router and the rows MoE front door see it -- the router this family declares
@@ -227,7 +226,7 @@ pulsar_moe_block_shape moe_block_shape(const pulsar_qwen_shape *s) {
     return b;
 }
 /** The MoE op's scratch layout (moe_layout): byte offsets into scratch[PULSAR_QWEN_OP_MOE]. */
-struct moe_scratch { uint64_t nf, ws, ws_bytes, total; };
+struct moe_scratch { SlabOff nf, ws; TensorBytes ws_bytes, total; };
 /** @var moe_scratch::nf
  *  byte offset in the op's scratch tensor: the u32 non-finite flag (cleared at embed, read at step end; 0 = finite, else 0x51000000 | layer) */
 /** @var moe_scratch::ws
@@ -241,18 +240,18 @@ struct moe_scratch { uint64_t nf, ws, ws_bytes, total; };
 /// @return the layout
 moe_scratch moe_layout(const pulsar_qwen_shape *s, uint32_t rows) {
     moe_scratch m{};
-    m.nf = 0;
-    m.ws = 256;
+    m.nf = SlabOff{};
+    m.ws = SlabOff{256};   /* past the flag's 256-byte slot */
     const pulsar_moe_block_shape b = moe_block_shape(s);
-    m.ws_bytes = pulsar_moe_block_workspace_bytes(&b, (int)rows);
-    m.total = m.ws + m.ws_bytes;
+    m.ws_bytes = TensorBytes{pulsar_moe_block_workspace_bytes(&b, (int)rows)};
+    m.total = (m.ws + m.ws_bytes).before();
     return m;
 }
 /* L288 qwen-exl3-head: lin_ws is the head Linear's dense-arm workspace at the head's widest call -- sized for an
  * n_embd -> n_vocab head whatever format the container stores (the draft head's rows are fewer; an mxfp8_lt head
  * takes none), because the scratch is laid out from the shape, before any head is admitted. */
 /** The head op's scratch layout (head_layout): byte offsets into scratch[PULSAR_QWEN_OP_HEAD]. */
-struct head_scratch { uint64_t ws, ws_bytes, xkey, lin_ws, lin_ws_bytes, total; };
+struct head_scratch { SlabOff ws; TensorBytes ws_bytes; SlabOff xkey, lin_ws; TensorBytes lin_ws_bytes, total; };
 /** @var head_scratch::ws
  *  byte offset in the op's scratch tensor: the mixer's GR workspace (0) */
 /** @var head_scratch::ws_bytes
@@ -269,15 +268,15 @@ struct head_scratch { uint64_t ws, ws_bytes, xkey, lin_ws, lin_ws_bytes, total; 
 /// @return the layout (independent of the step's rows: the head runs at most PULSAR_QWEN_HEAD_ROWS_MAX)
 head_scratch head_layout(const pulsar_qwen_shape *s) {
     head_scratch h{};
-    h.ws = 0;
-    h.ws_bytes = a256(pulsar_qwen_gr_workspace_bytes((int)PULSAR_QWEN_HEAD_ROWS_MAX));
-    h.xkey = h.ws_bytes;   /* the key of the head's bf16 activation slot: [16][2560] f32-sized */
-    h.lin_ws = h.xkey + a256((uint64_t)PULSAR_QWEN_HEAD_ROWS_MAX * PULSAR_QWEN_HIDDEN * sizeof(float));
+    h.ws = SlabOff{};
+    h.ws_bytes = a256(TensorBytes{pulsar_qwen_gr_workspace_bytes((int)PULSAR_QWEN_HEAD_ROWS_MAX)});
+    h.xkey = h.ws + h.ws_bytes;   /* the key of the head's bf16 activation slot: [16][2560] f32-sized */
+    h.lin_ws = h.xkey + a256(bytes_of<float>((uint64_t)PULSAR_QWEN_HEAD_ROWS_MAX * PULSAR_QWEN_HIDDEN));
     pulsar_rows_linear head{};
     head.in = (int)s->n_embd;
     head.out = (int)s->n_vocab;
-    h.lin_ws_bytes = a256(pulsar_rows_linear_workspace_bytes(&head, (int)PULSAR_QWEN_HEAD_ROWS_MAX));
-    h.total = h.lin_ws + h.lin_ws_bytes;
+    h.lin_ws_bytes = a256(TensorBytes{pulsar_rows_linear_workspace_bytes(&head, (int)PULSAR_QWEN_HEAD_ROWS_MAX)});
+    h.total = (h.lin_ws + h.lin_ws_bytes).before();
     return h;
 }
 
@@ -288,9 +287,9 @@ head_scratch head_layout(const pulsar_qwen_shape *s) {
 /// @param off byte offset
 /// @param bytes view length
 /// @return the view (caller frees), or NULL when the op has no scratch
-pulsar_gpu_tensor *scratch_view(const pulsar_qwen_step *st, pulsar_qwen_op_id op, uint64_t off, uint64_t bytes) {
+pulsar_gpu_tensor *scratch_view(const pulsar_qwen_step *st, pulsar_qwen_op_id op, SlabOff off, TensorBytes bytes) {
     pulsar_gpu_tensor *s = st->st->scratch[op];
-    return s ? pulsar_gpu_tensor_view(s, TensorBytes{off}, TensorBytes{bytes}) : NULL;
+    return s ? pulsar_gpu_tensor_view(s, off.before(), bytes) : NULL;
 }
 
 /** Print a step refusal once.
@@ -384,12 +383,12 @@ bool linear_dev(const pulsar_qwen_step *st, const pulsar_tensor *t, int in, int 
 /// @param ws_bytes its size
 /// @return false on a refused weight or a failed launch
 bool step_linear(const pulsar_qwen_step *st, const pulsar_tensor *t, int in, int out, const char *what,
-                 const uint16_t *x, float *y, void *ws, uint64_t ws_bytes) {
+                 const uint16_t *x, float *y, void *ws, TensorBytes ws_bytes) {
     if (st->tap) pulsar_imatrix_note_dense(st->tap, t, x, st->n_rows, (uint32_t)in);
     return arm_segments(st, 0, st->n_rows, [&](bool prompt, uint32_t r0, uint32_t m) {
         pulsar_rows_linear l;
         return linear_dev(st, t, in, out, prompt, what, &l) &&
-               pulsar_rows_linear_launch(&l, x + (size_t)r0 * in, (int)m, y + (size_t)r0 * out, ws, ws_bytes, 0) == 0;
+               pulsar_rows_linear_launch(&l, x + (size_t)r0 * in, (int)m, y + (size_t)r0 * out, ws, ws_bytes.raw(), 0) == 0;
     });
 }
 
@@ -408,7 +407,7 @@ bool step_linear(const pulsar_qwen_step *st, const pulsar_tensor *t, int in, int
 /// @param ws_bytes its size
 /// @return false on a refused weight or a failed launch
 bool step_linear_multi(const pulsar_qwen_step *st, int n, const pulsar_tensor *const *t, int in, const int *out,
-                       const char *const *what, const uint16_t *x, float *const *y, void *ws, uint64_t ws_bytes) {
+                       const char *const *what, const uint16_t *x, float *const *y, void *ws, TensorBytes ws_bytes) {
     if (st->tap)
         for (int j = 0; j < n; j++) pulsar_imatrix_note_dense(st->tap, t[j], x, st->n_rows, (uint32_t)in);
     return arm_segments(st, 0, st->n_rows, [&](bool prompt, uint32_t r0, uint32_t m) {
@@ -420,7 +419,7 @@ bool step_linear_multi(const pulsar_qwen_step *st, int n, const pulsar_tensor *c
             lp[j] = &l[j];
             yr[j] = y[j] + (size_t)r0 * (size_t)out[j];
         }
-        return pulsar_rows_linear_multi_launch(lp, n, x + (size_t)r0 * in, (int)m, yr, ws, ws_bytes, 0) == 0;
+        return pulsar_rows_linear_multi_launch(lp, n, x + (size_t)r0 * in, (int)m, yr, ws, ws_bytes.raw(), 0) == 0;
     });
 }
 
@@ -433,7 +432,7 @@ bool step_linear_multi(const pulsar_qwen_step *st, int n, const pulsar_tensor *c
 /// @param out_out its output width
 /// @param rows the most rows a step carries
 /// @return workspace bytes (256-aligned)
-uint64_t multi_lin_ws(int in, int n, const int *out, int out_in, int out_out, uint32_t rows) {
+TensorBytes multi_lin_ws(int in, int n, const int *out, int out_in, int out_out, uint32_t rows) {
     pulsar_rows_linear l[4] = {};
     const pulsar_rows_linear *lp[4];
     for (int j = 0; j < n; j++) {
@@ -444,8 +443,8 @@ uint64_t multi_lin_ws(int in, int n, const int *out, int out_in, int out_out, ui
     pulsar_rows_linear o{};
     o.in = out_in;
     o.out = out_out;
-    const uint64_t a = a256(pulsar_rows_linear_multi_workspace_bytes(lp, n, (int)rows));
-    const uint64_t b = a256(pulsar_rows_linear_workspace_bytes(&o, (int)rows));
+    const TensorBytes a = a256(TensorBytes{pulsar_rows_linear_multi_workspace_bytes(lp, n, (int)rows)});
+    const TensorBytes b = a256(TensorBytes{pulsar_rows_linear_workspace_bytes(&o, (int)rows)});
     return a > b ? a : b;
 }
 
@@ -455,7 +454,7 @@ uint64_t multi_lin_ws(int in, int n, const int *out, int out_in, int out_out, ui
  * replaced is gone, L335).  `lin_ws` is ONE dense-arm workspace shared by the
  * five launches (they serialize on the stream). */
 /** The GDN op's scratch layout (gdn_layout): byte offsets into scratch[PULSAR_QWEN_OP_GDN]. */
-struct gdn_scratch { uint64_t qkv, z, a, b, ws, ws_bytes, obf16, lin_ws, lin_ws_bytes, total; };
+struct gdn_scratch { SlabOff qkv, z, a, b, ws; TensorBytes ws_bytes; SlabOff obf16, lin_ws; TensorBytes lin_ws_bytes, total; };
 
 /** @var gdn_scratch::qkv
  *  byte offset in the op's scratch tensor: in_proj_qkv output, [rows][conv_dim] f32 */
@@ -480,7 +479,7 @@ struct gdn_scratch { uint64_t qkv, z, a, b, ws, ws_bytes, obf16, lin_ws, lin_ws_
 /// @param s the loaded shape
 /// @param rows the most rows a step carries
 /// @return the GDN linears' dense-arm workspace bytes
-uint64_t gdn_lin_ws(const pulsar_qwen_shape *s, uint32_t rows) {
+TensorBytes gdn_lin_ws(const pulsar_qwen_shape *s, uint32_t rows) {
     const int H = (int)s->n_embd, CD = (int)pulsar_qwen_gdn_conv_dim(s);
     const int VT = (int)pulsar_qwen_gdn_v_total(s), NV = (int)(s->gdn_n_v_head * pulsar_qwen_tp(s));   /* a / b whole */
     const int outs[4] = {CD, VT, NV, NV};   /* in_proj_qkv / _z / _a / _b as one multi launch, then out_proj */
@@ -493,16 +492,16 @@ uint64_t gdn_lin_ws(const pulsar_qwen_shape *s, uint32_t rows) {
 gdn_scratch gdn_layout(const pulsar_qwen_shape *s, uint32_t rows) {
     const uint64_t CD = pulsar_qwen_gdn_conv_dim(s), VT = pulsar_qwen_gdn_v_total(s), NV = (uint64_t)s->gdn_n_v_head * pulsar_qwen_tp(s);   /* a / b whole */
     gdn_scratch g{};
-    uint64_t o = 0;
-    g.qkv = o; o += a256((uint64_t)rows * CD * sizeof(float));
-    g.z   = o; o += a256((uint64_t)rows * VT * sizeof(float));
-    g.a   = o; o += a256((uint64_t)rows * NV * sizeof(float));
-    g.b   = o; o += a256((uint64_t)rows * NV * sizeof(float));
-    g.ws  = o; g.ws_bytes = a256((uint64_t)pulsar_gdn_scratch_bytes((int)rows)); o += g.ws_bytes;
+    SlabOff o{};
+    g.qkv = o; o += a256(bytes_of<float>((uint64_t)rows * CD));
+    g.z   = o; o += a256(bytes_of<float>((uint64_t)rows * VT));
+    g.a   = o; o += a256(bytes_of<float>((uint64_t)rows * NV));
+    g.b   = o; o += a256(bytes_of<float>((uint64_t)rows * NV));
+    g.ws  = o; g.ws_bytes = a256(TensorBytes{pulsar_gdn_scratch_bytes((int)rows)}); o += g.ws_bytes;
     g.lin_ws = o; g.lin_ws_bytes = gdn_lin_ws(s, rows); o += g.lin_ws_bytes;
     /* L251 / ac69748f: the GDN output's bf16 row -- what the out_proj reads */
-    g.obf16 = o; o += a256((uint64_t)rows * VT * sizeof(uint16_t));
-g.total = o;
+    g.obf16 = o; o += a256(bytes_of<uint16_t>((uint64_t)rows * VT));
+    g.total = o.before();
     return g;
 }
 
@@ -512,7 +511,7 @@ g.total = o;
  * L335 removed the a8_sf slab the kernel wrote and nothing read); ws is pulsar_gpu_qsa_forward's
  * workspace; lin_ws is the shared dense workspace. */
 /** The QSA op's scratch layout (qsa_layout): byte offsets into scratch[PULSAR_QWEN_OP_QSA]. */
-struct qsa_scratch { uint64_t qg, k, v, idx, obf16, ws, ws_bytes, lin_ws, lin_ws_bytes, total; };
+struct qsa_scratch { SlabOff qg, k, v, idx, obf16, ws; TensorBytes ws_bytes; SlabOff lin_ws; TensorBytes lin_ws_bytes, total; };
 
 /** @var qsa_scratch::qg
  *  byte offset in the op's scratch tensor: q_proj output (query | gate), [rows][q_in] f32 */
@@ -537,7 +536,7 @@ struct qsa_scratch { uint64_t qg, k, v, idx, obf16, ws, ws_bytes, lin_ws, lin_ws
 /// @param s the loaded shape
 /// @param rows the most rows a step carries
 /// @return the QSA linears' dense-arm workspace bytes
-uint64_t qsa_lin_ws(const pulsar_qwen_shape *s, uint32_t rows) {
+TensorBytes qsa_lin_ws(const pulsar_qwen_shape *s, uint32_t rows) {
     const int H = (int)s->n_embd;
     const int outs[4] = {(int)pulsar_qwen_qsa_q_in(s), (int)pulsar_qwen_qsa_kv_in(s), (int)pulsar_qwen_qsa_kv_in(s),
                          PULSAR_QSA_IDX_IN};   /* q / k / v / index_qk as one multi launch, then o_proj */
@@ -550,16 +549,16 @@ uint64_t qsa_lin_ws(const pulsar_qwen_shape *s, uint32_t rows) {
 /// @return the layout
 qsa_scratch qsa_layout(const pulsar_qwen_shape *s, uint32_t rows, uint32_t ctx) {
     qsa_scratch g{};
-    uint64_t o = 0;
-    g.qg  = o; o += a256((uint64_t)rows * pulsar_qwen_qsa_q_in(s) * sizeof(float));
-    g.k   = o; o += a256((uint64_t)rows * pulsar_qwen_qsa_kv_in(s) * sizeof(float));
-    g.v   = o; o += a256((uint64_t)rows * pulsar_qwen_qsa_kv_in(s) * sizeof(float));
-    g.idx = o; o += a256((uint64_t)rows * PULSAR_QSA_IDX_IN * sizeof(float));
-    g.ws = o; g.ws_bytes = a256((uint64_t)pulsar_gpu_qsa_workspace_bytes(rows, ctx)); o += g.ws_bytes;
+    SlabOff o{};
+    g.qg  = o; o += a256(bytes_of<float>((uint64_t)rows * pulsar_qwen_qsa_q_in(s)));
+    g.k   = o; o += a256(bytes_of<float>((uint64_t)rows * pulsar_qwen_qsa_kv_in(s)));
+    g.v   = o; o += a256(bytes_of<float>((uint64_t)rows * pulsar_qwen_qsa_kv_in(s)));
+    g.idx = o; o += a256(bytes_of<float>((uint64_t)rows * PULSAR_QSA_IDX_IN));
+    g.ws = o; g.ws_bytes = a256(TensorBytes{pulsar_gpu_qsa_workspace_bytes(rows, ctx)}); o += g.ws_bytes;
     g.lin_ws = o; g.lin_ws_bytes = qsa_lin_ws(s, rows); o += g.lin_ws_bytes;
     /* L251 / ac69748f: the o_proj's bf16 row */
-    g.obf16 = o; o += a256((uint64_t)rows * pulsar_qwen_qsa_out_dim(s) * sizeof(uint16_t));
-g.total = o;
+    g.obf16 = o; o += a256(bytes_of<uint16_t>((uint64_t)rows * pulsar_qwen_qsa_out_dim(s)));
+    g.total = o.before();
     (void)s;
     return g;
 }
@@ -811,16 +810,16 @@ void pulsar_qwen_s4_unload(pulsar_qwen_weights *w) {
     w->ple_io = NULL;
 }
 
-uint64_t pulsar_qwen_s4_scratch_bytes(pulsar_qwen_op_id op, const pulsar_qwen_shape *s, uint32_t max_rows, uint32_t ctx) {
+TensorBytes pulsar_qwen_s4_scratch_bytes(pulsar_qwen_op_id op, const pulsar_qwen_shape *s, uint32_t max_rows, uint32_t ctx) {
     switch (op) {
-    case PULSAR_QWEN_OP_EMBED:   return (uint64_t)max_rows * sizeof(int32_t);
+    case PULSAR_QWEN_OP_EMBED:   return bytes_of<int32_t>(max_rows);
     case PULSAR_QWEN_OP_PLE:     return ple_layout(max_rows).total;
     case PULSAR_QWEN_OP_GR_READ: return gr_layout(max_rows).total;
     case PULSAR_QWEN_OP_MOE:     return moe_layout(s, max_rows).total;
     case PULSAR_QWEN_OP_HEAD:    return head_layout(s).total;
     case PULSAR_QWEN_OP_GDN:     return gdn_layout(s, max_rows).total;
     case PULSAR_QWEN_OP_QSA:     return qsa_layout(s, max_rows, ctx).total;
-    default:                     return 0;   /* GR write reads GR read's inj; GDN / QSA are S2's / S3's */
+    default:                     return TensorBytes{};   /* GR write reads GR read's inj; GDN / QSA are S2's / S3's */
     }
 }
 
@@ -835,7 +834,7 @@ bool pulsar_qwen_s4_embed(const pulsar_qwen_step *st) {
     /* the MoE non-finite flag starts every step clear (read at pulsar_qwen_s4_step_end) */
     pulsar_gpu_tensor *moe_sc = st->st->scratch[PULSAR_QWEN_OP_MOE];
     static const uint32_t zero = 0;   /* L289: an enqueued write reads it later */
-    if (!moe_sc || !pulsar_gpu_tensor_write_async(moe_sc, TensorBytes{moe_layout(st->shape, st->st->max_rows).nf},
+    if (!moe_sc || !pulsar_gpu_tensor_write_async(moe_sc, moe_layout(st->shape, st->st->max_rows).nf.before(),
                                                   &zero, TensorBytes{sizeof(zero)}))
         return fail("could not clear the MoE non-finite flag");
     pulsar_gpu_tensor *tok = st->st->scratch[PULSAR_QWEN_OP_EMBED];
@@ -922,7 +921,7 @@ bool pulsar_qwen_s4_step_end(const pulsar_qwen_step *st, bool ok) {
     }
     pulsar_gpu_tensor *sc = st->st->scratch[PULSAR_QWEN_OP_MOE];
     uint32_t nf = 0;
-    if (!sc || !pulsar_gpu_tensor_read(sc, TensorBytes{moe_layout(st->shape, st->st->max_rows).nf}, &nf,
+    if (!sc || !pulsar_gpu_tensor_read(sc, moe_layout(st->shape, st->st->max_rows).nf.before(), &nf,
                                        TensorBytes{sizeof(nf)}))
         return fail("could not read the MoE non-finite flag");
     if (nf) {
@@ -964,13 +963,13 @@ bool pulsar_qwen_s4_ple(const pulsar_qwen_step *st, LayerSlot il) {
         for (uint32_t r = f; r < e; r++) { row_seq[r] = (int32_t)q; row_j[r] = (int32_t)(r - f); }
     }
     /* L289: enqueued behind layer 0, not waited for -- the host goes on queueing the step */
-    bool ok = pulsar_gpu_tensor_write_async(sc, TensorBytes{p.emb}, io->rows,
+    bool ok = pulsar_gpu_tensor_write_async(sc, p.emb.before(), io->rows,
                                             bytes_of<uint16_t>((uint64_t)n * PULSAR_QWEN_HIDDEN)) &&
-              pulsar_gpu_tensor_write_async(sc, TensorBytes{p.row_seq}, row_seq, bytes_of<int32_t>(n)) &&
-              pulsar_gpu_tensor_write_async(sc, TensorBytes{p.row_j}, row_j, bytes_of<int32_t>(n)) &&
-              pulsar_gpu_tensor_write_async(sc, TensorBytes{p.seq_first}, seq_first, bytes_of<int32_t>(n_seq)) &&
-              pulsar_gpu_tensor_write_async(sc, TensorBytes{p.seq_rows}, seq_rows, bytes_of<int32_t>(n_seq)) &&
-              pulsar_gpu_tensor_write_async(sc, TensorBytes{p.seq_bank}, seq_bank, bytes_of<int32_t>(n_seq));
+              pulsar_gpu_tensor_write_async(sc, p.row_seq.before(), row_seq, bytes_of<int32_t>(n)) &&
+              pulsar_gpu_tensor_write_async(sc, p.row_j.before(), row_j, bytes_of<int32_t>(n)) &&
+              pulsar_gpu_tensor_write_async(sc, p.seq_first.before(), seq_first, bytes_of<int32_t>(n_seq)) &&
+              pulsar_gpu_tensor_write_async(sc, p.seq_rows.before(), seq_rows, bytes_of<int32_t>(n_seq)) &&
+              pulsar_gpu_tensor_write_async(sc, p.seq_bank.before(), seq_bank, bytes_of<int32_t>(n_seq));
     if (!ok) return fail("could not stage the PLE rows");
 
     const pulsar_qwen_layer_weights &L = layer_w(st, il);
@@ -984,21 +983,21 @@ bool pulsar_qwen_s4_ple(const pulsar_qwen_step *st, LayerSlot il) {
     uint8_t *base = (uint8_t *)dptr(sc);
     /* key / value: row-independent Linears of the gathered rows, so they take the row-kind segments; the gate
      * and the dilated conv that follow read across a sequence's rows and stay one launch */
-    const uint16_t *emb = (const uint16_t *)(base + p.emb);
-    float *key = (float *)(base + p.key), *value = (float *)(base + p.value);
-    if (!step_linear(st, L.ple_key, H, HC, "qwen PLE key_proj", emb, key, base + p.lin_ws, p.lin_ws_bytes) ||
-        !step_linear(st, L.ple_value, H, H, "qwen PLE value_proj", emb, value, base + p.lin_ws, p.lin_ws_bytes))
+    const uint16_t *emb = pulsar_slab_at<const uint16_t>(base, p.emb);
+    float *key = pulsar_slab_at<float>(base, p.key), *value = pulsar_slab_at<float>(base, p.value);
+    if (!step_linear(st, L.ple_key, H, HC, "qwen PLE key_proj", emb, key, pulsar_slab_at(base, p.lin_ws), p.lin_ws_bytes) ||
+        !step_linear(st, L.ple_value, H, H, "qwen PLE value_proj", emb, value, pulsar_slab_at(base, p.lin_ws), p.lin_ws_bytes))
         return fail("a PLE projection launch failed");
     /* every kernel of the launch reads a row's own sequence alone, so the prompt run behind a fused step's verify
      * shares it; the capture covers the verify rows [0, n_dec) only (L284 #2) */
-    const pulsar_qwen_rows rows = {(const int32_t *)(base + p.row_seq), (const int32_t *)(base + p.row_j),
-                                   (const int32_t *)(base + p.seq_first), (const int32_t *)(base + p.seq_rows),
-                                   (const int32_t *)(base + p.seq_bank), (int)n_seq,
+    const pulsar_qwen_rows rows = {pulsar_slab_at<const int32_t>(base, p.row_seq), pulsar_slab_at<const int32_t>(base, p.row_j),
+                                   pulsar_slab_at<const int32_t>(base, p.seq_first), pulsar_slab_at<const int32_t>(base, p.seq_rows),
+                                   pulsar_slab_at<const int32_t>(base, p.seq_bank), (int)n_seq,
                                    st->verify ? (float *)pulsar_state_capture_rows(st->states, il, PULSAR_QWEN_STATE_PLE_CONV) : NULL,
                                    st->verify ? (int)st->n_dec : 0};
     return pulsar_qwen_ple_launch(&w, key, value, (uint16_t *)dptr(st->streams), (int)n,
                                   &rows, (float *)dptr(pulsar_state_tensor(st->states, il, PULSAR_QWEN_STATE_PLE_CONV)),
-                                  base + p.ws, p.ws_bytes, 0) == 0;
+                                  pulsar_slab_at(base, p.ws), p.ws_bytes.raw(), 0) == 0;
 }
 
 bool pulsar_qwen_s4_gr_read(const pulsar_qwen_step *st, LayerSlot il, pulsar_qwen_gr_side side) {
@@ -1015,13 +1014,13 @@ bool pulsar_qwen_s4_gr_read(const pulsar_qwen_step *st, LayerSlot il, pulsar_qwe
      * a row-kind segment is the launch at its rows' offsets. */
     const uint16_t *streams = (const uint16_t *)dptr(st->streams);
     uint16_t *x = (uint16_t *)dptr(st->st->x);
-    float *inj = (float *)(base + g.inj[side]);
+    float *inj = pulsar_slab_at<float>(base, g.inj[side]);
     const uint64_t HC = pulsar_qwen_hc_dim(st->shape), H = st->shape->n_embd;
     return arm_segments(st, 0, st->n_rows, [&](bool prompt, uint32_t r0, uint32_t m) {
         pulsar_qwen_gr_dev w;
         return gr_dev(st, gw, prompt, &w) &&
                pulsar_qwen_gr_read_launch(&w, streams + r0 * HC, (int)m, x + r0 * H, inj + (size_t)r0 * PULSAR_QWEN_HC,
-                                          base + g.ws, g.ws_bytes, 0) == 0;
+                                          pulsar_slab_at(base, g.ws), g.ws_bytes.raw(), 0) == 0;
     });
 }
 
@@ -1030,7 +1029,7 @@ bool pulsar_qwen_s4_gr_write(const pulsar_qwen_step *st, LayerSlot, pulsar_qwen_
     pulsar_gpu_tensor *sc = st->st->scratch[PULSAR_QWEN_OP_GR_READ];
     if (!sc) return fail("no GR scratch");
     return pulsar_qwen_gr_write_launch((uint16_t *)dptr(st->streams), (const float *)dptr(st->st->y),
-                                       (const float *)((uint8_t *)dptr(sc) + g.inj[side]), (int)st->n_rows, 0) == 0;
+                                       pulsar_slab_at<const float>(dptr(sc), g.inj[side]), (int)st->n_rows, 0) == 0;
 }
 
 /* L255: one Tessera stack's launch descriptor from its bound planes -- device pointers, the stack geometry
@@ -1081,7 +1080,7 @@ static bool moe_block(const pulsar_qwen_step *st, LayerSlot il) {
     uint8_t *base = (uint8_t *)dptr(sc);
     const pulsar_moe_block_shape bs = moe_block_shape(s);
     pulsar_moe_block_parts parts;
-    if (pulsar_moe_block_carve(&bs, (int)n, base + m.ws, m.ws_bytes, &parts) != 0) return false;
+    if (pulsar_moe_block_carve(&bs, (int)n, pulsar_slab_at(base, m.ws), m.ws_bytes.raw(), &parts) != 0) return false;
     /* the shared expert, sigmoid-gated, added after the routed sum -- under expert parallelism rank 0's alone.
      * Keyed on its FORMAT (task #44): three EXL3 dense slices ride the EXL3 routed launches (mmq/exl3_moe.cuh);
      * any other format, or a Tessera routed arm, runs its own launches after the routed sum.  L288 exl3-dense: a
@@ -1141,7 +1140,7 @@ static bool moe_block(const pulsar_qwen_step *st, LayerSlot il) {
     rc.top_k = K;
     rc.ws = parts.routed;
     rc.ws_bytes = parts.routed_bytes;
-    rc.nf_flag = (uint32_t *)(base + m.nf);
+    rc.nf_flag = pulsar_slab_at<uint32_t>(base, m.nf);
     rc.nf_code = 0x51000000u | il.raw();
     pulsar_tessera_proj tp[PULSAR_QWEN_TESS_PROJS];
     if (L.moe_tess[PULSAR_QWEN_TESS_GATE][PULSAR_QWEN_TESS_WORDS]) {
@@ -1229,10 +1228,10 @@ static bool build_draft_head(const pulsar_qwen_step *st, pulsar_qwen_weights *wm
     const uint32_t nd = wm->n_draft;
     if (!wm->draft_ids || nd == 0 || nd >= s->n_vocab) return fail("the MTP draft vocabulary was not chosen at load");
     const uint16_t *hb = (const uint16_t *)wptr(st, st->w->output, "qwen lm_head");
-    const uint64_t bytes = pulsar_mxfp8_bytes((int)nd, H);
+    const TensorBytes bytes{pulsar_mxfp8_bytes((int)nd, H)};   /* the launcher's sizing, raw at its boundary */
     /* the device id list lives as long as the head (the gather kernel may still be reading it) */
     wm->draft_ids_dev = pulsar_gpu_tensor_alloc(bytes_of<int32_t>(nd));
-    wm->draft_head_mx = hb && bytes ? pulsar_gpu_tensor_alloc(TensorBytes{bytes}) : NULL;
+    wm->draft_head_mx = hb && bytes != TensorBytes{} ? pulsar_gpu_tensor_alloc(bytes) : NULL;
     const bool ok = wm->draft_ids_dev && wm->draft_head_mx &&
                     pulsar_gpu_tensor_write(wm->draft_ids_dev, TensorBytes{0}, wm->draft_ids, bytes_of<int32_t>(nd)) &&
                     pulsar_bf16_to_mxfp8(hb, (const int32_t *)dptr(wm->draft_ids_dev), (int)nd, H,
@@ -1244,7 +1243,7 @@ static bool build_draft_head(const pulsar_qwen_step *st, pulsar_qwen_weights *wm
         wm->draft_ids_dev = NULL;
         return fail("the MTP draft head could not be built");
     }
-    fprintf(stderr, "pulsar: %s: MTP draft head: %u rows (%.0f MB MXFP8)\n", PULSAR_QWEN_ARCH, nd, (double)bytes / 1e6);
+    fprintf(stderr, "pulsar: %s: MTP draft head: %u rows (%.0f MB MXFP8)\n", PULSAR_QWEN_ARCH, nd, (double)bytes.raw() / 1e6);
     return true;
 }
 
@@ -1258,7 +1257,7 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n, 
     uint8_t *base = (uint8_t *)dptr(sc);
     /* the mixer's bf16 row IS the head GEMM's bf16 activation plane: written
      * straight into the slot of a key tensor, noted, read by the bf16 GEMM */
-    pulsar_gpu_tensor *xkey = scratch_view(st, PULSAR_QWEN_OP_HEAD, h.xkey, (uint64_t)n * H * sizeof(float));
+    pulsar_gpu_tensor *xkey = scratch_view(st, PULSAR_QWEN_OP_HEAD, h.xkey, bytes_of<float>((uint64_t)n * H));
     void *xb = NULL;
     bool ok = xkey && pulsar_gpu_bf16_act_slot(xkey, n, (uint64_t)H, &xb);
     /* the mixer's read over rows [row0, row0 + n), each row-kind segment through its arm, into xb's row r - row0 */
@@ -1268,7 +1267,7 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n, 
         pulsar_qwen_gr_dev w;
         return gr_dev(st, *st->mixer, prompt, &w) &&
                pulsar_qwen_gr_read_launch(&w, streams + r0 * HC, (int)m, (uint16_t *)xb + (size_t)(r0 - row0) * H, NULL,
-                                          base + h.ws, h.ws_bytes, 0) == 0;
+                                          pulsar_slab_at(base, h.ws), h.ws_bytes.raw(), 0) == 0;
     });
     if (ok) {
         /* The head is a dense Linear of the mixer's bf16 rows, through the core's bf16-rows front door
@@ -1290,11 +1289,11 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n, 
         if (ok && !dh && !stored && !wm->head_mx) {
             const uint16_t *hb = (const uint16_t *)wptr(st, st->w->output, "qwen lm_head");
             if (hb) hb += (uint64_t)v_lo * H;
-            const uint64_t bytes = pulsar_mxfp8_bytes((int)Vl, H);
-            wm->head_mx = hb && bytes ? pulsar_gpu_tensor_alloc(TensorBytes{bytes}) : NULL;
+            const TensorBytes bytes{pulsar_mxfp8_bytes((int)Vl, H)};   /* the launcher's sizing, raw at its boundary */
+            wm->head_mx = hb && bytes != TensorBytes{} ? pulsar_gpu_tensor_alloc(bytes) : NULL;
             ok = wm->head_mx && pulsar_bf16_to_mxfp8(hb, NULL, (int)Vl, H, dptr(wm->head_mx), 0) == 0;
             if (ok) fprintf(stderr, "pulsar: %s: lm_head as MXFP8 (%.2f GB, from bf16 %.2f GB)\n", PULSAR_QWEN_ARCH,
-                            (double)bytes / 1e9, (double)s->n_vocab * H * 2 / 1e9);
+                            (double)bytes.raw() / 1e9, (double)s->n_vocab * H * 2 / 1e9);
             else if (wm->head_mx) { pulsar_gpu_tensor_free(wm->head_mx); wm->head_mx = NULL; }
         }
         if (ok && dh && !stored && !wm->draft_head_mx) ok = build_draft_head(st, wm);
@@ -1316,8 +1315,8 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n, 
              * gather asks for under TP (the rank's own; the gather assembles the rest) */
             auto head = [&](uint32_t lo, uint32_t width, pulsar_gpu_tensor *dst) {
                 if (!dh && tp > 1 && (lo != v_lo || width != Vl)) return false;
-                return pulsar_rows_linear_launch(&l, (const uint16_t *)xb, (int)n, (float *)dptr(dst), base + h.lin_ws,
-                                                 h.lin_ws_bytes, 0) == 0;
+                return pulsar_rows_linear_launch(&l, (const uint16_t *)xb, (int)n, (float *)dptr(dst), pulsar_slab_at(base, h.lin_ws),
+                                                 h.lin_ws_bytes.raw(), 0) == 0;
             };
             if (ok && (tp == 1 || dh)) {
                 ok = head(0, rows, dst);
@@ -1340,7 +1339,7 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n, 
 /* L251 MTP: the input combine -- the MTP layer's starting streams from the trunk stacks `h` (device,
  * one per row) and the rows' NEXT tokens (st->tokens).  It plays embed's part for the MTP step: the
  * token check, the MoE non-finite flag cleared, the ids on the device. */
-uint64_t pulsar_qwen_s4_mtp_combine_ws_bytes(void) { return pulsar_qwen_mtp_combine_workspace_bytes(); }
+TensorBytes pulsar_qwen_s4_mtp_combine_ws_bytes(void) { return TensorBytes{pulsar_qwen_mtp_combine_workspace_bytes()}; }
 
 bool pulsar_qwen_s4_mtp_combine(const pulsar_qwen_step *st, const void *h) {
     const pulsar_qwen_shape *s = st->shape;
@@ -1351,7 +1350,7 @@ bool pulsar_qwen_s4_mtp_combine(const pulsar_qwen_step *st, const void *h) {
         if (!st->tokens[r].below(s->n_vocab)) return fail("a token id outside the vocabulary");
     pulsar_gpu_tensor *moe_sc = st->st->scratch[PULSAR_QWEN_OP_MOE];
     static const uint32_t zero = 0;   /* L289: an enqueued write reads it later */
-    if (!moe_sc || !pulsar_gpu_tensor_write_async(moe_sc, TensorBytes{moe_layout(st->shape, st->st->max_rows).nf},
+    if (!moe_sc || !pulsar_gpu_tensor_write_async(moe_sc, moe_layout(st->shape, st->st->max_rows).nf.before(),
                                                   &zero, TensorBytes{sizeof(zero)}))
         return fail("could not clear the MoE non-finite flag");
     if (!pulsar_gpu_tensor_write_async(st->st->mtp_tok, TensorBytes{0}, st->tokens, bytes_of<int32_t>(n)))
@@ -1373,7 +1372,7 @@ bool pulsar_qwen_s4_mtp_combine(const pulsar_qwen_step *st, const void *h) {
            fail("the MTP combine failed");
 }
 
-uint64_t pulsar_qwen_s4_draft_top_ws_bytes(void) { return pulsar_draft_top_ws_bytes(); }
+TensorBytes pulsar_qwen_s4_draft_top_ws_bytes(void) { return TensorBytes{pulsar_draft_top_ws_bytes()}; }
 
 static_assert(PULSAR_QWEN_HEAD_ROWS_MAX <= PULSAR_DRAFT_TOP_ROWS_MAX, "every headed MTP row can be picked");
 
@@ -1442,12 +1441,12 @@ bool pulsar_qwen_s2_gdn(const pulsar_qwen_step *st, LayerSlot il) {
     if (!sc) return fail("no GDN scratch");
     uint8_t *base = (uint8_t *)dptr(sc);
     const gdn_scratch g = gdn_layout(s, st->st->max_rows);
-    void *linws = base + g.lin_ws;
+    void *linws = pulsar_slab_at(base, g.lin_ws);
     {
         const pulsar_tensor *const t[4] = {L.gdn_in_qkv, L.gdn_in_z, L.gdn_in_a, L.gdn_in_b};
         const int outs[4] = {CD, VT, NVG, NVG};
         const char *const what[4] = {"qwen GDN in_proj_qkv", "qwen GDN in_proj_z", "qwen GDN in_proj_a", "qwen GDN in_proj_b"};
-        float *const y[4] = {(float *)(base + g.qkv), (float *)(base + g.z), (float *)(base + g.a), (float *)(base + g.b)};
+        float *const y[4] = {pulsar_slab_at<float>(base, g.qkv), pulsar_slab_at<float>(base, g.z), pulsar_slab_at<float>(base, g.a), pulsar_slab_at<float>(base, g.b)};
         if (!step_linear_multi(st, 4, t, H, outs, what, xin, y, linws, g.lin_ws_bytes))
             return fail("a GDN projection launch failed");
     }
@@ -1461,7 +1460,7 @@ bool pulsar_qwen_s2_gdn(const pulsar_qwen_step *st, LayerSlot il) {
     if (!gw.conv_w || !gw.A_log || !gw.dt_bias || !gw.norm_w) return false;
     /* the out_proj over every row of the step (its row-kind segments) */
     auto gdn_out = [&]() {
-        return step_linear(st, L.gdn_out, VT, H, "qwen GDN out_proj", (const uint16_t *)(base + g.obf16),
+        return step_linear(st, L.gdn_out, VT, H, "qwen GDN out_proj", pulsar_slab_at<const uint16_t>(base, g.obf16),
                            (float *)dptr(st->st->y), linws, g.lin_ws_bytes) ||
                fail("the GDN out_proj launch failed");
     };
@@ -1469,19 +1468,19 @@ bool pulsar_qwen_s2_gdn(const pulsar_qwen_step *st, LayerSlot il) {
     c.row_slot = (const int32_t *)dptr(st->st->row_bank);
     c.conv_state = (float *)dptr(pulsar_state_tensor(st->states, il, PULSAR_QWEN_STATE_GDN_CONV));
     c.rec_state  = (float *)dptr(pulsar_state_tensor(st->states, il, PULSAR_QWEN_STATE_GDN_REC));
-    c.qkv = (const float *)(base + g.qkv); c.ld_qkv = CD;
-    c.z   = (const float *)(base + g.z);   c.ld_z   = VT;
-    c.a   = (const float *)(base + g.a) + hv0;   c.ld_a = NVG;
-    c.b   = (const float *)(base + g.b) + hv0;   c.ld_b = NVG;
+    c.qkv = pulsar_slab_at<const float>(base, g.qkv); c.ld_qkv = CD;
+    c.z   = pulsar_slab_at<const float>(base, g.z);   c.ld_z   = VT;
+    c.a   = pulsar_slab_at<const float>(base, g.a) + hv0;   c.ld_a = NVG;
+    c.b   = pulsar_slab_at<const float>(base, g.b) + hv0;   c.ld_b = NVG;
     c.tp_ranks = (int)pulsar_qwen_tp(s);
     /* L339: the DELTA fold (state_kinds.h THE FOLD) -- every call applies its slots' pending rows first */
     c.rec_fold = pulsar_state_fold_table(st->states);
     c.rec_fold_rows = c.rec_fold ? (const float *)pulsar_state_capture_rows(st->states, il, PULSAR_QWEN_STATE_GDN_REC)
                                  : NULL;
     if (c.rec_fold && !c.rec_fold_rows) return fail("a folding state with no GDN delta records");
-    c.scratch = base + g.ws; c.scratch_bytes = g.ws_bytes;
+    c.scratch = pulsar_slab_at(base, g.ws); c.scratch_bytes = g.ws_bytes.raw();
     c.out_f32 = NULL;                               /* the bf16 row is the consumer's input, not f32 */
-    c.out_bf16 = base + g.obf16;                    /* L251 / ac69748f: no E4M3 slot in this family */
+    c.out_bf16 = pulsar_slab_at(base, g.obf16);                    /* L251 / ac69748f: no E4M3 slot in this family */
     if (st->mode == PULSAR_STEP_DECODE) {      /* one row per bank */
         c.n_seq = (int)n;
         c.seq_rows = 1;
@@ -1552,14 +1551,14 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, LayerSlot il) {
     pulsar_gpu_tensor *sc = st->st->scratch[PULSAR_QWEN_OP_QSA];
     if (!sc) return fail("no QSA scratch");
     const qsa_scratch g = qsa_layout(s, st->st->max_rows, st->states->ctx);
-    void *linws = (uint8_t *)dptr(sc) + g.lin_ws;
+    void *linws = pulsar_slab_at(dptr(sc), g.lin_ws);
 
     /* pulsar_qsa_io wants tensors for the four projections; the scratch IS a
      * tensor, so hand it views (and free them on every exit). */
-    pulsar_gpu_tensor *vq = scratch_view(st, PULSAR_QWEN_OP_QSA, g.qg, (uint64_t)n * pulsar_qwen_qsa_q_in(s) * 4);
-    pulsar_gpu_tensor *vk = scratch_view(st, PULSAR_QWEN_OP_QSA, g.k, (uint64_t)n * pulsar_qwen_qsa_kv_in(s) * 4);
-    pulsar_gpu_tensor *vv = scratch_view(st, PULSAR_QWEN_OP_QSA, g.v, (uint64_t)n * pulsar_qwen_qsa_kv_in(s) * 4);
-    pulsar_gpu_tensor *vi = scratch_view(st, PULSAR_QWEN_OP_QSA, g.idx, (uint64_t)n * PULSAR_QSA_IDX_IN * 4);
+    pulsar_gpu_tensor *vq = scratch_view(st, PULSAR_QWEN_OP_QSA, g.qg, bytes_of<float>((uint64_t)n * pulsar_qwen_qsa_q_in(s)));
+    pulsar_gpu_tensor *vk = scratch_view(st, PULSAR_QWEN_OP_QSA, g.k, bytes_of<float>((uint64_t)n * pulsar_qwen_qsa_kv_in(s)));
+    pulsar_gpu_tensor *vv = scratch_view(st, PULSAR_QWEN_OP_QSA, g.v, bytes_of<float>((uint64_t)n * pulsar_qwen_qsa_kv_in(s)));
+    pulsar_gpu_tensor *vi = scratch_view(st, PULSAR_QWEN_OP_QSA, g.idx, bytes_of<float>((uint64_t)n * PULSAR_QSA_IDX_IN));
     pulsar_gpu_tensor *views[64 + 4];
     int nv = 0;
     if (vq) views[nv++] = vq;
@@ -1581,7 +1580,7 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, LayerSlot il) {
     /* the per-bank caches: each bank's own KV and pooled-key tensors (L284 #3), its slice of the bank-major
      * index stage.  An evicted bank's are absent; the kernel refuses a row of it ("a sequence's cache is
      * missing"), and the server restores a bank before stepping it. */
-    const TensorBytes itb = TensorBytes{pulsar_qwen_index_tail_bytes(s)};
+    const TensorBytes itb = pulsar_qwen_index_tail_bytes(s);
     pulsar_qsa_seq seqs[64];
     for (uint32_t b = 0; ok && b < nb; b++) {
         seqs[b].kv    = pulsar_state_pool(st->states, il, PULSAR_QWEN_STATE_KV, BankId{b});
@@ -1598,8 +1597,7 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, LayerSlot il) {
          * capture (L284 #2: a fused step's prompt run behind them is not captured); the core kept each run's stage
          * before the step (pulsar_state_verify_capture) and rebuilds it at the commit (pulsar_state_commit) */
         ok = pulsar_gpu_tensor_copy_async(pulsar_state_capture_tensor(st->states, PULSAR_QWEN_STATE_IDX_TAIL),
-                                          TensorBytes{pulsar_state_capture_offset(st->states, il,
-                                                                                  PULSAR_QWEN_STATE_IDX_TAIL)},
+                                          pulsar_state_capture_offset(st->states, il, PULSAR_QWEN_STATE_IDX_TAIL).before(),
                                           vi, TensorBytes{0},
                                           bytes_of<float>((uint64_t)st->n_dec * PULSAR_QSA_IDX_IN)) != 0;
         if (!ok) { drop(); return fail("the verify capture of a QSA layer failed"); }
@@ -1626,7 +1624,7 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, LayerSlot il) {
                                                        bytes_of<float>((uint64_t)m * PULSAR_QSA_IDX_IN));
         pulsar_qsa_io io{};
         io.qg = sq; io.k = sk; io.v = sv; io.idx = si;
-        io.out_bf16 = (uint8_t *)dptr(sc) + g.obf16 + (uint64_t)r0 * OD * 2u;   /* L251 / ac69748f: bf16, not A8 */
+        io.out_bf16 = pulsar_slab_at(dptr(sc), g.obf16 + bytes_of<uint16_t>((uint64_t)r0 * OD));   /* L251 / ac69748f: bf16, not A8 */
         io.out_e4m3 = NULL;
         io.out_scale = NULL;     /* L335: no E4M3 slot, so no scales -- a slab written and never read is gone */
         io.out_sf_pitch = 0;
@@ -1649,7 +1647,7 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, LayerSlot il) {
     drop();
     if (!ok) return fail("pulsar_gpu_qsa_forward refused the step");
     return step_linear(st, L.attn_o, (int)pulsar_qwen_qsa_out_dim(s), H, "qwen QSA o_proj",
-                       (const uint16_t *)((uint8_t *)dptr(sc) + g.obf16), (float *)dptr(st->st->y), linws,
+                       pulsar_slab_at<const uint16_t>(dptr(sc), g.obf16), (float *)dptr(st->st->y), linws,
                        g.lin_ws_bytes) ||
            fail("the QSA o_proj launch failed");
 }

@@ -1555,7 +1555,7 @@ uint32_t pulsar_session_resume_grid(const pulsar_session *s) {
 }
 KvBytes pulsar_session_ckpt_host_bytes(const pulsar_session *s) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(const_cast<pulsar_session *>(s));
-    return KvBytes{st && st->ops ? pulsar_ckpt_host_bytes(st) : 0u};
+    return kv_bytes_of(st && st->ops ? pulsar_ckpt_host_bytes(st) : TensorBytes{});   /* L438: the named crossing */
 }
 bool pulsar_session_split_invariant(const pulsar_session *s) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(const_cast<pulsar_session *>(s));

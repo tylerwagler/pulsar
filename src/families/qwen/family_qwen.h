@@ -399,14 +399,14 @@ static inline const pulsar_qwen_layer_weights &pulsar_qwen_layer_w(const pulsar_
  * graded change, rule 7). */
 /// @param s the loaded (rank's) shape
 /// @return bytes per layer per bank
-static inline uint64_t pulsar_qwen_gdn_state_bytes(const pulsar_qwen_shape *s) {
-    return (uint64_t)s->gdn_n_v_head * s->gdn_k_dim * s->gdn_v_dim * sizeof(float);
+static inline TensorBytes pulsar_qwen_gdn_state_bytes(const pulsar_qwen_shape *s) {
+    return bytes_of<float>((uint64_t)s->gdn_n_v_head * s->gdn_k_dim * s->gdn_v_dim);
 }
 /** S2: the causal-conv history, f32 [conv_kernel - 1][conv_dim] per layer per bank. */
 /// @param s the loaded (rank's) shape
 /// @return bytes per layer per bank
-static inline uint64_t pulsar_qwen_gdn_conv_bytes(const pulsar_qwen_shape *s) {
-    return (uint64_t)(s->gdn_conv_kernel - 1u) * pulsar_qwen_gdn_conv_dim(s) * sizeof(float);
+static inline TensorBytes pulsar_qwen_gdn_conv_bytes(const pulsar_qwen_shape *s) {
+    return bytes_of<float>((uint64_t)(s->gdn_conv_kernel - 1u) * pulsar_qwen_gdn_conv_dim(s));
 }
 /** S3: one token's K and V for one QSA layer: n_head_kv x head_dim E4M3 each
  * (K post-norm post-RoPE, V raw), then one E8M0 byte per 32 elements -- 8 per
@@ -416,27 +416,27 @@ static inline uint64_t pulsar_qwen_gdn_conv_bytes(const pulsar_qwen_shape *s) {
  * cache as "short" until it was corrected, 2026-09-27.) */
 /// @param s the loaded (rank's) shape
 /// @return bytes per token per QSA layer
-static inline uint64_t pulsar_qwen_kv_row_bytes(const pulsar_qwen_shape *s) {
-    return 2ull * s->n_head_kv * s->head_dim + 2ull * s->n_head_kv * (s->head_dim / 32ull);
+static inline TensorBytes pulsar_qwen_kv_row_bytes(const pulsar_qwen_shape *s) {
+    return TensorBytes{2ull * s->n_head_kv * s->head_dim + 2ull * s->n_head_kv * (s->head_dim / 32ull)};
 }
 /** S3: one pooled indexer key block (idx_block tokens, post-norm, post-RoPE),
  * bf16 [idx_n_head_kv][idx_head_dim] = 256 B per 4 tokens. */
 /// @param s the loaded (rank's) shape
 /// @return bytes per pooled block
-static inline uint64_t pulsar_qwen_index_row_bytes(const pulsar_qwen_shape *s) {
-    return (uint64_t)s->idx_n_head_kv * s->idx_head_dim * 2u;
+static inline TensorBytes pulsar_qwen_index_row_bytes(const pulsar_qwen_shape *s) {
+    return bytes_of<uint16_t>((uint64_t)s->idx_n_head_kv * s->idx_head_dim);
 }
 /** S3: the partial tail block's raw (pre-pool) index keys, f32 [idx_block][idx_n_head_kv * idx_head_dim]. */
 /// @param s the loaded (rank's) shape
 /// @return bytes per QSA layer per bank
-static inline uint64_t pulsar_qwen_index_tail_bytes(const pulsar_qwen_shape *s) {
-    return (uint64_t)s->idx_block * s->idx_n_head_kv * s->idx_head_dim * sizeof(float);
+static inline TensorBytes pulsar_qwen_index_tail_bytes(const pulsar_qwen_shape *s) {
+    return bytes_of<float>((uint64_t)s->idx_block * s->idx_n_head_kv * s->idx_head_dim);
 }
 /** S4: the PLE dilated-conv history, f32 [conv_state_len][n_hc * n_embd] per bank. */
 /// @param s the loaded (rank's) shape
 /// @return bytes per bank
-static inline uint64_t pulsar_qwen_ple_conv_bytes(const pulsar_qwen_shape *s) {
-    return (uint64_t)pulsar_qwen_ple_conv_state_len(s) * pulsar_qwen_hc_dim(s) * sizeof(float);
+static inline TensorBytes pulsar_qwen_ple_conv_bytes(const pulsar_qwen_shape *s) {
+    return bytes_of<float>((uint64_t)pulsar_qwen_ple_conv_state_len(s) * pulsar_qwen_hc_dim(s));
 }
 /** Activation slot formats (the ops' shared contract; each set by the stream
  * that PRODUCES the slot).
@@ -659,7 +659,7 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n, 
 bool pulsar_qwen_s4_mtp_combine(const pulsar_qwen_step *st, const void *h);
 /** The combine's workspace bytes (a fixed size; the session allocates it once). */
 /// @return bytes
-uint64_t pulsar_qwen_s4_mtp_combine_ws_bytes(void);
+TensorBytes pulsar_qwen_s4_mtp_combine_ws_bytes(void);
 /** L289: the draft head's greedy pick over logits rows [0, n) of an MTP step that headed n rows (L288: every bank's
  *  draft row of a step, n <= PULSAR_QWEN_HEAD_ROWS_MAX), reduced on the device into st->st->mtp_top (enqueued after
  *  the head); pulsar_qwen_s4_draft_top_read, after the step's drain, gives each row's vocabulary id and softmax
@@ -678,7 +678,7 @@ bool pulsar_qwen_s4_draft_top_read(const pulsar_qwen_state *q, const pulsar_qwen
                                    float *conf);
 /** Its workspace bytes (the session allocates it once, beside the combine's). */
 /// @return bytes
-uint64_t pulsar_qwen_s4_draft_top_ws_bytes(void);
+TensorBytes pulsar_qwen_s4_draft_top_ws_bytes(void);
 /** L289: warm the page cache with the PLE rows of `n` tokens a later step will embed after the n-gram context `ctx`
  *  (oldest first; advanced over the tokens here, as the embed will) -- the verify's rows, issued while the draft
  *  chain runs, so the verify's own gather reads cached rows.  A hint: the gather still reads every row. */
@@ -729,7 +729,7 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, LayerSlot il);
  * @param max_rows the most rows a step carries
  * @param ctx the session's context, in tokens (QSA only)
  * @return bytes; 0 for an op with no arena of its own */
-uint64_t pulsar_qwen_s4_scratch_bytes(pulsar_qwen_op_id op, const pulsar_qwen_shape *s, uint32_t max_rows, uint32_t ctx);
+TensorBytes pulsar_qwen_s4_scratch_bytes(pulsar_qwen_op_id op, const pulsar_qwen_shape *s, uint32_t max_rows, uint32_t ctx);
 /** S4's load: admit every tensor its ops read (by format) and open the PLE row file.
  * @param e the engine being loaded
  * @param opt the open options

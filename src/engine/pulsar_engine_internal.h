@@ -3193,8 +3193,8 @@ struct pulsar_session {
      * resumes from (pulsar_session_dirty_view_drop). */
     bool mseq_dirty;
     /** GPU bytes this session's create actually allocated (tensor-allocator
-     * delta across pulsar_session_create); the server ledger commits this. */
-    uint64_t resident_bytes;
+     * delta across pulsar_session_create); the server ledger commits this (through kv_bytes_of, L438). */
+    TensorBytes resident_bytes;
     /** Live speculative/DSpark shadow; see pulsar_spec_carry_state. */
     pulsar_spec_carry_state spec;
     /** Tier-2 PATH A: per-bank host carry, one entry per pool bank.  Lazily
@@ -3311,8 +3311,8 @@ struct pulsar_session {
     /// @param n           chains
     /// @param tokens      receives n * slots tokens (read back from the device)
     /// @return false when the launch or the readback fails.
-    bool draw_chains(const pulsar_gpu_tensor *cand, uint64_t cand_off, const pulsar_gpu_tensor *scores,
-                     uint64_t scores_off, uint32_t slots, uint32_t topk, uint32_t vocab,
+    bool draw_chains(const pulsar_gpu_tensor *cand, SlabOff cand_off, const pulsar_gpu_tensor *scores,
+                     SlabOff scores_off, uint32_t slots, uint32_t topk, uint32_t vocab,
                      const pulsar_gpu_chain_req *reqs, uint32_t n, int32_t *tokens);
     /** The launch alone (masks as draw_rows'), the outs left in dev.out (a walk reads them there). */
     /// @param rows       the device rows, logits-width f32 each
@@ -3765,18 +3765,17 @@ bool pulsar_layer_subset(void);
  *
  * plans/96-two-profiles-one-engine.md s10. */
 /// @param kind  RING, COMP or INDEX
-/// @return the row's bytes under the loaded profile.
-static inline uint64_t pulsar_kv_row_bytes(pulsar_kv_row_kind kind) {
+/// @return the row's bytes under the loaded profile (L438: tensor bytes; rows scale them with .times).
+static inline TensorBytes pulsar_kv_row_bytes(pulsar_kv_row_kind kind) {
     /* The index-K row is the same FP4 row in both families. */
     if (kind == PULSAR_KV_ROW_INDEX) {
-        return (uint64_t)PULSAR_MXKV_FP4_ROWBYTES((uint64_t)PULSAR_N_INDEXER_HEAD_DIM);
+        return TensorBytes{(uint64_t)PULSAR_MXKV_FP4_ROWBYTES((uint64_t)PULSAR_N_INDEXER_HEAD_DIM)};
     }
     if (g_pulsar_shape.kv_row_style == PULSAR_KV_ROWS_UNIFIED) {
-        return (uint64_t)PULSAR_ATTN_PACK_ROWBYTES((uint64_t)PULSAR_N_HEAD_DIM);
+        return TensorBytes{(uint64_t)PULSAR_ATTN_PACK_ROWBYTES((uint64_t)PULSAR_N_HEAD_DIM)};
     }
-    return kind == PULSAR_KV_ROW_RING
-               ? (uint64_t)PULSAR_WINKV_ROWBYTES((uint64_t)PULSAR_N_HEAD_DIM)
-               : (uint64_t)PULSAR_MAINKV_ROWBYTES((uint64_t)PULSAR_N_HEAD_DIM);
+    return TensorBytes{kind == PULSAR_KV_ROW_RING ? (uint64_t)PULSAR_WINKV_ROWBYTES((uint64_t)PULSAR_N_HEAD_DIM)
+                                                  : (uint64_t)PULSAR_MAINKV_ROWBYTES((uint64_t)PULSAR_N_HEAD_DIM)};
 }
 
 /* The L218 row-format refactor replaced these two macros with
@@ -3790,11 +3789,11 @@ static inline uint64_t pulsar_kv_row_bytes(pulsar_kv_row_kind kind) {
  * index row is the FP4 index row.  A caller that needs the raw RING row should
  * call pulsar_kv_row_bytes(PULSAR_KV_ROW_RING) directly. */
 /// Legacy name: bytes of a compressed attention (COMP) KV row.
-#define PULSAR_ENGINE_MAINKV_ROWBYTES  (pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP))
+#define PULSAR_ENGINE_MAINKV_ROWBYTES  (pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP).raw())
 /// Legacy name: bytes of an FP4 index-key (INDEX) row.
-#define PULSAR_ENGINE_IDXFP4_ROWBYTES  (pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX))
+#define PULSAR_ENGINE_IDXFP4_ROWBYTES  (pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX).raw())
 /// Legacy name: bytes of a raw sliding-window (RING) KV row.
-#define PULSAR_ENGINE_WINKV_ROWBYTES   (pulsar_kv_row_bytes(PULSAR_KV_ROW_RING))
+#define PULSAR_ENGINE_WINKV_ROWBYTES   (pulsar_kv_row_bytes(PULSAR_KV_ROW_RING).raw())
 
 /// The layer whose caches layer `il` reads (see the CSA2 ownership comment above pulsar_kv_row_bytes).
 /// @param il  the layer
@@ -5617,13 +5616,13 @@ static inline uint32_t gpu_graph_comp_cap(uint32_t ctx_size, uint32_t ratio) {
  * (steering.cpp); the demand-paged term of the overcommit split. */
 /// @param ctx_size the context, tokens
 /// @return bytes
-uint64_t gpu_graph_comp_index_bytes_for_context(uint32_t ctx_size);
+TensorBytes gpu_graph_comp_index_bytes_for_context(uint32_t ctx_size);
 /** One bank's raw SWA ring across every layer at raw_cap rows, in the stored
  * WINDOW / MAIN row formats (steering.cpp): the eager term of the KV
  * sizing, the same bytes gpu_graph_bank_slabs_alloc lays out per layer. */
 /// @param raw_cap the ring's rows
 /// @return bytes
-uint64_t gpu_graph_raw_ring_bytes_for_context(uint32_t raw_cap);
+TensorBytes gpu_graph_raw_ring_bytes_for_context(uint32_t raw_cap);
 /** The deepest compressed pool any layer holds at ctx_size (the smallest
  * non-zero compress ratio's gpu_graph_comp_cap): the row count the
  * indexer_scores scratch is sized by and the one the boot line reports as

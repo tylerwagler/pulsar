@@ -74,7 +74,7 @@ static uint64_t trunk_pool_bytes(const pulsar_session *s, uint64_t rows) {
     for (uint32_t k = 0; k < p->n_trunk; k++)
         for (uint32_t id = 0; id < p->n_decl; id++)
             if ((p->slot[LayerSlot{k}] >> id & 1u) && p->decl[id].kind == PULSAR_STATE_POOL)
-                bytes += (rows + p->decl[id].tokens - 1u) / p->decl[id].tokens * p->decl[id].bytes;
+                bytes += (rows + p->decl[id].tokens - 1u) / p->decl[id].tokens * p->decl[id].bytes.raw();
     return bytes;
 }
 

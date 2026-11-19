@@ -169,7 +169,7 @@ bool gpu_graph_dspark_seed_draft_kv(
         const pulsar_model         *dspark_model,
         const pulsar_dspark_weights *w,
         uint32_t                 n_rows) {
-    const uint64_t kv_bytes = (uint64_t)PULSAR_N_HEAD_DIM * sizeof(float);
+    const TensorBytes kv_bytes = bytes_of<float>(PULSAR_N_HEAD_DIM);
     /* Persistent scratch (dspark_seed_*): the fused loop seeds up to 5 rows per
      * step across 3 layers; per-call cudaMalloc/cudaFree here was ~9 device-
      * serializing pairs per call. */
@@ -230,7 +230,7 @@ bool gpu_graph_dspark_seed_draft_kv(
              * would be read as if it held a seeded position.  Async: kv_rot is
              * consumed only by the rope/pack kernels that follow on this same
              * (per-thread) stream, so the host wait bought nothing. */
-            if (!pulsar_gpu_tensor_copy_async(kv_rot, TensorBytes{0}, kv_norm, TensorBytes{0}, TensorBytes{kv_bytes})) {
+            if (!pulsar_gpu_tensor_copy_async(kv_rot, TensorBytes{0}, kv_norm, TensorBytes{0}, kv_bytes)) {
                 seeded = false;
                 break;
             }
@@ -328,8 +328,8 @@ bool gpu_graph_dspark_seed_rows_banked(
             meta[6 * PULSAR_DSPARK_DRAFT_ROWS_MAX + t] = (int32_t)b;
         }
         if (!pulsar_gpu_tensor_write(g->dspark_row_meta, TensorBytes{0}, meta, TensorBytes{sizeof(meta)})) return false;
-        const uint64_t rb = (uint64_t)PULSAR_DSPARK_DRAFT_ROWS_MAX * sizeof(int32_t);
-        pulsar_gpu_tensor *meta_seq = pulsar_gpu_tensor_view(g->dspark_row_meta, TensorBytes{rb}.times(6u),
+        const TensorBytes rb = bytes_of<int32_t>(PULSAR_DSPARK_DRAFT_ROWS_MAX);
+        pulsar_gpu_tensor *meta_seq = pulsar_gpu_tensor_view(g->dspark_row_meta, rb.times(6u),
                                                              bytes_of<int32_t>(m));
         /* main_x rows: concat -> main_proj -> main_norm (E4M3 into main_x's slot) */
         void *cq = NULL, *csf = NULL; int ckbp = 0;
@@ -359,7 +359,7 @@ bool gpu_graph_dspark_seed_rows_banked(
         /* each layer: kv projection, its norm, rope at each row's position, banked ring store */
         for (DraftLayer li{0u}; ok && li.below(3); ++li) {
             pulsar_gpu_tensor *rope_pos = pulsar_gpu_tensor_view(g->dspark_row_meta,
-                                                                 TensorBytes{rb}.times(li.raw() * 2),
+                                                                 rb.times(li.raw() * 2),
                                                                  bytes_of<int32_t>(m));
             ok = rope_pos && pulsar_linear_slot(g->dspark_seed_kv, dspark_model, w->layer[li].attn_kv, PULSAR_N_EMBD, 0, PULSAR_N_HEAD_DIM, g->dspark_main_x, m);
             if (ok) ok = pulsar_gpu_rms_norm_weight_rows_tensor(g->dspark_seed_norm, g->dspark_seed_kv,
@@ -476,16 +476,16 @@ bool gpu_graph_dspark_draft_forward_banks(
             meta[6 * PULSAR_DSPARK_DRAFT_ROWS_MAX + t] = (int32_t)b;
         }
         if (!pulsar_gpu_tensor_write(g->dspark_row_meta, TensorBytes{0}, meta, TensorBytes{sizeof(meta)})) return false;
-        const uint64_t rb = (uint64_t)PULSAR_DSPARK_DRAFT_ROWS_MAX * sizeof(int32_t);
+        const TensorBytes rb = bytes_of<int32_t>(PULSAR_DSPARK_DRAFT_ROWS_MAX);
         bool vok = true;
         for (DraftLayer li{0u}; li.below(3); ++li) {
-            meta_rope[li] = pulsar_gpu_tensor_view(g->dspark_row_meta, TensorBytes{rb}.times(li.raw() * 2 + 0),
+            meta_rope[li] = pulsar_gpu_tensor_view(g->dspark_row_meta, rb.times(li.raw() * 2 + 0),
                                                    bytes_of<int32_t>(n_draft));
-            meta_vis[li] = pulsar_gpu_tensor_view(g->dspark_row_meta, TensorBytes{rb}.times(li.raw() * 2 + 1),
+            meta_vis[li] = pulsar_gpu_tensor_view(g->dspark_row_meta, rb.times(li.raw() * 2 + 1),
                                                   bytes_of<int32_t>(n_draft));
             vok = vok && meta_rope[li] && meta_vis[li];
         }
-        meta_seq = pulsar_gpu_tensor_view(g->dspark_row_meta, TensorBytes{rb}.times(6u),
+        meta_seq = pulsar_gpu_tensor_view(g->dspark_row_meta, rb.times(6u),
                                           bytes_of<int32_t>(n_draft));
         if (!vok || !meta_seq) {
             for (DraftLayer li{0u}; li.below(3); ++li) {

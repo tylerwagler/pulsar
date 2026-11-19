@@ -249,12 +249,12 @@ bool gpu_graph_engram_alloc(pulsar_gpu_graph *g, const pulsar_weights *w, uint32
     g->engram.model = em;
     g->engram.cap = cap;
     g->engram.n_banks = n_banks ? n_banks : 1u;
-    const uint64_t rec = (uint64_t)PULSAR_ENGRAM_N_COLS * PULSAR_ENGRAM_ROW_BYTES;
-    g->engram.rows = pulsar_gpu_tensor_alloc(TensorBytes{rec}.times(cap));
+    const TensorBytes rec = elt_bytes(PULSAR_ENGRAM_N_COLS, PULSAR_ENGRAM_ROW_BYTES);   /* a token's rows: one a column */
+    g->engram.rows = pulsar_gpu_tensor_alloc(rec.times(cap));
     g->engram.x_key = pulsar_gpu_tensor_alloc(bytes_of<float>((uint64_t)cap * ENGRAM_IN));
     g->engram.kv = pulsar_gpu_tensor_alloc(bytes_of<float>((uint64_t)cap * (PULSAR_N_HC + 1u) * PULSAR_N_EMBD));
     for (uint32_t l = 0; l < em->n_layers; l++) {
-        g->engram.host_rows[l] = (unsigned char *)xmalloc((size_t)cap * rec);
+        g->engram.host_rows[l] = (unsigned char *)xmalloc(rec.times(cap).raw());
         g->engram.ids[l] = (uint64_t *)xmalloc((size_t)cap * PULSAR_ENGRAM_N_COLS * sizeof(uint64_t));
     }
     const size_t ring = (size_t)g->engram.n_banks * PULSAR_ENGRAM_RING;
@@ -379,7 +379,7 @@ bool gpu_graph_engram_apply(pulsar_gpu_graph *g, const pulsar_model *model, cons
         fprintf(stderr, "pulsar: engram: block %u runs rows -> MX slot -> wkv -> gate + add (first step %u rows)\n",
                 il.raw(), n_tokens);
     }
-    const TensorBytes rec = TensorBytes{PULSAR_ENGRAM_ROW_BYTES}.times(PULSAR_ENGRAM_N_COLS);
+    const TensorBytes rec = elt_bytes(PULSAR_ENGRAM_N_COLS, PULSAR_ENGRAM_ROW_BYTES);
     bool ok = pulsar_gpu_tensor_write(g->engram.rows, TensorBytes{0}, g->engram.host_rows[l], rec.times(n_tokens)) != 0;
     ok = ok && pulsar_gpu_engram_rows_emit(g->engram.x_key, g->engram.rows, n_tokens) != 0;
     ok = ok && pulsar_linear_slot(g->engram.kv, model, layer->engram_wkv, ENGRAM_IN, 0,

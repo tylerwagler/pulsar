@@ -96,7 +96,7 @@ pulsar_mtp_lane *pulsar_mtp_lane_create(pulsar_session *s, const pulsar_mtp_ops 
     const pulsar_engine *e = s->engine;
     const pulsar_state_plan *p = &e->state_plan;
     const uint32_t mods = ops->modules(e);
-    const uint64_t cb = ops->cond_bytes(e);
+    const TensorBytes cb = ops->cond_bytes(e);
     /* the declaration the lane runs on: a drafter slot per module, the pending decl FIXED on the first, its row the
      * conditioning row, the plan's hooks the lane's */
     const char *why = mods == 0 || p->n_slots != p->n_trunk + mods ? "a drafter slot per module"
@@ -121,7 +121,7 @@ pulsar_mtp_lane *pulsar_mtp_lane_create(pulsar_session *s, const pulsar_mtp_ops 
     l->n_banks = n_banks;
     l->cond_bytes = cb;
     l->head_width = ops->head_width(e);
-    l->cond = pulsar_gpu_tensor_alloc(TensorBytes{cb}.times(max_rows));
+    l->cond = pulsar_gpu_tensor_alloc(cb.times(max_rows));
     l->pend_pos = (TokPos *)xmalloc(n_banks * sizeof(TokPos));
     l->stage_dirty = (bool *)xcalloc(n_banks, sizeof(bool));
     for (uint32_t b = 0; b < n_banks; b++) l->pend_pos[b] = TokPos::none();
@@ -178,7 +178,7 @@ bool pulsar_mtp_absorb(pulsar_session *s, pulsar_step_mode mode, const TokId *to
     if (!l) return true;
     const pulsar_mtp_ops *ops = l->ops;
     pulsar_gpu_tensor *pend = pend_tensor(s);
-    const uint64_t cb = l->cond_bytes;
+    const TensorBytes cb = l->cond_bytes;
     std::vector<TokId> mt(n + 1u);
     std::vector<int32_t> mp(n + 1u);
     std::vector<BankId> mb(n + 1u);
@@ -191,23 +191,23 @@ bool pulsar_mtp_absorb(pulsar_session *s, pulsar_step_mode mode, const TokId *to
     if (mode == PULSAR_STEP_PREFILL) {
         const uint32_t b = (uint32_t)bank[0].raw();   /* the driver's forward checked the step's banks */
         if (parked_before(l, b, TokPos{pos[0]})) {
-            ok = pulsar_gpu_tensor_copy_async(l->cond, TensorBytes{0}, pend, TensorBytes{cb}.times(b),
-                                              TensorBytes{cb}) != 0;
+            ok = pulsar_gpu_tensor_copy_async(l->cond, TensorBytes{0}, pend, cb.times(b),
+                                              cb) != 0;
             mt[k] = tokens[0]; mp[k] = pos[0] - 1; mb[k] = bank[0]; k++;
         }
-        if (ok && n > 1) ok = ops->trunk_rows(s, row0, n - 1u, l->cond, (uint64_t)k * cb);
+        if (ok && n > 1) ok = ops->trunk_rows(s, row0, n - 1u, l->cond, cb.times(k));
         for (uint32_t i = 0; i + 1u < n; i++) { mt[k] = tokens[i + 1]; mp[k] = pos[i]; mb[k] = bank[0]; k++; }
-        if (ok) ok = ops->trunk_rows(s, row0 + n - 1u, 1u, pend, (uint64_t)b * cb);
+        if (ok) ok = ops->trunk_rows(s, row0 + n - 1u, 1u, pend, cb.times(b));
         if (ok) l->pend_pos[b] = TokPos{pos[n - 1]};
     } else {
         for (uint32_t j = 0; ok && j < n; j++) {
             const uint32_t b = (uint32_t)bank[j].raw();   /* the driver's forward checked the step's banks */
             if (parked_before(l, b, TokPos{pos[j]})) {
-                ok = pulsar_gpu_tensor_copy_async(l->cond, TensorBytes{cb}.times(k), pend,
-                                                  TensorBytes{cb}.times(b), TensorBytes{cb}) != 0;
+                ok = pulsar_gpu_tensor_copy_async(l->cond, cb.times(k), pend,
+                                                  cb.times(b), cb) != 0;
                 mt[k] = tokens[j]; mp[k] = pos[j] - 1; mb[k] = bank[j]; k++;
             }
-            if (ok) ok = ops->trunk_rows(s, row0 + j, 1u, pend, (uint64_t)b * cb);
+            if (ok) ok = ops->trunk_rows(s, row0 + j, 1u, pend, cb.times(b));
             if (ok) l->pend_pos[b] = TokPos{pos[j]};
         }
     }
@@ -241,7 +241,7 @@ bool pulsar_mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const Ban
         return false;
     }
     const pulsar_mtp_ops *ops = l->ops;
-    const uint64_t cb = l->cond_bytes;
+    const TensorBytes cb = l->cond_bytes;
     pulsar_gpu_tensor *pend = pend_tensor(s);
     TokId tok[PULSAR_DRIVER_HEADS_MAX];
     int32_t pos[PULSAR_DRIVER_HEADS_MAX];
@@ -271,13 +271,13 @@ bool pulsar_mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const Ban
          * drafter did not run) -- pairs with the run's base token, the lockstep row a chain's step 1 would have
          * written: the module's state has no hole at pos0 - 1 */
         if (ok && parked_before(l, b, kept.pos0) && rows[i] < l->n_vtok) {
-            ok = pulsar_gpu_tensor_copy_async(l->cond, TensorBytes{cb}.times(m), pend,
-                                              TensorBytes{cb}.times(b), TensorBytes{cb}) != 0;
+            ok = pulsar_gpu_tensor_copy_async(l->cond, cb.times(m), pend,
+                                              cb.times(b), cb) != 0;
             tok[m] = l->vtok[rows[i]];
             pos[m] = (kept.pos0 - TokCount{1}).raw();
             bank[m++] = banks[i];
         }
-        if (ok && k > 1) ok = ops->trunk_rows(s, rows[i], k - 1u, l->cond, (uint64_t)m * cb);
+        if (ok && k > 1) ok = ops->trunk_rows(s, rows[i], k - 1u, l->cond, cb.times(m));
         for (uint32_t r = 0; r + 1 < k; r++, m++) {
             tok[m] = next[i + r];
             pos[m] = kept.pos_of(kept.first + StepRows{(int)r}).raw();
@@ -291,7 +291,7 @@ bool pulsar_mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const Ban
         uint32_t j = i + 1;
         while (j < n && banks[j] == banks[i]) j++;
         bool parked = ok && b < ss->n_banks && ss->bank_pos[b] >= TokPos::after(TokCount{(int)(j - i)});
-        if (parked) parked = ops->trunk_rows(s, rows[j - 1], 1u, pend, (uint64_t)b * cb);
+        if (parked) parked = ops->trunk_rows(s, rows[j - 1], 1u, pend, cb.times(b));
         if (b < ss->n_banks) l->pend_pos[b] = parked ? ss->bank_pos[b] - TokCount{1} : TokPos::none();
         ok = ok && parked;
         i = j;
@@ -327,7 +327,7 @@ static bool mtp_draft_chains(pulsar_session *s, const BankId *banks, uint64_t *c
         return false;
     }
     const pulsar_mtp_ops *ops = l->ops;
-    const TensorBytes cb = TensorBytes{l->cond_bytes};
+    const TensorBytes cb = l->cond_bytes;
     const float tau = pulsar_spec_tau(e);
     pulsar_gpu_tensor *pend = pend_tensor(s);
     if (n > PULSAR_DRIVER_HEADS_MAX || !pend) {

@@ -19,9 +19,9 @@ static uint32_t mask_words(const pulsar_session *s) { return ((uint32_t)s->engin
 
 /* dev.out: the sample outs, the walk outs, then a digest word */
 /// @return the byte offset of dev.out's digest word (8-aligned)
-static uint64_t dev_digest_off() {
-    return ((uint64_t)PULSAR_GPU_SAMPLE_ROWS_MAX * (sizeof(pulsar_gpu_sample_out) + sizeof(pulsar_gpu_spec_walk_out)) +
-            7u) & ~7ull;
+static SlabOff dev_digest_off() {
+    return SlabOff::after(pulsar_bytes_align(
+            elt_bytes(PULSAR_GPU_SAMPLE_ROWS_MAX, sizeof(pulsar_gpu_sample_out) + sizeof(pulsar_gpu_spec_walk_out)), 8u));
 }
 
 /* The device buffers, allocated with the session (session_build: priced with it). */
@@ -34,7 +34,7 @@ bool pulsar_session_dev_alloc(pulsar_session *s, uint32_t n_banks) {
     /* the sampler's scratch, the logprob passes' too (one stream: never both at once) */
     d.scratch = pulsar_gpu_tensor_alloc(
             TensorBytes{std::max(pulsar_gpu_sample_scratch_bytes(W), pulsar_gpu_logprobs_scratch_bytes(W))});
-    d.out = pulsar_gpu_tensor_alloc(TensorBytes{dev_digest_off() + sizeof(uint64_t)});
+    d.out = pulsar_gpu_tensor_alloc((dev_digest_off() + bytes_of<uint64_t>(1)).before());
     d.mask = pulsar_gpu_tensor_alloc(bytes_of<uint32_t>((uint64_t)PULSAR_GPU_SAMPLE_ROWS_MAX * mask_words(s)));
     d.lp = pulsar_gpu_tensor_alloc(bytes_of<pulsar_gpu_logprob_row>(PULSAR_GPU_SAMPLE_ROWS_MAX));
     d.bank_valid = (bool *)xcalloc(d.n_banks, sizeof(bool));   /* L375: no bank holds a row yet */
@@ -77,9 +77,9 @@ bool pulsar_session::live_from_rows(const pulsar_gpu_tensor *rows, uint32_t row)
 }
 
 bool pulsar_session::live_from_host(const float *row) {
-    const uint64_t rb = (uint64_t)engine->logits_width() * sizeof(float);
-    if (row != logits) memcpy(logits, row, rb);
-    if (!pulsar_gpu_tensor_write(dev.live, TensorBytes{0}, logits, TensorBytes{rb})) return false;
+    const TensorBytes rb = bytes_of<float>((uint64_t)engine->logits_width());
+    if (row != logits) memcpy(logits, row, rb.raw());
+    if (!pulsar_gpu_tensor_write(dev.live, TensorBytes{0}, logits, rb)) return false;
     dev.host_stale = false;
     dev.live_valid = true;
     return true;
@@ -217,11 +217,11 @@ bool pulsar_session::draw_rows(const pulsar_gpu_tensor *rows, const uint32_t *ro
 
 /* a block drafter's sampled chains, every slot's draw on the device (pulsar_gpu_sample_chains): one launch, one
  * readback of n * slots tokens */
-bool pulsar_session::draw_chains(const pulsar_gpu_tensor *cand, uint64_t cand_off, const pulsar_gpu_tensor *scores,
-                                 uint64_t scores_off, uint32_t slots, uint32_t topk, uint32_t vocab,
+bool pulsar_session::draw_chains(const pulsar_gpu_tensor *cand, SlabOff cand_off, const pulsar_gpu_tensor *scores,
+                                 SlabOff scores_off, uint32_t slots, uint32_t topk, uint32_t vocab,
                                  const pulsar_gpu_chain_req *reqs, uint32_t n, int32_t *tokens) {
-    return pulsar_gpu_sample_chains(cand, cand_off, scores, scores_off, slots, topk, vocab, reqs, n, dev.chain_out,
-                                    0) &&
+    return pulsar_gpu_sample_chains(cand, cand_off.raw(), scores, scores_off.raw(), slots, topk, vocab, reqs, n,
+                                    dev.chain_out, 0) &&   /* raw at the launcher */
            pulsar_gpu_tensor_read(dev.chain_out, TensorBytes{0}, tokens, bytes_of<int32_t>((uint64_t)n * slots));
 }
 
@@ -380,8 +380,8 @@ int pulsar_session::step_row_logprobs(uint32_t row, int token, pulsar_token_scor
 
 bool pulsar_session::rows_digest(const pulsar_gpu_tensor *rows, uint32_t row0, uint32_t n, uint64_t *out) {
     const uint32_t W = (uint32_t)engine->logits_width();
-    if (!rows || !pulsar_gpu_rows_digest(rows, (uint64_t)row0 * W * sizeof(float), n, W, dev.out, dev_digest_off()) ||
-        !pulsar_gpu_tensor_read(dev.out, TensorBytes{dev_digest_off()}, out, TensorBytes{sizeof(*out)})) {
+    if (!rows || !pulsar_gpu_rows_digest(rows, (uint64_t)row0 * W * sizeof(float), n, W, dev.out, dev_digest_off().raw()) ||   /* raw at the launcher */
+        !pulsar_gpu_tensor_read(dev.out, dev_digest_off().before(), out, TensorBytes{sizeof(*out)})) {
         fprintf(stderr, "pulsar: session: the rows' digest failed\n");
         return false;
     }

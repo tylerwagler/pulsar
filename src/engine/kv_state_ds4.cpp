@@ -58,20 +58,20 @@ static pulsar_gpu_graph *G_(void *state) { return (pulsar_gpu_graph *)state; }
 /// @param G_at      the position walked
 /// @param bytes_out receives the layout's size in bytes when non-NULL
 /// @return false when a copy failed
-static bool ds4_walk(void *state, int dir, bool frontier, pulsar_gpu_tensor *slab, uint64_t slot_off, TokPos G_at,
-                     uint64_t *bytes_out) {
+static bool ds4_walk(void *state, int dir, bool frontier, pulsar_gpu_tensor *slab, SlabOff slot_off, TokPos G_at,
+                     TensorBytes *bytes_out) {
     pulsar_gpu_graph *g = G_(state);
     const uint32_t G = pulsar_ckpt_raw(G_at);   /* the raw ring's offsets are tokens */
-    const TensorBytes raw_row{pulsar_kv_row_bytes(PULSAR_KV_ROW_RING)};
+    const TensorBytes raw_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_RING);
     const uint32_t W = g->raw_window;
-    TensorBytes off{slot_off};
+    SlabOff off = slot_off;   /* the walk's cursor in `slab` */
     bool ok = true;
     /* one device lane, whole */
     auto lane = [&](pulsar_gpu_tensor *t) {
         if (!t || !ok) return;
         const TensorBytes lb = pulsar_gpu_tensor_bytes(t);
-        if (dir == 0) ok = pulsar_gpu_tensor_copy_async(slab, off, t, TensorBytes{0}, lb) != 0;
-        else if (dir > 0) ok = pulsar_gpu_tensor_copy_async(t, TensorBytes{0}, slab, off, lb) != 0;
+        if (dir == 0) ok = pulsar_gpu_tensor_copy_async(slab, off.before(), t, TensorBytes{0}, lb) != 0;
+        else if (dir > 0) ok = pulsar_gpu_tensor_copy_async(t, TensorBytes{0}, slab, off.before(), lb) != 0;
         off += lb;
     };
     /* The window's positions [G - n, G): the first one's slot in the ring, and how many run before the wrap. */
@@ -80,7 +80,7 @@ static bool ds4_walk(void *state, int dir, bool frontier, pulsar_gpu_tensor *sla
     const uint32_t run = (g->raw_cap - first) < n ? (g->raw_cap - first) : n;
     for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER) && ok; ++il) {
         pulsar_gpu_tensor *raw = g->layer_raw_cache[il];
-        const TensorBytes at = off + raw_row.times(skip);
+        const TensorBytes at = (off + raw_row.times(skip)).before();
         if (dir == 0 && n) {
             ok = pulsar_gpu_tensor_copy_async(slab, at, raw, raw_row.times(first), raw_row.times(run)) != 0 &&
                  (run == n || pulsar_gpu_tensor_copy_async(slab, at + raw_row.times(run), raw, TensorBytes{0},
@@ -110,9 +110,9 @@ static bool ds4_walk(void *state, int dir, bool frontier, pulsar_gpu_tensor *sla
         }
         uint32_t c[5] = { g->dspark_n_raw[DraftLayer{0}], g->dspark_n_raw[DraftLayer{1}], g->dspark_n_raw[DraftLayer{2}], g->dspark_prompt_n,
                           g->dspark_prompt_lo };
-        if (ok && dir == 0) ok = pulsar_gpu_tensor_write(slab, off, c, TensorBytes{sizeof(c)}) != 0;
+        if (ok && dir == 0) ok = pulsar_gpu_tensor_write(slab, off.before(), c, TensorBytes{sizeof(c)}) != 0;
         else if (ok && dir > 0) {
-            ok = pulsar_gpu_tensor_read(slab, off, c, TensorBytes{sizeof(c)}) != 0;
+            ok = pulsar_gpu_tensor_read(slab, off.before(), c, TensorBytes{sizeof(c)}) != 0;
             for (int i = 0; ok && i < 3; i++) g->dspark_n_raw[DraftLayer{i}] = c[i];
             if (ok) { g->dspark_prompt_n = c[3]; g->dspark_prompt_lo = c[4]; }
         }
@@ -125,12 +125,14 @@ static bool ds4_walk(void *state, int dir, bool frontier, pulsar_gpu_tensor *sla
         uint32_t *pos = g->engram.ring_pos + (size_t)bank * PULSAR_ENGRAM_RING;
         const TensorBytes tb = bytes_of<int32_t>(PULSAR_ENGRAM_RING), pb = bytes_of<uint32_t>(PULSAR_ENGRAM_RING);
         if (ok && dir == 0)
-            ok = pulsar_gpu_tensor_write(slab, off, tok, tb) != 0 && pulsar_gpu_tensor_write(slab, off + tb, pos, pb) != 0;
+            ok = pulsar_gpu_tensor_write(slab, off.before(), tok, tb) != 0 &&
+                 pulsar_gpu_tensor_write(slab, (off + tb).before(), pos, pb) != 0;
         else if (ok && dir > 0)
-            ok = pulsar_gpu_tensor_read(slab, off, tok, tb) != 0 && pulsar_gpu_tensor_read(slab, off + tb, pos, pb) != 0;
+            ok = pulsar_gpu_tensor_read(slab, off.before(), tok, tb) != 0 &&
+                 pulsar_gpu_tensor_read(slab, (off + tb).before(), pos, pb) != 0;
         off += tb + pb;
     }
-    if (bytes_out) *bytes_out = (off - TensorBytes{slot_off}).raw();
+    if (bytes_out) *bytes_out = off - slot_off;
     return ok;
 }
 

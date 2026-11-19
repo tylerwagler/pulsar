@@ -4359,6 +4359,47 @@ static void test_l426_content_digest(void) {
     TEST_ASSERT(rmdir(root) == 0);
 }
 
+/* L438: the slab and file offsets are the uint64_t they replaced -- every operation computes what the raw expression
+ * did -- and a slab offset meets a pointer, and bytes round up, by name only. */
+static_assert(!std::is_constructible_v<SlabOff, TensorBytes> && !std::is_constructible_v<TensorBytes, SlabOff> &&
+                  !std::is_constructible_v<FileOff, SlabOff> && !std::is_constructible_v<SlabOff, FileOff> &&
+                  !std::is_constructible_v<FileOff, TensorBytes> && !std::is_convertible_v<uint64_t, SlabOff> &&
+                  !std::is_convertible_v<FileOff, uint64_t> && !std::is_constructible_v<SlabOff, double> &&
+                  !std::is_constructible_v<FileOff, bool>,
+              "L438: an offset is no size, no offset of the other space and no bare integer");
+static_assert(std::is_constructible_v<SlabOff, uint64_t> && std::is_constructible_v<FileOff, int>,
+              "L438: an offset enters from an integer by name (a constant, a header field)");
+static void test_l438_byte_offsets(void) {
+    const uint64_t vals[] = {0, 1, 255, 256, 257, 4096, 1ull << 20, 1ull << 40, UINT64_MAX / 4};
+    for (uint64_t a : vals) {
+        TEST_ASSERT(SlabOff{a}.raw() == a && FileOff{a}.raw() == a && SlabOff{a}.before() == TensorBytes{a});
+        TEST_ASSERT(SlabOff::after(TensorBytes{a}).raw() == a && FileOff::after(TensorBytes{a}).before().raw() == a);
+        TEST_ASSERT(pulsar_bytes_align(TensorBytes{a}, 256u).raw() == ((a + 255u) & ~(uint64_t)255u));
+        TEST_ASSERT(pulsar_bytes_align(TensorBytes{a}, 1u).raw() == a);
+        for (uint64_t b : vals) {
+            const SlabOff x{a}, y{b};
+            const FileOff fx{a}, fy{b};
+            TEST_ASSERT((x < y) == (a < b) && (x <= y) == (a <= b) && (x == y) == (a == b) && (fx > fy) == (a > b));
+            TEST_ASSERT((x + TensorBytes{b}).raw() == a + b && (fx + TensorBytes{b}).raw() == a + b);
+            SlabOff z = x;
+            z += TensorBytes{b};
+            TEST_ASSERT(z.raw() == a + b && (z - x) == TensorBytes{b});
+            z -= TensorBytes{b};
+            TEST_ASSERT(z == x);
+            if (a >= b) TEST_ASSERT((x - y).raw() == a - b && (fx - fy).raw() == a - b && (fx - TensorBytes{b}).raw() == a - b);
+        }
+    }
+    TEST_ASSERT(SlabOff{}.raw() == 0 && FileOff{}.raw() == 0);   /* value-initialised: zero, as the integer was */
+    pulsar_ckpt_slot_at at;
+    memset((void *)&at, 0, sizeof at);                           /* zeroed whole: offset 0 */
+    TEST_ASSERT(at.off == SlabOff{0});
+    uint8_t slab[64];
+    TEST_ASSERT(pulsar_slab_at(slab, SlabOff{0}) == slab && pulsar_slab_at<uint32_t>(slab, SlabOff{16}) == (uint32_t *)(slab + 16));
+    const uint8_t *ro = slab;
+    TEST_ASSERT(pulsar_slab_at<const uint16_t>(ro, SlabOff{6}) == (const uint16_t *)(slab + 6));
+    TEST_ASSERT(kv_bytes_of(TensorBytes{12345}) == KvBytes{12345});   /* the one crossing into the KV price */
+}
+
 /** The vocabulary of the L426 identity test's tokenizer: the engine under test reads it through its hooks. */
 static std::vector<std::string> g_l426_vocab;
 /** pulsar_family::model_id of the L426 test family.  @return 2 */
@@ -4441,8 +4482,10 @@ static void test_l426_engine_identity(void) {
 
 /* L426: the host-only group the check tier runs (make kv-identity-gate): the content digest on synthetic containers,
  * the engine's identity over it, then the store's side -- another weights or tokenizer word is another identity, set
- * aside and said once (server_tests.cpp), and the arithmetic words as before (L386). */
+ * aside and said once (server_tests.cpp), and the arithmetic words as before (L386); first (L438) the slab and file
+ * offsets the layouts and the content sample are typed with. */
 static void test_kv_identity(void) {
+    test_l438_byte_offsets();
     test_l426_content_digest();
     test_l426_engine_identity();
     test_l426_kv_identity_weights();
@@ -5498,8 +5541,8 @@ static void test_state_plan_overflow(void) {
     p.ckpt_slots = 1u;
     p.n_slots = 1u;
     p.n_trunk = 1u;
-    const pulsar_state_decl d{"fixed", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_NONE, false, false, 0, 16, 0, 0,
-                              NULL, NULL, NULL};
+    const pulsar_state_decl d{"fixed", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_NONE, false, false, 0, TensorBytes{16},
+                              TensorBytes{}, SlabOff{}, NULL, NULL, NULL};
     for (uint32_t i = 0; i < PULSAR_STATE_DECLS_MAX; i++) {
         const uint32_t id = pulsar_state_plan_add(&p, d);
         TEST_ASSERT(id == i);
@@ -5941,8 +5984,8 @@ static void test_fused_sched(void) {
 
 /* L311: the record pool and the endpoint cut, host only -- a fake kv-state whose walk moves no byte (every slab NULL,
  * every record's capacity above the walk's size, so nothing allocates), on a split-invariant grid of 128. */
-static bool fake_walk(void *, int, bool, pulsar_gpu_tensor *, uint64_t, TokPos, uint64_t *bytes) {
-    if (bytes) *bytes = 1024;
+static bool fake_walk(void *, int, bool, pulsar_gpu_tensor *, SlabOff, TokPos, TensorBytes *bytes) {
+    if (bytes) *bytes = TensorBytes{1024};
     return true;
 }
 static TokPos fake_min_ckpt(void *) { return pulsar_ckpt_pos(1u); }
@@ -5954,7 +5997,7 @@ static bool fake_install(void *, TokPos, TokCount) { return true; }
 static pulsar_gpu_tensor *fake_rows[3];
 static uint32_t fake_bank_pools(void *, BankId bank, pulsar_kv_pool *out, uint32_t cap) {
     if (!bank.below(3u) || cap < 1u || !fake_rows[pulsar_bank_index(bank)]) return 0u;
-    out[0] = {fake_rows[pulsar_bank_index(bank)], TokPerRow{1u}, 16u, false};
+    out[0] = {fake_rows[pulsar_bank_index(bank)], TokPerRow{1u}, TensorBytes{16u}, false};
     return 1u;
 }
 
@@ -5964,14 +6007,14 @@ struct ckpt_tier_state {
     pulsar_gpu_tensor *t;   ///< the "state": what a walk copies
     uint64_t n;             ///< its bytes
 };
-static bool tier_walk(void *state, int dir, bool, pulsar_gpu_tensor *slab, uint64_t off, TokPos, uint64_t *bytes) {
+static bool tier_walk(void *state, int dir, bool, pulsar_gpu_tensor *slab, SlabOff off, TokPos, TensorBytes *bytes) {
     const ckpt_tier_state *ts = (const ckpt_tier_state *)state;
     if (dir < 0) {
-        *bytes = ts->n;
+        *bytes = TensorBytes{ts->n};
         return true;
     }
-    return (dir == 0 ? pulsar_gpu_tensor_copy_async(slab, TensorBytes{off}, ts->t, TensorBytes{0}, TensorBytes{ts->n})
-                     : pulsar_gpu_tensor_copy_async(ts->t, TensorBytes{0}, slab, TensorBytes{off},
+    return (dir == 0 ? pulsar_gpu_tensor_copy_async(slab, off.before(), ts->t, TensorBytes{0}, TensorBytes{ts->n})
+                     : pulsar_gpu_tensor_copy_async(ts->t, TensorBytes{0}, slab, off.before(),
                                                     TensorBytes{ts->n})) != 0;
 }
 static TokPos tier_min_ckpt(void *) { return pulsar_ckpt_pos(128u); }
@@ -6025,7 +6068,7 @@ static void test_ckpt_host_tier(void) {
             TensorBytes priced{0};
             pulsar_gpu_tensor_dry_end(&priced, NULL);
             price[host][nb - 1u] = priced.raw();
-            TEST_ASSERT(st->lane == NULL && pulsar_ckpt_host_bytes(st) == 0u);   /* a price pins nothing */
+            TEST_ASSERT(st->lane == NULL && pulsar_ckpt_host_bytes(st) == TensorBytes{});   /* a price pins nothing */
             pulsar_ckpt_release(st);
             free(st);
         }
@@ -6049,11 +6092,11 @@ static void test_ckpt_host_tier(void) {
         TEST_ASSERT(pulsar_ckpt_alloc(st, &ops, &ts, 2u));
         if (integrated) {   /* GB10: the device tier, exactly as before I4 */
             TEST_ASSERT(!st->host && st->lane == NULL && st->slab[0] && st->slab[1] && !st->host_slab[0] &&
-                        !st->stage[0] && st->rec[0].slab && !st->rec[0].host && pulsar_ckpt_host_bytes(st) == 0u);
+                        !st->stage[0] && st->rec[0].slab && !st->rec[0].host && pulsar_ckpt_host_bytes(st) == TensorBytes{});
         } else {
             TEST_ASSERT(st->host && st->lane && !st->slab[0] && st->host_slab[0] && st->host_slab[1] && st->stage[0] &&
                         st->rec[0].host && !st->rec[0].slab &&
-                        pulsar_ckpt_host_bytes(st) == (2u * 2u + pulsar_ckpt_records_for(2)) * st->slot_bytes);
+                        pulsar_ckpt_host_bytes(st) == st->slot_bytes.times(2u * 2u + pulsar_ckpt_records_for(2)));
         }
         printf("  L347 I4 placement: %s GPU -> %s tier\n", integrated ? "integrated" : "discrete",
                st->host ? "host" : "device");
@@ -6064,7 +6107,7 @@ static void test_ckpt_host_tier(void) {
     std::vector<uint8_t> fill(n), got(n);
     for (int host = 0; host < 2; host++) {
         pulsar_ckpt_store *st = (pulsar_ckpt_store *)calloc(1, sizeof(pulsar_ckpt_store));
-        TEST_ASSERT(pulsar_ckpt_alloc_tier(st, &ops, &ts, 1u, host != 0) && st->slot_bytes == n);
+        TEST_ASSERT(pulsar_ckpt_alloc_tier(st, &ops, &ts, 1u, host != 0) && st->slot_bytes == TensorBytes{n});
         pulsar_ckpt_slot_at at;
         /* two captures, the second queued while the first's copy may still run */
         tier_fill(&ts, fill, 1);
@@ -6302,7 +6345,7 @@ static void test_ckpt_records(void) {
     /* the pool's size: two for one bank, n + n / 2 above that */
     TEST_ASSERT(pulsar_ckpt_records_for(1) == 2u && pulsar_ckpt_records_for(4) == 6u && pulsar_ckpt_records_for(16) == 24u);
     st->n_rec = pulsar_ckpt_records_for(2);   /* 3 records for 2 banks */
-    for (uint32_t i = 0; i < st->n_rec; i++) st->rec[i].cap = 1u << 20;
+    for (uint32_t i = 0; i < st->n_rec; i++) st->rec[i].cap = TensorBytes{1u << 20};
     TokId toks[600];
     for (int i = 0; i < 600; i++) toks[i] = TokId{1000 + i};
     float lg[4] = {1, 2, 3, 4}, out[4] = {0};
@@ -6424,7 +6467,7 @@ static void test_ckpt_records(void) {
      * evicts another record (it evicted the record bank 1 was just served from). */
     pulsar_gpu_tensor_dry_begin();
     for (uint32_t b = 0; b < 3u; b++) fake_rows[b] = pulsar_gpu_tensor_alloc(TensorBytes{600u * 16u});
-    for (uint32_t i = 0; i < st->n_rec; i++) st->rec[i].slab = pulsar_gpu_tensor_alloc(TensorBytes{st->rec[i].cap});
+    for (uint32_t i = 0; i < st->n_rec; i++) st->rec[i].slab = pulsar_gpu_tensor_alloc(st->rec[i].cap);
     pulsar_gpu_tensor_dry_end(NULL, NULL);
     ops.bank_pools = fake_bank_pools;
     /* the oldest */

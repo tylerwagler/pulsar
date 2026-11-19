@@ -119,8 +119,8 @@ int pulsar_driver_session_create(pulsar_session *s, uint32_t n_banks) {
     if (ok) ok = (s->states = pulsar_state_create(e, &e->state_plan, d, n_banks, (uint32_t)s->ctx_size,
                                                   verifies ? PULSAR_STATE_VERIFY_ROWS : 0u)) != NULL;
     for (uint32_t a = 0; ok && a < ops->n_scratch; a++) {
-        const uint64_t b = ops->scratch_bytes(a, d->max_rows, s->states->ctx);
-        if (b) ok = (d->scratch[a] = pulsar_gpu_tensor_alloc(TensorBytes{b})) != NULL;
+        const TensorBytes b = ops->scratch_bytes(a, d->max_rows, s->states->ctx);
+        if (b != TensorBytes{}) ok = (d->scratch[a] = pulsar_gpu_tensor_alloc(b)) != NULL;
     }
     /* L266 step 7: under TP, the row all-reduce's stage ticket (one u32) and the vocab gather's own slice (its row
      * lane's; sized whatever the transport, so the price holds) -- allocated here so the dry run prices them */
@@ -156,8 +156,8 @@ int pulsar_driver_session_create(pulsar_session *s, uint32_t n_banks) {
         for (uint32_t k = 0; k < p->n_slots; k++)
             for (uint32_t id = 0; id < p->n_decl; id++) {
                 if (!(p->slot[LayerSlot{k}] >> id & 1u)) continue;
-                if (p->decl[id].kind == PULSAR_STATE_POOL) per_token += (double)p->decl[id].bytes / p->decl[id].tokens;
-                else fixed += (double)pulsar_state_decl_bank_bytes(&p->decl[id]);
+                if (p->decl[id].kind == PULSAR_STATE_POOL) per_token += (double)p->decl[id].bytes.raw() / p->decl[id].tokens;
+                else fixed += (double)pulsar_state_decl_bank_bytes(&p->decl[id]).raw();
             }
         fprintf(stderr, "pulsar: %s session: %u bank(s) x %d tokens, %u-row steps "
                         "(%.1f MiB fixed per bank + %.1f KiB per token)\n",
