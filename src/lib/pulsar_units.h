@@ -1,6 +1,6 @@
 /** @file
  *  Typed quantities that share a raw integer type but must never mix (L333, L334): KvRows, KvBytes, TokCount,
- *  PromptToks, TokPos, the P2b index spaces, TokId, BankId, TensorBytes, TextBytes */
+ *  PromptToks, TokPos, the P2b index spaces, TokId, BankId, TensorBytes, TextBytes, the layer index spaces (L436) */
 #ifndef PULSAR_UNITS_H
 #define PULSAR_UNITS_H
 
@@ -551,5 +551,157 @@ typedef pulsar_unit<pulsar_text_bytes_tag> TextBytes;
 
 static_assert(sizeof(TextBytes) == sizeof(uint64_t) && std::is_trivial<TextBytes>::value,
               "text bytes are as cheap as the uint64_t they replace");
+
+/* ---- L436: layer index spaces -------------------------------------------------------------------------------------
+ * "Layer" names several numberings that were all uint32_t `il` / `li` / `l` / `layer` / `slot`, side by side in the
+ * same signatures and the same loops (L236#2: a drafter's own layer 0..2 indexed the TRUNK's expert-count table).
+ * Each is its own index type; none converts to another, to a unit above or to an integer without a name:
+ *
+ *   TrunkLayer  a layer of the model's layer plan (family.h pulsar_layer_plan: 0 .. n_layer - 1) -- what the step
+ *               driver dispatches on, a family's shape bit masks and per-layer weights, a drafter's tap point.
+ *   LayerSlot   a layer slot of the declared state (state_kinds.h pulsar_state_plan): the trunk's layers in order,
+ *               then a drafter's ([0, n_trunk) and [n_trunk, n_slots)).  What a state tensor, a KV pool and a
+ *               capture are addressed by, and what a forward that runs a drafter's layer through the trunk's code
+ *               carries (Qwen's MTP layer, Nemotron-H's MTP module).
+ *   DraftLayer  a drafter's OWN layer or module (a block drafter's layer, the chained-MTP lane's module, DeepSeek's
+ *               DSpark layer): it starts at 0 again, so it is never a trunk layer.
+ *   SrcBlock    a block in the source checkpoint's own numbering, as a drafter's config names its taps: equal to
+ *               the trunk layer where the checkpoint's blocks are the plan's layers (Qwen, Gemma 4), a table where
+ *               the plan groups blocks into layers (Nemotron-H: a mixer block and its MoE block are one layer).
+ *   KindOrd     a layer's ordinal among the layers of one KIND (the n-th attention layer of a Mamba / attention
+ *               interleave, the n-th slot carrying a state declaration, the n-th Engram layer): the index of
+ *               per-kind storage that is compacted over the kind.  One type for every kind: each ordinal lives in
+ *               one module beside the one table that produces it, and no two kinds' ordinals meet.
+ *   VisLayer    a block of a vision tower (the shared ViT encoder, Qwen's and DeepSeek's towers): its own depth, its
+ *               own weights, beside a decoder's trunk layers in the same family files.
+ *   TpSlot      a layer's exchange slot in the tensor-parallel slab (pulsar_tp.h's `layer`, the frame's field on the
+ *               wire): the engine's side of the transport boundary, which keeps the raw number.
+ *
+ * An index, not a quantity: no sum of two, no scaling.  It orders (a loop's bound, "the next layer"), steps by one
+ * (++, next()), and is asked against a COUNT by name (below(n): the bound is the owner's -- the plan's n_layer, the
+ * state plan's n_slots; last_of(n)).  none() is the unsigned all-ones the uint32 fields carried for "no layer"
+ * (UINT32_MAX); ordering and stepping on it abort (rule 9), == / != / is_none() ask it.  The crossings between
+ * spaces are named functions owned by whoever owns the relation: the state layout (state_kinds.h
+ * pulsar_layer_slot_of, pulsar_drafter_slot, pulsar_slot_trunk_layer), a family's shape (its SrcBlock -> TrunkLayer,
+ * its kind ordinals), the step driver (pulsar_tp_slot_of).  .raw() is for where the number leaves the type system:
+ * an array subscript in the space's own table, a kernel launch, a tensor's name, a printf, a file or wire field. */
+
+/** An index's misuse -- ordering or stepping on none(): a programmer error, fatal (rule 9).
+ *  @param what the operation refused */
+[[noreturn]] inline void pulsar_index_fail(const char *what) {
+    fprintf(stderr, "pulsar: %s on a layer index that is none()\n", what);
+    abort();
+}
+
+/** An index into the space named by `Tag`, held as an unsigned `Rep` (the uint32_t it replaces): explicit in, .raw()
+ *  out, ordered and stepped within its own space only (L436). */
+template <class Tag, class Rep = uint32_t>
+class pulsar_index {
+    static_assert(std::is_unsigned<Rep>::value && !std::is_same<Rep, bool>::value,
+                  "an index is held unsigned: none() is all ones");
+    /// The raw value of none().
+    static constexpr Rep kNone = std::numeric_limits<Rep>::max();
+
+    /** Abort when this is none(). @param what the operation */
+    constexpr void live(const char *what) const {
+        if (v_ == kNone) pulsar_index_fail(what);
+    }
+
+public:
+    /** Uninitialised, as the integer it replaces (value-initialise for index 0). */
+    pulsar_index() = default;
+    /** Enter from a raw integer (explicit only; bool and floating point are refused; all ones enters as none()).
+     *  @param v the raw index, converted to `Rep` exactly as an assignment to the old field was */
+    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    constexpr explicit pulsar_index(I v) : v_(static_cast<Rep>(v)) {}
+    /** No index (UINT32_MAX, the value the uint32 fields carried). */
+    /// @return the none() sentinel
+    static constexpr pulsar_index none() { return pulsar_index(kNone); }
+    /** Is this none()? */
+    /// @return true for none()
+    constexpr bool is_none() const { return v_ == kNone; }
+    /** The raw index, where it leaves the type system: a subscript of the space's own table, a kernel launch, a
+     *  tensor's name, printf, a file or wire field. */
+    /// @return the index as `Rep` (none() as all ones)
+    constexpr Rep raw() const { return v_; }
+    /** Is this an index below `n` -- the owner's count (a plan's n_layer, a drafter's depth)?  The loop bound and the
+     *  range check: `il < n`.  none() is below nothing.
+     *  @param n the count */
+    /// @return true when index < n
+    constexpr bool below(Rep n) const { return v_ != kNone && v_ < n; }
+    /** Is this the last of `n` -- `il + 1 == n`?  (fatal on none())
+     *  @param n the count */
+    /// @return true when this is index n - 1
+    constexpr bool last_of(Rep n) const { return live("last_of(n)"), v_ + Rep(1) == n; }
+    /** The index after this one in the same space: `il + 1` (fatal on none()). */
+    /// @return the next index
+    constexpr pulsar_index next() const { return live("next()"), pulsar_index(v_ + Rep(1)); }
+    /** Step to the next index in place: `il++` (fatal on none()). */
+    /// @return `*this`
+    constexpr pulsar_index &operator++() { return live("++"), ++v_, *this; }
+
+    /** The same index (none() equals none() only). */
+    friend constexpr bool operator==(pulsar_index a, pulsar_index b) { return a.v_ == b.v_; }
+    /** Another index. */
+    friend constexpr bool operator!=(pulsar_index a, pulsar_index b) { return a.v_ != b.v_; }
+    /** Earlier (neither may be none()). */
+    friend constexpr bool operator<(pulsar_index a, pulsar_index b) {
+        return a.live("index < index"), b.live("index < index"), a.v_ < b.v_;
+    }
+    /** Earlier or the same (neither may be none()). */
+    friend constexpr bool operator<=(pulsar_index a, pulsar_index b) {
+        return a.live("index <= index"), b.live("index <= index"), a.v_ <= b.v_;
+    }
+    /** Later (neither may be none()). */
+    friend constexpr bool operator>(pulsar_index a, pulsar_index b) {
+        return a.live("index > index"), b.live("index > index"), a.v_ > b.v_;
+    }
+    /** Later or the same (neither may be none()). */
+    friend constexpr bool operator>=(pulsar_index a, pulsar_index b) {
+        return a.live("index >= index"), b.live("index >= index"), a.v_ >= b.v_;
+    }
+
+private:
+    Rep v_;  ///< the index; all ones = none()
+};
+
+/** Tag of TrunkLayer (never instantiated). */
+struct pulsar_trunk_layer_tag;
+/** Tag of LayerSlot (never instantiated). */
+struct pulsar_layer_slot_tag;
+/** Tag of DraftLayer (never instantiated). */
+struct pulsar_draft_layer_tag;
+/** Tag of SrcBlock (never instantiated). */
+struct pulsar_src_block_tag;
+/** Tag of KindOrd (never instantiated). */
+struct pulsar_kind_ord_tag;
+/** Tag of VisLayer (never instantiated). */
+struct pulsar_vis_layer_tag;
+/** Tag of TpSlot (never instantiated). */
+struct pulsar_tp_slot_tag;
+
+/** A layer of the model's layer plan, 0 .. n_layer - 1 (L436). */
+typedef pulsar_index<pulsar_trunk_layer_tag> TrunkLayer;
+/** A layer slot of the declared state: the trunk's layers, then a drafter's (L436). */
+typedef pulsar_index<pulsar_layer_slot_tag> LayerSlot;
+/** A drafter's own layer or module, from 0 (L436). */
+typedef pulsar_index<pulsar_draft_layer_tag> DraftLayer;
+/** A block in the source checkpoint's own numbering (a drafter's tap ids) (L436). */
+typedef pulsar_index<pulsar_src_block_tag> SrcBlock;
+/** A layer's ordinal among the layers of one kind: the index of storage compacted over the kind (L436). */
+typedef pulsar_index<pulsar_kind_ord_tag> KindOrd;
+/** A block of a vision tower (L436). */
+typedef pulsar_index<pulsar_vis_layer_tag> VisLayer;
+/** A layer's exchange slot in the tensor-parallel slab (L436). */
+typedef pulsar_index<pulsar_tp_slot_tag> TpSlot;
+
+static_assert(sizeof(TrunkLayer) == sizeof(uint32_t) && sizeof(LayerSlot) == sizeof(uint32_t) &&
+                  sizeof(DraftLayer) == sizeof(uint32_t) && sizeof(SrcBlock) == sizeof(uint32_t) &&
+                  sizeof(KindOrd) == sizeof(uint32_t) && sizeof(VisLayer) == sizeof(uint32_t) &&
+                  sizeof(TpSlot) == sizeof(uint32_t) && std::is_trivial<TrunkLayer>::value &&
+                  std::is_standard_layout<TrunkLayer>::value && std::is_trivial<LayerSlot>::value &&
+                  std::is_standard_layout<LayerSlot>::value,
+              "a layer index is as cheap as the uint32 it replaces (memset / calloc-safe; arrays of it are uint32 "
+              "arrays)");
 
 #endif
