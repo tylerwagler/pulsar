@@ -4292,23 +4292,25 @@ static bool l426_copy(const std::string &from, const std::string &to) {
 static void test_l426_content_digest(void) {
     const uint64_t B = PULSAR_CONTENT_SAMPLE_BLOCK, S = PULSAR_CONTENT_SAMPLE_STRIDE;
     {   /* the rule, no I/O */
+        const auto F = [](uint64_t o) { return FileOff{o}; };
+        const auto T = [](uint64_t b) { return TensorBytes{b}; };
         std::vector<pulsar_content_read> plan;
-        pulsar_content_sample(7, 1000, 2 * B, &plan);            /* two blocks: whole */
-        TEST_ASSERT(plan.size() == 2 && plan[0].off == 1000 && plan[0].bytes == B && plan[1].off == 1000 + B &&
+        pulsar_content_sample(7, F(1000), T(2 * B), &plan);            /* two blocks: whole */
+        TEST_ASSERT(plan.size() == 2 && plan[0].off == F(1000) && plan[0].bytes == B && plan[1].off == F(1000 + B) &&
                     plan[1].bytes == B && plan[0].fd == 7);
         plan.clear();
-        pulsar_content_sample(7, 0, B + 10, &plan);              /* a short tail is read to its end */
-        TEST_ASSERT(plan.size() == 2 && plan[1].off == B && plan[1].bytes == 10);
+        pulsar_content_sample(7, F(0), T(B + 10), &plan);              /* a short tail is read to its end */
+        TEST_ASSERT(plan.size() == 2 && plan[1].off == F(B) && plan[1].bytes == 10);
         plan.clear();
-        pulsar_content_sample(7, 0, 0, &plan);
+        pulsar_content_sample(7, F(0), T(0), &plan);
         TEST_ASSERT(plan.empty());
-        pulsar_content_sample(7, 64, 2 * B + 1, &plan);          /* past two blocks: the first and the last */
-        TEST_ASSERT(plan.size() == 2 && plan[0].off == 64 && plan[1].off == 64 + B + 1 && plan[1].bytes == B);
+        pulsar_content_sample(7, F(64), T(2 * B + 1), &plan);          /* past two blocks: the first and the last */
+        TEST_ASSERT(plan.size() == 2 && plan[0].off == F(64) && plan[1].off == F(64 + B + 1) && plan[1].bytes == B);
         plan.clear();
-        pulsar_content_sample(7, 0, 3 * S + 5, &plan);           /* and one per stride between, evenly */
-        TEST_ASSERT(plan.size() == 5 && plan[0].off == 0 && plan[4].off + B == 3 * S + 5);
+        pulsar_content_sample(7, F(0), T(3 * S + 5), &plan);           /* and one per stride between, evenly */
+        TEST_ASSERT(plan.size() == 5 && plan[0].off == F(0) && plan[4].off.raw() + B == 3 * S + 5);
         for (size_t i = 1; i < plan.size(); i++) {
-            const uint64_t gap = plan[i].off - plan[i - 1].off;
+            const uint64_t gap = (plan[i].off - plan[i - 1].off).raw();
             TEST_ASSERT(plan[i].bytes == B && gap >= (3 * S + 5 - B) / 4 && gap <= (3 * S + 5 - B) / 4 + 1);
         }
     }
@@ -6226,7 +6228,7 @@ static void test_read_ahead(void) {
     if (fp) fclose(fp);
     pulsar_engram_table tb;
     const char *paths[1] = {path};
-    const uint64_t base = 64;
+    const FileOff base{64};
     TEST_ASSERT(pulsar_engram_table_open_parts(&tb, 1, 1, paths, &base, NR, RB, NR));
     pulsar_engram_io *io = pulsar_engram_io_create(PULSAR_ENGRAM_IO_THREADS);
     TEST_ASSERT(io != NULL);

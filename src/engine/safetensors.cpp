@@ -124,8 +124,9 @@ static char *st_strdup(const char *s) {
 typedef struct {
     char *name;         /**< tensor name as it appears in the file */
     char *dtype;        /**< "U8", "BF16", ... */
-    /// data_offsets[0]: first byte, relative to the shard's data buffer; off1 is one past the last
-    uint64_t off0, off1;/**< data_offsets, relative to the shard's data buffer */
+    /// data_offsets[0]: first byte, relative to the shard's data buffer (L438: a distance from buf_off); off1 is one
+    /// past the last
+    TensorBytes off0, off1;/**< data_offsets, relative to the shard's data buffer */
 } st_tensor;
 
 /** One `__metadata__` string pair of a shard header. */
@@ -146,7 +147,7 @@ typedef struct {
     const uint8_t *map;
     /// file size in bytes (the mapping's length)
     uint64_t size;
-    uint64_t buf_off;       /**< 8 + header length: where data_offsets start */
+    FileOff buf_off;        /**< 8 + header length: where data_offsets start, in the file */
     /// the header's tensor entries
     st_tensor *tensors;
     /// entries in `tensors`
@@ -448,7 +449,7 @@ static void st_parse_header(st_shard *s) {
         st_die("safetensors: %s has an implausible header length (%llu)",
                s->name, (unsigned long long)hlen);
     }
-    s->buf_off = 8 + hlen;
+    s->buf_off = FileOff{8 + hlen};
 
     /* The header is padded with SPACES for alignment, not NUL-terminated, so
      * copy it once and terminate it: the scanner walks a C string. */
@@ -530,11 +531,11 @@ static void st_parse_header(st_shard *s) {
             if (!st_obj_key(&q, "data_offsets") || !st_u64_array(&q, off, &no, 2) || no != 2) {
                 st_die("safetensors: %s: %s has bad data_offsets", s->name, key);
             }
-            if (off[1] < off[0] || off[1] > s->size - s->buf_off) {
+            if (off[1] < off[0] || off[1] > s->size - s->buf_off.raw()) {
                 st_die("safetensors: %s: %s data_offsets are outside the file", s->name, key);
             }
-            t->off0 = off[0];
-            t->off1 = off[1];
+            t->off0 = TensorBytes{off[0]};   /* the header's data_offsets: distances from the data buffer */
+            t->off1 = TensorBytes{off[1]};
             s->n_tensors++;
 
             if (!json_skip_value(&p)) st_die("safetensors: %s: %s is malformed", s->name, key);
@@ -669,11 +670,11 @@ static pulsar_tensor *dir_add(st_dir *d) {
 /// @param nd dims
 /// @param base the shard mapping
 /// @param shard_size its length
-/// @param abs_offset payload offset in the shard
+/// @param at the payload's first byte, in the shard's file
 /// @param bytes payload bytes
 static void dir_push(st_dir *d, const char *gguf_name, uint32_t type,
                      const uint64_t *dim, uint32_t nd, const uint8_t *base,
-                     uint64_t shard_size, uint64_t abs_offset, uint64_t bytes) {
+                     uint64_t shard_size, FileOff at, TensorBytes bytes) {
     pulsar_tensor *t = dir_add(d);
     /* The name is the engine's CANONICAL tensor name (blk.N.* / dspark.N.*),
      * borrowed from the declaration text but kept alive for the model's
@@ -685,10 +686,10 @@ static void dir_push(st_dir *d, const char *gguf_name, uint32_t type,
     for (uint32_t i = 0; i < nd; i++) t->dim[i] = dim[i];
     t->type = type;
     t->rel_offset = 0;
-    t->abs_offset = abs_offset;
+    t->abs_offset = at.raw();   /* L438: the shard is mapped whole (st_shard::map): its file offset is its map offset */
     t->elements = 1;
     for (uint32_t i = 0; i < nd; i++) t->elements = st_mul(t->elements, dim[i]);
-    t->bytes = bytes;
+    t->bytes = bytes.raw();   /* pulsar_tensor::bytes stays a bare count (read in ~90 places, L438's left-raw list) */
     t->ext_map = base;
     t->ext_size = shard_size;
 }
@@ -774,14 +775,12 @@ static void st_add_declared(st_dir *d, st_shard *s) {
                 st_die("safetensors: %s: %s is layout %s but stored as %s, not %s -- the container disagrees with itself",
                        s->name, hf, layout, ft->dtype, want_dtype);
         }
-        uint64_t want = st_bytes_for(type, dim, nd);
-        if (want != ft->off1 - ft->off0) {
+        const TensorBytes want{st_bytes_for(type, dim, nd)}, held = ft->off1 - ft->off0;
+        if (want != held) {
             st_die("safetensors: %s: %s declares %llu bytes but holds %llu",
-                   s->name, hf, (unsigned long long)want,
-                   (unsigned long long)(ft->off1 - ft->off0));
+                   s->name, hf, (unsigned long long)want.raw(), (unsigned long long)held.raw());
         }
-        dir_push(d, gguf_name, type, dim, nd, s->map, s->size,
-                 s->buf_off + ft->off0, want);
+        dir_push(d, gguf_name, type, dim, nd, s->map, s->size, s->buf_off + ft->off0, want);
         st_bind_record(&d->v[d->n - 1], p, gguf_name);
         free(hf);
         free(layout);
@@ -860,7 +859,8 @@ static void st_add_expert_stacks(st_dir *d, st_shard *s) {
         /* The per-expert tensors must be contiguous in expert order: the
          * kernels address them as base + xid * expert_bytes from ONE pointer, so
          * a gap or a reordering here would silently read the wrong expert. */
-        uint64_t first_off = 0;
+        const TensorBytes stride{expert_bytes};   /* the declaration's: one expert's stored bytes */
+        TensorBytes first_off{};
         for (uint64_t e = 0; e < n_experts; e++) {
             char tn[256];
             if (entry_name) {
@@ -873,20 +873,20 @@ static void st_add_expert_stacks(st_dir *d, st_shard *s) {
             }
             const st_tensor *ft = st_tensor_find(s, tn);
             if (!ft) st_die("safetensors: %s: missing %s", s->name, tn);
-            if (ft->off1 - ft->off0 != expert_bytes) {
+            if (ft->off1 - ft->off0 != stride) {
                 st_die("safetensors: %s: %s holds %llu bytes, not expert_bytes=%llu",
-                       s->name, tn, (unsigned long long)(ft->off1 - ft->off0),
+                       s->name, tn, (unsigned long long)(ft->off1 - ft->off0).raw(),
                        (unsigned long long)expert_bytes);
             }
             if (e == 0) {
                 first_off = ft->off0;
-            } else if (ft->off0 != first_off + e * expert_bytes) {
+            } else if (ft->off0 != first_off + stride.times(e)) {
                 st_die("safetensors: %s: expert %llu of %s is not contiguous "
                        "(offset %llu, expected %llu) -- the engine reads experts "
                        "by stride from one base pointer",
                        s->name, (unsigned long long)e, gguf_name,
-                       (unsigned long long)ft->off0,
-                       (unsigned long long)(first_off + e * expert_bytes));
+                       (unsigned long long)ft->off0.raw(),
+                       (unsigned long long)(first_off + stride.times(e)).raw());
             }
         }
 
@@ -910,8 +910,7 @@ static void st_add_expert_stacks(st_dir *d, st_shard *s) {
                    (unsigned long long)dim[0], (unsigned long long)dim[1],
                    (unsigned long long)model_expert_bytes);
         }
-        dir_push(d, gguf_name, type, dim, 3, s->map, s->size,
-                 s->buf_off + first_off, n_experts * expert_bytes);
+        dir_push(d, gguf_name, type, dim, 3, s->map, s->size, s->buf_off + first_off, stride.times(n_experts));
         st_bind_record(&d->v[d->n - 1], p, gguf_name);
         free(part);
         free(layout);
@@ -1023,7 +1022,7 @@ static void st_content_digest(pulsar_model *m) {
             const pulsar_tensor *t = &m->tensors[i];
             for (uint64_t k = 0; k < m->n_shards && m->shard_map[at] != t->ext_map; k++) at = (at + 1u) % m->n_shards;
             placed = m->shard_map[at] == t->ext_map;
-            if (placed) pulsar_content_sample(m->shard_fd[at], t->abs_offset, t->bytes, &plan);
+            if (placed) pulsar_content_sample(m->shard_fd[at], pulsar_tensor_file_off(t), pulsar_tensor_stored_bytes(t), &plan);
         }
         pulsar_kvdigest d;
         pulsar_kvdigest_init(&d);
@@ -1124,7 +1123,7 @@ static void st_open(pulsar_model *m, const char *path, bool gpu_mapping) {
             }
         };
         mix((const uint8_t *)shards[i].name, strlen(shards[i].name) + 1u);
-        mix(shards[i].map, shards[i].buf_off);
+        mix(shards[i].map, shards[i].buf_off.before().raw());   /* the shard's first bytes: its length word and header */
     }
 
     /* The primary shard is the one carrying the full KV block; it is also the

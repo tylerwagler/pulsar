@@ -112,7 +112,7 @@ int pulsar_engram_table_open(pulsar_engram_table *t, const char *path, uint32_t 
     }
     t->parts = (pulsar_engram_part *)xcalloc(1, sizeof *t->parts);
     t->parts[0].fd = fd;
-    t->parts[0].base = PULSAR_ENGRAM_HDR_BYTES;
+    t->parts[0].base = FileOff{PULSAR_ENGRAM_HDR_BYTES};   /* the rows start past the header */
     t->n_parts = 1;
     t->rows_per_part = n_rows;
     t->row_bytes = PULSAR_ENGRAM_ROW_BYTES;
@@ -123,7 +123,7 @@ int pulsar_engram_table_open(pulsar_engram_table *t, const char *path, uint32_t 
 }
 
 int pulsar_engram_table_open_parts(pulsar_engram_table *t, uint32_t layer, uint32_t n_parts,
-                                   const char *const *paths, const uint64_t *bases,
+                                   const char *const *paths, const FileOff *bases,
                                    uint64_t rows_per_part, uint32_t row_bytes, uint64_t n_rows) {
     if (!t) return 0;
     memset(t, 0, sizeof *t);
@@ -155,10 +155,11 @@ int pulsar_engram_table_open_parts(pulsar_engram_table *t, uint32_t layer, uint3
         }
         const uint64_t rows = i + 1 < n_parts ? rows_per_part : n_rows - (uint64_t)i * rows_per_part;
         struct stat st;
-        if (fstat(t->parts[i].fd, &st) != 0 || (uint64_t)st.st_size < bases[i] + rows * row_bytes) {
+        if (fstat(t->parts[i].fd, &st) != 0 ||
+            (uint64_t)st.st_size < (bases[i] + elt_bytes(rows, row_bytes)).raw()) {   /* the part's end, in the file */
             fprintf(stderr, "pulsar: row table part %u %s: %llu rows of %u B at offset %llu run past the file "
                             "(%lld B) -- refusing\n", i, paths[i], (unsigned long long)rows, row_bytes,
-                    (unsigned long long)bases[i], (long long)st.st_size);
+                    (unsigned long long)bases[i].raw(), (long long)st.st_size);
             pulsar_engram_table_close(t);
             return 0;
         }
@@ -292,7 +293,7 @@ static bool engram_read_row(const pulsar_engram_table *tb, uint64_t r, unsigned 
     if (r >= tb->n_rows) { errno = 0; return false; }
     const uint32_t rb = tb->row_bytes;
     const pulsar_engram_part *pt = &tb->parts[r / tb->rows_per_part];
-    const off_t off = (off_t)(pt->base + (r % tb->rows_per_part) * rb);
+    const off_t off = (off_t)(pt->base + elt_bytes(r % tb->rows_per_part, rb)).raw();   /* the row, in its file */
     size_t got = 0;
     while (got < rb) {
         const ssize_t n = pread(pt->fd, d + got, rb - got, off + (off_t)got);

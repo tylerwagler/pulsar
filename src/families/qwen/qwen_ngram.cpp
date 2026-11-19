@@ -72,7 +72,7 @@ int pulsar_qwen_ngram_table_open(pulsar_engram_table *t, const char *path, Trunk
                 (unsigned long long)want);
         return 0;
     }
-    const uint64_t base = PULSAR_ENGRAM_HDR_BYTES;
+    const FileOff base{PULSAR_ENGRAM_HDR_BYTES};   /* the rows start past the header */
     return pulsar_engram_table_open_parts(t, layer.raw(), 1, &path, &base, L->n_rows, PULSAR_QWEN_NGRAM_ROW_BYTES, L->n_rows);
 }
 

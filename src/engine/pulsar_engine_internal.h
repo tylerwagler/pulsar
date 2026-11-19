@@ -595,7 +595,7 @@ void pulsar_engram_hash_pos(const pulsar_engram_layout *L, uint32_t layer,
 /** One row-contiguous range of a table: rows [i * rows_per_part, ...) at `base`. */
 typedef struct {
     int fd;                 ///< shared by the parts that live in one file
-    uint64_t base;          ///< byte offset of the part's first row
+    FileOff base;           ///< where the part's first row sits in that file (L438: a file offset)
 } pulsar_engram_part;
 
 /** One Engram layer's row table on disk: the file ranges its rows live in, read row by row through the
@@ -635,13 +635,13 @@ int  pulsar_engram_table_open(pulsar_engram_table *t, const char *path, uint32_t
 /// @param layer          the model layer the table serves
 /// @param n_parts        parts, == ceil(n_rows / rows_per_part)
 /// @param paths          n_parts file paths
-/// @param bases          n_parts byte offsets of each part's first row
+/// @param bases          n_parts file offsets of each part's first row (in its file)
 /// @param rows_per_part  rows in every part but possibly the last
 /// @param row_bytes      bytes per row record
 /// @param n_rows         rows in the table
 /// @return 1 = open, 0 = refused (said).
 int  pulsar_engram_table_open_parts(pulsar_engram_table *t, uint32_t layer, uint32_t n_parts,
-                                    const char *const *paths, const uint64_t *bases,
+                                    const char *const *paths, const FileOff *bases,
                                     uint64_t rows_per_part, uint32_t row_bytes, uint64_t n_rows);
 /** L426: a digest of the table's rows -- its row count and record size, then each part's rows sampled
  *  (pulsar_content_sample).  A row table is weights kept beside the container, so a family that opens one binds this
@@ -894,6 +894,17 @@ typedef struct {
     /// bind_layer is valid (the record carries a `layer`).
     bool has_bind_layer, has_bind_index;
 } pulsar_tensor;
+
+/** L438: where tensor t's stored bytes start in the file they are read from -- a shard or an overlay donor, mapped
+ *  whole from its first byte, so its offset in the mapping (abs_offset) is its offset in the file: the model layer's
+ *  crossing, for the readers that pread instead of mapping (the content sample).
+ *  @param t the directory entry */
+/// @return its file offset
+static inline FileOff pulsar_tensor_file_off(const pulsar_tensor *t) { return FileOff{t->abs_offset}; }
+/** L438: tensor t's stored bytes, as the one byte unit (pulsar_tensor::bytes is a bare count, read in ~90 places).
+ *  @param t the directory entry */
+/// @return its bytes on disk, quantisation included
+static inline TensorBytes pulsar_tensor_stored_bytes(const pulsar_tensor *t) { return TensorBytes{t->bytes}; }
 
 /** A memory-mapped GGUF file plus its parsed directory.
  *
@@ -4098,8 +4109,8 @@ void pulsar_engine_bind_kv_source(pulsar_engine *e, const char *what, uint64_t d
 /** One read of a content sample: `bytes` (<= PULSAR_CONTENT_SAMPLE_BLOCK) at `off` of `fd`. */
 typedef struct pulsar_content_read {
     int fd;          ///< the open file (borrowed)
-    uint64_t off;    ///< the read's first byte
-    uint32_t bytes;  ///< its length
+    FileOff off;     ///< the read's first byte, in that file
+    uint32_t bytes;  ///< its length (a u32: the digest folds its four bytes, pulsar_content_sample_fold)
 } pulsar_content_read;
 /** L426: the content sample of the file span [off, off + bytes), appended to `plan`: its first block, its last, and
  *  one for every PULSAR_CONTENT_SAMPLE_STRIDE bytes spread evenly between them (blocks of PULSAR_CONTENT_SAMPLE_BLOCK
@@ -4112,10 +4123,10 @@ typedef struct pulsar_content_read {
  *  every sampled block and differ only between them (an edit inside a large tensor that leaves its first and last
  *  4 KiB and each 64 MiB mark alone).
  *  @param fd    the open file
- *  @param off   the span's first byte
+ *  @param off   the span's first byte, in that file
  *  @param bytes the span's length
  *  @param plan  receives the reads, in offset order */
-void pulsar_content_sample(int fd, uint64_t off, uint64_t bytes, std::vector<pulsar_content_read> *plan);
+void pulsar_content_sample(int fd, FileOff off, TensorBytes bytes, std::vector<pulsar_content_read> *plan);
 /** L426: read a plan (pulsar_content_sample) with pread on PULSAR_CONTENT_SAMPLE_READERS threads -- no mapping is
  *  touched and nothing is read ahead -- and fold each read's length and bytes into `d`, in plan order.
  *  @param plan the reads
