@@ -1721,10 +1721,10 @@ typedef struct {
     int fd;       ///< the job's non-blocking client socket
     buf pending;  ///< accepted-but-unsent bytes, in wire order
     size_t off;  ///< consumed prefix of pending
-    long long stall_deadline_ms;  ///< 0 = disarmed (nothing pending)
+    long long stall_deadline_ms;  ///< 0 = disarmed (nothing pending); CLOCK_MONOTONIC ms (pulsar_mono_ms, L442)
     bool failed;  ///< the stream has failed; further writes are refused
-    /** Wall clock of the last client bytes ACCEPTED by this writer (queued or
-     * sent), 0 until the first. Every streamed byte funnels through
+    /** The monotonic clock (pulsar_mono_ms; the wall clock until L442) of the last client bytes ACCEPTED by this
+     * writer (queued or sent), 0 until the first. Every streamed byte funnels through
      * slot_writer_send, so this is the one honest "when did the client last
      * hear from us" clock — the heartbeat below reads it. */
     long long last_write_ms;

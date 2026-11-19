@@ -1680,6 +1680,43 @@ static void test_stream_heartbeat_only_fires_when_silent(void) {
 
 
 
+/* L442 clock finding: the stream writer's stall deadline and idle clock read the WALL clock (gettimeofday), so a step
+ * of the system time (NTP, a manual set) moved them: a forward step failed a healthy stream's send as stalled, or
+ * sent a heartbeat early; a backward one held a stalled send past its timeout and starved the heartbeat.  They are
+ * intervals: they read CLOCK_MONOTONIC now.  The writer's stamps fall between two monotonic readings. */
+static void test_l442_stream_writer_is_monotonic(void) {
+    signal(SIGPIPE, SIG_IGN);
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+    int small = 4096;   /* as test_slot_writer_stall_times_out: a peer that never reads fills the socket at once */
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof(small));
+    setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &small, sizeof(small));
+    set_client_socket_nonblocking(sv[0]);
+    slot_writer w;
+    slot_writer_init(&w, sv[0]);
+    const int64_t before = pulsar_mono_ms();
+    slot_writer_mark_written(&w);
+    const int64_t after = pulsar_mono_ms();
+    TEST_ASSERT(w.last_write_ms >= before && w.last_write_ms <= after);
+    /* idle against the same clock: not idle now, idle an interval later */
+    TEST_ASSERT(!slot_writer_idle_for(&w, pulsar_mono_ms(), PULSAR_SERVER_HEARTBEAT_MS));
+    TEST_ASSERT(slot_writer_idle_for(&w, after + PULSAR_SERVER_HEARTBEAT_MS, PULSAR_SERVER_HEARTBEAT_MS));
+    /* a deferred send arms its stall deadline on the monotonic clock too */
+    slot_writer_install(&w);
+    char blob[8192];
+    memset(blob, 'q', sizeof(blob));
+    const int64_t t0 = pulsar_mono_ms();
+    for (int i = 0; i < 64 && w.pending.len <= w.off; i++) (void)send_all(sv[0], blob, sizeof(blob));
+    const int64_t t1 = pulsar_mono_ms();
+    TEST_ASSERT(w.pending.len > w.off);
+    TEST_ASSERT(w.stall_deadline_ms >= t0 + PULSAR_SERVER_SEND_STALL_TIMEOUT_MS &&
+                w.stall_deadline_ms <= t1 + PULSAR_SERVER_SEND_STALL_TIMEOUT_MS);
+    slot_writer_free(&w);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 /* OpenAI/Responses get an SSE COMMENT, which every conformant parser drops
  * before it reaches application code — it cannot perturb the delta stream. */
 static void test_stream_heartbeat_openai_uses_sse_comment(void) {
@@ -23817,6 +23854,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l442_mem_split_values_unchanged();
     test_l442_discrete_floor_step_holds_no_device_kv();
     test_l442_one_memavailable_reading();
+    test_l442_stream_writer_is_monotonic();
     test_bank_pick_prefers_resident_hole();
     test_refusal_evictable();
     test_l179_park_live_bank_only_when_not_in_quantum();

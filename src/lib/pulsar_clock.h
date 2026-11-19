@@ -11,9 +11,10 @@
  *                    milliseconds (double, or whole int64), or nanoseconds (uint64).  std::chrono::steady_clock is
  *                    this clock on Linux (constrain.cpp, pulsar_grammar_admit.h time with it locally).
  *   CLOCK_REALTIME   wall time: printed timestamps (/metrics/stream's "t", the agent trace), the absolute deadlines a
- *                    default-clock pthread_cond_timedwait takes, time(NULL)'s created / uptime seconds -- and genmsg's
- *                    wall_ms, the stream writer's stall deadline and idle clock (gettimeofday): an INTERVAL on the wall
- *                    clock (L442's clock finding; it compares only with itself).
+ *                    default-clock pthread_cond_timedwait takes, time(NULL)'s created / uptime seconds.  Until L442
+ *                    also genmsg's wall_ms, the stream writer's stall deadline and idle clock (gettimeofday): INTERVALS
+ *                    on a clock that steps (L442's clock finding; it compared only with itself).  They are monotonic
+ *                    now.
  *
  * Nothing compared or subtracted a reading of one clock with a reading of the other.  So: one reader per clock
  * (pulsar_mono_ts, pulsar_wall_ts), the unit accessors built on it, and named conversions.  A duration stays a plain
@@ -128,9 +129,6 @@ static inline uint64_t pulsar_mono_ns(void) {
     const struct timespec ts = pulsar_mono_ts();
     return pulsar_ns_of_sec((uint64_t)ts.tv_sec) + (uint64_t)ts.tv_nsec;
 }
-/** CLOCK_REALTIME in whole milliseconds. */
-/// @return milliseconds since the epoch
-static inline int64_t pulsar_wall_ms(void) { return pulsar_ts_ms(pulsar_wall_ts()); }
 /** The CLOCK_REALTIME deadline `seconds` from now, for pthread_cond_timedwait on a default-clock condition.
  *  @param seconds how long, >= 0 */
 /// @return the absolute deadline
