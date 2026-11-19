@@ -17800,7 +17800,7 @@ static_assert(std::is_same<decltype(server_mem_reading::kv_avail), DeviceBytes>:
                   std::is_same<decltype(server::guard_avail), DeviceBytes>::value &&
                   std::is_same<decltype(server_mem_floor()), HostBytes>::value &&
                   std::is_same<decltype(server_guard_floor(false)), DeviceBytes>::value &&
-                  std::is_same<decltype(server_mem_available_bytes()), HostBytes>::value &&
+                  std::is_same<decltype(pulsar_mem_available()), HostBytes>::value &&
                   std::is_same<decltype(server_persist_host_bytes(0)), HostBytes>::value,
               "each reading, floor and budget term names the memory it measures");
 
@@ -22002,6 +22002,39 @@ static void test_prefill_mem_step_tries_remedies_first(void) {
     TEST_ASSERT(!strcmp(prefill_mem_step_names[PREFILL_MEM_REFUSE], "refuse"));
 }
 
+/* L442: the one MemAvailable reading (lib/pulsar_meminfo.h) -- the KiB field times 1024, 0 when the field is missing
+ * or the file unreadable -- reads what each of the four parsers it replaced read: the server's and the engine's
+ * `sscanf(line, "MemAvailable: %llu kB")` (first match), /metrics' strncmp + " %llu kB" (kept scanning: the last
+ * match) and the generic field reader.  On a real meminfo there is one MemAvailable line, so first and last agree. */
+static void test_l442_one_memavailable_reading(void) {
+    char path[] = "/tmp/pulsar-l442-meminfo-XXXXXX";
+    const int fd = mkstemp(path);
+    TEST_ASSERT(fd >= 0);
+    if (fd < 0) return;
+    const char text[] = "MemTotal:       131072000 kB\nMemFree:          2048 kB\nMemAvailable:   9625600 kB\n"
+                        "Buffers:          100 kB\n";
+    TEST_ASSERT(write(fd, text, sizeof text - 1) == (ssize_t)(sizeof text - 1));
+    close(fd);
+    TEST_ASSERT(pulsar_mem_available_from(path) == HostBytes{9625600ull * 1024ull});
+    /* the old parse, as server_sched.cpp and prefill_loop.cpp spelt it, on the same text */
+    unsigned long long kib = 0;
+    for (const char *line = text; line && *line;) {
+        if (sscanf(line, "MemAvailable: %llu kB", &kib) == 1) break;
+        const char *nl = strchr(line, '\n');
+        line = nl ? nl + 1 : NULL;
+    }
+    TEST_ASSERT(pulsar_mem_available_from(path).raw() == (uint64_t)kib * 1024ull);
+    FILE *fp = fopen(path, "w");
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        fputs("MemTotal:       131072000 kB\n", fp);   /* no MemAvailable: 0, as every parser gave */
+        fclose(fp);
+    }
+    TEST_ASSERT(pulsar_mem_available_from(path) == HostBytes{});
+    unlink(path);
+    TEST_ASSERT(pulsar_mem_available_from(path) == HostBytes{});   /* unreadable: 0 */
+}
+
 /* L335: the stall dump's meminfo reader tells a missing field from an unreadable file (both read 0 before), and its
  * phase names are bounded by the table, which has one name per gen_phase plus idle. */
 static void test_stall_dump_meminfo_and_phase_names(void) {
@@ -23786,6 +23819,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l391_discrete_reads_the_device();
     test_l442_mem_split_values_unchanged();
     test_l442_discrete_floor_step_holds_no_device_kv();
+    test_l442_one_memavailable_reading();
     test_bank_pick_prefers_resident_hole();
     test_refusal_evictable();
     test_l179_park_live_bank_only_when_not_in_quantum();

@@ -1384,6 +1384,30 @@ constexpr HostBytes pulsar_unified_host_bytes(DeviceBytes b) { return HostBytes{
 /// @return the same bytes as HostBytes
 constexpr HostBytes host_bytes_of(TensorBytes b) { return HostBytes{b.raw()}; }
 
+/** Bytes per GiB: the one constant every GiB figure in a log line or a test is divided or built by (L442; the series
+ *  chose one shared constant over a type for GiB doubles). */
+constexpr double PULSAR_GIB = 1024.0 * 1024.0 * 1024.0;
+/** Bytes per MiB, the same for MiB figures. */
+constexpr double PULSAR_MIB = 1024.0 * 1024.0;
+/** A byte count in GiB, for a log line: `(double)b / PULSAR_GIB`.
+ *  @param b the bytes */
+/// @return GiB
+constexpr double pulsar_gib(uint64_t b) { return (double)b / PULSAR_GIB; }
+/** A byte unit's quantity in GiB, for a log line (KvBytes, HostBytes, DeviceBytes, TensorBytes alike).
+ *  @param b the bytes */
+/// @return GiB
+template <class Tag>
+constexpr double pulsar_gib(pulsar_unit<Tag, uint64_t> b) { return (double)b.raw() / PULSAR_GIB; }
+/** A byte count in MiB, for a log line: `(double)b / PULSAR_MIB`.
+ *  @param b the bytes */
+/// @return MiB
+constexpr double pulsar_mib(uint64_t b) { return (double)b / PULSAR_MIB; }
+/** A byte unit's quantity in MiB, for a log line.
+ *  @param b the bytes */
+/// @return MiB
+template <class Tag>
+constexpr double pulsar_mib(pulsar_unit<Tag, uint64_t> b) { return (double)b.raw() / PULSAR_MIB; }
+
 static_assert(sizeof(HostBytes) == sizeof(uint64_t) && sizeof(DeviceBytes) == sizeof(uint64_t) &&
                   std::is_trivial<HostBytes>::value && std::is_standard_layout<HostBytes>::value &&
                   std::is_trivial<DeviceBytes>::value && std::is_standard_layout<DeviceBytes>::value,

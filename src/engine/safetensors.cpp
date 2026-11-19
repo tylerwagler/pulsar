@@ -1196,7 +1196,7 @@ static void st_open(pulsar_model *m, const char *path, bool gpu_mapping) {
     fprintf(stderr, "pulsar: safetensors model: %llu shards, %llu tensors, "
                     "%.2f GiB mapped, %llu metadata keys\n",
             (unsigned long long)m->n_shards, (unsigned long long)m->n_tensors,
-            (double)m->mapped_bytes / 1073741824.0, (unsigned long long)m->n_kv);
+            (double)m->mapped_bytes / PULSAR_GIB, (unsigned long long)m->n_kv);
 
     /* PULSAR_VERIFY_TENSORS=<name prefix>: hash the bytes the KERNELS will read
      * (tensor_map_base(m,t) + t->abs_offset) for every tensor under that

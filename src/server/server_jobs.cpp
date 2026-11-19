@@ -833,8 +833,8 @@ static void gen_restore_start(session_slot *sl, gen_restore *gr) {
                "pulsar-server: bank %d restores %s chain of %d segments to %d (%.1f MiB, %.1f MiB cached) a slice "
                "per worker turn", sl->bank.raw(),
                gr->kind == GEN_RESTORE_SPILLED ? "its spilled history's" : "the request's",
-               h->n, h->chain[h->n - 1].G.raw(), (double)h->bytes / (1024.0 * 1024.0),
-               (double)h->cached / (1024.0 * 1024.0));
+               h->n, h->chain[h->n - 1].G.raw(), (double)h->bytes / PULSAR_MIB,
+               (double)h->cached / PULSAR_MIB);
 }
 
 bool spilled_history_serves(const spilled_history *was, const char *prompt_text, bool live_turn) {

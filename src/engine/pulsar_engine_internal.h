@@ -5007,12 +5007,9 @@ bool pulsar_read_ahead_plan(const pulsar_read_ahead_mark *mark, const TokId *pro
 /** L329 (b2): may a read-ahead be queued with MemAvailable at `mem_available` bytes (0 = unreadable: fail closed)?
  *  Only above PULSAR_READ_AHEAD_MEM_HEADROOM plus the pool's whole unread cap at a page a row (~9 GiB).  Pure
  *  (pulsar_test --read-ahead). */
-/// @param mem_available MemAvailable in bytes (0 = unreadable)
+/// @param mem_available MemAvailable in bytes (0 = unreadable; lib/pulsar_meminfo.h pulsar_mem_available)
 /// @return true when a read-ahead may be queued
-bool pulsar_read_ahead_admit(uint64_t mem_available);
-/** L329 (b2): MemAvailable from /proc/meminfo in bytes, 0 when unreadable (read once per arm, never per row). */
-/// @return bytes, or 0
-uint64_t pulsar_read_ahead_mem_available(void);
+bool pulsar_read_ahead_admit(HostBytes mem_available);
 /** L329 (b2): the session's read-ahead for `bank` (pulsar.h pulsar_session_prompt_read_ahead, which is this) and its
  *  cancel -- the bank's queued rows dropped, its record cleared (pulsar_session_family_invalidate, the walk).  It
  *  runs ONLY for a served prompt: `prompt` is the one a server named (the fused lane's call, or the sync's

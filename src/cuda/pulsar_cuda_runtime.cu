@@ -563,8 +563,8 @@ const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_
                 what ? what : "weights",
                 (double)bytes / 1048576.0,
                 (unsigned long long)offset,
-                (double)g_model_range_bytes / 1073741824.0,
-                (double)cuda_model_cache_limit_bytes() / 1073741824.0);
+                (double)g_model_range_bytes / PULSAR_GIB,
+                (double)cuda_model_cache_limit_bytes() / PULSAR_GIB);
     }
     return NULL;
 }
@@ -672,13 +672,13 @@ static void cuda_model_load_progress_note(uint64_t cached_bytes) {
     g_model_load_progress_tty = tty;
     if (g_model_load_progress_tty) {
         fprintf(stderr, "\r\033[Kpulsar: CUDA loading model tensors into device cache: %.2f GiB",
-                (double)cached_bytes / 1073741824.0);
+                (double)cached_bytes / PULSAR_GIB);
     } else {
         if (g_model_load_progress_last == 0.0) {
             fprintf(stderr, "pulsar: CUDA loading model tensors into device cache\n");
         } else {
             fprintf(stderr, "pulsar: CUDA loading model tensors %.2f GiB cached\n",
-                    (double)cached_bytes / 1073741824.0);
+                    (double)cached_bytes / PULSAR_GIB);
         }
     }
     fflush(stderr);
@@ -2897,7 +2897,7 @@ int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size) {
         if (g_model_reg.host == (const char *)model_map && g_model_reg.bytes == model_size) return 1;   /* set again */
         fprintf(stderr, "pulsar: a %.2f GiB mapping is host-registered already (one registration at a time): this "
                         "%.2f GiB mapping is staged into device memory span by span\n",
-                (double)g_model_reg.bytes / 1073741824.0, (double)model_size / 1073741824.0);
+                (double)g_model_reg.bytes / PULSAR_GIB, (double)model_size / PULSAR_GIB);
     } else if (integrated) {
         cudaError_t err = cudaHostRegister((void *)model_map, (size_t)model_size,
                                            cudaHostRegisterMapped | cudaHostRegisterReadOnly);
@@ -2907,7 +2907,7 @@ int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size) {
             if (err == cudaSuccess && dev) {
                 g_model_reg = {(const char *)model_map, model_size, (const char *)dev};
                 fprintf(stderr, "pulsar: CUDA registered %.2f GiB model mapping for device access\n",
-                        (double)model_size / 1073741824.0);
+                        (double)model_size / PULSAR_GIB);
                 return 1;
             }
             /* registered, but with no device address to read it at: unregister exactly that, and stage */
@@ -2921,7 +2921,7 @@ int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     } else {
         fprintf(stderr, "pulsar: discrete GPU: the model's %.2f GiB are staged into device memory span by span "
                         "(not host-registered: that would read every weight over PCIe)\n",
-                (double)model_size / 1073741824.0);
+                (double)model_size / PULSAR_GIB);
     }
     /* the staged route: the mapping must fit the device's weight budget */
     const uint64_t limit = cuda_model_local_model_limit_bytes();
@@ -2930,8 +2930,8 @@ int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size) {
                 "pulsar: CUDA model %.2f GiB exceeds the single-GPU startup cache "
                 "budget %.2f GiB (the device's memory less its scratch headroom; "
                 "not a setting) -- refusing\n",
-                (double)model_size / 1073741824.0,
-                (double)limit / 1073741824.0);
+                (double)model_size / PULSAR_GIB,
+                (double)limit / PULSAR_GIB);
         return 0;
     }
     return 1;
@@ -3043,8 +3043,8 @@ int pulsar_gpu_cache_external_range(const void *host_base_key, int fd,
         if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes) {
             fprintf(stderr, "pulsar: overlay range %s (%.2f GiB) does not fit: the weight cache holds "
                             "%.2f of %.0f GiB -- refusing the overlay\n",
-                    label ? label : "overlay", (double)bytes / 1073741824.0,
-                    (double)g_model_range_bytes / 1073741824.0, (double)limit / 1073741824.0);
+                    label ? label : "overlay", (double)bytes / PULSAR_GIB,
+                    (double)g_model_range_bytes / PULSAR_GIB, (double)limit / PULSAR_GIB);
             return 0;
         }
     }

@@ -6473,8 +6473,9 @@ static void test_read_ahead(void) {
     /* (3) memory pressure: nothing is queued under the headroom (+ the pool's unread cap), or when MemAvailable is
      * unreadable (0: fail closed) */
     const uint64_t floor_b = PULSAR_READ_AHEAD_MEM_HEADROOM + PULSAR_ENGRAM_AHEAD_PENDING_MAX * 4096ull;
-    TEST_ASSERT(!pulsar_read_ahead_admit(0) && !pulsar_read_ahead_admit(floor_b) && pulsar_read_ahead_admit(floor_b + 1));
-    TEST_ASSERT(!pulsar_read_ahead_admit(4ull << 30) && pulsar_read_ahead_admit(64ull << 30));
+    TEST_ASSERT(!pulsar_read_ahead_admit(HostBytes{0}) && !pulsar_read_ahead_admit(HostBytes{floor_b}) &&
+                pulsar_read_ahead_admit(HostBytes{floor_b + 1}));
+    TEST_ASSERT(!pulsar_read_ahead_admit(HostBytes{4ull << 30}) && pulsar_read_ahead_admit(HostBytes{64ull << 30}));
 
     /* (4) no served prompt, no read-ahead: a session whose syncs no server licensed (a gate's, the CLI's, imatrix's)
      * never reaches the family's reader -- the walk passes its license, NULL; a licensed prompt does reach it */
@@ -6494,7 +6495,7 @@ static void test_read_ahead(void) {
     pulsar_tokens served = {p.data(), (int)LEN, (int)LEN};
     pulsar_session_set_prefill_ahead(fs, &served);
     const uint32_t got = pulsar_session_read_ahead(fs, 0, fs->prefill_ahead, W);
-    const bool roomy = pulsar_read_ahead_admit(pulsar_read_ahead_mem_available());
+    const bool roomy = pulsar_read_ahead_admit(pulsar_mem_available());
     TEST_ASSERT(roomy ? got == W && g_fake_ahead_calls == 1 : got == 0 && g_fake_ahead_calls == 0);
     pulsar_session_set_prefill_ahead(fs, NULL);
     pulsar_session_read_ahead_cancel(fs, 0);   /* a NULL pool: nothing to drop, the record cleared */

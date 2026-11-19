@@ -15,6 +15,7 @@
  * prefill_chunk / prefill_display at the start and after each chunk. */
 #include "pulsar_engine_internal.h"
 #include "lib/pulsar_stall.h"
+#include "lib/pulsar_meminfo.h"
 
 void pulsar_prefill_plan_init(pulsar_prefill_plan *p, const pulsar_prefill_shape *shape, TokPos start_at,
                               const pulsar_ckpt_store *store, const pulsar_engine *e, const pulsar_tokens *prompt,
@@ -185,22 +186,10 @@ bool pulsar_read_ahead_plan(const pulsar_read_ahead_mark *mark, const TokId *pro
     return true;
 }
 
-bool pulsar_read_ahead_admit(uint64_t mem_available) {
+bool pulsar_read_ahead_admit(HostBytes mem_available) {
     /* the headroom plus the most the pool can hold unread, a page a row (a cold row ~ one page of cache) */
-    return mem_available != 0 && mem_available > PULSAR_READ_AHEAD_MEM_HEADROOM + PULSAR_ENGRAM_AHEAD_PENDING_MAX * 4096ull;
-}
-
-/* MemAvailable from /proc/meminfo in bytes, 0 when unreadable (the admit then fails closed).  Read once per arm --
- * a chunk, or a fused round that queues -- never per row or per step. */
-uint64_t pulsar_read_ahead_mem_available(void) {
-    FILE *fp = fopen("/proc/meminfo", "r");
-    if (!fp) return 0;
-    char line[256];
-    unsigned long long kib = 0;
-    while (fgets(line, sizeof(line), fp))
-        if (sscanf(line, "MemAvailable: %llu kB", &kib) == 1) break;
-    fclose(fp);
-    return (uint64_t)kib * 1024ull;
+    return mem_available != HostBytes{} &&
+           mem_available > HostBytes{PULSAR_READ_AHEAD_MEM_HEADROOM + PULSAR_ENGRAM_AHEAD_PENDING_MAX * 4096ull};
 }
 
 /** The engram pool tag of a session's bank: its read-ahead rows are queued and cancelled under it.
@@ -231,7 +220,9 @@ uint32_t pulsar_session_read_ahead(pulsar_session *s, uint32_t bank, const pulsa
         *m = {};
     }
     if (!go) return 0;
-    if (!pulsar_read_ahead_admit(pulsar_read_ahead_mem_available())) {
+    /* MemAvailable (lib/pulsar_meminfo.h, 0 when unreadable: the admit fails closed), read once per arm -- a chunk, or
+     * a fused round that queues -- never per row or per step */
+    if (!pulsar_read_ahead_admit(pulsar_mem_available())) {
         pulsar_engram_read_ahead_skipped(ops->read_ahead_pool(s->engine));
         static bool said = false;   /* rule 5: the stand-down, once */
         if (!said) {

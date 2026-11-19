@@ -20,6 +20,7 @@
 #include "pulsar_dsml.h"
 #include "pulsar_utf8.h"
 #include "pulsar_stall.h"
+#include "pulsar_meminfo.h"
 #include "pulsar_metrics_stream.h"
 /* The JSON scanner is shared with the engine's safetensors reader, so it lives
  * in src/lib and is declared there. */
@@ -2156,18 +2157,7 @@ typedef struct {
  *  @param bytes      receives the pool's size
  *  @param retain     receives whether the RAM tier is on */
 void kv_ram_plan_for(int integrated, uint64_t mem_total, int64_t ram_mb, uint64_t *bytes, bool *retain);
-/** What meminfo_kib found (L335: a missing key and an unreadable file are told apart). */
-enum meminfo_read {
-    MEMINFO_FOUND,       ///< the field was read
-    MEMINFO_MISSING,     ///< the file has no such field
-    MEMINFO_UNREADABLE,  ///< the file would not open
-};
-/** One field of a meminfo-format file (watchdog.cpp; the stall dump's swap line and kv_host_mem_total_from's MemTotal).
- *  @param path the meminfo file ("/proc/meminfo"; a test passes its own)
- *  @param key a field with its colon ("SwapTotal:")
- *  @param kib receives the field's value in KiB (0 unless found)
- *  @return MEMINFO_FOUND, MEMINFO_MISSING (the file has no such field) or MEMINFO_UNREADABLE (it would not open) */
-meminfo_read meminfo_kib(const char *path, const char *key, uint64_t *kib);
+/* meminfo_kib and meminfo_read: lib/pulsar_meminfo.h (the one /proc/meminfo reader, L442) */
 /** L338 (CT 130, 2026-11-03): a cgroup v2 memory.max value in bytes -- 0 for "max" (no limit) or anything unreadable.
  *  @param text the file's contents  @return the limit in bytes, 0 for none */
 uint64_t kv_cgroup_limit_parse(const char *text);
@@ -6425,11 +6415,6 @@ typedef enum { PREFILL_MEM_GO = 0, PREFILL_MEM_SPILL, PREFILL_MEM_PREEMPT, PREFI
 extern const char *const prefill_mem_step_names[PREFILL_MEM_STEPS];
 prefill_mem_step server_prefill_mem_step(const server_mem_reading &m, KvBytes need, int n_idle_victims,
                                          bool preemptible);
-
-/* MemAvailable from /proc/meminfo, in bytes (0 on parse failure — callers
- * fail closed).  Never called on a token/layer hot path (defined in
- * generate.cpp; also used by startup warmup/budget derivation in cli_main.cpp). */
-HostBytes server_mem_available_bytes(void);
 
 /* ==== The stall watchdog (watchdog.cpp) ===================================================================
  * The worker marks every CUDA-heavy section it enters (src/lib/pulsar_stall.h; each mark a heartbeat).  A watchdog

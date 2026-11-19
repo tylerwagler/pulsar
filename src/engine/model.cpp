@@ -333,8 +333,7 @@ bool model_open(pulsar_model *m, const char *path, bool gpu_mapping) {
 /// Print `bytes` to stdout as GiB.
 /// @param bytes the size
 static void print_size(uint64_t bytes) {
-    const double gib = 1024.0 * 1024.0 * 1024.0;
-    printf("%.2f GiB", (double)bytes / gib);
+    printf("%.2f GiB", (double)bytes / PULSAR_GIB);
 }
 
 
@@ -658,11 +657,11 @@ static bool accelerator_prepare_model_tensor_spans(const pulsar_model *m,
             if (tty) {
                 fprintf(stderr, "\r\033[Kpulsar: %s preparing model tensor mappings: %.2f GiB",
                         accelerator_name,
-                        (double)prepared / 1073741824.0);
+                        (double)prepared / PULSAR_GIB);
             } else {
                 fprintf(stderr, "pulsar: %s prepared model tensor mappings %.2f GiB\n",
                         accelerator_name,
-                        (double)prepared / 1073741824.0);
+                        (double)prepared / PULSAR_GIB);
             }
             fflush(stderr);
             last_progress = now;
@@ -675,7 +674,7 @@ static bool accelerator_prepare_model_tensor_spans(const pulsar_model *m,
      * on a tty), so a log's last tick under-reads the sum -- and under TP the
      * sum is the residency claim itself (L237). */
     fprintf(stderr, "pulsar: %s staged %.2f GiB of model tensors in %" PRIu64 " span(s)\n",
-            accelerator_name, (double)prepared / 1073741824.0, merged);
+            accelerator_name, (double)prepared / PULSAR_GIB, merged);
     free(spans);
     if (prepared_out) *prepared_out = prepared;
     return true;
@@ -698,7 +697,7 @@ bool accelerator_cache_model_tensors(pulsar_backend backend,
     if (m->tp_n_ranks > 1)
         fprintf(stderr, "pulsar: TP residency: rank %d/%u leaves %.2f GiB unstaged -- the stored tensors its plan's "
                         "slices replace (built or staged at open)\n",
-                m->tp_rank, m->tp_n_ranks, (double)pulsar_model_unstaged_expert_bytes(m) / 1073741824.0);
+                m->tp_rank, m->tp_n_ranks, (double)pulsar_model_unstaged_expert_bytes(m) / PULSAR_GIB);
     /* Register each MXFP8 weight's offset so the workhorse matmul executes
      * ONLY registered tensors (per-tensor routing; unregistered offsets are
      * rejected at dispatch). Runs before the weight-cache early-out so it
@@ -735,7 +734,7 @@ bool accelerator_cache_model_tensors(pulsar_backend backend,
     const char *accelerator_name = "CUDA";
     fprintf(stderr,
             "pulsar: %s startup model preparation covered %.2f GiB of tensor spans in %.3fs\n",
-            accelerator_name, (double)prepared / 1073741824.0, t1 - t0);
+            accelerator_name, (double)prepared / PULSAR_GIB, t1 - t0);
     return true;
 }
 
@@ -773,7 +772,7 @@ bool accelerator_prepare_expert_overlay(pulsar_backend backend,
         prepared += t->bytes;
     }
     fprintf(stderr, "pulsar: expert overlay prepared %.2f GiB for device access\n",
-            (double)prepared / 1073741824.0);
+            (double)prepared / PULSAR_GIB);
     return true;
 }
 

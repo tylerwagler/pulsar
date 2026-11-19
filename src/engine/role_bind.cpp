@@ -235,8 +235,8 @@ bool pulsar_role_binder_close(pulsar_role_binder *b, pulsar_role_census *out) {
     fprintf(stderr, "pulsar: %s: %llu of %llu tensors bound in %u roles, %.3f GiB priced of the directory's %.3f GiB "
                     "(%llu tensors, %.3f GiB declared unloaded)%s\n",
             b->owner, (unsigned long long)c.tensors, (unsigned long long)in_scope, c.roles,
-            (double)c.bytes / 1073741824.0, (double)c.directory_bytes / 1073741824.0, (unsigned long long)c.unloaded,
-            (double)c.unloaded_bytes / 1073741824.0, whole ? " (every staged byte is a declared role's)" : " -- refusing");
+            (double)c.bytes / PULSAR_GIB, (double)c.directory_bytes / PULSAR_GIB, (unsigned long long)c.unloaded,
+            (double)c.unloaded_bytes / PULSAR_GIB, whole ? " (every staged byte is a declared role's)" : " -- refusing");
     if (out) *out = c;
     delete b;
     return whole;

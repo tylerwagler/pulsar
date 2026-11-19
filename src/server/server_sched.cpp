@@ -117,10 +117,9 @@ int server::job_needed_ctx(const job *j) const {
 /// @param actual_bytes the bytes the allocator committed
 /// @return actual_bytes, or 0 on a mismatch (or 0 actual)
 KvBytes server_reconciled_session_cost(int slot_idx, int ctx, KvBytes est_bytes, KvBytes actual_bytes) {
-    const double gib = 1024.0 * 1024.0 * 1024.0;
     server_log(PULSAR_LOG_DEFAULT,
                "pulsar-server: slot %d session cost: priced=%.2f GiB actual=%.2f GiB (ctx=%d)",
-               slot_idx, (double)est_bytes.raw() / gib, (double)actual_bytes.raw() / gib, ctx);
+               slot_idx, pulsar_gib(est_bytes), pulsar_gib(actual_bytes), ctx);
     if (actual_bytes == KvBytes{} || est_bytes != actual_bytes) {
         server_log(PULSAR_LOG_WARNING,
                    "pulsar-server: SESSION COST MISMATCH: priced %llu bytes, allocated %llu "
@@ -133,25 +132,6 @@ KvBytes server_reconciled_session_cost(int slot_idx, int ctx, KvBytes est_bytes,
 }
 
 
-
-/* MemAvailable from /proc/meminfo, in bytes (0 on parse failure — the caller
- * fails closed and refuses provisioning). One read per slot-provisioning
- * attempt — never on a token/layer hot path. Coarse by design: driver 610's
- * UVM accounting lags MemAvailable, and under UVM pressure MemTotal itself
- * shrinks, so this is a belt-and-suspenders floor check on top of the
- * ledger, not a precise gauge. */
-/// @return MemAvailable in bytes; 0 when /proc/meminfo is unreadable or has no such line
-HostBytes server_mem_available_bytes(void) {
-    FILE *fp = fopen("/proc/meminfo", "r");
-    if (!fp) return HostBytes{};
-    char line[256];
-    unsigned long long kib = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        if (sscanf(line, "MemAvailable: %llu kB", &kib) == 1) break;
-    }
-    fclose(fp);
-    return HostBytes{(uint64_t)kib * 1024ull};   /* the kernel's reading enters the host's unit here */
-}
 
 /* The guard's live budget (pulsar_server_internal.h, server::guard_budget).  Before 2026-10-29 every decision read
  * the startup ceiling, i.e. it priced the post-warmup headroom as KV's alone for the life of the process: whatever
@@ -172,14 +152,13 @@ KvBytes server::guard_budget() {
     /* rule 5: the budget the guard is keeping, said when it moves by half a GiB or more */
     const KvBytes step{512ull << 20};
     if ((b > guard_budget_said ? b - guard_budget_said : guard_budget_said - b) >= step) {
-        const double gib = 1024.0 * 1024.0 * 1024.0;
         server_log(PULSAR_LOG_KVCACHE,
                    "pulsar-server: guard: live touched-KV budget %.2f GiB (ceiling %.2f; touched %.2f + %s "
                    "%.2f − floor %.2f)%s",
-                   (double)b.raw() / gib, (double)guard_touched_ceiling.raw() / gib,
-                   (double)pulsar_session_touched_kv_bytes(sess).raw() / gib,
-                   guard_discrete ? "device free" : "MemAvailable", (double)guard_avail.raw() / gib,
-                   (double)guard_floor.raw() / gib,
+                   pulsar_gib(b), pulsar_gib(guard_touched_ceiling),
+                   pulsar_gib(pulsar_session_touched_kv_bytes(sess)),
+                   guard_discrete ? "device free" : "MemAvailable", pulsar_gib(guard_avail),
+                   pulsar_gib(guard_floor),
                    guard_avail != DeviceBytes{} ? "" : " -- the headroom reading is unreadable: fail closed");
         guard_budget_said = b;
     }
@@ -435,22 +414,21 @@ bool warn_limiter_due(warn_limiter *w, double now_sec, double period_sec, unsign
 /// @param m the readings
 /// @return e.g. "MemAvailable 5.10 GiB (floor 4.43)" or "device free 0.40 GiB (floor 0.50), host MemAvailable ..."
 static std::string server_mem_reading_words(const server_mem_reading &m) {
-    const double gib = 1024.0 * 1024.0 * 1024.0;
     char buf[200];
     if (m.discrete)
         snprintf(buf, sizeof buf, "device free %.2f GiB (floor %.2f), host MemAvailable %.2f GiB (floor %.2f)",
-                 (double)m.kv_avail.raw() / gib, (double)m.kv_floor.raw() / gib, (double)m.host_avail.raw() / gib,
-                 (double)m.host_floor.raw() / gib);
+                 pulsar_gib(m.kv_avail), pulsar_gib(m.kv_floor), pulsar_gib(m.host_avail),
+                 pulsar_gib(m.host_floor));
     else
-        snprintf(buf, sizeof buf, "MemAvailable %.2f GiB (floor %.2f)", (double)m.kv_avail.raw() / gib,
-                 (double)m.kv_floor.raw() / gib);
+        snprintf(buf, sizeof buf, "MemAvailable %.2f GiB (floor %.2f)", pulsar_gib(m.kv_avail),
+                 pulsar_gib(m.kv_floor));
     return buf;
 }
 
 server_mem_reading server::mem_reading() const {
     server_mem_reading m;
     m.discrete = guard_discrete;
-    m.host_avail = server_mem_available_bytes();
+    m.host_avail = pulsar_mem_available();
     m.host_floor = server_mem_floor();
     /* the KV's memory: the device's free memory, or on unified memory the host's reading (one pool) */
     m.kv_avail = guard_discrete ? server_guard_avail_bytes(true) : pulsar_unified_device_bytes(m.host_avail);
@@ -528,9 +506,9 @@ session_slot *server::provision_bank(provision_refusal *refusal) {
             server_log(PULSAR_LOG_WARNING,
                        "pulsar-server: bank provisioning refused: the session-cost ledger does not admit bank %d's "
                        "charge %.2f GiB (committed %.2f of %.2f GiB; job queued; %u refusals in the last %.0f s not "
-                       "logged)", idx, (double)s->bank_charge(BankId{idx}).raw() / (1024.0 * 1024.0 * 1024.0),
-                       (double)s->kv_committed_bytes.raw() / (1024.0 * 1024.0 * 1024.0),
-                       (double)s->kv_budget_bytes.raw() / (1024.0 * 1024.0 * 1024.0), skipped,
+                       "logged)", idx, pulsar_gib(s->bank_charge(BankId{idx})),
+                       pulsar_gib(s->kv_committed_bytes),
+                       pulsar_gib(s->kv_budget_bytes), skipped,
                        PULSAR_SERVER_MEM_FLOOR_WARN_SEC);
         *refusal = PROVISION_REFUSED_ADMISSION;
         return NULL;
@@ -560,7 +538,7 @@ session_slot *server::provision_bank(provision_refusal *refusal) {
             server_log(PULSAR_LOG_WARNING,
                        "pulsar-server: bank provisioning refused: %s does not hold the floor for the bank's "
                        "demand-paged %.2f GiB (job queued; %u refusals in the last %.0f s not logged)",
-                       server_mem_reading_words(mem).c_str(), (double)demand.raw() / (1024.0 * 1024.0 * 1024.0),
+                       server_mem_reading_words(mem).c_str(), pulsar_gib(demand),
                        skipped, PULSAR_SERVER_MEM_FLOOR_WARN_SEC);
         }
         *refusal = PROVISION_REFUSED_MEM_FLOOR;
@@ -602,9 +580,9 @@ session_slot *server::provision_bank(provision_refusal *refusal) {
                "pulsar-server: provisioned bank %d (pooled) marginal=%.2f GiB "
                "total committed=%.2f GiB / %.2f GiB",
                idx,
-               (double)sl->bank_charge_bytes.raw() / (1024.0 * 1024.0 * 1024.0),
-               (double)s->kv_committed_bytes.raw() / (1024.0 * 1024.0 * 1024.0),
-               (double)s->kv_budget_bytes.raw() / (1024.0 * 1024.0 * 1024.0));
+               pulsar_gib(sl->bank_charge_bytes),
+               pulsar_gib(s->kv_committed_bytes),
+               pulsar_gib(s->kv_budget_bytes));
     return sl;
 }
 
@@ -1065,8 +1043,8 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
                 server_log(PULSAR_LOG_KVCACHE,
                            "pulsar-server: route: a fresh bank would add %.2f GiB of KV past the budget; continuing "
                            "on bank %d instead (it adds %.2f GiB)",
-                           (double)need_fresh.raw() / (1024.0 * 1024.0 * 1024.0), best->bank.raw(),
-                           (double)need_best.raw() / (1024.0 * 1024.0 * 1024.0));
+                           pulsar_gib(need_fresh), best->bank.raw(),
+                           pulsar_gib(need_best));
                 *clobbers = true;
                 j->kvr.route = KV_ROUTE_CLOBBER;   /* L378 */
                 return best;
@@ -1183,8 +1161,8 @@ KvBytes server_ledger_release(KvBytes committed_total, KvBytes slot_cost) {
                    "%.2f GiB committed — provision/evict pairing is out of sync; "
                    "clamping the ledger to 0 (the MemAvailable floor remains the "
                    "backstop against the resulting over-admission)",
-                   (double)slot_cost.raw() / (1024.0 * 1024.0 * 1024.0),
-                   (double)committed_total.raw() / (1024.0 * 1024.0 * 1024.0));
+                   pulsar_gib(slot_cost),
+                   pulsar_gib(committed_total));
         return KvBytes{};
     }
     return committed_total - slot_cost;
@@ -1567,11 +1545,11 @@ void server::worker_evict(int vi, int rank, job *for_job) {
                "released=%.2f GiB (allocator freed %.2f GiB) "
                "committed now %.2f / %.2f GiB, MemAvailable %.2f GiB",
                vi, evicted_ctx, live_tokens, snapshot,
-               (double)freed.raw() / (1024.0 * 1024.0 * 1024.0),
-               (double)freed.raw() / (1024.0 * 1024.0 * 1024.0),
-               (double)committed_now.raw() / (1024.0 * 1024.0 * 1024.0),
-               (double)s->kv_budget_bytes.raw() / (1024.0 * 1024.0 * 1024.0),
-               (double)server_mem_available_bytes().raw() / (1024.0 * 1024.0 * 1024.0));
+               pulsar_gib(freed),
+               pulsar_gib(freed),
+               pulsar_gib(committed_now),
+               pulsar_gib(s->kv_budget_bytes),
+               pulsar_gib(pulsar_mem_available()));
 }
 
 
@@ -1718,7 +1696,7 @@ void server::kv_dup_census_update() {
                        "pulsar-server: kv dup: banks %d and %d share %d tokens (%d whole pages of %d, %.2f GiB held "
                        "twice) -- deeper than the preamble (%d)", s->slots[a].bank.raw(), s->slots[b].bank.raw(),
                        shared, shared / grid, grid,
-                       (double)page_bytes.times((uint64_t)(shared / grid)).raw() / (1024.0 * 1024.0 * 1024.0),
+                       (double)page_bytes.times((uint64_t)(shared / grid)).raw() / PULSAR_GIB,
                        PULSAR_KV_DUP_DEEP_TOKENS);
         }
         s->w_dup_deep[a] = deep[a];
@@ -3296,13 +3274,12 @@ bool server::spill_bank(session_slot *victim) {
     s->slot_reply_forget(victim);   /* L380: its rows are a chain now; what comes back is read as a new bank */
     victim->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
     s->guard_evictions++;
-    const double gib = 1024.0 * 1024.0 * 1024.0;
     server_log(PULSAR_LOG_DEFAULT,
                "pulsar-server: guard EVICTED bank %d -> segments (%.1f ms persist, physical freed); "
                "touched %.2f GiB / budget %.2f GiB, evictions %llu",
                vb.raw(), (server_now_sec() - t0) * 1e3,
-               (double)pulsar_session_touched_kv_bytes(pool).raw() / gib,
-               (double)s->guard_budget().raw() / gib,
+               pulsar_gib(pulsar_session_touched_kv_bytes(pool)),
+               pulsar_gib(s->guard_budget()),
                (unsigned long long)s->guard_evictions);
     return true;
 }
@@ -3539,7 +3516,7 @@ bool server::preempt_newest_decoder(const session_slot *keep, KvBytes need) {
                    "%.1f MiB in %.1f ms, physical freed (%.2f GiB)", v->bank.raw(),
                    server_bank_pos(pool, v->bank).raw(), g->completion_total + g->completion,
                    (double)payload_bytes / 1048576.0,
-                   (server_now_sec() - t0) * 1e3, (double)bytes.raw() / (1024.0 * 1024.0 * 1024.0));
+                   (server_now_sec() - t0) * 1e3, pulsar_gib(bytes));
         return true;
     }
 }
@@ -3580,9 +3557,9 @@ bool server::worker_readmit_preempted() {
             snprintf(v->gen->err, sizeof v->gen->err,
                      "a preempted decode no longer fits the KV budget (%.2f GiB beside %.2f GiB resident, budget %.2f "
                      "GiB) and nothing running can make room",
-                     (double)v->preempt_bytes.raw() / (1024.0 * 1024.0 * 1024.0),
-                     (double)pulsar_session_touched_kv_bytes(pool).raw() / (1024.0 * 1024.0 * 1024.0),
-                     (double)s->guard_budget().raw() / (1024.0 * 1024.0 * 1024.0));
+                     pulsar_gib(v->preempt_bytes),
+                     pulsar_gib(pulsar_session_touched_kv_bytes(pool)),
+                     pulsar_gib(s->guard_budget()));
             v->gen->finish = "error";
             v->gen->phase = GEN_FINISH;
             server_log(PULSAR_LOG_WARNING, "pulsar-server: bank %d: %s", v->bank.raw(), v->gen->err);
@@ -3907,7 +3884,6 @@ bool server::prompt_kv_admit(session_slot *sl, job *j, bool *refused) {
            (server_judge_release(s) || s->preempt_newest_decoder(sl, need)))
         v = s->prompt_kv_check(sl, j, order, &n_spill, &need);
     if (v == PROMPT_KV_FITS) return true;
-    const double gib = 1024.0 * 1024.0 * 1024.0;
     const KvBytes touched = s->kv_reserved_bytes(sl);   /* the base the verdict read (L326) */
     if (v == PROMPT_KV_SPILL) {
         /* L394: said once per job, like the WAIT below: a job the worker retries says it again only once it bound */
@@ -3915,8 +3891,8 @@ bool server::prompt_kv_admit(session_slot *sl, job *j, bool *refused) {
             server_log(PULSAR_LOG_DEFAULT,
                        "pulsar-server: kv admission: a %d-token prompt adds %.2f GiB of KV to bank %d (resident %.2f + "
                        "%.2f > budget %.2f GiB): spilling %d idle bank(s) first",
-                       request_prompt_toks(&j->req).raw(), (double)need.raw() / gib, sl->bank.raw(), (double)touched.raw() / gib,
-                       (double)need.raw() / gib, (double)s->guard_budget().raw() / gib, n_spill);
+                       request_prompt_toks(&j->req).raw(), pulsar_gib(need), sl->bank.raw(), pulsar_gib(touched),
+                       pulsar_gib(need), pulsar_gib(s->guard_budget()), n_spill);
         bool failed = false;
         for (int k = 0; k < n_spill && !failed; k++) {
             failed = !s->spill_bank(&s->slots[order[k]]);
@@ -3940,8 +3916,8 @@ bool server::prompt_kv_admit(session_slot *sl, job *j, bool *refused) {
             server_log(PULSAR_LOG_WARNING,
                        "pulsar-server: kv admission: a %d-token prompt adds %.2f GiB of KV to bank %d (resident %.2f + "
                        "%.2f > budget %.2f GiB) and no idle bank can be spilled: queued until a busy bank's job ends",
-                       request_prompt_toks(&j->req).raw(), (double)need.raw() / gib, sl->bank.raw(), (double)touched.raw() / gib,
-                       (double)need.raw() / gib, (double)s->guard_budget().raw() / gib);
+                       request_prompt_toks(&j->req).raw(), pulsar_gib(need), sl->bank.raw(), pulsar_gib(touched),
+                       pulsar_gib(need), pulsar_gib(s->guard_budget()));
         s->note_provision_refusal(j, PROVISION_REFUSED_KV_TOUCHED);
         return false;
     }
@@ -3950,8 +3926,8 @@ bool server::prompt_kv_admit(session_slot *sl, job *j, bool *refused) {
              "not enough KV memory for this prompt now: its %d tokens need %.2f GiB of KV beside %.2f GiB the server "
              "keeps resident (budget %.2f GiB), and no idle conversation can be moved to disk to make room; retry "
              "later or shorten the prompt",
-             request_prompt_toks(&j->req).raw(), (double)need.raw() / gib, (double)touched.raw() / gib,
-             (double)s->guard_budget().raw() / gib);
+             request_prompt_toks(&j->req).raw(), pulsar_gib(need), pulsar_gib(touched),
+             pulsar_gib(s->guard_budget()));
     server_log(PULSAR_LOG_WARNING, "pulsar-server: kv admission REFUSED (503): %s", msg);
     s->count_503(SERVER_503_ADMISSION);   /* L378 */
     s->note_provision_refusal(j, PROVISION_REFUSED_KV_TOUCHED);
@@ -3998,7 +3974,6 @@ bool server::floor_admits_chunk(int rows, char *err, size_t errlen) {
     /* a host-only server (the unit tests) has no session to price a row by: the floor alone decides */
     const KvBytes need = s->sess ? pulsar_session_quantum_growth_bytes_per_bank(s->sess, KvRows{(uint32_t)rows})
                                  : KvBytes{};
-    const double gib = 1024.0 * 1024.0 * 1024.0;
     server_mem_reading mem = s->mem_reading();
     int spilled = 0;
     for (int round = 0; round <= PULSAR_SESSION_POOL_CAP; round++) {
@@ -4013,7 +3988,7 @@ bool server::floor_admits_chunk(int rows, char *err, size_t errlen) {
     }
     snprintf(err, errlen,
              "not enough memory for the next chunk now (%s, the chunk %.2f GiB, after %d spill(s)); retry later",
-             server_mem_reading_words(mem).c_str(), (double)need.raw() / gib, spilled);
+             server_mem_reading_words(mem).c_str(), pulsar_gib(need), spilled);
     return false;
 }
 
@@ -4023,7 +3998,6 @@ bool server::budget_admits_growth(BankId bank, int end_rows, char *err, size_t e
     if (!s->guard_enabled || s->pool_banks <= 0 || !s->sess) return true;
     pulsar_session *pool = s->sess;
     const KvBytes want = pulsar_session_quantum_growth_bytes_per_bank(pool, KvRows{(uint32_t)(end_rows > 0 ? end_rows : 0)});
-    const double gib = 1024.0 * 1024.0 * 1024.0;
     KvBytes need{}, base{};
     int spilled = 0;
     for (int round = 0; round < 2; round++) {
@@ -4042,8 +4016,8 @@ bool server::budget_admits_growth(BankId bank, int end_rows, char *err, size_t e
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: kv admission: bank %d's prompt of %d tokens adds %.2f GiB of KV (resident %.2f + "
                    "%.2f > budget %.2f GiB): spilling %d idle bank(s) first",
-                   bank.raw(), end_rows, (double)need.raw() / gib, (double)base.raw() / gib, (double)need.raw() / gib,
-                   (double)s->guard_budget().raw() / gib, n_spill);
+                   bank.raw(), end_rows, pulsar_gib(need), pulsar_gib(base), pulsar_gib(need),
+                   pulsar_gib(s->guard_budget()), n_spill);
         for (int k = 0; k < n_spill; k++) {
             if (!s->spill_bank(&s->slots[order[k]])) break;
             s->count_metric(&s->m_spills);
@@ -4053,7 +4027,7 @@ bool server::budget_admits_growth(BankId bank, int end_rows, char *err, size_t e
     snprintf(err, errlen,
              "not enough KV memory for this prompt now: its %d tokens need %.2f GiB of KV beside %.2f GiB the server "
              "keeps resident (budget %.2f GiB), after %d spill(s); retry later",
-             end_rows, (double)need.raw() / gib, (double)base.raw() / gib, (double)s->guard_budget().raw() / gib,
+             end_rows, pulsar_gib(need), pulsar_gib(base), pulsar_gib(s->guard_budget()),
              spilled);
     return false;
 }
@@ -4062,7 +4036,6 @@ bool server::prefill_headroom_ok(session_slot *sl) {
     auto *s = this;
     gen_state *g = sl->gen;
     const KvBytes need = s->prefill_chunk_need();
-    const double gib = 1024.0 * 1024.0 * 1024.0;
     server_mem_reading mem = s->mem_reading();
     bool preempt_tried = false;
     const char *why = "nothing left to free";   /* the refusal says which: a REFUSE verdict, or a remedy that failed */
@@ -4088,7 +4061,7 @@ bool server::prefill_headroom_ok(session_slot *sl) {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: prefill on bank %d: %s does not cover the next chunk's %.2f GiB over the floor -- "
                    "%s first",
-                   sl->bank.raw(), server_mem_reading_words(mem).c_str(), (double)need.raw() / gib,
+                   sl->bank.raw(), server_mem_reading_words(mem).c_str(), pulsar_gib(need),
                    step == PREFILL_MEM_SPILL ? "spilling the least-recently-used idle bank"
                                              : "preempting the newest decoder");
         if (step == PREFILL_MEM_SPILL) {
@@ -4106,7 +4079,7 @@ bool server::prefill_headroom_ok(session_slot *sl) {
     snprintf(g->err, sizeof g->err,
              "not enough memory to continue this prompt now (%s, next chunk %.2f GiB); the part computed is kept, "
              "retry later",
-             server_mem_reading_words(mem).c_str(), (double)need.raw() / gib);
+             server_mem_reading_words(mem).c_str(), pulsar_gib(need));
     unsigned skipped = 0;
     if (warn_limiter_due(&s->prefill_mem_warn, server_now_sec(), PULSAR_SERVER_MEM_FLOOR_WARN_SEC, &skipped))
         server_log(PULSAR_LOG_WARNING, "pulsar-server: prefill REFUSED (503) on bank %d at %d (a prompt of %d tokens) -- %s after "
@@ -4200,19 +4173,18 @@ int server::guard_maybe_evict(session_slot *const *dec, int n, session_slot **ke
         const uint64_t now_us = (uint64_t)(server_now_sec() * 1e6);
         if (projected > bound && now_us - last_warn_us > 5000000ull) {
             last_warn_us = now_us;
-            const double gib = 1024.0 * 1024.0 * 1024.0;
             server_log(PULSAR_LOG_WARNING,
                 "pulsar-server: guard: projected touched %.2f GiB > budget %.2f GiB but NO "
                 "idle victim and no preemption makes room — back-pressure (MemAvailable floor is the backstop)",
-                (double)projected.raw() / gib, (double)bound.raw() / gib);
+                pulsar_gib(projected), pulsar_gib(bound));
         }
     }
     if (spilled_this_quantum > 0) {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: guard: spilled %d bank(s) this quantum (touched now %.2f GiB / %.2f GiB)",
                    spilled_this_quantum,
-                   (double)pulsar_session_touched_kv_bytes(pool).raw() / (1024.0*1024.0*1024.0),
-                   (double)bound.raw() / (1024.0*1024.0*1024.0));
+                   pulsar_gib(pulsar_session_touched_kv_bytes(pool)),
+                   pulsar_gib(bound));
     }
     return n;
 }

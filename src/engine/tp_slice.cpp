@@ -214,7 +214,7 @@ bool pulsar_tp_plan_build(pulsar_engine *e) {
                     "views %u, gathers %u, mxfp4 halves %u, expert ranges %u, exl3 halves %u); %.2f GiB of stored "
                     "tensors unstaged\n",
             e->model.tp_rank, e->model.tp_n_ranks, p->slices.size(), count[0], count[1], count[2], count[3], count[4],
-            count[5], count[6], count[7], count[8], (double)unstaged / 1073741824.0);
+            count[5], count[6], count[7], count[8], (double)unstaged / PULSAR_GIB);
     return true;
 }
 
@@ -437,6 +437,6 @@ bool pulsar_tp_plan_run(pulsar_engine *e) {
     /* L272 B9: resident weights the model's staged count never sees (pulsar_engine::weights_resident_bytes) */
     if (!g_tp_record) e->tp_built_bytes += bytes;
     fprintf(stderr, "pulsar: TP rank %d: %zu slices %s, %.2f GiB built or staged\n", e->model.tp_rank, p->slices.size(),
-            g_tp_record ? "recorded" : "in place", (double)bytes / 1073741824.0);
+            g_tp_record ? "recorded" : "in place", (double)bytes / PULSAR_GIB);
     return true;
 }

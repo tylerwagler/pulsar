@@ -340,7 +340,7 @@ bool server_judge_release(server *s) {
     J->released = true;
     server_log(PULSAR_LOG_DEFAULT, "pulsar-server: /v1/systemone: bank %d's KV freed for chat (%.2f GiB; no judge "
                "request waits): the next one re-backs it empty and prefills again", J->bank.raw(),
-               (double)held.raw() / (1024.0 * 1024.0 * 1024.0));
+               pulsar_gib(held));
     return true;
 }
 
