@@ -2701,6 +2701,21 @@ bool kv_ledger_due(int64_t now_s, int64_t last_s);
 void kv_dup_census_core(int n, const int *hist_len, const bool *resident, const int *const *common, int grid,
                         KvBytes page_bytes, kv_dup_census *out, uint32_t *deep);
 
+/** L433: how a /v1/systemone request ended, as /metrics labels it (`pulsar:systemone_requests_total{outcome}`). */
+enum server_systemone_outcome {
+    SERVER_SYSTEMONE_OK = 0,   ///< 200: every question answered
+    SERVER_SYSTEMONE_INVALID,  ///< 4xx: a malformed request, or a server with no judge
+    SERVER_SYSTEMONE_BUSY,     ///< 503 with the retry hint: refused for memory or KV budget
+    SERVER_SYSTEMONE_FAILED,   ///< any other end: a 503 without the hint (the prefill failed, shutdown, the client left), a 500
+    SERVER_SYSTEMONE_OUTCOMES  ///< the count
+};
+/// The /metrics label of each server_systemone_outcome.
+extern const char *const server_systemone_outcome_names[SERVER_SYSTEMONE_OUTCOMES];
+/// @param status the HTTP status a /v1/systemone request was answered with (0: none sent)
+/// @param retry  the 503 carried the retry hint
+/// @return its outcome
+server_systemone_outcome server_systemone_outcome_of(int status, bool retry);
+
 /** The whole server: engine, session pool, scheduler queue, caches, metrics.
  *
  * ONE worker thread does every piece of engine work; client threads only parse,
@@ -3002,6 +3017,10 @@ struct server {
     pulsar_hist m_h_prompt_tok;  ///< prompt tokens per request
     pulsar_hist m_h_gen_tok;  ///< completion tokens per request
     uint64_t m_requests_finished;  ///< requests completed; the count these histograms summarise
+    /** L433: /v1/systemone requests answered, by outcome (server_systemone_outcome), counted when the handler
+     *  returns -- every end, refusals before the queue included.  /metrics had no stage-1 count at all. */
+    uint64_t m_systemone_requests[SERVER_SYSTEMONE_OUTCOMES];
+    uint64_t m_systemone_questions;  ///< L433: questions answered by /v1/systemone requests that ended 200
     /* Slot-pool lifecycle. Eviction forces the next turn of that conversation
      * to replay from a checkpoint, which is the dominant tail-latency source
      * on a busy pool, and none of it was previously observable. */

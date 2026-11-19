@@ -19577,6 +19577,74 @@ static void test_l432_a_systemone_request_reaches_the_stream(void) {
     server_judge_close(&x.s);
 }
 
+/* L433: a /v1/systemone request is counted once, by how it ended, when its handler returns -- and the count marks
+ * the metrics stream; /metrics carries the series only on a server with a judge. */
+static void test_l433_systemone_requests_are_counted(void) {
+    TEST_ASSERT(server_systemone_outcome_of(200, false) == SERVER_SYSTEMONE_OK);
+    TEST_ASSERT(server_systemone_outcome_of(400, false) == SERVER_SYSTEMONE_INVALID);
+    TEST_ASSERT(server_systemone_outcome_of(404, false) == SERVER_SYSTEMONE_INVALID);
+    TEST_ASSERT(server_systemone_outcome_of(503, true) == SERVER_SYSTEMONE_BUSY);
+    TEST_ASSERT(server_systemone_outcome_of(503, false) == SERVER_SYSTEMONE_FAILED);
+    TEST_ASSERT(server_systemone_outcome_of(500, false) == SERVER_SYSTEMONE_FAILED);
+    TEST_ASSERT(server_systemone_outcome_of(0, false) == SERVER_SYSTEMONE_FAILED);
+
+    stream_server_fixture x;
+    stream_server_start(&x);
+    struct timespec t0;
+    const auto ask = [&](const char *body) {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        server_judge_http(&x.s, sv[0], body, strlen(body));
+        char buf[512];
+        const ssize_t n = read(sv[1], buf, sizeof buf - 1);
+        buf[n > 0 ? n : 0] = 0;
+        close(sv[0]);
+        close(sv[1]);
+        return std::string(buf);
+    };
+    const auto metrics = [&]() {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        (void)x.s.send_metrics(sv[0]);
+        shutdown(sv[0], SHUT_WR);
+        std::string out;
+        char buf[4096];
+        for (ssize_t n; (n = read(sv[1], buf, sizeof buf)) > 0;) out.append(buf, (size_t)n);
+        close(sv[0]);
+        close(sv[1]);
+        return out;
+    };
+
+    /* no judge: 404, counted invalid; /metrics has no systemone series */
+    TEST_ASSERT(ask("{}").find(" 404 ") != std::string::npos);
+    TEST_ASSERT(x.s.m_systemone_requests[SERVER_SYSTEMONE_INVALID] == 1);
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    stream_server_expect_frame(&x, &t0);
+    TEST_ASSERT(metrics().find("pulsar:systemone_requests_total") == std::string::npos);
+
+    /* a judge: a malformed body is 400, counted invalid, framed; nothing else moves */
+    server_judge *J = new server_judge();
+    J->bank = BankId{1};
+    x.s.judge = J;
+    TEST_ASSERT(ask("not json").find(" 400 ") != std::string::npos);
+    TEST_ASSERT(x.s.m_systemone_requests[SERVER_SYSTEMONE_INVALID] == 2);
+    TEST_ASSERT(x.s.m_systemone_requests[SERVER_SYSTEMONE_OK] == 0 && x.s.m_systemone_requests[SERVER_SYSTEMONE_BUSY] == 0 &&
+                x.s.m_systemone_requests[SERVER_SYSTEMONE_FAILED] == 0 && x.s.m_systemone_questions == 0);
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    stream_server_expect_frame(&x, &t0);
+
+    const std::string m = metrics();
+    TEST_ASSERT(m.find("# TYPE pulsar:systemone_requests_total counter\n") != std::string::npos);
+    TEST_ASSERT(m.find("pulsar:systemone_requests_total{outcome=\"ok\"} 0\n") != std::string::npos);
+    TEST_ASSERT(m.find("pulsar:systemone_requests_total{outcome=\"invalid\"} 2\n") != std::string::npos);
+    TEST_ASSERT(m.find("pulsar:systemone_requests_total{outcome=\"busy\"} 0\n") != std::string::npos);
+    TEST_ASSERT(m.find("pulsar:systemone_requests_total{outcome=\"failed\"} 0\n") != std::string::npos);
+    TEST_ASSERT(m.find("pulsar:systemone_questions_total 0\n") != std::string::npos);
+
+    stream_server_stop(&x);
+    server_judge_close(&x.s);
+}
+
 /* L432: refusals and acceptance.  Every 503 is counted by cause through count_metric, on whichever thread refuses
  * (the accept loop's connection cap, a client thread's parse or shutdown refusal, the worker's admission); the
  * per-class count is a client thread's at acceptance; a head the worker cannot bind is counted by the worker with
@@ -21321,6 +21389,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_metrics_stream_handler_speaks_sse();
     test_metrics_stream_handler_refuses_past_its_own_cap();
     test_l432_a_systemone_request_reaches_the_stream();
+    test_l433_systemone_requests_are_counted();
     test_l432_refusals_and_counters_reach_the_stream();
     test_l432_a_mark_from_any_thread_reaches_the_stream();
     test_l432_an_idle_server_sends_only_the_refresh();

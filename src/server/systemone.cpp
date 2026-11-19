@@ -490,8 +490,10 @@ bool server_judge_step(server *s) {
  *  asked, the tokens their prompts rendered (the state once per question), how many of those the judge bank already
  *  held, how many were prefilled, the wall time and the HTTP status. */
 struct judge_req_log {
+    server *s = NULL;    ///< L433: the server whose /metrics counts the request (NULL: not counted)
     double t0 = 0.0;     ///< server_now_sec at the handler's start
     int status = 0;      ///< the HTTP status answered
+    bool retry = false;  ///< L433: a 503 sent with the retry hint (memory, KV budget, shutdown): the busy outcome
     int questions = 0;   ///< questions queued (0: refused before the queue)
     int tokens = 0;      ///< their prompts' tokens, summed
     int cached = 0;      ///< of those, held by the bank when each question began
@@ -500,8 +502,25 @@ struct judge_req_log {
         server_log(PULSAR_LOG_KVCACHE,
                    "pulsar-server: systemone req: questions=%d tokens=%d cached=%d prefilled=%d ms=%.1f status=%d",
                    questions, tokens, cached, prefilled, (server_now_sec() - t0) * 1e3, status);
+        if (!s) return;
+        /* L433: the request's one count, where its one line is written; count_metric marks the metrics stream */
+        const server_systemone_outcome o = server_systemone_outcome_of(status, retry);
+        if (o == SERVER_SYSTEMONE_OK && questions > 0) {
+            pulsar::ScopedLock lk(&s->mu);
+            s->m_systemone_questions += (uint64_t)questions;
+        }
+        s->count_metric(&s->m_systemone_requests[o]);
     }
 };
+
+const char *const server_systemone_outcome_names[SERVER_SYSTEMONE_OUTCOMES] = {"ok", "invalid", "busy", "failed"};
+
+server_systemone_outcome server_systemone_outcome_of(int status, bool retry) {
+    if (status == 200) return SERVER_SYSTEMONE_OK;
+    if (status >= 400 && status < 500) return SERVER_SYSTEMONE_INVALID;
+    if (status == 503 && retry) return SERVER_SYSTEMONE_BUSY;
+    return SERVER_SYSTEMONE_FAILED;   /* a 503 without the hint (the prefill failed, the client left), a 500, none */
+}
 
 /** L354: the questions one request may ask the judge.  Every question renders the whole state, so without a bound a body
  *  of small questions under one large state holds questions x state tokens and queues as many prefills. */
@@ -520,6 +539,7 @@ void server_judge_http(server *s, int fd, const char *body, size_t len) {
     server_judge *J = s->judge;
     /* L378: one line a request at its end, whatever the end -- the judge's calls left no line before */
     judge_req_log lg;
+    lg.s = s;
     lg.t0 = server_now_sec();
     const auto refuse = [&](int code, const char *msg) {
         lg.status = code;
@@ -661,6 +681,7 @@ void server_judge_http(server *s, int fd, const char *body, size_t len) {
         s->count_503(SERVER_503_SYSTEMONE);
         if (jb->busy) {
             lg.status = 503;
+            lg.retry = true;
             http_error_retry(fd, 503, jb->err.c_str(), HTTP_RETRY_BUSY_S);
         } else {
             refuse(503, jb->err.c_str());

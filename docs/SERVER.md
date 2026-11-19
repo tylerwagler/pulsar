@@ -709,6 +709,10 @@ between decode quanta, a 1024-token chunk a turn.
   kind's slots of `softcap * tanh((W h + b) / softcap) / T_kind` (`calibration_gold.json`), h the last row's final-norm
   hidden.
 - 404 without a judge; 400 for a malformed request; 503 when its prefill fails.
+- Counted in `/metrics` (L433, on a server with a judge): `pulsar:systemone_requests_total{outcome}` -- `ok` (200),
+  `invalid` (4xx), `busy` (503 with a retry hint: the memory floor or the KV budget), `failed` (any other end: the
+  prefill failed, shutdown, the client left, a 500) -- one count a request, at its end; and `pulsar:systemone_questions_total`, the
+  questions of the requests that ended 200. Each count marks the metrics stream.
 
 ## Health and metrics
 

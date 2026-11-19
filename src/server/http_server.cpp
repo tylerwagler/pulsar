@@ -631,6 +631,10 @@ bool server::send_metrics(int fd) {
     const pulsar_hist h_prompt_tok = s->m_h_prompt_tok;
     const pulsar_hist h_gen_tok = s->m_h_gen_tok;
     const unsigned long long reqs_finished = (unsigned long long)s->m_requests_finished;
+    unsigned long long systemone_reqs[SERVER_SYSTEMONE_OUTCOMES];   /* L433 */
+    for (int i = 0; i < SERVER_SYSTEMONE_OUTCOMES; i++) systemone_reqs[i] = (unsigned long long)s->m_systemone_requests[i];
+    const unsigned long long systemone_questions = (unsigned long long)s->m_systemone_questions;
+    const bool has_judge = s->judge != NULL;
     const unsigned long long evictions = (unsigned long long)s->m_evictions;
     const unsigned long long spills = (unsigned long long)s->m_spills;
     const unsigned long long restores = (unsigned long long)s->m_restores;
@@ -971,6 +975,18 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# HELP pulsar:requests_finished_total Requests whose turn ran to its end (not abandoned, not failed): the count the request histograms summarise.\n");
     buf_puts(&b, "# TYPE pulsar:requests_finished_total counter\n");
     buf_printf(&b, "pulsar:requests_finished_total %llu\n", reqs_finished);
+    if (has_judge) {   /* L433: only a server with a judge has the route */
+        buf_puts(&b, "# HELP pulsar:systemone_requests_total /v1/systemone requests answered, by outcome: ok (200), "
+                     "invalid (4xx), busy (503 with a retry hint), failed (any other end).\n");
+        buf_puts(&b, "# TYPE pulsar:systemone_requests_total counter\n");
+        for (int i = 0; i < SERVER_SYSTEMONE_OUTCOMES; i++)
+            buf_printf(&b, "pulsar:systemone_requests_total{outcome=\"%s\"} %llu\n", server_systemone_outcome_names[i],
+                       systemone_reqs[i]);
+        buf_puts(&b, "# HELP pulsar:systemone_questions_total Questions answered by /v1/systemone requests that ended 200 "
+                     "(a request asks up to 64).\n");
+        buf_puts(&b, "# TYPE pulsar:systemone_questions_total counter\n");
+        buf_printf(&b, "pulsar:systemone_questions_total %llu\n", systemone_questions);
+    }
 
     /* Slot-pool churn. An eviction forces that conversation to replay from a
      * checkpoint on its next turn, so these counters are the explanation for
