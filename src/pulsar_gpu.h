@@ -3490,10 +3490,10 @@ int pulsar_gpu_routed_moe_batch_tensor(
         MapOff                  down_offset,
         uint32_t                gate_type,
         uint32_t                down_type,
-        uint64_t                gate_expert_bytes,
-        uint64_t                gate_row_bytes,
-        uint64_t                down_expert_bytes,
-        uint64_t                down_row_bytes,
+        TensorBytes             gate_expert_bytes,
+        TensorBytes             gate_row_bytes,
+        TensorBytes             down_expert_bytes,
+        TensorBytes             down_row_bytes,
         uint32_t                expert_in_dim,
         uint32_t                expert_mid_dim,
         uint32_t                out_dim,
@@ -4038,10 +4038,10 @@ uint64_t pulsar_gpu_sample_scratch_bytes(uint32_t n_vocab);
  *  @param dist                emitted-distribution dump for the equality gate, or NULL
  *  @param dist_cap            entries per dist row
  *  @return 1 on success (enqueued), 0 on a bad launch (said) */
-int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offset_bytes, uint32_t row_stride,
+int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, TensorBytes logits_offset_bytes, uint32_t row_stride,
                            uint32_t n_vocab, uint32_t logits_rows, uint32_t n_rows, const pulsar_gpu_sample_req *reqs,
                            const pulsar_gpu_tensor *mask, uint32_t mask_words, const pulsar_gpu_tensor *id_map,
-                           pulsar_gpu_tensor *scratch, pulsar_gpu_tensor *out, uint64_t out_offset_bytes,
+                           pulsar_gpu_tensor *scratch, pulsar_gpu_tensor *out, TensorBytes out_offset_bytes,
                            pulsar_gpu_tensor *dist, uint32_t dist_cap);
 
 /** A verify run for the device walk: the sampler rows [row0, row0 + k] of one bank (the draw after the base and
@@ -4082,9 +4082,9 @@ typedef struct pulsar_gpu_spec_walk_out {
  *  @param out               receives n_runs pulsar_gpu_spec_walk_out
  *  @param out_offset_bytes  byte offset into out
  *  @return 1 on success (enqueued), 0 on a bad launch */
-int pulsar_gpu_spec_walk(const pulsar_gpu_tensor *rows, uint64_t rows_offset_bytes, uint32_t n_rows,
+int pulsar_gpu_spec_walk(const pulsar_gpu_tensor *rows, TensorBytes rows_offset_bytes, uint32_t n_rows,
                          const pulsar_gpu_spec_run *runs, uint32_t n_runs, pulsar_gpu_tensor *out,
-                         uint64_t out_offset_bytes);
+                         TensorBytes out_offset_bytes);
 
 /** The logprob outputs of a row (the host's pulsar_token_score, field for field). */
 #define PULSAR_GPU_LOGPROB_TOPK_MAX 20u
@@ -4126,9 +4126,9 @@ typedef struct pulsar_gpu_logprob_row {
  *  @param scratch             pulsar_gpu_logprobs_scratch_bytes of scratch
  *  @param out                 receives n_rows pulsar_gpu_logprob_row
  *  @return 1 on success, 0 on a bad launch */
-int pulsar_gpu_logprobs_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offset_bytes, uint32_t row_stride,
+int pulsar_gpu_logprobs_rows(const pulsar_gpu_tensor *logits, TensorBytes logits_offset_bytes, uint32_t row_stride,
                              uint32_t n_vocab, uint32_t n_rows, const pulsar_gpu_tensor *mask, uint32_t mask_words,
-                             const uint32_t *mask_rows, const pulsar_gpu_tensor *tokens, uint64_t tokens_offset_bytes,
+                             const uint32_t *mask_rows, const pulsar_gpu_tensor *tokens, TensorBytes tokens_offset_bytes,
                              uint32_t token_stride, uint32_t top_k, pulsar_gpu_tensor *scratch,
                              pulsar_gpu_tensor *out);
 /** Bytes of the scratch a logprob launch over rows of n_vocab takes (any row count). */
@@ -4181,10 +4181,10 @@ typedef struct pulsar_gpu_chain_req {
  *  @param out                 int32 tokens [n_chains][slots] out
  *  @param out_offset_bytes    byte offset into out
  *  @return 1 on success, 0 on a bad launch */
-int pulsar_gpu_sample_chains(const pulsar_gpu_tensor *cand, uint64_t cand_offset_bytes, const pulsar_gpu_tensor *scores,
-                             uint64_t scores_offset_bytes, uint32_t slots, uint32_t topk, uint32_t vocab,
+int pulsar_gpu_sample_chains(const pulsar_gpu_tensor *cand, TensorBytes cand_offset_bytes, const pulsar_gpu_tensor *scores,
+                             TensorBytes scores_offset_bytes, uint32_t slots, uint32_t topk, uint32_t vocab,
                              const pulsar_gpu_chain_req *reqs, uint32_t n_chains, pulsar_gpu_tensor *out,
-                             uint64_t out_offset_bytes);
+                             TensorBytes out_offset_bytes);
 
 /** A deterministic 64-bit digest of n_rows f32 rows of `width` (8-byte aligned) into out at out_offset_bytes: the
  *  TP mirror's cross-rank identity check over rows that stay on the device (L243, L302). */
@@ -4195,8 +4195,8 @@ int pulsar_gpu_sample_chains(const pulsar_gpu_tensor *cand, uint64_t cand_offset
  *  @param out              receives the uint64 digest
  *  @param out_offset_bytes byte offset into out
  *  @return 1 on success, 0 on a bad launch */
-int pulsar_gpu_rows_digest(const pulsar_gpu_tensor *rows, uint64_t offset_bytes, uint32_t n_rows, uint32_t width,
-                           pulsar_gpu_tensor *out, uint64_t out_offset_bytes);
+int pulsar_gpu_rows_digest(const pulsar_gpu_tensor *rows, TensorBytes offset_bytes, uint32_t n_rows, uint32_t width,
+                           pulsar_gpu_tensor *out, TensorBytes out_offset_bytes);
 
 
 /** L150: bank-batched markov refine. One launch per draft position serves

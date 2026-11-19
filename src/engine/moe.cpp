@@ -110,8 +110,10 @@ bool pulsar_moe_routed_slot(const pulsar_moe_slot_call *c) {
         return false;
     }
     return pulsar_gpu_routed_moe_batch_tensor(c->out, c->up_out, c->mid_out, c->experts_out, map, size, gate_off,
-                                              up_off, down_off, G->type, D->type, gate_expert, gate_row, down_expert,
-                                              down_row, (uint32_t)in, (uint32_t)mid, (uint32_t)out, c->selected,
+                                              up_off, down_off, G->type, D->type,
+                                              /* the byte model (routed_expert_side_layout) is raw: its sizes enter here */
+                                              TensorBytes{gate_expert}, TensorBytes{gate_row}, TensorBytes{down_expert},
+                                              TensorBytes{down_row}, (uint32_t)in, (uint32_t)mid, (uint32_t)out, c->selected,
                                               c->weights, c->n_expert_present, c->n_expert_used, c->clamp, c->x,
                                               c->layer, c->n_tokens, split) != 0;
 }

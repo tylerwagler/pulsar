@@ -116,7 +116,8 @@ static bool routed(const void *map, uint64_t size, const uint64_t off[3], int gk
     const uint32_t dtype = dk2 == 4 ? PULSAR_TENSOR_EXL3M_K2 : dk2 == 5 ? PULSAR_TENSOR_EXL3M_K2H : dk2 == 6 ? PULSAR_TENSOR_EXL3M_K3
                          : dk2 == 8 ? PULSAR_TENSOR_EXL3M_K4 : dk2 == 10 ? PULSAR_TENSOR_EXL3M_K5 : PULSAR_TENSOR_EXL3M_K6;
     const int ok = pulsar_gpu_routed_moe_batch_tensor(out, up, md, down, map, size, MapOff{off[0]}, MapOff{off[1]}, MapOff{off[2]}, gtype, dtype,
-                                                      gs, gt, ds, dt, H, (uint32_t)mid, H, sel, wts, E, TOPK, 10.0f, x,
+                                                      TensorBytes{gs}, TensorBytes{gt}, TensorBytes{ds}, TensorBytes{dt},
+                                                      H, (uint32_t)mid, H, sel, wts, E, TOPK, 10.0f, x,
                                                       0, (uint32_t)n_tok, (uint32_t)split);
     bool good = ok != 0 && cudaDeviceSynchronize() == cudaSuccess;
     if (good && r) {
@@ -297,7 +298,8 @@ int main(int argc, char **argv) {
             pulsar_gpu_mxfp8_act_cache_encode_f32(x, 1, H);
             auto split_call = [&](uint32_t gtype, uint32_t dtype, uint32_t mid) {
                 return pulsar_gpu_routed_moe_batch_tensor(o, u, m, d, &key, UINT64_MAX / 2u, MapOff{hoff[0][0]}, MapOff{hoff[0][1]},
-                                                          MapOff{hoff[0][2]}, gtype, dtype, gs, gt, ds, dt, H, mid, H, sel, wts,
+                                                          MapOff{hoff[0][2]}, gtype, dtype, TensorBytes{gs},
+                                                          TensorBytes{gt}, TensorBytes{ds}, TensorBytes{dt}, H, mid, H, sel, wts,
                                                           E, TOPK, 10.0f, x, 0, 1, 1);
             };
             pulsar_gpu_matmul_set_batch_decode_rows(1);

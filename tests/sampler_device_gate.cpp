@@ -253,13 +253,13 @@ bool run_batch(gate &g, uint32_t n_vocab, std::vector<case_row> &rows, pulsar_gp
     }
     std::vector<pulsar_gpu_sample_out> out1(nr), out2(nr);
     std::vector<uint32_t> dist((size_t)nr * (1 + 2 * DIST_CAP));
-    if (!pulsar_gpu_sample_rows(dl, 0, stride, n_vocab, nr, nr, reqs.data(), dm, words, idm, scratch, dout, 0, ddist,
+    if (!pulsar_gpu_sample_rows(dl, TensorBytes{0}, stride, n_vocab, nr, nr, reqs.data(), dm, words, idm, scratch, dout, TensorBytes{0}, ddist,
                                 DIST_CAP) ||
         !pulsar_gpu_synchronize() || !pulsar_gpu_tensor_read(dout, TensorBytes{0}, out1.data(),
                                                              TensorBytes{sizeof(out1[0])}.times(out1.size())) ||
         !pulsar_gpu_tensor_read(ddist, TensorBytes{0}, dist.data(), bytes_of<uint32_t>(dist.size())))
         return false;
-    if (!pulsar_gpu_sample_rows(dl, 0, stride, n_vocab, nr, nr, reqs.data(), dm, words, idm, scratch, dout, 0, nullptr, 0) ||
+    if (!pulsar_gpu_sample_rows(dl, TensorBytes{0}, stride, n_vocab, nr, nr, reqs.data(), dm, words, idm, scratch, dout, TensorBytes{0}, nullptr, 0) ||
         !pulsar_gpu_synchronize() || !pulsar_gpu_tensor_read(dout, TensorBytes{0}, out2.data(),
                                                              TensorBytes{sizeof(out2[0])}.times(out2.size())))
         return false;
@@ -267,7 +267,7 @@ bool run_batch(gate &g, uint32_t n_vocab, std::vector<case_row> &rows, pulsar_gp
     std::vector<pulsar_gpu_logprob_row> lp(nr);
     std::vector<uint32_t> mrows(nr);
     for (uint32_t r = 0; r < nr; r++) mrows[r] = reqs[r].mask_row;
-    if (check_lp && (!pulsar_gpu_logprobs_rows(dl, 0, stride, n_vocab, nr, dm, words, mrows.data(), dout, 0, sizeof(pulsar_gpu_sample_out) / 4,
+    if (check_lp && (!pulsar_gpu_logprobs_rows(dl, TensorBytes{0}, stride, n_vocab, nr, dm, words, mrows.data(), dout, TensorBytes{0}, sizeof(pulsar_gpu_sample_out) / 4,
                                                PULSAR_GPU_LOGPROB_TOPK_MAX, scratch, dlp) ||
                      !pulsar_gpu_synchronize() || !pulsar_gpu_tensor_read(dlp, TensorBytes{0}, lp.data(),
                                                                           TensorBytes{sizeof(lp[0])}.times(lp.size()))))
@@ -431,12 +431,12 @@ bool run_walk(gate &g, uint32_t n_vocab, pulsar_gpu_tensor *dl, pulsar_gpu_tenso
         runs.push_back(run);
         r0 += k + 1;
     }
-    if (!pulsar_gpu_sample_rows(dl, 0, n_vocab, n_vocab, ROWS, ROWS, reqs.data(), nullptr, 0, nullptr, scratch, dout, 0, nullptr, 0))
+    if (!pulsar_gpu_sample_rows(dl, TensorBytes{0}, n_vocab, n_vocab, ROWS, ROWS, reqs.data(), nullptr, 0, nullptr, scratch, dout, TensorBytes{0}, nullptr, 0))
         return false;
     std::vector<int> tok(ROWS);
     for (uint32_t r = 0; r < ROWS; r++) tok[r] = ho[r].tok;
     std::vector<pulsar_gpu_spec_walk_out> wo(runs.size());
-    if (!pulsar_gpu_spec_walk(dout, 0, ROWS, runs.data(), (uint32_t)runs.size(), dwalk, 0) ||
+    if (!pulsar_gpu_spec_walk(dout, TensorBytes{0}, ROWS, runs.data(), (uint32_t)runs.size(), dwalk, TensorBytes{0}) ||
         !pulsar_gpu_synchronize() || !pulsar_gpu_tensor_read(dwalk, TensorBytes{0}, wo.data(),
                                                              TensorBytes{sizeof(wo[0])}.times(wo.size())))
         return false;
@@ -496,11 +496,11 @@ void bench(uint32_t n_vocab, pulsar_gpu_tensor *dl, pulsar_gpu_tensor *scratch, 
                 reqs[r] = pulsar_gpu_sample_req{m.t, m.p, m.m, m.k, 0x1234ull + r, 0u, PULSAR_GPU_SAMPLE_NO_MASK, -1, r};
             }
             const int it = 20;
-            pulsar_gpu_sample_rows(dl, 0, n_vocab, n_vocab, nr, nr, reqs.data(), nullptr, 0, nullptr, scratch, dout, 0, nullptr, 0);
+            pulsar_gpu_sample_rows(dl, TensorBytes{0}, n_vocab, n_vocab, nr, nr, reqs.data(), nullptr, 0, nullptr, scratch, dout, TensorBytes{0}, nullptr, 0);
             pulsar_gpu_synchronize();
             const auto t0 = std::chrono::steady_clock::now();
             for (int i = 0; i < it; i++)
-                pulsar_gpu_sample_rows(dl, 0, n_vocab, n_vocab, nr, nr, reqs.data(), nullptr, 0, nullptr, scratch, dout, 0, nullptr,
+                pulsar_gpu_sample_rows(dl, TensorBytes{0}, n_vocab, n_vocab, nr, nr, reqs.data(), nullptr, 0, nullptr, scratch, dout, TensorBytes{0}, nullptr,
                                        0);
             pulsar_gpu_synchronize();
             const double us =
@@ -511,11 +511,11 @@ void bench(uint32_t n_vocab, pulsar_gpu_tensor *dl, pulsar_gpu_tensor *scratch, 
     pulsar_gpu_tensor *lp = pulsar_gpu_tensor_alloc(bytes_of<pulsar_gpu_logprob_row>(ROWS));
     for (uint32_t nr : {1u, 5u, 33u}) {
         const int it = 20;
-        pulsar_gpu_logprobs_rows(dl, 0, n_vocab, n_vocab, nr, nullptr, 0, nullptr, nullptr, 0, 0, 20, scratch, lp);
+        pulsar_gpu_logprobs_rows(dl, TensorBytes{0}, n_vocab, n_vocab, nr, nullptr, 0, nullptr, nullptr, TensorBytes{0}, 0, 20, scratch, lp);
         pulsar_gpu_synchronize();
         const auto t0 = std::chrono::steady_clock::now();
         for (int i = 0; i < it; i++)
-            pulsar_gpu_logprobs_rows(dl, 0, n_vocab, n_vocab, nr, nullptr, 0, nullptr, nullptr, 0, 0, 20, scratch, lp);
+            pulsar_gpu_logprobs_rows(dl, TensorBytes{0}, n_vocab, n_vocab, nr, nullptr, 0, nullptr, nullptr, TensorBytes{0}, 0, 20, scratch, lp);
         pulsar_gpu_synchronize();
         const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / it;
         printf("  bench V=%u %-28s %2u rows: %8.1f us a launch\n", n_vocab, "logprobs top 20", nr, us);
@@ -566,7 +566,7 @@ static void test_chains(gate &g, uint32_t V, uint32_t rounds) {
         std::vector<int32_t> out((size_t)nc * SL);
         if (!pulsar_gpu_tensor_write(dc, TensorBytes{0}, cand.data(), bytes_of<int32_t>(cand.size())) ||
             !pulsar_gpu_tensor_write(ds, TensorBytes{0}, sc.data(), bytes_of<float>(sc.size())) ||
-            !pulsar_gpu_sample_chains(dc, 0, ds, 0, SL, TK, V, rq.data(), nc, dout, 0) ||
+            !pulsar_gpu_sample_chains(dc, TensorBytes{0}, ds, TensorBytes{0}, SL, TK, V, rq.data(), nc, dout, TensorBytes{0}) ||
             !pulsar_gpu_tensor_read(dout, TensorBytes{0}, out.data(), bytes_of<int32_t>(out.size()))) {
             g.fails++;
             fprintf(stderr, "  FAIL chains: a launch failed\n");
@@ -649,8 +649,8 @@ static void test_walk_refusal(gate &g, uint32_t V, pulsar_gpu_tensor *dl, pulsar
     pulsar_gpu_spec_walk_out wo;
     g.cases++;
     if (!pulsar_gpu_tensor_write(dl, TensorBytes{0}, host.data(), bytes_of<float>(host.size())) ||
-        !pulsar_gpu_sample_rows(dl, 0, V, V, 3, 3, reqs, nullptr, 0, nullptr, scratch, dout, 0, nullptr, 0) ||
-        !pulsar_gpu_spec_walk(dout, 0, 3, &run, 1, dwalk, 0) || !pulsar_gpu_synchronize() ||
+        !pulsar_gpu_sample_rows(dl, TensorBytes{0}, V, V, 3, 3, reqs, nullptr, 0, nullptr, scratch, dout, TensorBytes{0}, nullptr, 0) ||
+        !pulsar_gpu_spec_walk(dout, TensorBytes{0}, 3, &run, 1, dwalk, TensorBytes{0}) || !pulsar_gpu_synchronize() ||
         !pulsar_gpu_tensor_read(dout, TensorBytes{0}, out,
                                 TensorBytes{sizeof(out)}) || !pulsar_gpu_tensor_read(dwalk, TensorBytes{0}, &wo,
                                                                                      TensorBytes{sizeof(wo)})) {
@@ -688,8 +688,8 @@ static void test_rows_digest(gate &g) {
     uint32_t checks = 0, bad = 0;
     auto digest = [&](uint64_t off_floats, uint32_t nr, uint32_t w) {
         uint64_t h = 0;
-        if (!pulsar_gpu_rows_digest(d, off_floats * 4u, nr, w, out,
-                                    0) || !pulsar_gpu_tensor_read(out, TensorBytes{0}, &h, TensorBytes{8u}))
+        if (!pulsar_gpu_rows_digest(d, bytes_of<float>(off_floats), nr, w, out,
+                                    TensorBytes{0}) || !pulsar_gpu_tensor_read(out, TensorBytes{0}, &h, TensorBytes{8u}))
             bad++;
         return h;
     };

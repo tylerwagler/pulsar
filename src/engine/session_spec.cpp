@@ -580,7 +580,7 @@ static bool spec_walk_rounds(pulsar_session *s, const spec_walk_round *w, uint32
     }
     const SlabOff walk_off = SlabOff::after(bytes_of<pulsar_gpu_sample_out>(PULSAR_GPU_SAMPLE_ROWS_MAX));
     if (!s->draw_rows_dev(s->dev.step_rows, rows, m, reqs, masks) ||
-        !pulsar_gpu_spec_walk(s->dev.out, 0, m, runs, n, s->dev.out, walk_off.raw()) ||   /* raw at the launcher */
+        !pulsar_gpu_spec_walk(s->dev.out, TensorBytes{0}, m, runs, n, s->dev.out, walk_off.before()) ||
         !pulsar_gpu_tensor_read(s->dev.out, walk_off.before(), out, TensorBytes{sizeof(*out)}.times(n))) {
         snprintf(err, errlen, "spec walk: the device sampler failed over %u rows", m);
         return false;
