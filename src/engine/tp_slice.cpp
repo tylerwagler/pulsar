@@ -378,8 +378,9 @@ static bool run_slice(pulsar_engine *e, pulsar_tp_plan *p, const pulsar_tp_slice
             return true;
         }
         return pulsar_gpu_register_mxfp4_expert_half(e, pulsar_tp_expert_half_offset(m, t), tensor_map_base(m, t),
-                                                     t->abs_offset, n_exp, k, n, k_half ? 1 : 0, lo, hi, ss, sd, hs,
-                                                     hd) != 0;
+                                                     t->abs_offset, n_exp, k, n, k_half ? 1 : 0, lo, hi,
+                                                     /* the byte model's (cutlass_mxfp4_expert_layout, raw) */
+                                                     TensorBytes{ss}, TensorBytes{sd}, TensorBytes{hs}, TensorBytes{hd}) != 0;
     }
     case PULSAR_TP_OP_EXL3_HALF: {
         /* a stack [k][n] x experts: OUT halves the n output columns (gate / up), IN the k input rows (down); the

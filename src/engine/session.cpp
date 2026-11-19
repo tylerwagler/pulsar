@@ -952,7 +952,7 @@ static bool open_finish(pulsar_engine *e, const pulsar_engine_options *opt) {
             }
             pulsar_tp_row_lane_layout_t L;
             pulsar_tp_row_lane_layout(e->tp, &L);
-            pulsar_gpu_tp_err_word_set((const volatile uint32_t *)((uint8_t *)e->tp_slab_base + L.err_off));
+            pulsar_gpu_tp_err_word_set(pulsar_slab_at<const volatile uint32_t>(e->tp_slab_base, L.err_off));
         }
         /* Slice 4f: the weights were staged for one identity and the transport
          * came up as another only if the two derivations drifted -- a bug, and
@@ -1215,12 +1215,14 @@ void pulsar_engine::destroy() {
 /// @return false (said) when an allocation failed; true with nothing to do
 static bool session_alloc_tp_scratch(pulsar_gpu_graph *g, pulsar_tp *tp) {
     if (!tp || !pulsar_tp_row_lane(tp)) return true;
-    const TensorBytes vb = TensorBytes{pulsar_tp_vec_bytes(tp)};
-    const uint64_t bytes = pulsar_tp_vocab_own_bytes(tp, (uint32_t)PULSAR_N_VOCAB, (uint32_t)PULSAR_SPEC_LOGITS_ALLOC_ROWS);
-    g->tp_vocab_own = pulsar_gpu_tensor_alloc(TensorBytes{bytes});
+    pulsar_tp_row_lane_layout_t L;   /* the lane's slot, as the launchers take it */
+    pulsar_tp_row_lane_layout(tp, &L);
+    const TensorBytes vb = L.vec_bytes;
+    const TensorBytes bytes = pulsar_tp_vocab_own_bytes(tp, (uint32_t)PULSAR_N_VOCAB, (uint32_t)PULSAR_SPEC_LOGITS_ALLOC_ROWS);
+    g->tp_vocab_own = pulsar_gpu_tensor_alloc(bytes);
     if (!g->tp_vocab_own) {
         fprintf(stderr, "pulsar: tp vocab gather scratch (%llu bytes) allocation failed\n",
-                (unsigned long long)bytes);
+                (unsigned long long)bytes.raw());
         return false;
     }
     g->tp_ain_own = pulsar_gpu_tensor_alloc(vb.times(PULSAR_TP_BATCH_MAX_ROWS));

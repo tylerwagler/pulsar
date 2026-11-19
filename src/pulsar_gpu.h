@@ -1287,8 +1287,8 @@ int pulsar_gpu_register_mxfp4_expert_half(const void *key_map, MapOff key_offset
                                           const void *model_map, MapOff src_offset,
                                           uint32_t n_expert, uint64_t k, uint64_t n, int k_half,
                                           uint64_t lo, uint64_t hi,
-                                          uint64_t src_stride, uint64_t src_data,
-                                          uint64_t dst_stride, uint64_t dst_data);
+                                          TensorBytes src_stride, TensorBytes src_data,
+                                          TensorBytes dst_stride, TensorBytes dst_data);
 /* L269 W1: the EXL3 twin -- this rank's half of every expert of one routed
  * EXL3 stack (in = k, out = n, rate k2): output columns [lo,hi) for gate/up,
  * input rows [lo,hi) for down when k_half.  The cut is exl3_expert_cut's (the
@@ -4660,7 +4660,7 @@ int pulsar_cuda_qwen_vision_forward(const pulsar_qwen_vision_weights_dev *w, con
  *  @param ticket     a zeroed device u32, one per stream
  *  @return 1 on success (enqueued), 0 on a bad argument or launch failure */
 int pulsar_gpu_tp_stage_publish(pulsar_gpu_tensor *src, pulsar_gpu_tensor *addend,
-                                void *slab_dev, uint64_t out_off, uint64_t vec_bytes,
+                                void *slab_dev, SlabOff out_off, TensorBytes vec_bytes,
                                 uint64_t first_msg, uint32_t n_slots, uint32_t rows,
                                 void *desc_dev, uint64_t exch, pulsar_gpu_tensor *ticket);
 /* The row lane's stream wait (L269-perf): resolves cuStreamWaitValue64 and
@@ -4685,7 +4685,7 @@ int pulsar_gpu_tp_wait_init(char *err, size_t errlen);
  *  @param err_dev    the lane's device error word (set = leave dst untouched)
  *  @return 1 on success (enqueued), 0 on a bad argument or launch failure */
 int pulsar_gpu_tp_combine_sum(pulsar_gpu_tensor *dst, const void *slab_dev,
-                              uint64_t in_off, uint64_t vec_bytes, uint64_t first_msg,
+                              SlabOff in_off, TensorBytes vec_bytes, uint64_t first_msg,
                               uint32_t n_slots, uint32_t rows, const void *done_dev,
                               uint64_t exch, const void *err_dev);
 /* The vocab gather's peer half: waits for done >= exch, then scatters this
@@ -4708,7 +4708,7 @@ int pulsar_gpu_tp_combine_sum(pulsar_gpu_tensor *dst, const void *slab_dev,
  *  @param err_dev    the lane's device error word (set = leave dst untouched)
  *  @return 1 on success (enqueued), 0 on a bad argument or launch failure */
 int pulsar_gpu_tp_combine_scatter(pulsar_gpu_tensor *dst, const void *slab_dev,
-                                  uint64_t in_off, uint64_t vec_bytes, uint64_t first_msg,
+                                  SlabOff in_off, TensorBytes vec_bytes, uint64_t first_msg,
                                   uint32_t n_slots, uint32_t msgs, uint64_t elem0,
                                   uint32_t rows, uint64_t width, uint64_t pitch, uint64_t col0,
                                   const void *done_dev, uint64_t exch, const void *err_dev);
@@ -4771,7 +4771,7 @@ typedef struct {
  *  @return 1 on success (enqueued), 0 on a bad argument or launch failure */
 int pulsar_gpu_tp_combine_gather_blocks(const pulsar_tp_gather_block *blocks, uint32_t n_blocks,
                                         uint32_t rows, const pulsar_gpu_tensor *own,
-                                        const void *slab_dev, uint64_t in_off, uint64_t vec_bytes,
+                                        const void *slab_dev, SlabOff in_off, TensorBytes vec_bytes,
                                         uint64_t first_msg, uint32_t n_slots, const void *done_dev,
                                         uint64_t exch, const void *err_dev);
 /* The BULK lane (prefill-sized exchanges, v14; pulsar_tp.h): stage `bytes` of
@@ -4786,14 +4786,14 @@ int pulsar_gpu_tp_combine_gather_blocks(const pulsar_tp_gather_block *blocks, ui
  *  @param out_dev the mapped bulk out-region
  *  @param bytes   bytes to stage (a nonzero multiple of 4)
  *  @return 1 on success (enqueued), 0 on a bad argument or launch failure */
-int pulsar_gpu_tp_bulk_stage(const pulsar_gpu_tensor *src, pulsar_gpu_tensor *addend, uint64_t off,
-                             void *out_dev, uint64_t bytes);
+int pulsar_gpu_tp_bulk_stage(const pulsar_gpu_tensor *src, pulsar_gpu_tensor *addend, TensorBytes off,
+                             void *out_dev, TensorBytes bytes);
 /** @param desc_dev the bulk descriptor
  *  @param exch     this exchange's number (nonzero)
  *  @param bytes    bytes staged (nonzero)
  *  @param word2    the bulk flag | receive buffer word
  *  @return 1 on success (enqueued), 0 on a bad argument or launch failure */
-int pulsar_gpu_tp_publish_bulk(void *desc_dev, uint64_t exch, uint64_t bytes, uint64_t word2);
+int pulsar_gpu_tp_publish_bulk(void *desc_dev, uint64_t exch, TensorBytes bytes, uint64_t word2);
 /** @param dst      f32 destination
  *  @param dst_off  byte offset into dst, a multiple of 4
  *  @param own_dev  this rank's staged partial (the out-region)
@@ -4803,8 +4803,8 @@ int pulsar_gpu_tp_publish_bulk(void *desc_dev, uint64_t exch, uint64_t bytes, ui
  *  @param exch       this exchange's number (the stream waits for done >= exch)
  *  @param err_dev    the lane's device error word (set = leave dst untouched)
  *  @return 1 on success (enqueued), 0 on a bad argument or launch failure */
-int pulsar_gpu_tp_bulk_combine_sum(pulsar_gpu_tensor *dst, uint64_t dst_off, const void *own_dev,
-                                   const void *peer_dev, uint64_t bytes, const void *done_dev,
+int pulsar_gpu_tp_bulk_combine_sum(pulsar_gpu_tensor *dst, TensorBytes dst_off, const void *own_dev,
+                                   const void *peer_dev, TensorBytes bytes, const void *done_dev,
                                    uint64_t exch, const void *err_dev);
 
 /* ---- Qwen3.8-Flash-Next full attention + QSA (L251 stream S3) ----------------

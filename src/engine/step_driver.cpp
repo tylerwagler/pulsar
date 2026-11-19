@@ -127,10 +127,10 @@ int pulsar_driver_session_create(pulsar_session *s, uint32_t n_banks) {
     if (ok && e->model.tp_n_ranks > 1) {
         uint32_t nl = 0, ne = 0, nv = 0;
         e->family->tp_shape(e, &nl, &ne, &nv);
-        const uint64_t vb = pulsar_tp_vocab_own_bytes_for((uint32_t)e->model.tp_n_ranks, (uint64_t)ne * sizeof(float),
-                                                          nv, PULSAR_DRIVER_HEADS_MAX);
+        const TensorBytes vb = pulsar_tp_vocab_own_bytes_for((uint32_t)e->model.tp_n_ranks, (uint64_t)ne * sizeof(float),
+                                                             nv, PULSAR_DRIVER_HEADS_MAX);
         ok = (d->tp_ticket = pulsar_gpu_tensor_alloc(bytes_of<uint32_t>(1))) != NULL &&
-             (d->tp_vocab_own = pulsar_gpu_tensor_alloc(TensorBytes{vb})) != NULL;
+             (d->tp_vocab_own = pulsar_gpu_tensor_alloc(vb)) != NULL;
     }
     /* L338 P2: the per-bank adapter switch, every bank plain (host only: the family's stage reads it per step) */
     if (ok && ops->adapter && ops->adapter(e)) d->bank_adapter = (uint8_t *)xcalloc(n_banks, 1);

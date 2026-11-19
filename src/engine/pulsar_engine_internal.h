@@ -6090,8 +6090,8 @@ typedef std::function<bool(uint32_t lo, uint32_t width, pulsar_gpu_tensor *dst)>
 /// @param n_vocab vocab width
 /// @param max_rows rows
 /// @return bytes
-uint64_t pulsar_tp_vocab_own_bytes(pulsar_tp *tp, uint32_t n_vocab, uint32_t max_rows);
-uint64_t pulsar_tp_vocab_own_bytes_for(uint32_t n_ranks, uint64_t vec_bytes, uint32_t n_vocab, uint32_t max_rows);
+TensorBytes pulsar_tp_vocab_own_bytes(pulsar_tp *tp, uint32_t n_vocab, uint32_t max_rows);
+TensorBytes pulsar_tp_vocab_own_bytes_for(uint32_t n_ranks, uint64_t vec_bytes, uint32_t n_vocab, uint32_t max_rows);
 /** Every rank's vocab range gathered into out [n_rows][n_vocab] (rank order). */
 /// @param x the transport and buffers
 /// @param n_rows rows (<= max_rows)

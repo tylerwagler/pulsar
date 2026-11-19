@@ -532,18 +532,19 @@ int pulsar_tp_gate_exchange(pulsar_tp *tp, TpSlot layer, uint32_t gate,
  * engine refuses at its next host sync through pulsar_tp_row_lane_check. */
 /// Bit ORed into the row lane's done word to release every stream wait after a failure.
 #define PULSAR_TP_DONE_RELEASE (1ull << 62)
-/// The row lane's slab layout, exported for the GPU stage/combine kernels (offsets from the slab base).
+/// The row lane's slab layout, exported for the GPU stage/combine kernels (offsets from the slab base; L438: SlabOff
+/// offsets and a TensorBytes slot, what the launchers take -- the transport's own pulsar_tp_slab stays raw).
 typedef struct {
     /// Out-vector ring (message slots this rank sends from); in_off is documented below.
-    uint64_t out_off, in_off;   /* gate-slot rings (message slots) */
+    SlabOff out_off, in_off;    /* gate-slot rings (message slots) */
     /// Descriptor: u64[3] {exchange id (written last), first message, rows}; GPU-written.
-    uint64_t desc_off;          /* u64[3] {exchange id (written last), first msg, rows} */
+    SlabOff desc_off;           /* u64[3] {exchange id (written last), first msg, rows} */
     /// Done word: u64, the last exchange the proxy completed (PULSAR_TP_DONE_RELEASE ORed in on release).
-    uint64_t done_off;          /* u64: last exchange the proxy completed */
+    SlabOff done_off;           /* u64: last exchange the proxy completed */
     /// Error latch: u32, 0 clean, 1 failed, 2 aborted.
-    uint64_t err_off;           /* u32: error latch (1 failed, 2 aborted) */
+    SlabOff err_off;            /* u32: error latch (1 failed, 2 aborted) */
     /// Bytes per row vector (n_embd * 4, f32).
-    uint64_t vec_bytes;
+    TensorBytes vec_bytes;
     /// Ring slots; message t lives in slot (t-1) % n_slots.
     uint32_t n_slots;
 } pulsar_tp_row_lane_layout_t;
@@ -588,7 +589,7 @@ int pulsar_tp_row_lane_check(pulsar_tp *tp);
  * so the buffer it writes next is never the one being read.  A payload larger
  * than cap_bytes is the caller's to cut. */
 /// The bulk lane's buffer layout: out | in[0] | in[1], each cap_bytes (see the comment above).
-typedef struct { uint64_t cap_bytes, out_off, in_off[2]; } pulsar_tp_bulk_layout_t;
+typedef struct { TensorBytes cap_bytes; SlabOff out_off, in_off[2]; } pulsar_tp_bulk_layout_t;
 /** @var pulsar_tp_bulk_layout_t::cap_bytes
  *  Bytes per region; a multiple of vec_bytes.  A payload larger than this is the caller's to cut. */
 /** @var pulsar_tp_bulk_layout_t::out_off

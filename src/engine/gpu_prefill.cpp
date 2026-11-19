@@ -1400,7 +1400,7 @@ static bool tp_attn_input_split(pulsar_gpu_graph *g, const pulsar_model *model,
     }
     pulsar_tp_row_lane_layout_t L;
     pulsar_tp_row_lane_layout(g->tp, &L);
-    const uint64_t vf = L.vec_bytes / sizeof(float);
+    const uint64_t vf = L.vec_bytes.raw() / sizeof(float);   /* floats a slot carries */
     const uint32_t msgs = (uint32_t)((elem0 + vf - 1u) / vf);
     if (ok && (msgs == 0 || msgs > PULSAR_TP_BATCH_MAX_ROWS)) {
         fprintf(stderr, "pulsar: layer %u: attention-input gather of %llu floats needs %u row-lane messages "
@@ -1411,13 +1411,13 @@ static bool tp_attn_input_split(pulsar_gpu_graph *g, const pulsar_model *model,
     uint8_t *slab = (uint8_t *)g->tp_slab_dev;
     uint64_t first = 0, exch = 0;
     pulsar_gpu_tensor *payload = ok ? pulsar_gpu_tensor_view(g->tp_ain_own, TensorBytes{0},
-                                                             TensorBytes{L.vec_bytes}.times(msgs)) : NULL;
+                                                             L.vec_bytes.times(msgs)) : NULL;
     if (ok) ok = payload && pulsar_tp_row_lane_begin(g->tp, msgs, &first, &exch) != 0;
     if (ok) ok = pulsar_gpu_tp_stage_publish(payload, NULL, slab, L.out_off, L.vec_bytes, first, L.n_slots,
-                                             msgs, slab + L.desc_off, exch, g->tp_stage_ticket) != 0;
+                                             msgs, pulsar_slab_at(slab, L.desc_off), exch, g->tp_stage_ticket) != 0;
     if (ok) ok = pulsar_gpu_tp_combine_gather_blocks(blocks, n, n_tokens, g->tp_ain_own, slab, L.in_off,
-                                                     L.vec_bytes, first, L.n_slots, slab + L.done_off, exch,
-                                                     slab + L.err_off) != 0;
+                                                     L.vec_bytes, first, L.n_slots, pulsar_slab_at(slab, L.done_off), exch,
+                                                     pulsar_slab_at(slab, L.err_off)) != 0;
     pulsar_gpu_tensor_free(payload);
     if (!ok) fprintf(stderr, "pulsar: layer %u: attention-input row split refused (%u rows, %u blocks)\n",
                      il.raw(), n_tokens, n);

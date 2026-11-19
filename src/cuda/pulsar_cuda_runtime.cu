@@ -1241,8 +1241,11 @@ int pulsar_gpu_register_mxfp4_expert_half(const void *key_map, MapOff key_offset
                                           const void *model_map, MapOff src_offset_m,
                                           uint32_t n_expert, uint64_t k, uint64_t n, int k_half,
                                           uint64_t lo, uint64_t hi,
-                                          uint64_t src_stride, uint64_t src_data,
-                                          uint64_t dst_stride, uint64_t dst_data) {
+                                          TensorBytes src_stride_b, TensorBytes src_data_b,
+                                          TensorBytes dst_stride_b, TensorBytes dst_data_b) {
+    /* L438: the four byte counts beside the counts and indices end at the launch */
+    const uint64_t src_stride = src_stride_b.raw(), src_data = src_data_b.raw(), dst_stride = dst_stride_b.raw(),
+                   dst_data = dst_data_b.raw();
     const uint64_t key_offset = key_offset_m.raw(), src_offset = src_offset_m.raw();   /* L438: MapOff ends at the launch */
     if (!key_map || !model_map || n_expert == 0 || hi <= lo || lo % 128 || hi % 128 ||
         (k_half ? hi > k : hi > n) || dst_data >= dst_stride || src_data >= src_stride) {

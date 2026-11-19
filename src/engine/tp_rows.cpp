@@ -35,11 +35,11 @@ bool pulsar_tp_allreduce_rows(const pulsar_tp_rows *g, TpSlot slot, uint32_t n_t
         bool ok = slab && g->ticket &&
                   pulsar_tp_row_lane_begin(g->tp, n_tokens, &first, &exch) != 0;
         if (ok) ok = pulsar_gpu_tp_stage_publish(t, addend, slab, L.out_off, L.vec_bytes,
-                                                 first, L.n_slots, n_tokens, slab + L.desc_off,
+                                                 first, L.n_slots, n_tokens, pulsar_slab_at(slab, L.desc_off),
                                                  exch, g->ticket) != 0;
         if (ok) ok = pulsar_gpu_tp_combine_sum(t, slab, L.in_off, L.vec_bytes,
-                                               first, L.n_slots, n_tokens, slab + L.done_off,
-                                               exch, slab + L.err_off) != 0;
+                                               first, L.n_slots, n_tokens, pulsar_slab_at(slab, L.done_off),
+                                               exch, pulsar_slab_at(slab, L.err_off)) != 0;
         if (!ok) fprintf(stderr, "pulsar: tp row lane: layer %u %s exchange refused (%u rows)\n", slot.raw(), what, n_tokens);
         return ok;
     }
@@ -62,21 +62,22 @@ bool pulsar_tp_allreduce_rows(const pulsar_tp_rows *g, TpSlot slot, uint32_t n_t
         pulsar_tp_bulk_layout(g->tp, &BL);
         uint8_t *slab = (uint8_t *)g->slab_dev;
         uint8_t *bulk = (uint8_t *)g->bulk_dev;
-        const uint64_t row_bytes = (uint64_t)g->n_embd * sizeof(float);
-        const uint64_t piece_rows = BL.cap_bytes / row_bytes;
+        const TensorBytes row_bytes = bytes_of<float>(g->n_embd);
+        const uint64_t piece_rows = BL.cap_bytes.raw() / row_bytes.raw();   /* whole rows a region holds */
         bool ok = piece_rows > 0;
         for (uint64_t r0 = 0; ok && r0 < n_tokens; r0 += piece_rows) {
             const uint64_t rows = n_tokens - r0 < piece_rows ? n_tokens - r0 : piece_rows;
-            const uint64_t off = r0 * row_bytes, len = rows * row_bytes;
+            const TensorBytes off = row_bytes.times(r0), len = row_bytes.times(rows);
             uint64_t exch = 0;
             uint32_t buf = 0;
-            ok = pulsar_tp_bulk_begin(g->tp, len, &exch, &buf) != 0 &&
-                 pulsar_gpu_tp_bulk_stage(t, addend, off, bulk + BL.out_off, len) != 0 &&
-                 pulsar_gpu_tp_publish_bulk(slab + L.desc_off, exch, len,
+            ok = pulsar_tp_bulk_begin(g->tp, len.raw(), &exch, &buf) != 0 &&   /* the transport's API is raw */
+                 pulsar_gpu_tp_bulk_stage(t, addend, off, pulsar_slab_at(bulk, BL.out_off), len) != 0 &&
+                 pulsar_gpu_tp_publish_bulk(pulsar_slab_at(slab, L.desc_off), exch, len,
                                             PULSAR_TP_DESC_BULK_FLAG | (uint64_t)buf) != 0 &&
-                 pulsar_gpu_tp_bulk_combine_sum(t, off, bulk + BL.out_off, bulk + BL.in_off[buf], len,
-                                                slab + L.done_off,
-                                                exch, slab + L.err_off) != 0;
+                 pulsar_gpu_tp_bulk_combine_sum(t, off, pulsar_slab_at(bulk, BL.out_off),
+                                                pulsar_slab_at(bulk, BL.in_off[buf]), len,
+                                                pulsar_slab_at(slab, L.done_off),
+                                                exch, pulsar_slab_at(slab, L.err_off)) != 0;
         }
         if (!ok) fprintf(stderr, "pulsar: tp bulk lane: layer %u %s exchange refused (%u rows)\n",
                          slot.raw(), what, n_tokens);
@@ -152,13 +153,14 @@ bool pulsar_tp_allreduce_rows(const pulsar_tp_rows *g, TpSlot slot, uint32_t n_t
 /// @param n_vocab   the vocab width
 /// @param max_rows  the most rows one gather carries
 /// @return bytes
-uint64_t pulsar_tp_vocab_own_bytes_for(uint32_t n_ranks, uint64_t vec_bytes, uint32_t n_vocab, uint32_t max_rows) {
+TensorBytes pulsar_tp_vocab_own_bytes_for(uint32_t n_ranks, uint64_t vec_bytes, uint32_t n_vocab, uint32_t max_rows) {
     const uint64_t stride = ((uint64_t)n_vocab + n_ranks - 1u) / n_ranks;
-    return ((uint64_t)max_rows * stride * sizeof(float) + vec_bytes - 1u) / vec_bytes * vec_bytes;
+    /* the rows' floats, rounded up to whole messages of the transport's (raw) size */
+    return TensorBytes{((uint64_t)max_rows * stride * sizeof(float) + vec_bytes - 1u) / vec_bytes * vec_bytes};
 }
 
-uint64_t pulsar_tp_vocab_own_bytes(pulsar_tp *tp, uint32_t n_vocab, uint32_t max_rows) {
-    if (!tp || !pulsar_tp_row_lane(tp)) return 0;
+TensorBytes pulsar_tp_vocab_own_bytes(pulsar_tp *tp, uint32_t n_vocab, uint32_t max_rows) {
+    if (!tp || !pulsar_tp_row_lane(tp)) return TensorBytes{};
     return pulsar_tp_vocab_own_bytes_for(pulsar_tp_n_ranks(tp), pulsar_tp_vec_bytes(tp), n_vocab, max_rows);
 }
 
@@ -186,7 +188,7 @@ bool pulsar_tp_vocab_gather(const pulsar_tp_vocab *g, uint32_t n_rows, const pul
         pulsar_tp_row_lane_layout_t L;
         pulsar_tp_row_lane_layout(g->tp, &L);
         uint8_t *slab = (uint8_t *)g->slab_dev;
-        const uint64_t vf = L.vec_bytes / sizeof(float);
+        const uint64_t vf = L.vec_bytes.raw() / sizeof(float);   /* floats a slot carries */
         const uint32_t msgs = (uint32_t)(((uint64_t)n_rows * stride + vf - 1u) / vf);
         pulsar_gpu_tensor *own = pulsar_gpu_tensor_view(g->vocab_own, TensorBytes{0},
                                                         bytes_of<float>((uint64_t)n_rows * (hi - lo)));
@@ -196,34 +198,33 @@ bool pulsar_tp_vocab_gather(const pulsar_tp_vocab *g, uint32_t n_rows, const pul
         for (uint32_t m0 = 0; ok && m0 < msgs; m0 += PULSAR_TP_BATCH_MAX_ROWS) {
             const uint32_t m = msgs - m0 < PULSAR_TP_BATCH_MAX_ROWS ? msgs - m0 : PULSAR_TP_BATCH_MAX_ROWS;
             uint64_t first = 0, exch = 0;
-            pulsar_gpu_tensor *chunk = pulsar_gpu_tensor_view(g->vocab_own, TensorBytes{L.vec_bytes}.times(m0),
-                                                              TensorBytes{L.vec_bytes}.times(m));
+            pulsar_gpu_tensor *chunk = pulsar_gpu_tensor_view(g->vocab_own, L.vec_bytes.times(m0), L.vec_bytes.times(m));
             ok = chunk && pulsar_tp_row_lane_begin(g->tp, m, &first, &exch) != 0 &&
                  pulsar_gpu_tp_stage_publish(chunk, NULL, slab, L.out_off, L.vec_bytes, first, L.n_slots, m,
-                                             slab + L.desc_off, exch, g->ticket) != 0 &&
+                                             pulsar_slab_at(slab, L.desc_off), exch, g->ticket) != 0 &&
                  pulsar_gpu_tp_combine_scatter(out, slab, L.in_off, L.vec_bytes, first, L.n_slots, m,
                                                (uint64_t)m0 * vf, n_rows, phi - plo, n_vocab, plo,
-                                               slab + L.done_off, exch, slab + L.err_off) != 0;
+                                               pulsar_slab_at(slab, L.done_off), exch, pulsar_slab_at(slab, L.err_off)) != 0;
             pulsar_gpu_tensor_free(chunk);
         }
         if (!ok) fprintf(stderr, "pulsar: tp vocab gather: row lane refused (%u rows, %u messages)\n",
                          n_rows, msgs);
         return ok;
     }
-    const uint64_t slice_bytes = (uint64_t)n_rows * stride * sizeof(float);
-    const uint64_t full_bytes  = (uint64_t)n_rows * n_vocab * sizeof(float);
-    pulsar_gpu_tensor *slice = pulsar_gpu_tensor_view(out, TensorBytes{0}, TensorBytes{slice_bytes});
+    const TensorBytes slice_bytes = bytes_of<float>((uint64_t)n_rows * stride);
+    const TensorBytes full_bytes  = bytes_of<float>((uint64_t)n_rows * n_vocab);
+    pulsar_gpu_tensor *slice = pulsar_gpu_tensor_view(out, TensorBytes{0}, slice_bytes);
     if (!slice) {
         fprintf(stderr, "pulsar: tp vocab slice view refused (rows=%u stride=%u)\n",
                 n_rows, stride);
         return false;
     }
-    float *own     = (float *)xmalloc(slice_bytes);
-    float *scratch = (float *)xmalloc(slice_bytes);
-    float *full    = (float *)xmalloc(full_bytes);
+    float *own     = (float *)xmalloc(slice_bytes.raw());   /* host staging of the same bytes */
+    float *scratch = (float *)xmalloc(slice_bytes.raw());
+    float *full    = (float *)xmalloc(full_bytes.raw());
     bool ok = own && scratch && full;
     if (!ok) fprintf(stderr, "pulsar: tp vocab staging out of memory (%llu + %llu bytes)\n",
-                      (unsigned long long)slice_bytes, (unsigned long long)full_bytes);
+                      (unsigned long long)slice_bytes.raw(), (unsigned long long)full_bytes.raw());
     /* This rank's range only.  slice 4d inc 1 made the range expressible: the
      * head weight is [vocab, in_dim] row-major, so it is a contiguous row range. */
     if (ok) ok = head(lo, hi - lo, slice);
@@ -251,7 +252,7 @@ bool pulsar_tp_vocab_gather(const pulsar_tp_vocab *g, uint32_t n_rows, const pul
                                        ++*g->seq, full, own, scratch,
                                        n_rows, n_vocab, 1u) != 0;
     }
-    if (ok) ok = pulsar_gpu_tensor_write(out, TensorBytes{0}, full, TensorBytes{full_bytes}) != 0;
+    if (ok) ok = pulsar_gpu_tensor_write(out, TensorBytes{0}, full, full_bytes) != 0;
     pulsar_gpu_tensor_free(slice);
     free(own);
     free(scratch);
