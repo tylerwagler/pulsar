@@ -1099,7 +1099,7 @@ static int spec_single_round(pulsar_session *s, int first_token,
         free(r.snap);
         return -1;
     }
-    const uint32_t n_rows = pulsar_spec_round_n_rows(&r);
+    const uint32_t n_rows = (uint32_t)pulsar_spec_round_n_rows(&r).raw();   /* the lane-cost fit's rows */
     const int na = spec_round_end(s, &r, first_token,
                                   temperature, top_k, top_p, min_p, 0u /* the caller's params at every row */,
                                   NULL, 0u, rng,
@@ -1286,17 +1286,17 @@ int pulsar_session_spec_round_begin_local(pulsar_session *s, pulsar_spec_round *
                             temperature, top_k, top_p, min_p, r, err, errlen);
 }
 
-uint32_t pulsar_spec_round_n_rows(const pulsar_spec_round *r) {
-    return r->n_batch;
+StepRows pulsar_spec_round_n_rows(const pulsar_spec_round *r) {
+    return StepRows{r->n_batch};   /* L443: one row a token of the round (base + drafts) */
 }
 
-uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, BankId bank_id, pulsar_multiseq_req *out) {
+StepRows pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, BankId bank_id, pulsar_multiseq_req *out) {
     for (uint32_t i = 0; i < r->n_batch; i++) {
         out[i].bank = bank_id;
         out[i].pos = r->saved_len + TokCount{(int)i};
         out[i].token = i == 0 ? r->base : TokId{r->pend[i - 1]};
     }
-    return r->n_batch;
+    return StepRows{r->n_batch};
 }
 
 /* The batched lane's round end: the round's verdict from the step's walk (spec_walk_rounds), then the one
@@ -1384,11 +1384,12 @@ int pulsar_session_spec_round_end_forced(pulsar_session *s, pulsar_spec_round *r
                                       TokId first_token_id,
                                       float temperature, int top_k, float top_p,
                                       float min_p, uint64_t *rng,
-                                      uint32_t row0,
+                                      StepRow row0_at,
                                       const TokId *truth,
                                       TokId *accepted, int accepted_cap,
                                       char *err, size_t errlen) {
     const int first_token = first_token_id.raw();   /* L334 P3: the round's body is raw (its fields: S2 next) */
+    const uint32_t row0 = pulsar_row_index(row0_at);   /* L443: the walk's index (raw inside) */
     if (spec_no_drafter(s, "spec round_end_forced", err, errlen)) return -1;   /* no round can have begun */
     if (!truth) {
         snprintf(err, errlen, "spec round_end_forced: no truth");
@@ -1489,10 +1490,10 @@ static bool spec_steps_no_drafter(const pulsar_session *s, pulsar_spec_step *ste
 }
 
 void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n,
-                                              uint32_t row_budget,
-                                              pulsar_multiseq_req *reqs, uint32_t *n_rows_out) {
-    uint32_t rows = 0;
-    *n_rows_out = 0;
+                                              StepRows row_budget,
+                                              pulsar_multiseq_req *reqs, StepRows *n_rows_out) {
+    StepRows rows{0};   /* the step's rows laid so far: the next round's first row is StepRow::after(rows) */
+    *n_rows_out = StepRows{0};
     if (spec_steps_no_drafter(s, steps, n, "spec assemble batch")) {
         for (int i = 0; i < n; i++) {   /* the phase's outputs, as a step that drew nothing leaves them */
             steps[i].first_token = TokId::none();
@@ -1511,7 +1512,7 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
             st->status = PULSAR_SPEC_STEP_RESTORE_FAILED;
             continue;
         }
-        const uint32_t cap_rows = st->k_alloc >= 0 ? 1u + (uint32_t)st->k_alloc
+        const StepRows cap_rows = st->k_alloc >= 0 ? StepRows{1u + (uint32_t)st->k_alloc}
                                                    : pulsar_session_spec_next_rows_max(s);
         if (s->pos() >= s->ctx()) {
             st->status = PULSAR_SPEC_STEP_LENGTH;
@@ -1533,19 +1534,18 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
                                                              /* the round's rows are at most the cap_rows the budget
                                                               * was checked against: begin cuts K to this cap - 1,
                                                               * whatever accepted_cap the step carries */
-                                                             st->accepted_cap < (int)cap_rows ? st->accepted_cap
-                                                                                              : (int)cap_rows,
+                                                             st->accepted_cap < cap_rows.raw() ? st->accepted_cap
+                                                                                               : cap_rows.raw(),
                                                              st->temperature, st->top_k, st->top_p, st->min_p,
                                                              st->err, sizeof st->err) != 0) {
                 st->status = PULSAR_SPEC_STEP_FAILED;
             } else {
                 /* The worker has no reqs: its rows ride the mixed-batch frame. */
                 /* L443: the step's rows are laid here, each round's contiguous from `rows` (the builder's row map) */
-                const uint32_t nr = reqs ? pulsar_spec_round_fill_reqs(st->round, st->bank, reqs + rows)
-                                         : pulsar_spec_round_n_rows(st->round);
-                st->n_rows = StepRows{nr};
-                st->row0 = StepRow{rows};
-                rows += nr;
+                st->n_rows = reqs ? pulsar_spec_round_fill_reqs(st->round, st->bank, reqs + rows.raw())
+                                  : pulsar_spec_round_n_rows(st->round);
+                st->row0 = StepRow::after(rows);
+                rows += st->n_rows;
             }
         }
         spec_bank_save(s, st->bank);
@@ -1665,13 +1665,13 @@ static uint32_t spec_fp(uint32_t h, uint32_t v) {
 }
 
 int pulsar_spec_steps_verdict(pulsar_spec_phase phase, const pulsar_spec_step *steps, int n,
-                              uint32_t n_rows) {
+                              StepRows n_rows) {
     /* Only what the phase itself decides, which both ranks hold the same way:
      * a field the phase does not write is the caller's leftover on the leader
      * and the wire's value on the worker. */
     uint32_t h = spec_fp(2166136261u, (uint32_t)phase);
     h = spec_fp(h, (uint32_t)n);
-    h = spec_fp(h, n_rows);
+    h = spec_fp(h, (uint32_t)n_rows.raw());   /* the digest's bytes, as the uint32 was */
     for (int i = 0; i < n; i++) {
         const pulsar_spec_step *st = &steps[i];
         h = spec_fp(h, (uint32_t)st->bank.raw());
@@ -1753,18 +1753,19 @@ TokPos pulsar_spec_round_saved_len(const pulsar_spec_round *r) {
     return r ? r->saved_len : TokPos::none();
 }
 
-uint32_t pulsar_session_spec_next_rows_max(const pulsar_session *s) {
+StepRows pulsar_session_spec_next_rows_max(const pulsar_session *s) {
     /* Upper bound on the next round's n_batch: begin's guards (base-token,
      * position, params, caps) only ever TRIM K from n_pend, so
      * 1 + pending is safe to budget against before consuming anything. */
     uint32_t k = s->spec.n_pend;
     if (k > 16u) k = 16u;
-    return 1u + k;
+    return StepRows{1u + k};
 }
 
 
-void pulsar_session_spec_arm_capture_local(pulsar_session *s, uint32_t n_rows) {
-    if (spec_target(s)->arm_verify) spec_target(s)->arm_verify(s, n_rows);
+void pulsar_session_spec_arm_capture_local(pulsar_session *s, StepRows n_rows) {
+    /* the family's op takes the raw count (its capture buffers are indexed by it) */
+    if (spec_target(s)->arm_verify) spec_target(s)->arm_verify(s, (uint32_t)n_rows.raw());
 }
 
 void pulsar_session_spec_round_abort_local(pulsar_session *s, pulsar_spec_round *r) {

@@ -3012,7 +3012,7 @@ void pulsar_session_spec_round_abort_local(pulsar_session *s, pulsar_spec_round 
 /// Arm (n_rows > 0) or disarm (0) the drafter capture for the next batched forward (pulsar_session_spec_arm_capture).
 /// @param s       the session
 /// @param n_rows  rows the next forward captures
-void pulsar_session_spec_arm_capture_local(pulsar_session *s, uint32_t n_rows);
+void pulsar_session_spec_arm_capture_local(pulsar_session *s, StepRows n_rows);
 /** L301 / L315: the verify curve's profile on the installed bank, every 1..rows_max-row verify forward timed into
  *  base[1..rows_max] (verify_curve.cpp has the procedure); `base` NULL runs the walk untimed (L306: the startup
  *  warmup's catalog of the verify widths, a cached curve).  The _local form is this rank's own run -- a pair's
@@ -3060,8 +3060,8 @@ void pulsar_session_spec_redraft_commit_local(pulsar_session *s, pulsar_spec_rou
 /// @param reqs        receives the rows (row_budget entries), or NULL
 /// @param n_rows_out  out: rows written
 void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n,
-                                              uint32_t row_budget,
-                                              pulsar_multiseq_req *reqs, uint32_t *n_rows_out);
+                                              StepRows row_budget,
+                                              pulsar_multiseq_req *reqs, StepRows *n_rows_out);
 /// The round-end phase over every step (pulsar_session_spec_round_end_batch), locally.
 /// @param s      the session
 /// @param steps  n steps from the assemble phase
@@ -3087,7 +3087,7 @@ typedef enum {
 /// @param n_rows  assemble's total rows; 0 for the other phases
 /// @return a positive 30-bit fingerprint.
 int pulsar_spec_steps_verdict(pulsar_spec_phase phase, const pulsar_spec_step *steps, int n,
-                              uint32_t n_rows);
+                              StepRows n_rows);
 
 /** Slice 4e (L238): the failure report a void mirrored operation can make --
  * marks the pair failed and prints the reason once.  Defined in engine_api.cpp,

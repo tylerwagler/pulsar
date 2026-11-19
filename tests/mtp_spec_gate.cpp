@@ -290,8 +290,9 @@ static void batched_lane(pulsar_engine *e, const std::vector<pulsar_tokens> &P, 
             bank_of[m++] = (uint32_t)b;
         }
         if (m == 0) break;
-        uint32_t rows = 0;
-        (void)pulsar_session_spec_assemble_batch(s, st, m, width, reqs.data(), &rows);
+        StepRows step_rows{0};
+        (void)pulsar_session_spec_assemble_batch(s, st, m, StepRows{width}, reqs.data(), &step_rows);
+        const uint32_t rows = (uint32_t)step_rows.raw();   /* decode_mixed's row count */
         /* as the server's lane: a bank whose base is a stop token emits it and ends (never evaluated); a bank
          * over the row budget sits the tick out untouched; the rest verify (a deep chain -- the drafter's cap 7,
          * a copy chain -- can fill the width) */
@@ -314,10 +315,10 @@ static void batched_lane(pulsar_engine *e, const std::vector<pulsar_tokens> &P, 
         if (m == 0 || rows == 0) continue;
         std::vector<float> logits((size_t)rows * W);
         uint32_t gotr = 0;
-        pulsar_session_spec_arm_capture(s, rows);
+        pulsar_session_spec_arm_capture(s, step_rows);
         ok = pulsar_session_decode_mixed(s, reqs.data(), rows, logits.data(), (int)rows * W, &gotr,
                                          PULSAR_MSEQ_HEAD_ALL_ROWS, err, sizeof(err)) == 0 && gotr == rows;
-        pulsar_session_spec_arm_capture(s, 0u);
+        pulsar_session_spec_arm_capture(s, StepRows{0});
         if (!ok) break;
         for (int i = 0; i < m; i++) {
             st[i].accepted = acc[i];

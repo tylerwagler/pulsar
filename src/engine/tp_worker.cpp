@@ -677,7 +677,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             pulsar_tp_mirror_fail_void(tp, "spec_arm_capture", ferr);
             return 1;
         }
-        pulsar_session_spec_arm_capture_local(slot->s, (uint32_t)c->spec.i0);
+        pulsar_session_spec_arm_capture_local(slot->s, StepRows{(int)(uint32_t)c->spec.i0});   /* the wire's int32 */
         return 1;
     case PULSAR_TP_FRAME_SPEC_ROUND_END: {
         int status = -1;
@@ -797,15 +797,16 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
                 if (!st->round) ok = 0;
                 if (c->type == PULSAR_TP_FRAME_SPEC_ROUND_END_BATCH &&
                     (r->i3 < 0 ||
-                     (uint64_t)r->i3 + pulsar_spec_round_n_rows(st->round) > (uint64_t)slot->s->dev.step_n))
+                     (uint64_t)r->i3 + (uint64_t)pulsar_spec_round_n_rows(st->round).raw() > (uint64_t)slot->s->dev.step_n))
                     ok = 0;
             }
             if (!ok) {
                 snprintf(ferr, sizeof(ferr), "tp: %s names a bank with no round or rows past this rank's forward block", op);
                 fprintf(stderr, "pulsar: tp worker: %s\n", ferr);
             } else if (c->type == PULSAR_TP_FRAME_SPEC_ASSEMBLE_BATCH) {
-                uint32_t rows = 0;
-                pulsar_session_spec_assemble_batch_local(slot->s, steps, n, (uint32_t)c->spec.i1,
+                StepRows rows{0};
+                /* the wire's int32 row budget (the leader's StepRows, as it sent it) */
+                pulsar_session_spec_assemble_batch_local(slot->s, steps, n, StepRows{(int)(uint32_t)c->spec.i1},
                                                          NULL, &rows);
                 status = pulsar_spec_steps_verdict(PULSAR_SPEC_PHASE_ASSEMBLE, steps, n, rows);
             } else if (c->type == PULSAR_TP_FRAME_SPEC_ROUND_END_BATCH) {
@@ -813,10 +814,10 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
                  * prices this round's quench from (L263). */
                 pulsar_engine_spec_cost_set(e, c->spec.i1, c->spec.i2, c->spec.i3 != 0);
                 pulsar_session_spec_round_end_batch_local(slot->s, steps, n);
-                status = pulsar_spec_steps_verdict(PULSAR_SPEC_PHASE_ROUND_END, steps, n, 0u);
+                status = pulsar_spec_steps_verdict(PULSAR_SPEC_PHASE_ROUND_END, steps, n, StepRows{0});
             } else {
                 pulsar_session_spec_redraft_commit_batch_local(slot->s, steps, n);
-                status = pulsar_spec_steps_verdict(PULSAR_SPEC_PHASE_REDRAFT_COMMIT, steps, n, 0u);
+                status = pulsar_spec_steps_verdict(PULSAR_SPEC_PHASE_REDRAFT_COMMIT, steps, n, StepRows{0});
             }
             for (int i = 0; i < n; i++)
                 if (steps[i].status == PULSAR_SPEC_STEP_FAILED || steps[i].status == PULSAR_SPEC_STEP_RESTORE_FAILED)

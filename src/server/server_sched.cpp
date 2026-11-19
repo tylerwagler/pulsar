@@ -5062,10 +5062,14 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             pulsar_session_bank_state_save(pool, s->live_bank);
             s->live_bank = BankId::none();
         }
-        uint32_t rows = 0;
+        StepRows step_rows{0};   /* the verify's rows, all headed: rows [0, step_rows) of the step */
+        /* the verify's row budget: the head width less the finishing chunks' heads (sched_choose keeps n_fin
+         * <= heads_max - n_dec, so this never wraps) */
         if (ns > 0)
-            (void)pulsar_session_spec_assemble_batch(pool, steps, ns,
-                                                     heads_max - (uint32_t)n_fin, reqs, &rows);
+            (void)pulsar_session_spec_assemble_batch(pool, steps, ns, StepRows{(int)(heads_max - (uint32_t)n_fin)},
+                                                     reqs, &step_rows);
+        /* the uint32 the forward's shape, the decode_mixed row count and the cost fit take */
+        const uint32_t rows = (uint32_t)step_rows.raw();
         int m = 0;
         for (int j = 0; j < ns; j++) {
             const pulsar_spec_step *st = &steps[j];
@@ -5131,7 +5135,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
         /* ---- ONE shared forward over every bank's rows ------------------- */
         const double fwd_t0 = server_now_sec();   /* L288: the round's phases (server::w_spec_phase_ms) */
         char err[160] = "";
-        pulsar_session_spec_arm_capture(pool, rows);
+        pulsar_session_spec_arm_capture(pool, step_rows);
         uint32_t got = 0;
         int rc;
         if (n_fr > 0) {
@@ -5186,7 +5190,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             rc = pulsar_session_decode_mixed(pool, reqs, rows, NULL, 0, &got, PULSAR_MSEQ_HEAD_ALL_ROWS, err,
                                              sizeof err);
         }
-        pulsar_session_spec_arm_capture(pool, 0u);
+        pulsar_session_spec_arm_capture(pool, StepRows{0});
         const double fwd_t1 = server_now_sec();
         s->live_bank = BankId::none();   /* pool is multiseq-poisoned until a bank_switch */
         if (rc == 0 && got != rows) {   /* the plain step: every row headed, or the round is refused by name */

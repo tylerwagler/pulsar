@@ -1036,8 +1036,10 @@ static bool spec_lane_round(pulsar_session *s, const uint32_t *banks, const int 
         st[i].k_alloc = k_alloc[i];
         st[i].accepted_cap = k_alloc[i] >= 0 ? k_alloc[i] + 1 : (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
     }
-    uint32_t rows = 0;
-    if (pulsar_session_spec_assemble_batch(s, st, n, width, reqs.data(), &rows) != 0 || rows == 0) {
+    StepRows step_rows{0};
+    const bool assembled = pulsar_session_spec_assemble_batch(s, st, n, StepRows{width}, reqs.data(), &step_rows) == 0;
+    const uint32_t rows = (uint32_t)step_rows.raw();   /* decode_mixed's row count */
+    if (!assembled || rows == 0) {
         snprintf(err, errlen, "assemble refused (%u rows)", rows);
         return false;
     }
@@ -1048,10 +1050,10 @@ static bool spec_lane_round(pulsar_session *s, const uint32_t *banks, const int 
         }
     std::vector<float> logits((size_t)rows * W);
     uint32_t got = 0;
-    pulsar_session_spec_arm_capture(s, rows);
+    pulsar_session_spec_arm_capture(s, step_rows);
     const int rc = pulsar_session_decode_mixed(s, reqs.data(), rows, logits.data(), (int)rows * W, &got,
                                                PULSAR_MSEQ_HEAD_ALL_ROWS, err, errlen);
-    pulsar_session_spec_arm_capture(s, 0u);
+    pulsar_session_spec_arm_capture(s, StepRows{0});
     if (rc != 0 || got != rows) return false;
     for (int i = 0; i < n; i++) {
         const StepRow row0 = st[i].row0;

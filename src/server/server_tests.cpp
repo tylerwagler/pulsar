@@ -22159,6 +22159,18 @@ static_assert(std::is_same_v<decltype(pulsar_spec_step{}.row0), StepRow> &&
                   std::is_same_v<decltype(pulsar_spec_step{}.n_rows), StepRows> &&
                   !l334_passes<uint32_t, StepRow> && !l334_passes<HeadRow, StepRow>,
               "the spec step's span is in step rows");
+/* L443 (2): the rest of the speculative round API -- every row it takes or returns is a step row / a step-row count */
+static_assert(std::is_same_v<decltype(&pulsar_session_spec_round_end),
+                             int (*)(pulsar_session *, pulsar_spec_round *, TokId, float, int, float, float, uint64_t *,
+                                     StepRow, TokId *, int, char *, size_t)> &&
+                  std::is_same_v<decltype(&pulsar_session_spec_assemble_batch),
+                                 int (*)(pulsar_session *, pulsar_spec_step *, int, StepRows, pulsar_multiseq_req *,
+                                         StepRows *)> &&
+                  std::is_same_v<decltype(&pulsar_session_spec_arm_capture), void (*)(pulsar_session *, StepRows)> &&
+                  std::is_same_v<decltype(pulsar_spec_round_n_rows(nullptr)), StepRows> &&
+                  std::is_same_v<decltype(pulsar_spec_round_fill_reqs(nullptr, BankId{}, nullptr)), StepRows> &&
+                  std::is_same_v<decltype(pulsar_session_spec_next_rows_max(nullptr)), StepRows>,
+              "the round API's rows are step rows");
 /* L443: token ids and the walks' counts at the server's emit boundary -- an id is a TokId, a chain's length a TokCount */
 static_assert(std::is_same_v<decltype(&server::gen_emit_token), bool (server::*)(session_slot *, TokId)> &&
                   std::is_same_v<decltype(&server::gen_emit_piece),

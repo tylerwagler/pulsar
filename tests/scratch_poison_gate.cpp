@@ -157,8 +157,9 @@ run_rec run(pulsar_engine *e, const std::vector<pulsar_tokens> &P, int n, bool p
             snprintf(err, sizeof err, "tick %u: a bank would not restore", t);
             break;
         }
-        uint32_t rows = 0;
-        ok = pulsar_session_spec_assemble_batch(s, st, m, width, reqs.data(), &rows) == 0;
+        StepRows step_rows{0};
+        ok = pulsar_session_spec_assemble_batch(s, st, m, StepRows{width}, reqs.data(), &step_rows) == 0;
+        const uint32_t rows = (uint32_t)step_rows.raw();   /* decode_mixed's row count */
         tick_rec T;
         int live = 0;
         for (int i = 0; ok && i < m; i++) {
@@ -188,10 +189,10 @@ run_rec run(pulsar_engine *e, const std::vector<pulsar_tokens> &P, int n, bool p
         }
         std::vector<float> logits((size_t)rows * W);
         uint32_t got = 0;
-        pulsar_session_spec_arm_capture(s, rows);
+        pulsar_session_spec_arm_capture(s, step_rows);
         ok = pulsar_session_decode_mixed(s, reqs.data(), rows, logits.data(), (int)rows * W, &got,
                                          PULSAR_MSEQ_HEAD_ALL_ROWS, err, sizeof err) == 0 && got == rows;
-        pulsar_session_spec_arm_capture(s, 0u);
+        pulsar_session_spec_arm_capture(s, StepRows{0});
         if (!ok) {
             snprintf(err + strlen(err), sizeof err - strlen(err), " (tick %u: the %u-row verify)", t, rows);
             break;
