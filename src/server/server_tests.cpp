@@ -767,7 +767,7 @@ static void test_context_length_error_uses_protocol_standard_shape(void) {
  * and never before the chunk that carries their token bytes. A bug here
  * double-emits or drops a token's logprobs across a chunk boundary. */
 static void test_logprob_stream_ready_watermark(void) {
-    logprob_entry v[4] = {0};
+    logprob_entry v[4] = {};
     v[0].end_off = GenOff{3};
     v[1].end_off = GenOff{7};
     v[2].end_off = GenOff{7};   /* two entries share a watermark (a multi-token piece) */
@@ -2274,7 +2274,7 @@ static void greedy_rows_run(const greedy_rows_case &c, bool with_stop) {
             const char *pp[8];
             size_t pl[8];
             for (int i = 0; i < n; i++) { pp[i] = pieces[(size_t)(e + i)].data(); pl[i] = pieces[(size_t)(e + i)].size(); }
-            const uint32_t bits = gen_spec_greedy_rows_text(&g, pp, pl, n, base_emitted);
+            const uint32_t bits = gen_spec_greedy_rows_text(&g, pp, pl, TokCount{n}, base_emitted);
             /* row r follows the base and r drafts: e tokens + r when the base was streamed, e + 1 + r when not */
             const int rows = base_emitted ? n + 1 : n;
             for (int r = 0; r < rows; r++) {
@@ -4438,7 +4438,7 @@ static size_t l303_feed(server *srv, gen_state *g, const std::string &text) {
     for (size_t i = 0; i < text.size(); i++) {
         const int tok = (uint8_t)text[i];
         if (!l303_allows(srv, g, tok)) return i;
-        TEST_ASSERT(gen_constrain_accept(srv, g, tok));
+        TEST_ASSERT(gen_constrain_accept(srv, g, TokId{tok}));
     }
     return text.size();
 }
@@ -4578,7 +4578,7 @@ static void test_l419_gate_and_parser_agree_on_quoted_calls(void) {
         std::vector<out_event> ev;
         for (size_t i = 0; i < text.size(); i++) {
             const int tok = (uint8_t)text[i];
-            if (!l303_allows(&srv, g, tok) || !gen_constrain_accept(&srv, g, tok)) return false;
+            if (!l303_allows(&srv, g, tok) || !gen_constrain_accept(&srv, g, TokId{tok})) return false;
             p->feed(&text[i], 1, &ev);
             if (gen_constrain_live(g) != p->in_tool_call()) return false;
         }
@@ -4645,7 +4645,7 @@ static void test_l419_gate_and_parser_agree_on_quoted_calls(void) {
                 size_t i = 0;
                 for (; same && i < text.size() && p->calls().empty(); i++) {
                     const int tok = (uint8_t)text[i];
-                    same = l303_allows(&srv, &g, tok) && gen_constrain_accept(&srv, &g, tok);
+                    same = l303_allows(&srv, &g, tok) && gen_constrain_accept(&srv, &g, TokId{tok});
                     if (!same) break;
                     p->feed(&text[i], 1, &ev);
                     if (p->calls().empty()) same = gen_constrain_live(&g) == p->in_tool_call() && !gen_constrain_turn_over(&g);
@@ -4658,7 +4658,7 @@ static void test_l419_gate_and_parser_agree_on_quoted_calls(void) {
                     for (size_t k = 0; k < tail.size(); k++) {
                         TEST_ASSERT(gen_constrain_live(&g) && !gen_constrain_turn_over(&g));
                         TEST_ASSERT(!l303_allows(&srv, &g, v.stop) && l303_allows(&srv, &g, (uint8_t)tail[k]));
-                        TEST_ASSERT(gen_constrain_accept(&srv, &g, (uint8_t)tail[k]));
+                        TEST_ASSERT(gen_constrain_accept(&srv, &g, TokId{(uint8_t)tail[k]}));
                     }
                     TEST_ASSERT(gen_constrain_turn_over(&g));
                     TEST_ASSERT(l303_allows(&srv, &g, v.stop) && !l303_allows(&srv, &g, '\n') &&
@@ -4702,7 +4702,7 @@ static void test_l419_gate_and_parser_agree_on_quoted_calls(void) {
                 if (pick(6) == 0) {
                     /* a draft walk the gate rolls back leaves it where it was */
                     const TokId drafts[3] = {TokId{(int)'\n'}, TokId{(int)'`'}, TokId{(int)'<'}};
-                    TEST_ASSERT(gen_constrain_draft_prefix(&srv, &g, TokId{(int)'`'}, drafts, 3) >= 0);
+                    TEST_ASSERT(gen_constrain_draft_prefix(&srv, &g, TokId{(int)'`'}, drafts, TokCount{3}).raw() >= 0);
                 }
                 const std::string &piece = pieces[pick((unsigned)pieces.size())];
                 same = feed_both(&g, p, piece);
@@ -4953,7 +4953,7 @@ static void test_l428_gate_admits_one_call(void) {
                 const TokId round[3] = {last, TokId{(int)'\n'}, TokId{(int)'x'}};
                 const uint32_t *masks = NULL;
                 const uint32_t W = gen_constrain_words(&srv);
-                TEST_ASSERT(gen_constrain_round(&srv, &g, round, 3, false, &masks) == 3 && masks);
+                TEST_ASSERT(gen_constrain_round(&srv, &g, round, TokCount{3}, false, &masks) == 3 && masks);
                 auto bit = [&](int row, int t) {
                     return (masks[(size_t)row * W + ((uint32_t)t >> 5)] >> ((uint32_t)t & 31u)) & 1u;
                 };
@@ -4961,15 +4961,15 @@ static void test_l428_gate_admits_one_call(void) {
                 TEST_ASSERT(!gen_constrain_turn_over(&g));   /* the walk was rolled back */
                 /* the pending chain: nothing after the token that completes the call, a stop excepted */
                 const TokId drafts[2] = {TokId{(int)'\n'}, TokId{(int)'x'}};
-                TEST_ASSERT(gen_constrain_draft_prefix(&srv, &g, last, drafts, 2) == 0);
+                TEST_ASSERT(gen_constrain_draft_prefix(&srv, &g, last, drafts, TokCount{2}).raw() == 0);
                 const TokId ends[2] = {TokId{v.stop}, TokId{(int)'x'}};
-                TEST_ASSERT(gen_constrain_draft_prefix(&srv, &g, last, ends, 2) == 1);
+                TEST_ASSERT(gen_constrain_draft_prefix(&srv, &g, last, ends, TokCount{2}).raw() == 1);
                 TEST_ASSERT(!gen_constrain_turn_over(&g));
                 /* now emitted: past the turn's call */
                 TEST_ASSERT(l303_feed(&srv, &g, whole.substr(whole.size() - 1)) == 1);
                 TEST_ASSERT(gen_constrain_turn_over(&g) && gen_constrain_live(&g));
                 TEST_ASSERT(l428_only_the_stop(&srv, &g, v));
-                TEST_ASSERT(!gen_constrain_accept(&srv, &g, '\n'));
+                TEST_ASSERT(!gen_constrain_accept(&srv, &g, TokId{'\n'}));
                 TEST_ASSERT(strstr(g.err, "follows the one tool call this turn may make"));
                 TEST_ASSERT(gen_constrain_turn_over(&g));   /* a refused token leaves the gate where it was */
             }
@@ -5137,13 +5137,13 @@ static l428_run l428_turn(server *srv, const l303_vocab &v, pulsar_chat_format f
         const int tok = t.size() == 1 ? (int)(uint8_t)t[0] : v.id(t.c_str());
         if (g->gate) {
             TEST_ASSERT(tok >= 0);   /* a gated turn's tokens are the toy vocabulary's */
-            if (tok < 0 || !l303_allows(srv, g, tok) || !gen_constrain_accept(srv, g, tok)) {
+            if (tok < 0 || !l303_allows(srv, g, tok) || !gen_constrain_accept(srv, g, TokId{tok})) {
                 res.refused = true;
                 break;
             }
         }
         res.emitted++;
-        res.stopped = srv->gen_emit_piece(g, tok < 0 ? 0 : tok, t.data(), t.size());
+        res.stopped = srv->gen_emit_piece(g, TokId{tok < 0 ? 0 : tok}, t.data(), t.size());
         if (g->gate && r->single_tool_call && gen_constrain_turn_over(g) != res.stopped) res.agree = false;
         if (res.stopped) break;
     }
@@ -5433,7 +5433,7 @@ static void test_l428_turn_ends_at_its_first_call(void) {
         g->parser = j.req.family->output;
         g->parser_st = g->parser->create(&srv, g, err, sizeof err);
         TEST_ASSERT(g->parser_st != NULL);
-        for (int i = 0; i < 9; i++) TEST_ASSERT(!srv.gen_emit_piece(g, 0, pieces[(size_t)i].data(), pieces[(size_t)i].size()));
+        for (int i = 0; i < 9; i++) TEST_ASSERT(!srv.gen_emit_piece(g, TokId{0}, pieces[(size_t)i].data(), pieces[(size_t)i].size()));
         const char *chain[9];
         size_t lens[9];
         for (int i = 0; i < 8; i++) {
@@ -5441,25 +5441,25 @@ static void test_l428_turn_ends_at_its_first_call(void) {
             lens[i] = pieces[(size_t)(9 + i)].size();
         }
         /* base "\n</parameter>\n", drafts "</function>\n", "</tool_call>", "\n", "<tool_call>", ...: two drafts stay */
-        TEST_ASSERT(gen_turn_draft_prefix_text(g, chain, lens, 7) == 2);
-        TEST_ASSERT(gen_turn_draft_prefix_text(g, chain, lens, 2) == 2);
-        TEST_ASSERT(gen_turn_draft_prefix_text(g, chain, lens, 1) == 1);   /* the chain ends before the close */
+        TEST_ASSERT(gen_turn_draft_prefix_text(g, chain, lens, TokCount{7}).raw() == 2);
+        TEST_ASSERT(gen_turn_draft_prefix_text(g, chain, lens, TokCount{2}).raw() == 2);
+        TEST_ASSERT(gen_turn_draft_prefix_text(g, chain, lens, TokCount{1}).raw() == 1);   /* the chain ends before the close */
         chain[1] = NULL;                                                    /* a stop token ends the walk */
-        TEST_ASSERT(gen_turn_draft_prefix_text(g, chain, lens, 7) == 7);
+        TEST_ASSERT(gen_turn_draft_prefix_text(g, chain, lens, TokCount{7}).raw() == 7);
         /* the base itself closes the call: no draft */
-        TEST_ASSERT(!srv.gen_emit_piece(g, 0, pieces[9].data(), pieces[9].size()));
-        TEST_ASSERT(!srv.gen_emit_piece(g, 0, pieces[10].data(), pieces[10].size()));
+        TEST_ASSERT(!srv.gen_emit_piece(g, TokId{0}, pieces[9].data(), pieces[9].size()));
+        TEST_ASSERT(!srv.gen_emit_piece(g, TokId{0}, pieces[10].data(), pieces[10].size()));
         const char *chain2[3] = {pieces[11].c_str(), pieces[12].c_str(), pieces[13].c_str()};
         const size_t lens2[3] = {pieces[11].size(), pieces[12].size(), pieces[13].size()};
-        TEST_ASSERT(gen_turn_draft_prefix_text(g, chain2, lens2, 2) == 0);
+        TEST_ASSERT(gen_turn_draft_prefix_text(g, chain2, lens2, TokCount{2}).raw() == 0);
         /* the walk left the attempt where it was: the call is still open, and its close still ends the turn */
         GenOff end{0};
         TEST_ASSERT(!g->parser->turn_complete(g->parser_st, g, &end));
-        TEST_ASSERT(srv.gen_emit_piece(g, 0, pieces[11].data(), pieces[11].size()));
+        TEST_ASSERT(srv.gen_emit_piece(g, TokId{0}, pieces[11].data(), pieces[11].size()));
         TEST_ASSERT(!strcmp(g->finish, "tool_calls") && g->completion == 12);
         /* a request without the flag keeps every draft */
         j.req.single_tool_call = false;
-        TEST_ASSERT(gen_turn_draft_prefix_text(g, chain2, lens2, 2) == 2);
+        TEST_ASSERT(gen_turn_draft_prefix_text(g, chain2, lens2, TokCount{2}).raw() == 2);
         g->parser->destroy(g->parser_st);
         buf_free(&g->text);
         delete g;
@@ -5987,7 +5987,7 @@ static bool l430_one_turn(server *srv, l430_rng *r, const l430_cfg &c, l430_coun
         }
         const l430_state before = l430_read(&a);
         const uint32_t bits_ref = gen_spec_greedy_rows_text_ref(b.g, pieces, lens, ahead, base_emitted);
-        const uint32_t bits = gen_spec_greedy_rows_text(a.g, pieces, lens, ahead, base_emitted);
+        const uint32_t bits = gen_spec_greedy_rows_text(a.g, pieces, lens, TokCount{ahead}, base_emitted);
         const int rows = ahead + (base_emitted ? 1 : 0);
         const uint32_t all = rows >= 32 ? ~0u : (1u << rows) - 1u;
         n->crossing += (bits & all) != 0 && (bits & all) != all;
@@ -6001,7 +6001,7 @@ static bool l430_one_turn(server *srv, l430_rng *r, const l430_cfg &c, l430_coun
         }
         if (!base_emitted && ahead >= 2) {   /* pieces[0] the base, then ahead - 1 drafts */
             const int keep_ref = gen_turn_draft_prefix_text_ref(b.g, pieces, lens, ahead - 1);
-            const int keep = gen_turn_draft_prefix_text(a.g, pieces, lens, ahead - 1);
+            const int keep = gen_turn_draft_prefix_text(a.g, pieces, lens, TokCount{ahead - 1}).raw();
             n->prefix_cut += keep < ahead - 1;
             if (keep != keep_ref) {
                 ok = differ("the usable chain differs", pos);
@@ -6018,7 +6018,7 @@ static bool l430_one_turn(server *srv, l430_rng *r, const l430_cfg &c, l430_coun
         if (take == 0) take = 1;   /* a round always commits its base; a streamed base's round, its first draft */
         for (int k = 0; ok && k < take && pos < nt && !a.stopped; k++, pos++) {
             const std::string &t = toks[(size_t)pos];
-            a.stopped = srv->gen_emit_piece(a.g, 0, t.data(), t.size());
+            a.stopped = srv->gen_emit_piece(a.g, TokId{0}, t.data(), t.size());
             /* L431: side B stays on the stop scan's old rule.  The release as it was (gen_release_ref) runs beside
              * the emit, from B's resume point; the emit's own release starts from that same point, so it finds what
              * the old scan found, and B's resume point is then put back where the old rule leaves it. */
@@ -6033,7 +6033,7 @@ static bool l430_one_turn(server *srv, l430_rng *r, const l430_cfg &c, l430_coun
             }
             gen_release_ref(&b.j.req.stops, grown.c_str(), grown.size(), t.data(), t.size(),
                             b.g->plain_stream_pos.raw(), &think, &from, &hit, &sp, &sl);
-            b.stopped = srv->gen_emit_piece(b.g, 0, t.data(), t.size());
+            b.stopped = srv->gen_emit_piece(b.g, TokId{0}, t.data(), t.size());
             b.g->stop_scan_from = GenOff{from};
             a_from = a.g->stop_scan_from.raw();
             n->tokens++;
@@ -6808,7 +6808,7 @@ static l437_run l437_turn(server *srv, pulsar_chat_format fmt, const std::string
     ((kit_gen *)g->parser_st)->fed = origin;
     g->plain_stream_pos = g->stop_scan_from = origin;
     for (const std::string &t : toks) {
-        res.stopped = srv->gen_emit_piece(g, 0, t.data(), t.size());
+        res.stopped = srv->gen_emit_piece(g, TokId{0}, t.data(), t.size());
         if (res.stopped) break;
     }
     if (!res.stopped) g->finish = "stop";
@@ -6946,7 +6946,7 @@ static std::vector<l437_chunk> l437_logprob_stream(server *srv, pulsar_chat_form
         g->logprobs.pending_valid = true;   /* the draw's capture: one a token */
         g->logprobs.pending_logprob = -0.5f;
         g->logprobs.pending_n_top = 0;
-        stopped = srv->gen_emit_piece(g, 0, t.data(), t.size());
+        stopped = srv->gen_emit_piece(g, TokId{0}, t.data(), t.size());
         TEST_ASSERT(!stopped);
     }
     g->finish = "stop";
@@ -8166,21 +8166,21 @@ static void test_l303_round_masks_match_plain(void) {
         std::vector<TokId> toks;
         for (char c : round) toks.push_back(TokId{(uint8_t)c});
         const uint32_t *masks = NULL;
-        const int rows = gen_constrain_round(&srv, &g, toks.data(), (int)toks.size(), false, &masks);
+        const int rows = gen_constrain_round(&srv, &g, toks.data(), TokCount{(int)toks.size()}, false, &masks);
         TEST_ASSERT(rows == (int)toks.size() && masks);
         /* the gate is back where it was: the next draw's mask is the round's base mask */
         std::vector<uint32_t> row(W);
         TEST_ASSERT(l303_allows(&srv, &g, 't') && !l303_allows(&srv, &g, 'x'));
         /* step by step, as the plain lane decodes the same tokens */
         size_t i = 0;
-        TEST_ASSERT(gen_constrain_accept(&srv, &g, toks[0].raw()));
+        TEST_ASSERT(gen_constrain_accept(&srv, &g, toks[0]));
         for (; i < (size_t)rows; i++) {
             TEST_ASSERT(gen_constrain_mask(&srv, &g, row.data()));
             TEST_ASSERT(!memcmp(row.data(), masks + i * W, W * sizeof(uint32_t)));
             if (i + 1 == (size_t)rows) break;
             const int t = toks[i + 1].raw();
             if (!((row[(uint32_t)t >> 5] >> ((uint32_t)t & 31u)) & 1u)) break;   /* the walk stops here */
-            TEST_ASSERT(gen_constrain_accept(&srv, &g, t));
+            TEST_ASSERT(gen_constrain_accept(&srv, &g, TokId{t}));
         }
         TEST_ASSERT(refuse ? i == 5 : i + 1 == (size_t)rows);   /* "sx": 'x' refused after "tion=s" */
         l303_end(&j, &g);
@@ -8216,7 +8216,7 @@ static void test_l309_draft_prefix(void) {
         for (char c : std::string(pc.round)) toks.push_back(TokId{(uint8_t)c});
         if (pc.stop_at >= 0) toks[(size_t)pc.stop_at + 1u] = TokId{v.stop};
         const int n = (int)toks.size() - 1;
-        const int got = gen_constrain_draft_prefix(&srv, &g, toks[0], toks.data() + 1, n);
+        const int got = gen_constrain_draft_prefix(&srv, &g, toks[0], toks.data() + 1, TokCount{n}).raw();
         if (got != pc.want) fprintf(stderr, "l309 \"%s\": prefix %d, want %d\n", pc.round, got, pc.want);
         TEST_ASSERT(got == pc.want);
         /* the gate is back: the next draw's mask still takes the base, and the round's masks agree with the cut */
@@ -8224,7 +8224,7 @@ static void test_l309_draft_prefix(void) {
         if (pc.stop_at < 0) {
             std::vector<TokId> rt(toks.begin(), toks.end());
             const uint32_t *masks = NULL;
-            const int rows = gen_constrain_round(&srv, &g, rt.data(), (int)rt.size(), false, &masks);
+            const int rows = gen_constrain_round(&srv, &g, rt.data(), TokCount{(int)rt.size()}, false, &masks);
             TEST_ASSERT(rows == (int)rt.size() && masks);
             int walk = 0;   /* the drafts the masked walk can accept: row i takes draft i */
             while (walk < n && ((masks[(size_t)walk * W + ((uint32_t)rt[(size_t)walk + 1u].raw() >> 5)] >>
@@ -8238,7 +8238,7 @@ static void test_l309_draft_prefix(void) {
     gen_state g;
     memset(&g, 0, sizeof g);
     const TokId d[3] = {TokId{'a'}, TokId{'b'}, TokId{'c'}};
-    TEST_ASSERT(gen_constrain_draft_prefix(&srv, &g, TokId{'z'}, d, 3) == 3);
+    TEST_ASSERT(gen_constrain_draft_prefix(&srv, &g, TokId{'z'}, d, TokCount{3}).raw() == 3);
     l303_server_free(&srv);
 }
 
@@ -22159,6 +22159,24 @@ static_assert(std::is_same_v<decltype(pulsar_spec_step{}.row0), StepRow> &&
                   std::is_same_v<decltype(pulsar_spec_step{}.n_rows), StepRows> &&
                   !l334_passes<uint32_t, StepRow> && !l334_passes<HeadRow, StepRow>,
               "the spec step's span is in step rows");
+/* L443: token ids and the walks' counts at the server's emit boundary -- an id is a TokId, a chain's length a TokCount */
+static_assert(std::is_same_v<decltype(&server::gen_emit_token), bool (server::*)(session_slot *, TokId)> &&
+                  std::is_same_v<decltype(&server::gen_emit_piece),
+                                 bool (server::*)(gen_state *, TokId, const char *, size_t)> &&
+                  std::is_same_v<decltype(&gen_constrain_accept), bool (*)(server *, gen_state *, TokId)> &&
+                  std::is_same_v<decltype(&logprob_capture_row), void (*)(logprob_ledger *, pulsar_session *, HeadRow, TokId)> &&
+                  std::is_same_v<decltype(&logprob_capture_session), void (*)(logprob_ledger *, pulsar_session *, TokId)> &&
+                  std::is_same_v<decltype(logprob_token{}.token), TokId>,
+              "the emit path and the logprobs ledger take token ids");
+static_assert(std::is_same_v<decltype(&gen_turn_draft_prefix),
+                             TokCount (*)(server *, gen_state *, TokId, const TokId *, TokCount)> &&
+                  std::is_same_v<decltype(&gen_turn_draft_prefix_text),
+                                 TokCount (*)(gen_state *, const char *const *, const size_t *, TokCount)> &&
+                  std::is_same_v<decltype(&gen_constrain_draft_prefix),
+                                 TokCount (*)(server *, gen_state *, TokId, const TokId *, TokCount)> &&
+                  std::is_same_v<decltype(&gen_spec_greedy_rows), uint32_t (*)(server *, gen_state *, const TokId *, TokCount, bool)> &&
+                  !l334_passes<int, TokCount> && !l334_passes<TokId, TokCount> && !l334_passes<StepRows, TokCount>,
+              "a chain's drafts are counted in tokens: no int, id or row count passes for them");
 
 /* L334 P3: a token id is an identity -- the compile-fail checks.  No arithmetic, no ordering, no position / count /
  * row passes for it or it for them, and no int enters it implicitly (L251's eval(sess, 1, ..) count). */

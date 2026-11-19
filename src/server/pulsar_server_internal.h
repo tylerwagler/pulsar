@@ -546,7 +546,7 @@ static inline void pulsar_hist_observe(pulsar_hist *h, const double *bounds, dou
  * recoverable from the response stream: it can be partial UTF-8, or inside a
  * string the projection has rewritten. */
 typedef struct {
-    int    token;      ///< token id
+    TokId  token;      ///< token id (L443)
     char  *piece;  ///< owned raw token bytes (may be partial UTF-8)
     size_t piece_len;  ///< length of `piece` in bytes
     float  logprob;    ///< the token's logprob
@@ -3883,7 +3883,7 @@ struct server {
     /// @param sl the slot whose job this is (its gen_state; its bank installed by the caller unless said)
     /// @param token  the decoded token id
     /// @return true when the decode loop must stop after this token (g->finish set)
-    bool gen_emit_token(session_slot *sl, int token);
+    bool gen_emit_token(session_slot *sl, TokId token);
     /** L428: gen_emit_token past its engine reads (the stop set, the gate's accept, the token's text): `piece` joins
      *  the generated text and goes through the release, the stream, the family's parser, the stop strings and the
      *  turn's own end (gen_turn_complete).  No engine call unless the request asked for logprobs, so the unit tests
@@ -3893,7 +3893,7 @@ struct server {
     /// @param piece      the token's text
     /// @param piece_len  its length, bytes
     /// @return true when the decode loop must stop after this token (g->finish set)
-    bool gen_emit_piece(gen_state *g, int token, const char *piece, size_t piece_len);
+    bool gen_emit_piece(gen_state *g, TokId token, const char *piece, size_t piece_len);
     /** Post-decode epilogue: tool repair/recovery, final parse, protocol live
      * state, checkpoints, the final response, and logging. Recovery paths loop
      * back to GEN_DECODE_INIT (the old goto decode_again).  The turn is read through the decode attempt's parser
@@ -5971,7 +5971,7 @@ bool gen_constrain_mask(struct server *s, struct gen_state *g, uint32_t *row);
 /// @param g  the request's generation state
 /// @param token  the emitted token id
 /// @return false when refused or failed
-bool gen_constrain_accept(struct server *s, struct gen_state *g, int token);
+bool gen_constrain_accept(struct server *s, struct gen_state *g, TokId token);
 /** A speculative round's masks: `toks` are the round's tokens (the base unless `base_emitted`, then the
  *  drafts), row i the token after the base and drafts 0..i-1, so the gate goes through them and back.  Rows
  *  are written into the gate's own buffer (*masks; valid until the next call on this gate).  Returns the rows
@@ -5983,7 +5983,7 @@ bool gen_constrain_accept(struct server *s, struct gen_state *g, int token);
 /// @param base_emitted  the base was already emitted (toks are the drafts)
 /// @param masks  receives the rows (the gate's buffer)
 /// @return rows written, 0, or -1
-int gen_constrain_round(struct server *s, struct gen_state *g, const TokId *toks, int n, bool base_emitted,
+int gen_constrain_round(struct server *s, struct gen_state *g, const TokId *toks, TokCount n, bool base_emitted,
                         const uint32_t **masks);
 /** L309: how many of a pending chain's `n` drafts (after the not yet emitted `base`) can be accepted under the
  *  grammar: the gate goes through the base and the drafts, as gen_constrain_round's walk does, and back; the first
@@ -5994,8 +5994,8 @@ int gen_constrain_round(struct server *s, struct gen_state *g, const TokId *toks
 /// @param base_id  the round's base token (not yet emitted; L334 P3: an id, not the KV cache's `base` count)
 /// @param drafts  the pending drafts
 /// @param n  how many
-/// @return the acceptable prefix length, or -1
-int gen_constrain_draft_prefix(struct server *s, struct gen_state *g, TokId base_id, const TokId *drafts, int n);
+/// @return the acceptable prefix length, or -1 (a count below 0: the failure)
+TokCount gen_constrain_draft_prefix(struct server *s, struct gen_state *g, TokId base_id, const TokId *drafts, TokCount n);
 /** The base draw's mask for a speculative round's assemble (live only; the gate's buffer, valid until the next
  *  call).  NULL + g->err on failure. */
 /// @param s  the server
@@ -6684,7 +6684,7 @@ void gen_resolve_sampling(const request *req, float *temperature,
 /// @param n  how many
 /// @param base_emitted  the base was already emitted
 /// @return the greedy-row bit set
-uint32_t gen_spec_greedy_rows(server *s, gen_state *g, const TokId *toks, int n, bool base_emitted);
+uint32_t gen_spec_greedy_rows(server *s, gen_state *g, const TokId *toks, TokCount n, bool base_emitted);
 /** The same over the tokens' texts (NULL = a stop token): the probe itself, engine-free (server tests). */
 /// @param g  the request's generation state (read ahead in place, then restored)
 /// @param pieces  each token's text (NULL = a stop token)
@@ -6692,7 +6692,7 @@ uint32_t gen_spec_greedy_rows(server *s, gen_state *g, const TokId *toks, int n,
 /// @param n  how many
 /// @param base_emitted  the base was already emitted
 /// @return the greedy-row bit set
-uint32_t gen_spec_greedy_rows_text(gen_state *g, const char *const *pieces, const size_t *piece_lens, int n,
+uint32_t gen_spec_greedy_rows_text(gen_state *g, const char *const *pieces, const size_t *piece_lens, TokCount n,
                                    bool base_emitted);
 /** L428: the family's turn ended before its stop token (server_output_parser_ops::turn_complete -- DeepSeek's closed
  *  DSML block; the first call of a turn that may make one, request::single_tool_call): g->text is cut where the
@@ -6712,14 +6712,14 @@ bool gen_turn_complete(struct gen_state *g);
 /// @param drafts  the pending drafts
 /// @param n  how many
 /// @return the usable prefix length, 0..n
-int gen_turn_draft_prefix(server *s, gen_state *g, TokId base_id, const TokId *drafts, int n);
+TokCount gen_turn_draft_prefix(server *s, gen_state *g, TokId base_id, const TokId *drafts, TokCount n);
 /** The same over the tokens' texts (NULL = a stop token), pieces[0] the base: the probe itself, engine-free. */
 /// @param g  the request's generation state (read ahead in place, then restored)
 /// @param pieces  the base's text, then each draft's (NULL = a stop token)
 /// @param piece_lens  their lengths, bytes
 /// @param n  the drafts (pieces holds n + 1)
 /// @return the usable prefix length, 0..n
-int gen_turn_draft_prefix_text(gen_state *g, const char *const *pieces, const size_t *piece_lens, int n);
+TokCount gen_turn_draft_prefix_text(gen_state *g, const char *const *pieces, const size_t *piece_lens, TokCount n);
 /** The emit path's byte release (gen_emit_token's; the probe's on its look ahead): returns the bytes of `text` the
  *  stop-string scan releases after `text` grew by `piece`. */
 /// @param stops  the request's stop strings
@@ -6748,9 +6748,9 @@ bool gen_streams_plain(const gen_state *g);
  * logprob_stream_ready reports how many entries a byte watermark releases. */
 void logprob_ledger_reset(logprob_ledger *lg);
 void logprob_ledger_free(logprob_ledger *lg);
-void logprob_capture_session(logprob_ledger *lg, pulsar_session *sess, int token);
-void logprob_capture_row(logprob_ledger *lg, pulsar_session *sess, HeadRow row, int token);
-bool logprob_commit(logprob_ledger *lg, pulsar_engine *engine, int token,
+void logprob_capture_session(logprob_ledger *lg, pulsar_session *sess, TokId token);
+void logprob_capture_row(logprob_ledger *lg, pulsar_session *sess, HeadRow row, TokId token);
+bool logprob_commit(logprob_ledger *lg, pulsar_engine *engine, TokId token,
                     const char *piece, size_t piece_len, GenOff end_off);
 int  logprob_stream_ready(const logprob_ledger *lg, GenOff upto);
 int  logprob_stream_all(const logprob_ledger *lg);

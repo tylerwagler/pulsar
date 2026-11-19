@@ -2769,7 +2769,7 @@ const uint32_t *gen_think_masks(server *s, gen_state *g, int row, int rows, cons
     return g->think_rows;
 }
 
-/* the slot's draw from the pool session's live row.  -1 with g->err set: the sampler refused the row, or the
+/* the slot's draw from the pool session's live row.  none() with g->err set: the sampler refused the row, or the
  * grammar failed. */
 /// @param s the server
 /// @param g the slot's generation
@@ -2778,14 +2778,14 @@ const uint32_t *gen_think_masks(server *s, gen_state *g, int row, int rows, cons
 /// @param top_k top-k (0: off)
 /// @param top_p top-p
 /// @param min_p min-p
-/// @return the token, or -1
-static int gen_sample_pool(server *s, gen_state *g, pulsar_session *pool, float temp, int top_k, float top_p,
-                           float min_p) {
+/// @return the token, or none()
+static TokId gen_sample_pool(server *s, gen_state *g, pulsar_session *pool, float temp, int top_k, float top_p,
+                             float min_p) {
     std::vector<uint32_t> mask;
     pulsar_row_draw d;
-    if (!gen_draw_req(s, g, temp, top_k, top_p, min_p, &mask, &d)) return -1;
-    const int tok = pulsar_session_draw(pool, &d).raw();   /* none(): PULSAR_SAMPLE_REFUSED */
-    if (tok < 0) snprintf(g->err, sizeof g->err, "sampler refused a degenerate logits row (L188)");
+    if (!gen_draw_req(s, g, temp, top_k, top_p, min_p, &mask, &d)) return TokId::none();
+    const TokId tok = pulsar_session_draw(pool, &d);   /* none(): PULSAR_SAMPLE_REFUSED */
+    if (!tok.is_token()) snprintf(g->err, sizeof g->err, "sampler refused a degenerate logits row (L188)");
     return tok;
 }
 
@@ -4360,11 +4360,11 @@ static void lane_emit_and_draw(server *s, session_slot **dec, const int *live_id
     for (int q = 0; q < m; q++) {
         session_slot *sl = dec[live_idx[q]];
         gen_state *g = sl->gen;
-        const int committed = g->batch_feed_token.raw(); /* committed at batch_feed_pos */
+        const TokId committed = g->batch_feed_token; /* committed at batch_feed_pos */
         g->batch_feed_pos += TokCount{1};
         sl->committed_pos = g->batch_feed_pos;
         sl->tokens_emitted++;   /* L118: classic-loop accounting parity */
-        pulsar_tokens_push(&g->batch_pending, TokId{committed});
+        pulsar_tokens_push(&g->batch_pending, committed);
         if (g->first_token_t == 0.0) g->first_token_t = server_now_sec();
         /* Route THIS slot's stream writes through its own deferral queue
          * (the worker-thread-local writer is shared across slots). */
@@ -4397,7 +4397,7 @@ static void lane_emit_and_draw(server *s, session_slot **dec, const int *live_id
         }
         /* This bank's row IS the target distribution at batch_feed_pos, and
          * it is overwritten by the next step's sweep. */
-        logprob_capture_row(&g->logprobs, pool, rows[k], tok[k].raw());
+        logprob_capture_row(&g->logprobs, pool, rows[k], tok[k]);
     }
 }
 
@@ -4453,7 +4453,7 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n, int quantu
         }
         float temp, top_p, min_p; int top_k;
         gen_resolve_sampling_decode(g, &temp, &top_k, &top_p, &min_p);
-        g->batch_feed_token = TokId{gen_sample_pool(s, g, pool, temp, top_k, top_p, min_p)};
+        g->batch_feed_token = gen_sample_pool(s, g, pool, temp, top_k, top_p, min_p);
         if (!g->batch_feed_token.is_token()) {
             g->finish = "error"; g->batch_feed_valid = false; g->phase = GEN_FINISH;
             continue;
@@ -4461,7 +4461,7 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n, int quantu
         /* The bank is live and its classic logits are what this token was drawn
          * from; after the multiseq step below they describe nothing (the step
          * leaves s->logits untouched by contract), so capture here or never. */
-        logprob_capture_session(&g->logprobs, pool, g->batch_feed_token.raw());
+        logprob_capture_session(&g->logprobs, pool, g->batch_feed_token);
         g->batch_feed_pos = pulsar_session_pos(pool);
         pulsar_session_bank_state_save(pool, sl->bank);
         g->batch_feed_valid = true;
@@ -4486,7 +4486,7 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n, int quantu
             }
             reqs[m].bank = sl->bank;
             reqs[m].pos = g->batch_feed_pos;
-            reqs[m].token = TokId{g->batch_feed_token};
+            reqs[m].token = g->batch_feed_token;
             live_idx[m] = i;
             m++;
         }
@@ -4746,7 +4746,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
     }
 
     pulsar_spec_round *rounds[PULSAR_SESSION_POOL_CAP] = {0};
-    int first_tok[PULSAR_SESSION_POOL_CAP];
+    TokId first_tok[PULSAR_SESSION_POOL_CAP];   /* each round's base (assemble's first_token) */
     StepRow row0s[PULSAR_SESSION_POOL_CAP];    /* each round's first step row (the engine's assemble laid them) */
     StepRows row_nb[PULSAR_SESSION_POOL_CAP];  /* rows this bank contributed (base+K) */
     int live_idx[PULSAR_SESSION_POOL_CAP];
@@ -4867,7 +4867,8 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             uint32_t np = pulsar_session_bank_pendings(pool, dec[i]->bank, &pbase, ptok, conf);
             /* L309: a chain under a grammar ends before its first draft the grammar refuses */
             if (np > 0 && ag->gate) {
-                const int legal = gen_constrain_draft_prefix(s, ag, pbase, ptok, (int)np);
+                /* L443: the engine's pending count (uint32) in and out of the walk as a token count */
+                const int legal = gen_constrain_draft_prefix(s, ag, pbase, ptok, TokCount{(int)np}).raw();
                 if (legal < 0) {
                     ag->finish = "error";
                     ag->phase = GEN_FINISH;
@@ -4881,7 +4882,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             }
             /* L428: a chain in a turn that may make one call ends with the token that closes that call */
             if (np > 0) {
-                const int usable = gen_turn_draft_prefix(s, ag, pbase, ptok, (int)np);
+                const int usable = gen_turn_draft_prefix(s, ag, pbase, ptok, TokCount{(int)np}).raw();
                 if ((uint32_t)usable < np && !s->w_spec_turn_cut_said) {   /* rule 5: the cut ran */
                     s->w_spec_turn_cut_said = true;
                     server_log(PULSAR_LOG_DEFAULT, "pulsar-server: a turn limited to one tool call cut a pending "
@@ -5075,7 +5076,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             case PULSAR_SPEC_STEP_OK:
                 row0s[m] = st->row0;
                 row_nb[m] = st->n_rows;
-                first_tok[m] = st->first_token.raw();
+                first_tok[m] = st->first_token;
                 live_idx[m] = i;
                 m++;
                 break;
@@ -5085,7 +5086,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 /* generate_speculative's short-circuit: emit EOS, never eval it. */
                 slot_writer_install(&g->writer);
                 if (g->first_token_t == 0.0) g->first_token_t = server_now_sec();
-                (void)s->gen_emit_token(sl, st->first_token.raw());
+                (void)s->gen_emit_token(sl, st->first_token);
                 g->phase = GEN_FINISH;
                 emitted_total++;
                 break;
@@ -5282,9 +5283,9 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 int nt = 0;
                 for (int i = base_sent[q] ? 1 : 0; i < row_nb[q].raw(); i++)
                     toks[nt++] = reqs[(row0s[q] + StepRows{i}).raw()].token;   /* reqs is indexed by step row */
-                st->greedy_rows = gen_spec_greedy_rows(s, g, toks, nt, base_sent[q]);
+                st->greedy_rows = gen_spec_greedy_rows(s, g, toks, TokCount{nt}, base_sent[q]);
                 /* L303: each verify row's mask -- the gate walked through the round's tokens and back */
-                const int mr = gen_constrain_round(s, g, toks, nt, base_sent[q], &st->masks);
+                const int mr = gen_constrain_round(s, g, toks, TokCount{nt}, base_sent[q], &st->masks);
                 if (mr < 0) {
                     /* the grammar failed (g->err says how): masks with no rows make the round refuse and undo
                      * itself, so this request fails and the others' rounds go on */
@@ -5313,7 +5314,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 }
             }
             st->rng = &g->rng;
-            st->first_token = TokId{first_tok[q]};
+            st->first_token = first_tok[q];
             st->row0 = row0s[q];
             st->accepted = accepted[q];
             st->accepted_cap = (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
@@ -5362,7 +5363,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             for (int t = t0; !stopped && t < na; t++) {
                 if (g->first_token_t == 0.0) g->first_token_t = server_now_sec();
                 done = t + 1;
-                if (s->gen_emit_token(sl, st->accepted[t].raw())) { stopped = true; break; }
+                if (s->gen_emit_token(sl, st->accepted[t])) { stopped = true; break; }
             }
             if (stopped) g->phase = GEN_FINISH;
             /* L264 S4: decode creates no grid checkpoints, so there is nothing
@@ -5574,10 +5575,10 @@ bool server::batch_leave(session_slot *sl) {
     /* the token the batch sampled (its logprob already captured) is committed here as the batch's next
      * step would have: fed, counted, emitted -- so the session's logits are fresh for the family's
      * generate, which draws the token after it */
-    const int tok = g->batch_feed_token.raw();
+    const TokId tok = g->batch_feed_token;
     g->batch_feed_valid = false;
     char err[160] = "";
-    if (pulsar_session_eval(pool, TokId{tok}, err, sizeof err) != 0) {
+    if (pulsar_session_eval(pool, tok, err, sizeof err) != 0) {
         if (!g->err[0]) snprintf(g->err, sizeof g->err, "leaving the batch: %s", err);
         g->finish = "error";
         g->phase = GEN_FINISH;
@@ -5762,12 +5763,12 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
         }
         float temp, top_p, min_p; int top_k;
         gen_resolve_sampling_decode(g, &temp, &top_k, &top_p, &min_p);
-        g->batch_feed_token = TokId{gen_sample_pool(s, g, pool, temp, top_k, top_p, min_p)};
+        g->batch_feed_token = gen_sample_pool(s, g, pool, temp, top_k, top_p, min_p);
         if (!g->batch_feed_token.is_token()) {
             g->finish = "error"; g->batch_feed_valid = false; g->phase = GEN_FINISH;
             continue;
         }
-        logprob_capture_session(&g->logprobs, pool, g->batch_feed_token.raw());
+        logprob_capture_session(&g->logprobs, pool, g->batch_feed_token);
         g->batch_feed_pos = pulsar_session_pos(pool);
         pulsar_session_bank_state_save(pool, sl->bank);
         g->batch_feed_valid = true; g->batch_active = true;
@@ -5821,7 +5822,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
                 g->batch_feed_valid = false; g->finish = "length"; g->phase = GEN_FINISH; continue;
             }
             reqs[m].bank = sl->bank; reqs[m].pos = g->batch_feed_pos;
-            reqs[m].token = TokId{g->batch_feed_token}; live_idx[m] = i; m++;
+            reqs[m].token = g->batch_feed_token; live_idx[m] = i; m++;
         }
         /* Fold this step's ascending prefill sub-chunk from P0+pf_done, all the way
          * to len (the FINAL sub-chunk carries the last-position logits used for the

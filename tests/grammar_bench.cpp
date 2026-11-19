@@ -329,7 +329,7 @@ int main(int argc, char **argv) {
                     const int nt = (int)std::min(ids.size() - i, (size_t)K + 1);
                     const uint32_t *masks = NULL;
                     a = now_us();
-                    const int rows = gen_constrain_round(&srv, &g, round_ids.data() + i, nt, false, &masks);
+                    const int rows = gen_constrain_round(&srv, &g, round_ids.data() + i, TokCount{nt}, false, &masks);
                     round.add(now_us() - a);
                     if (rows < 0) {
                         printf("    round failed: %s\n", g.err);
@@ -338,7 +338,7 @@ int main(int argc, char **argv) {
                     }
                 }
                 const double a = now_us();
-                if (!gen_constrain_accept(&srv, &g, t)) {
+                if (!gen_constrain_accept(&srv, &g, TokId{t})) {
                     printf("    accept failed at token %zu: %s\n", i, g.err);
                     findings++;
                     break;

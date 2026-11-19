@@ -93,15 +93,15 @@ static void trace_write_escaped_bytes(FILE *fp, const char *p, size_t len) {
 /// @brief Write a token as "<id> \"<escaped text>\"", or "- <none>" for a negative id.
 /// @param fp      the trace file
 /// @param engine  the engine (for the token's text)
-/// @param token   the token id (< 0: none)
-static void trace_write_token(FILE *fp, pulsar_engine *engine, int token) {
-    if (token < 0) {
+/// @param token   the token id (not a token: none)
+static void trace_write_token(FILE *fp, pulsar_engine *engine, TokId token) {
+    if (!token.is_token()) {
         fputs("- <none>", fp);
         return;
     }
     size_t len = 0;
-    char *piece = pulsar_token_text(engine, TokId{token}, &len);
-    fprintf(fp, "%d ", token);
+    char *piece = pulsar_token_text(engine, token, &len);
+    fprintf(fp, "%d ", token.raw());
     trace_write_escaped_bytes(fp, piece, len);
     free(piece);
 }
@@ -165,9 +165,9 @@ void server::trace_write_cache_diag(
         else mark = live == prompt ? "==" : "!=";
 
         fprintf(s->trace, "%7d %-11s live ", pos, mark);
-        trace_write_token(s->trace, s->engine, live);
+        trace_write_token(s->trace, s->engine, TokId{live});   /* the diff's raw id rows */
         fputs(" | prompt ", s->trace);
-        trace_write_token(s->trace, s->engine, prompt);
+        trace_write_token(s->trace, s->engine, TokId{prompt});
         fputc('\n', s->trace);
     }
 }
