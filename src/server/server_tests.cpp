@@ -37,6 +37,16 @@ static void test_assert(bool cond, const char *file, int line, const char *expr)
 
 #define TEST_ASSERT(expr) test_assert((expr), __FILE__, __LINE__, #expr)
 
+/* L391: hand-built free-memory readings (server_mem_reading).  Unified memory: one reading, one floor, the KV's and
+ * the host's alike.  A discrete card: the device's pair for the KV, the host's own beside it. */
+static server_mem_reading test_mem_unified(uint64_t avail, uint64_t floor) {
+    return server_mem_reading{false, KvBytes{avail}, KvBytes{floor}, KvBytes{avail}, KvBytes{floor}};
+}
+static server_mem_reading test_mem_discrete(uint64_t dev_free, uint64_t dev_floor, uint64_t host_avail,
+                                            uint64_t host_floor) {
+    return server_mem_reading{true, KvBytes{dev_free}, KvBytes{dev_floor}, KvBytes{host_avail}, KvBytes{host_floor}};
+}
+
 /* L335: request_init sets no family and no model (the loaded engine's, in the server).  A hand-built test request
  * says which it is: the DeepSeek V4.1 family and its served id, unless the test sets another. */
 static void test_request_init(request *r, req_kind kind, int max_tokens) {
@@ -13671,9 +13681,9 @@ static void test_l372_judge_bank_floor_and_release(void) {
     TEST_ASSERT(!server_judge_release(&s) && !J->released);   /* nothing resident: nothing freed, nothing to re-back */
     /* the order: an idle chat bank is spilled first; the judge bank's turn is where the step would preempt or refuse */
     const uint64_t MiB = 1024ull * 1024ull, F = 4538ull * MiB, need = 52ull * MiB;
-    TEST_ASSERT(server_prefill_mem_step(KvBytes{F}, KvBytes{need}, KvBytes{F}, 1, true) == PREFILL_MEM_SPILL);
-    TEST_ASSERT(server_prefill_mem_step(KvBytes{F}, KvBytes{need}, KvBytes{F}, 0, true) == PREFILL_MEM_PREEMPT);
-    TEST_ASSERT(server_prefill_mem_step(KvBytes{F}, KvBytes{need}, KvBytes{F}, 0, false) == PREFILL_MEM_REFUSE);
+    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(F, F), KvBytes{need}, 1, true) == PREFILL_MEM_SPILL);
+    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(F, F), KvBytes{need}, 0, true) == PREFILL_MEM_PREEMPT);
+    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(F, F), KvBytes{need}, 0, false) == PREFILL_MEM_REFUSE);
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     if (sv[0] >= 0 && sv[1] >= 0) {
@@ -14622,22 +14632,22 @@ static void test_mem_floor_admits_warmed_box_shape(void) {
      * free at full commit); the 4 GiB floor must admit — post-admission
      * MemAvailable stays >= ~5.89 GiB, well above the backstop. */
     const KvBytes est = kvb(2560ull * MiB);                 /* 2.5 GiB session */
-    TEST_ASSERT(server_mem_floor_admits(kvb(8590ull * MiB), est));  /* 8.39 GiB avail */
+    TEST_ASSERT(server_headroom_admits(kvb(8590ull * MiB), est, server_mem_floor()));  /* 8.39 GiB avail */
 
     /* Warmed-box full-commit steady state measured 2026-07-15: 5.96 GiB
      * avail with three live sessions. A further session would leave ~3.4,
      * below the backstop: refuse. */
-    TEST_ASSERT(!server_mem_floor_admits(kvb(6103ull * MiB), est)); /* 5.96 GiB avail */
+    TEST_ASSERT(!server_headroom_admits(kvb(6103ull * MiB), est, server_mem_floor())); /* 5.96 GiB avail */
 
     /* A genuinely tight box must always refuse. */
-    TEST_ASSERT(!server_mem_floor_admits(kvb(4ull * GiB), est));
+    TEST_ASSERT(!server_headroom_admits(kvb(4ull * GiB), est, server_mem_floor()));
     /* Exact boundary: est + floor. */
-    TEST_ASSERT(server_mem_floor_admits(est + kvb(PULSAR_SERVER_MEM_FLOOR_BYTES), est));
-    TEST_ASSERT(!server_mem_floor_admits(est + kvb(PULSAR_SERVER_MEM_FLOOR_BYTES - 1), est));
+    TEST_ASSERT(server_headroom_admits(est + kvb(PULSAR_SERVER_MEM_FLOOR_BYTES), est, server_mem_floor()));
+    TEST_ASSERT(!server_headroom_admits(est + kvb(PULSAR_SERVER_MEM_FLOOR_BYTES - 1), est, server_mem_floor()));
     /* Unreadable /proc/meminfo (avail == 0) fails closed. */
-    TEST_ASSERT(!server_mem_floor_admits(kvb(0), est));
+    TEST_ASSERT(!server_headroom_admits(kvb(0), est, server_mem_floor()));
     /* Overflow guard: absurd estimate must refuse, not wrap. */
-    TEST_ASSERT(!server_mem_floor_admits(KvBytes::max(), kvb(UINT64_MAX - 1ull * GiB)));
+    TEST_ASSERT(!server_headroom_admits(KvBytes::max(), kvb(UINT64_MAX - 1ull * GiB), server_mem_floor()));
 }
 
 
@@ -14783,13 +14793,13 @@ static void test_session_eviction_victim_selection(void) {
     memset(slots, 0, sizeof(slots));
     for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) slots[i].provisioned = true;
     slots[0].last_serviced_us = 1;              /* oldest of all — but pinned */
-    slots[0].est_cost_bytes = kvb(9ull * GiB);
+    slots[0].bank_charge_bytes = kvb(9ull * GiB);
     slots[1].last_serviced_us = 100;
-    slots[1].est_cost_bytes = kvb(3ull * GiB);
+    slots[1].bank_charge_bytes = kvb(3ull * GiB);
     slots[2].last_serviced_us = 50;
-    slots[2].est_cost_bytes = kvb(2ull * GiB);
+    slots[2].bank_charge_bytes = kvb(2ull * GiB);
     slots[3].last_serviced_us = 50;             /* LRU tie with slot 2 */
-    slots[3].est_cost_bytes = kvb(1ull * GiB);       /* ...but cheaper to restore */
+    slots[3].bank_charge_bytes = kvb(1ull * GiB);       /* ...but cheaper to restore */
 
     TEST_ASSERT(server_evict_pick_victim(slots, 4, NULL) == 3); /* LRU tie-break */
     bool protect[PULSAR_SESSION_POOL_CAP] = {0};
@@ -16306,32 +16316,387 @@ static void test_l179_deep_guard_blocks_two_deep_decoders(void) {
  * bank (n_provisioned == 0) is never floor-refused, at any gauge reading
  * including an unreadable one (a first-bank refusal is a worker hard-spin);
  * from the second bank on, a bank that would page in fresh memory meets the
- * floor (avail == 0 fails closed; the box must hold marginal +
- * PULSAR_SERVER_MEM_FLOOR_BYTES, same boundary as server_mem_floor_admits),
+ * floor (avail == 0 fails closed; the box must hold the provision's demand-paged
+ * bytes + the floor, server_kv_headroom_admits),
  * and a recycled bank whose pages are already resident is never refused --
  * reinstalling it pages in nothing (the 2026-09-29 pair's serialized c2). */
 static void test_l179_bank_floor_exempts_first_bank(void) {
     const uint64_t MiB = 1024ull * 1024ull;
     const uint64_t GiB = 1024ull * MiB;
-    const uint64_t marginal = 2560ull * MiB;                 /* 2.5 GiB bank */
-    const uint64_t floor = marginal + PULSAR_SERVER_MEM_FLOOR_BYTES;
+    const uint64_t demand = 2560ull * MiB;                   /* 2.5 GiB of demand-paged KV */
+    const uint64_t floor = demand + PULSAR_SERVER_MEM_FLOOR_BYTES;
     /* first bank: exempt everywhere */
-    TEST_ASSERT(!server_bank_floor_refuses(0, false, kvb(0), kvb(marginal)));
-    TEST_ASSERT(!server_bank_floor_refuses(0, false, kvb(floor - 1), kvb(marginal)));
-    TEST_ASSERT(!server_bank_floor_refuses(0, false, kvb(floor), kvb(marginal)));
-    TEST_ASSERT(!server_bank_floor_refuses(0, false, kvb(1ull * GiB), kvb(marginal)));
+    TEST_ASSERT(!server_bank_floor_refuses(0, false, test_mem_unified(0, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
+    TEST_ASSERT(!server_bank_floor_refuses(0, false, test_mem_unified(floor - 1, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
+    TEST_ASSERT(!server_bank_floor_refuses(0, false, test_mem_unified(floor, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
+    TEST_ASSERT(!server_bank_floor_refuses(0, false, test_mem_unified(1ull * GiB, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
     /* second bank onward, fresh pages: gauge and floor both bind */
-    TEST_ASSERT(server_bank_floor_refuses(1, false, kvb(0), kvb(marginal)));
-    TEST_ASSERT(server_bank_floor_refuses(1, false, kvb(floor - 1), kvb(marginal)));
-    TEST_ASSERT(!server_bank_floor_refuses(1, false, kvb(floor), kvb(marginal)));
-    TEST_ASSERT(server_bank_floor_refuses(3, false, kvb(0), kvb(marginal)));
-    TEST_ASSERT(server_bank_floor_refuses(3, false, kvb(floor - 1), kvb(marginal)));
-    TEST_ASSERT(!server_bank_floor_refuses(3, false, kvb(floor), kvb(marginal)));
-    TEST_ASSERT(!server_bank_floor_refuses(3, false, kvb(100ull * GiB), kvb(marginal)));
+    TEST_ASSERT(server_bank_floor_refuses(1, false, test_mem_unified(0, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
+    TEST_ASSERT(server_bank_floor_refuses(1, false, test_mem_unified(floor - 1, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
+    TEST_ASSERT(!server_bank_floor_refuses(1, false, test_mem_unified(floor, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
+    TEST_ASSERT(server_bank_floor_refuses(3, false, test_mem_unified(0, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
+    TEST_ASSERT(server_bank_floor_refuses(3, false, test_mem_unified(floor - 1, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
+    TEST_ASSERT(!server_bank_floor_refuses(3, false, test_mem_unified(floor, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
+    TEST_ASSERT(!server_bank_floor_refuses(3, false, test_mem_unified(100ull * GiB, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
     /* a recycled bank (resident pages): admitted however tight the box reads */
-    TEST_ASSERT(!server_bank_floor_refuses(15, true, kvb(floor - 1), kvb(marginal)));
-    TEST_ASSERT(!server_bank_floor_refuses(15, true, kvb(4ull * GiB + 1), kvb(marginal)));
-    TEST_ASSERT(!server_bank_floor_refuses(15, true, kvb(0), kvb(marginal)));
+    TEST_ASSERT(!server_bank_floor_refuses(15, true, test_mem_unified(floor - 1, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
+    TEST_ASSERT(!server_bank_floor_refuses(15, true, test_mem_unified(4ull * GiB + 1, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
+    TEST_ASSERT(!server_bank_floor_refuses(15, true, test_mem_unified(0, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
+}
+
+/* ---- L391: the session-cost ledger and the free-memory readings ------------------------------------------------
+ * The two production shapes, from their startup lines and the published containers:
+ *   Qwen (GB10, unified): 16 banks x 1,048,576, no judge.  Weights 66,657,567,056 B (the container's shards) ->
+ *     budget 36.92 GiB; shared 2.85 GiB + 0.78 GiB a bank eager -> admitted 15.33 GiB (notes L280: the eager floor
+ *     does not grow with ctx on Qwen); 13,440 B of KV a token -> 13.125 GiB a bank demand-paged at 1M.
+ *   Gemma (RTX 6000, discrete): 3 banks x 131,072 = 2 chat + the judge's.  7.9 GiB free after the weights -> budget
+ *     6.4 GiB; 2,684,354,560 B a bank demand-paged (notes L393).  Its shared / eager split is NOT from a log of
+ *     the 3-bank pool (none is on this machine): 1.00 + 1.41 GiB a bank reproduces the 2-bank line's 1.91 GiB
+ *     marginal; the ledger's identities below hold for any split. */
+/// The Qwen production pool's admitted price in bytes (see the note above).
+static const uint64_t L391_QWEN_ADMITTED = (2918ull + 16ull * 799ull) << 20;
+/// The Qwen container's resident weights in bytes.
+static const uint64_t L391_QWEN_WEIGHTS = 66657567056ull;
+/// One Qwen bank's demand-paged KV at --ctx 1048576 in bytes.
+static const uint64_t L391_QWEN_BANK_KV = 13440ull * 1048576ull;
+/// The Gemma production pool's admitted price in bytes (see the note above).
+static const uint64_t L391_GEMMA_ADMITTED = (1024ull + 3ull * 1444ull) << 20;
+/// The RTX 6000's admission budget in bytes: 7.9 GiB free after the weights less the 1.5 GiB margin.
+static const uint64_t L391_GEMMA_BUDGET = (7900ull - 1536ull) << 20;
+/// One Gemma bank's demand-paged KV at --ctx 131072 in bytes.
+static const uint64_t L391_GEMMA_BANK_KV = 2684354560ull;
+
+/// @brief A host-only server with a bank pool of `chat` chat banks and nothing installed.
+/// @param s     the server to set up (zeroed here)
+/// @param chat  its chat banks
+static void l391_pool_server(server *s, int chat) {
+    memset(s, 0, sizeof *s);
+    pthread_mutex_init(&s->mu, NULL);
+    pthread_mutex_init(&s->tool_mu, NULL);
+    s->pool_banks = chat;
+    s->live_bank = BankId::none();
+    for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) s->slots[i].bank = BankId{i};
+}
+
+/// @brief Mark bank `b` provisioned and commit its charge, as provision_bank does once the bank installed.
+/// @param s the server
+/// @param b the bank
+static void l391_provision(server *s, int b) {
+    session_slot *sl = &s->slots[b];
+    sl->provisioned = true;
+    sl->state = SLOT_IDLE;
+    pthread_mutex_lock(&s->mu);
+    s->ledger_commit_bank(sl);
+    if (b >= s->n_slots) s->n_slots = b + 1;
+    pthread_mutex_unlock(&s->mu);
+}
+
+/* Finding 4: the charges of all the banks a price was priced over sum to it exactly -- for any price and bank count
+ * -- and the pool's ledger with every chat bank live equals the estimate, with and without a judge bank.  The
+ * self-check fails, by name, on a ledger that does not: the pre-L391 state (the judge's share divided out and
+ * committed nowhere), a divisor that is not the priced bank count, a price past the budget. */
+static void test_l391_ledger_sums_to_the_estimate(void) {
+    const uint64_t prices[] = {1, 7, 16, 17, 1000003, L391_QWEN_ADMITTED, L391_GEMMA_ADMITTED, L391_GEMMA_ADMITTED + 1,
+                               (uint64_t)47 << 30 | 12345};
+    for (uint64_t price : prices)
+        for (uint32_t n = 1; n <= PULSAR_SESSION_POOL_CAP; n++) {
+            TEST_ASSERT(server_bank_charges(kvb(price), n, 0, n) == kvb(price));
+            /* an even split: no two banks differ by more than the remainder's one byte */
+            TEST_ASSERT(server_bank_charge(kvb(price), n, 0).raw() - server_bank_charge(kvb(price), n, n - 1).raw() <= 1);
+            TEST_ASSERT(server_bank_charge(kvb(price), n, n) == kvb(0));   /* no such bank: no charge */
+            for (uint32_t chat = 1; chat <= n; chat++) {
+                char err[320] = "";
+                const KvBytes reserved = server_bank_charges(kvb(price), n, chat, n);
+                TEST_ASSERT(server_ledger_self_check(kvb(price), n, chat, reserved, kvb(price), err, sizeof err));
+            }
+        }
+    TEST_ASSERT(server_bank_charge(kvb(100), 0, 0) == kvb(0));
+
+    char err[320] = "";
+    /* the pre-L391 ledger on Gemma: priced over 3 banks, 2 chat banks charged, the judge's share committed nowhere */
+    TEST_ASSERT(!server_ledger_self_check(kvb(L391_GEMMA_ADMITTED), 3, 2, kvb(0), kvb(L391_GEMMA_BUDGET), err,
+                                          sizeof err));
+    TEST_ASSERT(strstr(err, "with every chat bank live the ledger holds") != NULL);
+    /* a reserve priced over another bank count */
+    TEST_ASSERT(!server_ledger_self_check(kvb(L391_GEMMA_ADMITTED), 3, 2,
+                                          server_bank_charges(kvb(L391_GEMMA_ADMITTED), 2, 1, 2),
+                                          kvb(L391_GEMMA_BUDGET), err, sizeof err));
+    /* a price the budget does not hold */
+    err[0] = 0;
+    TEST_ASSERT(!server_ledger_self_check(kvb(L391_GEMMA_ADMITTED), 3, 2,
+                                          server_bank_charges(kvb(L391_GEMMA_ADMITTED), 3, 2, 3),
+                                          kvb(L391_GEMMA_ADMITTED - 1), err, sizeof err));
+    TEST_ASSERT(strstr(err, "past the budget") != NULL);
+    /* no pool at all: more chat banks than were priced, no chat bank, no price */
+    TEST_ASSERT(!server_ledger_self_check(kvb(L391_GEMMA_ADMITTED), 2, 3, kvb(0), kvb(L391_GEMMA_BUDGET), err, sizeof err));
+    TEST_ASSERT(!server_ledger_self_check(kvb(L391_GEMMA_ADMITTED), 3, 0, kvb(L391_GEMMA_ADMITTED),
+                                          kvb(L391_GEMMA_BUDGET), err, sizeof err));
+    TEST_ASSERT(!server_ledger_self_check(kvb(0), 3, 2, kvb(0), kvb(L391_GEMMA_BUDGET), err, sizeof err));
+
+    /* the server's opener runs it: a pool whose price is past the budget is not opened, and says so */
+    server s;
+    l391_pool_server(&s, 2);
+    err[0] = 0;
+    TEST_ASSERT(!s.ledger_open_pool(kvb(L391_GEMMA_ADMITTED - 1), kvb(L391_GEMMA_ADMITTED), 3, err, sizeof err));
+    TEST_ASSERT(strstr(err, "past the budget") != NULL && s.ledger_priced_banks == 0 && s.kv_budget_bytes == kvb(0));
+    pthread_mutex_destroy(&s.tool_mu);
+    pthread_mutex_destroy(&s.mu);
+}
+
+/* Finding 2: one meaning a field.  Classic mode: the one session's actual cost is the ledger's whole commitment and
+ * no slot carries a charge.  Pool mode: startup commits the banks no chat slot holds (the judge's), a slot carries
+ * its bank's charge from its provision to its eviction, and with every chat bank live the ledger is the estimate. */
+static void test_l391_ledger_two_modes(void) {
+    const uint64_t GiB = 1024ull * 1024ull * 1024ull;
+    server s;
+    /* classic */
+    l391_pool_server(&s, 0);
+    s.ledger_open_classic(kvb(13ull * GiB), kvb(4710ull << 20));
+    TEST_ASSERT(s.kv_committed_bytes == kvb(4710ull << 20) && s.kv_budget_bytes == kvb(13ull * GiB));
+    TEST_ASSERT(s.slots[0].bank_charge_bytes == kvb(0) && s.bank_charge(BankId{0}) == kvb(0));
+    TEST_ASSERT(s.ledger_admitted_bytes == kvb(0) && s.ledger_reserved_bytes == kvb(0));
+    TEST_ASSERT(!s.worker_eviction_could_help(NULL));   /* nothing to evict in classic mode, whatever the ledger */
+
+    /* Qwen: 16 chat banks, no judge -- nothing committed at startup, the estimate with all sixteen live */
+    char err[320] = "";
+    l391_pool_server(&s, 16);
+    const KvBytes qwen_budget = server_kv_budget_bytes(kvb(L391_QWEN_WEIGHTS));
+    TEST_ASSERT(qwen_budget > kvb(36ull * GiB) && qwen_budget < kvb(37ull * GiB));   /* 36.92 GiB */
+    TEST_ASSERT(s.ledger_open_pool(qwen_budget, kvb(L391_QWEN_ADMITTED), 16, err, sizeof err));
+    TEST_ASSERT(s.kv_committed_bytes == kvb(0) && s.ledger_reserved_bytes == kvb(0));
+    for (int b = 0; b < 16; b++) {
+        TEST_ASSERT(s.slots[b].bank_charge_bytes == kvb(0));
+        TEST_ASSERT(s.ledger_admits_bank(BankId{b}));
+        l391_provision(&s, b);
+        TEST_ASSERT(s.slots[b].bank_charge_bytes == s.bank_charge(BankId{b}));
+    }
+    TEST_ASSERT(s.kv_committed_bytes == kvb(L391_QWEN_ADMITTED));
+    /* an eviction releases exactly the slot's charge, and the hole's provision takes it again */
+    pthread_mutex_lock(&s.mu);
+    TEST_ASSERT(s.ledger_release_bank(&s.slots[5]) == s.bank_charge(BankId{5}));
+    pthread_mutex_unlock(&s.mu);
+    TEST_ASSERT(s.slots[5].bank_charge_bytes == kvb(0));
+    TEST_ASSERT(s.kv_committed_bytes == kvb(L391_QWEN_ADMITTED) - s.bank_charge(BankId{5}));
+    TEST_ASSERT(s.ledger_admits_bank(BankId{5}));
+    l391_provision(&s, 5);
+    TEST_ASSERT(s.kv_committed_bytes == kvb(L391_QWEN_ADMITTED));
+
+    /* Gemma: 2 chat banks + the judge's.  Before L391 the two chat banks' charges were all the ledger ever held
+     * (two thirds of the estimate); now the judge's share is committed at startup. */
+    l391_pool_server(&s, 2);
+    TEST_ASSERT(s.ledger_open_pool(kvb(L391_GEMMA_BUDGET), kvb(L391_GEMMA_ADMITTED), 3, err, sizeof err));
+    TEST_ASSERT(s.ledger_reserved_bytes == s.bank_charge(BankId{2}) && s.kv_committed_bytes == s.ledger_reserved_bytes);
+    TEST_ASSERT(s.ledger_reserved_bytes > kvb(0));
+    for (int b = 0; b < 2; b++) {
+        TEST_ASSERT(s.ledger_admits_bank(BankId{b}));
+        l391_provision(&s, b);
+    }
+    TEST_ASSERT(s.kv_committed_bytes == kvb(L391_GEMMA_ADMITTED));
+    TEST_ASSERT(s.kv_committed_bytes ==
+                s.ledger_reserved_bytes + s.slots[0].bank_charge_bytes + s.slots[1].bank_charge_bytes);
+    pthread_mutex_destroy(&s.tool_mu);
+    pthread_mutex_destroy(&s.mu);
+}
+
+/* Finding 1: provision_bank asks the ledger.  (a) On the two production shapes every provision the pool can make is
+ * admitted, in any order of provisions and evictions -- the self-check's guarantee, walked.  (b) A ledger out of
+ * step with its price (the budget lowered under an open pool) refuses the provision by name, before the floor and
+ * before anything is installed; the refusal is counted as `ledger_full`; an eviction relieves it (it releases a
+ * charge), and the precheck says so.  No session here: a provision the ledger and the floor admit goes on to the
+ * bank install, which a host-only server refuses (create_fail) -- so "not ledger_full" is what is asserted. */
+static void test_l391_provision_consults_the_ledger(void) {
+    struct { int chat; uint32_t priced; uint64_t admitted; KvBytes budget; } shapes[] = {
+        {16, 16, L391_QWEN_ADMITTED, server_kv_budget_bytes(kvb(L391_QWEN_WEIGHTS))},
+        {2, 3, L391_GEMMA_ADMITTED, kvb(L391_GEMMA_BUDGET)},
+    };
+    server s;
+    char err[320] = "";
+    for (const auto &sh : shapes) {
+        l391_pool_server(&s, sh.chat);
+        TEST_ASSERT(s.ledger_open_pool(sh.budget, kvb(sh.admitted), sh.priced, err, sizeof err));
+        /* a churn of provisions and evictions: every bank the pool can hand out is admitted */
+        uint32_t x = 12345;
+        for (int step = 0; step < 4000; step++) {
+            x = x * 1664525u + 1013904223u;
+            const int b = (int)((x >> 8) % (uint32_t)sh.chat);
+            if (!s.slots[b].provisioned) {
+                TEST_ASSERT(s.ledger_admits_bank(BankId{b}));
+                l391_provision(&s, b);
+            } else {
+                pthread_mutex_lock(&s.mu);
+                (void)s.ledger_release_bank(&s.slots[b]);
+                pthread_mutex_unlock(&s.mu);
+                s.slots[b].provisioned = false;
+            }
+            TEST_ASSERT(s.kv_committed_bytes <= kvb(sh.admitted) && s.kv_committed_bytes <= s.kv_budget_bytes);
+        }
+        /* and the real function: the first bank of an empty pool is never the ledger's to refuse */
+        for (int b = 0; b < sh.chat; b++) {
+            if (!s.slots[b].provisioned) continue;
+            pthread_mutex_lock(&s.mu);
+            (void)s.ledger_release_bank(&s.slots[b]);
+            pthread_mutex_unlock(&s.mu);
+            s.slots[b].provisioned = false;
+        }
+        TEST_ASSERT(s.kv_committed_bytes == s.ledger_reserved_bytes);
+        provision_refusal refusal = PROVISION_OK;
+        TEST_ASSERT(s.provision_bank(&refusal) == NULL && refusal == PROVISION_REFUSED_CREATE_FAIL);
+        TEST_ASSERT(s.kv_committed_bytes == s.ledger_reserved_bytes);   /* a provision that failed commits nothing */
+        pthread_mutex_destroy(&s.tool_mu);
+        pthread_mutex_destroy(&s.mu);
+    }
+
+    /* (b) Gemma's pool with bank 0 live and the budget one byte short of bank 1's charge */
+    l391_pool_server(&s, 2);
+    TEST_ASSERT(s.ledger_open_pool(kvb(L391_GEMMA_BUDGET), kvb(L391_GEMMA_ADMITTED), 3, err, sizeof err));
+    l391_provision(&s, 0);
+    s.kv_budget_bytes = s.kv_committed_bytes + s.bank_charge(BankId{1}) - kvb(1);
+    provision_refusal refusal = PROVISION_OK;
+    TEST_ASSERT(s.provision_bank(&refusal) == NULL && refusal == PROVISION_REFUSED_ADMISSION);
+    TEST_ASSERT(!s.slots[1].provisioned && s.slots[1].bank_charge_bytes == kvb(0));
+    job j;
+    memset(&j, 0, sizeof j);
+    s.note_provision_refusal(&j, refusal);
+    TEST_ASSERT(s.m_refusals[PROVISION_REFUSED_ADMISSION] == 1 && s.m_queue_block_reason == PROVISION_REFUSED_ADMISSION + 1);
+    TEST_ASSERT(!strcmp(refusal_names[PROVISION_REFUSED_ADMISSION], "ledger_full"));
+    /* relief is an eviction: the idle bank's charge comes back, and the precheck knows it would */
+    TEST_ASSERT(server_refusal_evictable(refusal, true) && s.worker_eviction_could_help(NULL));
+    bool protect[PULSAR_SESSION_POOL_CAP] = {true};
+    TEST_ASSERT(!s.worker_eviction_could_help(protect));   /* ... but not when the only idle bank is protected */
+    pthread_mutex_lock(&s.mu);
+    (void)s.ledger_release_bank(&s.slots[0]);
+    pthread_mutex_unlock(&s.mu);
+    s.slots[0].provisioned = false;
+    refusal = PROVISION_OK;
+    TEST_ASSERT(s.provision_bank(&refusal) == NULL && refusal == PROVISION_REFUSED_CREATE_FAIL);   /* past the ledger */
+    /* the exact budget admits: the boundary is server_kv_admits' */
+    l391_provision(&s, 0);
+    s.kv_budget_bytes = s.kv_committed_bytes + s.bank_charge(BankId{1});
+    TEST_ASSERT(s.ledger_admits_bank(BankId{1}));
+    pthread_mutex_destroy(&s.tool_mu);
+    pthread_mutex_destroy(&s.mu);
+}
+
+/* Finding 1, the other half: what a bank GROWS by is priced by the ledger's share inside the touched budget
+ * (server_guard_touched_budget's budget - eager term), per prompt, and a spill relieves it -- a spill frees a bank's
+ * KV, never its ledger charge.  Qwen's production numbers: the share is 36.92 - 15.33 = 21.59 GiB and binds (the
+ * post-warmup MemAvailable term is 28.39).  The sequences admitted before L391 are admitted still: nothing here
+ * changed. */
+static void test_l391_ledger_share_prices_growth(void) {
+    const uint64_t GiB = 1024ull * 1024ull * 1024ull, MiB = 1024ull * 1024ull;
+    const KvBytes budget = server_kv_budget_bytes(kvb(L391_QWEN_WEIGHTS));
+    const KvBytes floor = kvb(4538ull * MiB);
+    const KvBytes share = budget - kvb(L391_QWEN_ADMITTED);
+    /* the ledger's share is the bound while memory has more than it free */
+    TEST_ASSERT(server_guard_touched_budget(budget, kvb(L391_QWEN_ADMITTED), kvb(0), kvb(28ull * GiB) + floor, floor) ==
+                share);
+    TEST_ASSERT(share > kvb(21ull * GiB) && share < kvb(22ull * GiB));
+    int n_spill = 0;
+    /* a 200k-token prompt on a fresh bank beside 6 GiB resident: fits, as before */
+    const KvBytes p200k = kvb(13440ull * 200000ull);
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(6ull * GiB), p200k, share, NULL, 0, false, &n_spill) == PROMPT_KV_FITS);
+    /* a full 1M bank (13.125 GiB) beside 8 GiB: fits; beside 9 GiB with a 3 GiB idle bank: one spill makes room */
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(8ull * GiB), kvb(L391_QWEN_BANK_KV), share, NULL, 0, false, &n_spill) ==
+                PROMPT_KV_FITS);
+    const KvBytes drop[2] = {kvb(3ull * GiB), kvb(6ull * GiB)};
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(9ull * GiB), kvb(L391_QWEN_BANK_KV), share, drop, 2, false, &n_spill) ==
+                PROMPT_KV_SPILL && n_spill == 1);
+    /* nothing to spill: it waits for a busy bank, or is refused -- never run past the ledger's share */
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(9ull * GiB), kvb(L391_QWEN_BANK_KV), share, NULL, 0, true, &n_spill) ==
+                PROMPT_KV_WAIT);
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(9ull * GiB), kvb(L391_QWEN_BANK_KV), share, NULL, 0, false, &n_spill) ==
+                PROMPT_KV_REFUSE);
+    /* a spill leaves the ledger's charges alone */
+    server s;
+    char err[320] = "";
+    l391_pool_server(&s, 16);
+    TEST_ASSERT(s.ledger_open_pool(budget, kvb(L391_QWEN_ADMITTED), 16, err, sizeof err));
+    l391_provision(&s, 0);
+    const KvBytes before = s.kv_committed_bytes;
+    s.slots[0].spilled = true;
+    TEST_ASSERT(s.kv_committed_bytes == before && s.slots[0].bank_charge_bytes == s.bank_charge(BankId{0}));
+    pthread_mutex_destroy(&s.tool_mu);
+    pthread_mutex_destroy(&s.mu);
+}
+
+/* Finding 3: what a provision asks of free memory is demand-paged bytes -- never the bank's ledger charge, a share
+ * of memory the create already made resident.  With the touched-KV guard running a fresh bank's provision pages in
+ * nothing no later guard prices; without it, the bank's whole context-scaled KV. */
+static void test_l391_provision_demand_is_demand_paged(void) {
+    const uint64_t MiB = 1024ull * 1024ull, F = 4538ull * MiB;
+    TEST_ASSERT(server_bank_provision_demand(true, kvb(L391_QWEN_BANK_KV)) == kvb(0));
+    TEST_ASSERT(server_bank_provision_demand(false, kvb(L391_QWEN_BANK_KV)) == kvb(L391_QWEN_BANK_KV));
+    TEST_ASSERT(server_bank_provision_demand(false, kvb(L391_GEMMA_BANK_KV)) == kvb(L391_GEMMA_BANK_KV));
+    /* Qwen, guarded.  Before L391 the second bank needed the floor + its 0.96 GiB ledger charge free; half a GiB
+     * over the floor was refused though the charge was resident already.  Now the floor alone decides. */
+    const KvBytes charge = server_bank_charge(kvb(L391_QWEN_ADMITTED), 16, 1);
+    TEST_ASSERT(charge > kvb(512ull * MiB));
+    const KvBytes guarded = server_bank_provision_demand(true, kvb(L391_QWEN_BANK_KV));
+    TEST_ASSERT(server_bank_floor_refuses(1, false, test_mem_unified(F + 512ull * MiB, F), charge));     /* was */
+    TEST_ASSERT(!server_bank_floor_refuses(1, false, test_mem_unified(F + 512ull * MiB, F), guarded));   /* is */
+    TEST_ASSERT(!server_bank_floor_refuses(1, false, test_mem_unified(F, F), guarded));
+    TEST_ASSERT(server_bank_floor_refuses(1, false, test_mem_unified(F - 1, F), guarded));   /* under the floor */
+    TEST_ASSERT(server_bank_floor_refuses(1, false, test_mem_unified(0, F), guarded));       /* unreadable: closed */
+    /* unguarded (PULSAR_OVERCOMMIT=0): the bank's whole KV must fit over the floor */
+    const KvBytes whole = server_bank_provision_demand(false, kvb(L391_QWEN_BANK_KV));
+    TEST_ASSERT(server_bank_floor_refuses(1, false, test_mem_unified(F + L391_QWEN_BANK_KV - 1, F), whole));
+    TEST_ASSERT(!server_bank_floor_refuses(1, false, test_mem_unified(F + L391_QWEN_BANK_KV, F), whole));
+    /* a host-only server reads unified memory: one reading for the KV and the host, the memory floor for both */
+    server s;
+    l391_pool_server(&s, 2);
+    const server_mem_reading m = s.mem_reading();
+    TEST_ASSERT(!m.discrete && m.kv_avail == m.host_avail && m.kv_floor == server_mem_floor() &&
+                m.host_floor == server_mem_floor());
+    pthread_mutex_destroy(&s.tool_mu);
+    pthread_mutex_destroy(&s.mu);
+}
+
+/* L391, the discrete card (the RTX 6000: KV in 24 GB of device memory, the process in a 32 GiB container).  A KV
+ * need is read against the DEVICE; the host must only be at its own floor.  Before, provision_bank and the three
+ * per-chunk prefill checks compared the KV need with the host's MemAvailable: a low host refused a chunk the device
+ * had room for, and a full device was never seen. */
+static void test_l391_discrete_reads_the_device(void) {
+    const uint64_t MiB = 1024ull * 1024ull, GiB = 1024ull * MiB;
+    const uint64_t HF = 4538ull * MiB;                                  /* the host's memory floor */
+    const uint64_t DF = PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES;       /* the device's */
+    const KvBytes chunk = kvb(4096ull * 20480ull);                      /* one 4096-token chunk of Gemma KV: 80 MiB */
+    /* host MemAvailable low -- over its floor by less than the chunk -- and the device roomy: admitted */
+    const server_mem_reading host_low = test_mem_discrete(2ull * GiB, DF, HF + 1ull * MiB, HF);
+    TEST_ASSERT(server_kv_headroom_admits(host_low, chunk));
+    TEST_ASSERT(server_prefill_mem_step(host_low, chunk, 1, true) == PREFILL_MEM_GO);
+    TEST_ASSERT(!server_headroom_admits(host_low.host_avail, chunk, host_low.host_floor));   /* the old test: refused */
+    /* the device full and the host roomy: an idle bank is spilled, else a decoder preempted, else refused */
+    const server_mem_reading dev_full = test_mem_discrete(DF + chunk.raw() - 1, DF, 20ull * GiB, HF);
+    TEST_ASSERT(!server_kv_headroom_admits(dev_full, chunk));
+    TEST_ASSERT(server_prefill_mem_step(dev_full, chunk, 1, true) == PREFILL_MEM_SPILL);
+    TEST_ASSERT(server_prefill_mem_step(dev_full, chunk, 0, true) == PREFILL_MEM_PREEMPT);
+    TEST_ASSERT(server_prefill_mem_step(dev_full, chunk, 0, false) == PREFILL_MEM_REFUSE);
+    TEST_ASSERT(server_headroom_admits(dev_full.host_avail, chunk, dev_full.host_floor));    /* the old test: admitted */
+    TEST_ASSERT(server_kv_headroom_admits(test_mem_discrete(DF + chunk.raw(), DF, 20ull * GiB, HF), chunk));
+    /* the host under its own floor refuses whatever the device holds; an unreadable reading of either fails closed */
+    TEST_ASSERT(!server_kv_headroom_admits(test_mem_discrete(8ull * GiB, DF, HF - 1, HF), chunk));
+    TEST_ASSERT(!server_kv_headroom_admits(test_mem_discrete(0, DF, 20ull * GiB, HF), chunk));
+    TEST_ASSERT(!server_kv_headroom_admits(test_mem_discrete(8ull * GiB, DF, 0, HF), chunk));
+    /* a provision.  Guarded (production): it pages in nothing, so the device is not asked -- the prompt's growth
+     * is the touched budget's, read against the device (server_guard_avail_bytes) -- and the host floor stands. */
+    const KvBytes guarded = server_bank_provision_demand(true, kvb(L391_GEMMA_BANK_KV));
+    TEST_ASSERT(!server_bank_floor_refuses(1, false, test_mem_discrete(DF - 1, DF, 20ull * GiB, HF), guarded));
+    TEST_ASSERT(server_bank_floor_refuses(1, false, test_mem_discrete(8ull * GiB, DF, HF - 1, HF), guarded));
+    /* unguarded: the bank's whole KV against the device, not the host */
+    const KvBytes whole = server_bank_provision_demand(false, kvb(L391_GEMMA_BANK_KV));
+    TEST_ASSERT(server_bank_floor_refuses(1, false, test_mem_discrete(2ull * GiB, DF, 20ull * GiB, HF), whole));
+    TEST_ASSERT(!server_bank_floor_refuses(1, false, test_mem_discrete(DF + L391_GEMMA_BANK_KV, DF, HF, HF), whole));
+    /* unified memory is one reading: the same test as before L391 */
+    TEST_ASSERT(server_kv_headroom_admits(test_mem_unified(HF + chunk.raw(), HF), chunk));
+    TEST_ASSERT(!server_kv_headroom_admits(test_mem_unified(HF + chunk.raw() - 1, HF), chunk));
+    /* a server on a discrete card reads the device for the KV */
+    server s;
+    l391_pool_server(&s, 2);
+    s.guard_discrete = true;
+    const server_mem_reading m = s.mem_reading();
+    TEST_ASSERT(m.discrete && m.kv_floor == kvb(DF) && m.host_floor == server_mem_floor());
+    pthread_mutex_destroy(&s.tool_mu);
+    pthread_mutex_destroy(&s.mu);
 }
 
 /* 2026-09-29 -- which free bank provision_bank takes: the most resident pages,
@@ -18804,7 +19169,7 @@ static void test_l179_evict_reset_leaves_a_reusable_hole(void) {
     sl.gen = &fake_gen;
     sl.state = SLOT_DECODING;
     sl.ctx_size = 131072;
-    sl.est_cost_bytes = kvb(9ull << 30);
+    sl.bank_charge_bytes = kvb(9ull << 30);
     sl.tokens_emitted = 777;
     sl.prefill_counted = 4000;
     sl.last_serviced_us = 123456789ull;
@@ -18815,7 +19180,7 @@ static void test_l179_evict_reset_leaves_a_reusable_hole(void) {
     TEST_ASSERT(sl.active_job == NULL);
     TEST_ASSERT(sl.state == SLOT_EVICTED);
     TEST_ASSERT(sl.ctx_size == 0);
-    TEST_ASSERT(sl.est_cost_bytes == kvb(0));
+    TEST_ASSERT(sl.bank_charge_bytes == kvb(9ull << 30));   /* L391: the ledger's to release (ledger_release_bank) */
     TEST_ASSERT(sl.tokens_emitted == 0);
     TEST_ASSERT(sl.prefill_counted == 0);
     TEST_ASSERT(sl.last_serviced_us == 0);
@@ -19764,8 +20129,8 @@ static void test_mem_floor_is_derived_from_the_watermarks(void) {
     TEST_ASSERT(server_mem_floor_init(kvb(zone), kvb(step)) == kvb(PULSAR_SERVER_MEM_FLOOR_BYTES + zone + step));
     TEST_ASSERT(server_mem_floor() == kvb(PULSAR_SERVER_MEM_FLOOR_BYTES + zone + step));
     const uint64_t F = server_mem_floor().raw();
-    TEST_ASSERT(server_mem_floor_admits(kvb(F + 10 * MiB), kvb(10 * MiB)));
-    TEST_ASSERT(!server_mem_floor_admits(kvb(F + 10 * MiB - 1), kvb(10 * MiB)));
+    TEST_ASSERT(server_headroom_admits(kvb(F + 10 * MiB), kvb(10 * MiB), server_mem_floor()));
+    TEST_ASSERT(!server_headroom_admits(kvb(F + 10 * MiB - 1), kvb(10 * MiB), server_mem_floor()));
     /* the guard's ceiling keeps the derived floor free */
     TEST_ASSERT(server_guard_touched_budget(kvb(64ull << 30), kvb(0), kvb(0), kvb(F + 3 * MiB), server_mem_floor()) == kvb(3 * MiB));
     TEST_ASSERT(server_guard_touched_budget(kvb(64ull << 30), kvb(0), kvb(0), kvb(F), server_mem_floor()) == KvBytes{});
@@ -20287,19 +20652,19 @@ static void test_l347_i3b_failure_rules(void) {
  * headroom leg's single conversation: one bank, nothing to spill, the 503 is right). */
 static void test_prefill_mem_step_tries_remedies_first(void) {
     const uint64_t MiB = 1024ull * 1024ull, F = 4538ull * MiB, need = 52ull * MiB;
-    TEST_ASSERT(server_prefill_mem_step(kvb(F + need), kvb(need), kvb(F), 0, false) == PREFILL_MEM_GO);
-    TEST_ASSERT(server_prefill_mem_step(kvb(F + need), kvb(need), kvb(F), 3,
+    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(F + need, F), kvb(need), 0, false) == PREFILL_MEM_GO);
+    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(F + need, F), kvb(need), 3,
                                         true) == PREFILL_MEM_GO);     /* room: no remedy */
-    TEST_ASSERT(server_prefill_mem_step(kvb(F + need - 1), kvb(need), kvb(F), 3, true) == PREFILL_MEM_SPILL);
-    TEST_ASSERT(server_prefill_mem_step(kvb(F), kvb(need), kvb(F), 1,
+    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(F + need - 1, F), kvb(need), 3, true) == PREFILL_MEM_SPILL);
+    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(F, F), kvb(need), 1,
                                         false) == PREFILL_MEM_SPILL);       /* an idle bank first */
-    TEST_ASSERT(server_prefill_mem_step(kvb(F), kvb(need), kvb(F), 0,
+    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(F, F), kvb(need), 0,
                                         true) == PREFILL_MEM_PREEMPT);      /* then a decoder */
-    TEST_ASSERT(server_prefill_mem_step(kvb(F), kvb(need), kvb(F), 0,
+    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(F, F), kvb(need), 0,
                                         false) == PREFILL_MEM_REFUSE);      /* nothing to free */
-    TEST_ASSERT(server_prefill_mem_step(kvb(0), kvb(need), kvb(F), 0,
+    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(0, F), kvb(need), 0,
                                         false) == PREFILL_MEM_REFUSE);      /* unreadable: closed */
-    TEST_ASSERT(server_prefill_mem_step(kvb(0), kvb(need), kvb(F), 2,
+    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(0, F), kvb(need), 2,
                                         false) == PREFILL_MEM_SPILL);       /* ... but freeing helps */
     TEST_ASSERT(!strcmp(prefill_mem_step_names[PREFILL_MEM_REFUSE], "refuse"));
 }
@@ -21274,6 +21639,12 @@ static void pulsar_server_unit_tests_run(void) {
     test_l282_done_slot_is_released();
     test_l284_schema_lines_openai_tools();
     test_l179_bank_floor_exempts_first_bank();
+    test_l391_ledger_sums_to_the_estimate();
+    test_l391_ledger_two_modes();
+    test_l391_provision_consults_the_ledger();
+    test_l391_ledger_share_prices_growth();
+    test_l391_provision_demand_is_demand_paged();
+    test_l391_discrete_reads_the_device();
     test_bank_pick_prefers_resident_hole();
     test_refusal_evictable();
     test_l179_park_live_bank_only_when_not_in_quantum();

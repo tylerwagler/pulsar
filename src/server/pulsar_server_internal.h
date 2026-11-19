@@ -2365,9 +2365,10 @@ static inline KvBytes server_discrete_working_set_bytes(KvBytes free_before_crea
  * Two guards use it:
  *   - server_kv_budget_bytes subtracts it from the admission budget, so the
  *     ledger can never legally commit the machine to zero free;
- *   - server_mem_floor_admits: provision_slot (and the eviction precheck)
- *     additionally refuse to create a session unless
- *     MemAvailable >= estimated cost + this floor.
+ *   - server_kv_headroom_admits (reading >= need + floor): a fresh bank's
+ *     provision asks it of the bytes the provision can demand-page
+ *     (server_bank_provision_demand, L391) and each prefill chunk of its new
+ *     KV, in the memory they occupy (server_mem_reading).
  * The MemAvailable read is a coarse belt-and-suspenders guard: driver 610's
  * UVM accounting lags MemAvailable (and under UVM pressure MemTotal itself
  * SHRINKS — the incident box reported MemTotal 866 MiB — so percentage-based
@@ -2378,6 +2379,27 @@ static inline KvBytes server_discrete_working_set_bytes(KvBytes free_before_crea
  * attempt, never on a hot path. */
 /// The default MemAvailable floor (kernel breathing room), bytes.
 #define PULSAR_SERVER_MEM_FLOOR_BYTES        (4ull * 1024ull * 1024ull * 1024ull)
+
+/** L391: the free-memory readings a headroom check compares a need with, each beside its own floor.  KV bytes are
+ *  device memory on a discrete card and unified memory on the GB10, and both are KvBytes: a KV need tested against
+ *  the host's MemAvailable on a discrete card (as provision_bank and the per-chunk prefill checks did) reads the
+ *  wrong memory and the type cannot say so.  So the reading and its floor travel together, named by what they
+ *  measure, and a need is tested only through server_kv_headroom_admits.
+ *    kv_*    the memory the KV occupies: the device's free memory over PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES on a
+ *            discrete card, MemAvailable over the memory floor on unified memory (server_guard_avail_bytes /
+ *            server_guard_floor -- the guard's own pair).
+ *    host_*  the host's MemAvailable over the memory floor: the persists, the pinned staging and everything else
+ *            the process takes from RAM.  On unified memory it is the same reading as kv_*.
+ *  Nothing host-side grows with a prefill chunk on a discrete card: the grid checkpoints' pinned slabs and the disk
+ *  cache's RAM tier are allocated once (pulsar_ckpt_alloc, kv_cache_open), and a persist asks the host floor for its
+ *  own bytes where it runs (kv_cache.cpp).  So a chunk's host need is zero: the host must only be at its floor. */
+typedef struct server_mem_reading {
+    bool    discrete;    ///< the KV is a discrete card's (the two pairs are different memories)
+    KvBytes kv_avail;    ///< free memory where the KV lives (0 = unreadable)
+    KvBytes kv_floor;    ///< the floor that reading keeps
+    KvBytes host_avail;  ///< the host's MemAvailable (0 = unreadable)
+    KvBytes host_floor;  ///< the memory floor (server_mem_floor)
+} server_mem_reading;
 
 /// A slot's lifecycle state (session_slot::state).
 typedef enum {
@@ -2424,11 +2446,11 @@ typedef struct session_slot {
     gen_state   *gen;  ///< resumable state for active_job
     slot_state   state;  ///< lifecycle state; SLOT_EVICTED marks a reusable hole
     int          ctx_size;  ///< context this slot was admitted for
-    /** The slot's charge to the session-cost ledger (server::kv_committed_bytes), released on eviction.  Two
-     *  meanings by mode: classic (no pool) -- slot 0's FULL session cost, the actual the create allocated (the
-     *  priced estimate only gates admission before the create); pool mode -- one bank's even-split marginal
-     *  (server::bank_marginal_bytes), charged at provision_bank. */
-    KvBytes      est_cost_bytes;
+    /** Pool mode: this bank's charge to the session-cost ledger (server::bank_charge of its bank), committed by
+     *  provision_bank (server::ledger_commit_bank) and released on eviction; zero while the slot is a hole.  L391:
+     *  ONE meaning.  Classic mode (no pool) keeps nothing here: its one session's cost is the ledger's whole
+     *  commitment (server::ledger_open_classic), and no slot is ever provisioned or evicted there. */
+    KvBytes      bank_charge_bytes;
     uint64_t     tokens_emitted;  ///< decode bookkeeping for the scheduler
     /** L114 counter watermark: session position up to which computed prefill
      * rows have been ticked into w_prefill_chunk_tokens. Advanced by BOTH the
@@ -2520,8 +2542,13 @@ typedef enum {
     PROVISION_OK = 0,
     /// no free slot entry; eviction helps
     PROVISION_REFUSED_POOL_FULL,   /* no free slot entry — eviction helps */
-    /// the ledger is full; eviction helps
-    PROVISION_REFUSED_ADMISSION,   /* ledger full — eviction helps */
+    /// the session-cost ledger does not admit the bank's charge; eviction helps (it releases a charge)
+    PROVISION_REFUSED_ADMISSION,   /* ledger full — eviction helps.  L391:
+                                      provision_bank asks the ledger; on a pool
+                                      whose startup self-check passed
+                                      (server_ledger_self_check) every chat bank
+                                      fits, so this is the ledger out of step
+                                      with its price, refused rather than run */
     /// MemAvailable is under the floor (or unreadable); eviction helps in pool mode only
     PROVISION_REFUSED_MEM_FLOOR,   /* machine physically tight (incl. an
                                       unreadable /proc/meminfo, fail closed) —
@@ -2789,9 +2816,15 @@ struct server {
      * uniform eviction of slot 0 zeroed it, silently poisoning every later
      * provision with ctx 0 (banks the router then skipped forever). */
     int          pool_ctx_size;
-    /** Tier-2: per-bank ledger charge in pooled mode (even split of the admitted pool cost,
-     *  server_session_price::per_bank_charge; conservative, demand-paged reality is smaller). 0 in classic mode. */
-    KvBytes      bank_marginal_bytes;
+    /** L391: the pool's ledger price (server::ledger_open_pool; all zero in classic mode).  `ledger_admitted_bytes`
+     *  is what startup admission charged for the whole pool (server_session_price::admission of the session's bank
+     *  count: every bank's share of it is resident from the create, the judge's included); `ledger_priced_banks`
+     *  the bank count it was priced over -- the divisor of server_bank_charge; `ledger_reserved_bytes` the charges
+     *  of the banks no chat slot holds (the judge's bank, any past the slot cap), committed at startup and never
+     *  released.  With every chat bank provisioned kv_committed_bytes == ledger_admitted_bytes, to the byte. */
+    KvBytes      ledger_admitted_bytes;
+    uint32_t     ledger_priced_banks;   ///< see ledger_admitted_bytes
+    KvBytes      ledger_reserved_bytes; ///< see ledger_admitted_bytes
     KvBytes      kv_budget_bytes;  ///< admission ceiling computed at startup
     /** Context-scaled KV one bank holds at the configured context — the
      *  compressed rows plus their index. Demand-paged under overcommit, so it is
@@ -2799,7 +2832,10 @@ struct server {
      *  budget by it is the only way to answer "how many tokens of KV does this
      *  box actually hold", which the configured slot count does not answer. */
     KvBytes      kv_bank_bytes;
-    KvBytes      kv_committed_bytes;  ///< sum of est_cost_bytes over live slots (under mu)
+    /** The session-cost ledger's committed bytes (under mu).  Pool mode: ledger_reserved_bytes plus the
+     *  bank_charge_bytes of every provisioned slot.  Classic mode: the one session's cost, the actual the create
+     *  allocated (ledger_open_classic). */
+    KvBytes      kv_committed_bytes;
     /** Tier-2 task #55 increment 2b — proactive-eviction guard. `guard_enabled`
      * gates the whole mechanism (on iff overcommit sized N>1 banks and the disk
      * KV cache is open: a spill persists to it, L264). `guard_touched_budget` is the resident-KV ceiling the guard keeps
@@ -2813,7 +2849,9 @@ struct server {
     KvBytes      guard_eager_bytes;      ///< eager floor already resident
     KvBytes      guard_avail;            ///< the headroom reading the live budget last used (server_guard_avail_bytes)
     KvBytes      guard_floor;            ///< the floor that reading must stay above (server_guard_floor)
-    bool         guard_discrete;         ///< L338: the KV is a discrete card's: the readings are the device's
+    /** L338: the KV is a discrete card's: its readings are the device's.  L391: set whether or not the guard runs
+     *  -- every headroom check reads the memory the bytes occupy through it (server::mem_reading). */
+    bool         guard_discrete;
     double       guard_avail_at;         ///< when it was read (server_now_sec); re-read at most every 0.25 s
     KvBytes      guard_budget_said;      ///< the live budget last logged (a move of 0.5 GiB or more is said)
     /** L357: the ledger budget set at run time by the test route POST /test/guard-budget (0 = none: guard_kv_budget
@@ -2844,6 +2882,7 @@ struct server {
     bool         watchdog_quit;          ///< __atomic: ends the watchdog
     uint64_t     guard_evictions;        ///< spills performed, for metrics
     warn_limiter mem_floor_warn;         ///< the per-request MemAvailable-floor refusal line, rate-limited (L190 C1)
+    warn_limiter ledger_full_warn;       ///< L391: provision_bank's ledger refusal line, rate-limited the same way
     /** Trivial-match threshold for the choose-vs-provision routing decision:
      * template-header tokens measured at startup +
      * PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS (cli_main.cpp; immutable after
@@ -3514,14 +3553,16 @@ struct server {
      *  unset) leaves them; otherwise each binding the request did not continue is cleared. */
     /// @param sl the slot whose job this is (its gen_state)
     void live_bindings_settle(session_slot *sl);
-    /** 2026-10-29: may this prefill quantum start?  MemAvailable must cover one chunk's new KV over the floor; short
+    /** 2026-10-29: may this prefill quantum start?  Free memory, read where the KV lives (L391, mem_reading:
+     *  MemAvailable on unified memory, the device beside the host's own floor on a discrete card), must cover one
+     *  chunk's new KV over the floor; short
      *  of it the guard's remedies run first (spill an idle bank, preempt the newest decoder: server_prefill_mem_step).
      *  false = the request was refused (503) and its gen is done -- the bank keeps what it prefilled. */
     /// @param sl the slot whose job this is (its gen_state; its bank installed by the caller unless said)
     /// @return true when the quantum may start; false = refused (503 sent, gen done)
     bool prefill_headroom_ok(session_slot *sl);
-    /** L372 (O12): the per-chunk memory floor for a prefill that is no slot's -- the judge's.  MemAvailable must cover
-     *  `rows` new KV rows over the floor (prefill_headroom_ok's rule, server_prefill_mem_step); short of it the idle
+    /** L372 (O12): the per-chunk memory floor for a prefill that is no slot's -- the judge's.  Free memory (L391,
+     *  mem_reading) must cover `rows` new KV rows over the floor (prefill_headroom_ok's rule, server_prefill_mem_step); short of it the idle
      *  chat banks are spilled, least recently used first, until it does.  No decoder is preempted for it. */
     /// @param rows       the chunk's rows
     /// @param err        receives the refusal (the numbers, and how many banks were spilled)
@@ -3541,7 +3582,7 @@ struct server {
     /** The fused / mixed lanes' form: no remedy (banks would move under the step being assembled) and no refusal --
      *  short of the floor the prompt leaves the fused lane (gen->no_fuse) and its classic quantum decides. */
     /// @param sl the slot whose job this is (its gen_state; its bank installed by the caller unless said)
-    /// @return true when MemAvailable covers a chunk over the floor; false sets gen->no_fuse
+    /// @return true when free memory (mem_reading) covers a chunk over the floor; false sets gen->no_fuse
     bool prefill_headroom_fused_ok(session_slot *sl);
     /** One prefill chunk's new KV on one bank (the per-chunk re-check's need). */
     /// @return bytes one prefill chunk (the session's prefill cap in rows) grows a bank by
@@ -4032,14 +4073,13 @@ struct server {
      * If even reclaiming EVERY unprotected idle slot leaves admission refusing,
      * skip eviction entirely — the head is genuinely waiting for a busy slot to
      * free, and evicting warm idle sessions would only churn snapshots. (Host
-     * arithmetic only: pulsar_engine_session_cost_bytes is the same sizing code the
-     * allocator uses, no CUDA work; runs only on failed bind attempts. Guard #1
-     * is the provisioning-refusal reason check in worker_try_bind.)
+     * arithmetic over the ledger only; runs only on failed bind attempts. Guard #1
+     * is the provisioning-refusal reason check in worker_try_bind.)  Classic mode
+     * has nothing to evict: always false.
      */
-    /// @param j        the head job
     /// @param protect  per slot index: slots that must not be evicted
-    /// @return true when evicting the unprotected idle slots could admit it
-    bool worker_eviction_could_help(const job *j, const bool *protect);
+    /// @return true when evicting the unprotected idle slots could admit a bank's provision
+    bool worker_eviction_could_help(const bool *protect);
     /** L379: the victim classes of every slot, the facts both victim orders rank by (server_victim_rank): the
      *  make-room eviction's (server_evict_pick_victim) and the guard's spill order (guard_pick_victim). */
     /// @param dominated  receives, per slot index: dominated (dominated_slots) or a dead prefix (hint_dead)
@@ -4181,16 +4221,55 @@ struct server {
     /** Provision a bank in the shared pool (Tier-2). No GPU allocation happens here:
      * the whole n-bank pool was allocated and admitted ONCE at startup, so this is
      * pure host bookkeeping — find a free bank slot, install it, reset it to an
-     * empty conversation (so gen_begin sees pos 0 / no stale prefix), and charge
-     * the even-split per-bank marginal to the ledger. The only runtime pressure is
-     * the demand-paged comp/index pages a bank touches as it fills; the belt-and-
-     * suspenders MemAvailable floor still guards each provision. Returns NULL with
-     * *refusal set on a full pool or a tight box (never on a create/admission
-     * failure — there is no runtime create).
+     * empty conversation (so gen_begin sees pos 0 / no stale prefix), and commit
+     * the bank's charge to the ledger. The guards, in order (L391; docs/SERVER.md,
+     * "Memory admission"): a free bank (pool_full); the session-cost ledger admits
+     * the bank's charge (ledger_full, ledger_admits_bank); the memory floor holds
+     * for the bytes the provision can demand-page (mem_floor,
+     * server_bank_floor_refuses); the bank installs (create_fail). What the bank's
+     * prompt then grows it by is the touched budget's to admit (prompt_kv_admit).
      */
     /// @param refusal  receives why provisioning was refused (PROVISION_OK on success)
     /// @return the provisioned slot, or NULL
     session_slot * provision_bank(provision_refusal *refusal);
+    /** L391: open the session-cost ledger of a bank pool -- `pool_banks` (the chat banks) must be set.  Startup
+     *  commits the charges of the banks no chat slot holds (ledger_reserved_bytes); each chat bank's is committed as
+     *  it is provisioned.  Refuses (false, `err` says why) a price the ledger cannot add up to or that the budget
+     *  does not hold (server_ledger_self_check): the caller does not start. */
+    /// @param budget        the admission budget (kv_budget_bytes)
+    /// @param admitted      what startup admission charged for the pool
+    /// @param priced_banks  the bank count `admitted` was priced over (the session's banks, the judge's included)
+    /// @param err           receives the refusal
+    /// @param errlen        its size
+    /// @return true when the ledger is open and adds up
+    bool ledger_open_pool(KvBytes budget, KvBytes admitted, uint32_t priced_banks, char *err, size_t errlen);
+    /** L391: open the session-cost ledger of classic mode (no pool): the one session's cost, the actual its create
+     *  allocated, is the whole commitment for the life of the process. */
+    /// @param budget          the admission budget (kv_budget_bytes)
+    /// @param session_actual  the bytes the create allocated
+    void ledger_open_classic(KvBytes budget, KvBytes session_actual);
+    /** L391: bank `b`'s charge to the pool's ledger (server_bank_charge over the pool's price). */
+    /// @param b the bank
+    /// @return its charge; zero in classic mode
+    KvBytes bank_charge(BankId b) const;
+    /** L391: does the session-cost ledger admit bank `b`'s charge beside what is committed (server_kv_admits)?
+     *  provision_bank's ledger guard; takes `mu` for the read. */
+    /// @param b the bank about to be provisioned
+    /// @return true when committed + its charge fits the budget
+    bool ledger_admits_bank(BankId b);
+    /** L391: commit a freshly provisioned slot's charge (its bank's) to the ledger and record it on the slot.  The
+     *  caller holds `mu`. */
+    /// @param sl the slot provision_bank just provisioned
+    void ledger_commit_bank(session_slot *sl);
+    /** L391: release an evicted slot's charge from the ledger (server_ledger_release) and clear it on the slot.  The
+     *  caller holds `mu`. */
+    /// @param sl the evicted slot
+    /// @return the bytes released
+    KvBytes ledger_release_bank(session_slot *sl);
+    /** L391: the readings every headroom check compares a need with, taken now -- the memory the KV occupies (the
+     *  device's free memory on a discrete card, MemAvailable on unified memory) and the host's (server_mem_reading). */
+    /// @return the readings
+    server_mem_reading mem_reading() const;
     /** Find or provision a slot able to serve a job needing `ctx` context.
      * @return the slot, or NULL with *refusal set. */
     /// @param ctx      context the job needs, in tokens (classic mode cannot provision: always refuses)
@@ -5884,10 +5963,6 @@ server_config server_parse_options(int argc, char **argv);
 void server_resolve_kv_disk_dir(server_config *c);
 /* Admission predicate (defined in cli_main.cpp; unit-tested there). */
 bool server_kv_admits(KvBytes kv_budget_bytes, KvBytes committed_bytes, KvBytes incoming_bytes);
-/* Live MemAvailable floor predicate: kernel-breathing-room backstop applied
- * at provisioning time on top of the ledger (defined in cli_main.cpp;
- * unit-tested there). avail == 0 (unreadable /proc/meminfo) fails closed. */
-bool server_mem_floor_admits(KvBytes avail_bytes, KvBytes est_bytes);
 /* L319: the touched-KV ceiling -- min(kv budget − eager, touched + avail − floor); 0 when avail is at or under the
  * floor, or unreadable (defined in cli_main.cpp; unit-tested there).  The startup ceiling reads the post-warmup
  * headroom; the guard's live budget (server::guard_budget) the current one.  What avail and floor are is the device's
@@ -5954,11 +6029,57 @@ KvBytes server_persist_host_bytes(int tokens);
 /// @param floor  the floor, bytes
 /// @return true when the floor stays
 bool server_headroom_admits(KvBytes avail, KvBytes need, KvBytes floor);
-/** The per-chunk prefill re-check's next move (server::prefill_headroom_ok): GO when MemAvailable covers the chunk
- *  over the floor; else SPILL while an idle bank can go, else PREEMPT while a decoder can, else REFUSE. */
+/** L391: do the readings admit `kv_need` more bytes of KV?  The KV's own memory must keep its floor after the need
+ *  (the device on a discrete card, where a need of zero asks nothing of it), and the host must be at or over its
+ *  floor (on unified memory the two are one reading and one test).  An unreadable reading (0) refuses. */
+/// @param m        the readings (server::mem_reading)
+/// @param kv_need  KV bytes about to be demand-paged
+/// @return true when both floors stay
+bool server_kv_headroom_admits(const server_mem_reading &m, KvBytes kv_need);
+/** L391: the demand-paged bytes a fresh bank's provision is checked for against free memory: what the bank may page
+ *  in that no later guard prices.  With the touched-KV guard running that is nothing -- the bank's prompt is admitted
+ *  against the same memory next (prompt_kv_admit), each chunk re-checked (prefill_headroom_ok), each decode quantum
+ *  guarded, and the floor itself holds one worker step's demand; without it (PULSAR_OVERCOMMIT=0) it is the bank's
+ *  whole context-scaled KV (server::kv_bank_bytes).  Never the ledger's charge: that is the bank's share of memory
+ *  the create already made resident. */
+/// @param growth_guarded  the touched-KV guard runs (server::guard_enabled)
+/// @param kv_bank_bytes   one bank's demand-paged KV at the configured context
+/// @return the bytes
+KvBytes server_bank_provision_demand(bool growth_guarded, KvBytes kv_bank_bytes);
+/** L391: bank `bank`'s charge to a pool's ledger: `admitted` split evenly over the `priced_banks` it was priced over,
+ *  the division's remainder a byte each on the first banks, so the charges of all the banks sum to `admitted`
+ *  exactly. */
+/// @param admitted      what startup admission charged for the pool
+/// @param priced_banks  the bank count it was priced over (0: no charge)
+/// @param bank          the bank's index
+/// @return the charge
+KvBytes server_bank_charge(KvBytes admitted, uint32_t priced_banks, uint32_t bank);
+/** L391: the summed charges of banks [from, to) (server_bank_charge). */
+/// @param admitted      what startup admission charged for the pool
+/// @param priced_banks  the bank count it was priced over
+/// @param from          the first bank
+/// @param to            one past the last (clamped to priced_banks)
+/// @return the sum
+KvBytes server_bank_charges(KvBytes admitted, uint32_t priced_banks, uint32_t from, uint32_t to);
+/** L391: the pool ledger's startup self-check.  True when the ledger adds up: with every chat bank provisioned the
+ *  committed bytes -- `reserved` plus the chat banks' charges -- equal `admitted` to the byte, and the budget holds
+ *  it, so no chat bank's provision can ever be refused by the ledger.  False says why in `err`. */
+/// @param admitted      what startup admission charged for the pool
+/// @param priced_banks  the bank count it was priced over
+/// @param chat_banks    the banks chat slots hold (server::pool_banks)
+/// @param reserved      the charges committed at startup (the judge's bank, any past the slot cap)
+/// @param budget        the admission budget
+/// @param err           receives the refusal
+/// @param errlen        its size
+/// @return true when the ledger adds up and fits
+bool server_ledger_self_check(KvBytes admitted, uint32_t priced_banks, uint32_t chat_banks, KvBytes reserved,
+                              KvBytes budget, char *err, size_t errlen);
+/** The per-chunk prefill re-check's next move (server::prefill_headroom_ok): GO when the readings cover the chunk
+ *  over the floors (server_kv_headroom_admits); else SPILL while an idle bank can go, else PREEMPT while a decoder
+ *  can, else REFUSE. */
 typedef enum { PREFILL_MEM_GO = 0, PREFILL_MEM_SPILL, PREFILL_MEM_PREEMPT, PREFILL_MEM_REFUSE, PREFILL_MEM_STEPS } prefill_mem_step;
 extern const char *const prefill_mem_step_names[PREFILL_MEM_STEPS];
-prefill_mem_step server_prefill_mem_step(KvBytes avail, KvBytes need, KvBytes floor, int n_idle_victims,
+prefill_mem_step server_prefill_mem_step(const server_mem_reading &m, KvBytes need, int n_idle_victims,
                                          bool preemptible);
 
 /* MemAvailable from /proc/meminfo, in bytes (0 on parse failure — callers

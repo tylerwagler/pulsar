@@ -408,6 +408,10 @@ The pool is sized at startup (`src/server/cli_main.cpp`):
   pool.
 - A pool with no measured headroom left after warmup refuses to start; lower
   `--ctx` or `PULSAR_MSEQ_BANKS`.
+- The pool's admitted price is split evenly over all its banks, the judge's
+  bank included. A pool whose ledger does not add up to that price, or whose
+  price the budget does not hold, refuses to start (see
+  [Memory admission](#memory-admission)).
 
 Scheduling (`src/server/server_sched.cpp`, `server_jobs.cpp`):
 
@@ -650,6 +654,72 @@ Written when the handler returns, whatever the answer: `questions` (0 when it wa
 when each question began), `prefilled` (tokens the worker prefilled for it), `ms` (the handler's wall time) and
 `status` (the HTTP status).
 
+## Memory admission
+
+Two modes. **Pool mode** is every production server: more than one bank
+(`PULSAR_MSEQ_BANKS`, or auto-sizing), all allocated by the one session create
+at startup. **Classic mode** is a pool of one: a single session, no bank to
+provision or evict; a request that finds it busy queues.
+
+What memory a session takes, as startup prices it (the create run dry):
+
+- a **shared** part, once for the pool;
+- an **eager floor** per bank (raw window, state lanes, drafter state, and on
+  unified memory the checkpoint slots), resident from the create for every
+  bank, provisioned or not;
+- a **demand-paged** part per bank: the context-scaled KV. It is reserved as
+  address space and becomes resident a page at a time as a conversation grows.
+
+With overcommit (the default) startup admission charges `shared + N x eager`
+against the budget; with `PULSAR_OVERCOMMIT=0` it charges the full price.
+
+The **session-cost ledger** holds that admitted price. Each bank's charge is
+the price divided by the bank count it was priced over (all the session's
+banks, the judge's included; the division's remainder goes a byte each to the
+first banks). The charges of the banks no chat slot holds (the judge's bank)
+are committed at startup; a chat bank's is committed when it is provisioned and
+released when it is evicted. With every chat bank provisioned the ledger equals
+the admitted price to the byte. Startup checks this and that the budget holds
+the price, and refuses to start otherwise. In classic mode the ledger holds the
+one session's actual cost for the life of the process.
+
+The ledger's remaining room, `budget - admitted price`, is the most resident KV
+the pool may hold on unified memory. The guards below keep to it. (On a
+discrete card the device's free memory is the bound instead.)
+
+The guards, in the order a request meets them:
+
+| # | Guard | When | Measures | Short of it |
+|---|---|---|---|---|
+| 0 | Startup admission | once | the pool's admitted price against the budget; the ledger adds up; measured headroom is left after warmup | the server does not start |
+| 1 | A free bank | a request needs a fresh bank | a bank no conversation holds | `pool_full`: evict an idle bank, else queue |
+| 2 | Session-cost ledger | the bank is provisioned | committed charges + this bank's charge against the budget | `ledger_full`: evict an idle bank (its charge is released), else queue. Cannot occur on a server that passed check 0 |
+| 3 | Memory floor at provision | the bank is provisioned (not the first bank; not a bank whose pages are still resident) | free memory at or over the floor, plus the bytes the provision itself can demand-page: none with the KV guard running, the bank's whole KV with `PULSAR_OVERCOMMIT=0` | `mem_floor`: evict an idle bank and reuse its resident pages, else queue |
+| 4 | Bank install | the bank is provisioned | the bank's state installs | `create_fail`: 500 |
+| 5 | Touched-KV budget | the request is bound to its bank, before any prefill | resident KV + admitted prompts' growth + this prompt's growth against the live budget: the smaller of the ledger's room and `touched + free memory - floor`, never over the post-warmup ceiling | spill idle banks, else release the judge's bank, else preempt the newest decoder, else `kv_touched`: queue for a busy bank, or 503 when nothing can make room |
+| 6 | Memory floor per chunk | before each prefill chunk | free memory against the chunk's new KV over the floor | spill an idle bank, else release the judge's bank, else preempt a decoder, else 503 (the part computed is kept) |
+| 7 | Decode guard | before each decode round | resident KV + one round's growth of every decoder against the live budget | spill idle banks, else release the judge's bank, else preempt the newest decoder; a lone decoder proceeds |
+| 8 | Persist floor | before a disk-KV persist | host memory against the persist's host bytes over the floor | the persist is skipped and counted |
+
+"Free memory" is read where the bytes will live: `MemAvailable` on unified
+memory; on a discrete card the device's free memory for KV, with the host at
+its own floor.
+
+A `/v1/systemone` request has no slot. It meets guards 5 and 6 for its own
+bank (it spills idle chat banks; it never preempts or waits) and answers 503
+`busy` short of them.
+
+Guards 1 to 4 decide whether a bank can be handed out. They commit no new
+memory: a provision is host bookkeeping over memory the create already took.
+What a conversation then grows to is decided by guards 5 to 7, a prompt, a
+chunk and a round at a time, and a spill is their relief. A spill frees a
+bank's KV; it does not release the bank's ledger charge (the eager floor stays
+resident). An eviction releases the charge and keeps the pages for the next
+conversation.
+
+The memory floor these guards read and the stall watchdog, which refuses
+nothing, are the next section.
+
 ## Memory floor and stall watchdog
 
 The GB10 shares one memory pool between CPU and GPU, and the kernel's own
@@ -663,6 +733,13 @@ derived at startup and logged, as the sum of:
 
 Every `MemAvailable` check uses it: bank provisioning, the guard's live budget,
 each prefill chunk, and each disk-KV persist.
+
+On a **discrete card** the KV lives in device memory, not host RAM. There a KV
+need is read against the device's free memory, over a 512 MiB device floor,
+and the host must only be at its own floor: nothing host-side grows with a
+prefill chunk (the pinned checkpoint slabs and the disk cache's RAM tier are
+allocated once at startup). A persist's bytes are host bytes on both kinds of
+machine and are read against the host floor.
 
 When a prefill chunk would cross the floor, the server tries in order:
 
@@ -749,7 +826,20 @@ Everything else is in the `pulsar:` namespace. The main groups:
   prefill progress, draft depth.
 - **Admission and memory:**
   - `pulsar:admission_refusals_total{reason}`, where `reason` is one of
-    `pool_full`, `ledger_full`, `mem_floor`, `create_fail`, `kv_touched`
+    (guard numbers from [Memory admission](#memory-admission)):
+    - `pool_full`: no free bank (1). Relieved by evicting an idle bank.
+    - `ledger_full`: the session-cost ledger does not admit the bank's charge
+      (2). Relieved by an eviction. A server that started cannot produce it
+      unless its ledger is out of step with its price; a non-zero count is a
+      bug to report.
+    - `mem_floor`: free memory is under the floor for a fresh bank (3).
+    - `create_fail`: the bank could not be installed (4).
+    - `kv_touched`: the prompt's KV does not fit the touched-KV budget and no
+      idle bank can be spilled (5). The ledger's room is one of that budget's
+      two bounds.
+  - `pulsar:kv_ledger_committed_bytes`, `pulsar:kv_ledger_budget_bytes`: the
+    session-cost ledger. Committed starts at the reserved banks' charges (the
+    judge's bank) and rises by one bank's charge per provisioned chat bank.
   - `pulsar:prefill_mem_refusals_total`, `pulsar:mem_floor_bytes`
   - `pulsar:kv_eager_floor_bytes`, `pulsar:kv_touched_bytes`,
     `pulsar:kv_touched_ceiling_bytes`, `pulsar:kv_ledger_*`
