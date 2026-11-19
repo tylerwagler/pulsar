@@ -984,7 +984,7 @@ static_assert(sizeof(ContentOff) == sizeof(size_t) && std::is_trivial<ContentOff
               "a message content's offset is no offset of generated text and no length, and enters by name only");
 /* ==== L437: offsets into the texts of the OUTPUT path (end) ======================================================== */
 
-/* ==== L439: a position on a PROMPT (begin) ===================================================================
+/* ==== L439: a position on a PROMPT (begin) ==========================================================================
  * PromptToks had no point type (L334: "no prompt-side position crosses the API yet").  One does now: the shared-
  * prefix wait cuts a prefill at a token of the prompt its sync was handed, the fused prefill lanes read that prompt
  * at the bank's position, and both carried the index as the `int` that also held a position on the bank's history.
@@ -1011,7 +1011,6 @@ static_assert(!std::is_constructible<PromptPos, TokPos>::value && !std::is_const
                   !std::is_convertible<int, PromptPos>::value && !std::is_convertible<PromptPos, int>::value,
               "a prompt position is no live position and no count, not even explicitly, and no bare integer");
 /* ==== L439: a position on a PROMPT (end) ============================================================================ */
-=======
 /* ==== L440: offsets into the RENDERED PROMPT and into a renderer's input content (begin) ============================
  * A chat renderer writes one text -- the rendered prompt, the string the tokenizer consumes -- and records the byte
  * ranges it copied from client data (pulsar_text_span), where the tokenizers match no control token.  Those offsets
