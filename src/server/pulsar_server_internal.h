@@ -2038,7 +2038,20 @@ typedef struct {
     PromptToks shared;   ///< tokens the two prompts share from 0 (the same ids): a length of either prompt
     TokPos pos;          ///< where the leader's prefill stands (its bank's rows)
     PromptToks len;      ///< the leader's prompt length (the prompt its sync was handed)
+    /** L439: the leader's bank history and its sync prompt meet at a token seam (slot_prefix_match): its sync runs
+     *  the stitch, on which an index of the prompt and a position on the bank are different numbers -- no wait is
+     *  taken on it (server_prefix_wait_pick; prefix_mark_on_bank) */
+    bool seamed;
 } prefix_lead;
+
+/** L439: the prefix wait's cut as a position on the leader's bank.  The cut is an index of the leader's sync prompt
+ *  and of the waiter's (the two share it by id); it is the same position on the bank because a wait is taken only on
+ *  a leader whose history and sync prompt match with no token seam (prefix_lead::seamed): its sync rewinds to a point
+ *  of that match and appends the prompt's own tokens, each at its index.  The one conversion the wait's readers use
+ *  (the release check, the leader's cut, the fused lanes' stop).
+ *  @param mark the cut (position 0: none) */
+/// @return the position on the leader's bank
+inline TokPos prefix_mark_on_bank(PromptPos mark) { return TokPos{mark.raw()}; }
 
 /** The wait's decision, pure: the lead (index into `leads`, -1 for none) whose prefill a request of `prompt_len`
  *  tokens waits on, and the cut `*mark` -- the deepest resume-grid point both prompts share, short of either's end,

@@ -1729,9 +1729,9 @@ void server::gen_step_prefill(session_slot *sl) {
      * adopts -- the cold phase's mechanism, for a cut a sibling request named.  A text prefill only (a waiter never
      * names an image prompt's). */
     pulsar_tokens to_cut = {0};
-    /* L439 (typing; value unchanged): the cut is an index of the prompt -- it cuts the target there -- and is read
-     * as where the bank stands */
-    const bool cut = n_images == 0 && seam_unconverted_live(g->share_mark) > server_bank_pos(s->sess, sl->bank) &&
+    /* L439: the cut is an index of the prompt -- it cuts the target there -- and the same position on the bank (a
+     * wait is taken only on an unseamed leader: prefix_mark_on_bank) */
+    const bool cut = n_images == 0 && prefix_mark_on_bank(g->share_mark) > server_bank_pos(s->sess, sl->bank) &&
                      g->share_mark < target.end();
     if (cut) {
         prompt_copy_prefix(&to_cut, target, g->share_mark.before());
@@ -1787,7 +1787,7 @@ void server::gen_step_prefill(session_slot *sl) {
         server_log(PULSAR_LOG_PREFILL, "pulsar-server: bank %d stands at %d, the shared cut a queued request "
                    "waits for (prompt %d; grid checkpoint %d)", sl->bank.raw(), g->share_mark.raw(),
                    g->prompt_for_sync.len().raw(),
-                   pulsar_session_checkpoint_best(s->sess, seam_unconverted_live(g->share_mark)).raw());
+                   pulsar_session_checkpoint_best(s->sess, prefix_mark_on_bank(g->share_mark)).raw());
         return;   /* a quantum boundary: the waiters bind before this prompt's next chunk */
     }
 

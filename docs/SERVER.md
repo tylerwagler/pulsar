@@ -445,7 +445,8 @@ Scheduling (`src/server/server_sched.cpp`, `server_jobs.cpp`):
   work is chosen by a value-per-time price (L312).
 - **Shared-prefix wait.** Requests arriving together on a new shared prefix
   wait (up to `PULSAR_SERVER_PREFIX_WAIT_MS`) for the first one's prefill to reach
-  a checkpoint, then adopt it.
+  a checkpoint, then adopt it. A prefill whose bank holds another spelling of its
+  prompt's text (a token seam) is not waited on (L439).
 - **Preemption.** When a prompt does not fit, a running decoder leaves through a
   terminal checkpoint and is readmitted later. It continues exactly; the output is
   unchanged.

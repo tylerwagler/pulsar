@@ -4587,6 +4587,7 @@ static void test_disk_depth(void) {
     test_l334_prompt_held_across_a_seam();
     test_l439_route_discard_is_live_side();   /* L439: the server's remaining seam crossings */
     test_l439_context_admits_the_stitch();
+    test_l439_prefix_wait_seamed_leader();
     test_l439_prefill_bounds_are_live_side();
 }
 

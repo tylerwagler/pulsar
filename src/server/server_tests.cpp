@@ -83,7 +83,8 @@ typedef struct {
 static int unseamed_wait_pick(int have, int prompt_len, int grid, int min_gain, const unseamed_lead *leads, int n,
                               int *mark) {
     prefix_lead typed[PULSAR_SESSION_POOL_CAP];
-    for (int i = 0; i < n; i++) typed[i] = {PromptToks{leads[i].shared}, TokPos{leads[i].pos}, PromptToks{leads[i].len}};
+    for (int i = 0; i < n; i++)
+        typed[i] = {PromptToks{leads[i].shared}, TokPos{leads[i].pos}, PromptToks{leads[i].len}, false};
     PromptPos at{0};
     const int pick = server_prefix_wait_pick(PromptToks{have}, PromptToks{prompt_len}, TokCount{grid},
                                              PromptToks{min_gain}, typed, n, &at);
@@ -22336,6 +22337,9 @@ static_assert(std::is_same_v<decltype(kv_req_line::prompt), PromptToks> &&
                   std::is_same_v<decltype(prefix_lead::pos), TokPos> &&
                   std::is_same_v<decltype(prefix_lead::len), PromptToks>,
               "the carriers are typed: the kv req line's fields, the prompt's carriers in gen_state, the prefix wait's");
+static_assert(std::is_same_v<decltype(prefix_lead::seamed), bool> &&
+                  std::is_same_v<decltype(&prefix_mark_on_bank), TokPos (*)(PromptPos)>,
+              "the prefix wait converts its cut to a bank position by one rule, behind the no-seam gate");
 static_assert(std::is_same_v<decltype(&gen_target_end), TokPos (*)(const gen_state *)>,
               "a prefill's bounds read its target's end on the bank");
 static_assert(std::is_same_v<decltype(&server_sync_admit), sync_admit (*)(TokCount, TokCount, PromptToks, bool)> &&
@@ -22796,6 +22800,47 @@ static void test_l439_prefill_bounds_are_live_side(void) {
     TEST_ASSERT(gen_target_end(&g) == TokPos{(int)u.prompt.size()});
 }
 
+/* L439 (5): the prefix wait on a seamed leader.  The leader's bank sampled the stretches (302 tokens to Y); its sync
+ * prompt and the queued follower's spell them canonically (202 to Y) and share 300 more tokens by id.  The wait's cut
+ * is an index of the two prompts; on the leader's stitch the same text stands 100 positions further.  (The reverse
+ * spelling stands 100 SHORT: a leader cut there stopped below its own cut, re-cut there every quantum, and the
+ * follower held to its bound.)  A seamed lead is now never waited on; the same numbers unseamed still wait. */
+static void test_l439_prefix_wait_seamed_leader(void) {
+    std::vector<int> tail(300, L334_Z);
+    tail.push_back(L334_A);
+    const l439_seam lead = l439_make(true, false, NULL, 0, tail.data(), (int)tail.size());
+    std::vector<int> wtail(300, L334_Z);
+    wtail.push_back(L334_B);
+    wtail.push_back(L334_B);
+    const l439_seam wait = l439_make(false, false, NULL, 0, wtail.data(), (int)wtail.size());
+    pulsar_tokens lp = {const_cast<TokId *>(lead.prompt.data()), (int)lead.prompt.size(), (int)lead.prompt.size()};
+    pulsar_tokens wp = {const_cast<TokId *>(wait.prompt.data()), (int)wait.prompt.size(), (int)wait.prompt.size()};
+    const PromptToks shared{pulsar_tokens_common_prefix(&lp, &wp)};
+    TEST_ASSERT(lead.m.seamed && lead.m.live_cut == TokCount{302} && lead.m.prompt_cut == PromptToks{202});
+    TEST_ASSERT(shared == PromptToks{502} && lead.prompt.size() == 503 && wait.prompt.size() == 504);
+    /* the leader stands at 256 on its bank; the deepest grid point inside the shared prefix is 384 */
+    prefix_lead l = {shared, TokPos{256}, PromptToks{(int)lead.prompt.size()}, false};
+    PromptPos mark{0};
+    /* unseamed, these numbers take the wait (the L329 tables pass unchanged) */
+    TEST_ASSERT(server_prefix_wait_pick(PromptToks{0}, PromptToks{(int)wait.prompt.size()}, TokCount{128},
+                                        PromptToks{64}, &l, 1, &mark) == 0 && mark == PromptPos{384});
+    /* on the seamed leader that cut is not where its bank stands: the stitch of the prompt's first 384 tokens ends
+     * 100 further (the release read 384 as reached early, and the gain counted tokens the follower does not get) */
+    const TokCount cut_on_stitch = pulsar_prefix_match_stitched_len(&lead.m, mark.before());
+    TEST_ASSERT(cut_on_stitch == TokCount{484});
+    l.seamed = true;
+    TEST_ASSERT(server_prefix_wait_pick(PromptToks{0}, PromptToks{(int)wait.prompt.size()}, TokCount{128},
+                                        PromptToks{64}, &l, 1, &mark) == -1);
+    /* the reverse spelling: the leader's stitch of the cut ends 100 SHORT of it, so the old release never saw it
+     * reached (HOLD to the bound) and the leader's own cut was never stale */
+    const l439_seam rev = l439_make(false, true, NULL, 0, tail.data(), (int)tail.size());
+    TEST_ASSERT(rev.m.seamed);
+    const TokCount rev_stop = pulsar_prefix_match_stitched_len(&rev.m, PromptToks{512});
+    TEST_ASSERT(rev_stop == TokCount{412});
+    TEST_ASSERT(server_prefix_wait_check(true, TokPos::after(rev_stop), PromptPos{512}, 10.0, 60000.0) ==
+                PREFIX_WAIT_HOLD);
+}
+
 static void pulsar_server_unit_tests_run(void) {
     test_l333_kv_units();
     test_l334_p2b_crossings();
@@ -22816,6 +22861,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l439_route_discard_is_live_side();
     test_l439_context_admits_the_stitch();
     test_l439_prefill_bounds_are_live_side();
+    test_l439_prefix_wait_seamed_leader();
     test_mem_floor_is_derived_from_the_watermarks();
     test_guard_budget_reads_live_memavailable();
     test_guard_discrete_reads_the_device();

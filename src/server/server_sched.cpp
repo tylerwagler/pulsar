@@ -1750,16 +1750,19 @@ int server_prefix_wait_pick(PromptToks have, PromptToks prompt_len, TokCount gri
     const PromptToks one{1};
     for (int i = 0; i < n; i++) {
         const prefix_lead *l = &leads[i];
+        /* L439: a leader whose sync runs a token-seam stitch stands at another position than its prompt's index: a
+         * cut there is not where it stops (its cut sync ends short of or past it), the release reads the two as one,
+         * and with the stitch shorter the leader never reaches its own cut (it re-cut there every quantum) */
+        if (l->seamed) continue;
         PromptToks cut = l->shared;
         if (cut > prompt_len - one) cut = prompt_len - one;   /* the request's sync evaluates at least its last token */
         if (cut > l->len - one) cut = l->len - one;           /* inside the leader's prompt: its prefill stops there */
-        /* L439 (typing; value unchanged): the bank's grid applied to an index of the prompt, and that index read as
-         * where the leader's bank stands */
+        /* L439: the bank's grid applied to an index of the prompt -- one number on an unseamed leader */
         cut = PromptToks{cut.raw() / grid.raw() * grid.raw()};
         if (cut <= PromptToks{0}) continue;   /* no cut: every leader stands at or past position 0 (as before) */
         /* a cut the leader stands at or past is served now (have), and one the adopt would not take is not waited
          * for (server_resume_memory_depth: more than min_gain past what serves it) */
-        if (seam_unconverted_live(PromptPos::after(cut)) <= l->pos || cut <= have + min_gain) continue;
+        if (prefix_mark_on_bank(PromptPos::after(cut)) <= l->pos || cut <= have + min_gain) continue;
         if (PromptPos::after(cut) > *mark || (PromptPos::after(cut) == *mark && l->pos > leads[best].pos)) {
             best = i;
             *mark = PromptPos::after(cut);
@@ -1771,14 +1774,13 @@ int server_prefix_wait_pick(PromptToks have, PromptToks prompt_len, TokCount gri
 prefix_wait_verdict server_prefix_wait_check(bool live, TokPos leader_pos, PromptPos mark, double waited_ms,
                                              double bound_ms) {
     if (!live) return PREFIX_WAIT_LEFT;
-    /* L439 (typing; value unchanged): the cut, an index of the prompt, against a position on the leader's bank */
-    if (leader_pos >= seam_unconverted_live(mark)) return PREFIX_WAIT_REACHED;
+    if (leader_pos >= prefix_mark_on_bank(mark)) return PREFIX_WAIT_REACHED;   /* L439: on the leader's bank */
     if (waited_ms >= bound_ms) return PREFIX_WAIT_TIMEOUT;
     return PREFIX_WAIT_HOLD;
 }
 
 PromptPos server_prefix_mark_merge(PromptPos cur, PromptPos want, TokPos pos) {
-    return seam_unconverted_live(cur) <= pos || cur > want ? want : cur;   /* L439: as the check above */
+    return prefix_mark_on_bank(cur) <= pos || cur > want ? want : cur;   /* L439: as the check above */
 }
 
 int server_prefix_wait_parse(const char *text) {
@@ -1814,6 +1816,8 @@ void server::prefix_wait_release(job *const *queued, int n) {
                    live ? "" : ", its prefill ended");
         pthread_mutex_lock(&s->mu);
         s->m_prefix_waits[v]++;
+        /* L439: both the waiter's own tokens -- the cut is an index of its prompt (shared with the leader's by id), and
+         * an unseamed leader's checkpoint there holds that many of them */
         if (v == PREFIX_WAIT_REACHED) s->m_prefix_wait_gain += (uint64_t)(w->mark.before() - w->have).raw();
         pthread_mutex_unlock(&s->mu);
         w->leader = 0;
@@ -1848,7 +1852,10 @@ bool server::prefix_wait_decide(job *j) {
         const prompt_view lp = sl->gen->prompt_for_sync;
         /* the two prompts' common prefix by id: a length of either */
         const PromptToks shared{pulsar_tokens_common_prefix(lp.tokens(), &r->prompt)};
-        leads[n] = {shared, server_bank_pos(s->sess, sl->bank), lp.len()};
+        /* L439: the leader's sync stitches when its history and prompt meet at a seam: no wait on it */
+        pulsar_prefix_match lm;
+        s->slot_prefix_match(sl, lp.tokens(), &lm);
+        leads[n] = {shared, server_bank_pos(s->sess, sl->bank), lp.len(), lm.seamed};
         lead_slot[n++] = i;
     }
     PromptPos mark{0};
@@ -5609,7 +5616,7 @@ session_slot *server::worker_find_fuse_prefill() {
         const TokPos P = server_bank_pos(pool, sl->bank);
         /* L439: done is the bank standing at the prompt's stitch, not at its own length */
         if (P <= TokPos{0} || P >= g->sync_end) continue;       /* first chunk / done: classic */
-        if (seam_unconverted_live(g->share_mark) > P) continue; /* L329 (a): the classic sync stops at the cut */
+        if (prefix_mark_on_bank(g->share_mark) > P) continue;   /* L329 (a): the classic sync stops at the cut */
         /* 2026-10-29: the fused run is prefill chunks too -- short of the floor it goes classic (prefill_headroom_ok) */
         if (!s->prefill_headroom_fused_ok(sl)) continue;
         return sl;                                              /* P=1: first qualifier */
