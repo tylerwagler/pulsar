@@ -231,7 +231,7 @@ void agent_bash_job::poll() {
         agent_worker_note_terminal_mode_may_have_changed(job->worker);
         return;
     }
-    if (agent_now_sec() - job->start_time >= job->timeout_sec) {
+    if (pulsar_mono_sec() - job->start_time >= job->timeout_sec) {
         job->timed_out = true;
         kill(-job->pid, SIGKILL);
         kill(job->pid, SIGKILL);
@@ -339,7 +339,7 @@ agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
     job->tmp_fd = tmpfd;
     snprintf(job->path, sizeof(job->path), "%s", tmp_path);
     job->cmd = xstrdup(cmd);
-    job->start_time = agent_now_sec();
+    job->start_time = pulsar_mono_sec();
     job->timeout_sec = timeout_sec;
     job->exit_status = -1;
     job->running = true;
@@ -460,7 +460,7 @@ char *agent_bash_job::observation(bool mark_observed) {
     job->poll();
     bool first_observation = !job->observed_once;
     int display_lines = job->display_lines();
-    double elapsed = agent_now_sec() - job->start_time;
+    double elapsed = pulsar_mono_sec() - job->start_time;
 
     agent_buf out = {0};
     char line[PATH_MAX + 256];
@@ -593,8 +593,8 @@ static void agent_bash_publish_observation(agent_worker *w, const char *obs) {
  *  @param refresh_sec the wait budget, seconds */
 static void agent_bash_refresh_for(agent_worker *w, agent_bash_job *job,
                                    int refresh_sec) {
-    double start = agent_now_sec();
-    while (job->running && agent_now_sec() - start < refresh_sec) {
+    double start = pulsar_mono_sec();
+    while (job->running && pulsar_mono_sec() - start < refresh_sec) {
         if (worker_should_interrupt(w)) break;
         job->poll();
         if (!job->running) break;
@@ -613,8 +613,8 @@ char *agent_bash_job_tool_result(agent_worker *w, agent_bash_job *job,
     if (stop && job->running) {
         kill(-job->pid, SIGTERM);
         kill(job->pid, SIGTERM);
-        double start = agent_now_sec();
-        while (job->running && agent_now_sec() - start < 1.0) {
+        double start = pulsar_mono_sec();
+        while (job->running && pulsar_mono_sec() - start < 1.0) {
             job->poll();
             if (!job->running) break;
             usleep(20000);
@@ -766,7 +766,7 @@ static void test_agent_bash_teardown(void) {
     agent_bash_job *timed = agent_bash_start(&w, "sleep 300", 1, err, sizeof err);
     AGENT_TEST_ASSERT(timed != NULL);
     if (timed) {
-        usleep(1100 * 1000);
+        usleep(pulsar_us_of_ms(1100u));
         AGENT_TEST_ASSERT(!agent_on_worker_thread(&w));           /* no worker thread: this one is "the UI's" */
         worker_progress_cb(&w, "prefill_chunk", TokPos{10}, TokCount{100});
         AGENT_TEST_ASSERT(timed->running && !timed->timed_out);   /* not polled */

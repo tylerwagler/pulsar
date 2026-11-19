@@ -40,12 +40,6 @@ uint64_t align_up(uint64_t value, uint64_t alignment) {
 
 
 
-double now_sec(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
-}
-
 
 
 

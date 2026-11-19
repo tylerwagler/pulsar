@@ -640,7 +640,7 @@ bool server::send_metrics(int fd) {
     const unsigned long long restores = (unsigned long long)s->m_restores;
     const unsigned long long restore_failures = (unsigned long long)s->m_restore_failures;
     const unsigned long long restore_slices = (unsigned long long)s->m_restore_slices;    /* L330 */
-    const double restore_stall_max_s = s->m_restore_stall_max_ms / 1000.0;
+    const double restore_stall_max_s = pulsar_sec_of_ms((double)s->m_restore_stall_max_ms);
     const unsigned long long kv_touched = (unsigned long long)s->m_kv_touched.raw();      /* L328 */
     const unsigned long long kv_reserved = (unsigned long long)s->m_kv_reserved.raw();
     const unsigned long long kv_budget_live = (unsigned long long)s->m_kv_budget.raw();   /* 2026-10-29 */
@@ -1078,7 +1078,7 @@ bool server::send_metrics(int fd) {
         const char *from[2] = {"disk", "ram"};   /* L347 I3a: the RAM tier (was page_cache) */
         for (int i = 0; i < 2; i++)
             buf_printf(&b, "pulsar:kv_disk_read_bytes_per_second{from=\"%s\"} %.0f\n", from[i],
-                       per_gib[i] > 0.0 ? 1024.0 * 1024.0 * 1024.0 * 1000.0 / per_gib[i] : 0.0);
+                       per_gib[i] > 0.0 ? pulsar_per_sec(PULSAR_GIB, per_gib[i]) : 0.0);
     }
     buf_puts(&b, "# HELP pulsar:kv_disk_last_transfer_ms The last disk hit's estimated chain read time.\n");
     buf_puts(&b, "# TYPE pulsar:kv_disk_last_transfer_ms gauge\n");
@@ -1200,7 +1200,7 @@ bool server::send_metrics(int fd) {
         buf_printf(&b, "pulsar:ple_read_ahead_bytes_total %llu\n", (unsigned long long)ra.bytes_read);
         buf_puts(&b, "# HELP pulsar:ple_read_ahead_seconds_total Reader time on read-ahead rows, summed over the readers.\n");
         buf_puts(&b, "# TYPE pulsar:ple_read_ahead_seconds_total counter\n");
-        buf_printf(&b, "pulsar:ple_read_ahead_seconds_total %.6f\n", (double)ra.read_ns * 1e-9);
+        buf_printf(&b, "pulsar:ple_read_ahead_seconds_total %.6f\n", pulsar_sec_of_ns((double)ra.read_ns));
         buf_puts(&b, "# HELP pulsar:ple_read_ahead_issued_total Read-aheads queued (one per prompt chunk ahead).\n");
         buf_puts(&b, "# TYPE pulsar:ple_read_ahead_issued_total counter\n");
         buf_printf(&b, "pulsar:ple_read_ahead_issued_total %llu\n", (unsigned long long)ra.issued);
@@ -1408,33 +1408,20 @@ bool server::send_metrics(int fd) {
      * Baseline self-captures once, >=60s after the listener came up, so
      * load-time churn stays out of the window. */
     {
-        static uint64_t base_avail_kib = 0;
+        static HostBytes base_avail{};
         static uint64_t base_census = 0;
         static bool base_set = false;
-        static const char *const akey[] = {"MemAvailable:"};
-        uint64_t avail_kib[1] = {0};
-        FILE *mf = fopen("/proc/meminfo", "r");
-        if (mf) {
-            char line[256];
-            while (fgets(line, sizeof(line), mf)) {
-                if (!strncmp(line, akey[0], strlen(akey[0]))) {
-                    unsigned long long v = 0;
-                    if (sscanf(line + strlen(akey[0]), " %llu kB", &v) == 1)
-                        avail_kib[0] = v;
-                }
-            }
-            fclose(mf);
-        }
+        const HostBytes avail = pulsar_mem_available();   /* L442: the one reading */
         const uint64_t census = pulsar_gpu_tensor_alloc_bytes_current().raw();
         if (!base_set && s->started && time(NULL) - s->started >= 60 &&
-            avail_kib[0] > 0) {
-            base_avail_kib = avail_kib[0];
+            avail > HostBytes{}) {
+            base_avail = avail;
             base_census = census;
             base_set = true;
         }
-        if (base_set && avail_kib[0] > 0) {
+        if (base_set && avail > HostBytes{}) {
             const long long box_delta =
-                ((long long)base_avail_kib - (long long)avail_kib[0]) * 1024ll;
+                (long long)base_avail.raw() - (long long)avail.raw();
             const long long census_delta =
                 (long long)census - (long long)base_census;
             buf_puts(&b, "# HELP pulsar:mem_reconcile_residual_bytes Box consumption since baseline minus census-explained bytes (signed; page-cache drift included).\n");
@@ -1503,12 +1490,11 @@ bool metrics_stream_pump(int fd, pthread_mutex_t *mu, pthread_cond_t *cv,
          * never queues behind a slow client. A change and a refresh are the
          * same frame: the refresh repeats the generation with a new `t`. */
         buf b = {0};
-        struct timespec now;
-        clock_gettime(CLOCK_REALTIME, &now);
+        const struct timespec now = pulsar_wall_ts();
         buf_puts(&b, "event: metrics\ndata: {\"generation\":");
         buf_printf(&b, "%llu", gen);
         buf_puts(&b, ",\"t\":");
-        buf_printf(&b, "%.3f", (double)now.tv_sec + (double)now.tv_nsec / 1e9);
+        buf_printf(&b, "%.3f", pulsar_ts_sec(now));
         buf_puts(&b, "}\n\n");
         bool ok = send_all(fd, b.ptr, b.len);
         buf_free(&b);
@@ -1646,13 +1632,12 @@ void *client_main(void *arg) {
             http_error(fd, 400, "/test/guard-budget: the body is a decimal byte count (0 restores the startup budget)");
         } else {
             s->set_test_guard_budget(KvBytes{(uint64_t)b});   /* the request's byte count enters the unit here */
-            const double gib = 1024.0 * 1024.0 * 1024.0;
             if (b)
                 server_log(PULSAR_LOG_WARNING, "pulsar-server: guard: KV budget OVERRIDDEN to %.2f GiB (test route)",
-                           (double)b / gib);
+                           (double)b / PULSAR_GIB);
             else
                 server_log(PULSAR_LOG_WARNING, "pulsar-server: guard: KV budget back to the startup %.2f GiB (test "
-                           "route)", (double)s->guard_kv_budget.raw() / gib);
+                           "route)", pulsar_gib(s->guard_kv_budget));
             char out[96];
             snprintf(out, sizeof(out), "{\"guard_budget_bytes\":%llu}",
                      b ? b : (unsigned long long)s->guard_kv_budget.raw());
@@ -1798,7 +1783,7 @@ void *client_main(void *arg) {
     memset(&j, 0, sizeof(j));
     j.fd = fd;
     j.req = req;
-    j.accepted_at = server_now_sec();
+    j.accepted_at = pulsar_mono_sec();
     pthread_mutex_init(&j.mu, NULL);
     pthread_cond_init(&j.cv, NULL);
 
@@ -1818,15 +1803,12 @@ void *client_main(void *arg) {
              * so the worker-only pop invariant holds (upstream ds4 e9ded97,
              * reshaped for our stack-owned jobs). */
             while (!j.done) {
-                struct timespec ts;
-                clock_gettime(CLOCK_REALTIME, &ts);
-                ts.tv_nsec += 250 * 1000000L;
-                if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+                const struct timespec ts = pulsar_wall_deadline_after(0.25);
                 pthread_cond_timedwait(&j.cv, &j.mu, &ts);
                 if (!j.done && !j.cancelled && gen_client_disconnected(j.fd))
                     j.cancelled = true;
                 /* L249 D: a streaming job still waiting for the worker gets its stream opened and kept alive */
-                if (!j.done && !j.cancelled) job_early_keepalive(&j, server_now_sec());
+                if (!j.done && !j.cancelled) job_early_keepalive(&j, pulsar_mono_sec());
             }
         }
     }

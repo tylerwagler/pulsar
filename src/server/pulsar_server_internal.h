@@ -20,6 +20,7 @@
 #include "pulsar_dsml.h"
 #include "pulsar_utf8.h"
 #include "pulsar_stall.h"
+#include "pulsar_meminfo.h"
 #include "pulsar_metrics_stream.h"
 /* The JSON scanner is shared with the engine's safetensors reader, so it lives
  * in src/lib and is declared there. */
@@ -1722,10 +1723,10 @@ typedef struct {
     int fd;       ///< the job's non-blocking client socket
     buf pending;  ///< accepted-but-unsent bytes, in wire order
     size_t off;  ///< consumed prefix of pending
-    long long stall_deadline_ms;  ///< 0 = disarmed (nothing pending)
+    long long stall_deadline_ms;  ///< 0 = disarmed (nothing pending); CLOCK_MONOTONIC ms (pulsar_mono_ms, L442)
     bool failed;  ///< the stream has failed; further writes are refused
-    /** Wall clock of the last client bytes ACCEPTED by this writer (queued or
-     * sent), 0 until the first. Every streamed byte funnels through
+    /** The monotonic clock (pulsar_mono_ms; the wall clock until L442) of the last client bytes ACCEPTED by this
+     * writer (queued or sent), 0 until the first. Every streamed byte funnels through
      * slot_writer_send, so this is the one honest "when did the client last
      * hear from us" clock — the heartbeat below reads it. */
     long long last_write_ms;
@@ -1744,8 +1745,8 @@ typedef struct {
  *  typically over 100 ms and a two-chunk checkpoint about 300 ms, so a follow-up arriving inside the grace finds the
  *  bank free and absorbs the reply's rows in its own sync (about 1 ms a token). */
 #define PULSAR_SERVER_TERMINAL_GRACE_MS 300
-/// @param now_sec       server_now_sec() now
-/// @param turn_ended_at server_now_sec() when the slot's turn ended (session_slot::turn_ended_at)
+/// @param now_sec       pulsar_mono_sec() now
+/// @param turn_ended_at pulsar_mono_sec() when the slot's turn ended (session_slot::turn_ended_at)
 /// @return seconds of the idle grace (PULSAR_SERVER_TERMINAL_GRACE_MS) still to pass before the turn's terminal
 ///         checkpoint may start; 0 once it may
 double server_terminal_grace_left_s(double now_sec, double turn_ended_at);
@@ -1922,7 +1923,7 @@ typedef struct {
     bool cached_seen;                ///< L353 no. 17: a load with cached bytes has set best_cached_ms_per_gib
     double best_cold_ms_per_gib;     ///< L342: the lowest cold_ms_per_gib has been (the relaxation's floor)
     double best_cached_ms_per_gib;   ///< L342: the lowest cached_ms_per_gib has been (the relaxation's floor)
-    /// L342: server_now_sec() of the last load's start, slice or finish; 0 = never
+    /// L342: pulsar_mono_sec() of the last load's start, slice or finish; 0 = never
     double last_sec;
 } kv_read_cost;
 /** @var kv_read_cost::scc
@@ -1946,7 +1947,7 @@ typedef struct {
 void kv_read_cost_observe(kv_read_cost *c, uint64_t bytes, uint64_t cached, double ms, double now_sec);
 /** L342: a load started or progressed at `now_sec` -- holds the relaxation (kv_read_cost::last_sec). */
 /// @param c        the fit (caller holds server::mu)
-/// @param now_sec  server_now_sec() now; an earlier reading is ignored
+/// @param now_sec  pulsar_mono_sec() now; an earlier reading is ignored
 void kv_read_cost_touch(kv_read_cost *c, double now_sec);
 /** L353 no. 16: how many times a restore read its chain.
  *  @param verify it was checked before the load
@@ -1958,7 +1959,7 @@ uint64_t kv_restore_reads(bool verify, bool retained);
 /// @param c        the fit
 /// @param bytes    bytes to read
 /// @param cached   of which in the RAM tier
-/// @param now_sec  server_now_sec() now (the relaxation's clock)
+/// @param now_sec  pulsar_mono_sec() now (the relaxation's clock)
 /// @param ms       receives the estimate, ms
 /// @return false before the first load
 bool kv_read_cost_ms(const kv_read_cost *c, uint64_t bytes, uint64_t cached, double now_sec, double *ms);
@@ -2032,7 +2033,7 @@ typedef struct {
     SlotIdx slot;           ///< that job's slot
     PromptPos mark;         ///< the cut the leader's prefill is to stand at: an index into both prompts (shared by id)
     PromptToks have;        ///< the request's tokens served when it started waiting (the gain is mark - have)
-    double since;           ///< server_now_sec() when it started waiting
+    double since;           ///< pulsar_mono_sec() when it started waiting
 } prefix_wait;
 
 /** One bound prefill a queued request could wait on. */
@@ -2158,18 +2159,7 @@ typedef struct {
  *  @param bytes      receives the pool's size
  *  @param retain     receives whether the RAM tier is on */
 void kv_ram_plan_for(int integrated, uint64_t mem_total, int64_t ram_mb, uint64_t *bytes, bool *retain);
-/** What meminfo_kib found (L335: a missing key and an unreadable file are told apart). */
-enum meminfo_read {
-    MEMINFO_FOUND,       ///< the field was read
-    MEMINFO_MISSING,     ///< the file has no such field
-    MEMINFO_UNREADABLE,  ///< the file would not open
-};
-/** One field of a meminfo-format file (watchdog.cpp; the stall dump's swap line and kv_host_mem_total_from's MemTotal).
- *  @param path the meminfo file ("/proc/meminfo"; a test passes its own)
- *  @param key a field with its colon ("SwapTotal:")
- *  @param kib receives the field's value in KiB (0 unless found)
- *  @return MEMINFO_FOUND, MEMINFO_MISSING (the file has no such field) or MEMINFO_UNREADABLE (it would not open) */
-meminfo_read meminfo_kib(const char *path, const char *key, uint64_t *kib);
+/* meminfo_kib and meminfo_read: lib/pulsar_meminfo.h (the one /proc/meminfo reader, L442) */
 /** L338 (CT 130, 2026-11-03): a cgroup v2 memory.max value in bytes -- 0 for "max" (no limit) or anything unreadable.
  *  @param text the file's contents  @return the limit in bytes, 0 for none */
 uint64_t kv_cgroup_limit_parse(const char *text);
@@ -2537,18 +2527,21 @@ constexpr BankCount session_pool_cap{PULSAR_SESSION_POOL_CAP};
  *  plus the guard's floor (PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES, the one reserve).
  *  @param working_set_bytes the working set: PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES at sizing
  *  @return the margin, bytes */
-static inline KvBytes server_discrete_margin_bytes(KvBytes working_set_bytes) {
-    return working_set_bytes + KvBytes{PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES};
+static inline DeviceBytes server_discrete_margin_bytes(DeviceBytes working_set_bytes) {
+    return working_set_bytes + DeviceBytes{PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES};
 }
 /** L347 I4: the working set the warmup measured on a discrete card (0 when the readings say none).
  *  @param free_before_create the device's free memory just before the session's create
  *  @param free_after_warmup  its free memory after the warmup
- *  @param session_resident   what of the session is resident then (its price less untouched demand-paged VA)
+ *  @param session_resident   what of the session is resident then (its price less untouched demand-paged VA): KV,
+ *                            in the device's memory (pulsar_kv_device_bytes)
  *  @return bytes */
-static inline KvBytes server_discrete_working_set_bytes(KvBytes free_before_create, KvBytes free_after_warmup,
-                                                        KvBytes session_resident) {
-    const KvBytes taken = free_before_create > free_after_warmup ? free_before_create - free_after_warmup : KvBytes{};
-    return taken > session_resident ? taken - session_resident : KvBytes{};
+static inline DeviceBytes server_discrete_working_set_bytes(DeviceBytes free_before_create, DeviceBytes free_after_warmup,
+                                                            KvBytes session_resident) {
+    const DeviceBytes taken =
+        free_before_create > free_after_warmup ? free_before_create - free_after_warmup : DeviceBytes{};
+    const DeviceBytes resident = pulsar_kv_device_bytes(session_resident);
+    return taken > resident ? taken - resident : DeviceBytes{};
 }
 /// The box's usable memory for the static admission formula, bytes (an upper bound after warm-up).
 #define PULSAR_SERVER_USABLE_BYTES          (121ull * 1024ull * 1024ull * 1024ull)
@@ -2593,10 +2586,11 @@ static inline KvBytes server_discrete_working_set_bytes(KvBytes free_before_crea
 #define PULSAR_SERVER_MEM_FLOOR_BYTES        (4ull * 1024ull * 1024ull * 1024ull)
 
 /** L391: the free-memory readings a headroom check compares a need with, each beside its own floor.  KV bytes are
- *  device memory on a discrete card and unified memory on the GB10, and both are KvBytes: a KV need tested against
- *  the host's MemAvailable on a discrete card (as provision_bank and the per-chunk prefill checks did) reads the
- *  wrong memory and the type cannot say so.  So the reading and its floor travel together, named by what they
- *  measure, and a need is tested only through server_kv_headroom_admits.
+ *  device memory on a discrete card and unified memory on the GB10: a KV need tested against the host's MemAvailable
+ *  on a discrete card (as provision_bank and the per-chunk prefill checks did) reads the wrong memory.  So the reading
+ *  and its floor travel together, named by what they measure, and a need is tested only through
+ *  server_kv_headroom_admits.  L442: the pairs are typed by their memory (pulsar_units.h, HostBytes / DeviceBytes),
+ *  so a KV need (KvBytes) compiles against the device's pair only, through pulsar_kv_device_bytes.
  *    kv_*    the memory the KV occupies: the device's free memory over PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES on a
  *            discrete card, MemAvailable over the memory floor on unified memory (server_guard_avail_bytes /
  *            server_guard_floor -- the guard's own pair).
@@ -2606,11 +2600,11 @@ static inline KvBytes server_discrete_working_set_bytes(KvBytes free_before_crea
  *  cache's RAM tier are allocated once (pulsar_ckpt_alloc, kv_cache_open), and a persist asks the host floor for its
  *  own bytes where it runs (kv_cache.cpp).  So a chunk's host need is zero: the host must only be at its floor. */
 typedef struct server_mem_reading {
-    bool    discrete;    ///< the KV is a discrete card's (the two pairs are different memories)
-    KvBytes kv_avail;    ///< free memory where the KV lives (0 = unreadable)
-    KvBytes kv_floor;    ///< the floor that reading keeps
-    KvBytes host_avail;  ///< the host's MemAvailable (0 = unreadable)
-    KvBytes host_floor;  ///< the memory floor (server_mem_floor)
+    bool        discrete;    ///< the KV is a discrete card's (the two pairs are different memories)
+    DeviceBytes kv_avail;    ///< free memory where the KV lives (0 = unreadable); on unified memory the host's reading
+    DeviceBytes kv_floor;    ///< the floor that reading keeps
+    HostBytes   host_avail;  ///< the host's MemAvailable (0 = unreadable)
+    HostBytes   host_floor;  ///< the memory floor (server_mem_floor)
 } server_mem_reading;
 
 /// A slot's lifecycle state (session_slot::state).
@@ -2687,7 +2681,7 @@ typedef struct session_slot {
      *  history is prefilled again to its consumed end (server::terminal_checkpoint_step), so the next turn resumes
      *  there instead of re-prefilling the reply first.  Cleared by the next job's bind. */
     bool         terminal_pending;
-    /** L380: server_now_sec() when the turn that armed terminal_pending ended: its checkpoint starts no sooner than
+    /** L380: pulsar_mono_sec() when the turn that armed terminal_pending ended: its checkpoint starts no sooner than
      *  PULSAR_SERVER_TERMINAL_GRACE_MS after it (server_terminal_grace_left_s). */
     double       turn_ended_at;
     /** L380: the turn of a terminal checkpoint that YIELDED to a queued request (len > 0 only with terminal_pending):
@@ -3107,12 +3101,12 @@ struct server {
     KvBytes      guard_touched_ceiling;  ///< the startup ceiling (post-warmup reading); the live budget never exceeds it
     KvBytes      guard_kv_budget;        ///< the ledger budget the ceiling was cut from
     KvBytes      guard_eager_bytes;      ///< eager floor already resident
-    KvBytes      guard_avail;            ///< the headroom reading the live budget last used (server_guard_avail_bytes)
-    KvBytes      guard_floor;            ///< the floor that reading must stay above (server_guard_floor)
+    DeviceBytes  guard_avail;            ///< the headroom reading the live budget last used (server_guard_avail_bytes)
+    DeviceBytes  guard_floor;            ///< the floor that reading must stay above (server_guard_floor)
     /** L338: the KV is a discrete card's: its readings are the device's.  L391: set whether or not the guard runs
      *  -- every headroom check reads the memory the bytes occupy through it (server::mem_reading). */
     bool         guard_discrete;
-    double       guard_avail_at;         ///< when it was read (server_now_sec); re-read at most every 0.25 s
+    double       guard_avail_at;         ///< when it was read (pulsar_mono_sec); re-read at most every 0.25 s
     KvBytes      guard_budget_said;      ///< the live budget last logged (a move of 0.5 GiB or more is said)
     /** L357: the ledger budget set at run time by the test route POST /test/guard-budget (0 = none: guard_kv_budget
      *  stands).  The run-time twin of PULSAR_SERVER_KV_BUDGET_OVERRIDE, so the live legs that lower the budget share
@@ -3126,7 +3120,7 @@ struct server {
     void set_test_guard_budget(KvBytes b) { __atomic_store_n(&guard_test_budget_raw, b.raw(), __ATOMIC_RELAXED); }
     /** L357: PULSAR_SERVER_TEST_ROUTES=1 at startup -- the /test/ routes answer; otherwise they are unknown paths. */
     bool         test_routes;
-    /** L362: when spill_bank last said "nowhere to park the pool" for each bank (server_now_sec; once per 10 s) */
+    /** L362: when spill_bank last said "nowhere to park the pool" for each bank (pulsar_mono_sec; once per 10 s) */
     pulsar_indexed<double, BankId, PULSAR_SESSION_POOL_CAP> park_refused_said;
     /** The stall watchdog (watchdog.cpp).  `stall_s` is written by the watchdog and read by /health (__atomic);
      *  For the dump, `worker_tid` is set by server_worker_main and `worker_thread` by cli_main after pthread_create. */
@@ -3962,12 +3956,12 @@ struct server {
      *  has passed, and the sync yields at a chunk end to a request queued meanwhile (server_request_queued, after
      *  at least one chunk landed): the bank then stands at a valid prefix, nothing is persisted, and the slot stays
      *  pending with its turn kept (session_slot::terminal_turn) for the next idle moment. */
-    /// @param now_sec       server_now_sec() now
+    /// @param now_sec       pulsar_mono_sec() now
     /// @param grace_waived  true to pick a turn still inside its grace (shutdown: every pending checkpoint runs)
     /// @return true when it ran one (to its end or to a yield) or dropped one that no longer applies, false when none
     ///         is pending and due
     bool terminal_checkpoint_step(double now_sec, bool grace_waived);
-    /// @param now_sec server_now_sec() now
+    /// @param now_sec pulsar_mono_sec() now
     /// @return seconds until the earliest pending terminal checkpoint is due (0: one is due now), < 0 when none is
     ///         pending -- the idle worker's wait (L380)
     double terminal_wait_s(double now_sec) const;
@@ -4725,16 +4719,16 @@ struct job {
      *  a prefill it shares): a gateway in front (Cloudflare's ~100 s origin timeout) sees bytes from then on, not at
      *  the first prefill chunk.  The worker claims the socket (job_claim_writes) before its first write; after that
      *  the client thread writes nothing.  All under mu. */
-    double accepted_at;   ///< server_now_sec when the client thread enqueued it
+    double accepted_at;   ///< pulsar_mono_sec when the client thread enqueued it
     bool worker_writes;   ///< the worker owns the socket's writes
     bool sse_early;       ///< the client thread sent the SSE head (the stream is open)
     bool sse_early_dead;  ///< an early write failed: the stream is dead
-    double early_last;    ///< server_now_sec of the last early write
+    double early_last;    ///< pulsar_mono_sec of the last early write
 };
 /** Client thread, mu held, while the job waits: open the stream / send a keepalive when one is due (a streaming
  *  request the worker has not claimed).  A write that does not go out whole marks the stream dead. */
 /// @param j    the job
-/// @param now  server_now_sec
+/// @param now  pulsar_mono_sec
 void job_early_keepalive(job *j, double now);
 /** Worker: take the socket's writes from the client thread (before the job's first write).  Returns whether the
  *  stream is already open; `*dead` = an early write failed (nothing more can be written). */
@@ -5197,10 +5191,10 @@ struct gen_state {
     fuse_witness fuse;
     /** L312: the fused lane's round selection (sched_value.cpp) -- this request's token service price over f
      *  (ms per token, Flare's ServicePrice; kept from prefill into decode; <= 0 until first priced), when it last
-     *  delivered output (the decode-age clock, server_now_sec; 0: never), and the round it last rode as a prompt
+     *  delivered output (the decode-age clock, pulsar_mono_sec; 0: never), and the round it last rode as a prompt
      *  (the unpriced rule's order). */
     double sched_inv_ms;
-    /// when it last delivered output (server_now_sec; 0: never)
+    /// when it last delivered output (pulsar_mono_sec; 0: never)
     double sched_out_t;
     /// the round it last rode as a prompt (server::w_sched_rounds; 0: never)
     uint64_t sched_last_ride;
@@ -6197,7 +6191,6 @@ bool anthropic_final_response(int fd,
                                      int prompt_tokens, int completion_tokens);
 bool anthropic_sse_start_live(int fd, const request *r, const char *id,
                                      int prompt_tokens, anthropic_stream *st);
-double server_now_sec(void);
 void server_log(pulsar_log_type type, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 int tool_memory_max_entries(const tool_memory *m);
@@ -6361,8 +6354,8 @@ bool server_route_in_place(TokCount common, TokPos resume_at, TokPos frontier, T
 int server_image_cold_cut(int cut, const pulsar_image_ref *images, int n_images, int *inside);
 /* The admission budgets (unified memory; a discrete card's own) and the command line with its disk KV directory
  * resolved: defined in cli_main.cpp for main(), unit-tested in server_tests.cpp. */
-KvBytes server_kv_budget_bytes(KvBytes weights_resident_bytes);
-KvBytes server_kv_budget_discrete_bytes(KvBytes free_bytes, KvBytes working_set_bytes);
+KvBytes server_kv_budget_bytes(HostBytes weights_resident_bytes);
+KvBytes server_kv_budget_discrete_bytes(DeviceBytes free_bytes, DeviceBytes working_set_bytes);
 server_config server_parse_options(int argc, char **argv);
 void server_resolve_kv_disk_dir(server_config *c);
 /* Admission predicate (defined in cli_main.cpp; unit-tested there). */
@@ -6370,9 +6363,9 @@ bool server_kv_admits(KvBytes kv_budget_bytes, KvBytes committed_bytes, KvBytes 
 /* L319: the touched-KV ceiling -- min(kv budget − eager, touched + avail − floor); 0 when avail is at or under the
  * floor, or unreadable (defined in cli_main.cpp; unit-tested there).  The startup ceiling reads the post-warmup
  * headroom; the guard's live budget (server::guard_budget) the current one.  What avail and floor are is the device's
- * (server_guard_avail_bytes, server_guard_floor). */
+ * (server_guard_avail_bytes, server_guard_floor): device memory, which on unified memory is MemAvailable. */
 KvBytes server_guard_touched_budget(KvBytes kv_budget_bytes, KvBytes eager_bytes, KvBytes touched_bytes,
-                                    KvBytes avail_bytes, KvBytes floor);
+                                    DeviceBytes avail_bytes, DeviceBytes floor);
 /* L338: the guard's headroom on a DISCRETE card.  Its demand-paged KV lands in the card's own memory, so the reading
  * is the device's free memory (cudaMemGetInfo, exact there) above PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES, and the
  * ledger's share (budget − eager) does not cap it: on a discrete card the budget is free-after-weights less the
@@ -6381,11 +6374,12 @@ KvBytes server_guard_touched_budget(KvBytes kv_budget_bytes, KvBytes eager_bytes
  * prompt over ~2K tokens was refused (2026-11-02, CT 130).  GB10's unified memory keeps MemAvailable, the host floor
  * and the ledger's share. */
 /// @param discrete the KV lives in a discrete card's memory (pulsar_gpu_integrated() == 0)
-/// @return the headroom reading in bytes (0 = unreadable: every decision fails closed)
-KvBytes server_guard_avail_bytes(bool discrete);
+/// @return the headroom reading in bytes (0 = unreadable: every decision fails closed): the device's free memory, or
+///         on unified memory MemAvailable (the one pool)
+DeviceBytes server_guard_avail_bytes(bool discrete);
 /// @param discrete as server_guard_avail_bytes
 /// @return the floor that reading keeps free
-KvBytes server_guard_floor(bool discrete);
+DeviceBytes server_guard_floor(bool discrete);
 
 /* ==== The memory floor (2026-10-29 production hang) ========================================================
  * The hang: Nemotron 3.5 Super, 16 banks at --ctx 1M, a continued prefill at ~188k.  The guard's ceiling had
@@ -6404,35 +6398,52 @@ KvBytes server_guard_floor(bool discrete);
  * test, a tool) it is the OS margin alone. */
 /** The derived floor (bytes). */
 /// @return the floor, bytes
-KvBytes server_mem_floor(void);
+HostBytes server_mem_floor(void);
 /** Derive and set the floor: the OS margin + `zone_high_bytes` + `step_bytes`; returns it. */
 /// @param zone_high_bytes  the zones' high watermarks, bytes
 /// @param step_bytes  the largest demand of one worker step, bytes
 /// @return the floor, bytes
-KvBytes server_mem_floor_init(KvBytes zone_high_bytes, KvBytes step_bytes);
+HostBytes server_mem_floor_init(HostBytes zone_high_bytes, HostBytes step_bytes);
+/** The floor's step term (server_mem_floor_init): the largest host demand one worker step makes between two checks --
+ *  a persist's (`persist`), and on unified memory a prefill chunk's new KV pages on one bank (`chunk_kv`).  On a
+ *  discrete card the chunk's KV is the device's (its floor is PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES and every
+ *  chunk is checked against the device, server_kv_headroom_admits), so it is no host demand (L442; before, it was
+ *  added to the host floor there too). */
+/// @param discrete  the KV is a discrete card's (pulsar_gpu_integrated() == 0)
+/// @param chunk_kv  one prefill chunk's KV growth on one bank (the family's growth price)
+/// @param persist   a persist's host bytes at the full context (server_persist_host_bytes)
+/// @return the step, bytes
+HostBytes server_floor_step_bytes(bool discrete, KvBytes chunk_kv, HostBytes persist);
 /** Sum of every zone's `high` watermark in a /proc/zoneinfo text, in bytes (pages of `page_bytes`); 0 when none
  *  parses (the caller logs it and the floor keeps the OS margin). */
 /// @param zoneinfo  the file's text
 /// @param page_bytes  the page size, bytes
 /// @return bytes
-KvBytes server_zoneinfo_high_bytes(const char *zoneinfo, uint64_t page_bytes);
+HostBytes server_zoneinfo_high_bytes(const char *zoneinfo, uint64_t page_bytes);
 /** /proc/zoneinfo's high watermarks (server_zoneinfo_high_bytes over the live file); 0 when unreadable. */
 /// @return bytes
-KvBytes server_zone_high_watermark_bytes(void);
+HostBytes server_zone_high_watermark_bytes(void);
 /** The host bytes one disk-KV persist of a `tokens`-long history can take beyond the pinned staging buffer: the
  *  writeback window of dirty page cache (PULSAR_WRITEBACK_STEP) and the two renders of the history's text
  *  (pulsar_kvchain_persist), bounded at PERSIST_TEXT_BYTES_PER_TOKEN a token. */
 /// @param tokens  the history's length
 /// @return bytes
-KvBytes server_persist_host_bytes(int tokens);
+HostBytes server_persist_host_bytes(int tokens);
 /// Rendered-text bytes a token is bounded at for a persist's host demand (server_persist_host_bytes).
 #define PERSIST_TEXT_BYTES_PER_TOKEN 64u
-/** Does MemAvailable `avail` leave `floor` after `need` more bytes?  avail 0 (unreadable) is no. */
+/** Does the host's MemAvailable `avail` leave `floor` after `need` more bytes?  avail 0 (unreadable) is no. */
 /// @param avail  MemAvailable, bytes (0 = unreadable)
 /// @param need  the bytes about to be taken
 /// @param floor  the floor, bytes
 /// @return true when the floor stays
-bool server_headroom_admits(KvBytes avail, KvBytes need, KvBytes floor);
+bool server_headroom_admits(HostBytes avail, HostBytes need, HostBytes floor);
+/** The same test on the device's memory (a KV need, through pulsar_kv_device_bytes): the reading, the need and the
+ *  floor are all one memory's, or the call does not compile. */
+/// @param avail  the device's free memory, bytes (0 = unreadable)
+/// @param need  the bytes about to be taken
+/// @param floor  the floor, bytes
+/// @return true when the floor stays
+bool server_headroom_admits(DeviceBytes avail, DeviceBytes need, DeviceBytes floor);
 /** L391: do the readings admit `kv_need` more bytes of KV?  The KV's own memory must keep its floor after the need
  *  (the device on a discrete card, where a need of zero asks nothing of it), and the host must be at or over its
  *  floor (on unified memory the two are one reading and one test).  An unreadable reading (0) refuses. */
@@ -6485,11 +6496,6 @@ typedef enum { PREFILL_MEM_GO = 0, PREFILL_MEM_SPILL, PREFILL_MEM_PREEMPT, PREFI
 extern const char *const prefill_mem_step_names[PREFILL_MEM_STEPS];
 prefill_mem_step server_prefill_mem_step(const server_mem_reading &m, KvBytes need, int n_idle_victims,
                                          bool preemptible);
-
-/* MemAvailable from /proc/meminfo, in bytes (0 on parse failure — callers
- * fail closed).  Never called on a token/layer hot path (defined in
- * generate.cpp; also used by startup warmup/budget derivation in cli_main.cpp). */
-KvBytes server_mem_available_bytes(void);
 
 /* ==== The stall watchdog (watchdog.cpp) ===================================================================
  * The worker marks every CUDA-heavy section it enters (src/lib/pulsar_stall.h; each mark a heartbeat).  A watchdog

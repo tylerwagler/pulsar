@@ -9,7 +9,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#include "lib/pulsar_units.h"   /* KvRows / KvBytes: the KV accounting's units (L333) */
+#include "lib/pulsar_units.h"   /* KvRows / KvBytes: the KV accounting's units (L333); HostBytes (L442) */
 
 
 /* Public engine boundary.
@@ -699,13 +699,14 @@ KvBytes pulsar_session_resident_bytes(const pulsar_session *s);
  *  host tier); 0 on an integrated GPU (GB10), where they are device memory and in pulsar_session_resident_bytes.
  *  @param s the session
  *  @return pinned host bytes */
-KvBytes pulsar_session_ckpt_host_bytes(const pulsar_session *s);
+HostBytes pulsar_session_ckpt_host_bytes(const pulsar_session *s);
 /** Resident (mmap'd, read-only, shared) weight footprint in bytes: the main
  * GGUF plus an external drafter and expert overlay when mapped separately.
- * This competes with per-session KV for the unified-memory budget. */
+ * A host mapping (L442: HostBytes); on unified memory it is the pool's, and it
+ * competes with per-session KV for the unified-memory budget. */
 /** @param e the engine, or NULL (0)
  *  @return mapped weight bytes */
-KvBytes pulsar_engine_weights_resident_bytes(pulsar_engine *e);
+HostBytes pulsar_engine_weights_resident_bytes(pulsar_engine *e);
 /** Whether `fp` is a terminal (pulsar_log colours only there).
  *  @param fp an open stream
  *  @return true when its descriptor is a tty */

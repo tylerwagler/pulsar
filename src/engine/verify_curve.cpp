@@ -682,17 +682,17 @@ bool pulsar_session_verify_profile_local(pulsar_session *s, uint32_t rows_max, d
             spec_bank_save(s, bank);
             pulsar_session_spec_arm_capture_local(s, rows);
             uint32_t got = 0;
-            const double t0 = now_sec();
+            const double t0 = pulsar_mono_sec();
             ok = fs->decode_mixed(s, reqs, rows, logits.data(), (int)((size_t)rows * V), &got,
                                   PULSAR_MSEQ_HEAD_ALL_ROWS, err, errlen) == 0 && got == rows;
-            const double t1 = now_sec();
+            const double t1 = pulsar_mono_sec();
             pulsar_session_spec_arm_capture_local(s, 0u);
             if (!ok) break;
             pulsar_gpu_seg_stats_get(&g1);
             const bool replayed = g1.misses == g0.misses;
             if (paired) {
                 if (warm && base) {
-                    ms[timed++] = (t1 - t0) * 1e3;
+                    ms[timed++] = pulsar_ms_of_sec(t1 - t0);
                     if (!replayed && !missed) {
                         missed = true;
                         fprintf(stderr, "pulsar: verify curve: the %u-row verify missed the graph cache after the "
@@ -705,7 +705,7 @@ bool pulsar_session_verify_profile_local(pulsar_session *s, uint32_t rows_max, d
             } else {
                 if (!warm && rep >= 1u && replayed) warm = true;
                 if (warm && base) {
-                    ms[timed++] = (t1 - t0) * 1e3;
+                    ms[timed++] = pulsar_ms_of_sec(t1 - t0);
                 } else if (!warm && rep + 1u == VC_WARM_MAX) {
                     /* rule 5: a width whose segments never all replay is timed as it runs, and says so */
                     warm = true;
@@ -750,7 +750,7 @@ int pulsar_session_verify_curve_open(pulsar_session *s, const char *cache_dir, c
     char path[4096] = "";
     if (cache_dir && cache_dir[0])
         snprintf(path, sizeof path, "%s/%016llx.curve", cache_dir, (unsigned long long)key);
-    const double t0 = now_sec();
+    const double t0 = pulsar_mono_sec();
     const bool cached = path[0] && vc_cache_read(path, key, rows_max, base);
     /* L306: the walk runs on every start -- it is the warmup's catalog of the verify widths -- and times them only
      * without a cached curve (on a pair every rank runs it in step, L315); then the drafter's own captured shapes
@@ -770,7 +770,7 @@ int pulsar_session_verify_curve_open(pulsar_session *s, const char *cache_dir, c
     for (uint32_t r = 1; r <= rows_max && at < (int)sizeof line - 16; r++)
         at += snprintf(line + at, sizeof line - (size_t)at, " %.1f", c->base_ms[r]);
     fprintf(stderr, "pulsar: verify curve %s (key %016llx, %.1f s): ms at 1..%u rows:%s\n",
-            c->cached ? "loaded from the cache" : "profiled", (unsigned long long)c->key, now_sec() - t0, rows_max,
+            c->cached ? "loaded from the cache" : "profiled", (unsigned long long)c->key, pulsar_mono_sec() - t0, rows_max,
             line);
     /* L327: the prompt chunk cost fit beside it, under its key -- read back only with a cached curve (a curve
      * profiled again starts a fresh fit), written as it moves; a pair's leader fits nothing (the observations stop

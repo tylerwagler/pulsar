@@ -363,7 +363,7 @@ uint32_t pulsar_engine_bank_pool(int *pinned_by_env) { if (pinned_by_env) *pinne
 void pulsar_engine_set_bank_pool(uint32_t n_banks) { gpu_graph_bank_pool_set(n_banks); }
 KvBytes pulsar_engine_demand_paged_bytes_per_bank(pulsar_engine *e, int ctx_size) { PULSAR_FAMILY_REQUIRES_E(e, PULSAR_FAMILY_CAP_BANKS, "the demand-paged bank price", KvBytes{}); return e ? e->family->banks->demand_paged_bytes(e, ctx_size) : KvBytes{}; }
 /* the mapped weights enter the ledger's unit here: they compete with the sessions' KV for the same budget */
-KvBytes pulsar_engine_weights_resident_bytes(pulsar_engine *e) { return KvBytes{e ? e->weights_resident_bytes() : 0}; }
+HostBytes pulsar_engine_weights_resident_bytes(pulsar_engine *e) { return HostBytes{e ? e->weights_resident_bytes() : 0}; }
 int pulsar_engine_collect_imatrix(pulsar_engine *e,
                                const char *dataset_path,
                                const char *output_path,
@@ -1581,9 +1581,9 @@ uint32_t pulsar_session_resume_grid(const pulsar_session *s) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(const_cast<pulsar_session *>(s));
     return st && st->ops ? st->ops->resume_grid : 0u;
 }
-KvBytes pulsar_session_ckpt_host_bytes(const pulsar_session *s) {
+HostBytes pulsar_session_ckpt_host_bytes(const pulsar_session *s) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(const_cast<pulsar_session *>(s));
-    return kv_bytes_of(st && st->ops ? pulsar_ckpt_host_bytes(st) : TensorBytes{});   /* L438: the named crossing */
+    return host_bytes_of(st && st->ops ? pulsar_ckpt_host_bytes(st) : TensorBytes{});   /* L442: pinned host slabs */
 }
 bool pulsar_session_split_invariant(const pulsar_session *s) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(const_cast<pulsar_session *>(s));
@@ -2062,8 +2062,8 @@ void pulsar_engine_lane_cost_observe(pulsar_engine *e, pulsar_decode_lane lane, 
         f->ann_row_us = f->row_us;
         f->ann_n = f->n;
         fprintf(stderr, "pulsar: %s lane cost measured: step = %.1f + %.2f x rows ms (%u steps%s)\n",
-                lane == PULSAR_LANE_SPEC ? "spec" : "plain", (double)f->flat_us / 1000.0,
-                (double)f->row_us / 1000.0, f->n, first ? "" : ", moved");
+                lane == PULSAR_LANE_SPEC ? "spec" : "plain", pulsar_ms_of_us((double)f->flat_us),
+                pulsar_ms_of_us((double)f->row_us), f->n, first ? "" : ", moved");
     }
 }
 pulsar_lane_cost pulsar_engine_lane_cost(const pulsar_engine *e, pulsar_decode_lane lane) {

@@ -269,13 +269,6 @@ struct pulsar_engram_io {
     int stopping;
 };
 
-/// @return CLOCK_MONOTONIC, in ns
-static uint64_t engram_now_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-}
-
 /// Free a detached gather with its pool-owned rows and dst.
 /// @param g the gather
 static void engram_gather_free(pulsar_engram_gather *g) {
@@ -350,7 +343,7 @@ static void *engram_io_worker(void *arg) {
 
         uint32_t failed = 0, first_errno = 0;
         uint64_t first_bad = 0;
-        const uint64_t t0 = bg ? engram_now_ns() : 0;
+        const uint64_t t0 = bg ? pulsar_mono_ns() : 0;
         unsigned char sink[PULSAR_ENGRAM_AHEAD_ROW_MAX];
         for (uint32_t i = i0; i < i1; i++) {
             unsigned char *d = g->dst ? g->dst + (uint64_t)i * g->table->row_bytes : sink;
@@ -367,7 +360,7 @@ static void *engram_io_worker(void *arg) {
             io->ahead.rows_read += i1 - i0 - failed;
             io->ahead.rows_failed += failed;   /* a hint's failure is the later gather's to report */
             io->ahead.bytes_read += (uint64_t)(i1 - i0 - failed) * g->table->row_bytes;
-            io->ahead.read_ns += engram_now_ns() - t0;
+            io->ahead.read_ns += pulsar_mono_ns() - t0;
             if (engram_bg_ready(io)) pthread_cond_signal(&io->work);
         } else if (--io->hi_busy == 0 && engram_bg_ready(io)) {
             pthread_cond_signal(&io->work);   /* the foreground went quiet: the background resumes */

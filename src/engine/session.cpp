@@ -968,7 +968,7 @@ static bool open_finish(pulsar_engine *e, const pulsar_engine_options *opt) {
         fprintf(stderr, "pulsar: TP rank %d/%d armed (prefill big-gate), slab %zu bytes, %.2f GiB of stored tensors "
                         "unstaged (the plan's)\n",
                 pulsar_tp_rank(e->tp), pulsar_tp_n_ranks(e->tp), e->tp_slab_bytes,
-                (double)pulsar_model_unstaged_expert_bytes(&e->model) / 1073741824.0);
+                (double)pulsar_model_unstaged_expert_bytes(&e->model) / PULSAR_GIB);
     }
 
     /* The rank's TP slices (the core's plan), then the family's own device-side registrations and announces. */
@@ -994,7 +994,7 @@ static bool open_finish(pulsar_engine *e, const pulsar_engine_options *opt) {
                 released += pulsar_model_release_host_pages(&e->dspark_model);
             if (e->overlay_ready) released += pulsar_model_release_host_pages(&e->overlay_model);
             fprintf(stderr, "pulsar: released %.2f GiB of checkpoint pages from host memory after load "
-                            "(weights are device-resident)\n", (double)released / 1073741824.0);
+                            "(weights are device-resident)\n", (double)released / PULSAR_GIB);
         }
     }
 

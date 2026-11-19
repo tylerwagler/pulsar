@@ -150,7 +150,7 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
             ARCH, s->name, s->n_layer, s->n_layer - n_full, s->window, s->n_head, s->swa_n_head_kv, s->swa_head_dim, n_full,
             s->n_head, s->n_head_kv, s->head_dim, s->n_ff, pulsar_gemma4_ff_stored(s), s->n_expert_used, s->n_expert,
             s->n_ff_exp, pulsar_gemma4_ff_exp_stored(s), (double)s->softcap,
-            (double)w->census.bytes / (1024.0 * 1024.0 * 1024.0));
+            (double)w->census.bytes / PULSAR_GIB);
     return true;
 }
 

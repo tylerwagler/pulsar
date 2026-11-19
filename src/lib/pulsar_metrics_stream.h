@@ -33,6 +33,8 @@
 #include <pthread.h>
 #include <time.h>
 
+#include "lib/pulsar_clock.h"
+
 /** The pace of one subscriber's frames.  `refresh_ms >= min_interval_ms > 0`. */
 struct pulsar_metrics_stream_pace {
     int min_interval_ms;   ///< two frames are at least this far apart; also the longest a mark waits for its frame
@@ -93,13 +95,6 @@ static inline pulsar_metrics_stream_step pulsar_metrics_stream_plan(const pulsar
     return {PULSAR_METRICS_STREAM_WAIT, (int)(to_refresh < pace.min_interval_ms ? to_refresh : pace.min_interval_ms)};
 }
 
-/** @return the monotonic clock, ms */
-static inline long long pulsar_metrics_stream_now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long long)ts.tv_sec * 1000ll + ts.tv_nsec / 1000000l;
-}
-
 /** Block until the subscriber is owed a frame or the stream stops, and move its cursor to that frame.  The wait is
  *  on the monotonic clock (pthread_cond_clockwait): a wall-clock step neither holds a frame back nor releases one.
  *  @param c           the subscriber's cursor (zeroed before the first call)
@@ -123,7 +118,7 @@ static inline pulsar_metrics_stream_event pulsar_metrics_stream_next(pulsar_metr
             return PULSAR_METRICS_STREAM_STOP;
         }
         const unsigned long long gen = pulsar_metrics_feed_read(generation);
-        const long long now = pulsar_metrics_stream_now_ms();
+        const long long now = pulsar_mono_ms();
         const pulsar_metrics_stream_step step = pulsar_metrics_stream_plan(*c, gen, now, *pace);
         if (step.event != PULSAR_METRICS_STREAM_WAIT) {
             c->sent = true;
@@ -133,10 +128,9 @@ static inline pulsar_metrics_stream_event pulsar_metrics_stream_next(pulsar_metr
             pthread_mutex_unlock(mu);
             return step.event;
         }
-        struct timespec deadline;
-        clock_gettime(CLOCK_MONOTONIC, &deadline);
-        deadline.tv_sec += step.wait_ms / 1000;
-        deadline.tv_nsec += (long)(step.wait_ms % 1000) * 1000000L;
+        struct timespec deadline = pulsar_mono_ts();
+        deadline.tv_sec += pulsar_sec_of_ms(step.wait_ms);
+        deadline.tv_nsec += pulsar_ns_of_ms((long)(step.wait_ms % 1000));
         if (deadline.tv_nsec >= 1000000000L) {
             deadline.tv_sec += 1;
             deadline.tv_nsec -= 1000000000L;

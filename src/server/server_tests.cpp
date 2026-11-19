@@ -116,11 +116,11 @@ static int unseamed_mark_merge(int cur, int want, int pos) {
 /* L391: hand-built free-memory readings (server_mem_reading).  Unified memory: one reading, one floor, the KV's and
  * the host's alike.  A discrete card: the device's pair for the KV, the host's own beside it. */
 static server_mem_reading test_mem_unified(uint64_t avail, uint64_t floor) {
-    return server_mem_reading{false, KvBytes{avail}, KvBytes{floor}, KvBytes{avail}, KvBytes{floor}};
+    return server_mem_reading{false, DeviceBytes{avail}, DeviceBytes{floor}, HostBytes{avail}, HostBytes{floor}};
 }
 static server_mem_reading test_mem_discrete(uint64_t dev_free, uint64_t dev_floor, uint64_t host_avail,
                                             uint64_t host_floor) {
-    return server_mem_reading{true, KvBytes{dev_free}, KvBytes{dev_floor}, KvBytes{host_avail}, KvBytes{host_floor}};
+    return server_mem_reading{true, DeviceBytes{dev_free}, DeviceBytes{dev_floor}, HostBytes{host_avail}, HostBytes{host_floor}};
 }
 
 /* L335: request_init sets no family and no model (the loaded engine's, in the server).  A hand-built test request
@@ -1689,6 +1689,43 @@ static void test_stream_heartbeat_only_fires_when_silent(void) {
 }
 
 
+
+/* L442 clock finding: the stream writer's stall deadline and idle clock read the WALL clock (gettimeofday), so a step
+ * of the system time (NTP, a manual set) moved them: a forward step failed a healthy stream's send as stalled, or
+ * sent a heartbeat early; a backward one held a stalled send past its timeout and starved the heartbeat.  They are
+ * intervals: they read CLOCK_MONOTONIC now.  The writer's stamps fall between two monotonic readings. */
+static void test_l442_stream_writer_is_monotonic(void) {
+    signal(SIGPIPE, SIG_IGN);
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+    int small = 4096;   /* as test_slot_writer_stall_times_out: a peer that never reads fills the socket at once */
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof(small));
+    setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &small, sizeof(small));
+    set_client_socket_nonblocking(sv[0]);
+    slot_writer w;
+    slot_writer_init(&w, sv[0]);
+    const int64_t before = pulsar_mono_ms();
+    slot_writer_mark_written(&w);
+    const int64_t after = pulsar_mono_ms();
+    TEST_ASSERT(w.last_write_ms >= before && w.last_write_ms <= after);
+    /* idle against the same clock: not idle now, idle an interval later */
+    TEST_ASSERT(!slot_writer_idle_for(&w, pulsar_mono_ms(), PULSAR_SERVER_HEARTBEAT_MS));
+    TEST_ASSERT(slot_writer_idle_for(&w, after + PULSAR_SERVER_HEARTBEAT_MS, PULSAR_SERVER_HEARTBEAT_MS));
+    /* a deferred send arms its stall deadline on the monotonic clock too */
+    slot_writer_install(&w);
+    char blob[8192];
+    memset(blob, 'q', sizeof(blob));
+    const int64_t t0 = pulsar_mono_ms();
+    for (int i = 0; i < 64 && w.pending.len <= w.off; i++) (void)send_all(sv[0], blob, sizeof(blob));
+    const int64_t t1 = pulsar_mono_ms();
+    TEST_ASSERT(w.pending.len > w.off);
+    TEST_ASSERT(w.stall_deadline_ms >= t0 + PULSAR_SERVER_SEND_STALL_TIMEOUT_MS &&
+                w.stall_deadline_ms <= t1 + PULSAR_SERVER_SEND_STALL_TIMEOUT_MS);
+    slot_writer_free(&w);
+    close(sv[0]);
+    close(sv[1]);
+}
 
 /* OpenAI/Responses get an SSE COMMENT, which every conformant parser drops
  * before it reaches application code — it cannot perturb the delta stream. */
@@ -14783,11 +14820,11 @@ static void test_l372_judge_bank_floor_and_release(void) {
         TEST_ASSERT(!server_judge_holds_kv(&s));   /* a freed bank holds nothing */
         J->released = false;
         /* (a) no box has this much free, and there is no chat bank to spill: refused busy, nothing installed */
-        (void)server_mem_floor_init(KvBytes{UINT64_MAX / 4}, KvBytes{0});
+        (void)server_mem_floor_init(HostBytes{UINT64_MAX / 4}, HostBytes{0});
         char err[320] = "";
         TEST_ASSERT(!s.floor_admits_chunk(1024, err, sizeof err) && strstr(err, "not enough memory") != NULL);
         TEST_ASSERT(server_judge_step(&s));
-        (void)server_mem_floor_init(KvBytes{0}, KvBytes{0});
+        (void)server_mem_floor_init(HostBytes{0}, HostBytes{0});
         TEST_ASSERT(jb.done && jb.busy && !jb.started && jb.err.find("not enough memory") != std::string::npos);
         TEST_ASSERT(!server_judge_queued(&s) && !J->released && s.live_bank == BankId::none());
         TEST_ASSERT(s.floor_admits_chunk(1024, err, sizeof err));   /* the real floor admits a chunk here */
@@ -15599,6 +15636,10 @@ static void test_unterminated_think_stays_off_content(void) {
 /** L333: a test's byte figure entered into the KV accounting's unit (pulsar_units.h); the tests below keep their
  *  arithmetic in plain integers and type it at the call, as the server types a measured or configured figure. */
 static constexpr KvBytes kvb(uint64_t v) { return KvBytes{v}; }
+/** L442: host memory bytes, as kvb.  @param v the bytes  @return HostBytes */
+static constexpr HostBytes hostb(uint64_t v) { return HostBytes{v}; }
+/** L442: device memory bytes, as kvb.  @param v the bytes  @return DeviceBytes */
+static constexpr DeviceBytes devb(uint64_t v) { return DeviceBytes{v}; }
 
 static void test_kv_admission_budget_math(void) {
     const uint64_t GiB = 1024ull * 1024ull * 1024ull;
@@ -15606,33 +15647,33 @@ static void test_kv_admission_budget_math(void) {
     /* Budget = usable - weights - overhead - free floor, clamped at 0 (the
      * floor term is the 2026-07-13 lockup fix: a fully committed budget must
      * still leave PULSAR_SERVER_MEM_FLOOR_BYTES of the machine free). */
-    TEST_ASSERT(server_kv_budget_bytes(kvb(91ull * GiB)) ==
+    TEST_ASSERT(server_kv_budget_bytes(hostb(91ull * GiB)) ==
                 kvb(PULSAR_SERVER_USABLE_BYTES - 91ull * GiB -
                     PULSAR_SERVER_PROCESS_OVERHEAD_BYTES - PULSAR_SERVER_MEM_FLOOR_BYTES));
-    TEST_ASSERT(server_kv_budget_bytes(kvb(200ull * GiB)) == kvb(0));  /* weights > usable: no underflow */
+    TEST_ASSERT(server_kv_budget_bytes(hostb(200ull * GiB)) == kvb(0));  /* weights > usable: no underflow */
     /* Reserves alone (no weights) must also clamp, not underflow. */
-    TEST_ASSERT(server_kv_budget_bytes(kvb(PULSAR_SERVER_USABLE_BYTES)) == kvb(0));
+    TEST_ASSERT(server_kv_budget_bytes(hostb(PULSAR_SERVER_USABLE_BYTES)) == kvb(0));
     /* L338 / L347 I4: a discrete card's budget is its own free memory less the margin -- a working set plus the guard's
      * floor (the one reserve), the estimate at sizing */
     const uint64_t Mi = 1024ull * 1024ull;
-    const KvBytes ws_est = kvb(PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES);
-    TEST_ASSERT(server_discrete_margin_bytes(kvb(0)) == kvb(PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES));
-    TEST_ASSERT(server_discrete_margin_bytes(ws_est) == kvb(1536ull * Mi));
-    TEST_ASSERT(server_kv_budget_discrete_bytes(kvb(9ull * GiB), kvb(1ull * GiB)) == kvb(9ull * GiB - 1536ull * Mi));
-    TEST_ASSERT(server_kv_budget_discrete_bytes(kvb(1536ull * Mi), kvb(1ull * GiB)) == kvb(0));   /* the margin */
-    TEST_ASSERT(server_kv_budget_discrete_bytes(kvb(1ull * GiB), kvb(1ull * GiB)) == kvb(0));     /* no underflow */
+    const DeviceBytes ws_est = devb(PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES);
+    TEST_ASSERT(server_discrete_margin_bytes(devb(0)) == devb(PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES));
+    TEST_ASSERT(server_discrete_margin_bytes(ws_est) == devb(1536ull * Mi));
+    TEST_ASSERT(server_kv_budget_discrete_bytes(devb(9ull * GiB), devb(1ull * GiB)) == kvb(9ull * GiB - 1536ull * Mi));
+    TEST_ASSERT(server_kv_budget_discrete_bytes(devb(1536ull * Mi), devb(1ull * GiB)) == kvb(0));   /* the margin */
+    TEST_ASSERT(server_kv_budget_discrete_bytes(devb(1ull * GiB), devb(1ull * GiB)) == kvb(0));     /* no underflow */
     /* the RTX 6000 at startup (2026-11-02): 7.9 GiB free after the weights -> 6.4 GiB, was 5.0 at max(2, total / 8) */
     const uint64_t free6000 = 7900ull * Mi;
-    TEST_ASSERT(server_kv_budget_discrete_bytes(kvb(free6000), ws_est) == kvb(free6000 - 1536ull * Mi));
+    TEST_ASSERT(server_kv_budget_discrete_bytes(devb(free6000), ws_est) == kvb(free6000 - 1536ull * Mi));
     /* the warmup's measured working set: free before the create, less free after the warmup, less the session's
      * resident bytes; readings that show none are 0, never an underflow */
-    TEST_ASSERT(server_discrete_working_set_bytes(kvb(7900ull * Mi), kvb(2250ull * Mi), kvb(4900ull * Mi)) ==
-                kvb(750ull * Mi));
-    TEST_ASSERT(server_discrete_working_set_bytes(kvb(7900ull * Mi), kvb(3000ull * Mi), kvb(4900ull * Mi)) == kvb(0));
-    TEST_ASSERT(server_discrete_working_set_bytes(kvb(2000ull * Mi), kvb(3000ull * Mi), kvb(0)) == kvb(0));
-    TEST_ASSERT(server_discrete_working_set_bytes(kvb(7900ull * Mi), kvb(2250ull * Mi), kvb(4900ull * Mi)) <=
+    TEST_ASSERT(server_discrete_working_set_bytes(devb(7900ull * Mi), devb(2250ull * Mi), kvb(4900ull * Mi)) ==
+                devb(750ull * Mi));
+    TEST_ASSERT(server_discrete_working_set_bytes(devb(7900ull * Mi), devb(3000ull * Mi), kvb(4900ull * Mi)) == devb(0));
+    TEST_ASSERT(server_discrete_working_set_bytes(devb(2000ull * Mi), devb(3000ull * Mi), kvb(0)) == devb(0));
+    TEST_ASSERT(server_discrete_working_set_bytes(devb(7900ull * Mi), devb(2250ull * Mi), kvb(4900ull * Mi)) <=
                 ws_est);   /* the 6000's measured case starts */
-    TEST_ASSERT(server_discrete_working_set_bytes(kvb(7900ull * Mi), kvb(1500ull * Mi), kvb(4900ull * Mi)) >
+    TEST_ASSERT(server_discrete_working_set_bytes(devb(7900ull * Mi), devb(1500ull * Mi), kvb(4900ull * Mi)) >
                 ws_est);   /* 1.5 GiB taken past the session: refused */
 
     /* Admission: committed + incoming <= budget, with overflow-safe compare. */
@@ -15651,7 +15692,7 @@ static void test_kv_admission_budget_math(void) {
      * admitted three. */
     const uint64_t MiB = 1024ull * 1024ull;
     const uint64_t gb10_weights = 87450ull * MiB;              /* ~85.4 GiB */
-    const KvBytes gb10_budget = server_kv_budget_bytes(kvb(gb10_weights));
+    const KvBytes gb10_budget = server_kv_budget_bytes(hostb(gb10_weights));
     TEST_ASSERT(gb10_budget == kvb(PULSAR_SERVER_USABLE_BYTES - gb10_weights -
                                    PULSAR_SERVER_PROCESS_OVERHEAD_BYTES - PULSAR_SERVER_MEM_FLOOR_BYTES));
     TEST_ASSERT(gb10_budget > kvb(13ull * GiB) && gb10_budget < kvb(14ull * GiB));   /* ~13.6 GiB */
@@ -15680,26 +15721,26 @@ static void test_guard_touched_budget_is_physical(void) {
     const uint64_t GiB = 1024ull * MiB;
     const uint64_t F = PULSAR_SERVER_MEM_FLOOR_BYTES;
     const uint64_t avail = 9400ull * MiB, budget = 41257ull * MiB, eager = 31990ull * MiB;   /* 9.18 / 40.29 / 31.24 */
-    const KvBytes c = server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(avail), server_mem_floor());
+    const KvBytes c = server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), devb(avail), server_guard_floor(false));
     TEST_ASSERT(c == kvb(avail - F));                /* the headroom binds, not the ledger's 9.05 GiB */
     TEST_ASSERT(c < kvb(budget - eager));
     /* pages the warmup touched are already out of MemAvailable: they count toward the ceiling */
-    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(1 * GiB), kvb(avail), server_mem_floor()) ==
+    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(1 * GiB), devb(avail), server_guard_floor(false)) ==
                 kvb(avail - F + 1 * GiB));
     /* a roomy box: the ledger's share binds */
-    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(64 * GiB), server_mem_floor()) == kvb(budget - eager));
+    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), devb(64 * GiB), server_guard_floor(false)) == kvb(budget - eager));
     /* no headroom, or /proc/meminfo unreadable: 0 (startup refuses rather than run the pool unguarded) */
-    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(F), server_mem_floor()) == KvBytes{});
-    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(F - 1), server_mem_floor()) == KvBytes{});
-    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(0), server_mem_floor()) == KvBytes{});
-    TEST_ASSERT(server_guard_touched_budget(kvb(eager), kvb(eager), kvb(0), kvb(avail), server_mem_floor()) == KvBytes{});
-    TEST_ASSERT(server_guard_touched_budget(kvb(UINT64_MAX), kvb(0), kvb(UINT64_MAX), kvb(avail), server_mem_floor()) ==
+    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), devb(F), server_guard_floor(false)) == KvBytes{});
+    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), devb(F - 1), server_guard_floor(false)) == KvBytes{});
+    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), devb(0), server_guard_floor(false)) == KvBytes{});
+    TEST_ASSERT(server_guard_touched_budget(kvb(eager), kvb(eager), kvb(0), devb(avail), server_guard_floor(false)) == KvBytes{});
+    TEST_ASSERT(server_guard_touched_budget(kvb(UINT64_MAX), kvb(0), kvb(UINT64_MAX), devb(avail), server_guard_floor(false)) ==
                 KvBytes::max());   /* no wrap */
     /* the invariant over a sweep */
     for (uint64_t a = F + 1; a < 40 * GiB; a += 777 * MiB)
         for (uint64_t t = 0; t < 8 * GiB; t += 1531 * MiB)
             for (uint64_t b = 0; b < 64 * GiB; b += 2999 * MiB) {
-                const uint64_t ceil = server_guard_touched_budget(kvb(b), kvb(eager / 4), kvb(t), kvb(a), server_mem_floor()).raw();
+                const uint64_t ceil = server_guard_touched_budget(kvb(b), kvb(eager / 4), kvb(t), devb(a), server_guard_floor(false)).raw();
                 TEST_ASSERT(ceil <= t || a - (ceil - t) >= F);
             }
 }
@@ -15713,23 +15754,23 @@ static void test_mem_floor_admits_warmed_box_shape(void) {
      * floor demanded 8.50 and refused (a 0.11 GiB miss with ~5.9 GiB truly
      * free at full commit); the 4 GiB floor must admit — post-admission
      * MemAvailable stays >= ~5.89 GiB, well above the backstop. */
-    const KvBytes est = kvb(2560ull * MiB);                 /* 2.5 GiB session */
-    TEST_ASSERT(server_headroom_admits(kvb(8590ull * MiB), est, server_mem_floor()));  /* 8.39 GiB avail */
+    const HostBytes est = hostb(2560ull * MiB);                 /* 2.5 GiB session */
+    TEST_ASSERT(server_headroom_admits(hostb(8590ull * MiB), est, server_mem_floor()));  /* 8.39 GiB avail */
 
     /* Warmed-box full-commit steady state measured 2026-07-15: 5.96 GiB
      * avail with three live sessions. A further session would leave ~3.4,
      * below the backstop: refuse. */
-    TEST_ASSERT(!server_headroom_admits(kvb(6103ull * MiB), est, server_mem_floor())); /* 5.96 GiB avail */
+    TEST_ASSERT(!server_headroom_admits(hostb(6103ull * MiB), est, server_mem_floor())); /* 5.96 GiB avail */
 
     /* A genuinely tight box must always refuse. */
-    TEST_ASSERT(!server_headroom_admits(kvb(4ull * GiB), est, server_mem_floor()));
+    TEST_ASSERT(!server_headroom_admits(hostb(4ull * GiB), est, server_mem_floor()));
     /* Exact boundary: est + floor. */
-    TEST_ASSERT(server_headroom_admits(est + kvb(PULSAR_SERVER_MEM_FLOOR_BYTES), est, server_mem_floor()));
-    TEST_ASSERT(!server_headroom_admits(est + kvb(PULSAR_SERVER_MEM_FLOOR_BYTES - 1), est, server_mem_floor()));
+    TEST_ASSERT(server_headroom_admits(est + hostb(PULSAR_SERVER_MEM_FLOOR_BYTES), est, server_mem_floor()));
+    TEST_ASSERT(!server_headroom_admits(est + hostb(PULSAR_SERVER_MEM_FLOOR_BYTES - 1), est, server_mem_floor()));
     /* Unreadable /proc/meminfo (avail == 0) fails closed. */
-    TEST_ASSERT(!server_headroom_admits(kvb(0), est, server_mem_floor()));
+    TEST_ASSERT(!server_headroom_admits(hostb(0), est, server_mem_floor()));
     /* Overflow guard: absurd estimate must refuse, not wrap. */
-    TEST_ASSERT(!server_headroom_admits(KvBytes::max(), kvb(UINT64_MAX - 1ull * GiB), server_mem_floor()));
+    TEST_ASSERT(!server_headroom_admits(HostBytes::max(), hostb(UINT64_MAX - 1ull * GiB), server_mem_floor()));
 }
 
 
@@ -15741,7 +15782,7 @@ static void test_mem_floor_admits_warmed_box_shape(void) {
 static void test_session_eviction_ledger_math(void) {
     const uint64_t GiB = 1024ull * 1024ull * 1024ull;
     const uint64_t MiB = 1024ull * 1024ull;
-    const KvBytes budget = server_kv_budget_bytes(kvb(87450ull * MiB)); /* ~13.6 GiB */
+    const KvBytes budget = server_kv_budget_bytes(hostb(87450ull * MiB)); /* ~13.6 GiB */
     const KvBytes slot0 = kvb(4710ull * MiB);   /* startup slot, ctx 64k measured */
     const KvBytes a = kvb(2560ull * MiB);       /* lazy 64k slot (pc 2048 shape) */
     const KvBytes b = kvb(2571ull * MiB);       /* same shape, distinct actual */
@@ -16845,7 +16886,7 @@ static std::string early_drain(int fd) {
 
 static void test_early_stream_keepalive(void) {
     signal(SIGPIPE, SIG_IGN);
-    const double iv = PULSAR_SERVER_HEARTBEAT_MS / 1000.0;
+    const double iv = pulsar_sec_of_ms((double)PULSAR_SERVER_HEARTBEAT_MS);
     for (api_style api : {API_ANTHROPIC, API_OPENAI}) {
         int sv[2];
         TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -16915,7 +16956,7 @@ static void test_early_stream_keepalive(void) {
         j.fd = sv[0];
         j.req.api = API_ANTHROPIC;
         j.req.stream = true;
-        j.accepted_at = server_now_sec();
+        j.accepted_at = pulsar_mono_sec();
         gen_state *g = (gen_state *)calloc(1, sizeof(gen_state));
         g->j = &j;
         slot_writer_init(&g->writer, sv[0]);
@@ -17542,7 +17583,7 @@ static void test_l391_ledger_two_modes(void) {
     /* Qwen: 16 chat banks, no judge -- nothing committed at startup, the estimate with all sixteen live */
     char err[320] = "";
     l391_pool_server(&s, 16);
-    const KvBytes qwen_budget = server_kv_budget_bytes(kvb(L391_QWEN_WEIGHTS));
+    const KvBytes qwen_budget = server_kv_budget_bytes(hostb(L391_QWEN_WEIGHTS));
     TEST_ASSERT(qwen_budget > kvb(36ull * GiB) && qwen_budget < kvb(37ull * GiB));   /* 36.92 GiB */
     TEST_ASSERT(s.ledger_open_pool(qwen_budget, kvb(L391_QWEN_ADMITTED), 16, err, sizeof err));
     TEST_ASSERT(s.kv_committed_bytes == kvb(0) && s.ledger_reserved_bytes == kvb(0));
@@ -17588,7 +17629,7 @@ static void test_l391_ledger_two_modes(void) {
  * bank install, which a host-only server refuses (create_fail) -- so "not ledger_full" is what is asserted. */
 static void test_l391_provision_consults_the_ledger(void) {
     struct { int chat; uint32_t priced; uint64_t admitted; KvBytes budget; } shapes[] = {
-        {16, 16, L391_QWEN_ADMITTED, server_kv_budget_bytes(kvb(L391_QWEN_WEIGHTS))},
+        {16, 16, L391_QWEN_ADMITTED, server_kv_budget_bytes(hostb(L391_QWEN_WEIGHTS))},
         {2, 3, L391_GEMMA_ADMITTED, kvb(L391_GEMMA_BUDGET)},
     };
     server s;
@@ -17666,11 +17707,11 @@ static void test_l391_provision_consults_the_ledger(void) {
  * changed. */
 static void test_l391_ledger_share_prices_growth(void) {
     const uint64_t GiB = 1024ull * 1024ull * 1024ull, MiB = 1024ull * 1024ull;
-    const KvBytes budget = server_kv_budget_bytes(kvb(L391_QWEN_WEIGHTS));
-    const KvBytes floor = kvb(4538ull * MiB);
+    const KvBytes budget = server_kv_budget_bytes(hostb(L391_QWEN_WEIGHTS));
+    const DeviceBytes floor = devb(4538ull * MiB);
     const KvBytes share = budget - kvb(L391_QWEN_ADMITTED);
     /* the ledger's share is the bound while memory has more than it free */
-    TEST_ASSERT(server_guard_touched_budget(budget, kvb(L391_QWEN_ADMITTED), kvb(0), kvb(28ull * GiB) + floor, floor) ==
+    TEST_ASSERT(server_guard_touched_budget(budget, kvb(L391_QWEN_ADMITTED), kvb(0), devb(28ull * GiB) + floor, floor) ==
                 share);
     TEST_ASSERT(share > kvb(21ull * GiB) && share < kvb(22ull * GiB));
     BankCount n_spill{0};
@@ -17727,8 +17768,8 @@ static void test_l391_provision_demand_is_demand_paged(void) {
     server s;
     l391_pool_server(&s, 2);
     const server_mem_reading m = s.mem_reading();
-    TEST_ASSERT(!m.discrete && m.kv_avail == m.host_avail && m.kv_floor == server_mem_floor() &&
-                m.host_floor == server_mem_floor());
+    TEST_ASSERT(!m.discrete && m.kv_floor == server_guard_floor(false) && m.host_floor == server_mem_floor());
+    TEST_ASSERT(m.kv_floor.raw() == m.host_floor.raw());   /* unified: one pool, one floor */
     pthread_mutex_destroy(&s.tool_mu);
     pthread_mutex_destroy(&s.mu);
 }
@@ -17746,14 +17787,17 @@ static void test_l391_discrete_reads_the_device(void) {
     const server_mem_reading host_low = test_mem_discrete(2ull * GiB, DF, HF + 1ull * MiB, HF);
     TEST_ASSERT(server_kv_headroom_admits(host_low, chunk));
     TEST_ASSERT(server_prefill_mem_step(host_low, chunk, 1, true) == PREFILL_MEM_GO);
-    TEST_ASSERT(!server_headroom_admits(host_low.host_avail, chunk, host_low.host_floor));   /* the old test: refused */
+    /* the old test: refused (the KV chunk against the host's reading: since L442 the crossing has to be spelt out) */
+    TEST_ASSERT(!server_headroom_admits(host_low.host_avail, pulsar_unified_host_bytes(pulsar_kv_device_bytes(chunk)),
+                                        host_low.host_floor));
     /* the device full and the host roomy: an idle bank is spilled, else a decoder preempted, else refused */
     const server_mem_reading dev_full = test_mem_discrete(DF + chunk.raw() - 1, DF, 20ull * GiB, HF);
     TEST_ASSERT(!server_kv_headroom_admits(dev_full, chunk));
     TEST_ASSERT(server_prefill_mem_step(dev_full, chunk, 1, true) == PREFILL_MEM_SPILL);
     TEST_ASSERT(server_prefill_mem_step(dev_full, chunk, 0, true) == PREFILL_MEM_PREEMPT);
     TEST_ASSERT(server_prefill_mem_step(dev_full, chunk, 0, false) == PREFILL_MEM_REFUSE);
-    TEST_ASSERT(server_headroom_admits(dev_full.host_avail, chunk, dev_full.host_floor));    /* the old test: admitted */
+    TEST_ASSERT(server_headroom_admits(dev_full.host_avail, pulsar_unified_host_bytes(pulsar_kv_device_bytes(chunk)),
+                                       dev_full.host_floor));    /* the old test: admitted */
     TEST_ASSERT(server_kv_headroom_admits(test_mem_discrete(DF + chunk.raw(), DF, 20ull * GiB, HF), chunk));
     /* the host under its own floor refuses whatever the device holds; an unreadable reading of either fails closed */
     TEST_ASSERT(!server_kv_headroom_admits(test_mem_discrete(8ull * GiB, DF, HF - 1, HF), chunk));
@@ -17776,9 +17820,194 @@ static void test_l391_discrete_reads_the_device(void) {
     l391_pool_server(&s, 2);
     s.guard_discrete = true;
     const server_mem_reading m = s.mem_reading();
-    TEST_ASSERT(m.discrete && m.kv_floor == kvb(DF) && m.host_floor == server_mem_floor());
+    TEST_ASSERT(m.discrete && m.kv_floor == devb(DF) && m.host_floor == server_mem_floor());
     pthread_mutex_destroy(&s.tool_mu);
     pthread_mutex_destroy(&s.mu);
+}
+
+/* ===== L442: host and device memory, values unchanged on both platforms ========================================= */
+
+/** L442: is `server_headroom_admits(A, B, C)` callable? (the compile-time half of the split, below) */
+template <class A, class B, class C, class = void>
+struct l442_headroom_callable : std::false_type {};
+/** L442: it is. */
+template <class A, class B, class C>
+struct l442_headroom_callable<A, B, C, decltype((void)server_headroom_admits(std::declval<A>(), std::declval<B>(),
+                                                                             std::declval<C>()))> : std::true_type {};
+/* one memory's three, or no call: a KV need against a host reading -- L391's S1-1 -- no longer compiles, and neither
+ * does a device reading against the host's floor */
+static_assert(l442_headroom_callable<HostBytes, HostBytes, HostBytes>::value &&
+                  l442_headroom_callable<DeviceBytes, DeviceBytes, DeviceBytes>::value,
+              "a reading, a need and a floor of one memory compare");
+static_assert(!l442_headroom_callable<HostBytes, KvBytes, HostBytes>::value &&
+                  !l442_headroom_callable<DeviceBytes, KvBytes, DeviceBytes>::value &&
+                  !l442_headroom_callable<KvBytes, KvBytes, KvBytes>::value &&
+                  !l442_headroom_callable<DeviceBytes, DeviceBytes, HostBytes>::value &&
+                  !l442_headroom_callable<HostBytes, HostBytes, DeviceBytes>::value,
+              "a KV need is no host need, and a device reading keeps no host floor");
+static_assert(std::is_same<decltype(server_mem_reading::kv_avail), DeviceBytes>::value &&
+                  std::is_same<decltype(server_mem_reading::host_avail), HostBytes>::value &&
+                  std::is_same<decltype(server::guard_avail), DeviceBytes>::value &&
+                  std::is_same<decltype(server_mem_floor()), HostBytes>::value &&
+                  std::is_same<decltype(server_guard_floor(false)), DeviceBytes>::value &&
+                  std::is_same<decltype(pulsar_mem_available()), HostBytes>::value &&
+                  std::is_same<decltype(server_persist_host_bytes(0)), HostBytes>::value,
+              "each reading, floor and budget term names the memory it measures");
+
+/** L442: the pre-L442 headroom predicate on raw bytes (cli_main's body at 1df9725a), the reference the typed one must
+ *  reproduce.  @param avail the reading  @param need the bytes  @param floor the floor  @return the old verdict */
+static bool l442_old_headroom(uint64_t avail, uint64_t need, uint64_t floor) {
+    if (avail == 0 || need > UINT64_MAX - floor) return false;
+    return avail >= need + floor;
+}
+/** L442: the pre-L442 server_kv_headroom_admits on raw bytes.  @param discrete the platform  @param kv_avail
+ *  @param kv_floor  @param host_avail  @param host_floor  the readings  @param need the KV need  @return the verdict */
+static bool l442_old_kv_headroom(bool discrete, uint64_t kv_avail, uint64_t kv_floor, uint64_t host_avail,
+                                 uint64_t host_floor, uint64_t need) {
+    if (!discrete) return l442_old_headroom(kv_avail, need, kv_floor);
+    if (!l442_old_headroom(host_avail, 0, host_floor)) return false;
+    return need == 0 || l442_old_headroom(kv_avail, need, kv_floor);
+}
+/** L442: the pre-L442 touched-KV ceiling on raw bytes.  @param budget @param eager @param touched @param avail
+ *  @param floor  as server_guard_touched_budget  @return the ceiling */
+static uint64_t l442_old_touched_budget(uint64_t budget, uint64_t eager, uint64_t touched, uint64_t avail,
+                                        uint64_t floor) {
+    if (avail <= floor) return 0;
+    const uint64_t ledger = budget > eager ? budget - eager : 0;
+    const uint64_t headroom = avail - floor;
+    const uint64_t physical = touched > UINT64_MAX - headroom ? UINT64_MAX : touched + headroom;
+    return ledger < physical ? ledger : physical;
+}
+
+/* L442: every admission function, run over a unified configuration (the GB10: the KV and the host one pool, one
+ * reading, the memory floor for both) and a discrete one (the RTX 6000: the device's free memory over its own floor
+ * for the KV, the host's MemAvailable over the memory floor beside it), gives the verdicts and bytes the untyped code
+ * gave -- the split changes which comparisons compile, never a value.  The shapes are L391's: Qwen's 16 x 1M on the
+ * GB10, Gemma's 3 x 131072 on CT 130. */
+static void test_l442_mem_split_values_unchanged(void) {
+    const uint64_t MiB = 1024ull * 1024ull, GiB = 1024ull * MiB;
+    const uint64_t HF = 4538ull * MiB, DF = PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES;
+    const uint64_t avails[] = {0, 1, DF - 1, DF, DF + 1, HF - 1, HF, HF + 1, HF + 80ull * MiB, 2ull * GiB, 8ull * GiB,
+                               28ull * GiB + HF, UINT64_MAX - 1, UINT64_MAX};
+    const uint64_t needs[] = {0, 1, 80ull * MiB, 4096ull * 20480ull, L391_GEMMA_BANK_KV, L391_QWEN_BANK_KV,
+                              UINT64_MAX - 1ull * GiB, UINT64_MAX};
+    int checked = 0;
+    for (uint64_t a : avails)
+        for (uint64_t h : avails)
+            for (uint64_t n : needs) {
+                /* unified: one reading for both pairs (h unused, as mem_reading builds it) */
+                const server_mem_reading u = test_mem_unified(a, HF);
+                TEST_ASSERT(server_kv_headroom_admits(u, kvb(n)) == l442_old_kv_headroom(false, a, HF, a, HF, n));
+                /* discrete: the device's pair, the host's beside it */
+                const server_mem_reading d = test_mem_discrete(a, DF, h, HF);
+                TEST_ASSERT(server_kv_headroom_admits(d, kvb(n)) == l442_old_kv_headroom(true, a, DF, h, HF, n));
+                for (int idle = 0; idle < 2; idle++)
+                    for (int pre = 0; pre < 2; pre++) {
+                        const bool ok_u = l442_old_kv_headroom(false, a, HF, a, HF, n);
+                        const bool ok_d = l442_old_kv_headroom(true, a, DF, h, HF, n);
+                        const prefill_mem_step want_u = ok_u ? PREFILL_MEM_GO : idle ? PREFILL_MEM_SPILL
+                                                      : pre ? PREFILL_MEM_PREEMPT : PREFILL_MEM_REFUSE;
+                        const prefill_mem_step want_d = ok_d ? PREFILL_MEM_GO : idle ? PREFILL_MEM_SPILL
+                                                      : pre ? PREFILL_MEM_PREEMPT : PREFILL_MEM_REFUSE;
+                        TEST_ASSERT(server_prefill_mem_step(u, kvb(n), idle, pre != 0) == want_u);
+                        TEST_ASSERT(server_prefill_mem_step(d, kvb(n), idle, pre != 0) == want_d);
+                    }
+                /* the provision's floor, both platforms, first bank exempt, a resident hole admitted */
+                for (int prov = 0; prov < 2; prov++)
+                    for (int res = 0; res < 2; res++) {
+                        TEST_ASSERT(server_bank_floor_refuses(prov, res != 0, u, kvb(n)) ==
+                                    (prov > 0 && !res && !l442_old_kv_headroom(false, a, HF, a, HF, n)));
+                        TEST_ASSERT(server_bank_floor_refuses(prov, res != 0, d, kvb(n)) ==
+                                    (prov > 0 && !res && !l442_old_kv_headroom(true, a, DF, h, HF, n)));
+                    }
+                checked++;
+            }
+    TEST_ASSERT(checked == (int)(sizeof avails / sizeof avails[0] * sizeof avails / sizeof avails[0] *
+                                 (sizeof needs / sizeof needs[0])));
+    /* the touched-KV ceiling over both floors (the unified guard keeps the memory floor, the discrete one its own) */
+    const uint64_t budgets[] = {0, 5120ull * MiB, 36ull * GiB, UINT64_MAX};
+    const uint64_t eagers[] = {0, 5079ull * MiB, 15ull * GiB};
+    const uint64_t toucheds[] = {0, 82ull * MiB, 6ull * GiB, UINT64_MAX};
+    for (uint64_t b : budgets)
+        for (uint64_t e : eagers)
+            for (uint64_t t : toucheds)
+                for (uint64_t a : avails) {
+                    TEST_ASSERT(server_guard_touched_budget(kvb(b), kvb(e), kvb(t), devb(a), server_guard_floor(false))
+                                    .raw() == l442_old_touched_budget(b, e, t, a, server_mem_floor().raw()));
+                    TEST_ASSERT(server_guard_touched_budget(kvb(b), kvb(e), kvb(t), devb(a), server_guard_floor(true))
+                                    .raw() == l442_old_touched_budget(b, e, t, a, DF));
+                }
+    /* the floors: unified memory's guard floor is the memory floor, a discrete card's its own; the host's is the
+     * memory floor on both */
+    TEST_ASSERT(server_guard_floor(false).raw() == server_mem_floor().raw());
+    TEST_ASSERT(server_guard_floor(true).raw() == DF);
+    /* the startup budgets: the unified formula on the GB10's numbers, the discrete one on the RTX 6000's */
+    TEST_ASSERT(server_kv_budget_bytes(hostb(L391_QWEN_WEIGHTS)).raw() ==
+                PULSAR_SERVER_USABLE_BYTES - L391_QWEN_WEIGHTS - PULSAR_SERVER_PROCESS_OVERHEAD_BYTES -
+                    PULSAR_SERVER_MEM_FLOOR_BYTES);
+    TEST_ASSERT(server_kv_budget_discrete_bytes(devb(7900ull * MiB), devb(PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES))
+                    .raw() == 7900ull * MiB - PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES - DF);
+    TEST_ASSERT(server_discrete_working_set_bytes(devb(7900ull * MiB), devb(2250ull * MiB), kvb(4900ull * MiB)).raw() ==
+                750ull * MiB);
+    /* the floor's step on unified memory: a chunk's KV and a persist's host bytes, summed as before */
+    TEST_ASSERT(server_floor_step_bytes(false, kvb(80ull * MiB), server_persist_host_bytes(131072)).raw() ==
+                80ull * MiB + PULSAR_WRITEBACK_STEP + 2ull * 131072ull * PERSIST_TEXT_BYTES_PER_TOKEN);
+    /* a server reads where its KV lives: unified -- the host's reading as the device's, the one pool; discrete -- the
+     * device beside the host */
+    server s;
+    l391_pool_server(&s, 2);
+    server_mem_reading m = s.mem_reading();
+    TEST_ASSERT(!m.discrete && m.kv_floor.raw() == m.host_floor.raw() && m.host_floor == server_mem_floor());
+    s.guard_discrete = true;
+    m = s.mem_reading();
+    TEST_ASSERT(m.discrete && m.kv_floor == devb(DF) && m.host_floor == server_mem_floor());
+    /* the live budget, both platforms, against the old formula at the same reading */
+    for (int disc = 0; disc < 2; disc++) {
+        server g;
+        memset(&g, 0, sizeof g);
+        g.guard_enabled = true;
+        g.guard_discrete = disc != 0;
+        g.guard_floor = server_guard_floor(disc != 0);
+        g.guard_kv_budget = disc ? KvBytes::max() : kvb(40ull * GiB);
+        g.guard_eager_bytes = kvb(31ull * GiB);
+        g.guard_touched_ceiling = kvb(5ull * GiB);
+        g.guard_budget_said = kvb(5ull * GiB);
+        g.guard_avail_at = pulsar_mono_sec();
+        for (uint64_t a : avails) {
+            g.guard_avail = devb(a);
+            const uint64_t live = l442_old_touched_budget(g.guard_kv_budget.raw(), 31ull * GiB, 0, a,
+                                                          g.guard_floor.raw());
+            TEST_ASSERT(g.guard_budget().raw() == (live < 5ull * GiB ? live : 5ull * GiB));
+            g.guard_budget_said = g.guard_budget();   /* no line for the next reading unless it moves */
+        }
+    }
+    pthread_mutex_destroy(&s.tool_mu);
+    pthread_mutex_destroy(&s.mu);
+}
+
+/* L442 finding: the memory floor's step held a prefill chunk's KV on a discrete card too, though there the chunk's
+ * pages are the DEVICE's (checked per chunk against the device and its own floor, L391) -- the host floor sat one
+ * chunk's KV of one bank too high (Gemma 4 on CT 130: a 4096-token chunk is 80 MiB), so a host MemAvailable in
+ * [floor - chunk, floor) refused provisions, chunks and persists that had their room.  The step is now the persist
+ * alone there; unified memory keeps both terms (the chunk's pages come out of MemAvailable). */
+static void test_l442_discrete_floor_step_holds_no_device_kv(void) {
+    const uint64_t MiB = 1024ull * 1024ull;
+    const KvBytes chunk = kvb(4096ull * 20480ull);                      /* 80 MiB of Gemma KV */
+    const HostBytes persist = server_persist_host_bytes(131072);
+    TEST_ASSERT(server_floor_step_bytes(true, chunk, persist) == persist);
+    TEST_ASSERT(server_floor_step_bytes(false, chunk, persist).raw() == chunk.raw() + persist.raw());
+    TEST_ASSERT(server_floor_step_bytes(true, kvb(0), persist) == server_floor_step_bytes(false, kvb(0), persist));
+    /* the shape it changes: a discrete host 40 MiB over the corrected floor -- refused before, admitted now (a chunk
+     * asks the host only to be at its floor) */
+    const uint64_t zone = 486ull * MiB;
+    const HostBytes was = server_mem_floor_init(hostb(zone), server_floor_step_bytes(false, chunk, persist));
+    const HostBytes is = server_mem_floor_init(hostb(zone), server_floor_step_bytes(true, chunk, persist));
+    TEST_ASSERT(was - is == hostb(chunk.raw()));
+    const server_mem_reading d = test_mem_discrete(8ull * 1024ull * MiB, PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES,
+                                                   is.raw() + 40ull * MiB, is.raw());
+    TEST_ASSERT(server_kv_headroom_admits(d, chunk));
+    TEST_ASSERT(!server_headroom_admits(d.host_avail, hostb(0), was));   /* the old floor refused it */
+    (void)server_mem_floor_init(hostb(0), hostb(0));   /* back to the OS margin for the tests after this one */
 }
 
 /* 2026-09-29 -- which free bank provision_bank takes: the most resident pages,
@@ -18171,7 +18400,7 @@ static void test_l289_lane_reprobe_evidence(void) {
  * functions (the step itself needs a session): the grace and the worker's wait, the cancel predicate, what a sync's
  * result does to the slot, and where a yielded slot's live binding matches. */
 static void test_l380_terminal_grace_and_yield(void) {
-    const double G = PULSAR_SERVER_TERMINAL_GRACE_MS / 1000.0;
+    const double G = pulsar_sec_of_ms((double)PULSAR_SERVER_TERMINAL_GRACE_MS);
     /* the grace: not before it has passed since the turn ended, yes from then on */
     TEST_ASSERT(fabs(server_terminal_grace_left_s(100.0, 100.0) - G) < 1e-9);
     TEST_ASSERT(server_terminal_grace_left_s(100.0 + G / 2, 100.0) > 0.0);
@@ -19396,7 +19625,7 @@ static void l329_fanout(const l329_req *rq, int n, int wait_ms, l329_out *o) {
             st *l = &r[w->slot.raw()];   /* the simulation's requests, by the leader's number */
             const bool live = l->bound && !l->finished && !l->cancelled;
             const prefix_wait_verdict v =
-                unseamed_wait_check(live, l->pos, w->mark.raw(), (t - w->since) * 1e3, wait_ms);
+                unseamed_wait_check(live, l->pos, w->mark.raw(), pulsar_ms_of_sec(t - w->since), wait_ms);
             if (v == PREFIX_WAIT_HOLD) {
                 l->mark = unseamed_mark_merge(l->mark, w->mark.raw(), l->pos);
                 continue;
@@ -20207,7 +20436,7 @@ static void test_l281_prefill_chunk_publishes_the_slot_gauges(void) {
     g.phase = GEN_PREFILL_MAIN;
     g.prefill_last_current = -1;
     g.progress.srv = &s;
-    g.progress.t0 = server_now_sec();
+    g.progress.t0 = pulsar_mono_sec();
     g.progress.fd = -1;
     s.slots[SlotIdx{0u}].provisioned = true;
     s.slots[SlotIdx{0u}].active_job = &j;
@@ -20516,14 +20745,14 @@ static void test_metrics_stream_refreshes_when_quiet(void) {
 
     for (int i = 0; i < 2; i++) {
         struct timespec t0, t1;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
+        t0 = pulsar_mono_ts();
         int n = stream_read_within(fds[1], buf, sizeof buf, 2000);
-        clock_gettime(CLOCK_MONOTONIC, &t1);
+        t1 = pulsar_mono_ts();
         TEST_ASSERT(n > 0);
         TEST_ASSERT(strncmp(buf, "event: metrics\ndata: {\"generation\":5,", 37) == 0);
         TEST_ASSERT(strstr(buf, ": keepalive") == NULL);
         /* not before its time: a refresh that came early would be a frame storm on an idle server */
-        TEST_ASSERT((t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6 > 100.0);
+        TEST_ASSERT(pulsar_ms_between(t0, t1) > 100.0);
     }
 
     stream_stop(&f);
@@ -20547,13 +20776,13 @@ static void test_metrics_stream_frames_a_mark_nobody_broadcast(void) {
     TEST_ASSERT(stream_last_generation(buf) == 0 && stream_count_frames(buf) == 1);
 
     struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    t0 = pulsar_mono_ts();
     pulsar_metrics_feed_mark(&f.generation);   /* no lock, no broadcast */
     TEST_ASSERT(stream_read_within(fds[1], buf, sizeof buf, 2000) > 0);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
+    t1 = pulsar_mono_ts();
     TEST_ASSERT(stream_last_generation(buf) == 1);
     /* the bound is the window (100 ms); the margin is the machine's, for a loaded check run */
-    TEST_ASSERT((t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6 < 100.0 + 400.0);
+    TEST_ASSERT(pulsar_ms_between(t0, t1) < 100.0 + 400.0);
 
     stream_stop(&f);
     pthread_join(th, NULL);
@@ -20579,7 +20808,7 @@ static void test_metrics_stream_coalesces_a_burst_and_ends_on_the_last_state(voi
         used = strlen(all);
 
         struct timespec t0, t1;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
+        t0 = pulsar_mono_ts();
         for (int i = 0; i < 1000; i++) {
             if (wake) {
                 pthread_mutex_lock(&f.mu);
@@ -20599,11 +20828,11 @@ static void test_metrics_stream_coalesces_a_burst_and_ends_on_the_last_state(voi
             int n = stream_read_within(fds[1], all + used, sizeof all - used, 100);
             if (n > 0) used += (size_t)n;
         }
-        clock_gettime(CLOCK_MONOTONIC, &t1);
+        t1 = pulsar_mono_ts();
         TEST_ASSERT(stream_last_generation(all) == 1000);
         TEST_ASSERT(stream_read_within(fds[1], all + used, sizeof all - used, 250) < 0);
         /* the bound: one frame a window, so 1 (the first) + elapsed / window + 1 at the very most */
-        const double elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        const double elapsed_ms = pulsar_ms_between(t0, t1);
         const int frames = stream_count_frames(all);
         TEST_ASSERT(frames >= 2);
         TEST_ASSERT(frames <= 2 + (int)(elapsed_ms / 100.0));
@@ -20633,13 +20862,12 @@ static void test_metrics_stream_exits_promptly_on_shutdown(void) {
     TEST_ASSERT(stream_read_within(fds[1], buf, sizeof buf, 2000) > 0);
 
     struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    t0 = pulsar_mono_ts();
     stream_stop(&f);
     pthread_join(th, NULL);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
+    t1 = pulsar_mono_ts();
 
-    const double elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
-                            + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    const double elapsed_ms = pulsar_ms_between(t0, t1);
     TEST_ASSERT(elapsed_ms < 1000.0);
     TEST_ASSERT(f.result == true);   /* a shutdown exit is not a failure */
 
@@ -20742,12 +20970,11 @@ static void test_metrics_stream_write_does_not_hold_the_metrics_lock(void) {
 
     /* The lock must still be free: the pump is inside send_all right now. */
     struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    t0 = pulsar_mono_ts();
     pthread_mutex_lock(&f.mu);
     pthread_mutex_unlock(&f.mu);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    const double held_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
-                         + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    t1 = pulsar_mono_ts();
+    const double held_ms = pulsar_ms_between(t0, t1);
     TEST_ASSERT(held_ms < 500.0);
 
     /* Teardown: draining unblocks the write, then shutdown wakes the wait.
@@ -20789,12 +21016,11 @@ static void test_send_all_gives_up_on_a_wedged_socket(void) {
     char big[64 * 1024];
     memset(big, 'y', sizeof big);
     struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    t0 = pulsar_mono_ts();
     const bool ok = send_all(fds[0], big, sizeof big);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
+    t1 = pulsar_mono_ts();
 
-    const double took_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
-                         + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    const double took_ms = pulsar_ms_between(t0, t1);
     TEST_ASSERT(ok == false);
     /* Deadline is PULSAR_SERVER_SEND_STALL_TIMEOUT_MS; allow a wide margin for
      * scheduler noise but nothing like the unbounded case. */
@@ -20963,12 +21189,12 @@ static void stream_server_expect_frame(stream_server_fixture *x, const struct ti
     char buf[1024];
     const int n = stream_read_within(x->fds[1], buf, sizeof buf, 3000);
     struct timespec t1;
-    clock_gettime(CLOCK_MONOTONIC, &t1);
+    t1 = pulsar_mono_ts();
     TEST_ASSERT(n > 0);
     if (n <= 0) return;
     TEST_ASSERT(stream_count_frames(buf) == 1);
     TEST_ASSERT(stream_last_generation(buf) == x->s.metrics_generation);
-    TEST_ASSERT((t1.tv_sec - t0->tv_sec) * 1000.0 + (t1.tv_nsec - t0->tv_nsec) / 1e6 <
+    TEST_ASSERT(pulsar_ms_between(*t0, t1) <
                 PULSAR_METRICS_STREAM_MIN_INTERVAL_MS + 400.0);
 }
 
@@ -21001,7 +21227,7 @@ static void test_l432_a_systemone_request_reaches_the_stream(void) {
     TEST_ASSERT(jb.done);
     TEST_ASSERT(pulsar_metrics_feed_read(&x.s.metrics_generation) == gen0 + 1);
     struct timespec t0;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    t0 = pulsar_mono_ts();
     stream_server_expect_frame(&x, &t0);
 
     /* a step with no request waiting is no step: nothing published, no frame owed */
@@ -21010,7 +21236,7 @@ static void test_l432_a_systemone_request_reaches_the_stream(void) {
 
     /* the request's thread counts its 503 */
     x.s.count_503(SERVER_503_SYSTEMONE);
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    t0 = pulsar_mono_ts();
     TEST_ASSERT(x.s.m_kvl.refused[SERVER_503_SYSTEMONE] == 1);
     stream_server_expect_frame(&x, &t0);
 
@@ -21063,7 +21289,7 @@ static void test_l433_systemone_requests_are_counted(void) {
     /* no judge: 404, counted invalid; /metrics has no systemone series */
     TEST_ASSERT(ask("{}").find(" 404 ") != std::string::npos);
     TEST_ASSERT(x.s.m_systemone_requests[SERVER_SYSTEMONE_INVALID] == 1);
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    t0 = pulsar_mono_ts();
     stream_server_expect_frame(&x, &t0);
     TEST_ASSERT(metrics().find("pulsar:systemone_requests_total") == std::string::npos);
 
@@ -21075,7 +21301,7 @@ static void test_l433_systemone_requests_are_counted(void) {
     TEST_ASSERT(x.s.m_systemone_requests[SERVER_SYSTEMONE_INVALID] == 2);
     TEST_ASSERT(x.s.m_systemone_requests[SERVER_SYSTEMONE_OK] == 0 && x.s.m_systemone_requests[SERVER_SYSTEMONE_BUSY] == 0 &&
                 x.s.m_systemone_requests[SERVER_SYSTEMONE_FAILED] == 0 && x.s.m_systemone_questions == 0);
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    t0 = pulsar_mono_ts();
     stream_server_expect_frame(&x, &t0);
 
     const std::string m = metrics();
@@ -21101,18 +21327,18 @@ static void test_l432_refusals_and_counters_reach_the_stream(void) {
 
     for (int cause = 0; cause < SERVER_503_CAUSES; cause++) {
         x.s.count_503((server_503_cause)cause);
-        clock_gettime(CLOCK_MONOTONIC, &t0);
+        t0 = pulsar_mono_ts();
         stream_server_expect_frame(&x, &t0);
     }
 
     x.s.count_metric(&x.s.m_req_class[0]);
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    t0 = pulsar_mono_ts();
     stream_server_expect_frame(&x, &t0);
 
     job j;
     memset(&j, 0, sizeof j);
     x.s.note_provision_refusal(&j, PROVISION_REFUSED_KV_TOUCHED);
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    t0 = pulsar_mono_ts();
     TEST_ASSERT(x.s.m_refusals[PROVISION_REFUSED_KV_TOUCHED] == 1);
     stream_server_expect_frame(&x, &t0);
     /* the worker retries that head a hundred times a second: the retries change nothing and mark nothing */
@@ -21142,7 +21368,7 @@ static void test_l432_a_mark_from_any_thread_reaches_the_stream(void) {
         TEST_ASSERT(pthread_create(&th, NULL, l432_mark_thread, &x.s) == 0);
         pthread_join(th, NULL);
         struct timespec t0;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
+        t0 = pulsar_mono_ts();
         stream_server_expect_frame(&x, &t0);
     }
     stream_server_stop(&x);
@@ -21162,10 +21388,10 @@ static void test_l432_an_idle_server_sends_only_the_refresh(void) {
     char all[4096] = {0};
     size_t used = 0;
     struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    t0 = pulsar_mono_ts();
     for (;;) {
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        const double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        t1 = pulsar_mono_ts();
+        const double ms = pulsar_ms_between(t0, t1);
         if (ms >= 1000.0) break;
         int n = stream_read_within(fds[1], all + used, sizeof all - used, (int)(1000.0 - ms) + 1);
         if (n > 0) used += (size_t)n;
@@ -21268,32 +21494,34 @@ static void test_mem_floor_is_derived_from_the_watermarks(void) {
         "        high     124302\n"
         "        promo    150000\n"
         "        high_x   99999\n";
-    TEST_ASSERT(server_zoneinfo_high_bytes(zi, 4096) == kvb((2000ull + 124302ull) * 4096ull));
-    TEST_ASSERT(server_zoneinfo_high_bytes("Node 0, zone Normal\n  pages free 5\n", 4096) == kvb(0));   /* none: 0 */
-    TEST_ASSERT(server_zoneinfo_high_bytes("", 4096) == kvb(0));
-    TEST_ASSERT(server_zoneinfo_high_bytes("        high     7", 4096) == kvb(0));   /* a line must be whole */
+    TEST_ASSERT(server_zoneinfo_high_bytes(zi, 4096) == hostb((2000ull + 124302ull) * 4096ull));
+    TEST_ASSERT(server_zoneinfo_high_bytes("Node 0, zone Normal\n  pages free 5\n", 4096) == hostb(0));   /* none: 0 */
+    TEST_ASSERT(server_zoneinfo_high_bytes("", 4096) == hostb(0));
+    TEST_ASSERT(server_zoneinfo_high_bytes("        high     7", 4096) == hostb(0));   /* a line must be whole */
     /* the floor: the margin + the watermarks + the step; every MemAvailable check reads it */
     const uint64_t zone = 486ull * MiB, step = 160ull * MiB;
-    TEST_ASSERT(server_mem_floor_init(kvb(zone), kvb(step)) == kvb(PULSAR_SERVER_MEM_FLOOR_BYTES + zone + step));
-    TEST_ASSERT(server_mem_floor() == kvb(PULSAR_SERVER_MEM_FLOOR_BYTES + zone + step));
+    TEST_ASSERT(server_mem_floor_init(hostb(zone), hostb(step)) == hostb(PULSAR_SERVER_MEM_FLOOR_BYTES + zone + step));
+    TEST_ASSERT(server_mem_floor() == hostb(PULSAR_SERVER_MEM_FLOOR_BYTES + zone + step));
     const uint64_t F = server_mem_floor().raw();
-    TEST_ASSERT(server_headroom_admits(kvb(F + 10 * MiB), kvb(10 * MiB), server_mem_floor()));
-    TEST_ASSERT(!server_headroom_admits(kvb(F + 10 * MiB - 1), kvb(10 * MiB), server_mem_floor()));
+    TEST_ASSERT(server_headroom_admits(hostb(F + 10 * MiB), hostb(10 * MiB), server_mem_floor()));
+    TEST_ASSERT(!server_headroom_admits(hostb(F + 10 * MiB - 1), hostb(10 * MiB), server_mem_floor()));
     /* the guard's ceiling keeps the derived floor free */
-    TEST_ASSERT(server_guard_touched_budget(kvb(64ull << 30), kvb(0), kvb(0), kvb(F + 3 * MiB), server_mem_floor()) == kvb(3 * MiB));
-    TEST_ASSERT(server_guard_touched_budget(kvb(64ull << 30), kvb(0), kvb(0), kvb(F), server_mem_floor()) == KvBytes{});
+    TEST_ASSERT(server_guard_touched_budget(kvb(64ull << 30), kvb(0), kvb(0), devb(F + 3 * MiB), server_guard_floor(false)) ==
+                kvb(3 * MiB));
+    TEST_ASSERT(server_guard_touched_budget(kvb(64ull << 30), kvb(0), kvb(0), devb(F), server_guard_floor(false)) ==
+                KvBytes{});
     /* headroom: unreadable MemAvailable (0) is never room; no wrap */
-    TEST_ASSERT(!server_headroom_admits(kvb(0), kvb(0), kvb(0)));
-    TEST_ASSERT(server_headroom_admits(kvb(5), kvb(2), kvb(3)));
-    TEST_ASSERT(!server_headroom_admits(kvb(4), kvb(2), kvb(3)));
-    TEST_ASSERT(!server_headroom_admits(kvb(UINT64_MAX), kvb(UINT64_MAX), kvb(2)));
+    TEST_ASSERT(!server_headroom_admits(hostb(0), hostb(0), hostb(0)));
+    TEST_ASSERT(server_headroom_admits(hostb(5), hostb(2), hostb(3)));
+    TEST_ASSERT(!server_headroom_admits(hostb(4), hostb(2), hostb(3)));
+    TEST_ASSERT(!server_headroom_admits(hostb(UINT64_MAX), hostb(UINT64_MAX), hostb(2)));
     /* a persist's host demand: the writeback window + two renders of the text, at the bound a token */
-    TEST_ASSERT(server_persist_host_bytes(0) == kvb(PULSAR_WRITEBACK_STEP));
-    TEST_ASSERT(server_persist_host_bytes(-5) == kvb(PULSAR_WRITEBACK_STEP));
+    TEST_ASSERT(server_persist_host_bytes(0) == hostb(PULSAR_WRITEBACK_STEP));
+    TEST_ASSERT(server_persist_host_bytes(-5) == hostb(PULSAR_WRITEBACK_STEP));
     TEST_ASSERT(server_persist_host_bytes(188416) ==
-                kvb(PULSAR_WRITEBACK_STEP + 2ull * 188416ull * PERSIST_TEXT_BYTES_PER_TOKEN));
-    (void)server_mem_floor_init(kvb(0), kvb(0));   /* back to the OS margin for the tests after this one */
-    TEST_ASSERT(server_mem_floor() == kvb(PULSAR_SERVER_MEM_FLOOR_BYTES));
+                hostb(PULSAR_WRITEBACK_STEP + 2ull * 188416ull * PERSIST_TEXT_BYTES_PER_TOKEN));
+    (void)server_mem_floor_init(hostb(0), hostb(0));   /* back to the OS margin for the tests after this one */
+    TEST_ASSERT(server_mem_floor() == hostb(PULSAR_SERVER_MEM_FLOOR_BYTES));
 }
 
 /* 2026-10-29: the guard's decisions read the LIVE budget -- touched + MemAvailable − floor now -- never above the
@@ -21309,18 +21537,18 @@ static void test_guard_budget_reads_live_memavailable(void) {
     s.guard_eager_bytes = kvb(31 * GiB);
     s.guard_touched_ceiling = kvb(5 * GiB);     /* cut at warmup: MemAvailable was floor + 5 GiB */
     s.guard_budget_said = kvb(5 * GiB);         /* no line for the cases below that stay put */
-    s.guard_avail_at = server_now_sec();        /* the reading below is fresh: no /proc read in this test */
-    s.guard_floor = server_mem_floor();
-    s.guard_avail = kvb(F + 2 * GiB);           /* 3 GiB went to something no ledger counts */
+    s.guard_avail_at = pulsar_mono_sec();        /* the reading below is fresh: no /proc read in this test */
+    s.guard_floor = server_guard_floor(false);
+    s.guard_avail = devb(F + 2 * GiB);           /* 3 GiB went to something no ledger counts */
     TEST_ASSERT(s.guard_budget() == kvb(2 * GiB));   /* the live headroom binds */
-    s.guard_avail = kvb(F + 20 * GiB);          /* memory came back: never above the startup ceiling */
+    s.guard_avail = devb(F + 20 * GiB);          /* memory came back: never above the startup ceiling */
     TEST_ASSERT(s.guard_budget() == kvb(5 * GiB));
-    s.guard_avail = kvb(F);                     /* at the floor: nothing more may be touched */
+    s.guard_avail = devb(F);                     /* at the floor: nothing more may be touched */
     TEST_ASSERT(s.guard_budget() == KvBytes{});
-    s.guard_avail = KvBytes{};                  /* unreadable: fail closed */
+    s.guard_avail = DeviceBytes{};                  /* unreadable: fail closed */
     TEST_ASSERT(s.guard_budget() == KvBytes{});
     /* L357: the test route's ledger budget stands in for the startup one: 33 − eager 31 = 2 GiB binds ... */
-    s.guard_avail = kvb(F + 20 * GiB);
+    s.guard_avail = devb(F + 20 * GiB);
     s.set_test_guard_budget(kvb(33 * GiB));
     TEST_ASSERT(s.guard_budget() == kvb(2 * GiB));
     s.set_test_guard_budget(kvb(100 * GiB));    /* ... never above the startup ceiling ... */
@@ -21335,20 +21563,20 @@ static void test_guard_budget_reads_live_memavailable(void) {
 static void test_guard_discrete_reads_the_device(void) {
     const uint64_t MiB = 1024ull * 1024ull;
     const uint64_t GiB = 1024ull * MiB;
-    const KvBytes floor = server_guard_floor(true);
-    TEST_ASSERT(floor == kvb(PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES));
-    TEST_ASSERT(server_guard_floor(false) == server_mem_floor());
+    const DeviceBytes floor = server_guard_floor(true);
+    TEST_ASSERT(floor == devb(PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES));
+    TEST_ASSERT(server_guard_floor(false) == pulsar_unified_device_bytes(server_mem_floor()));
     const uint64_t budget = 5120ull * MiB, eager = 5079ull * MiB, touched = 82ull * MiB, dev_free = 2253ull * MiB;
     /* the host formula's ledger binds at 0.04 GiB: what refused every judge prompt */
-    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(touched), kvb(dev_free), floor) ==
+    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(touched), devb(dev_free), floor) ==
                 kvb(budget - eager));
     /* the discrete ceiling: touched + device free − floor (the startup passes no ledger) */
-    const KvBytes c = server_guard_touched_budget(KvBytes::max(), kvb(eager), kvb(touched), kvb(dev_free), floor);
+    const KvBytes c = server_guard_touched_budget(KvBytes::max(), kvb(eager), kvb(touched), devb(dev_free), floor);
     TEST_ASSERT(c == kvb(touched + dev_free - PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES));
     TEST_ASSERT(c > kvb(35724ull * 20ull * 1024ull));   /* the 35.7K-token prompt's KV fits beside the warm banks */
     /* at the floor, or unreadable: nothing more may be touched */
     TEST_ASSERT(server_guard_touched_budget(KvBytes::max(), kvb(eager), kvb(0), floor, floor) == KvBytes{});
-    TEST_ASSERT(server_guard_touched_budget(KvBytes::max(), kvb(eager), kvb(0), KvBytes{}, floor) == KvBytes{});
+    TEST_ASSERT(server_guard_touched_budget(KvBytes::max(), kvb(eager), kvb(0), DeviceBytes{}, floor) == KvBytes{});
     /* the live budget reads the device when the guard is discrete, and stays under the startup ceiling */
     server s;
     memset(&s, 0, sizeof s);
@@ -21359,8 +21587,8 @@ static void test_guard_discrete_reads_the_device(void) {
     s.guard_eager_bytes = kvb(eager);
     s.guard_touched_ceiling = c;
     s.guard_budget_said = c;
-    s.guard_avail_at = server_now_sec();
-    s.guard_avail = kvb(floor.raw() + 1 * GiB);   /* 1.2 GiB went to something else: the live reading binds */
+    s.guard_avail_at = pulsar_mono_sec();
+    s.guard_avail = devb(floor.raw() + 1 * GiB);   /* 1.2 GiB went to something else: the live reading binds */
     TEST_ASSERT(s.guard_budget() == kvb(1 * GiB));
 }
 
@@ -21371,7 +21599,7 @@ static void test_persist_skipped_under_the_floor(void) {
     memset(&s, 0, sizeof s);
     pthread_mutex_init(&s.mu, NULL);
     s.kv.enabled = true;                                 /* a store is configured ... */
-    (void)server_mem_floor_init(kvb(UINT64_MAX / 4), kvb(0));      /* ... and no box has this much free */
+    (void)server_mem_floor_init(hostb(UINT64_MAX / 4), hostb(0));      /* ... and no box has this much free */
     int end = -1;
     session_slot sl;   /* L347 I3b: a persist reads its slot's X-Pulsar-KV tokens (none here) */
     memset(&sl, 0, sizeof sl);
@@ -21385,7 +21613,7 @@ static void test_persist_skipped_under_the_floor(void) {
     bool no_room = true;
     TEST_ASSERT(s.kv_cache_persist(&sl, KV_PERSIST_SPILL, nullptr, &no_room) == 0 && !no_room);
     TEST_ASSERT(s.m_persist_skipped == 2);
-    (void)server_mem_floor_init(kvb(0), kvb(0));
+    (void)server_mem_floor_init(hostb(0), hostb(0));
     pthread_mutex_destroy(&s.mu);
 }
 
@@ -21461,7 +21689,7 @@ static void test_l347_i3b_read_only_writes_nothing(void) {
     pthread_mutex_init(&s.mu, NULL);
     s.kv.enabled = true;
     /* the witness: a persist the mark lets through reaches the memory floor, which no box clears here */
-    (void)server_mem_floor_init(kvb(UINT64_MAX / 4), kvb(0));
+    (void)server_mem_floor_init(hostb(UINT64_MAX / 4), hostb(0));
     session_slot sl;
     memset(&sl, 0, sizeof sl);
     sl.kv_flags = KV_HDR_READ_ONLY;
@@ -21477,7 +21705,7 @@ static void test_l347_i3b_read_only_writes_nothing(void) {
     bool no_room = false;
     TEST_ASSERT(s.kv_cache_persist(&sl, KV_PERSIST_EVICT, nullptr, &no_room) == 0 && no_room);
     TEST_ASSERT(s.m_persist_read_only == 5 && s.m_persist_skipped == 1);
-    (void)server_mem_floor_init(kvb(0), kvb(0));
+    (void)server_mem_floor_init(hostb(0), hostb(0));
     pthread_mutex_destroy(&s.mu);
 }
 
@@ -21815,6 +22043,39 @@ static void test_prefill_mem_step_tries_remedies_first(void) {
     TEST_ASSERT(server_prefill_mem_step(test_mem_unified(0, F), kvb(need), 2,
                                         false) == PREFILL_MEM_SPILL);       /* ... but freeing helps */
     TEST_ASSERT(!strcmp(prefill_mem_step_names[PREFILL_MEM_REFUSE], "refuse"));
+}
+
+/* L442: the one MemAvailable reading (lib/pulsar_meminfo.h) -- the KiB field times 1024, 0 when the field is missing
+ * or the file unreadable -- reads what each of the four parsers it replaced read: the server's and the engine's
+ * `sscanf(line, "MemAvailable: %llu kB")` (first match), /metrics' strncmp + " %llu kB" (kept scanning: the last
+ * match) and the generic field reader.  On a real meminfo there is one MemAvailable line, so first and last agree. */
+static void test_l442_one_memavailable_reading(void) {
+    char path[] = "/tmp/pulsar-l442-meminfo-XXXXXX";
+    const int fd = mkstemp(path);
+    TEST_ASSERT(fd >= 0);
+    if (fd < 0) return;
+    const char text[] = "MemTotal:       131072000 kB\nMemFree:          2048 kB\nMemAvailable:   9625600 kB\n"
+                        "Buffers:          100 kB\n";
+    TEST_ASSERT(write(fd, text, sizeof text - 1) == (ssize_t)(sizeof text - 1));
+    close(fd);
+    TEST_ASSERT(pulsar_mem_available_from(path) == HostBytes{9625600ull * 1024ull});
+    /* the old parse, as server_sched.cpp and prefill_loop.cpp spelt it, on the same text */
+    unsigned long long kib = 0;
+    for (const char *line = text; line && *line;) {
+        if (sscanf(line, "MemAvailable: %llu kB", &kib) == 1) break;
+        const char *nl = strchr(line, '\n');
+        line = nl ? nl + 1 : NULL;
+    }
+    TEST_ASSERT(pulsar_mem_available_from(path).raw() == (uint64_t)kib * 1024ull);
+    FILE *fp = fopen(path, "w");
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        fputs("MemTotal:       131072000 kB\n", fp);   /* no MemAvailable: 0, as every parser gave */
+        fclose(fp);
+    }
+    TEST_ASSERT(pulsar_mem_available_from(path) == HostBytes{});
+    unlink(path);
+    TEST_ASSERT(pulsar_mem_available_from(path) == HostBytes{});   /* unreadable: 0 */
 }
 
 /* L335: the stall dump's meminfo reader tells a missing field from an unreadable file (both read 0 before), and its
@@ -23865,6 +24126,10 @@ static void pulsar_server_unit_tests_run(void) {
     test_l391_ledger_share_prices_growth();
     test_l391_provision_demand_is_demand_paged();
     test_l391_discrete_reads_the_device();
+    test_l442_mem_split_values_unchanged();
+    test_l442_discrete_floor_step_holds_no_device_kv();
+    test_l442_one_memavailable_reading();
+    test_l442_stream_writer_is_monotonic();
     test_bank_pick_prefers_resident_hole();
     test_refusal_evictable();
     test_l179_park_live_bank_only_when_not_in_quantum();

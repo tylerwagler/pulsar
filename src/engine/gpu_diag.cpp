@@ -1535,8 +1535,8 @@ bool gpu_graph_alloc_raw_cap(
                 "(kv cache %.2f GiB, context buffers %.2f GiB); "
                 "this may degrade performance but is needed for very large contexts\n",
                 ctx_size,
-                (double)kv_cache_bytes / 1073741824.0,
-                (double)context_bytes / 1073741824.0);
+                (double)kv_cache_bytes / PULSAR_GIB,
+                (double)context_bytes / PULSAR_GIB);
     }
 
     /* ROW GEOMETRY: one definition (src/pulsar_gpu.h), so the only thing left

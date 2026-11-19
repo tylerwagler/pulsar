@@ -29,7 +29,7 @@ bool server_stall_limit_parse(const char *v, int *limit_s, char *err, size_t err
 
 int64_t server_stall_seconds(int64_t now_ms, int64_t beat_ms, bool busy, int limit_s) {
     if (limit_s <= 0 || !busy || now_ms < beat_ms) return 0;
-    const int64_t s = (now_ms - beat_ms) / 1000;
+    const int64_t s = pulsar_sec_of_ms(now_ms - beat_ms);
     return s >= limit_s ? s : 0;
 }
 
@@ -121,15 +121,15 @@ const char *phase_name(int ph) {
 void *watchdog_main(void *arg) {
     server *s = (server *)arg;
     uint64_t seen = g_pulsar_stall.beats.load(std::memory_order_relaxed);
-    int64_t beat_ms = pulsar_stall_now_ms();
+    int64_t beat_ms = pulsar_mono_ms();
     bool dumped = false, busy = false;
-    int64_t ledger_s = beat_ms / 1000;   /* L378: when the last hourly `kv ledger:` line was written (the start) */
+    int64_t ledger_s = pulsar_sec_of_ms(beat_ms);   /* L378: when the last hourly `kv ledger:` line was written (the start) */
     while (!__atomic_load_n(&s->watchdog_quit, __ATOMIC_RELAXED)) {
-        usleep(1000000);
-        const int64_t now = pulsar_stall_now_ms();
+        usleep(pulsar_us_of_sec(1u));
+        const int64_t now = pulsar_mono_ms();
         /* L378: the hourly ledger line, from the variables /metrics reads (under mu, tried once: a held mu leaves it
          * due for the next second) */
-        if (kv_ledger_due(now / 1000, ledger_s) && s->kv_ledger_log(false)) ledger_s = now / 1000;
+        if (kv_ledger_due(pulsar_sec_of_ms(now), ledger_s) && s->kv_ledger_log(false)) ledger_s = pulsar_sec_of_ms(now);
         const uint64_t beats = g_pulsar_stall.beats.load(std::memory_order_relaxed);
         if (beats != seen) {
             seen = beats;
@@ -159,25 +159,6 @@ void *watchdog_main(void *arg) {
 }
 
 }  // namespace
-
-/* meminfo_kib: declared in pulsar_server_internal.h (also kv_host_mem_total_from's MemTotal) */
-meminfo_read meminfo_kib(const char *path, const char *key, uint64_t *kib) {
-    *kib = 0;
-    FILE *fp = fopen(path, "r");
-    if (!fp) return MEMINFO_UNREADABLE;
-    char line[256];
-    unsigned long long v = 0;
-    const size_t kl = strlen(key);
-    meminfo_read r = MEMINFO_MISSING;
-    while (fgets(line, sizeof line, fp))
-        if (!strncmp(line, key, kl) && sscanf(line + kl, " %llu", &v) == 1) {
-            r = MEMINFO_FOUND;
-            *kib = v;
-            break;
-        }
-    fclose(fp);
-    return r;
-}
 
 bool server::watchdog_start() {
     if (stall_limit_s <= 0) {
@@ -211,24 +192,23 @@ void server::watchdog_stop() {
 
 void server::watchdog_dump(int64_t stalled_s) {
     auto *s = this;
-    const double gib = 1024.0 * 1024.0 * 1024.0;
     const char *where = g_pulsar_stall.where.load(std::memory_order_relaxed);
     const int64_t where_ms = g_pulsar_stall.where_ms.load(std::memory_order_relaxed);
-    const double where_age = where_ms ? (double)(pulsar_stall_now_ms() - where_ms) / 1000.0 : 0.0;
+    const double where_age = where_ms ? pulsar_sec_of_ms((double)(pulsar_mono_ms() - where_ms)) : 0.0;
     server_log(PULSAR_LOG_DEFAULT,
                "pulsar-server: STALL: the worker has made no progress for %lld s (limit %d s, PULSAR_STALL_WATCHDOG_S): "
                "last section entered \"%s\" %.1f s ago, %llu marks so far",
                (long long)stalled_s, s->stall_limit_s, where ? where : "(none yet)", where_age,
                (unsigned long long)g_pulsar_stall.beats.load(std::memory_order_relaxed));
     /* memory: what MemAvailable, swap and the KV figures read now */
-    const KvBytes avail = server_mem_available_bytes();
+    const HostBytes avail = pulsar_mem_available();
     uint64_t swap_total = 0, swap_free = 0;
     const meminfo_read rt = meminfo_kib("/proc/meminfo", "SwapTotal:", &swap_total);
     const meminfo_read rf = meminfo_kib("/proc/meminfo", "SwapFree:", &swap_free);
     char swap[96];
     if (rt == MEMINFO_FOUND && rf == MEMINFO_FOUND)
-        snprintf(swap, sizeof swap, "swap used %.2f of %.2f GiB", (double)(swap_total - swap_free) / (1024.0 * 1024.0),
-                 (double)swap_total / (1024.0 * 1024.0));
+        snprintf(swap, sizeof swap, "swap used %.2f of %.2f GiB", (double)(swap_total - swap_free) / PULSAR_MIB,
+                 (double)swap_total / PULSAR_MIB);
     else
         snprintf(swap, sizeof swap, "swap unknown (%s)",
                  rt == MEMINFO_UNREADABLE || rf == MEMINFO_UNREADABLE ? "/proc/meminfo unreadable"
@@ -246,10 +226,10 @@ void server::watchdog_dump(int64_t stalled_s) {
                    "pulsar-server: STALL:   queue %d waiting, %d running%s; KV touched %.2f GiB, reserved %.2f GiB, "
                    "guard budget %.2f GiB (ceiling %.2f); MemAvailable %.2f GiB, floor %.2f GiB, %s",
                    s->n_queued, s->n_generating, server_judge_queued(s) ? ", a /v1/systemone request with the judge" : "",
-                   (double)s->m_kv_touched.raw() / gib,
-                   (double)s->m_kv_reserved.raw() / gib, (double)s->m_kv_budget.raw() / gib,
-                   (double)s->guard_touched_ceiling.raw() / gib, (double)avail.raw() / gib,
-                   (double)server_mem_floor().raw() / gib, swap);
+                   pulsar_gib(s->m_kv_touched),
+                   pulsar_gib(s->m_kv_reserved), pulsar_gib(s->m_kv_budget),
+                   pulsar_gib(s->guard_touched_ceiling), pulsar_gib(avail),
+                   pulsar_gib(server_mem_floor()), swap);
         for (int i = 0; i < s->n_slots.raw(); i++) {   /* L441: the published snapshot, by the slot's number */
             const int ph = s->m_slot_phase[i];
             if (ph == 0 && s->m_slot_pos[i] == 0) continue;   /* idle and empty */

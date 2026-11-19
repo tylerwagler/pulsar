@@ -1,6 +1,7 @@
 /** @file
  *  pulsar-bench: prefill and decode throughput at fixed context frontiers. */
 #include "pulsar.h"
+#include "lib/pulsar_clock.h"   /* L442: the clocks and the time-unit conversions */
 #include "pulsar_help.h"
 #include "pulsar_ctxmem.h"
 #include "pulsar_argparse.h"
@@ -51,14 +52,6 @@ typedef struct {
     double step_mul;               ///< multiplicative step; 1.0 selects the additive form
     const char *dump_frontier_logits_dir;  ///< write each step's frontier logits here, for divergence checks
 } bench_config;
-
-/** @brief Monotonic wall clock.
- *  @return seconds since an arbitrary epoch (CLOCK_MONOTONIC) */
-static double bench_now_sec(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
-}
 
 /** @brief Print pulsar-bench's help text.
  *  @param fp    the stream to print to
@@ -416,13 +409,13 @@ int main(int argc, char **argv) {
             .cap = frontier,
         };
 
-        const double prefill_t0 = bench_now_sec();
+        const double prefill_t0 = pulsar_mono_sec();
         if (pulsar_session_sync(session, &prefix, err, sizeof(err)) != 0) {
             fprintf(stderr, "pulsar-bench: prefill to %d failed: %s\n", frontier, err);
             rc = 1;
             break;
         }
-        const double prefill_t1 = bench_now_sec();
+        const double prefill_t1 = pulsar_mono_sec();
         const double prefill_sec = prefill_t1 - prefill_t0;
         const int prefill_tokens = frontier - previous;
 
@@ -439,7 +432,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        const double gen_t0 = bench_now_sec();
+        const double gen_t0 = pulsar_mono_sec();
         for (int i = 0; i < cfg.gen_tokens; i++) {
             if (pulsar_session_pos(session) + TokCount{1} >= TokPos::after(pulsar_session_ctx(session))) {
                 fprintf(stderr, "pulsar-bench: generation would exceed allocated context at frontier %d\n", frontier);
@@ -458,7 +451,7 @@ int main(int argc, char **argv) {
                 break;
             }
         }
-        const double gen_t1 = bench_now_sec();
+        const double gen_t1 = pulsar_mono_sec();
         if (rc != 0) break;
 
         if (cfg.gen_tokens == 0) {

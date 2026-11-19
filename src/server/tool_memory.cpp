@@ -1,19 +1,11 @@
 /** @file
  *  Tool memory (call bodies by id and block bytes, LRU) and the protocols' live tool-state bindings; also
- *  server_now_sec and server_log.
+ *  server_log.
  */
 #include "pulsar_server_internal.h"
 #include "pulsar_lock.hpp"
 
 
-
-/// @brief The monotonic clock (CLOCK_MONOTONIC), in seconds; for intervals, not wall time.
-/// @return seconds since an arbitrary fixed point
-double server_now_sec(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-}
 
 
 

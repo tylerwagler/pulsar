@@ -293,13 +293,6 @@ bool lin(const pulsar_model *m, const pulsar_nemotron_h_vision_run *r, const pul
                0;
 }
 
-/// @return CLOCK_MONOTONIC in milliseconds
-double now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return 1e3 * (double)ts.tv_sec + 1e-6 * (double)ts.tv_nsec;
-}
-
 }  // namespace
 
 bool pulsar_nemotron_h_vision_encode(const pulsar_model *m, const pulsar_nemotron_h_vision *v, const uint8_t *bytes,
@@ -310,7 +303,7 @@ bool pulsar_nemotron_h_vision_encode(const pulsar_model *m, const pulsar_nemotro
     const pulsar_nemotron_h_vision_run *r = v->run;
     if (!v->present || !r) return vfail(err, errlen, "no tower is bound");
     const pulsar_nemotron_h_vision_shape &s = v->shape;
-    const double t0 = now_ms();
+    const double t0 = pulsar_mono_ms_f();
     pulsar_nemotron_h_image img;
     if (!pulsar_nemotron_h_image_prepare(&s, bytes, len, &img, err, errlen)) return false;
     const uint32_t np = img.wp * img.hp, NC = s.prefix, N = NC + np, D = s.width, P = 3u * s.patch * s.patch;
@@ -375,7 +368,7 @@ bool pulsar_nemotron_h_vision_encode(const pulsar_model *m, const pulsar_nemotro
     }
     /* rule 5: the lane taken, per image */
     fprintf(stderr, "pulsar: " NHV "tile %ux%u patches -> %u rows (tower + final norm + mlp1, bf16 rows) %.1f ms\n",
-            img.wp, img.hp, n_llm, now_ms() - t0);
+            img.wp, img.hp, n_llm, pulsar_mono_ms_f() - t0);
     *rows_out = out;
     *n_rows_out = (int)n_llm;
     return true;

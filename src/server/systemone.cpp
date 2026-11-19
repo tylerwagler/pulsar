@@ -340,7 +340,7 @@ bool server_judge_release(server *s) {
     J->released = true;
     server_log(PULSAR_LOG_DEFAULT, "pulsar-server: /v1/systemone: bank %d's KV freed for chat (%.2f GiB; no judge "
                "request waits): the next one re-backs it empty and prefills again", J->bank.raw(),
-               (double)held.raw() / (1024.0 * 1024.0 * 1024.0));
+               pulsar_gib(held));
     return true;
 }
 
@@ -491,7 +491,7 @@ bool server_judge_step(server *s) {
  *  held, how many were prefilled, the wall time and the HTTP status. */
 struct judge_req_log {
     server *s = NULL;    ///< L433: the server whose /metrics counts the request (NULL: not counted)
-    double t0 = 0.0;     ///< server_now_sec at the handler's start
+    double t0 = 0.0;     ///< pulsar_mono_sec at the handler's start
     int status = 0;      ///< the HTTP status answered
     bool retry = false;  ///< L433: a 503 sent with the retry hint (memory, KV budget, shutdown): the busy outcome
     int questions = 0;   ///< questions queued (0: refused before the queue)
@@ -501,7 +501,7 @@ struct judge_req_log {
     ~judge_req_log() {
         server_log(PULSAR_LOG_KVCACHE,
                    "pulsar-server: systemone req: questions=%d tokens=%d cached=%d prefilled=%d ms=%.1f status=%d",
-                   questions, tokens, cached, prefilled, (server_now_sec() - t0) * 1e3, status);
+                   questions, tokens, cached, prefilled, pulsar_ms_of_sec(pulsar_mono_sec() - t0), status);
         if (!s) return;
         /* L433: the request's one count, where its one line is written; count_metric marks the metrics stream */
         const server_systemone_outcome o = server_systemone_outcome_of(status, retry);
@@ -540,7 +540,7 @@ void server_judge_http(server *s, int fd, const char *body, size_t len) {
     /* L378: one line a request at its end, whatever the end -- the judge's calls left no line before */
     judge_req_log lg;
     lg.s = s;
-    lg.t0 = server_now_sec();
+    lg.t0 = pulsar_mono_sec();
     const auto refuse = [&](int code, const char *msg) {
         lg.status = code;
         http_error(fd, code, msg);
@@ -658,7 +658,7 @@ void server_judge_http(server *s, int fd, const char *body, size_t len) {
     }
     jb->probs.resize(jb->prompts.size());
     jb->cached.assign(jb->prompts.size(), 0);
-    const double t0 = server_now_sec();
+    const double t0 = pulsar_mono_sec();
     {
         pulsar::ScopedLock lk(&s->mu);
         if (J->tail) J->tail->next = jb;
@@ -729,7 +729,7 @@ void server_judge_http(server *s, int fd, const char *body, size_t len) {
     }
     char tail[160];
     snprintf(tail, sizeof tail, "],\"usage\":{\"prompt_tokens\":%d,\"cached_tokens\":%d},\"ms\":%.1f}\n", prompt_tokens,
-             cached, (server_now_sec() - t0) * 1e3);
+             cached, pulsar_ms_of_sec(pulsar_mono_sec() - t0));
     out += tail;
     lg.status = 200;
     http_response(fd, 200, "application/json", out.c_str());

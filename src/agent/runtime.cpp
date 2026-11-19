@@ -107,8 +107,8 @@ static int run_agent_non_interactive(pulsar_engine *engine, agent_config *cfg) {
 
         int timeout_ms = -1;
         if (!one_shot && input.len > 0) {
-            double rem = quiet_deadline - agent_now_sec();
-            timeout_ms = rem <= 0.0 ? 0 : (int)(rem * 1000.0) + 1;
+            double rem = quiet_deadline - pulsar_mono_sec();
+            timeout_ms = rem <= 0.0 ? 0 : (int)pulsar_ms_of_sec(rem) + 1;
         }
 
         struct pollfd pfd[2];
@@ -136,7 +136,7 @@ static int run_agent_non_interactive(pulsar_engine *engine, agent_config *cfg) {
                 break;
             }
             if (input.len != old_len) {
-                quiet_deadline = agent_now_sec() + 0.200;
+                quiet_deadline = pulsar_mono_sec() + 0.200;
                 waiting_announced = false;
             }
         }
@@ -164,7 +164,7 @@ static int run_agent_non_interactive(pulsar_engine *engine, agent_config *cfg) {
         }
 
         if (!one_shot && input.len > 0 &&
-            (stdin_eof || agent_now_sec() >= quiet_deadline))
+            (stdin_eof || pulsar_mono_sec() >= quiet_deadline))
         {
             char *prompt = agent_input_buf_take(&input);
             if (worker_is_idle(&worker) && queue.len == 0) {

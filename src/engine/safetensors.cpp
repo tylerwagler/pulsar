@@ -1011,8 +1011,7 @@ static int st_cmp_tensor_name(const void *a, const void *b) {
  *  cannot be read, and says what the sample cost (it is paid at every open).
  *  @param[in,out] m the model: shards, directory and container_digest set; content_digest is written */
 static void st_content_digest(pulsar_model *m) {
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    const struct timespec t0 = pulsar_mono_ts();
     uint64_t bytes = 0;
     bool placed = true, read = false;
     {   /* the plan's storage is released before a refusal's longjmp */
@@ -1034,10 +1033,10 @@ static void st_content_digest(pulsar_model *m) {
     }
     if (!placed) st_die("safetensors: a tensor lies in no shard of the container");
     if (!read) st_die("safetensors: cannot read the container's bytes for its content digest: %s", strerror(errno));
-    clock_gettime(CLOCK_MONOTONIC, &t1);
+    const struct timespec t1 = pulsar_mono_ts();
     fprintf(stderr, "pulsar: container content digest %016llx: %.1f MiB of %llu tensors sampled in %.0f ms\n",
             (unsigned long long)m->content_digest, (double)bytes / 1048576.0, (unsigned long long)m->n_tensors,
-            (double)(t1.tv_sec - t0.tv_sec) * 1e3 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6);
+            pulsar_ms_between(t0, t1));
 }
 
 /// Open a shard directory or single file into m (refuses by longjmp).
@@ -1196,7 +1195,7 @@ static void st_open(pulsar_model *m, const char *path, bool gpu_mapping) {
     fprintf(stderr, "pulsar: safetensors model: %llu shards, %llu tensors, "
                     "%.2f GiB mapped, %llu metadata keys\n",
             (unsigned long long)m->n_shards, (unsigned long long)m->n_tensors,
-            (double)m->mapped_bytes / 1073741824.0, (unsigned long long)m->n_kv);
+            (double)m->mapped_bytes / PULSAR_GIB, (unsigned long long)m->n_kv);
 
     /* PULSAR_VERIFY_TENSORS=<name prefix>: hash the bytes the KERNELS will read
      * (tensor_map_base(m,t) + t->abs_offset) for every tensor under that

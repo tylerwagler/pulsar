@@ -35,20 +35,19 @@ static inline const char *pulsar_context_memory_line(char *buf,
                                                      uint32_t prefill_chunk) {
     const pulsar_context_memory m =
         pulsar_context_memory_estimate(backend, ctx_size, prefill_chunk);
-    const double GiB = 1073741824.0;
     snprintf(buf, cap,
              "%s: context buffers %.2f GiB (ctx=%d, backend=%s, prefill_chunk=%u, "
              "kv=%.2f GiB [raw %.2f + comp/idx %.2f], scratch %.2f GiB, "
              "raw_kv_rows=%u, compressed_kv_rows=%u)",
              prog,
-             (double)m.total_bytes / GiB,
+             (double)m.total_bytes / PULSAR_GIB,
              ctx_size,
              pulsar_backend_name(backend),
              m.prefill_cap,
-             (double)(m.raw_bytes + m.comp_index_bytes) / GiB,
-             (double)m.raw_bytes / GiB,
-             (double)m.comp_index_bytes / GiB,
-             (double)m.scratch_bytes / GiB,
+             (double)(m.raw_bytes + m.comp_index_bytes) / PULSAR_GIB,
+             (double)m.raw_bytes / PULSAR_GIB,
+             (double)m.comp_index_bytes / PULSAR_GIB,
+             (double)m.scratch_bytes / PULSAR_GIB,
              m.raw_cap,
              m.comp_cap);
     return buf;

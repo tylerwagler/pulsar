@@ -2,7 +2,7 @@
  *  Typed quantities that share a raw integer type but must never mix (L333, L334): KvRows, KvBytes, TokCount,
  *  PromptToks, TokPos, the P2b index spaces, TokId, BankId, TensorBytes, TextBytes, the layer index spaces (L436),
  *  the output path's text offsets (L437), slab, file and model-map offsets (L438), the server's session slots, bank
- *  counts and job / trace ids (L441) */
+ *  counts and job / trace ids (L441), host and device memory (L442) */
 #ifndef PULSAR_UNITS_H
 #define PULSAR_UNITS_H
 
@@ -15,8 +15,9 @@
  *
  *   KvRows   token rows of KV: a bank's high-water, a prompt's length, a decode quantum, a page of the disk grid --
  *            what a family's pools grow by, one row per token.
- *   KvBytes  bytes of the unified memory the KV accounting prices: a bank's touched pages, a growth price, the
- *            guard's budget and ceiling, the memory floor and the MemAvailable reading the guard turns into KV room.
+ *   KvBytes  bytes of KV the KV accounting prices: a bank's touched pages, a growth price, the guard's budget and
+ *            ceiling.  The memory readings and floors it is compared with are HostBytes / DeviceBytes since L442
+ *            (that section, at the end of this file, says which memory a KV price lives in).
  *
  * L334 phase 1, the token seam's two currencies (pulsar.h pulsar_prefix_match, L115).  A client re-sends sampled
  * turns in canonical spelling, so across a seam the bank's live history and the request's prompt spend a different
@@ -74,6 +75,7 @@
 #include <stdlib.h>
 #include <limits>
 #include <type_traits>
+#include <utility>
 
 /** One quantity of the unit named by `Tag`, held as a `Rep`: an integer that converts to nothing and from nothing
  *  implicitly. */
@@ -135,7 +137,7 @@ struct pulsar_kv_bytes_tag;
 
 /** Token rows of KV (one row per token a bank's pools hold or will hold). */
 typedef pulsar_unit<pulsar_kv_rows_tag> KvRows;
-/** Bytes of the unified memory the KV accounting prices. */
+/** Bytes of KV the KV accounting prices (in the device's memory: pulsar_kv_device_bytes, L442). */
 typedef pulsar_unit<pulsar_kv_bytes_tag> KvBytes;
 
 /** Tag of TokCount (never instantiated). */
@@ -1543,5 +1545,117 @@ static_assert(!std::is_convertible<int, SlotIdx>::value && !std::is_convertible<
                   !std::is_constructible<BankCount, bool>::value && !std::is_constructible<SlotIdx, double>::value,
               "no implicit way in or out of a bare integer");
 /* ==== L441: the server's session slots, pool counts, job and trace ids (end) ======================================= */
+
+/* ==== L442: host and device memory ================================================================================
+ * KvBytes carried three memories until L442 (L391's note, L435 S2-5): the host's (MemAvailable, the zones' high
+ * watermarks, the memory floor, a persist's dirty pages, a discrete card's pinned checkpoints), the device's
+ * (cudaMemGetInfo's free memory, a discrete card's working set, margin and guard floor) and the KV accounting's own
+ * prices.  On the GB10 the three are one pool of unified memory; on a discrete card (CT 130's RTX 6000, CT 131's
+ * RTX 5000) the host and the device are two, and a KV need tested against the host's MemAvailable read the wrong one
+ * (L391's S1-1: provision_bank and the three per-chunk prefill checks).  Each memory is now its own unit:
+ *
+ *   HostBytes    bytes of the host's RAM: a /proc/meminfo reading, the memory floor and its terms, what a persist or
+ *                a pinned host slab takes, a host mapping (the weights' mmap).
+ *   DeviceBytes  bytes of the device's memory: cudaMemGetInfo's free / total, a discrete card's working set, its
+ *                admission margin and its guard floor; the free memory a KV headroom check reads.
+ *   KvBytes      (above) the KV accounting: a price, a budget, the ledger, touched and reserved KV.
+ *
+ * Where a KV price lives: in the DEVICE's memory, on every platform -- a discrete card's VRAM, or on the GB10 the
+ * unified pool the device allocates the KV from (cudaMallocManaged).  So a KV quantity meets a memory reading only as
+ * DeviceBytes, through the one relation pulsar_kv_device_bytes (a price as the device memory it takes) and its
+ * inverse pulsar_kv_room_bytes (device memory as room for KV); a KV price never meets a host reading.
+ * Where host and device are one pool (unified memory: pulsar_gpu_integrated() != 0) a host reading IS the device's:
+ * pulsar_unified_device_bytes / pulsar_unified_host_bytes are that one crossing, and are called only on unified
+ * memory's paths (each call site says why it is one).  On a discrete card nothing converts between the two.
+ * Every crossing is the identity on the value: the split changes no number, only which comparisons compile. */
+/** Tag of HostBytes (never instantiated). */
+struct pulsar_host_bytes_tag;
+/** Tag of DeviceBytes (never instantiated). */
+struct pulsar_device_bytes_tag;
+/** Bytes of the host's RAM: a MemAvailable reading, the memory floor, a persist's or a pinned slab's bytes (L442). */
+typedef pulsar_unit<pulsar_host_bytes_tag> HostBytes;
+/** Bytes of the device's memory: cudaMemGetInfo's readings, a discrete card's working set and floors (L442). */
+typedef pulsar_unit<pulsar_device_bytes_tag> DeviceBytes;
+
+/** A KV price as the device memory it occupies -- the KV lives in the device's memory on every platform (on the GB10
+ *  the unified pool).  The one way a KV quantity meets a memory reading.
+ *  @param b the KV bytes */
+/// @return the same bytes as DeviceBytes
+constexpr DeviceBytes pulsar_kv_device_bytes(KvBytes b) { return DeviceBytes{b.raw()}; }
+/** Device memory as room for KV: the inverse of pulsar_kv_device_bytes (a headroom reading turned into a KV budget).
+ *  @param b the device bytes */
+/// @return the same bytes as KvBytes
+constexpr KvBytes pulsar_kv_room_bytes(DeviceBytes b) { return KvBytes{b.raw()}; }
+/** A host reading as the device's, where the two are ONE pool: unified memory only (pulsar_gpu_integrated() != 0;
+ *  on the GB10 MemAvailable is what the device can still allocate).  Never on a discrete card's path.
+ *  @param b the host bytes */
+/// @return the same bytes as DeviceBytes
+constexpr DeviceBytes pulsar_unified_device_bytes(HostBytes b) { return DeviceBytes{b.raw()}; }
+/** The inverse of pulsar_unified_device_bytes, under the same condition: unified memory only.
+ *  @param b the device bytes */
+/// @return the same bytes as HostBytes
+constexpr HostBytes pulsar_unified_host_bytes(DeviceBytes b) { return HostBytes{b.raw()}; }
+
+/** A host slab's tensor bytes as the host memory they take (a pinned checkpoint slab's extent): the one crossing
+ *  from TensorBytes into HostBytes, beside kv_bytes_of.
+ *  @param b the tensor bytes, of a host allocation */
+/// @return the same bytes as HostBytes
+constexpr HostBytes host_bytes_of(TensorBytes b) { return HostBytes{b.raw()}; }
+
+/** Bytes per GiB: the one constant every GiB figure in a log line or a test is divided or built by (L442; the series
+ *  chose one shared constant over a type for GiB doubles). */
+constexpr double PULSAR_GIB = 1024.0 * 1024.0 * 1024.0;
+/** Bytes per MiB, the same for MiB figures. */
+constexpr double PULSAR_MIB = 1024.0 * 1024.0;
+/** A byte count in GiB, for a log line: `(double)b / PULSAR_GIB`.
+ *  @param b the bytes */
+/// @return GiB
+constexpr double pulsar_gib(uint64_t b) { return (double)b / PULSAR_GIB; }
+/** A byte unit's quantity in GiB, for a log line (KvBytes, HostBytes, DeviceBytes, TensorBytes alike).
+ *  @param b the bytes */
+/// @return GiB
+template <class Tag>
+constexpr double pulsar_gib(pulsar_unit<Tag, uint64_t> b) { return (double)b.raw() / PULSAR_GIB; }
+/** A byte count in MiB, for a log line: `(double)b / PULSAR_MIB`.
+ *  @param b the bytes */
+/// @return MiB
+constexpr double pulsar_mib(uint64_t b) { return (double)b / PULSAR_MIB; }
+/** A byte unit's quantity in MiB, for a log line.
+ *  @param b the bytes */
+/// @return MiB
+template <class Tag>
+constexpr double pulsar_mib(pulsar_unit<Tag, uint64_t> b) { return (double)b.raw() / PULSAR_MIB; }
+
+static_assert(sizeof(HostBytes) == sizeof(uint64_t) && sizeof(DeviceBytes) == sizeof(uint64_t) &&
+                  std::is_trivial<HostBytes>::value && std::is_standard_layout<HostBytes>::value &&
+                  std::is_trivial<DeviceBytes>::value && std::is_standard_layout<DeviceBytes>::value,
+              "host and device bytes are as cheap as the uint64_t they replace (memset / calloc-safe)");
+static_assert(!std::is_constructible<HostBytes, DeviceBytes>::value &&
+                  !std::is_constructible<DeviceBytes, HostBytes>::value &&
+                  !std::is_constructible<HostBytes, KvBytes>::value && !std::is_constructible<KvBytes, HostBytes>::value &&
+                  !std::is_constructible<DeviceBytes, KvBytes>::value &&
+                  !std::is_constructible<KvBytes, DeviceBytes>::value &&
+                  !std::is_constructible<HostBytes, TensorBytes>::value &&
+                  !std::is_constructible<DeviceBytes, TensorBytes>::value &&
+                  !std::is_constructible<HostBytes, KvRows>::value && !std::is_constructible<DeviceBytes, KvRows>::value,
+              "host, device and KV bytes are three memories: none converts to another except by a named function");
+static_assert(!std::is_convertible<uint64_t, HostBytes>::value && !std::is_convertible<HostBytes, uint64_t>::value &&
+                  !std::is_convertible<uint64_t, DeviceBytes>::value &&
+                  !std::is_convertible<DeviceBytes, uint64_t>::value,
+              "no implicit way in or out of a bare integer");
+/* a host reading compared with a device reading, or a KV price with either, does not compile: the operators are
+ * per unit (pulsar_unit's friends take two of the same type) */
+/** Whether `A < B` compiles (the static_assert below): false unless an operator takes the two. */
+template <class A, class B, class = void>
+struct pulsar_units_comparable_ : std::false_type {};
+/** `A < B` compiles. */
+template <class A, class B>
+struct pulsar_units_comparable_<A, B, decltype((void)(std::declval<A>() < std::declval<B>()))> : std::true_type {};
+static_assert(!pulsar_units_comparable_<HostBytes, DeviceBytes>::value &&
+                  !pulsar_units_comparable_<KvBytes, HostBytes>::value &&
+                  !pulsar_units_comparable_<KvBytes, DeviceBytes>::value &&
+                  pulsar_units_comparable_<DeviceBytes, DeviceBytes>::value,
+              "a reading is compared only with a reading of the same memory");
+/* ==== L442: host and device memory (end) ========================================================================== */
 
 #endif

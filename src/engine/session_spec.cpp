@@ -403,8 +403,8 @@ void lane_cost_fit_observe(pulsar_lane_cost_fit *f, uint32_t rows, double ms) {
     if (f->n < SPEC_COST_MIN_OBS || vx < SPEC_COST_MIN_VAR) return;
     const double row = cxy / vx, flat = my - row * mx;
     if (!(row > 0.0) || !(flat > 0.0)) return;
-    f->flat_us = (int32_t)(flat * 1000.0 + 0.5);
-    f->row_us = (int32_t)(row * 1000.0 + 0.5);
+    f->flat_us = (int32_t)(pulsar_us_of_ms(flat) + 0.5);
+    f->row_us = (int32_t)(pulsar_us_of_ms(row) + 0.5);
     f->valid = f->flat_us > 0 && f->row_us > 0;
 }
 
@@ -426,7 +426,7 @@ pulsar_lane_cost lane_cost_fit_view(const pulsar_lane_cost_fit *f) {
  * never spread (a steady N on the plain lane) still knows its cost at N. */
 double pulsar_lane_cost_ms(const pulsar_lane_cost *c, double rows) {
     if (!c || !(rows > 0.0)) return 0.0;
-    if (c->valid) return ((double)c->flat_us + (double)c->row_us * rows) / 1000.0;
+    if (c->valid) return pulsar_ms_of_us((double)c->flat_us + (double)c->row_us * rows);
     if (c->n >= SPEC_COST_MIN_OBS && c->mean_ms > 0.0f && fabs(rows - (double)c->mean_rows) <= 0.5)
         return (double)c->mean_ms;
     return 0.0;
@@ -1011,7 +1011,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
          * generate_speculative call consumes before routing plain. */
         if (dspark_stats && t0 > 0.0)
             fprintf(stderr, "pulsar: dspark fused n_batch=%u committed=%d nodraft step_ms=%.1f\n",
-                    n_batch, commit, (now_sec() - t0) * 1000.0);
+                    n_batch, commit, pulsar_ms_of_sec(pulsar_mono_sec() - t0));
         return n_accept;
     }
 
@@ -1038,7 +1038,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
      * lane) -- step_ms would print the epoch, so skip the line there. */
     if (dspark_stats && t0 > 0.0)
         fprintf(stderr, "pulsar: dspark fused n_batch=%u committed=%d pend=%u step_ms=%.1f\n",
-                n_batch, commit, keep, (now_sec() - t0) * 1000.0);
+                n_batch, commit, keep, pulsar_ms_of_sec(pulsar_mono_sec() - t0));
     return n_accept;
 }
 
@@ -1066,7 +1066,7 @@ static int spec_single_round(pulsar_session *s, int first_token,
                              TokId *accepted, int accepted_cap,
                              char *err, size_t errlen) {
     pulsar_engine *e = s->engine;
-    const double t0 = now_sec();
+    const double t0 = pulsar_mono_sec();
     pulsar_spec_round r;
     memset(&r, 0, sizeof r);
     {
@@ -1111,7 +1111,7 @@ static int spec_single_round(pulsar_session *s, int first_token,
      * lane has no frame to carry one, so on a group neither rank observes
      * here (the batched lane ships the leader's with every round's end). */
     if (na >= 0 && !e->tp) {
-        const double ms = (now_sec() - t0) * 1e3;
+        const double ms = pulsar_ms_of_sec(pulsar_mono_sec() - t0);
         pulsar_engine_lane_cost_observe(e, PULSAR_LANE_SPEC, n_rows, ms);
     }
     return na;

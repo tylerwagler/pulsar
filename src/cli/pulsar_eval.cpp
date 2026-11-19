@@ -2,6 +2,7 @@
  *  pulsar-eval: built-in benchmark integration test -- real model, chat prompts, graded answers,
  *  with a small ANSI terminal UI. */
 #include "pulsar.h"
+#include "lib/pulsar_clock.h"   /* L442: the clocks and the time-unit conversions */
 #include "pulsar_help.h"
 #include "pulsar_ctxmem.h"
 #include "pulsar_argparse.h"
@@ -1432,19 +1433,11 @@ typedef struct {
 /** The run's UI, for tui_restore (atexit) and the signal handler's terminal repair; NULL until tui_start. */
 static eval_ui *global_ui;
 
-/** @brief Monotonic wall clock: the run clock's and every phase timer's one time source.
- *  @return seconds since an arbitrary epoch (CLOCK_MONOTONIC) */
-static double now_sec(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
-}
-
 /** @brief Fold the time since the last tick into run_elapsed_sec (only while the clock runs).
  *  @param ui the UI; NULL is a no-op */
 static void tui_run_clock_tick(eval_ui *ui) {
     if (!ui || !ui->run_clock_active) return;
-    double now = now_sec();
+    double now = pulsar_mono_sec();
     double delta = now - ui->run_last_sec;
     if (delta > 0.0) ui->run_elapsed_sec += delta;
     ui->run_last_sec = now;
@@ -1454,7 +1447,7 @@ static void tui_run_clock_tick(eval_ui *ui) {
  *  @param ui the UI; NULL is a no-op */
 static void tui_run_clock_start(eval_ui *ui) {
     if (!ui || ui->run_clock_active) return;
-    ui->run_last_sec = now_sec();
+    ui->run_last_sec = pulsar_mono_sec();
     ui->run_clock_active = true;
 }
 
@@ -1473,7 +1466,7 @@ static double tui_run_clock_visible_sec(const eval_ui *ui) {
     if (!ui) return 0.0;
     double elapsed = ui->run_elapsed_sec;
     if (ui->run_clock_active) {
-        double delta = now_sec() - ui->run_last_sec;
+        double delta = pulsar_mono_sec() - ui->run_last_sec;
         if (delta > 0.0) elapsed += delta;
     }
     return elapsed;
@@ -2206,7 +2199,7 @@ static void tui_reset_stream(eval_ui *ui, const eval_case *tc, bool in_think) {
     ui->generated = 0;
     ui->prefill_current = 0;
     ui->prefill_total = 0;
-    ui->phase_start_sec = now_sec();
+    ui->phase_start_sec = pulsar_mono_sec();
     ui->speed_tps = 0.0;
 
     for (int row = 2; row <= ui->rows; row++) {
@@ -4112,7 +4105,7 @@ static double tui_wait_if_paused(eval_ui *ui, const char *phase) {
     if (!ui->enabled || !ui->paused) return 0.0;
     bool was_running = ui->run_clock_active;
     if (was_running) tui_run_clock_stop(ui);
-    double start = now_sec();
+    double start = pulsar_mono_sec();
     tui_refresh(ui, phase);
     while (ui->paused) {
         usleep(50000);
@@ -4121,7 +4114,7 @@ static double tui_wait_if_paused(eval_ui *ui, const char *phase) {
     }
     if (was_running) tui_run_clock_start(ui);
     tui_refresh(ui, phase);
-    return now_sec() - start;
+    return pulsar_mono_sec() - start;
 }
 
 /** @brief Session progress callback during a case's prefill: updates the counts and speed, redraws, and
@@ -4139,7 +4132,7 @@ static void eval_prefill_progress(void *ud, const char *event, TokPos current, T
     tui_run_clock_tick(ui);
     ui->prefill_current = current.raw();
     ui->prefill_total = total.raw();
-    double elapsed = now_sec() - ui->phase_start_sec;
+    double elapsed = pulsar_mono_sec() - ui->phase_start_sec;
     ui->speed_tps = elapsed > 0.001 ? (double)current.raw() / elapsed : 0.0;
     tui_refresh(ui, "prefill");
     double paused_sec = tui_wait_if_paused(ui, "prefill");
@@ -4294,7 +4287,7 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
 
     ui->status[idx] = EVAL_THINKING;
     ui->generated = 0;
-    ui->phase_start_sec = now_sec();
+    ui->phase_start_sec = pulsar_mono_sec();
     ui->speed_tps = 0.0;
     byte_buf raw = {0};
     bool plain_in_think = pulsar_think_mode_enabled(think_mode);
@@ -4329,7 +4322,7 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
                 trace_write_case(trace, cfg, tc, idx, ui->ncases, "STOPPED", NULL,
                                  system, question, raw.v ? raw.v : "", think_mode,
                                  prompt_tokens, ui->generated, generation_limit,
-                                 now_sec() - t0, "?",
+                                 pulsar_mono_sec() - t0, "?",
                                  &think_close);
                 free(question);
                 pulsar_tokens_free(&think_close_tokens);
@@ -4344,7 +4337,7 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
                 trace_write_case(trace, cfg, tc, idx, ui->ncases, "SWITCHED", NULL,
                                  system, question, raw.v ? raw.v : "", think_mode,
                                  prompt_tokens, ui->generated, generation_limit,
-                                 now_sec() - t0, "?",
+                                 pulsar_mono_sec() - t0, "?",
                                  &think_close);
                 free(question);
                 pulsar_tokens_free(&think_close_tokens);
@@ -4364,7 +4357,7 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
                 trace_write_case(trace, cfg, tc, idx, ui->ncases, "STOPPED", NULL,
                                  system, question, raw.v ? raw.v : "", think_mode,
                                  prompt_tokens, ui->generated, generation_limit,
-                                 now_sec() - t0, "?",
+                                 pulsar_mono_sec() - t0, "?",
                                  &think_close);
                 free(question);
                 pulsar_tokens_free(&think_close_tokens);
@@ -4379,7 +4372,7 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
                 trace_write_case(trace, cfg, tc, idx, ui->ncases, "SWITCHED", NULL,
                                  system, question, raw.v ? raw.v : "", think_mode,
                                  prompt_tokens, ui->generated, generation_limit,
-                                 now_sec() - t0, "?",
+                                 pulsar_mono_sec() - t0, "?",
                                  &think_close);
                 free(question);
                 pulsar_tokens_free(&think_close_tokens);
@@ -4432,7 +4425,7 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
             trace_write_case(trace, cfg, tc, idx, ui->ncases, "ERROR", err,
                              system, question, raw.v ? raw.v : "", think_mode,
                              prompt_tokens, ui->generated, generation_limit,
-                                 now_sec() - t0, "?",
+                                 pulsar_mono_sec() - t0, "?",
                              &think_close);
             free(question);
             pulsar_tokens_free(&think_close_tokens);
@@ -4455,7 +4448,7 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
             trace_write_case(trace, cfg, tc, idx, ui->ncases, "ERROR", err,
                              system, question, raw.v ? raw.v : "", think_mode,
                              prompt_tokens, ui->generated, generation_limit,
-                                 now_sec() - t0, "?",
+                                 pulsar_mono_sec() - t0, "?",
                              &think_close);
             free(question);
             pulsar_tokens_free(&think_close_tokens);
@@ -4478,7 +4471,7 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
                 think_close.rank = 0;
             }
         }
-        double elapsed = now_sec() - ui->phase_start_sec;
+        double elapsed = pulsar_mono_sec() - ui->phase_start_sec;
         ui->speed_tps = elapsed > 0.001 ? (double)ui->generated / elapsed : 0.0;
 
         if (tty) {
@@ -4508,7 +4501,7 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
     ui->status[idx] = outcome;
     ui->generated_tokens[idx] = ui->generated;
     tui_run_clock_stop(ui);
-    double sec = now_sec() - t0;
+    double sec = pulsar_mono_sec() - t0;
     const char *outcome_name = report_status_name(outcome);
     tui_refresh(ui, outcome == EVAL_PASSED ? "passed" :
                     outcome == EVAL_FAILED ? "failed" : "incomplete");
@@ -4525,7 +4518,7 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
                got, tc->answer, sec, ui->generated, generation_limit);
     }
 
-    if (tty && cfg->pause_ms > 0) usleep((useconds_t)cfg->pause_ms * 1000);
+    if (tty && cfg->pause_ms > 0) usleep(pulsar_us_of_ms((useconds_t)cfg->pause_ms));
     free(question);
     pulsar_tokens_free(&think_close_tokens);
     buf_free(&raw);
