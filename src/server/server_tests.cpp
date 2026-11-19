@@ -6681,6 +6681,166 @@ static void test_l437_deepseek_walk_reads_released_bytes_only(void) {
     l303_server_free(&srv);
 }
 
+/* ==== L437: the shared JSON call body against its reading before its offsets were typed ======================= */
+
+#include <functional>
+
+#include "json_call_body_ref.h"
+
+/// Inkling's grammar around a JSON call body of type `Body` (the live one, or the reference).
+template <class Body> class l437_json_parser : public out_parser {
+public:
+    /// Start a turn after the generation prompt's role marker.
+    void start() { out_parser::init(&inkling_output_grammar(), &body_, OUT_HEADER); }
+    out_parser *clone() const override {
+        l437_json_parser *p = new l437_json_parser(*this);
+        p->rebind_body(&p->body_);
+        return p;
+    }
+
+private:
+    Body body_;   ///< the call-body reader
+};
+
+/// @param r  the generator
+/// @return one Inkling turn: thinking, text and 0..3 tool calls with random JSON bodies, some broken
+static std::string l437_json_turn(l430_rng *r) {
+    static const std::vector<std::string> frag = {
+        "x", "pulsars", " ", "\n", "\\\"", "\\\\", "\\n", "\\u00e9", "\xc3\xa9", "\xe2\x82\xac", "\xf0\x9f\x9a\x80", "{", "}",
+        "[", "]", ":", ",", "<|end_message|>", "<|end_", "<", "args", "name", "\"", "<|content_invoke_tool_json|>"};
+    auto str = [&]() {
+        std::string v = "\"";
+        for (uint32_t k = r->below(6); k > 0; k--) {
+            const std::string &f = r->pick(frag);
+            v += (f == "\"" || f == "\n") ? "q" : f;   /* a bare quote or newline would end / break the literal */
+        }
+        return v + "\"";
+    };
+    std::function<std::string(int)> value = [&](int depth) -> std::string {
+        switch (r->below(depth > 2 ? 4 : 7)) {
+        case 0: return std::to_string(r->below(1000));
+        case 1: return r->chance(50) ? "true" : "null";
+        case 2:
+        case 3: return str();
+        case 4: {
+            std::string o = "{";
+            for (uint32_t k = r->below(4), i = 0; i < k; i++) o += (i ? ", " : "") + str() + ": " + value(depth + 1);
+            return o + "}";
+        }
+        default: {
+            std::string a = "[";
+            for (uint32_t k = r->below(4), i = 0; i < k; i++) a += (i ? "," : "") + value(depth + 1);
+            return a + "]";
+        }
+        }
+    };
+    std::string out;
+    if (r->chance(40)) out += "<|content_thinking|>plan " + r->pick(frag) + "<|end_message|><|message_model|>";
+    if (r->chance(50)) out += "<|content_text|>On it" + r->pick(frag) + "<|end_message|><|message_model|>";
+    for (uint32_t c = r->below(4); c > 0; c--) {
+        out += r->chance(90) ? "search" : "";
+        out += "<|content_invoke_tool_json|>";
+        std::string body = "{";
+        std::vector<std::string> members;
+        if (!r->chance(8)) members.push_back(std::string("\"name\"") + (r->chance(20) ? " : " : ":") +
+                                            (r->chance(92) ? "\"search\"" : value(1)));
+        if (!r->chance(15)) {
+            std::string args = "{";
+            for (uint32_t k = r->below(4), i = 0; i < k; i++) args += (i ? ", " : "") + str() + ": " + value(1);
+            members.push_back("\"args\":" + (r->chance(92) ? args + "}" : value(1)));
+        }
+        if (r->chance(20)) members.push_back(str() + ":" + value(1));
+        if (r->chance(30) && members.size() > 1) std::swap(members[0], members[1]);
+        for (size_t i = 0; i < members.size(); i++) body += (i ? "," : "") + members[i];
+        body += "}";
+        if (r->chance(12) && !body.empty()) {   /* break it */
+            const size_t at = r->below((uint32_t)body.size());
+            if (r->chance(50)) body.erase(at, 1 + r->below(6));
+            else body.insert(at, r->pick(frag));
+        }
+        out += body;
+        if (!r->chance(5)) out += "<|end_message|>";
+        if (c > 1) out += "<|message_model|>";
+    }
+    if (r->chance(10) && !out.empty()) out.resize(r->below((uint32_t)out.size()));
+    return out;
+}
+
+/* L437: the JSON call body (Inkling's: `{"name": NAME, "args": {...}}`) has no kept earlier reading of its own, as
+ * the XML body has (the chat gates' P3), so the retyping of its cursors gets one here: the kit is run twice over the
+ * same bytes in the same chunks, around the live body and around the body as it was (tests/json_call_body_ref.h),
+ * and after EVERY feed the two must have produced the same events and give the same in_tool_call() / in_payload();
+ * at the end the same calls, text, error count and sampled span.  Clones taken mid-turn go on as the originals. */
+static void test_l437_json_call_body_matches_reference(void) {
+    l430_rng r = {0x4c343337ull};
+    long feeds = 0, begins = 0, fragments = 0, ends = 0, errors = 0, payload = 0;
+    int bad = 0;
+    const int streams = 3000;
+    for (int n = 0; n < streams && !bad; n++) {
+        const std::string out = l437_json_turn(&r);
+        auto *live0 = new l437_json_parser<out_json_call_body>();
+        auto *ref0 = new l437_json_parser<out_json_call_body_ref>();
+        std::unique_ptr<out_parser> live(live0), ref(ref0);
+        live0->start();
+        ref0->start();
+        const int clone_at = r.chance(30) ? (int)r.below(40) : -1;
+        const uint32_t mode = r.below(3);   /* a byte a feed, random chunks, or whole */
+        std::vector<out_event> el, er;
+        int k = 0;
+        for (size_t at = 0; at < out.size() && !bad; k++) {
+            const size_t step = mode == 0 ? 1 : mode == 1 ? 1 + r.below(9) : out.size();
+            const size_t end = std::min(out.size(), at + step);
+            if (k == clone_at) {
+                live.reset(live->clone());
+                ref.reset(ref->clone());
+            }
+            el.clear();
+            er.clear();
+            live->feed(out.data() + at, end - at, &el);
+            ref->feed(out.data() + at, end - at, &er);
+            feeds++;
+            payload += live->in_payload();
+            bool same = el.size() == er.size();
+            for (size_t i = 0; same && i < el.size(); i++) {
+                same = el[i].kind == er[i].kind && el[i].index == er[i].index && el[i].name == er[i].name &&
+                       el[i].text == er[i].text && el[i].arguments == er[i].arguments;
+                begins += el[i].kind == out_event::TOOL_BEGIN;
+                fragments += el[i].kind == out_event::TOOL_ARGS;
+                ends += el[i].kind == out_event::TOOL_END;
+                errors += el[i].kind == out_event::ERROR;
+            }
+            if (!same || live->in_payload() != ref->in_payload() || live->in_tool_call() != ref->in_tool_call()) {
+                fprintf(stderr, "l437 json body: stream %d differs after the feed ending at byte %zu:\n%s\n", n, end,
+                        out.c_str());
+                bad++;
+            }
+            at = end;
+        }
+        el.clear();
+        er.clear();
+        live->finish(&el);
+        ref->finish(&er);
+        size_t llo = 0, lhi = 0, rlo = 0, rhi = 0;
+        const bool lspan = test_raw_span(*live, &llo, &lhi), rspan = test_raw_span(*ref, &rlo, &rhi);
+        bool same = el.size() == er.size() && live->content() == ref->content() &&
+                    live->reasoning() == ref->reasoning() && live->errors() == ref->errors() &&
+                    live->calls().size() == ref->calls().size() && lspan == rspan && llo == rlo && lhi == rhi;
+        for (size_t i = 0; same && i < el.size(); i++) same = el[i].kind == er[i].kind && el[i].text == er[i].text;
+        for (size_t i = 0; same && i < live->calls().size(); i++)
+            same = live->calls()[i].name == ref->calls()[i].name &&
+                   live->calls()[i].arguments == ref->calls()[i].arguments;
+        if (!same && !bad) {
+            fprintf(stderr, "l437 json body: stream %d differs at the finish:\n%s\n", n, out.c_str());
+            bad++;
+        }
+    }
+    fprintf(stderr, "  L437 JSON call body vs its untyped reading: %d streams, %ld feeds (in_payload after %ld); %ld "
+            "calls announced, %ld argument fragments, %ld calls closed, %ld errors; %d differ\n", streams, feeds,
+            payload, begins, fragments, ends, errors, bad);
+    TEST_ASSERT(bad == 0);
+    TEST_ASSERT(begins > 1000 && fragments > 1000 && ends > 1000 && errors > 100 && payload > 1000);   /* it reached them */
+}
+
 /* L428, the prefix: after a turn the server ended at its first call, the bank holds the prompt and the turn's tokens
  * through the call's close -- gen_emit_token is the one place a decoded token reaches the client, and the lanes
  * commit what it took (a speculative round's later drafts are cut before the round, gen_turn_draft_prefix, and a
@@ -21521,6 +21681,26 @@ static_assert(std::is_same_v<decltype(gen_state{}.plain_stream_pos), GenOff> &&
               "the output path carries the pair: the turn's cursors and the kit's are text offsets, the call_tail's is "
               "a length, the parser reports stream offsets, and the kit state converts them");
 
+/* L437: a call body's offsets (BodyOff) -- no offset of the stream or the turn's text passes for one, nor a length;
+ * the body readers' interface carries the pair (the kit's held bytes are a length, the failure point an offset). */
+static_assert(!l334_passes<BodyOff, GenOff> && !l334_passes<GenOff, BodyOff> && !l334_passes<BodyOff, StreamOff> &&
+                  !l334_passes<StreamOff, BodyOff> && !l334_passes<size_t, BodyOff> && !l334_passes<BodyOff, size_t> &&
+                  !l334_passes<GenBytes, BodyOff> && !l334_passes<TextBytes, BodyOff> &&
+                  !std::is_constructible_v<BodyOff, GenOff> && !std::is_constructible_v<BodyOff, StreamOff> &&
+                  !std::is_constructible_v<StreamOff, BodyOff> && !std::is_constructible_v<BodyOff, GenBytes> &&
+                  !l333_orders<BodyOff, StreamOff> && !l333_equates<BodyOff, GenOff> && !l437_subtracts<BodyOff, GenOff> &&
+                  l437_subtracts<BodyOff, BodyOff> && l333_adds<BodyOff, GenBytes> &&
+                  std::is_same_v<decltype(BodyOff{} - BodyOff{}), GenBytes>,
+              "a call body's offset mixes with no other text's, and moves by a length");
+static_assert(std::is_invocable_v<decltype(&out_call_body::grow), out_call_body &, const std::string &, GenBytes, bool,
+                                  int, std::vector<out_event> *> &&
+                  !std::is_invocable_v<decltype(&out_call_body::grow), out_call_body &, const std::string &, size_t,
+                                       bool, int, std::vector<out_event> *> &&
+                  std::is_invocable_v<decltype(&out_call_body::close), out_call_body &, const std::string &, int,
+                                      std::vector<out_event> *, out_call *, const char **, BodyOff *> &&
+                  std::is_same_v<decltype(body_ix(BodyOff{})), size_t>,
+              "the body readers take the kit's held bytes as a length and report where a reading stopped as a BodyOff");
+
 /* L334 fix: what a state at live position G serves of the request across a token seam -- the conversion both the
  * bank's own resume (pulsar_session_bank_resume_at) and an adopt's rank (pulsar_session_bank_adopt_score) now read.
  * Before, each answered G itself: a live-side position counted as the request's tokens. */
@@ -21745,6 +21925,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l437_parser_started_mid_text();
     test_l437_logprobs_ride_with_their_text();
     test_l437_deepseek_walk_reads_released_bytes_only();
+    test_l437_json_call_body_matches_reference();
     test_l428_next_prompt_extends_the_cut_turn();
     test_l420_stop_inside_reasoning_answers_with_it();
     test_l420_other_endings_are_unchanged();

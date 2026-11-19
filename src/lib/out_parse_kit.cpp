@@ -72,7 +72,7 @@ void out_parser::init(const out_grammar *g, out_call_body *body, out_state initi
     prefix_done_ = !g->reasoning_prefix;
     lent_out_ = false;
     loan_ = LOAN_NONE;
-    loan_len_ = 0;
+    loan_len_ = GenBytes{0};
     parked_.clear();
 }
 
@@ -97,7 +97,7 @@ out_parser *out_parser::probe() {
     calls.swap(calls_);
     p->block_.swap(block);
     p->loan_ = LOAN_HELD;
-    p->loan_len_ = p->block_.size();
+    p->loan_len_ = GenBytes{p->block_.size()};
     lent_out_ = true;
     return p;
 }
@@ -105,8 +105,8 @@ out_parser *out_parser::probe() {
 void out_parser::probe_end(out_parser *probe) {
     if (!lent_out_ || probe->loan_ == LOAN_NONE) kit_die("probe_end() without its probe()");
     std::string &lent = probe->loan_ == LOAN_PARKED ? probe->parked_ : probe->block_;
-    if (lent.size() < probe->loan_len_) kit_die("a probe lost bytes of the body it borrowed");
-    lent.resize(probe->loan_len_);
+    if (GenBytes{lent.size()} < probe->loan_len_) kit_die("a probe lost bytes of the body it borrowed");
+    lent.resize(probe->loan_len_.raw());
     block_.swap(lent);
     lent_out_ = false;
     delete probe;
@@ -279,7 +279,7 @@ bool out_parser::quoted(const out_transition &tr) const {
 void out_parser::close_call(std::vector<out_event> *ev) {
     out_call call;
     const char *why = "";
-    size_t at = 0;
+    BodyOff at{0};
     if (body_->close(block_, index_, ev, &call, &why, &at)) {
         out_event e;
         e.kind = out_event::TOOL_END;
@@ -292,7 +292,7 @@ void out_parser::close_call(std::vector<out_event> *ev) {
         out_event e;
         e.kind = out_event::ERROR;
         char msg[200];
-        snprintf(msg, sizeof msg, "malformed tool call %d: %s at byte %zu of the block", index_, why, at);
+        snprintf(msg, sizeof msg, "malformed tool call %d: %s at byte %zu of the block", index_, why, at.raw());
         e.text = msg;
         e.index = index_;
         ev->push_back(std::move(e));
@@ -321,7 +321,7 @@ void out_parser::feed(const char *p, size_t n, std::vector<out_event> *ev) {
             block_.append(hold_, 0, take);
             if (at == std::string::npos) {
                 hold_.erase(0, take);
-                body_->grow(block_, hold_.size(), false, index_, ev);
+                body_->grow(block_, GenBytes{hold_.size()}, false, index_, ev);
                 return;
             }
             if (body_->holds_closer(block_)) {   /* L410: the marker is a value's text, the call is still open */
@@ -332,7 +332,7 @@ void out_parser::feed(const char *p, size_t n, std::vector<out_event> *ev) {
             const StreamOff marker_at = stream_at(at);
             raw_hi_ = marker_at + GenBytes{len};
             hold_.erase(0, at + len);
-            body_->grow(block_, 0, true, index_, ev);
+            body_->grow(block_, GenBytes{0}, true, index_, ev);
             close_call(ev);
             if (tr->to == OUT_HEADER) header_at_ = marker_at + GenBytes{len};
             state_ = tr->to;
@@ -515,25 +515,26 @@ const char *out_tool_param_type(const out_tools &tools, const std::string &fn, c
 /* ---- the shared JSON call body ----------------------------------------------------------------- */
 
 void out_json_call_body::open() {
-    pos_ = 0;
+    pos_ = BodyOff{0};
     depth_ = 0;
     in_str_ = esc_ = false;
-    str_lo_ = 0;
+    str_lo_ = BodyOff{0};
     key_.clear();
     want_value_ = false;
     value_key_.clear();
     name_done_ = false;
     name_.clear();
-    args_lo_ = args_hi_ = std::string::npos;
-    args_sent_ = 0;
+    args_lo_ = args_hi_ = BodyOff::none();
+    args_sent_ = GenBytes{0};
     began_ = payload_ = held_ = false;
 }
 
 /* Advance over the body's new bytes: the depth-1 members' keys, "name"'s string value, where the "args"
  * object starts and ends. */
 void out_json_call_body::scan(const std::string &b) {
-    for (; pos_ < b.size(); pos_++) {
-        const char c = b[pos_];
+    /* L437: the scan's index is the cursor pos_, written back as the loop steps (pos_ is read after it only) */
+    for (size_t pos = body_ix(pos_); pos < b.size(); pos_ = BodyOff{++pos}) {
+        const char c = b[pos];
         if (in_str_) {
             if (esc_) {
                 esc_ = false;
@@ -545,14 +546,14 @@ void out_json_call_body::scan(const std::string &b) {
                     if (value_key_ == "name" && !name_done_) {
                         pyjson_value v;
                         char jerr[8];
-                        if (pyjson_parse(b.data() + str_lo_, pos_ + 1 - str_lo_, &v, jerr, sizeof jerr)) {
+                        if (pyjson_parse(b.data() + body_ix(str_lo_), pos + 1 - body_ix(str_lo_), &v, jerr, sizeof jerr)) {
                             name_ = v.s;
                             name_done_ = true;
                         }
                     }
                     want_value_ = false;
                 } else if (depth_ == 1) {
-                    key_.assign(b, str_lo_ + 1, pos_ - str_lo_ - 1);
+                    key_.assign(b, body_ix(str_lo_) + 1, pos - body_ix(str_lo_) - 1);
                 }
             }
             continue;
@@ -560,7 +561,7 @@ void out_json_call_body::scan(const std::string &b) {
         switch (c) {
         case '"':
             in_str_ = true;
-            str_lo_ = pos_;
+            str_lo_ = BodyOff{pos};
             break;
         case ':':
             if (depth_ == 1) {
@@ -577,7 +578,7 @@ void out_json_call_body::scan(const std::string &b) {
         case '{':
         case '[':
             if (depth_ == 1 && want_value_) {
-                if (c == '{' && value_key_ == "args" && args_lo_ == std::string::npos) args_lo_ = pos_;
+                if (c == '{' && value_key_ == "args" && args_lo_.is_none()) args_lo_ = BodyOff{pos};
                 want_value_ = false;
             }
             depth_++;
@@ -585,8 +586,8 @@ void out_json_call_body::scan(const std::string &b) {
         case '}':
         case ']':
             depth_--;
-            if (depth_ == 1 && args_lo_ != std::string::npos && args_hi_ == std::string::npos && pos_ > args_lo_)
-                args_hi_ = pos_ + 1;   /* the first container closed back to depth 1 after "args" opened is it */
+            if (depth_ == 1 && !args_lo_.is_none() && args_hi_.is_none() && pos > body_ix(args_lo_))
+                args_hi_ = BodyOff{pos + 1};   /* the first container closed back to depth 1 after "args" opened is it */
             break;
         default:
             break;
@@ -596,23 +597,23 @@ void out_json_call_body::scan(const std::string &b) {
 
 /* The args object's bytes so far, whole UTF-8 sequences, its final "}" held back. */
 void out_json_call_body::stream_args(const std::string &b, bool closing, int index, std::vector<out_event> *ev) {
-    if (!began_ || args_lo_ == std::string::npos) return;
-    const size_t from = args_lo_ + args_sent_;
-    size_t end = args_hi_ != std::string::npos ? args_hi_ - 1 : b.size();
-    if (!closing && args_hi_ == std::string::npos) end = utf8_whole_end(b, from, end);
+    if (!began_ || args_lo_.is_none()) return;
+    const size_t from = body_ix(args_lo_ + args_sent_);
+    size_t end = !args_hi_.is_none() ? body_ix(args_hi_) - 1 : b.size();
+    if (!closing && args_hi_.is_none()) end = utf8_whole_end(b, from, end);
     if (end <= from) return;
     out_event e;
     e.kind = out_event::TOOL_ARGS;
     e.index = index;
     e.text.assign(b, from, end - from);
     ev->push_back(std::move(e));
-    args_sent_ = end - args_lo_;
+    args_sent_ = BodyOff{end} - args_lo_;
 }
 
-void out_json_call_body::grow(const std::string &b, size_t held, bool closing, int index,
+void out_json_call_body::grow(const std::string &b, GenBytes held, bool closing, int index,
                               std::vector<out_event> *ev) {
     scan(b);
-    held_ = held > 0;
+    held_ = held > GenBytes{0};
     if (!began_ && name_done_ && !name_.empty()) {
         out_event e;
         e.kind = out_event::TOOL_BEGIN;
@@ -626,10 +627,10 @@ void out_json_call_body::grow(const std::string &b, size_t held, bool closing, i
 }
 
 bool out_json_call_body::close(const std::string &b, int index, std::vector<out_event> *ev, out_call *call,
-                               const char **why, size_t *at) {
+                               const char **why, BodyOff *at) {
     pyjson_value v;
     char jerr[160];
-    *at = 0;
+    *at = BodyOff{0};
     if (!pyjson_parse(b.data(), b.size(), &v, jerr, sizeof jerr) || v.kind != pyjson_value::OBJ) {
         *why = "the body is not one JSON object";
         return false;
@@ -642,7 +643,7 @@ bool out_json_call_body::close(const std::string &b, int index, std::vector<out_
     const pyjson_value *args = v.get("args");
     if (args && args->kind != pyjson_value::OBJ) {
         *why = "\"args\" is not an object";
-        *at = args_lo_ == std::string::npos ? 0 : args_lo_;
+        *at = args_lo_.is_none() ? BodyOff{0} : args_lo_;
         return false;
     }
     if (!began_) {
@@ -653,7 +654,7 @@ bool out_json_call_body::close(const std::string &b, int index, std::vector<out_
         ev->push_back(std::move(e));
     }
     call->name = name->s;
-    call->arguments = args && args_hi_ != std::string::npos ? b.substr(args_lo_, args_hi_ - args_lo_) : "{}";
+    call->arguments = args && !args_hi_.is_none() ? b.substr(body_ix(args_lo_), (args_hi_ - args_lo_).raw()) : "{}";
     return true;
 }
 
@@ -677,7 +678,7 @@ const out_parser_family *out_parser_family_find(int chat_format) {
 
 void xml_call_body::open() {
     began_ = false;
-    head_ws_ = head_seen_ = 0;
+    head_ws_ = head_seen_ = BodyOff{0};
     fn_.clear();
     pay_ = closer_ = value_scan();
 }
@@ -688,33 +689,34 @@ void xml_call_body::open() {
  * passes `r`, where a 0 leaves how far the key's end and then the value's closer were looked for; the next
  * reading starts there (a 0 said nothing before it ends the key or starts a whole closer, and the body only
  * grows).  The answers are those of a reading from the parameter's start. */
-int xml_call_body::read_param(const std::string &b, size_t *i, const std::string &fn, std::string *key,
+int xml_call_body::read_param(const std::string &b, BodyOff *i, const std::string &fn, std::string *key,
                               pyjson_value *v, const char **why, param_resume *r) const {
     static const char kParam[] = "<parameter=", kParamEnd[] = "</parameter>";
-    const size_t n = strlen(kParam), rem = b.size() - *i;
-    if (b.compare(*i, std::min(rem, n), kParam, std::min(rem, n))) {
+    const size_t i0 = body_ix(*i);   /* L437: where the parameter starts, as the string functions' index */
+    const size_t n = strlen(kParam), rem = b.size() - i0;
+    if (b.compare(i0, std::min(rem, n), kParam, std::min(rem, n))) {
         *why = "expected <parameter= or </function>";
         return -1;
     }
     *why = "unterminated <parameter=KEY>";
     if (rem < n) return 0;
-    const size_t at = *i + n;
-    size_t key_end = r ? r->key_end : 0;
+    const size_t at = i0 + n;
+    size_t key_end = r ? body_ix(r->key_end) : 0;
     if (!key_end) {
         /* the key ends at its '>'; a newline before it (or with no '>' yet) is not a key */
-        key_end = b.find_first_of(">\n", r ? std::max(at, r->seen) : at);
+        key_end = b.find_first_of(">\n", r ? std::max(at, body_ix(r->seen)) : at);
         if (key_end == std::string::npos) {
-            if (r) r->seen = b.size();
+            if (r) r->seen = BodyOff{b.size()};
             return 0;
         }
         if (b[key_end] == '\n') return -1;
-        if (r) *r = {key_end, key_end + 1};
+        if (r) *r = {BodyOff{key_end}, BodyOff{key_end + 1}};
     }
     *why = "unterminated parameter value";
-    const size_t close = b.find(kParamEnd, r ? r->seen : key_end + 1);
+    const size_t close = b.find(kParamEnd, r ? body_ix(r->seen) : key_end + 1);
     if (close == std::string::npos) {
         /* a closer that starts in the last strlen - 1 bytes may still complete */
-        if (r) r->seen = std::max(r->seen, b.size() - std::min(b.size(), strlen(kParamEnd) - 1));
+        if (r) r->seen = BodyOff{std::max(body_ix(r->seen), b.size() - std::min(b.size(), strlen(kParamEnd) - 1))};
         return 0;
     }
     *key = b.substr(at, key_end - at);
@@ -722,7 +724,7 @@ int xml_call_body::read_param(const std::string &b, size_t *i, const std::string
     if (vlo < vhi && b[vlo] == '\n') vlo++;
     if (vhi > vlo && b[vhi - 1] == '\n') vhi--;
     const std::string text = b.substr(vlo, vhi - vlo);
-    *i = close + strlen(kParamEnd);
+    *i = BodyOff{close + strlen(kParamEnd)};
     /* A value is JSON only when the schema does not declare it a string
      * AND the text is exactly what tojson would have written for it: the
      * template writes every non-string with tojson, so text in any other
@@ -758,16 +760,17 @@ int xml_call_body::read_param(const std::string &b, size_t *i, const std::string
 void xml_call_body::stream_params(const std::string &b, int index, std::vector<out_event> *ev) {
     static const char kFnEnd[] = "</function>";
     while (!arg_stop_) {
-        size_t i = arg_pos_;
+        size_t i = body_ix(arg_pos_);
         while (i < b.size() && (b[i] == ' ' || b[i] == '\n' || b[i] == '\t' || b[i] == '\r')) i++;
-        arg_pos_ = i;   /* the whitespace between parameters is skipped once */
+        arg_pos_ = BodyOff{i};   /* the whitespace between parameters is skipped once */
         const size_t rem = b.size() - i;
         if (!rem || !b.compare(i, std::min(rem, strlen(kFnEnd)), kFnEnd, std::min(rem, strlen(kFnEnd))))
             return;   /* the call's close is close()'s */
         std::string key;
         pyjson_value v;
         const char *why = NULL;
-        const int r = read_param(b, &i, fn_, &key, &v, &why, &arg_resume_);
+        BodyOff past = arg_pos_;   /* in: the parameter's start; out, on 1: past it */
+        const int r = read_param(b, &past, fn_, &key, &v, &why, &arg_resume_);
         if (r == 0) return;
         if (r < 0) {
             arg_stop_ = true;   /* close() names the fault */
@@ -784,7 +787,7 @@ void xml_call_body::stream_params(const std::string &b, int index, std::vector<o
         e.text = arg_n_ ? ", " + d.substr(1, d.size() - 2) : d.substr(0, d.size() - 1);
         ev->push_back(std::move(e));
         arg_n_++;
-        arg_pos_ = i;
+        arg_pos_ = past;
         arg_resume_ = param_resume();
     }
 }
@@ -797,40 +800,42 @@ void xml_call_body::scan_values(value_scan *vs, const std::string &b) const {
     value_scan &ps = *vs;
     for (;;) {
         if (!ps.value) {
-            const size_t at = b.find(kParam, ps.pos);
+            const size_t at = b.find(kParam, body_ix(ps.pos));
             if (at == std::string::npos) {
-                ps.pos = b.size() > strlen(kParam) ? std::max(ps.pos, b.size() - strlen(kParam)) : ps.pos;
+                if (b.size() > strlen(kParam)) ps.pos = BodyOff{std::max(body_ix(ps.pos), b.size() - strlen(kParam))};
                 break;
             }
             /* L429: a tag still open is looked through once (key_seen is at most the '>' of the last tag read,
              * so it never hides a later tag's) */
-            const size_t gt = b.find('>', std::max(at, ps.key_seen));
+            const size_t gt = b.find('>', std::max(at, body_ix(ps.key_seen)));
             if (gt == std::string::npos) {
-                ps.pos = at;
-                ps.key_seen = b.size();
+                ps.pos = BodyOff{at};
+                ps.key_seen = BodyOff{b.size()};
                 break;
             }
             const char *type = out_tool_param_type(tools, fn_, b.substr(at + strlen(kParam), gt - at - strlen(kParam)));
             ps.value = true;
             ps.is_string = type && !strcmp(type, "string");
             ps.json_str = ps.esc = false;
-            ps.pos = ps.vstart = gt + 1;
+            ps.pos = ps.vstart = BodyOff{gt + 1};
             continue;
         }
         bool closed = false;
-        while (ps.pos < b.size()) {
-            if (b[ps.pos] == '<') {
-                if (!b.compare(ps.pos, strlen(kParamEnd), kParamEnd)) {
-                    ps.pos += strlen(kParamEnd);
+        while (body_ix(ps.pos) < b.size()) {
+            const size_t pos = body_ix(ps.pos);
+            if (b[pos] == '<') {
+                if (!b.compare(pos, strlen(kParamEnd), kParamEnd)) {
+                    ps.pos += GenBytes{strlen(kParamEnd)};
                     ps.value = false;
                     closed = true;
                     break;
                 }
-                if (b.size() - ps.pos < strlen(kParamEnd) &&
-                    !b.compare(ps.pos, b.size() - ps.pos, kParamEnd, b.size() - ps.pos))
+                if (b.size() - pos < strlen(kParamEnd) &&
+                    !b.compare(pos, b.size() - pos, kParamEnd, b.size() - pos))
                     break;   /* a partial closer waits for its next bytes */
             }
-            const char c = b[ps.pos++];
+            const char c = b[pos];
+            ps.pos += GenBytes{1};
             if (ps.is_string) continue;
             if (ps.json_str) {
                 if (ps.esc) ps.esc = false;
@@ -846,13 +851,14 @@ void xml_call_body::scan_values(value_scan *vs, const std::string &b) const {
 
 /* Advance pay_ over the body's new bytes (the kit holds a partial "</tool_call>" out of it: `held`) and say
  * whether the next byte is payload. */
-void xml_call_body::scan_payload(const std::string &b, size_t held) {
+void xml_call_body::scan_payload(const std::string &b, GenBytes held) {
     value_scan &ps = pay_;
     scan_values(&ps, b);
     /* the payload: inside a string value or a JSON string, past the template's leading newline, not on
      * "</" of a closer (this block's or the held "</tool_call>") */
-    const size_t pending = b.size() - std::min(ps.pos, b.size());
-    ps.payload = ps.value && (ps.is_string || ps.json_str) && b.size() > ps.vstart && pending < 2 && held < 2;
+    const size_t pending = b.size() - std::min(body_ix(ps.pos), b.size());
+    ps.payload = ps.value && (ps.is_string || ps.json_str) && b.size() > body_ix(ps.vstart) && pending < 2 &&
+                 held < GenBytes{2};
 }
 
 /* L410: a "</tool_call>" found after `b` is a value's text when `b` ends inside a parameter value -- past a
@@ -870,17 +876,17 @@ bool xml_call_body::holds_closer(const std::string &b) {
     return !(e >= strlen(kFnEnd) && !b.compare(e - strlen(kFnEnd), strlen(kFnEnd), kFnEnd));
 }
 
-void xml_call_body::grow(const std::string &b, size_t held, bool closing, int index,
+void xml_call_body::grow(const std::string &b, GenBytes held, bool closing, int index,
                          std::vector<out_event> *ev) {
     if (!began_) {
         /* announce the call as soon as its name is complete (L429: looking from where the last feed stopped) */
-        size_t i = head_ws_;
+        size_t i = body_ix(head_ws_);
         while (i < b.size() && (b[i] == ' ' || b[i] == '\n' || b[i] == '\t' || b[i] == '\r')) i++;
-        head_ws_ = i;
+        head_ws_ = BodyOff{i};
         if (!b.compare(i, 10, "<function=")) {
             /* the name ends at its '>'; a newline first is no name (close() names the fault) */
-            const size_t e = b.find_first_of(">\n", std::max(i + 10, head_seen_));
-            head_seen_ = e == std::string::npos ? b.size() : e;
+            const size_t e = b.find_first_of(">\n", std::max(i + 10, body_ix(head_seen_)));
+            head_seen_ = BodyOff{e == std::string::npos ? b.size() : e};
             if (e != std::string::npos && b[e] == '>') {
                 out_event ev_begin;
                 ev_begin.kind = out_event::TOOL_BEGIN;
@@ -889,7 +895,7 @@ void xml_call_body::grow(const std::string &b, size_t held, bool closing, int in
                 fn_ = ev_begin.name;
                 ev->push_back(std::move(ev_begin));
                 began_ = true;
-                arg_pos_ = e + 1;
+                arg_pos_ = BodyOff{e + 1};
                 arg_resume_ = param_resume();
                 arg_n_ = 0;
                 arg_stop_ = false;
@@ -903,14 +909,14 @@ void xml_call_body::grow(const std::string &b, size_t held, bool closing, int in
 
 /* The body of one <tool_call> ... </tool_call>. */
 bool xml_call_body::close(const std::string &b, int index, std::vector<out_event> *ev, out_call *call,
-                          const char **why, size_t *at) {
+                          const char **why, BodyOff *at) {
     size_t i = 0;
     auto skip_ws = [&]() {
         while (i < b.size() && (b[i] == ' ' || b[i] == '\n' || b[i] == '\t' || b[i] == '\r')) i++;
     };
     auto fail = [&](const char *w) {
         *why = w;
-        *at = i;
+        *at = BodyOff{i};
         return false;
     };
     skip_ws();
@@ -931,7 +937,9 @@ bool xml_call_body::close(const std::string &b, int index, std::vector<out_event
         std::string key;
         pyjson_value v;
         const char *w = NULL;
-        if (read_param(b, &i, name, &key, &v, &w, NULL) != 1) return fail(w);
+        BodyOff past{i};   /* in: the parameter's start; out, on 1: past it */
+        if (read_param(b, &past, name, &key, &v, &w, NULL) != 1) return fail(w);
+        i = body_ix(past);
         bool replaced = false;   /* a repeated key: first position, last value */
         for (auto &kv : args.o)
             if (kv.first == key) { kv.second = v; replaced = true; }

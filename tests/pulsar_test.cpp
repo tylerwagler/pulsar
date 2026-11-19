@@ -4463,6 +4463,7 @@ static void test_gen_host(void) {
     test_l437_parser_started_mid_text();
     test_l437_logprobs_ride_with_their_text();
     test_l437_deepseek_walk_reads_released_bytes_only();
+    test_l437_json_call_body_matches_reference();
 }
 
 /* L335: a bank carry's restore is all or nothing -- a live row that does not restore (here: a bank past the device

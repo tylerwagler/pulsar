@@ -218,11 +218,11 @@ const out_grammar &gemma4_output_grammar(void) {
 
 void gemma4_call_body::open() {
     began_ = false;
-    args_lo_ = scan_ = 0;
+    args_lo_ = scan_ = BodyOff{0};
     in_str_ = false;
 }
 
-void gemma4_call_body::grow(const std::string &b, size_t, bool, int index, std::vector<out_event> *ev) {
+void gemma4_call_body::grow(const std::string &b, GenBytes, bool, int index, std::vector<out_event> *ev) {
     if (!began_) {
         const size_t ns = name_start(b);
         if (ns == std::string::npos) return;
@@ -234,28 +234,28 @@ void gemma4_call_body::grow(const std::string &b, size_t, bool, int index, std::
         e.name = strip(b.substr(ns, brace - ns));
         ev->push_back(std::move(e));
         began_ = true;
-        args_lo_ = scan_ = brace + 1;
+        args_lo_ = scan_ = BodyOff{brace + 1};
     }
     /* the payload: inside a <|"|> string of the arguments (a quote is one token, so never split; a tail that may
      * still become one waits) */
-    while (scan_ < b.size()) {
-        const size_t q = b.find(kQ, scan_);
+    while (body_ix(scan_) < b.size()) {
+        const size_t q = b.find(kQ, body_ix(scan_));
         if (q == std::string::npos) {
             size_t keep = 0;
-            for (size_t k = std::min(kQ.size() - 1, b.size() - scan_); k > 0; k--)
+            for (size_t k = std::min(kQ.size() - 1, b.size() - body_ix(scan_)); k > 0; k--)
                 if (!kQ.compare(0, k, b, b.size() - k, k)) { keep = k; break; }
-            scan_ = b.size() - keep;
+            scan_ = BodyOff{b.size() - keep};
             break;
         }
         in_str_ = !in_str_;
-        scan_ = q + kQ.size();
+        scan_ = BodyOff{q + kQ.size()};
     }
 }
 
 bool gemma4_call_body::close(const std::string &b, int index, std::vector<out_event> *ev, out_call *call,
-                             const char **why, size_t *at) {
+                             const char **why, BodyOff *at) {
     const size_t ns = name_start(b);
-    *at = 0;
+    *at = BodyOff{0};
     if (ns == std::string::npos) {
         *why = "expected call:NAME";
         return false;
@@ -264,7 +264,7 @@ bool gemma4_call_body::close(const std::string &b, int index, std::vector<out_ev
     const std::string name = strip(b.substr(ns, brace == std::string::npos ? std::string::npos : brace - ns));
     if (name.empty()) {
         *why = "no function name";
-        *at = ns;
+        *at = BodyOff{ns};
         return false;
     }
     pyjson_value args;

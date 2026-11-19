@@ -565,6 +565,9 @@ static_assert(sizeof(TextBytes) == sizeof(uint64_t) && std::is_trivial<TextBytes
  *               serves as its own offsets -- a prompt's length or offset must not move a generated text's offset.
  *   GenOff      an offset into the turn's generated text (gen_state::text, from the attempt's first byte).
  *   StreamOff   an offset into the bytes ONE output parser was fed since its init().
+ *   BodyOff     an offset into an open tool call's BODY: the bytes between the marker that opened the call and the
+ *               one that closes it, as an out_call_body reader is handed them (it is not a stretch of the stream:
+ *               dropped markers are cut out of it).
  *
  * off + len -> off, off - len -> off, off - off -> len (within one text), ordering and equality within one text; an
  * offset of one text is no offset of another, not even explicitly.  The only way from a parser's stream to the turn's
@@ -577,11 +580,10 @@ static_assert(sizeof(TextBytes) == sizeof(uint64_t) && std::is_trivial<TextBytes
  * next byte goes).  Zero cost: one size_t.
  *
  * Left untyped, each inside one object and crossing no boundary as an offset: the parser's held bytes (hold_: offsets
- * local to out_parser::feed / find_marker, converted by out_parser::stream_at), an open call's body (out_call_body
- * readers), the Markdown scanner (run lengths only, no offset) and the grammar gate's trigger matchers (KMP states:
- * prefix lengths of a PATTERN).  Two readers of the turn's text take its offsets raw at their own door: the protocol
- * sinks' release watermark (chat_sink::text, the logprob ledger's) and DeepSeek's DSML walk, a (text, length, offset)
- * scanner.  Rendered-prompt offsets stay TextBytes / pulsar_text_span (L334 P7). */
+ * local to out_parser::feed / find_marker, converted by out_parser::stream_at), the Markdown scanner (run lengths
+ * only, no offset) and the grammar gate's trigger matchers (KMP states: prefix lengths of a PATTERN).  The scanners
+ * under DeepSeek's DSML walk and under the call-body readers take a (text, index) pair like any string function; a
+ * typed cursor becomes that index in one place each (walk_ix, body_ix). */
 
 /** Tag of GenBytes (never instantiated). */
 struct pulsar_gen_bytes_tag;
@@ -682,16 +684,27 @@ private:
 struct pulsar_gen_off_tag;
 /** Tag of StreamOff (never instantiated). */
 struct pulsar_stream_off_tag;
+/** Tag of BodyOff (never instantiated). */
+struct pulsar_body_off_tag;
 
 /** An offset into the turn's generated text: gen_state::text of one decode attempt (L437). */
 typedef pulsar_text_off<pulsar_gen_off_tag> GenOff;
 /** An offset into the bytes one output parser was fed since its init() (L437). */
 typedef pulsar_text_off<pulsar_stream_off_tag> StreamOff;
+/** An offset into an open tool call's body, as its out_call_body reader is handed it (L437). */
+typedef pulsar_text_off<pulsar_body_off_tag> BodyOff;
 
 static_assert(sizeof(GenBytes) == sizeof(size_t) && sizeof(GenOff) == sizeof(size_t) &&
                   sizeof(StreamOff) == sizeof(size_t) && std::is_trivial<GenBytes>::value &&
                   std::is_trivial<GenOff>::value && std::is_standard_layout<StreamOff>::value,
               "an output-path offset or length is as cheap as the size_t it replaces");
+static_assert(sizeof(BodyOff) == sizeof(size_t) && std::is_trivial<BodyOff>::value &&
+                  !std::is_constructible<BodyOff, GenOff>::value && !std::is_constructible<GenOff, BodyOff>::value &&
+                  !std::is_constructible<BodyOff, StreamOff>::value &&
+                  !std::is_constructible<StreamOff, BodyOff>::value &&
+                  !std::is_constructible<BodyOff, GenBytes>::value && !std::is_constructible<BodyOff, TextBytes>::value &&
+                  !std::is_convertible<size_t, BodyOff>::value && !std::is_convertible<BodyOff, size_t>::value,
+              "a call body's offset is as cheap as a size_t, and is no offset of the stream or the text, no length");
 static_assert(!std::is_constructible<GenOff, StreamOff>::value && !std::is_constructible<StreamOff, GenOff>::value &&
                   !std::is_constructible<GenOff, GenBytes>::value && !std::is_constructible<GenBytes, GenOff>::value &&
                   !std::is_constructible<StreamOff, GenBytes>::value &&
