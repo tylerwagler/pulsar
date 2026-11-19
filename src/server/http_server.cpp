@@ -1696,7 +1696,7 @@ void *client_main(void *arg) {
         buf cb = {0};
         /* L337: with context_management, input_tokens is the edited prompt's and original_input_tokens the
          * prompt's as sent */
-        buf_printf(&cb, "{\"input_tokens\":%d", creq.prompt.len);
+        buf_printf(&cb, "{\"input_tokens\":%d", request_prompt_toks(&creq).raw());
         if (creq.ctx_mgmt)
             buf_printf(&cb, ",\"context_management\":{\"original_input_tokens\":%d}", creq.ctx_original_tokens);
         buf_puts(&cb, "}\n");
@@ -1785,10 +1785,10 @@ void *client_main(void *arg) {
         req.model = server_xstrdup(server_served_model_id(s));
     }
     s->count_metric(&s->m_req_class[req.hints.cls]);   /* L249 D: per request class, at acceptance */
-    int ctx_size;
-    ctx_size = pulsar_session_ctx(s->sess).raw();
+    TokCount ctx_size;
+    ctx_size = pulsar_session_ctx(s->sess);
     if (request_exceeds_context(&req, ctx_size)) {
-        http_error_context_length_exceeded(fd, &req, req.prompt.len, ctx_size);
+        http_error_context_length_exceeded(fd, &req, request_prompt_toks(&req).raw(), ctx_size.raw());
         request_free(&req);
         goto done;
     }

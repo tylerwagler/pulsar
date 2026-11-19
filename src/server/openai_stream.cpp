@@ -202,13 +202,16 @@ static const char *context_length_error_param(const request *r) {
 
 /// Whether the prompt leaves no room to generate.
 /// @param r         the request (NULL: false)
-/// @param ctx_size  the context size, tokens
+/// @param ctx_size  the context size, rows of a bank
 /// @return true when the prompt's tokens reach `ctx_size`
-bool request_exceeds_context(const request *r, int ctx_size) {
+bool request_exceeds_context(const request *r, TokCount ctx_size) {
     /* pulsar_session_sync() rejects prompt->len >= ctx_size because generation
      * needs at least one free context slot.  Catch the same boundary here so
      * clients get a normal protocol error instead of a later backend failure. */
-    return r && r->prompt.len >= ctx_size;
+    /* L439: the front door's check, on the request's own tokens -- the rows a cold prefill of them takes.  A bound
+     * request's sync can run a longer stitch onto its bank's history: gen_begin_plan admits that one
+     * (server_sync_admit) */
+    return r && prompt_rows_cold(request_prompt_toks(r)) >= ctx_size;
 }
 
 
@@ -259,6 +262,15 @@ bool http_error_context_length_exceeded(int fd,
     bool ok = http_response(fd, 400, "application/json", b.ptr);
     buf_free(&b);
     return ok;
+}
+
+
+
+bool send_context_refusal(int fd, const request *r, bool stream_open, int n_tokens, int ctx) {
+    if (!stream_open) return http_error_context_length_exceeded(fd, r, n_tokens, ctx);
+    char msg[160];
+    context_length_message(msg, sizeof msg, r, n_tokens, ctx);
+    return sse_error_event(fd, r, 400, msg);
 }
 
 

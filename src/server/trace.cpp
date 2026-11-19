@@ -189,11 +189,11 @@ static void trace_time(FILE *fp) {
 
 uint64_t server::trace_begin(
         const job *j,
-        int cached,
-        int effective_prompt_tokens,
+        PromptToks cached,
+        PromptToks effective_prompt_tokens,
         const trace_cache_diag *cache_diag,
         const char *cache_source,
-        int disk_cached,
+        PromptToks disk_cached,
         const char *disk_path) {
     auto *s = this;
     if (!s->trace) return 0;
@@ -209,9 +209,9 @@ uint64_t server::trace_begin(
             j->req.stream ? 1 : 0,
             j->req.has_tools ? 1 : 0,
             pulsar_think_mode_name(j->req.think_mode),
-            j->req.prompt.len,
-            effective_prompt_tokens,
-            cached,
+            request_prompt_toks(&j->req).raw(),
+            effective_prompt_tokens.raw(),
+            cached.raw(),
             j->req.max_tokens,
             j->req.temperature,
             j->req.top_k,
@@ -220,8 +220,8 @@ uint64_t server::trace_begin(
             (unsigned long long)j->req.seed);
     fprintf(s->trace, "stream_include_usage: %d\n",
             j->req.stream_include_usage ? 1 : 0);
-    s->trace_write_cache_diag(cache_diag, &j->req.tool_replay, cached,
-                           cache_source, disk_cached, disk_path);
+    s->trace_write_cache_diag(cache_diag, &j->req.tool_replay, cached.raw(),
+                           cache_source, disk_cached.raw(), disk_path);
     if (j->req.raw_body) {
         fputs("\n--- raw request json ---\n", s->trace);
         fputs(j->req.raw_body, s->trace);

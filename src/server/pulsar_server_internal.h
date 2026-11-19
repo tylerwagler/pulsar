@@ -997,6 +997,113 @@ typedef struct {
 /// @param len   bytes at `line`
 void client_hints_read_line(client_hints *h, const char *line, size_t len);
 
+/* ---- L439: a prompt's tokens, typed ---------------------------------------------------------------------------
+ * pulsar_tokens::len is one bare int for every token array: the request's prompt, the prompt a sync is handed, a
+ * bank's history.  The server read `prompt.len` in ~70 places as whichever count the line needed, and across a token
+ * seam (pulsar.h pulsar_prefix_match: a bank holds the model's SAMPLED spelling of a reply, the client re-sends it
+ * canonically) a prompt's own count and the bank's count of the same text differ.  A prompt is read through this
+ * view: its length is PromptToks and its index PromptPos, so it meets a live position (TokPos) or a history's length
+ * (TokCount) only through the match that relates the two sequences -- the stitch
+ * (pulsar_prefix_match_stitched_len), its inverse below the cut
+ * (pulsar_tokens_prompt_held_with) or a proof that no seam lies below (fuse_witness). */
+/** A prompt as its own tokens: the request's (request_prompt) or the one a sync is handed
+ *  (gen_state::prompt_for_sync -- the request's own, which the engine stitches onto the bank's history at the seam
+ *  match, or an effective prompt that opens with a history's tokens by id).  Borrowed, never owned. */
+struct prompt_view {
+    const pulsar_tokens *t;   ///< the tokens (NULL: no prompt)
+    /** Is there a prompt? */
+    /// @return true when the view names one
+    explicit operator bool() const { return t != NULL; }
+    /** The prompt's length, in its own tokens. */
+    /// @return the tokens
+    PromptToks len() const { return PromptToks{t->len}; }
+    /** The position past its last token. */
+    /// @return the end
+    PromptPos end() const { return PromptPos::after(len()); }
+    /** The token at `i` (fatal on none(); the caller keeps i below end()).
+     *  @param i a position of this prompt */
+    /// @return its id
+    TokId at(PromptPos i) const { return t->v[i.before().raw()]; }
+    /** The tokens from `i` on, for a run the engine reads in place.
+     *  @param i a position of this prompt */
+    /// @return the array at i
+    const TokId *from(PromptPos i) const { return t->v + i.before().raw(); }
+    /** The array itself, for the engine's API (which takes pulsar_tokens and stitches or matches it itself). */
+    /// @return the borrowed tokens
+    const pulsar_tokens *tokens() const { return t; }
+    /** Is this view of the array `o`?
+     *  @param o a token array */
+    /// @return true when it is
+    bool is(const pulsar_tokens *o) const { return t == o; }
+};
+/** A prompt's tokens as a view.
+ *  @param t the tokens (NULL: no prompt) */
+/// @return the view
+inline prompt_view prompt_view_of(const pulsar_tokens *t) { return prompt_view{t}; }
+
+/** L439: the proof the fused prefill lanes read a prompt by -- "this bank's history IS the first tokens of the prompt
+ *  its prefill was handed, by id: no token seam and no foreign tail lies below the bank's position, so a position on
+ *  the bank at or past it is that same index of the prompt, and the prompt's length is the length the bank ends at".
+ *  The lanes feed the engine `prompt[live position]` (a chunk's tokens, its rows' positions); across a seam that
+ *  index is another token, and nothing tied the read to the gate that excludes one (server::fuse_prepare's id-prefix
+ *  test).  Now the read exists only on this type and the type is made only by the gate's own comparison
+ *  (when_history_is_prefix): without the gate there is no witness and the indexing does not compile.  Trivial: a
+ *  zeroed gen_state holds none. */
+class fuse_witness {
+    const pulsar_tokens *p_;   ///< the prompt proven (NULL: no witness)
+
+public:
+    /** No witness (as zeroed memory). */
+    fuse_witness() = default;
+    /** THE gate: a witness for `p` when the bank's history is p's first tokens by id -- the tokens the two share
+     *  from 0 by id (`common_by_id`: pulsar_session_common_prefix on the installed bank) reach the bank's position.
+     *  Anything else (a seam the sync would stitch, a tail the sync would rewind) gives none.
+     *  @param p             the prompt the prefill is handed
+     *  @param common_by_id  the bank's tokens p opens with, by id
+     *  @param pos           the bank's position */
+    /// @return the witness, or none
+    static fuse_witness when_history_is_prefix(prompt_view p, TokCount common_by_id, TokPos pos) {
+        fuse_witness w;
+        w.p_ = p && !pos.is_none() && TokPos::after(common_by_id) == pos ? p.tokens() : NULL;
+        return w;
+    }
+    /** Is there a witness? */
+    /// @return true when the gate passed
+    explicit operator bool() const { return p_ != NULL; }
+    /** Abort without a witness: a lane reached the prompt past the gate (a programmer error, rule 9). */
+    void require() const {
+        if (!p_) {
+            fprintf(stderr, "pulsar-server: a fused prefill read its prompt at a bank position with no witness "
+                            "that the bank's history is the prompt's prefix\n");
+            abort();
+        }
+    }
+    /** The prompt index a position on the bank is -- the identity the witness proves.
+     *  @param live a position on the bank, at or past where the gate found it */
+    /// @return the same token's index in the prompt
+    PromptPos at(TokPos live) const { return require(), PromptPos::after(PromptToks{live.before().raw()}); }
+    /** The position on the bank a prompt index is -- the same identity, read the other way.
+     *  @param i an index of the prompt */
+    /// @return the bank position
+    TokPos live_at(PromptPos i) const { return require(), TokPos::after(TokCount{i.before().raw()}); }
+    /** The prompt's token that goes at a position on the bank.
+     *  @param live the position (below end()) */
+    /// @return its id
+    TokId token(TokPos live) const { return prompt_view{p_}.at(at(live)); }
+    /** The prompt's tokens from a position on the bank on, for a run recorded in place.
+     *  @param live the position (at or below end()) */
+    /// @return the array there
+    const TokId *run(TokPos live) const { return prompt_view{p_}.from(at(live)); }
+    /** Where the bank stands when the whole prompt is in: the prompt's length, as a position on the bank. */
+    /// @return the end
+    TokPos end() const { return require(), TokPos::after(TokCount{prompt_view{p_}.len().raw()}); }
+    /** The prompt proven, for the engine calls that take it whole. */
+    /// @return the view
+    prompt_view prompt() const { return require(), prompt_view{p_}; }
+};
+static_assert(std::is_trivial<fuse_witness>::value && std::is_standard_layout<fuse_witness>::value,
+              "a fuse witness lives in a memset gen_state: zeroed memory is no witness");
+
 /* ---- L378: the KV evidence ------------------------------------------------------------------------------------
  * One `kv req:` line a generation request, written when its job ends (server::kv_req_log), and a cumulative
  * `kv ledger:` line an hour and at shutdown (server::kv_ledger_log).  Log lines and counters only: nothing here
@@ -1130,29 +1237,30 @@ typedef struct {
     bool has_pre;        ///< the prompt has a preamble end (a first user marker)
     uint64_t pre;        ///< server_kv_token_hash of the prompt to its preamble end (server_prompt_preamble_end)
     uint64_t conv;       ///< ... to its conversation key's end (server_prompt_conv_end)
-    int prompt;          ///< the prompt's tokens
-    int bank;            ///< the bank it bound to
+    /* L439: each count and position in its currency.  A count of -1, a position's or a bank's none() is "absent". */
+    PromptToks prompt;   ///< the prompt's tokens (the usage's prompt: the request's own; a live continuation's effective one)
+    BankId bank;         ///< the bank it bound to
     kv_route route;      ///< where the router sent it
-    int best;            ///< the best-scoring free bank
-    int common;          ///< tokens it shares with that bank
-    int score;           ///< where that bank's sync would resume (the route's score)
-    int anchor;          ///< that bank's route anchor
-    int frontier;        ///< that bank's frontier
-    int prefilled;       ///< that bank's prefill frontier
+    BankId best;         ///< the best-scoring free bank
+    TokCount common;     ///< that bank's tokens the request's text shares (the live side of the match)
+    PromptToks score;    ///< the request's tokens that bank's resume serves (the route's score)
+    TokPos anchor;       ///< that bank's route anchor, on its history
+    TokPos frontier;     ///< that bank's frontier
+    TokPos prefilled;    ///< that bank's prefill frontier
     pulsar_resume_why why;   ///< why the score is what it is (pulsar_bank_resume::why)
-    int deep;            ///< the deepest match any free bank had (the best bank's is `common`)
+    TokCount deep;       ///< the deepest match any free bank had, in that bank's tokens (the best bank's is `common`)
     kv_pick pick;        ///< the state its sync started from
-    int from;            ///< the bank an adopt copied from
-    int at;              ///< where its sync started computing
-    int reused;          ///< its tokens served from state (the cache read)
-    int prefilled_now;   ///< tokens this request prefilled
+    BankId from;         ///< the bank an adopt copied from
+    TokPos at;           ///< where its sync started computing, on the bank's history
+    PromptToks reused;   ///< its tokens served from state (the cache read)
+    TokCount prefilled_now;   ///< rows this request prefilled, on the bank's history
     /// L380: the prefill's cut at the prompt's message endpoint: 1 made (and recorded), 0 waived, -1 no endpoint ahead
     int epcut;
     /// L380: what it found of its bank's previous reply: 1 continued from it, 0 left it, -1 no evidence (reply_use)
     int reply;
     bool spill_restored; ///< its bank's history came back from the spill chain for it
-    int evict;           ///< the bank its bind evicted (the last, when several)
-    int evict_tokens;    ///< that bank's history, in tokens
+    BankId evict;        ///< the bank its bind evicted (the last, when several)
+    TokCount evict_tokens;   ///< that bank's history, in its tokens
     uint64_t evict_conv; ///< that history's conversation key (as `conv`)
     bool evict_ro;       ///< that history was read-only (session_slot::kv_flags)
     char snapshot[40];   ///< the eviction's snapshot word (server_evict_snapshot_word)
@@ -1384,6 +1492,68 @@ typedef struct request {
      *  tool binding is neither continued nor recorded, since the client's next request may render it either way. */
     bool ctx_edited;
 } request;
+
+/** L439: the request's prompt as its own tokens (the client's bytes as tokenised): the view every server reader takes
+ *  it through, so its length is PromptToks and never a count on a bank's history.
+ *  @param r the request */
+/// @return the view of r->prompt
+inline prompt_view request_prompt(const request *r) { return prompt_view{&r->prompt}; }
+/** L439: the request's prompt length, in its own tokens.
+ *  @param r the request */
+/// @return the tokens
+inline PromptToks request_prompt_toks(const request *r) { return PromptToks{r->prompt.len}; }
+/** L439: the rows a COLD prefill of a prompt puts on an empty bank -- one a token of its own (no history below it, so
+ *  no token seam: the stitch is the prompt itself).  The front door's context check reads a request this way; the
+ *  length a sync runs on a bank that holds a history is the stitch's (server::slot_sync_len).
+ *  @param own the prompt's tokens */
+/// @return the same number as rows of a bank
+inline TokCount prompt_rows_cold(PromptToks own) { return TokCount{own.raw()}; }
+
+/** L439: context admission on the length a sync RUNS (the engine's cap, sync_driver.cpp: a prompt at or past the
+ *  context is refused there, and so is a token-seam stitch).  The front door admits on the request's own tokens; once
+ *  the request is bound, the stitch onto its bank's history is known and can be longer (a sampled reply the client
+ *  re-sends in fewer tokens): within the seam's shift of the edge the engine refused it and the client got a backend
+ *  failure instead of context_length_exceeded. */
+typedef enum {
+    SYNC_ADMIT_FITS,     ///< the sync's prompt fits: run it as resolved
+    SYNC_ADMIT_COLD,     ///< it does not, but the request's own tokens do: prefill them cold on the bank, emptied
+    SYNC_ADMIT_REFUSE,   ///< neither: refuse with context_length_exceeded (400), as the front door does
+} sync_admit;
+/** The admission's rule, pure.
+ *  @param ctx              the context (rows of a bank)
+ *  @param sync_len         the length the sync would run (server::slot_sync_len)
+ *  @param own              the request's own tokens
+ *  @param replays_history  the request carries its whole conversation (false for a live tool continuation, whose
+ *                          own tokens name server-held state and are no prompt of their own) */
+/// @return the verdict
+sync_admit server_sync_admit(TokCount ctx, TokCount sync_len, PromptToks own, bool replays_history);
+
+/** L439: a common prefix BY ID is a length of both sequences -- the same tokens at the same indices -- so the live
+ *  side's count of it is the prompt side's with no match in between (pulsar_session_common_prefix,
+ *  pulsar_tokens_common_prefix; never a byte match's live_cut).
+ *  @param common_by_id tokens a history and a prompt share from 0 by id */
+/// @return the same tokens as a length of the prompt
+inline PromptToks id_prefix_as_prompt(TokCount common_by_id) { return PromptToks{common_by_id.raw()}; }
+
+/* L439: the MARKED crossings.  A typing commit changes no value: where the code it types reads a count or a position
+ * of one side of a token seam as the other's, the read goes through one of these four, unconverted, and is fixed in
+ * a commit of its own (with a test on a seamed case).  A caller of them is a wrong-meaning site still open. */
+/** A prompt-side count read as a live-side one, unconverted (a marked crossing: see above).
+ *  @param n the prompt's tokens */
+/// @return the same number as live tokens
+inline TokCount seam_unconverted_live(PromptToks n) { return TokCount{n.raw()}; }
+/** A prompt position read as a live one, unconverted (a marked crossing).
+ *  @param p the prompt position (none() stays none()) */
+/// @return the same number as a live position
+inline TokPos seam_unconverted_live(PromptPos p) { return TokPos{p.raw()}; }
+/** A live-side count read as a prompt-side one, unconverted (a marked crossing).
+ *  @param n the live tokens */
+/// @return the same number as prompt tokens
+inline PromptToks seam_unconverted_prompt(TokCount n) { return PromptToks{n.raw()}; }
+/** A live position read as a prompt one, unconverted (a marked crossing).
+ *  @param p the live position (none() stays none()) */
+/// @return the same number as a prompt position
+inline PromptPos seam_unconverted_prompt(TokPos p) { return PromptPos{p.raw()}; }
 
 /** One key/value pair from a parsed JSON object. */
 typedef struct {
@@ -1858,33 +2028,46 @@ typedef struct {
     bool decided;           ///< the wait was decided for this job (it waits at most once)
     uint64_t leader;        ///< the bound job it waits on (job::seq), 0 = not waiting
     int slot;               ///< that job's slot (server::slots index)
-    int mark;               ///< the cut the leader's prefill is to stand at
-    int have;               ///< what served the request when it started waiting (the gain is mark - have)
+    PromptPos mark;         ///< the cut the leader's prefill is to stand at: an index into both prompts (shared by id)
+    PromptToks have;        ///< the request's tokens served when it started waiting (the gain is mark - have)
     double since;           ///< server_now_sec() when it started waiting
 } prefix_wait;
 
 /** One bound prefill a queued request could wait on. */
 typedef struct {
-    int shared;   ///< tokens the two prompts share from 0 (the same ids)
-    int pos;      ///< where the leader's prefill stands (its bank's rows)
-    int len;      ///< the leader's prompt length
+    PromptToks shared;   ///< tokens the two prompts share from 0 (the same ids): a length of either prompt
+    TokPos pos;          ///< where the leader's prefill stands (its bank's rows)
+    PromptToks len;      ///< the leader's prompt length (the prompt its sync was handed)
+    /** L439: the leader's bank history and its sync prompt meet at a token seam (slot_prefix_match): its sync runs
+     *  the stitch, on which an index of the prompt and a position on the bank are different numbers -- no wait is
+     *  taken on it (server_prefix_wait_pick; prefix_mark_on_bank) */
+    bool seamed;
 } prefix_lead;
+
+/** L439: the prefix wait's cut as a position on the leader's bank.  The cut is an index of the leader's sync prompt
+ *  and of the waiter's (the two share it by id); it is the same position on the bank because a wait is taken only on
+ *  a leader whose history and sync prompt match with no token seam (prefix_lead::seamed): its sync rewinds to a point
+ *  of that match and appends the prompt's own tokens, each at its index.  The one conversion the wait's readers use
+ *  (the release check, the leader's cut, the fused lanes' stop).
+ *  @param mark the cut (position 0: none) */
+/// @return the position on the leader's bank
+inline TokPos prefix_mark_on_bank(PromptPos mark) { return TokPos{mark.raw()}; }
 
 /** The wait's decision, pure: the lead (index into `leads`, -1 for none) whose prefill a request of `prompt_len`
  *  tokens waits on, and the cut `*mark` -- the deepest resume-grid point both prompts share, short of either's end,
  *  that the lead has not reached and that starts the request's sync more than `min_gain` tokens (the adopt's own
  *  threshold, PULSAR_SERVER_ADOPT_MIN_GAIN) deeper than `have`, the deepest state serving it now.  Ties go to the
  *  lead nearest its cut. */
-/// @param have        the deepest state serving the request now, tokens
-/// @param prompt_len  the request's prompt length, tokens
-/// @param grid        the resume grid, tokens (<= 0: no lead)
-/// @param min_gain    the gain a wait must beat, tokens
+/// @param have        the request's tokens the deepest state serving it now holds
+/// @param prompt_len  the request's prompt length
+/// @param grid        the resume grid, tokens of a bank's history (<= 0: no lead)
+/// @param min_gain    the gain a wait must beat, the request's tokens
 /// @param leads       the bound prefills
 /// @param n           entries in `leads`
-/// @param mark        receives the cut, tokens (0 for none)
+/// @param mark        receives the cut, a position on both prompts (0 for none)
 /// @return the lead's index, or -1
-int server_prefix_wait_pick(int have, int prompt_len, int grid, int min_gain, const prefix_lead *leads, int n,
-                            int *mark);
+int server_prefix_wait_pick(PromptToks have, PromptToks prompt_len, TokCount grid, PromptToks min_gain,
+                            const prefix_lead *leads, int n, PromptPos *mark);
 
 /** Whether a waiting request goes on (server_prefix_wait_check). */
 typedef enum {
@@ -1898,19 +2081,20 @@ typedef enum {
 extern const char *const prefix_wait_names[PREFIX_WAIT_OUTCOMES];
 /** The release rule, pure: `live` = the job it waits on still prefills on its bank. */
 /// @param live        the leader still prefills on its bank
-/// @param leader_pos  where its prefill stands, tokens
-/// @param mark        the cut waited for, tokens
+/// @param leader_pos  where its prefill stands, on its bank
+/// @param mark        the cut waited for
 /// @param waited_ms   how long the request has waited, ms
 /// @param bound_ms    the wait's bound, ms
 /// @return the verdict
-prefix_wait_verdict server_prefix_wait_check(bool live, int leader_pos, int mark, double waited_ms, double bound_ms);
+prefix_wait_verdict server_prefix_wait_check(bool live, TokPos leader_pos, PromptPos mark, double waited_ms,
+                                             double bound_ms);
 /** The cut a leader's prefill stops at, pure: its pending mark `cur` unless stale (<= `pos`) or deeper than a
  *  waiter's `want` -- the shallowest pending cut first; a deeper waiter re-asserts its own once that one is reached. */
-/// @param cur   the leader's pending cut (0 = none)
+/// @param cur   the leader's pending cut (position 0 = none)
 /// @param want  a waiter's cut
-/// @param pos   where the leader's prefill stands
+/// @param pos   where the leader's prefill stands, on its bank
 /// @return the cut the prefill stops at
-int server_prefix_mark_merge(int cur, int want, int pos);
+PromptPos server_prefix_mark_merge(PromptPos cur, PromptPos want, TokPos pos);
 /** PULSAR_SERVER_PREFIX_WAIT_MS's value, pure: unset or empty = the default, else whole milliseconds (0 = off);
  *  -1 for anything else (the server refuses to start on it). */
 /// @param text  the variable's value (NULL = unset)
@@ -3286,16 +3470,16 @@ struct server {
     /** L347 I2: the anchor's second sighting -- the store holds the rows of `prompt`[0, cut) (an earlier request with
      *  the same preamble trickled them; pulsar_segstore_covers over the rendered text) and no restore point at `cut`.
      *  Then the prefill stops at `cut` and persists it as KV_PERSIST_ANCHOR.
-     *  @param prompt the request's tokens
-     *  @param cut    the anchor cut (kv_cache_anchor_cut)
+     *  @param prompt the prompt the sync is handed
+     *  @param cut    the anchor cut (kv_cache_anchor_cut), a length of that prompt
      *  @return true when the anchor is due */
-    bool kv_cache_anchor_due(const pulsar_tokens *prompt, int cut);
+    bool kv_cache_anchor_due(prompt_view prompt, PromptToks cut);
     /** L347 I3b (X-Pulsar-KV pin-anchor): a restore point the store holds exactly at `prompt`[0, cut) is flagged
      *  PINNED (said once, when it was not).
-     *  @param prompt the request's tokens
-     *  @param cut    the anchor cut (kv_cache_anchor_cut)
+     *  @param prompt the prompt the sync is handed
+     *  @param cut    the anchor cut (kv_cache_anchor_cut), a length of that prompt
      *  @return true when such a restore point exists (pinned now) -- no anchor write is due */
-    bool kv_cache_pin_anchor(const pulsar_tokens *prompt, int cut);
+    bool kv_cache_pin_anchor(prompt_view prompt, PromptToks cut);
     /** L347 I3b: publish the store's pinned anchors for /metrics (the store is the worker's; send_metrics reads the
      *  copies under mu).  Worker thread. */
     void kv_cache_publish_store();
@@ -3570,6 +3754,12 @@ struct server {
      */
     /// @param sl the slot whose job this is (its gen_state; its bank installed by the caller unless said)
     void gen_prefill_fail(session_slot *sl);
+    /** L439: end a bound job whose sync would not fit the context (server_sync_admit's REFUSE): the 400 refusal
+     *  (send_context_refusal), its `kv req:` finish `refused-context`, GEN_DONE.  Nothing was prefilled.
+     *  @param sl        the slot whose job this is
+     *  @param sync_len  the length the sync would run
+     *  @param ctx       the context */
+    void gen_context_refuse(session_slot *sl, TokCount sync_len, TokCount ctx);
     /** L318 / L347 I3b: what bank `src`'s published state serves of the slot's request (its tokens held to the state's
      *  T, pulsar_session_bank_adopt_score), 0 when it may not be adopted from (not resident, spilled, preempted,
      *  mid-restore, the slot's own) -- the resume pick's scan, and a failed restore's look again.
@@ -3893,14 +4083,16 @@ struct server {
     void trace_write_cache_diag(const trace_cache_diag *d, const tool_replay_stats *tool_replay, int cached, const char *cache_source, int disk_cached, const char *disk_path);
     /** Open a trace for `j`. @return the trace id every later call passes back. */
     /// @param j                        the job
-    /// @param cached                   tokens the resolved prompt reuses
-    /// @param effective_prompt_tokens  tokens of the prompt to sync
+    /// @param cached                   the usage's prompt tokens the state serves (the cache read)
+    /// @param effective_prompt_tokens  the length of the prompt the sync is handed, in its own tokens
     /// @param cache_diag               the cache-decision diagnostics
     /// @param cache_source             the label of the layer that supplied the cached tokens
-    /// @param disk_cached              tokens restored from the disk chain
+    /// @param disk_cached              the request's tokens a disk chain loaded
     /// @param disk_path                the loaded chain's segment key (may be NULL)
     /// @return 0 when tracing is off
-    uint64_t trace_begin(const job *j, int cached, int effective_prompt_tokens, const trace_cache_diag *cache_diag, const char *cache_source, int disk_cached, const char *disk_path);
+    uint64_t trace_begin(const job *j, PromptToks cached, PromptToks effective_prompt_tokens,
+                         const trace_cache_diag *cache_diag, const char *cache_source, PromptToks disk_cached,
+                         const char *disk_path);
     /** Close the trace: outcome, token counts, what the final parse produced. */
     /// @param id                the request's trace id (0: ignored)
     /// @param r                 the request
@@ -4241,8 +4433,9 @@ struct server {
      * Its bank is necessarily DISTINCT from every decode bank (different phase). NULL
      * when the flag is off, not in pool mode, or nothing qualifies.
      */
+    /// @param w  receives the slot's witness (L439: the lane reads its prompt at the bank's position only through it)
     /// @return the slot to fold, or NULL
-    session_slot * worker_find_fuse_prefill();
+    session_slot * worker_find_fuse_prefill(fuse_witness *w);
     /** plan-34 phase-2 inc 5 — FUSED mixed-batch quantum. One decode quantum whose EVERY
      * step folds a small (s->mixed_chunk_tokens) prefill run for `pf` into the SAME
      * pulsar_session_decode_mixed sweep as the decode banks (true continuous batching,
@@ -4260,7 +4453,8 @@ struct server {
     /// @param dec  the decoding slots
     /// @param n    how many
     /// @param pf   the prefilling slot folded into the steps
-    void worker_mixed_batch_quantum(session_slot **dec, int n, session_slot *pf);
+    /// @param w    pf's witness from worker_find_fuse_prefill (L439)
+    void worker_mixed_batch_quantum(session_slot **dec, int n, session_slot *pf, const fuse_witness &w);
     /** Provision a bank in the shared pool (Tier-2). No GPU allocation happens here:
      * the whole n-bank pool was allocated and admitted ONCE at startup, so this is
      * pure host bookkeeping — find a free bank slot, install it, reset it to an
@@ -4361,8 +4555,16 @@ struct server {
     /** Longest common token prefix between the slot's history and `prompt`. */
     /// @param sl      the slot (unprovisioned: 0)
     /// @param prompt  the request's tokens
-    /// @return the live-side common prefix (pulsar_prefix_match::live_cut), tokens
-    int slot_common_prefix(const session_slot *sl, const pulsar_tokens *prompt) const;
+    /// @return the live-side common prefix (pulsar_prefix_match::live_cut), the slot's tokens
+    TokCount slot_common_prefix(const session_slot *sl, const pulsar_tokens *prompt) const;
+    /** L439: the length, on the slot's bank, of the prompt a sync of `p` runs -- the token-seam stitch onto the
+     *  bank's history (pulsar_prefix_match_stitched_len over slot_prefix_match, the match the engine's sync stitches
+     *  at): `p`'s own length when no seam lies in the match, the live tokens of a re-spelled stretch in place of the
+     *  prompt's when one does.  An empty bank: `p`'s own length.
+     *  @param sl the slot
+     *  @param p  the prompt a sync is handed */
+    /// @return the stitched length, rows of the bank
+    TokCount slot_sync_len(const session_slot *sl, prompt_view p) const;
     /** L115: the one prefix-reuse question, asked of a slot.  Callers that need
      * the request-side count (accounting, prefill bounds) read `prompt_cut`;
      * callers that need KV rows or a cut point read `live_cut`.  Across a seam
@@ -4531,7 +4733,7 @@ typedef struct kv_restore {
 /** L330: gen_begin's resolution of the prompt, handed to its plan (server::gen_begin_plan) -- in the same call, or
  *  across a sliced disk restore when the resume pick is the disk chain (then the plan runs once the chain is in). */
 typedef struct gen_resolution {
-    const pulsar_tokens *prompt_for_sync;   ///< &j->req.prompt or &g->effective_prompt
+    prompt_view prompt_for_sync;   ///< the request's own prompt (&j->req.prompt) or &g->effective_prompt
     /** The cache read: tokens of the prompt usage counts that the state serves -- the request's own tokenisation, or
      *  a live continuation's effective prompt (L434: typed; it carried a chain's end, its writer's tokens). */
     PromptToks cached;
@@ -4776,17 +4978,26 @@ struct gen_state {
      *  (PULSAR_SESSION_SYNC_BUSY): answered 503 with Retry-After, not as a fault of the request's image */
     bool prefill_busy;
     pulsar_tokens effective_prompt;  ///< prompt after template rendering and any cache-driven rewrite
-    const pulsar_tokens *prompt_for_sync;  ///< &j->req.prompt or &effective_prompt
+    /** The prompt the sync is handed: the request's own (&j->req.prompt; the engine stitches it onto the bank's
+     *  history at the seam match, so the bank ends at the STITCH's length, not this prompt's) or &effective_prompt.
+     *  L439: a prompt_view -- its length is PromptToks, its index PromptPos; a live position reads it only through
+     *  a fuse_witness or the stitch. */
+    prompt_view prompt_for_sync;
     bool responses_protocol;          ///< request came in on the /responses API
     bool responses_live_continuation;   ///< resuming a live /responses stream rather than starting one
     bool anthropic_live_continuation;   ///< resuming a live Anthropic stream
     char *disk_cache_path;            ///< KV file backing this prompt, owned; NULL when none
     /** The prompt's tokens as usage reports them (L434: the request's own tokenisation; a live continuation's
      *  effective prompt) -- not the length the sync runs, which is the stitch's (prefill_end). */
-    int prompt_tokens;
+    PromptToks prompt_tokens;
     /** L434: where the prompt's prefill ended on the bank's history (the live side; position 0 until the main prefill
      *  completes): what `kv req:`'s prefilled_now and the decode log's context span count from. */
     TokPos prefill_end;
+    /** L439: where the bank stands once prompt_for_sync is in -- the stitch's length (server::slot_sync_len), the
+     *  live-side end the prefill bounds read (the decode budget, the fused lanes' "done", their log).  Its own length
+     *  (prompt_for_sync.len()) is the request's count when it is the request's prompt: across a seam another number.
+     *  Set by gen_begin_plan, again when a cold phase ends (the bank's history changed under it). */
+    TokPos sync_end;
     double t0;                        ///< wall time the request began, for latency accounting
     double first_token_t;  ///< wall time the first output token was produced (TTFT); 0 until set. Request-lifetime: survives decode_again so it reflects the genuinely first token emitted.
     uint64_t trace_id;   ///< correlates every trace event for this request
@@ -4795,12 +5006,12 @@ struct gen_state {
     server_prefill_progress progress;  ///< stable address: callback userdata
     /// L380: this request's syncs waive the cut at the prompt's message endpoint (server_endpoint_waive, gen_begin_plan)
     bool endpoint_waive;
-    int cold_store_len;  ///< the anchor cut (kv_cache_anchor_cut, system prompt + tools before the task message) the prefill stops at and persists as KV_PERSIST_ANCHOR on its second sighting (L347 I2); always < the prompt; 0 = no cold write
+    PromptToks cold_store_len;  ///< (L439: a length of prompt_for_sync) the anchor cut (kv_cache_anchor_cut, system prompt + tools before the task message) the prefill stops at and persists as KV_PERSIST_ANCHOR on its second sighting (L347 I2); always < the prompt; 0 = no cold write
     pulsar_tokens cold_prefix;  ///< the token prefix the cold write covers
     /** L329 (a): a cut on the resume grid that a queued request waits for this prefill to stand at (0: none; stale
      *  once the bank stands at or past it).  The prefill's next chunk ends there, so it captures the grid checkpoint
      *  the waiter adopts (server::prefix_wait_release sets it, gen_step_prefill and the fused round honour it). */
-    int share_mark;
+    PromptPos share_mark;
 
     /* prefill quantum policy (see gen_prefill_cancel_cb) */
     uint32_t prefill_min_suffix;  ///< 0 = interrupting is never exact
@@ -4918,8 +5129,9 @@ struct gen_state {
     /** L260 fusion: this prompt rides the spec lane's fused steps -- its bank was
      * installed once and found an exact extension point (or invalidated for a fresh
      * conversation).  A prompt that is not an extension of its bank's history is
-     * marked no_fuse instead and prefills classically. */
-    bool fuse_ready;
+     * marked no_fuse instead and prefills classically.  L439: the proof itself (fuse_witness): the lanes read the
+     * prompt at the bank's position only through it. */
+    fuse_witness fuse;
     /** L312: the fused lane's round selection (sched_value.cpp) -- this request's token service price over f
      *  (ms per token, Flare's ServicePrice; kept from prefill into decode; <= 0 until first priced), when it last
      *  delivered output (the decode-age clock, server_now_sec; 0: never), and the round it last rode as a prompt
@@ -5791,7 +6003,24 @@ int gen_constrain_draft_prefix(struct server *s, struct gen_state *g, TokId base
 /// @return the mask, or NULL
 const uint32_t *gen_constrain_base_mask(struct server *s, struct gen_state *g);
 
-bool request_exceeds_context(const request *r, int ctx_size);
+bool request_exceeds_context(const request *r, TokCount ctx_size);
+/** L439: where a prefilling job's bank stands once its current target is in -- the main prompt's stitch
+ *  (gen_state::sync_end), or in the cold phase the anchor cut, a length of the prompt that is the same position on
+ *  the bank: the cut lies at or before the first user turn, and a token seam needs a sampled (assistant) stretch below
+ *  it (kv_cache_anchor_cut).  The prefill bounds read this, never the target's own length.
+ *  @param g the job (GEN_PREFILL_COLD or GEN_PREFILL_MAIN) */
+/// @return the target's end on the bank
+TokPos gen_target_end(const gen_state *g);
+/** L439: the context_length_exceeded refusal (400) once a request is bound: the front door's response
+ *  (http_error_context_length_exceeded) while nothing was written, else the same message as an error event in the
+ *  open stream (as worker_try_bind's) -- never a 500.
+ *  @param fd           the client socket
+ *  @param r            the request (its protocol's shape)
+ *  @param stream_open  the SSE stream is open (its headers sent)
+ *  @param n_tokens     the tokens that do not fit
+ *  @param ctx          the context size
+ *  @return false when a write failed */
+bool send_context_refusal(int fd, const request *r, bool stream_open, int n_tokens, int ctx);
 bool gen_client_disconnected(int fd);
 /** A decoding job whose bank could not be installed (server::bank_switch refused): it finishes on an error -- the one
  *  statement of it for generate_job_step, batch_leave, the three quanta's entry and the batched round's begin.  An
@@ -5950,6 +6179,13 @@ int kv_cache_wait_written(kv_disk_cache *kc);
 void kv_cache_writer_state(kv_disk_cache *kc, uint64_t *staged, int *uncommitted);
 char *render_tokens_text(pulsar_engine *engine, const pulsar_tokens *tokens, TextBytes *out_len);
 void tokens_copy_prefix(pulsar_tokens *dst, const pulsar_tokens *src, TokCount n);
+/** L439: the first `n` tokens of a prompt, copied (tokens_copy_prefix, whose count is the source array's own).
+ *  @param dst receives the copy (owned)
+ *  @param src the prompt
+ *  @param n   how many of its tokens */
+inline void prompt_copy_prefix(pulsar_tokens *dst, prompt_view src, PromptToks n) {
+    tokens_copy_prefix(dst, src.tokens(), TokCount{n.raw()});
+}
 /// @param a  a token vector
 /// @param b  another
 /// @return true when `a` is a prefix of `b` (or equal to it)
@@ -5990,10 +6226,13 @@ int build_live_continuation_prompt(pulsar_engine *engine, const pulsar_tokens *l
  *  the cache's min_tokens.  No margin and no floor beyond that: the second-sighting rule (server::kv_cache_anchor_due)
  *  writes only a prefix two requests rendered alike.
  *  @param kc     the cache (its min_tokens)
- *  @param anchor the chat anchor, tokens (-1: none)
+ *  L439: the anchor is an index into the PROMPT and the cut a length of it (PromptToks), while the grid is the bank's
+ *  (live positions).  The two agree here because the anchor sits at or before the first user turn of the prompt and a
+ *  token seam needs a sampled (assistant) stretch below it: the prefix to the cut is the same tokens on the bank.
+ *  @param anchor the chat anchor, an index into the prompt (-1: none)
  *  @param grid   the resume grid, tokens
- *  @return the cut in tokens, 0 for none */
-int kv_cache_anchor_cut(const kv_disk_cache *kc, int anchor, TokCount grid);
+ *  @return the cut, the prompt's tokens before it; 0 for none */
+PromptToks kv_cache_anchor_cut(const kv_disk_cache *kc, int anchor, TokCount grid);
 int kv_cache_chat_anchor_pos(const kv_disk_cache *kc, const pulsar_tokens *prompt, const pulsar_turn_markers *m);
 /** L353: where a persisted shared prefix ends: the FIRST user marker -- the system prompt and tools, what conversations
  *  of one client share however their first messages differ.  A function of the prompt's tokens alone, so the restore
@@ -6007,8 +6246,7 @@ int kv_cache_chat_anchor_pos(const kv_disk_cache *kc, const pulsar_tokens *promp
 int kv_cache_preamble_pos(const kv_disk_cache *kc, const pulsar_tokens *prompt, const pulsar_turn_markers *m);
 /* Trivial-match classifier for the memory-token resolver (defined in
  * server_sched.cpp; unit-tested in server_tests.cpp). */
-bool server_slot_match_is_trivial(int common, int slot_pos,
-                                         int share_ceiling, int protect_floor);
+bool server_slot_match_is_trivial(TokCount common, TokPos slot_pos, PromptToks share_ceiling, TokCount protect_floor);
 /* L275: the position of the bank's last user marker among its prefilled tokens
  * when a completed exchange precedes it; -1 otherwise (defined in
  * server_sched.cpp; unit-tested in server_tests.cpp). */
@@ -6029,9 +6267,12 @@ int server_route_header_anchor(const pulsar_tokens *bank, int prefilled, const p
 int server_route_anchor(const pulsar_tokens *bank, int prefilled, const pulsar_turn_markers *m);
 /* L264 S3 + L275: does the best-scoring free bank take the request in place, or
  * is a fresh bank preferred.  `anchor` is server_route_anchor's answer for
- * that bank (defined in server_sched.cpp; unit-tested in server_tests.cpp). */
-bool server_route_in_place(int common, int score, int frontier, int prefilled, int protect_floor,
-                           int anchor);
+ * that bank (defined in server_sched.cpp; unit-tested in server_tests.cpp).
+ * L439: what an in-place resume discards is the bank's rows past where it resumes -- a position on the bank
+ * (pulsar_bank_resume::at), not the request's tokens it serves (::served, the route's rank), which across a token
+ * seam below the resume point is another number. */
+bool server_route_in_place(TokCount common, TokPos resume_at, TokPos frontier, TokPos prefilled, TokCount protect_floor,
+                           TokPos anchor);
 /* L273: an image request's cold phase -- `cut` (the anchor cut, kv_cache_anchor_cut) when every image begins at or
  * past it, 0 when one begins inside it (*inside = its index, else -1).  Defined in server_jobs.cpp; unit-tested in
  * server_tests.cpp. */
@@ -6219,6 +6460,14 @@ KvBytes server_ledger_release(KvBytes committed_total, KvBytes slot_cost);
 inline bool server_slot_batch_decoding(const session_slot *sl) {
     return sl && sl->gen && sl->gen->batch_active && sl->gen->phase == GEN_DECODE;
 }
+/** L439: the mixed fused lane's gate and its proof (fuse_witness): the bank's history `h` holds `p`'s first `pos`
+ *  tokens by id (no token seam and no foreign token below the bank's position), so the lane reads `p` at the bank's
+ *  positions.  The tokens compared are the first `pos` of each: a history that stands past `pos` is not read.
+ *  @param h   the slot's history (server::slot_history)
+ *  @param p   the prompt its prefill was handed
+ *  @param pos the bank's position */
+/// @return the witness, or none
+fuse_witness fuse_witness_of_history(const slot_tokens &h, prompt_view p, TokPos pos);
 /** L380: slot_tokens' length.  @param h the history */
 /// @return its tokens (0 for none)
 inline int slot_tokens_len(const slot_tokens &h) { return h.base ? h.base->len + (h.tail ? h.tail->len : 0) : 0; }
@@ -6328,7 +6577,7 @@ int server_evict_pick_victim(const session_slot *slots, int n_slots,
  *  @param min_tokens  the disk tier's minimum (kv_cache_options::min_tokens; 0 with the tier off: only the
  *                     read-only half applies)
  *  @return true when the bank is scratch */
-bool server_slot_is_scratch(const session_slot *sl, int frontier, int min_tokens);
+bool server_slot_is_scratch(const session_slot *sl, TokPos frontier, TokCount min_tokens);
 /** L379: the victim classes' order, the ONE rule of the make-room eviction and the guard's spill order: 0 a
  *  dominated or dead bank, 1 a scratch one, 2 a conversation.  The lower rank goes first; LRU decides within one.
  *  @param dominated  the bank is dominated, or holds a dead prefix
