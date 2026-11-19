@@ -17700,9 +17700,9 @@ static void test_l184_every_consumer_loops_the_syntax_table(void) {
         /* the stream projection opens on this row and binds to it */
         dsml_tool_stream ts;
         memset(&ts, 0, sizeof ts);
-        TEST_ASSERT(dsml_tool_stream_init(&ts, text.ptr, text.len, 4));
+        TEST_ASSERT(dsml_tool_stream_init(&ts, text.ptr, text.len, GenOff{4}));
         TEST_ASSERT(ts.syn == syn);
-        TEST_ASSERT(ts.parse_pos == 4 + strlen(syn->tool_calls_start));
+        TEST_ASSERT(ts.parse_pos.raw() == 4 + strlen(syn->tool_calls_start));
         dsml_tool_stream_free(&ts);
 
         /* a truncated closing tag of this row is trimmed as tag debris */
@@ -17791,7 +17791,7 @@ static void test_dsml_stream_never_announces_an_undeclared_tool(void) {
     chat_sink k = capture_sink(&r, &c);
     dsml_tool_stream ts;
     memset(&ts, 0, sizeof ts);
-    TEST_ASSERT(dsml_tool_stream_init(&ts, raw, n, 0));
+    TEST_ASSERT(dsml_tool_stream_init(&ts, raw, n, GenOff{0}));
     for (size_t len = 1; len <= n; len++) TEST_ASSERT(dsml_tool_stream_update(&ts, &k, raw, len));
     TEST_ASSERT(!ts.active && ts.state == DSML_TOOL_ERROR);
     TEST_ASSERT(c.begins == 0 && c.ends == 0 && !c.args.ptr);
@@ -17822,7 +17822,7 @@ static void test_l184_shared_tool_stream_drives_protocol_emitters(void) {
     chat_sink k = capture_sink(&r, &c);
     dsml_tool_stream ts;
     memset(&ts, 0, sizeof ts);
-    TEST_ASSERT(dsml_tool_stream_init(&ts, raw, n, 0));
+    TEST_ASSERT(dsml_tool_stream_init(&ts, raw, n, GenOff{0}));
     for (size_t len = 1; len <= n; len++) {
         TEST_ASSERT(dsml_tool_stream_update(&ts, &k, raw, len));
     }
@@ -17846,7 +17846,7 @@ static void test_l184_shared_tool_stream_drives_protocol_emitters(void) {
         PULSAR_PARAM_START " name=\"command\" string=\"true\">ls -la</";
     memset(&c, 0, sizeof c);
     memset(&ts, 0, sizeof ts);
-    TEST_ASSERT(dsml_tool_stream_init(&ts, cut, strlen(cut), 0));
+    TEST_ASSERT(dsml_tool_stream_init(&ts, cut, strlen(cut), GenOff{0}));
     TEST_ASSERT(dsml_tool_stream_update(&ts, &k, cut, strlen(cut)));
     TEST_ASSERT(ts.active && ts.state == DSML_TOOL_PARAM_VALUE);
     TEST_ASSERT(dsml_tool_stream_finalize(&ts, &k, cut, strlen(cut)));

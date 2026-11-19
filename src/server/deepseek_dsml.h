@@ -49,7 +49,7 @@ typedef struct dsml_tool_stream dsml_tool_stream;
 struct dsml_tool_stream {
     dsml_tool_stream_state state;  ///< where the projection is in the block
     const pulsar_dsml_syntax *syn; ///< the marker literals this block opened with; borrowed
-    size_t parse_pos;              ///< how far into the generated text the projection has consumed
+    GenOff parse_pos;              ///< how far into the generated text the projection has consumed
     int index;                     ///< invocation index: OpenAI's tool_call index / Anthropic's block counter
     bool active;                   ///< a tool block is being projected
     bool emitted_any;              ///< at least one event has gone out
@@ -74,7 +74,7 @@ typedef enum {
 typedef struct {
     /** Where the walk is: reasoning, answer, a DSML block, or suppressed. */
     deepseek_walk_mode mode;
-    size_t emit_pos;             ///< bytes of generated text already turned into events
+    GenOff emit_pos;             ///< bytes of generated text already turned into events
     bool checked_think_prefix;   ///< the leading `<think>` check has been done once
     /** Thinking+tools: hold tentative answer text after the first \</think\>
      * until a tool marker, stream end, or a SECOND close proves whether it
@@ -123,7 +123,7 @@ typedef struct {
     dsml_track_mode mode;      ///< what the tracker is watching for
     dsml_decode_state decode;  ///< where it currently is
     const pulsar_dsml_syntax *syn;  ///< marker literals this block opened with; borrowed
-    size_t pos;                ///< how far into the generated text it has consumed
+    GenOff pos;                ///< how far into the generated text it has consumed
     bool json_in_string;       ///< inside a JSON string, where markers do not apply
     bool json_escaped;         ///< previous byte was a backslash, so this one is literal
 } dsml_decode_tracker;
@@ -140,15 +140,24 @@ typedef struct {
      * request rather than per token -- the flag exists to keep a model that
      * emits the marker repeatedly from flooding the log. */
     bool saw_orphan_tool_end;
-    size_t tool_scan_from;            ///< where the tool-marker scan resumes (a marker can straddle a piece)
+    GenOff tool_scan_from;            ///< where the tool-marker scan resumes (a marker can straddle a piece)
     int next_tool_progress;           ///< token count at which to emit the next tool-progress event
     /** Tool markers inside a reasoning block are NOT tool calls -- the model is
      * thinking about calling something. True when the request has thinking
      * enabled, so marker scanning must wait for the block to close. */
     bool thinking_gates_tool_markers;
     bool tool_scan_waiting_for_think_close;  ///< a marker was seen inside reasoning; scan resumes after the block
-    size_t think_recovery_scan_from;  ///< where to resume scanning after a malformed reasoning block
+    GenOff think_recovery_scan_from;  ///< where to resume scanning after a malformed reasoning block
 } deepseek_parser;
+
+/** L437: the walk's cursors (dsml_tool_stream::parse_pos, deepseek_stream_walk::emit_pos, dsml_decode_tracker::pos,
+ *  the parser's two scan points) are offsets of the text the walk is given -- the turn's generated text in the
+ *  server, any string in a unit test -- held as GenOff.  The scanners under them (raw_full_lit, the trims, the
+ *  stream-safe limits, memchr / strstr) are generic readers of a (text, length, index) triple, like the stop list's:
+ *  this is the ONE place a cursor becomes the index they take. */
+/// @param at  a cursor of the walk
+/// @return it as the byte index into the walk's text
+static inline size_t walk_ix(GenOff at) { return at.raw(); }
 
 size_t trim_truncated_dsml_close_tail(const char *raw, size_t start, size_t len);
 
@@ -156,7 +165,7 @@ const char *find_any_tool_start(const char *s);
 
 const char *find_any_tool_end(const char *s);
 
-bool complete_tool_call_inside_thinking(const char *text, size_t len, size_t *scan_from);
+bool complete_tool_call_inside_thinking(const char *text, size_t len, GenOff *scan_from);
 
 void observe_tool_markers(const char *scan, bool *saw_start,
                                  bool *saw_end, bool *orphan_end);
@@ -166,7 +175,7 @@ size_t trim_tool_separator_ws(const char *raw, size_t start, size_t limit);
 const char *find_last_substr(const char *s, const char *needle);
 
 /* ---- the live DSML tool-stream projection ---- */
-bool dsml_tool_stream_init(dsml_tool_stream *ts, const char *raw, size_t raw_len, size_t pos);
+bool dsml_tool_stream_init(dsml_tool_stream *ts, const char *raw, size_t raw_len, GenOff pos);
 void dsml_tool_stream_free(dsml_tool_stream *ts);
 bool dsml_tool_stream_update(dsml_tool_stream *ts, chat_sink *k,
                              const char *raw, size_t raw_len);

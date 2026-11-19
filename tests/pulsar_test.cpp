@@ -1506,7 +1506,7 @@ static void test_think_tool_recovery(void) {
         PULSAR_TOOL_CALLS_END;
 
     buf text = {0};
-    size_t scan_from = 0;
+    GenOff scan_from{0};
     bool complete = false;
     for (size_t i = 0; generated[i]; i++) {
         buf_append(&text, generated + i, 1);
