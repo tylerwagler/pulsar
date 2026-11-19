@@ -1383,6 +1383,11 @@ void server::gen_begin(session_slot *sl) {
     s->gen_begin_plan(sl, &res);
 }
 
+TokPos gen_target_end(const gen_state *g) {
+    if (g->phase == GEN_PREFILL_COLD) return TokPos::after(prompt_rows_cold(g->cold_store_len));   /* no seam below */
+    return g->sync_end;
+}
+
 sync_admit server_sync_admit(TokCount ctx, TokCount sync_len, PromptToks own, bool replays_history) {
     if (sync_len < ctx) return SYNC_ADMIT_FITS;
     return replays_history && prompt_rows_cold(own) < ctx ? SYNC_ADMIT_COLD : SYNC_ADMIT_REFUSE;

@@ -5487,9 +5487,9 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
     for (int k = 0; k < s->n_slots; k++) {
         if (!rv[k].rounds && !rv[k].why) continue;
         const session_slot *c = &s->slots[k];
-        /* L439 (typing; value unchanged): the prompt's own length printed as the total of the bank's position */
-        const int len = c->gen && c->gen->prompt_for_sync
-                            ? seam_unconverted_live(c->gen->prompt_for_sync.len()).raw() : -1;
+        /* L439: the total of the bank's position is where it stands with the prompt in (it printed the prompt's own
+         * length: across a seam, a bank "at 401/401" with rows left) */
+        const int len = c->gen && c->gen->prompt_for_sync ? c->gen->sync_end.raw() : -1;
         server_log(PULSAR_LOG_PREFILL, "pulsar-server: fuse: bank %d at %d/%d rode %d rows in %d of %d rounds%s%s",
                    c->bank.raw(), server_bank_pos(pool, c->bank).raw(), len, rv[k].rows, rv[k].rounds,
                    round_ix, rv[k].why ? "; last miss: " : "", rv[k].why ? rv[k].why : "");
@@ -5607,10 +5607,8 @@ session_slot *server::worker_find_fuse_prefill() {
             g->no_fuse)
             continue;
         const TokPos P = server_bank_pos(pool, sl->bank);
-        /* L439 (typing; value unchanged): the prompt's own end and the cut, an index of it, against the bank's
-         * position */
-        const TokPos len = seam_unconverted_live(g->prompt_for_sync.end());
-        if (P <= TokPos{0} || P >= len) continue;               /* first chunk / done: classic */
+        /* L439: done is the bank standing at the prompt's stitch, not at its own length */
+        if (P <= TokPos{0} || P >= g->sync_end) continue;       /* first chunk / done: classic */
         if (seam_unconverted_live(g->share_mark) > P) continue; /* L329 (a): the classic sync stops at the cut */
         /* 2026-10-29: the fused run is prefill chunks too -- short of the floor it goes classic (prefill_headroom_ok) */
         if (!s->prefill_headroom_fused_ok(sl)) continue;
@@ -5907,10 +5905,10 @@ static int worker_decode_budget(server *s) {
         const session_slot *c = &s->slots[i];
         if (!slot_prefilling(c)) continue;
         const gen_state *g = c->gen;
-        const prompt_view target = g->phase == GEN_PREFILL_COLD ? prompt_view_of(&g->cold_prefix) : g->prompt_for_sync;
-        if (!target) continue;
-        /* L439 (typing; value unchanged): the target's own length less the bank's position */
-        const TokCount left = seam_unconverted_live(target.end()) - server_bank_pos(s->sess, c->bank);
+        if (!g->prompt_for_sync) continue;
+        /* L439: the target's end on the bank, less where the bank stands (it took the target's own length: across a
+         * seam off by the shift, so a prefill near its end ran full decode quanta, or one far from it single steps) */
+        const TokCount left = gen_target_end(g) - server_bank_pos(s->sess, c->bank);
         if (left <= TokCount{cap}) return 1;
     }
     return PULSAR_SERVER_DECODE_QUANTUM_TOKENS;

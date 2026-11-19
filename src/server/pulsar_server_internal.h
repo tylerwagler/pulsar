@@ -5989,6 +5989,13 @@ int gen_constrain_draft_prefix(struct server *s, struct gen_state *g, TokId base
 const uint32_t *gen_constrain_base_mask(struct server *s, struct gen_state *g);
 
 bool request_exceeds_context(const request *r, TokCount ctx_size);
+/** L439: where a prefilling job's bank stands once its current target is in -- the main prompt's stitch
+ *  (gen_state::sync_end), or in the cold phase the anchor cut, a length of the prompt that is the same position on
+ *  the bank: the cut lies at or before the first user turn, and a token seam needs a sampled (assistant) stretch below
+ *  it (kv_cache_anchor_cut).  The prefill bounds read this, never the target's own length.
+ *  @param g the job (GEN_PREFILL_COLD or GEN_PREFILL_MAIN) */
+/// @return the target's end on the bank
+TokPos gen_target_end(const gen_state *g);
 /** L439: the context_length_exceeded refusal (400) once a request is bound: the front door's response
  *  (http_error_context_length_exceeded) while nothing was written, else the same message as an error event in the
  *  open stream (as worker_try_bind's) -- never a 500.

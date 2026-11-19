@@ -22336,6 +22336,8 @@ static_assert(std::is_same_v<decltype(kv_req_line::prompt), PromptToks> &&
                   std::is_same_v<decltype(prefix_lead::pos), TokPos> &&
                   std::is_same_v<decltype(prefix_lead::len), PromptToks>,
               "the carriers are typed: the kv req line's fields, the prompt's carriers in gen_state, the prefix wait's");
+static_assert(std::is_same_v<decltype(&gen_target_end), TokPos (*)(const gen_state *)>,
+              "a prefill's bounds read its target's end on the bank");
 static_assert(std::is_same_v<decltype(&server_sync_admit), sync_admit (*)(TokCount, TokCount, PromptToks, bool)> &&
                   std::is_same_v<decltype(&server::slot_sync_len), TokCount (server::*)(const session_slot *, prompt_view) const> &&
                   std::is_same_v<decltype(gen_state::sync_end), TokPos> &&
@@ -22769,6 +22771,31 @@ static void test_l439_context_admits_the_stitch(void) {
     }
 }
 
+/* L439 (4): the prefill bounds read the target's end on the bank.  The seamed pair of (3): the bank stands at 250 of
+ * a stitch of 303; the request's own 203 put it 47 past its end (the decode budget saw no prefill left; the fused
+ * lane called it done).  The cold phase's end is the anchor cut, the same number on both sides. */
+static void test_l439_prefill_bounds_are_live_side(void) {
+    const int z[] = {L334_Z};
+    const l439_seam f = l439_make(true, false, NULL, 0, z, 1);
+    gen_state g;
+    memset(&g, 0, sizeof g);
+    pulsar_tokens prompt = {const_cast<TokId *>(f.prompt.data()), (int)f.prompt.size(), (int)f.prompt.size()};
+    g.prompt_for_sync = prompt_view_of(&prompt);
+    g.phase = GEN_PREFILL_MAIN;
+    g.sync_end = TokPos::after(pulsar_prefix_match_stitched_len(&f.m, g.prompt_for_sync.len()));
+    const TokPos at{250};
+    TEST_ASSERT(gen_target_end(&g) == TokPos{303} && gen_target_end(&g) - at == TokCount{53});
+    TEST_ASSERT(seam_unconverted_live(g.prompt_for_sync.end()) - at == TokCount{-47});   /* the old reading */
+    g.phase = GEN_PREFILL_COLD;
+    g.cold_store_len = PromptToks{128};
+    TEST_ASSERT(gen_target_end(&g) == TokPos{128});
+    /* no seam: the stitch is the prompt, and the bound is what it was */
+    const l439_seam u = l439_make(false, false, NULL, 0, z, 1);
+    g.phase = GEN_PREFILL_MAIN;
+    g.sync_end = TokPos::after(pulsar_prefix_match_stitched_len(&u.m, PromptToks{(int)u.prompt.size()}));
+    TEST_ASSERT(gen_target_end(&g) == TokPos{(int)u.prompt.size()});
+}
+
 static void pulsar_server_unit_tests_run(void) {
     test_l333_kv_units();
     test_l334_p2b_crossings();
@@ -22788,6 +22815,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l434_kv_req_fields_are_consistent();
     test_l439_route_discard_is_live_side();
     test_l439_context_admits_the_stitch();
+    test_l439_prefill_bounds_are_live_side();
     test_mem_floor_is_derived_from_the_watermarks();
     test_guard_budget_reads_live_memavailable();
     test_guard_discrete_reads_the_device();
