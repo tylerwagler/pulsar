@@ -343,10 +343,6 @@ struct server_session_price {
     /// @param n banks
     /// @return what admission charges for an n-bank pool: shared + n x eager under overcommit, else full(n)
     KvBytes admission(uint32_t n) const { return overcommit ? shared + eager_per_bank.times(n) : full(n); }
-    /// @param admitted the pool's admitted price (admission() of the pool's size)
-    /// @param n the pool's banks (> 0)
-    /// @return the ledger's even-split per-bank charge, the admitted price over n banks
-    static KvBytes per_bank_charge(KvBytes admitted, uint32_t n) { return KvBytes{admitted.raw() / n}; }
 };
 
 /// @brief The session price at `ctx` (server_session_price); the overcommit split is measured only under overcommit.
@@ -370,9 +366,10 @@ static server_session_price server_session_price_of(pulsar_engine *engine, int c
 
 /* Admission rule: the already-committed live-session cost plus this request's
  * estimated cost must fit under the budget. Gates the startup session here and
- * every lazy slot provisioning in the scheduler (server_sched.cpp); an over-budget
- * provisioning attempt leaves the job queued until a slot frees (plan Tier 1
- * §1.4). Non-static: the scheduler calls it; unit tests live in this TU. */
+ * every bank provisioning in the scheduler (provision_bank's ledger guard,
+ * server::ledger_admits_bank, L391); an over-budget provisioning attempt leaves
+ * the job queued until an eviction releases a charge (plan Tier 1 §1.4).
+ * Non-static: the scheduler calls it; unit tests live in this TU. */
 /// @param kv_budget_bytes the admission budget, bytes
 /// @param committed_bytes the live sessions' committed cost, bytes
 /// @param incoming_bytes the new session's estimated cost, bytes
@@ -382,25 +379,63 @@ bool server_kv_admits(KvBytes kv_budget_bytes, KvBytes committed_bytes, KvBytes 
     return committed_bytes <= kv_budget_bytes - incoming_bytes;
 }
 
-/* Live MemAvailable floor: refuse a session create unless the kernel still
- * reports room for the estimated cost plus the free floor. The floor is
- * kernel/OS breathing room only — process-fixed costs live in the overhead
- * reserve the ledger already subtracted (see PULSAR_SERVER_MEM_FLOOR_BYTES in
- * pulsar_server_internal.h for the 2026-07-15 sizing). avail == 0 means
- * /proc/meminfo was unreadable: fail closed — this guard exists precisely
- * for when other accounting is wrong, so it must not silently disarm
- * itself. Non-static: provision_slot and the eviction precheck (server_sched.cpp)
- * call it; unit tests live in this TU. */
-/// @param avail_bytes MemAvailable in bytes (0 = unreadable: refused)
-/// @param est_bytes the session's estimated cost, bytes
-/// @return server_headroom_admits over the server's floor
-bool server_mem_floor_admits(KvBytes avail_bytes, KvBytes est_bytes) {
-    return server_headroom_admits(avail_bytes, est_bytes, server_mem_floor());
-}
-
+/* The headroom predicate every floor check is built on: the reading must keep
+ * the floor after `need` more bytes.  The floor is kernel/OS breathing room
+ * only — process-fixed costs live in the overhead reserve the ledger already
+ * subtracted (see PULSAR_SERVER_MEM_FLOOR_BYTES in pulsar_server_internal.h for
+ * the 2026-07-15 sizing).  avail == 0 means the reading was unreadable: fail
+ * closed — this guard exists precisely for when other accounting is wrong, so
+ * it must not silently disarm itself.  A KV need is asked through
+ * server_kv_headroom_admits, which reads the memory the KV occupies (L391). */
 bool server_headroom_admits(KvBytes avail, KvBytes need, KvBytes floor) {
     if (avail == KvBytes{} || need > KvBytes::max() - floor) return false;
     return avail >= need + floor;
+}
+
+bool server_kv_headroom_admits(const server_mem_reading &m, KvBytes kv_need) {
+    if (!m.discrete) return server_headroom_admits(m.kv_avail, kv_need, m.kv_floor);
+    if (!server_headroom_admits(m.host_avail, KvBytes{}, m.host_floor)) return false;
+    return kv_need == KvBytes{} || server_headroom_admits(m.kv_avail, kv_need, m.kv_floor);
+}
+
+KvBytes server_bank_provision_demand(bool growth_guarded, KvBytes kv_bank_bytes) {
+    return growth_guarded ? KvBytes{} : kv_bank_bytes;
+}
+
+KvBytes server_bank_charge(KvBytes admitted, uint32_t priced_banks, uint32_t bank) {
+    if (priced_banks == 0 || bank >= priced_banks) return KvBytes{};
+    return KvBytes{admitted.raw() / priced_banks + (bank < admitted.raw() % priced_banks ? 1u : 0u)};
+}
+
+KvBytes server_bank_charges(KvBytes admitted, uint32_t priced_banks, uint32_t from, uint32_t to) {
+    KvBytes sum{};
+    for (uint32_t b = from; b < to && b < priced_banks; b++) sum += server_bank_charge(admitted, priced_banks, b);
+    return sum;
+}
+
+bool server_ledger_self_check(KvBytes admitted, uint32_t priced_banks, uint32_t chat_banks, KvBytes reserved,
+                              KvBytes budget, char *err, size_t errlen) {
+    const double gib = 1024.0 * 1024.0 * 1024.0;
+    if (admitted == KvBytes{} || chat_banks == 0 || chat_banks > priced_banks) {
+        snprintf(err, errlen, "a pool of %u chat bank(s) priced at %llu bytes over %u bank(s) is no pool", chat_banks,
+                 (unsigned long long)admitted.raw(), priced_banks);
+        return false;
+    }
+    const KvBytes all_live = reserved + server_bank_charges(admitted, priced_banks, 0, chat_banks);
+    if (all_live != admitted) {
+        snprintf(err, errlen,
+                 "with every chat bank live the ledger holds %llu bytes (%llu reserved + %u chat bank charges) but "
+                 "the pool was admitted at %llu over %u bank(s)",
+                 (unsigned long long)all_live.raw(), (unsigned long long)reserved.raw(), chat_banks,
+                 (unsigned long long)admitted.raw(), priced_banks);
+        return false;
+    }
+    if (!server_kv_admits(budget, KvBytes{}, admitted)) {
+        snprintf(err, errlen, "the pool's admitted price %.2f GiB is past the budget %.2f GiB",
+                 (double)admitted.raw() / gib, (double)budget.raw() / gib);
+        return false;
+    }
+    return true;
 }
 
 /* The one floor (pulsar_server_internal.h, "The memory floor"): set once at startup, before the listener opens and
@@ -1273,7 +1308,7 @@ int main(int argc, char **argv) {
              * session estimate — the extra-slot ctx is capped at slot 0's,
              * so its est can never exceed session_est); when memory is
              * GENUINELY tight, the LIVE per-attempt floor check
-             * (server_mem_floor_admits — truthful post-warmup) is the guard,
+             * (server_kv_headroom_admits — truthful post-warmup) is the guard,
              * and it recovers naturally when memory frees. */
             const KvBytes budget_min = resident_now + session_est;
             if (measured < budget_min) {
@@ -1422,24 +1457,33 @@ int main(int argc, char **argv) {
                    s.mixed_deep_guard_rows);
     }
     s.n_slots = 1;
-    s.kv_budget_bytes = kv_budget_final;
     for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) s.slots[i].bank = BankId{i}; /* slot i holds bank i */
     if (s.pool_banks > 0) {
-        /* Even-split per-bank ledger charge: the whole pool's admitted cost
-         * spread across its banks (conservative — demand-paged reality is
-         * smaller). Startup commits bank 0's share; each provisioned bank adds
-         * one share, so committed == session_est only when all banks are live,
-         * and that sum was already verified <= budget above. */
-        s.bank_marginal_bytes = server_session_price::per_bank_charge(session_est, (uint32_t)pool_banks);
-        /* Pool mode: NO bank is provisioned at boot — bank 0 is an ordinary
-         * bank provisioned on first use like the rest (uniform ledger:
-         * committed starts at 0, each provision charges one marginal).  The
+        /* The pool's ledger (L391, server::ledger_open_pool): the admitted
+         * price split evenly over the banks it was priced over -- ALL the
+         * session's banks, the judge's included, each one's eager floor being
+         * resident from the create.  Startup commits the charges of the banks
+         * no chat slot holds (the judge's; before L391 its share was divided
+         * out and committed nowhere, so a full pool sat one charge under the
+         * estimate); each chat bank's is committed as it is provisioned, so
+         * committed == session_est, to the byte, when all are live.  The
+         * self-check refuses a ledger that does not add up to that or that the
+         * budget does not hold.
+         * Pool mode: NO chat bank is provisioned at boot — bank 0 is an
+         * ordinary bank provisioned on first use like the rest.  The
          * old boot-provisioned slot 0 was the root of a whole wart family:
          * the routing phantom (first conversation routed "in place" to the
          * empty boot slot but landing on bank 1), the un-provisionable /
          * un-evictable squatter, and the compensating special cases each of
          * those needed. */
-        s.kv_committed_bytes = KvBytes{};
+        char ledger_err[320];
+        if (!s.ledger_open_pool(kv_budget_final, session_est, (uint32_t)pool_banks, ledger_err, sizeof ledger_err)) {
+            server_log(PULSAR_LOG_ERROR, "pulsar-server: refusing to start: the session-cost ledger does not add up "
+                       "-- %s (L391)", ledger_err);
+            pulsar_session_free(session);
+            pulsar_engine_close(engine);
+            return 1;
+        }
         /* L347 I4: where the checkpoints are (the store's placement): a discrete card's are pinned host RAM */
         char ckpt_where[96];
         const KvBytes ckpt_host = pulsar_session_ckpt_host_bytes(session);
@@ -1451,14 +1495,18 @@ int main(int argc, char **argv) {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: Tier-2 shared pool ACTIVE: %d banks, "
                    "unified batch decode (L118), per-bank marginal %.2f GiB "
-                   "(pool resident actual %.2f GiB; grid checkpoints %s)",
+                   "(pool resident actual %.2f GiB; grid checkpoints %s); ledger: admitted %.2f GiB over %d "
+                   "bank(s), %d chat bank(s) charged as provisioned, %.2f GiB committed now for the rest",
                    pool_banks,
-                   (double)s.bank_marginal_bytes.raw() / (1024.0 * 1024.0 * 1024.0),
-                   (double)session_actual.raw() / (1024.0 * 1024.0 * 1024.0), ckpt_where);
+                   (double)s.bank_charge(BankId{0}).raw() / (1024.0 * 1024.0 * 1024.0),
+                   (double)session_actual.raw() / (1024.0 * 1024.0 * 1024.0), ckpt_where,
+                   (double)s.ledger_admitted_bytes.raw() / (1024.0 * 1024.0 * 1024.0), pool_banks, s.pool_banks,
+                   (double)s.ledger_reserved_bytes.raw() / (1024.0 * 1024.0 * 1024.0));
     } else {
-        s.kv_committed_bytes = session_actual;
-        s.slots[0].est_cost_bytes = session_actual;
+        s.ledger_open_classic(kv_budget_final, session_actual);
     }
+    /* L338 / L391: where the KV lives, for every headroom check (server::mem_reading), guard or no guard */
+    s.guard_discrete = (pulsar_gpu_integrated() == 0);
     /* Tier-2 task #55 increment 2b — proactive-eviction guard. Enabled only under
      * overcommit with N>1 banks (banks are 1M-capable but total physical is
      * bounded). The guard keeps touched (demand-paged) KV under budget − eager by
@@ -1470,7 +1518,6 @@ int main(int argc, char **argv) {
     if (overcommit && s.pool_banks > 0) {
         /* L338: a discrete card's guard reads the device (server_guard_avail_bytes), and the ledger's share does not
          * cap it unless the test hook below sets a budget. */
-        s.guard_discrete = (pulsar_gpu_integrated() == 0);
         s.guard_floor = server_guard_floor(s.guard_discrete);
         KvBytes budget = s.guard_discrete ? KvBytes::max() : kv_budget_final;
         /* Test hook (restored L264, 2026-10-04: its callers are the guard legs of
