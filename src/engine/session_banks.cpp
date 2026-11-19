@@ -268,12 +268,14 @@ const pulsar_tokens *pulsar_bank_history_as(pulsar_session *s, uint32_t bank, pu
  * is a prefill's (pulsar_kv_state_ops::noted_at); and the finishing chunk's headed row becomes the session's
  * next-token logits.  The family's state already moved with the step; a record that disagrees with it refuses
  * before anything changes. */
-int pulsar_session::note_prefilled(const TokId *toks, int n, int head) {
+int pulsar_session::note_prefilled(const TokId *toks, int n, PromptHead head) {
     auto *s = this;
     if (!toks || n <= 0) return 1;
-    if (head >= 0 && (!s->fused_valid || (uint32_t)head >= s->fused_heads)) {
+    /* L443: any negative is no headed run, as `head >= 0` read it (none() is -1) */
+    const bool headed = head.raw() >= 0;
+    if (headed && (!s->fused_valid || (uint32_t)head.raw() >= s->fused_heads)) {
         fprintf(stderr, "pulsar: note_prefilled: head row %d of a fused step that headed %u -- refusing\n",
-                head, s->fused_valid ? s->fused_heads : 0u);
+                head.raw(), s->fused_valid ? s->fused_heads : 0u);
         return 1;
     }
     pulsar_ckpt_store *ck = pulsar_session_kv_store(s);
@@ -293,9 +295,11 @@ int pulsar_session::note_prefilled(const TokId *toks, int n, int head) {
     pulsar_session_note_committed(s, toks, n);
     s->checkpoint_valid = true;
     s->prefill_frontier = s->hist_end();   /* L195: a prefill wrote up to here */
-    if (head >= 0) {
-        /* the step's rows are still the session's (L302: nothing ran since the fused step) */
-        if (!s->live_from_rows(s->dev.step_rows, s->fused_n_dec + (uint32_t)head)) return 1;
+    if (headed) {
+        /* the step's rows are still the session's (L302: nothing ran since the fused step); the run's head row
+         * follows the step's decode heads */
+        if (!s->live_from_rows(s->dev.step_rows, pulsar_row_index(pulsar_prompt_head_row(head, s->fused_n_dec))))
+            return 1;
         s->logits_stale = false;   /* the next-token row of the history, as a sync's last chunk leaves it */
     }
     return 0;

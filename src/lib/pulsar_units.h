@@ -1,7 +1,8 @@
 /** @file
  *  Typed quantities that share a raw integer type but must never mix (L333, L334): KvRows, KvBytes, TokCount,
  *  PromptToks, TokPos, the P2b index spaces, TokId, BankId, TensorBytes, TextBytes, the layer index spaces (L436),
- *  the output path's text offsets (L437), slab, file and model-map offsets (L438) */
+ *  the output path's text offsets (L437), slab, file and model-map offsets (L438), a fused step's headed prompt
+ *  runs (L443) */
 #ifndef PULSAR_UNITS_H
 #define PULSAR_UNITS_H
 
@@ -1325,5 +1326,36 @@ static_assert(!std::is_constructible<TensorBytes, KvBytes>::value && !std::is_co
                   !std::is_convertible<uint64_t, TextBytes>::value && !std::is_convertible<TextBytes, uint64_t>::value,
               "tensor, KV and text bytes are three units: none converts to another, to a row count or to an integer");
 /* ==== L438: byte offsets -- into a slab, into a file, into a model map (end) ======================================= */
+
+/* ==== L443: the fused step's headed prompt runs ===================================================================
+ * A fused step (pulsar_session_decode_fused) heads its decode / verify rows in place, then -- after them, in run
+ * order -- the last row of each prompt run that finishes on it.  pulsar_session_note_prefilled names such a run by its
+ * place among those headed prompt runs ("the head-th"), an index that once sat as an int beside the chunk's token count
+ * and that is no HeadRow: head row = the step's decode rows + it.  Its own affine pair; none() = an intermediate chunk
+ * (no head).  The one crossing to a head row takes the step's decode rows. */
+/** Tag of PromptHeads (never instantiated). */
+struct pulsar_prompt_heads_tag;
+/** Headed prompt runs of a fused step: a count, or the distance between two of them (L443). */
+typedef pulsar_unit<pulsar_prompt_heads_tag, int> PromptHeads;
+/** One headed prompt run of a fused step, by its place among them (none() = the chunk is headed by no row). */
+typedef pulsar_point<PromptHeads> PromptHead;
+
+/** The head row a fused step's headed prompt run sits at: after the step's n_dec decode heads (fatal on none()).
+ *  @param h     the headed prompt run
+ *  @param n_dec the step's decode / verify rows, every one headed in place */
+/// @return its head row, n_dec + h
+constexpr HeadRow pulsar_prompt_head_row(PromptHead h, uint32_t n_dec) {
+    return HeadRow{(int)(n_dec + (uint32_t)h.before().raw())};
+}
+
+static_assert(sizeof(PromptHead) == sizeof(int) && std::is_trivial<PromptHead>::value &&
+                  std::is_standard_layout<PromptHead>::value,
+              "a headed prompt run is as cheap as the int it replaces");
+static_assert(!std::is_constructible<HeadRow, PromptHead>::value && !std::is_constructible<PromptHead, HeadRow>::value &&
+                  !std::is_constructible<StepRow, PromptHead>::value && !std::is_constructible<PromptHead, StepRow>::value &&
+                  !std::is_constructible<PromptHeads, HeadRows>::value && !std::is_constructible<TokPos, PromptHead>::value &&
+                  !std::is_convertible<int, PromptHead>::value && !std::is_convertible<PromptHead, int>::value,
+              "a headed prompt run is no head row, step row or position, not even explicitly: pulsar_prompt_head_row");
+/* ==== L443 (end) ================================================================================================= */
 
 #endif

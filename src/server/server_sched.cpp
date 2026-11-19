@@ -5233,12 +5233,17 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
          * prefill frontier); a finished prompt takes its head row as the bank's
          * next-token logits and starts its stream (the classic sync's epilogue),
          * then decodes from the next pass. */
-        for (int r = 0, fin_row = 0; r < n_fr; r++) {
+        PromptHeads fin_heads{0};   /* L443: the finishing runs so far: shape.head_last's runs, headed in run order */
+        for (int r = 0; r < n_fr; r++) {
             session_slot *c = fr[r].sl;
             gen_state *pg = c->gen;
-            const int head = fr[r].fin ? fin_row++ : -1;
+            PromptHead head = PromptHead::none();
+            if (fr[r].fin) {
+                head = PromptHead::after(fin_heads);
+                fin_heads += PromptHeads{1};
+            }
             if (!s->bank_switch(c->bank) ||
-                pulsar_session_note_prefilled(pool, pg->fuse.run(TokPos{fr[r].p0}), fr[r].k, head) != 0) {
+                pulsar_session_note_prefilled(pool, pg->fuse.run(TokPos{fr[r].p0}), TokCount{fr[r].k}, head) != 0) {
                 snprintf(pg->err, sizeof pg->err, "bank %d: the fused prompt chunk could not be recorded",
                          c->bank.raw());
                 s->gen_prefill_fail(c);
@@ -5926,7 +5931,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
          * bank's prefill frontier moves with them (a resume computes its grid
          * point from it) and a commit that ends on the grid is a checkpoint. */
         if (pulsar_session_bank_state_restore(pool, pf->bank) &&
-            pulsar_session_note_prefilled(pool, w.run(TokPos{P0}), pf_done, -1) == 0) {
+            pulsar_session_note_prefilled(pool, w.run(TokPos{P0}), TokCount{pf_done}, PromptHead::none()) == 0) {
             pf->committed_pos = TokPos{P0 + pf_done};
             s->live_bank = pf->bank;
             if (reached_end) {

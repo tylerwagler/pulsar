@@ -844,7 +844,7 @@ static void part_fused_runs(pulsar_engine *e, int W) {
             /* F8: the record, then a divergent sync of bank 2 from the checkpoint the record left */
             char err[256] = "";
             bool ok = pulsar_session_bank_state_restore(x, BankId{2}) &&
-                      pulsar_session_note_prefilled(x, L2.v, m2, ord[0] == 2 ? 0 : 1) == 0;
+                      pulsar_session_note_prefilled(x, L2.v, TokCount{m2}, PromptHead{ord[0] == 2 ? 0 : 1}) == 0;
             double d = 0;
             CHECK(ok && pulsar_session_pos(x).raw() == m2 && same(logits_of(x, W), cl2[0], &d),
                   "F8 bank 2's record: %d tokens, its headed row as the next-token logits (max |diff| %.3g)",
@@ -859,7 +859,7 @@ static void part_fused_runs(pulsar_engine *e, int W) {
                   "(max |diff| %.3g) %s", d, ok ? "" : err);
             if (ok) pulsar_session_bank_state_save(x, BankId{2});
             ok = pulsar_session_bank_state_restore(x, BankId{1}) &&
-                 pulsar_session_note_prefilled(x, L.v + pre_len, m1, ord[0] == 1 ? 0 : 1) == 0;
+                 pulsar_session_note_prefilled(x, L.v + pre_len, TokCount{m1}, PromptHead{ord[0] == 1 ? 0 : 1}) == 0;
             CHECK(ok && pulsar_session_pos(x).raw() == pre_len + m1 && same(logits_of(x, W), cl1[0], &d),
                   "F8 bank 1's record: %d tokens, its headed row as the next-token logits (max |diff| %.3g)",
                   pulsar_session_pos(x).raw(), d);

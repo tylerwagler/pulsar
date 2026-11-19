@@ -2153,9 +2153,9 @@ void pulsar_session_note_committed_tokens(pulsar_session *s, const TokId *toks, 
 /** @param s the session
  *  @param toks the chunk's tokens
  *  @param n their count
- *  @param head the headed run's index, or -1
+ *  @param head the headed prompt run, or none() (L443: was -1)
  *  @return 0, or 1 on a refusal */
-int pulsar_session_note_prefilled(pulsar_session *s, const TokId *toks, int n, int head);
+int pulsar_session_note_prefilled(pulsar_session *s, const TokId *toks, TokCount n, PromptHead head);
 /** One speculative round (or a plain step when the drafter is quenched or absent); returns the tokens emitted.
  *  A round -- here, in the round API and in the batched phases -- stops at the family's whole stop set
  *  (pulsar_token_is_stop): nothing is committed past a stop (L284: the callers' single eos id is gone). */

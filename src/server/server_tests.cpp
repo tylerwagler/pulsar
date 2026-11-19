@@ -22188,6 +22188,13 @@ static_assert(sizeof(pulsar_spec_step) == 272 && offsetof(pulsar_spec_step, max_
                   offsetof(pulsar_spec_step, n_rows) == 92 && offsetof(pulsar_spec_step, n_accepted) == 100 &&
                   offsetof(pulsar_spec_step, err) == 112,
               "pulsar_spec_step's layout as it was with int / uint32 fields (L443 probe, x86-64)");
+/* L443 (3): note_prefilled names its run by its place among the fused step's headed prompt runs -- no head row */
+static_assert(std::is_same_v<decltype(&pulsar_session_note_prefilled),
+                             int (*)(pulsar_session *, const TokId *, TokCount, PromptHead)> &&
+                  !l334_passes<int, PromptHead> && !l334_passes<HeadRow, PromptHead> && !l334_passes<PromptHead, HeadRow> &&
+                  std::is_same_v<decltype(pulsar_prompt_head_row(PromptHead{}, 0u)), HeadRow> &&
+                  pulsar_prompt_head_row(PromptHead{1}, 3u) == HeadRow{4} && PromptHead::none().raw() == -1,
+              "a headed prompt run crosses to its head row by name, after the step's decode heads");
 /* L443: token ids and the walks' counts at the server's emit boundary -- an id is a TokId, a chain's length a TokCount */
 static_assert(std::is_same_v<decltype(&server::gen_emit_token), bool (server::*)(session_slot *, TokId)> &&
                   std::is_same_v<decltype(&server::gen_emit_piece),

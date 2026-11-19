@@ -3462,7 +3462,7 @@ struct pulsar_session {
     /// @param n     their count (> 0)
     /// @param head  index of the headed run of the last fused step that finishes the prompt, or -1 on an intermediate chunk
     /// @return 0, or 1 (refused, said).
-    int note_prefilled(const TokId *toks, int n, int head);
+    int note_prefilled(const TokId *toks, int n, PromptHead head);
     /** Generate with the drafter: propose a block, verify it against the target
      * in one pass, and commit the accepted prefix.
      * @param temperature   sampling temperature; 0 selects argmax

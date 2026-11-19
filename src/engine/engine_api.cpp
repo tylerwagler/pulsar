@@ -1612,7 +1612,8 @@ const pulsar_tokens *pulsar_session_bank_tokens_as(pulsar_session *s, BankId ban
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "per-bank state", NULL);
     return pulsar_bank_history_as(s, bank, view);
 }
-int pulsar_session_note_prefilled(pulsar_session *s, const TokId *toks, int n, int head) {
+int pulsar_session_note_prefilled(pulsar_session *s, const TokId *toks, TokCount n_toks, PromptHead head) {
+    const int n = n_toks.raw();   /* L443: raw inside; the head stays typed to the session's crossing */
     PULSAR_NVTX_FN();
     if (!s) return 1;
     pulsar_tp *tp = tp_mirror_target(s);
@@ -1628,7 +1629,7 @@ int pulsar_session_note_prefilled(pulsar_session *s, const TokId *toks, int n, i
      * block, whose digest the step's ack already matched across ranks. */
     if (!tp_mirror_sent(tp, "note prefilled",
                         pulsar_tp_send_note_prefilled(tp, s->tp_session_id, pulsar_tok_ids_raw(toks), (uint32_t)n,
-                                                      head),
+                                                      head.raw()),   /* the wire's int32 (-1 = none()) */
                         NULL, 0)) return 1;
     return tp_mirror_bank_verdict(s, tp, "note prefilled", s->note_prefilled(toks, n, head), 1);
 }

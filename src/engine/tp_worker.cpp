@@ -629,7 +629,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
     case PULSAR_TP_FRAME_NOTE_PREFILLED: {
         int status = -1;
         if (!worker_refused(e, c, "note prefilled", &slot, ferr, sizeof(ferr))) {
-            status = slot->s->note_prefilled(worker_tok_ids(c->tokens), (int)c->n_tokens, c->value) != 0 ? 1 : 0;
+            status = slot->s->note_prefilled(worker_tok_ids(c->tokens), (int)c->n_tokens, PromptHead{c->value}) != 0 ? 1 : 0;
         } else {
             fprintf(stderr, "pulsar: tp worker: note prefilled refused: %s\n", ferr);
         }
