@@ -1537,7 +1537,9 @@ inline PromptToks id_prefix_as_prompt(TokCount common_by_id) { return PromptToks
 
 /* L439: the MARKED crossings.  A typing commit changes no value: where the code it types reads a count or a position
  * of one side of a token seam as the other's, the read goes through one of these four, unconverted, and is fixed in
- * a commit of its own (with a test on a seamed case).  A caller of them is a wrong-meaning site still open. */
+ * a commit of its own (with a test on a seamed case).  A caller of them is a wrong-meaning site still open.  (L441:
+ * the last two production callers, routing's ceiling and the KV admission price, are fixed; the seam tests read the
+ * old values through them.) */
 /** A prompt-side count read as a live-side one, unconverted (a marked crossing: see above).
  *  @param n the prompt's tokens */
 /// @return the same number as live tokens
@@ -4618,6 +4620,14 @@ struct server {
      *  @param p  the prompt a sync is handed */
     /// @return the stitched length, rows of the bank
     TokCount slot_sync_len(const session_slot *sl, prompt_view p) const;
+    /** L441: the rows the slot's bank holds once job `j`'s prompt is in -- what a KV admission prices the prompt at
+     *  (kv_reserved_bytes, prompt_kv_check): server_prompt_rows over the slot's gen (when it is `j`'s) and the stitch
+     *  of `j`'s prompt onto the bank's history as it stands (slot_sync_len; an empty bank, or NULL: the prompt's own
+     *  tokens).
+     *  @param sl the slot the job is bound or would bind to (NULL: an empty bank)
+     *  @param j  the job */
+    /// @return the rows, a length on the bank
+    TokCount prompt_rows_on(const session_slot *sl, const job *j) const;
     /** L115: the one prefix-reuse question, asked of a slot.  Callers that need
      * the request-side count (accounting, prefill bounds) read `prompt_cut`;
      * callers that need KV rows or a cut point read `live_cut`.  Across a seam
@@ -6310,6 +6320,15 @@ bool server_slot_match_is_trivial(const pulsar_prefix_match &m, TokPos slot_pos,
  *  @param share_ceiling the trivial-match ceiling, the request's tokens
  *  @return true when the job waits for the gone bank's abandon */
 bool server_route_waits_for_gone(PromptToks gone_shared, PromptToks best_shared, PromptToks share_ceiling);
+/** L441: the rows a bank holds once a prompt is in, the one rule a KV admission prices by.  Once the job's plan ran
+ *  (a prefill phase: gen_begin_plan set gen_state::sync_end, and again when its cold phase ended) its sync's end on
+ *  the bank; before it (bound with no gen yet, or restoring a chain) the stitch of the request's prompt onto the
+ *  bank's history now.  Rows of the bank -- a token-seam stitch's, not the request's own count, which across a seam
+ *  is another number.
+ *  @param g           the job's generation (NULL: none yet)
+ *  @param stitch_now  the stitch of the request's prompt onto the bank as it stands (server::slot_sync_len) */
+/// @return the rows
+TokCount server_prompt_rows(const gen_state *g, TokCount stitch_now);
 /* L275: the position of the bank's last user marker among its prefilled tokens
  * when a completed exchange precedes it; -1 otherwise (defined in
  * server_sched.cpp; unit-tested in server_tests.cpp). */

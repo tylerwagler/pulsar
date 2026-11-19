@@ -337,6 +337,18 @@ TokCount server::slot_sync_len(const session_slot *sl, prompt_view p) const {
     return pulsar_prefix_match_stitched_len(&m, p.len());
 }
 
+TokCount server_prompt_rows(const gen_state *g, TokCount stitch_now) {
+    const bool planned = g && (g->phase == GEN_PREFILL_COLD || g->phase == GEN_PREFILL_MAIN);
+    return planned ? g->sync_end.before() : stitch_now;
+}
+
+TokCount server::prompt_rows_on(const session_slot *sl, const job *j) const {
+    const gen_state *g = sl && sl->active_job == j ? sl->gen : NULL;
+    if (g && (g->phase == GEN_PREFILL_COLD || g->phase == GEN_PREFILL_MAIN))
+        return server_prompt_rows(g, TokCount{0});   /* the plan's own end: no match to walk */
+    return server_prompt_rows(g, slot_sync_len(sl, request_prompt(&j->req)));
+}
+
 /* L115: the one prefix-reuse question, asked of a slot.  Callers that need
  * the request-side count (accounting, prefill bounds) read `prompt_cut`;
  * callers that need KV rows or a cut point read `live_cut`.  Across a seam
@@ -3485,10 +3497,10 @@ KvBytes server::kv_reserved_bytes(const session_slot *except) {
     for (SlotIdx i{0u}; s->n_slots.covers(i) && n < PULSAR_SESSION_POOL_CAP; ++i) {
         const session_slot *c = &s->slots[i];
         if (c == except || !server_slot_reserves(c)) continue;
-        /* L439: the rows a prompt adds are its STITCH's (one a token of what the bank ends up holding); the price
-         * takes the request's own count -- a marked crossing, off by the seam's shift */
-        want[n] = pulsar_session_quantum_growth_bytes_per_bank(
-            pool, pulsar_kv_rows(seam_unconverted_live(request_prompt_toks(&c->active_job->req))));
+        /* L441: the rows a prompt adds are its STITCH's -- what the bank holds once the prompt is in (the plan's sync
+         * end, or the stitch onto its history before the plan); L439 left the request's own count here (a marked
+         * crossing, off by the seam's shift) */
+        want[n] = pulsar_session_quantum_growth_bytes_per_bank(pool, pulsar_kv_rows(s->prompt_rows_on(c, c->active_job)));
         have[n] = pulsar_session_bank_touched_kv_bytes(pool, c->bank);
         n++;
     }
@@ -3898,9 +3910,8 @@ prompt_kv_verdict server::prompt_kv_check(const session_slot *sl, const job *j, 
     *need = KvBytes{};
     if (!s->guard_enabled || !s->pool_banks.any()) return PROMPT_KV_FITS;
     pulsar_session *pool = s->sess;
-    /* L439: as kv_reserved_bytes -- the request's own count for the rows its stitch adds (a marked crossing) */
-    const KvBytes want = pulsar_session_quantum_growth_bytes_per_bank(
-        pool, pulsar_kv_rows(seam_unconverted_live(request_prompt_toks(&j->req))));
+    /* L441: as kv_reserved_bytes -- the rows of its stitch onto `sl`'s history (an empty bank: its own tokens) */
+    const KvBytes want = pulsar_session_quantum_growth_bytes_per_bank(pool, pulsar_kv_rows(s->prompt_rows_on(sl, j)));
     /* NULL: an empty bank */
     const KvBytes have = sl ? pulsar_session_bank_touched_kv_bytes(pool, sl->bank) : KvBytes{};
     *need = want > have ? want - have : KvBytes{};

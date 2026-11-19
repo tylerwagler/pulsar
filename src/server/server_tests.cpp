@@ -23331,6 +23331,91 @@ static void test_l441_trivial_ceiling_is_the_jobs(void) {
     }
 }
 
+/* L441 (b): the KV admission prices a prompt at the rows its STITCH puts on the bank, not the request's own count.
+ * The seamed pair of L439 (3): the bank sampled the stretches (302 tokens to Y), the request re-spells them canonically
+ * and adds Z -- 203 of its own, a stitch of 303 rows.  At 1000 bytes a row and a 250,000-byte budget, the old price
+ * (203 rows) FITS a prompt whose bank ends at 303 rows; the stitch's price is past the budget (REFUSE, as the engine's
+ * pool would find).  The reverse spelling (a stitch of 203 for 303 of its own) was refused and fits.  Before the plan
+ * the price is the stitch onto the bank now, once the plan ran its sync's end (gen_state::sync_end).  No seam: the
+ * stitch is the prompt's own length and every verdict is the old one. */
+static void test_l441_admission_prices_the_stitch(void) {
+    const int z[] = {L334_Z};
+    const uint64_t row = 1000;
+    const KvBytes budget{250000};
+    const auto price = [&](TokCount rows) { return KvBytes{row * pulsar_kv_rows(rows).raw()}; };
+    BankCount k{-1};
+    {
+        const l439_seam f = l439_make(true, false, NULL, 0, z, 1);
+        const PromptToks own{(int)f.prompt.size()};
+        const TokCount stitch = pulsar_prefix_match_stitched_len(&f.m, own);
+        TEST_ASSERT(own == PromptToks{203} && stitch == TokCount{303});
+        /* bound with no gen yet, or restoring: the stitch onto the bank now */
+        TEST_ASSERT(server_prompt_rows(NULL, stitch) == TokCount{303});
+        gen_state g;
+        memset(&g, 0, sizeof g);
+        g.phase = GEN_RESTORE;
+        TEST_ASSERT(server_prompt_rows(&g, stitch) == TokCount{303});
+        /* the plan ran: its sync's end, whatever the bank holds now (a prefill part-way: 250 rows in) */
+        g.phase = GEN_PREFILL_MAIN;
+        g.sync_end = TokPos::after(stitch);
+        TEST_ASSERT(server_prompt_rows(&g, TokCount{250}) == TokCount{303});
+        g.phase = GEN_PREFILL_COLD;
+        TEST_ASSERT(server_prompt_rows(&g, TokCount{250}) == TokCount{303});
+        /* the verdicts: the old price fits, the stitch's does not */
+        TEST_ASSERT(server_prompt_kv_verdict(KvBytes{}, price(seam_unconverted_live(own)), budget, NULL, BankCount{0},
+                                             false, &k) == PROMPT_KV_FITS);
+        TEST_ASSERT(server_prompt_kv_verdict(KvBytes{}, price(server_prompt_rows(NULL, stitch)), budget, NULL,
+                                             BankCount{0}, false, &k) == PROMPT_KV_REFUSE);
+    }
+    {
+        const l439_seam f = l439_make(false, true, NULL, 0, z, 1);
+        const PromptToks own{(int)f.prompt.size()};
+        const TokCount stitch = pulsar_prefix_match_stitched_len(&f.m, own);
+        TEST_ASSERT(own == PromptToks{303} && stitch == TokCount{203});
+        TEST_ASSERT(server_prompt_kv_verdict(KvBytes{}, price(seam_unconverted_live(own)), budget, NULL, BankCount{0},
+                                             false, &k) == PROMPT_KV_REFUSE);
+        TEST_ASSERT(server_prompt_kv_verdict(KvBytes{}, price(server_prompt_rows(NULL, stitch)), budget, NULL,
+                                             BankCount{0}, false, &k) == PROMPT_KV_FITS);
+    }
+    {
+        const l439_seam u = l439_make(false, false, NULL, 0, z, 1);
+        const PromptToks own{(int)u.prompt.size()};
+        const TokCount stitch = pulsar_prefix_match_stitched_len(&u.m, own);
+        TEST_ASSERT(!u.m.seamed && stitch == seam_unconverted_live(own) && server_prompt_rows(NULL, stitch) == stitch);
+        for (uint64_t b = 200000; b <= 206000; b += 1000)
+            TEST_ASSERT(server_prompt_kv_verdict(KvBytes{}, price(server_prompt_rows(NULL, stitch)), KvBytes{b}, NULL,
+                                                 BankCount{0}, false, &k) ==
+                        server_prompt_kv_verdict(KvBytes{}, price(seam_unconverted_live(own)), KvBytes{b}, NULL,
+                                                 BankCount{0}, false, &k));
+    }
+    /* the server's own read: an empty bank (no slot) is the prompt's own tokens; a slot whose gen planned, its end */
+    {
+        server s;
+        memset(&s, 0, sizeof s);
+        job j;
+        memset(&j, 0, sizeof j);
+        const l439_seam f = l439_make(true, false, NULL, 0, z, 1);
+        pulsar_tokens p = {const_cast<TokId *>(f.prompt.data()), (int)f.prompt.size(), (int)f.prompt.size()};
+        j.req.prompt = p;
+        TEST_ASSERT(s.prompt_rows_on(NULL, &j) == TokCount{203});
+        gen_state g;
+        memset(&g, 0, sizeof g);
+        g.phase = GEN_PREFILL_MAIN;
+        g.sync_end = TokPos{303};
+        session_slot &sl = s.slots[sx(0)];
+        sl.provisioned = true;
+        sl.active_job = &j;
+        sl.gen = &g;
+        TEST_ASSERT(s.prompt_rows_on(&sl, &j) == TokCount{303});
+        job other;
+        memset(&other, 0, sizeof other);
+        other.req.prompt = p;
+        TEST_ASSERT(s.prompt_rows_on(&sl, &other) == TokCount{203});   /* another job on it: not its gen (no session) */
+        j.req.prompt.v = NULL;
+        other.req.prompt.v = NULL;
+    }
+}
+
 /* ---- L441: the pool's two index spaces, their count, and the ids of the server's work --------------------------- */
 /** True when `T` takes a subscript of type `I`. */
 template <class T, class I, class = void>
@@ -23470,6 +23555,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l439_fused_lane_refuses_a_seam();
     test_l441_pool_spaces();
     test_l441_trivial_ceiling_is_the_jobs();
+    test_l441_admission_prices_the_stitch();
     test_mem_floor_is_derived_from_the_watermarks();
     test_guard_budget_reads_live_memavailable();
     test_guard_discrete_reads_the_device();

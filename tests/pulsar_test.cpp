@@ -4658,6 +4658,7 @@ static void test_disk_depth(void) {
     test_l439_fused_lane_refuses_a_seam();
     test_l441_pool_spaces();   /* L441: the pool's slot / bank spaces and their count */
     test_l441_trivial_ceiling_is_the_jobs();   /* L441 (a): the trivial-match ceiling in the job's tokens */
+    test_l441_admission_prices_the_stitch();   /* L441 (b): the KV admission at the stitch's rows */
 }
 
 /* L440: the host-only group the check tier runs (make prompt-offsets-gate): the rendered prompt's offsets and spans
