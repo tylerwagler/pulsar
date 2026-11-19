@@ -6191,8 +6191,11 @@ int server_route_header_anchor(const pulsar_tokens *bank, int prefilled, const p
 int server_route_anchor(const pulsar_tokens *bank, int prefilled, const pulsar_turn_markers *m);
 /* L264 S3 + L275: does the best-scoring free bank take the request in place, or
  * is a fresh bank preferred.  `anchor` is server_route_anchor's answer for
- * that bank (defined in server_sched.cpp; unit-tested in server_tests.cpp). */
-bool server_route_in_place(TokCount common, PromptToks score, TokPos frontier, TokPos prefilled, TokCount protect_floor,
+ * that bank (defined in server_sched.cpp; unit-tested in server_tests.cpp).
+ * L439: what an in-place resume discards is the bank's rows past where it resumes -- a position on the bank
+ * (pulsar_bank_resume::at), not the request's tokens it serves (::served, the route's rank), which across a token
+ * seam below the resume point is another number. */
+bool server_route_in_place(TokCount common, TokPos resume_at, TokPos frontier, TokPos prefilled, TokCount protect_floor,
                            TokPos anchor);
 /* L273: an image request's cold phase -- `cut` (the anchor cut, kv_cache_anchor_cut) when every image begins at or
  * past it, 0 when one begins inside it (*inside = its index, else -1).  Defined in server_jobs.cpp; unit-tested in

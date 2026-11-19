@@ -821,19 +821,20 @@ int server_route_anchor(const pulsar_tokens *bank, int prefilled, const pulsar_t
  * so it takes a fresh bank, which restores the shared prefix from the disk
  * chain. */
 /// @param common the bank's tokens the job's text shares (the live side of the match)
-/// @param score the job's prompt tokens the bank's resume serves (the route's rank)
+/// @param resume_at where on the bank its resume starts (pulsar_bank_resume::at; L439: the route's rank, ::served,
+///        counts the job's tokens and is no position on the bank)
 /// @param frontier the bank's frontier position
 /// @param prefilled the bank's prefill frontier
 /// @param protect_floor the discard under which in-place reuse is always allowed, the bank's tokens
 /// @param anchor the bank's route anchor, on its history (server_route_anchor; none(): none)
 /// @return true when the job continues on the bank in place
-bool server_route_in_place(TokCount common, PromptToks score, TokPos frontier, TokPos prefilled, TokCount protect_floor,
+bool server_route_in_place(TokCount common, TokPos resume_at, TokPos frontier, TokPos prefilled, TokCount protect_floor,
                            TokPos anchor) {
     const TokPos matched = TokPos::after(common);
-    /* L439 (typing; value unchanged): "what the resume would discard" takes the job's served prompt tokens for the
-     * position on the bank the resume starts at */
-    return matched >= prefilled || (!anchor.is_none() && matched > anchor) ||
-           frontier - TokPos::after(seam_unconverted_live(score)) < protect_floor;
+    /* L439: what the resume would discard -- the bank's rows from where it resumes to its frontier, both on the bank
+     * (it took the job's served tokens for that position: across a seam below the resume point, off by the seam's
+     * shift, which flipped the in-place / fresh-bank decision near the protect floor) */
+    return matched >= prefilled || (!anchor.is_none() && matched > anchor) || frontier - resume_at < protect_floor;
 }
 
 /* L261 / L372: the phases in which a job whose client is gone ends by an abandon that keeps its bank's history, so a
@@ -906,6 +907,7 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
     /* L439: the match in the bank's tokens, the score in the job's; -1 = no bank yet (below every real count) */
     TokCount best_common{-1};
     PromptToks best_score{-1};
+    TokPos best_at{0};                                     /* L439: where the best bank's resume starts, on it */
     TokCount deep{-1};                                     /* L378: the deepest match any free bank has */
     pulsar_resume_why best_why = PULSAR_RESUME_WHY_NONE;   /* L378: why the best bank's score is what it is */
     static const int route_debug = getenv("PULSAR_ROUTE_DEBUG") != NULL;
@@ -930,6 +932,7 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
         if (score > best_score || (score == best_score && common > best_common)) {
             best_score = score;
             best_common = common;
+            best_at = resume.at;
             best = sl;
             best_why = resume.why;
         }
@@ -1000,7 +1003,7 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
         ? TokPos{server_route_anchor(pulsar_session_bank_tokens(s->sess, best->bank), prefilled.raw(),
                                      &s->turn_markers)}
         : TokPos::none();
-    const bool in_place = best && server_route_in_place(best_common, best_score, frontier, prefilled,
+    const bool in_place = best && server_route_in_place(best_common, best_at, frontier, prefilled,
                                                         TokCount{s->slot_trivial_common_tokens}, anchor);
     /* L378: the decision's numbers, for the request's `kv req:` line (the last routing of a head that waited) */
     j->kvr.best = best ? best->bank : BankId::none();

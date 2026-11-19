@@ -43,12 +43,13 @@ static void test_assert(bool cond, const char *file, int line, const char *expr)
  * tokens and the bank's are the same tokens, so one number is every currency's.  These adapters enter such a number
  * into each type and call the typed predicate -- the table of unseamed cases, unchanged, proving the typed (and the
  * fixed) predicates decide as before when no seam exists.  The seamed cases are built on real matches (test_l439_*). */
-/** server_route_in_place on unseamed numbers: the resume's position on the bank is the score.
+/** server_route_in_place on unseamed numbers: the resume's position on the bank is the score (L439: with no seam
+ *  the request's tokens it serves and the position it starts at are one number).
  *  @param common tokens shared  @param score the resume point  @param frontier the bank's frontier
  *  @param prefilled its prefill frontier  @param protect_floor the floor  @param anchor its anchor (-1: none)
  *  @return the verdict */
 static bool unseamed_route_in_place(int common, int score, int frontier, int prefilled, int protect_floor, int anchor) {
-    return server_route_in_place(TokCount{common}, PromptToks{score}, TokPos{frontier}, TokPos{prefilled},
+    return server_route_in_place(TokCount{common}, TokPos{score}, TokPos{frontier}, TokPos{prefilled},
                                  TokCount{protect_floor}, TokPos{anchor});
 }
 /** server_slot_match_is_trivial on unseamed numbers.
@@ -22301,6 +22302,13 @@ static_assert(std::is_same_v<decltype(&server_slot_match_is_trivial), bool (*)(T
                                  uint64_t (server::*)(const job *, PromptToks, PromptToks, const trace_cache_diag *,
                                                       const char *, PromptToks, const char *)>,
               "the routing, scratch, anchor, prefix-wait and trace predicates take each count in its currency");
+/** Does the route's in-place rule take this type for where the resume starts? */
+template <class A> concept l439_route_takes = requires(A a) {
+    server_route_in_place(TokCount{0}, a, TokPos{0}, TokPos{0}, TokCount{0}, TokPos::none());
+};
+static_assert(l439_route_takes<TokPos> && !l439_route_takes<PromptToks> && !l439_route_takes<TokCount> &&
+                  !l439_route_takes<int>,
+              "what an in-place resume discards is counted from a position on the bank, never the request's tokens");
 static_assert(std::is_same_v<decltype(kv_req_line::prompt), PromptToks> &&
                   std::is_same_v<decltype(kv_req_line::score), PromptToks> &&
                   std::is_same_v<decltype(kv_req_line::reused), PromptToks> &&
@@ -22592,6 +22600,85 @@ static void test_l434_kv_req_fields_are_consistent(void) {
                 j.kvr.reused + PromptToks{j.kvr.prefilled_now.raw()} == j.kvr.prompt);
 }
 
+/* ---- L439: the server's remaining seam crossings, on the toy vocabulary's two spellings (L434's fixtures) -------- */
+/** A bank's history and a request over the toy vocabulary, and the token-seam match between them. */
+struct l439_seam {
+    std::vector<TokId> bank;     ///< the bank's history
+    std::vector<TokId> prompt;   ///< the request's tokens
+    pulsar_prefix_match m;       ///< the match (pulsar_tokens_prefix_match_with on the toy text)
+};
+/** X + 100 stretches of "abcd" + Y, the bank in one spelling and the request in another (or the same).
+ *  @param bank_sampled the bank's spelling  @param prompt_sampled the request's
+ *  @param bank_tail ids after Y on the bank  @param n_bank their count
+ *  @param prompt_tail ids after Y on the request  @param n_prompt their count
+ *  @return the pair and its match */
+static l439_seam l439_make(bool bank_sampled, bool prompt_sampled, const int *bank_tail, int n_bank,
+                           const int *prompt_tail, int n_prompt) {
+    l439_seam f;
+    std::vector<int> bt = {L334_Y}, pt = {L334_Y};
+    bt.insert(bt.end(), bank_tail, bank_tail + n_bank);
+    pt.insert(pt.end(), prompt_tail, prompt_tail + n_prompt);
+    f.bank = l434_spell(bank_sampled, 100, bt.data(), (int)bt.size());
+    f.prompt = l434_spell(prompt_sampled, 100, pt.data(), (int)pt.size());
+    pulsar_tokens_prefix_match_with(l334_text, NULL, f.bank.data(), (int)f.bank.size(), f.prompt.data(),
+                                    (int)f.prompt.size(), &f.m);
+    return f;
+}
+/** The request's tokens a resume at `at` on the bank serves (the route's rank, pulsar_bank_resume::served).
+ *  @param f the pair  @param at the resume position  @return the tokens */
+static PromptToks l439_served(const l439_seam &f, TokPos at) {
+    return pulsar_tokens_prompt_held_with(l334_text, NULL, f.bank.data(), at, f.prompt.data(), (int)f.prompt.size());
+}
+
+/* L439 (2): the route's "what an in-place resume discards" is the bank's frontier less where the resume starts on it.
+ * It took the request's served tokens for that position: across a seam the two differ, and the verdict flipped. */
+static void test_l439_route_discard_is_live_side(void) {
+    const int dd[] = {L334_D, L334_D, L334_D, L334_D, L334_D, L334_D, L334_D, L334_D, L334_D, L334_D};
+    const int z[] = {L334_Z};
+    /* (a) the bank sampled the stretches (a|b|cd: 302 tokens to Y, then 10 more it prefilled); the request re-spells
+     * them canonically (abc|d: 202 to Y) and goes on with Z.  Its resume: the grid point 256 below the match */
+    {
+        const l439_seam f = l439_make(true, false, dd, 10, z, 1);
+        TEST_ASSERT(f.bank.size() == 312 && f.prompt.size() == 203 && f.m.seamed);
+        TEST_ASSERT(f.m.live_cut == TokCount{302} && f.m.prompt_cut == PromptToks{202});
+        const TokPos at{256}, frontier{312}, prefilled{312};
+        const PromptToks served = l439_served(f, at);
+        TEST_ASSERT(served == PromptToks{171});   /* X + 85 stretches, two tokens each: the seam's shift is 85 */
+        const TokCount floor_{100};
+        /* the old expression: 312 - 171 = 141 discarded, over the floor -> a fresh bank */
+        TEST_ASSERT(frontier - TokPos::after(seam_unconverted_live(served)) >= floor_);
+        /* the bank's own rows past the resume: 312 - 256 = 56, under the floor -> in place */
+        TEST_ASSERT(frontier - at < floor_);
+        TEST_ASSERT(server_route_in_place(f.m.live_cut, at, frontier, prefilled, floor_, TokPos::none()));
+    }
+    /* (b) the reverse: the bank holds the canonical spelling (202 to Y + 10), the request the sampled one (302 to Y,
+     * then Z).  A resume at 128 on the bank serves 192 of the request's tokens: the old expression read 212 - 192 = 20
+     * discarded (in place under a floor of 50); the bank discards 212 - 128 = 84 (a fresh bank) */
+    {
+        const l439_seam f = l439_make(false, true, dd, 10, z, 1);
+        TEST_ASSERT(f.bank.size() == 212 && f.prompt.size() == 303 && f.m.seamed);
+        const TokPos at{128}, frontier{212}, prefilled{212};
+        const PromptToks served = l439_served(f, at);
+        TEST_ASSERT(served == PromptToks{192});
+        const TokCount floor_{50};
+        TEST_ASSERT(frontier - TokPos::after(seam_unconverted_live(served)) < floor_);
+        TEST_ASSERT(!server_route_in_place(f.m.live_cut, at, frontier, prefilled, floor_, TokPos::none()));
+    }
+    /* (c) no seam: the request's tokens served ARE the position, and both readings give one verdict either side of
+     * the floor (the unseamed tables of L264 / L275 / L311 / L322 / L351 pass unchanged) */
+    {
+        const l439_seam f = l439_make(false, false, dd, 10, z, 1);
+        TEST_ASSERT(!f.m.seamed && f.m.live_cut == TokCount{202} && f.m.prompt_cut == PromptToks{202});
+        const TokPos at{128}, frontier{212};
+        TEST_ASSERT(l439_served(f, at) == PromptToks{128});
+        for (int fl = 80; fl <= 90; fl++) {
+            const TokCount floor_{fl};
+            const bool old_v = frontier - TokPos::after(seam_unconverted_live(l439_served(f, at))) < floor_;
+            TEST_ASSERT(server_route_in_place(f.m.live_cut, at, frontier, frontier, floor_, TokPos::none()) == old_v);
+        }
+    }
+}
+
 static void pulsar_server_unit_tests_run(void) {
     test_l333_kv_units();
     test_l334_p2b_crossings();
@@ -22609,6 +22696,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l434_usage_is_one_prompts();
     test_l434_progress_line_is_live_side();
     test_l434_kv_req_fields_are_consistent();
+    test_l439_route_discard_is_live_side();
     test_mem_floor_is_derived_from_the_watermarks();
     test_guard_budget_reads_live_memavailable();
     test_guard_discrete_reads_the_device();
