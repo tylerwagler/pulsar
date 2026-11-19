@@ -4866,15 +4866,15 @@ static void test_batch_history(void) {
     ld.gen = &lg;
     lg.j = &lead_job;
     lg.phase = GEN_PREFILL_MAIN;
-    lg.prompt_for_sync = &lead_t;
+    lg.prompt_for_sync = prompt_view_of(&lead_t);
 
     /* the one read: the history at entry, then the batch's commits; the prefix match reads the former */
     const slot_tokens h = s.slot_history(&dec);
     TEST_ASSERT(h.base == &fs->bank_carry[1].checkpoint && h.tail == &g.batch_pending && slot_tokens_len(h) == 603);
     TEST_ASSERT(slot_tokens_len(h) == s.slot_frontier_pos(&dec).raw());
     pulsar_tokens resend_t = {resend.data(), (int)resend.size(), (int)resend.size()};
-    TEST_ASSERT(s.slot_common_prefix(&dec, &resend_t) == 600);
-    TEST_ASSERT(s.slot_common_prefix(&s.slots[0], &resend_t) == 300 && s.slot_history(&s.slots[0]).tail == NULL);
+    TEST_ASSERT(s.slot_common_prefix(&dec, &resend_t) == TokCount{600});
+    TEST_ASSERT(s.slot_common_prefix(&s.slots[0], &resend_t) == TokCount{300} && s.slot_history(&s.slots[0]).tail == NULL);
 
     /* (1) the L261 wait: the decoder's client is gone and the re-send extends its prompt -- wait for its abandon */
     {
@@ -4934,15 +4934,15 @@ static void test_batch_history(void) {
 
     /* the scope.  The same reads when the decoder's bank is not the installed one: the carry either way */
     g_test_bh_live = 0u;
-    TEST_ASSERT(s.slot_common_prefix(&dec, &resend_t) == 600 && slot_tokens_len(s.slot_history(&dec)) == 603);
+    TEST_ASSERT(s.slot_common_prefix(&dec, &resend_t) == TokCount{600} && slot_tokens_len(s.slot_history(&dec)) == 603);
     g_test_bh_live = 1u;
     /* a slot that left the batch, or is finishing in it (a failed step, an abandon), reads the engine's current
      * view -- here none, and the prefix wait then starts as it did */
     g.phase = GEN_FINISH;
-    TEST_ASSERT(s.slot_history(&dec).base == NULL && s.slot_common_prefix(&dec, &resend_t) == 0);
+    TEST_ASSERT(s.slot_history(&dec).base == NULL && s.slot_common_prefix(&dec, &resend_t) == TokCount{0});
     g.phase = GEN_DECODE;
     g.batch_active = false;
-    TEST_ASSERT(s.slot_history(&dec).base == NULL && s.slot_common_prefix(&dec, &resend_t) == 0);
+    TEST_ASSERT(s.slot_history(&dec).base == NULL && s.slot_common_prefix(&dec, &resend_t) == TokCount{0});
     {
         bool dom[PULSAR_SESSION_POOL_CAP];
         s.dominated_slots(dom);
@@ -4951,14 +4951,15 @@ static void test_batch_history(void) {
         memset(&j, 0, sizeof j);
         j.fd = -1;
         j.req.prompt = wait_t;
-        TEST_ASSERT(s.prefix_wait_decide(&j) && j.pw.leader == 12 && j.pw.mark == 768 && j.pw.have == 300);
-        lg.share_mark = 0;
+        TEST_ASSERT(s.prefix_wait_decide(&j) && j.pw.leader == 12 && j.pw.mark == PromptPos{768} &&
+                    j.pw.have == PromptToks{300});
+        lg.share_mark = PromptPos{0};
     }
     g.batch_active = true;
     /* a carry the engine invalidated (a failed step reset the bank) names no history, in the batch or not */
     pulsar_bank_view_invalidate(fs, 1);
     TEST_ASSERT(s.slot_history(&dec).base == NULL && s.slot_history(&dec).tail == NULL &&
-                slot_tokens_len(s.slot_history(&dec)) == 0 && s.slot_common_prefix(&dec, &resend_t) == 0);
+                slot_tokens_len(s.slot_history(&dec)) == 0 && s.slot_common_prefix(&dec, &resend_t) == TokCount{0});
 
     pulsar_tokens_free(&g.batch_pending);
     pthread_mutex_destroy(&s.mu);

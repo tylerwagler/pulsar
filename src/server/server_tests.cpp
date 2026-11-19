@@ -37,6 +37,70 @@ static void test_assert(bool cond, const char *file, int line, const char *expr)
 
 #define TEST_ASSERT(expr) test_assert((expr), __FILE__, __LINE__, #expr)
 
+/* ---- L439: the routing and prefix-wait predicates on UNSEAMED numbers -----------------------------------------
+ * The predicates take each count in its currency (the bank's tokens, the request's, a position on either).  Every
+ * test written before that passed bare integers, and each of those cases is one with no token seam: the request's
+ * tokens and the bank's are the same tokens, so one number is every currency's.  These adapters enter such a number
+ * into each type and call the typed predicate -- the table of unseamed cases, unchanged, proving the typed (and the
+ * fixed) predicates decide as before when no seam exists.  The seamed cases are built on real matches (test_l439_*). */
+/** server_route_in_place on unseamed numbers: the resume's position on the bank is the score.
+ *  @param common tokens shared  @param score the resume point  @param frontier the bank's frontier
+ *  @param prefilled its prefill frontier  @param protect_floor the floor  @param anchor its anchor (-1: none)
+ *  @return the verdict */
+static bool unseamed_route_in_place(int common, int score, int frontier, int prefilled, int protect_floor, int anchor) {
+    return server_route_in_place(TokCount{common}, PromptToks{score}, TokPos{frontier}, TokPos{prefilled},
+                                 TokCount{protect_floor}, TokPos{anchor});
+}
+/** server_slot_match_is_trivial on unseamed numbers.
+ *  @param common tokens shared  @param slot_pos the slot's frontier  @param share_ceiling the ceiling
+ *  @param protect_floor the floor  @return the verdict */
+static bool unseamed_match_is_trivial(int common, int slot_pos, int share_ceiling, int protect_floor) {
+    return server_slot_match_is_trivial(TokCount{common}, TokPos{slot_pos}, PromptToks{share_ceiling},
+                                        TokCount{protect_floor});
+}
+/** server_slot_is_scratch on raw numbers.  @param sl the slot  @param frontier its frontier
+ *  @param min_tokens the disk tier's minimum  @return the verdict */
+static bool unseamed_is_scratch(const session_slot *sl, int frontier, int min_tokens) {
+    return server_slot_is_scratch(sl, TokPos{frontier}, TokCount{min_tokens});
+}
+/** kv_cache_anchor_cut's answer as a number.  @param kc the cache  @param anchor the anchor  @param grid the grid
+ *  @return the cut */
+static int unseamed_anchor_cut(const kv_disk_cache *kc, int anchor, TokCount grid) {
+    return kv_cache_anchor_cut(kc, anchor, grid).raw();
+}
+/** One bound prefill on unseamed numbers: the two prompts share `shared` tokens by id, the leader's bank stands at
+ *  `pos` and its prompt is `len` long. */
+typedef struct {
+    int shared;   ///< tokens the prompts share
+    int pos;      ///< where the leader stands
+    int len;      ///< the leader's prompt length
+} unseamed_lead;
+/** server_prefix_wait_pick on unseamed leads.
+ *  @param have what serves the request now  @param prompt_len its prompt  @param grid the grid
+ *  @param min_gain the threshold  @param leads the leads  @param n their count  @param mark receives the cut
+ *  @return the lead's index, or -1 */
+static int unseamed_wait_pick(int have, int prompt_len, int grid, int min_gain, const unseamed_lead *leads, int n,
+                              int *mark) {
+    prefix_lead typed[PULSAR_SESSION_POOL_CAP];
+    for (int i = 0; i < n; i++) typed[i] = {PromptToks{leads[i].shared}, TokPos{leads[i].pos}, PromptToks{leads[i].len}};
+    PromptPos at{0};
+    const int pick = server_prefix_wait_pick(PromptToks{have}, PromptToks{prompt_len}, TokCount{grid},
+                                             PromptToks{min_gain}, typed, n, &at);
+    *mark = at.raw();
+    return pick;
+}
+/** server_prefix_wait_check on unseamed numbers.
+ *  @param live the leader still prefills  @param leader_pos where it stands  @param mark the cut
+ *  @param waited_ms the wait so far  @param bound_ms its bound  @return the verdict */
+static prefix_wait_verdict unseamed_wait_check(bool live, int leader_pos, int mark, double waited_ms, double bound_ms) {
+    return server_prefix_wait_check(live, TokPos{leader_pos}, PromptPos{mark}, waited_ms, bound_ms);
+}
+/** server_prefix_mark_merge on unseamed numbers.
+ *  @param cur the pending cut  @param want a waiter's  @param pos where the leader stands  @return the cut */
+static int unseamed_mark_merge(int cur, int want, int pos) {
+    return server_prefix_mark_merge(PromptPos{cur}, PromptPos{want}, TokPos{pos}).raw();
+}
+
 /* L391: hand-built free-memory readings (server_mem_reading).  Unified memory: one reading, one floor, the KV's and
  * the host's alike.  A discrete card: the device's pair for the KV, the host's own beside it. */
 static server_mem_reading test_mem_unified(uint64_t avail, uint64_t floor) {
@@ -649,8 +713,8 @@ static void test_context_length_error_uses_protocol_standard_shape(void) {
     test_request_init(&r, REQ_CHAT, 128);
     r.api = API_OPENAI;
     r.prompt.len = 16;
-    TEST_ASSERT(request_exceeds_context(&r, 16));
-    TEST_ASSERT(!request_exceeds_context(&r, 17));
+    TEST_ASSERT(request_exceeds_context(&r, TokCount{16}));
+    TEST_ASSERT(!request_exceeds_context(&r, TokCount{17}));
 
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -11182,26 +11246,26 @@ static void test_l347_anchor_cut(void) {
     kv_disk_cache kc = {0};
     kc.opt = kv_cache_default_options();
     TEST_ASSERT(kc.opt.min_tokens == 512);
-    TEST_ASSERT(kv_cache_anchor_cut(&kc, 21950, TokCount{128}) == 21888);   /* the 2026-08-11 Claude Code anchor */
-    TEST_ASSERT(kv_cache_anchor_cut(&kc, 2100,
+    TEST_ASSERT(unseamed_anchor_cut(&kc, 21950, TokCount{128}) == 21888);   /* the 2026-08-11 Claude Code anchor */
+    TEST_ASSERT(unseamed_anchor_cut(&kc, 2100,
                                     TokCount{128}) == 2048);     /* a judge preamble: the old rule's cut was 0 */
-    TEST_ASSERT(kv_cache_anchor_cut(&kc, 2048, TokCount{128}) == 2048);     /* on the grid: the anchor itself */
-    TEST_ASSERT(kv_cache_anchor_cut(&kc, 639, TokCount{128}) == 512);
-    TEST_ASSERT(kv_cache_anchor_cut(&kc, 700, TokCount{256}) == 512);       /* the family's grid, whatever it is */
+    TEST_ASSERT(unseamed_anchor_cut(&kc, 2048, TokCount{128}) == 2048);     /* on the grid: the anchor itself */
+    TEST_ASSERT(unseamed_anchor_cut(&kc, 639, TokCount{128}) == 512);
+    TEST_ASSERT(unseamed_anchor_cut(&kc, 700, TokCount{256}) == 512);       /* the family's grid, whatever it is */
     /* nothing below min_tokens, before or after the alignment; no anchor or no grid, no cut */
-    TEST_ASSERT(kv_cache_anchor_cut(&kc, 511, TokCount{128}) == 0);
-    TEST_ASSERT(kv_cache_anchor_cut(&kc, 1000, TokCount{1024}) == 0);
-    TEST_ASSERT(kv_cache_anchor_cut(&kc, -1, TokCount{128}) == 0);
-    TEST_ASSERT(kv_cache_anchor_cut(&kc, 21950, TokCount{0}) == 0);
+    TEST_ASSERT(unseamed_anchor_cut(&kc, 511, TokCount{128}) == 0);
+    TEST_ASSERT(unseamed_anchor_cut(&kc, 1000, TokCount{1024}) == 0);
+    TEST_ASSERT(unseamed_anchor_cut(&kc, -1, TokCount{128}) == 0);
+    TEST_ASSERT(unseamed_anchor_cut(&kc, 21950, TokCount{0}) == 0);
     /* an image block that begins below the cut: no anchor (the cold phase is a text sync) */
     pulsar_image_ref imgs[1];
     memset(imgs, 0, sizeof imgs);
     imgs[0].start_pos = 1500;
     int inside = -1;
-    TEST_ASSERT(server_image_cold_cut(kv_cache_anchor_cut(&kc, 2100, TokCount{128}), imgs, 1, &inside) == 0 &&
+    TEST_ASSERT(server_image_cold_cut(unseamed_anchor_cut(&kc, 2100, TokCount{128}), imgs, 1, &inside) == 0 &&
                 inside == 0);
     imgs[0].start_pos = 2100;
-    TEST_ASSERT(server_image_cold_cut(kv_cache_anchor_cut(&kc, 2100, TokCount{128}), imgs, 1, &inside) == 2048 &&
+    TEST_ASSERT(server_image_cold_cut(unseamed_anchor_cut(&kc, 2100, TokCount{128}), imgs, 1, &inside) == 2048 &&
                 inside == -1);
 }
 
@@ -13340,7 +13404,7 @@ static void test_l372_no_fuse_prefill_is_the_classic_steps(void) {
     pulsar_tokens prompt = {0};
     g.j = &j;
     g.phase = GEN_PREFILL_MAIN;
-    g.prompt_for_sync = &prompt;
+    g.prompt_for_sync = prompt_view_of(&prompt);
     sl.provisioned = true;
     sl.active_job = &j;
     sl.gen = &g;
@@ -13598,26 +13662,26 @@ static void test_l378_kv_req_line_format(void) {
     r.has_pre = true;
     r.pre = UINT64_C(0x00000000000000ab);
     r.conv = UINT64_C(0xfd1f0f4381eb0395);
-    r.prompt = 60812;
-    r.bank = 1;
+    r.prompt = PromptToks{60812};
+    r.bank = BankId{1};
     r.route = KV_ROUTE_FRESH;
-    r.best = 0;
-    r.common = 60460;
-    r.score = 0;
-    r.anchor = 31104;
-    r.frontier = 60987;
-    r.prefilled = 60900;
+    r.best = BankId{0};
+    r.common = TokCount{60460};
+    r.score = PromptToks{0};
+    r.anchor = TokPos{31104};
+    r.frontier = TokPos{60987};
+    r.prefilled = TokPos{60900};
     r.why = PULSAR_RESUME_CHECKPOINT_ABOVE;
-    r.deep = 60460;
+    r.deep = TokCount{60460};
     r.pick = KV_PICK_DISK;
-    r.from = -1;
-    r.at = 31104;
-    r.reused = 31104;
-    r.prefilled_now = 29708;
+    r.from = BankId::none();
+    r.at = TokPos{31104};
+    r.reused = PromptToks{31104};
+    r.prefilled_now = TokCount{29708};
     r.epcut = 1;
     r.reply = -1;
-    r.evict = 1;
-    r.evict_tokens = 69233;
+    r.evict = BankId{1};
+    r.evict_tokens = TokCount{69233};
     r.evict_conv = UINT64_C(0x84c39a079fc08121);
     r.evict_ro = false;
     snprintf(r.snapshot, sizeof r.snapshot, "none (read-only)");
@@ -13638,8 +13702,8 @@ static void test_l378_kv_req_line_format(void) {
         "snapshot=none(read-only) qwait_ms=3 restore_ms=456 prefill_ms=37300 ttft_ms=38012 out=16 finish=stop"));
     /* an adopt names its source bank; a resume point inside the match has no noresume */
     r.pick = KV_PICK_ADOPT;
-    r.from = 3;
-    r.score = 12288;
+    r.from = BankId{3};
+    r.score = PromptToks{12288};
     kv_req_format(&r, line, sizeof line);
     TEST_ASSERT(strstr(line, " pick=adopt from=3 ") && strstr(line, " noresume=- "));
 
@@ -13962,7 +14026,7 @@ static void l379_banks(session_slot *slots, int n, const int *tokens, const bool
         slots[i].bank = BankId{i};
         slots[i].kv_flags = ro[i] ? KV_HDR_READ_ONLY : 0u;
         slots[i].last_serviced_us = served[i];
-        scratch[i] = server_slot_is_scratch(&slots[i], tokens[i], min_tokens);
+        scratch[i] = unseamed_is_scratch(&slots[i], tokens[i], min_tokens);
     }
 }
 
@@ -14233,11 +14297,11 @@ static void test_l379_scratch_predicate(void) {
     memset(&sl, 0, sizeof sl);
     sl.provisioned = true;
     /* (v) a 300-token bank is scratch; a 600-token one that no read-only request wrote is not */
-    TEST_ASSERT(server_slot_is_scratch(&sl, 300, min_tokens));
-    TEST_ASSERT(!server_slot_is_scratch(&sl, 600, min_tokens));
-    TEST_ASSERT(server_slot_is_scratch(&sl, 511, min_tokens) && !server_slot_is_scratch(&sl, 512, min_tokens));
+    TEST_ASSERT(unseamed_is_scratch(&sl, 300, min_tokens));
+    TEST_ASSERT(!unseamed_is_scratch(&sl, 600, min_tokens));
+    TEST_ASSERT(unseamed_is_scratch(&sl, 511, min_tokens) && !unseamed_is_scratch(&sl, 512, min_tokens));
     /* without a disk tier there is no minimum: only a read-only history is scratch */
-    TEST_ASSERT(!server_slot_is_scratch(&sl, 300, 0));
+    TEST_ASSERT(!unseamed_is_scratch(&sl, 300, 0));
     /* (vi) a read-only request taking the bank makes it scratch at any length; a request without the token taking
      * it clears that */
     request ro, plain;
@@ -14247,17 +14311,17 @@ static void test_l379_scratch_predicate(void) {
     snprintf(ro.hints.session, sizeof ro.hints.session, "judge");
     sl.hint_dead = true;
     server_slot_take_history(&sl, &ro);
-    TEST_ASSERT(server_slot_is_scratch(&sl, 60987, min_tokens) && server_slot_is_scratch(&sl, 60987, 0));
+    TEST_ASSERT(unseamed_is_scratch(&sl, 60987, min_tokens) && unseamed_is_scratch(&sl, 60987, 0));
     TEST_ASSERT(!sl.hint_dead && !strcmp(sl.hint_session, "judge"));
     server_slot_take_history(&sl, &plain);
-    TEST_ASSERT(!server_slot_is_scratch(&sl, 60987, min_tokens) && sl.kv_flags == 0u && !sl.hint_session[0]);
+    TEST_ASSERT(!unseamed_is_scratch(&sl, 60987, min_tokens) && sl.kv_flags == 0u && !sl.hint_session[0]);
     /* a busy bank and an unprovisioned one are nobody's victim, so not scratch */
     sl.kv_flags = KV_HDR_READ_ONLY;
     sl.active_job = (struct job *)&sl;
-    TEST_ASSERT(!server_slot_is_scratch(&sl, 60987, min_tokens));
+    TEST_ASSERT(!unseamed_is_scratch(&sl, 60987, min_tokens));
     sl.active_job = NULL;
     sl.provisioned = false;
-    TEST_ASSERT(!server_slot_is_scratch(&sl, 60987, min_tokens));
+    TEST_ASSERT(!unseamed_is_scratch(&sl, 60987, min_tokens));
 }
 
 /* L372 (O24): an eviction says what became of the history -- on disk, not written by a rule (named, no warning), or
@@ -15465,18 +15529,18 @@ static void test_l264_route_in_place(void) {
      * stripped by the client: the match reaches the end of what the bank
      * prefilled (51200), then diverges in the generated tail -- in place,
      * however much the tail holds */
-    TEST_ASSERT(server_route_in_place(51200, 51200, 58000, 51200, floor_, -1));
+    TEST_ASSERT(unseamed_route_in_place(51200, 51200, 58000, 51200, floor_, -1));
     /* the measured clobber (2026-10-04): another conversation behind the same
      * 2.3k-token system prompt matches 2318 of a bank that prefilled 2723 --
      * fresh preferred */
-    TEST_ASSERT(!server_route_in_place(2318, 2304, 2900, 2723, floor_, -1));
+    TEST_ASSERT(!unseamed_route_in_place(2318, 2304, 2900, 2723, floor_, -1));
     /* ...unless what it would discard is under the protect floor */
-    TEST_ASSERT(server_route_in_place(2318, 2304, 2304 + floor_ - 1, 2723, floor_, -1));
-    TEST_ASSERT(!server_route_in_place(2318, 2304, 2304 + floor_, 2723, floor_, -1));
+    TEST_ASSERT(unseamed_route_in_place(2318, 2304, 2304 + floor_ - 1, 2723, floor_, -1));
+    TEST_ASSERT(!unseamed_route_in_place(2318, 2304, 2304 + floor_, 2723, floor_, -1));
     /* an empty bank is simply free */
-    TEST_ASSERT(server_route_in_place(0, 0, 0, 0, floor_, -1));
+    TEST_ASSERT(unseamed_route_in_place(0, 0, 0, 0, floor_, -1));
     /* one token short of the bank's prefill is a different branch */
-    TEST_ASSERT(!server_route_in_place(2722, 2688, 4000, 2723, floor_, -1));
+    TEST_ASSERT(!unseamed_route_in_place(2722, 2688, 4000, 2723, floor_, -1));
 }
 
 /* L275: the bank's last-turn anchor -- the position of its last user marker when
@@ -15582,13 +15646,13 @@ static void test_l311_route_header_anchor(void) {
     TEST_ASSERT(server_route_header_anchor(&b, prefilled, &q) == 345);
     TEST_ASSERT(server_route_turn_anchor(&b, prefilled, &q) == -1);   /* a first-turn bank has no last-turn anchor */
     /* turn 2 matches through "<think>" (348): in place, where the last-turn anchor alone took a fresh bank */
-    TEST_ASSERT(server_route_in_place(348, 256, b.len, prefilled, 157, 345));
-    TEST_ASSERT(!server_route_in_place(348, 256, b.len, prefilled, 157, -1));
+    TEST_ASSERT(unseamed_route_in_place(348, 256, b.len, prefilled, 157, 345));
+    TEST_ASSERT(!unseamed_route_in_place(348, 256, b.len, prefilled, 157, -1));
     /* a request matching only the header's first token (a side request's "<|im_start|>user" there) is not this
      * conversation's next turn by the header rule (the last-turn anchor decides it) */
-    TEST_ASSERT(!server_route_in_place(345, 256, b.len, prefilled, 157, 345));
+    TEST_ASSERT(!unseamed_route_in_place(345, 256, b.len, prefilled, 157, 345));
     /* the clobber: another conversation behind the same system prompt diverges inside the first user message */
-    TEST_ASSERT(!server_route_in_place(320, 256, b.len, prefilled, 157, 345));
+    TEST_ASSERT(!unseamed_route_in_place(320, 256, b.len, prefilled, 157, 345));
     /* the header's second token past what the bank prefilled: the marker before it */
     TEST_ASSERT(server_route_header_anchor(&b, 345, &q) == -1);
     const pulsar_turn_markers none = {};
@@ -15967,10 +16031,10 @@ static void test_l351_tool_turns(void) {
     const int common = u2 + 4 + 3, resume = u2 + 4;
     const int anchor = server_route_anchor(&b2, b2.len, &q);
     TEST_ASSERT(anchor == u2);
-    TEST_ASSERT(server_route_in_place(common, resume, b2.len, b2.len, 0, anchor));
+    TEST_ASSERT(unseamed_route_in_place(common, resume, b2.len, b2.len, 0, anchor));
     /* the old markers (tool results as user turns): the anchor was the last tool result, past the divergence */
     const int old_anchor = server_route_anchor(&b2, b2.len, &plain);
-    TEST_ASSERT(old_anchor > common && !server_route_in_place(common, resume, b2.len, b2.len, 0, old_anchor));
+    TEST_ASSERT(old_anchor > common && !unseamed_route_in_place(common, resume, b2.len, b2.len, 0, old_anchor));
     /* the FIRST turn's bank (the repro of 2026-11-04): no user turn after an assistant one, so the last-turn anchor is
      * -1 and the header anchor decides -- the header of the client's turn (8 + 1), not the tool round's (30 + 1) */
     TEST_ASSERT(server_route_header_anchor(&b, b.len, &q) == 9);
@@ -15978,10 +16042,10 @@ static void test_l351_tool_turns(void) {
     const int anchor1 = server_route_anchor(&b, b.len, &q);
     TEST_ASSERT(anchor1 == 9);
     /* turn 2 re-renders reply 1 without its reasoning: it matches through the header + "\n" (common 11) */
-    TEST_ASSERT(server_route_in_place(11, 8, b.len, b.len, 0, anchor1));
-    TEST_ASSERT(!server_route_in_place(11, 8, b.len, b.len, 0, server_route_anchor(&b, b.len, &plain)));
+    TEST_ASSERT(unseamed_route_in_place(11, 8, b.len, b.len, 0, anchor1));
+    TEST_ASSERT(!unseamed_route_in_place(11, 8, b.len, b.len, 0, server_route_anchor(&b, b.len, &plain)));
     /* a request that stops short of the header (a side request inside the client's message) is not this turn */
-    TEST_ASSERT(!server_route_in_place(7, 3, b.len, b.len, 0, anchor1));
+    TEST_ASSERT(!unseamed_route_in_place(7, 3, b.len, b.len, 0, anchor1));
     pulsar_tokens_free(&b);
     pulsar_tokens_free(&b2);
 }
@@ -16277,17 +16341,17 @@ static void test_l322_route_side_call(void) {
      * shape (common 178833 = the real turn's end 178828 + 5; resume 178816, the grid checkpoint below) */
     const int common = side_user + 3, score = turn_end - turn_end % 128 > 0 ? turn_end - turn_end % 128 : 128;
     TEST_ASSERT(frontier - score >= 157);   /* the protect floor alone would not keep it */
-    TEST_ASSERT(server_route_in_place(common, score, frontier, prefilled, 157, server_route_anchor(&b, prefilled, &q)));
+    TEST_ASSERT(unseamed_route_in_place(common, score, frontier, prefilled, 157, server_route_anchor(&b, prefilled, &q)));
     /* ...where the deeper anchor (L311's combination) took a fresh bank */
-    TEST_ASSERT(!server_route_in_place(common, score, frontier, prefilled, 157, server_route_header_anchor(&b, prefilled, &q)));
+    TEST_ASSERT(!unseamed_route_in_place(common, score, frontier, prefilled, 157, server_route_header_anchor(&b, prefilled, &q)));
     /* the side call itself carries everything the bank prefilled before it: in place either way */
-    TEST_ASSERT(server_route_in_place(turn_end, score, turn_end, turn_end, 157, server_route_anchor(&b, turn_end, &q)));
+    TEST_ASSERT(unseamed_route_in_place(turn_end, score, turn_end, turn_end, 157, server_route_anchor(&b, turn_end, &q)));
     /* a request that leaves the history BEFORE the bank's last user marker (an edit of an earlier turn, a subagent
      * sibling sharing the conversation only up to there) is not taken by the anchor */
-    TEST_ASSERT(!server_route_in_place(turn_end, score, frontier, prefilled, 157, server_route_anchor(&b, prefilled, &q)));
-    TEST_ASSERT(!server_route_in_place(user_n + 20, 384, frontier, prefilled, 157, server_route_anchor(&b, prefilled, &q)));
+    TEST_ASSERT(!unseamed_route_in_place(turn_end, score, frontier, prefilled, 157, server_route_anchor(&b, prefilled, &q)));
+    TEST_ASSERT(!unseamed_route_in_place(user_n + 20, 384, frontier, prefilled, 157, server_route_anchor(&b, prefilled, &q)));
     /* the 2026-10-04 clobber (another conversation inside the first user message) stays fresh */
-    TEST_ASSERT(!server_route_in_place(320, 256, frontier, prefilled, 157, server_route_anchor(&b, prefilled, &q)));
+    TEST_ASSERT(!unseamed_route_in_place(320, 256, frontier, prefilled, 157, server_route_anchor(&b, prefilled, &q)));
     /* a first-turn bank has no last-turn anchor: the header's decides (L311) */
     TEST_ASSERT(server_route_anchor(&b, side_user - 1, &q) == user_n);   /* turn N prefilled through its reply */
     pulsar_tokens fb = {0};
@@ -16305,21 +16369,21 @@ static void test_l275_route_in_place_through_last_turn(void) {
     /* the session recap on the idle main bank: the bank prefilled 41670 (its
      * last user turn starts at 41505) and generated to 41860; the recap matches
      * 41517 and appends its instruction -- in place, the tail is one turn */
-    TEST_ASSERT(server_route_in_place(41517, 41472, 41860, 41670, floor_, 41505));
+    TEST_ASSERT(unseamed_route_in_place(41517, 41472, 41860, 41670, floor_, 41505));
     /* the same request without an anchor took a fresh bank (the behaviour
      * measured 2026-09-29 .. 2026-10-06) */
-    TEST_ASSERT(!server_route_in_place(41517, 41472, 41860, 41670, floor_, -1));
+    TEST_ASSERT(!unseamed_route_in_place(41517, 41472, 41860, 41670, floor_, -1));
     /* a subagent summary against the previous summary's bank: that bank
      * prefilled the main prompt + 153 summary tokens; the new one matches
      * through the tool result */
-    TEST_ASSERT(server_route_in_place(42468, 42112, 42825, 42620, floor_, 42300));
+    TEST_ASSERT(unseamed_route_in_place(42468, 42112, 42825, 42620, floor_, 42300));
     /* the match ends BEFORE the last user marker (an edited earlier turn, or a
      * conversation sharing the history only up to there): fresh */
-    TEST_ASSERT(!server_route_in_place(41400, 41216, 41860, 41670, floor_, 41505));
+    TEST_ASSERT(!unseamed_route_in_place(41400, 41216, 41860, 41670, floor_, 41505));
     /* the match ends AT the marker: the marker itself did not match -- fresh */
-    TEST_ASSERT(!server_route_in_place(41505, 41472, 41860, 41670, floor_, 41505));
+    TEST_ASSERT(!unseamed_route_in_place(41505, 41472, 41860, 41670, floor_, 41505));
     /* the 2026-10-04 clobber: a first-turn bank has no anchor, so it stays fresh */
-    TEST_ASSERT(!server_route_in_place(2318, 2304, 2900, 2723, floor_, -1));
+    TEST_ASSERT(!unseamed_route_in_place(2318, 2304, 2900, 2723, floor_, -1));
 }
 
 static void test_slot_route_trivial_match_decision(void) {
@@ -16327,30 +16391,30 @@ static void test_slot_route_trivial_match_decision(void) {
     /* Legacy single-threshold behavior: share_ceiling == protect_floor == T. */
     /* zero common vs a warm 5.2k-token conversation: provision (the one
      * case the v0.2.0 gate did handle — behavior kept) */
-    TEST_ASSERT(server_slot_match_is_trivial(0, 5200, T, T));
+    TEST_ASSERT(unseamed_match_is_trivial(0, 5200, T, T));
     /* trivial common (template header only, the measured bounce shape):
      * THE FIX — a different conversation must not clobber a warm slot */
-    TEST_ASSERT(server_slot_match_is_trivial(4, 5200, T, T));
-    TEST_ASSERT(server_slot_match_is_trivial(9, 5200, T, T));
-    TEST_ASSERT(server_slot_match_is_trivial(T - 1, 5200, T, T));
+    TEST_ASSERT(unseamed_match_is_trivial(4, 5200, T, T));
+    TEST_ASSERT(unseamed_match_is_trivial(9, 5200, T, T));
+    TEST_ASSERT(unseamed_match_is_trivial(T - 1, 5200, T, T));
     /* real common (long shared prefix: a client resending a longer version
      * of the same prompt, or the documented stateless-continuation
      * pattern): reuse the warm slot, never provision away from it */
-    TEST_ASSERT(!server_slot_match_is_trivial(T, 5200, T, T));
-    TEST_ASSERT(!server_slot_match_is_trivial(5175, 5900, T, T));
+    TEST_ASSERT(!unseamed_match_is_trivial(T, 5200, T, T));
+    TEST_ASSERT(!unseamed_match_is_trivial(5175, 5900, T, T));
     /* empty slot: nothing to protect, reuse it (never "clobbers") */
-    TEST_ASSERT(!server_slot_match_is_trivial(0, 0, T, T));
+    TEST_ASSERT(!unseamed_match_is_trivial(0, 0, T, T));
     /* short same-conversation continuation: common covers nearly the whole
      * slot state — stay on the warm slot even though common < T */
-    TEST_ASSERT(!server_slot_match_is_trivial(38, 40, T, T));
+    TEST_ASSERT(!unseamed_match_is_trivial(38, 40, T, T));
     /* sub-threshold warm tail past the match: clobbering costs a sub-second
      * re-prefill, a fresh provisioning costs seconds — reuse (deliberate
      * semantic change from v0.2.0, which provisioned for pos in (0, T)) */
-    TEST_ASSERT(!server_slot_match_is_trivial(0, T - 1, T, T));
+    TEST_ASSERT(!unseamed_match_is_trivial(0, T - 1, T, T));
     /* boundary: destroyed tail exactly at the threshold provisions */
-    TEST_ASSERT(server_slot_match_is_trivial(0, T, T, T));
-    TEST_ASSERT(server_slot_match_is_trivial(T - 1, 2 * T - 1, T, T));
-    TEST_ASSERT(!server_slot_match_is_trivial(T - 1, 2 * T - 2, T, T));
+    TEST_ASSERT(unseamed_match_is_trivial(0, T, T, T));
+    TEST_ASSERT(unseamed_match_is_trivial(T - 1, 2 * T - 1, T, T));
+    TEST_ASSERT(!unseamed_match_is_trivial(T - 1, 2 * T - 2, T, T));
 
     /* Tools-client bounce: two unrelated Claude Code conversations share a
      * large fixed tool/system prefix. The caller lifts share_ceiling to this
@@ -16358,14 +16422,14 @@ static void test_slot_route_trivial_match_decision(void) {
      * the shared-prefix depth must now read as TRIVIAL and provision fresh,
      * where the old single-T classifier called it "real" and clobbered. */
     const int CEIL = 1800;
-    TEST_ASSERT(server_slot_match_is_trivial(1500, 5200, CEIL, T));   /* the fix */
-    TEST_ASSERT(server_slot_match_is_trivial(CEIL - 1, 5200, CEIL, T));
+    TEST_ASSERT(unseamed_match_is_trivial(1500, 5200, CEIL, T));   /* the fix */
+    TEST_ASSERT(unseamed_match_is_trivial(CEIL - 1, 5200, CEIL, T));
     /* genuine continuation past the shared scaffolding: not trivial, reuse */
-    TEST_ASSERT(!server_slot_match_is_trivial(CEIL, 5200, CEIL, T));
-    TEST_ASSERT(!server_slot_match_is_trivial(3000, 5200, CEIL, T));
+    TEST_ASSERT(!unseamed_match_is_trivial(CEIL, 5200, CEIL, T));
+    TEST_ASSERT(!unseamed_match_is_trivial(3000, 5200, CEIL, T));
     /* raised ceiling must NOT change the protect side: a slot with only a
      * sub-floor tail past a shared-prefix match is still reused, not protected */
-    TEST_ASSERT(!server_slot_match_is_trivial(1500, 1500 + T - 1, CEIL, T));
+    TEST_ASSERT(!unseamed_match_is_trivial(1500, 1500 + T - 1, CEIL, T));
 }
 
 
@@ -18181,7 +18245,7 @@ static void test_l380_batch_frontier(void) {
     s.pool_banks = 2;
     TEST_ASSERT(s.slot_history(&sl).base == NULL && s.slot_history(&sl).tail == NULL);
     pulsar_tokens any = {0};
-    TEST_ASSERT(s.slot_common_prefix(&sl, &any) == 0);
+    TEST_ASSERT(s.slot_common_prefix(&sl, &any) == TokCount{0});
     s.pool_banks = 0;
     /* a slot's history is the engine's tokens, then the batch's commits: its length and its compares read both */
     TokId bv[4] = {TokId{1}, TokId{2}, TokId{3}, TokId{4}}, tv[2] = {TokId{5}, TokId{6}}, wv[6] = {TokId{1}, TokId{2},
@@ -18840,42 +18904,42 @@ static void test_l329_prefix_wait_pick(void) {
     int mark = -1;
     /* the production fan-out (2026-10-23 16:08): the leader adopted 8192 from another conversation, its prompt
      * 25078; a sibling of 24903 shares 24000 with it */
-    const prefix_lead fan[] = {{24000, 8192, 25078}};
-    TEST_ASSERT(server_prefix_wait_pick(8192, 24903, 128, G, fan, 1, &mark) == 0 && mark == 23936);
+    const unseamed_lead fan[] = {{24000, 8192, 25078}};
+    TEST_ASSERT(unseamed_wait_pick(8192, 24903, 128, G, fan, 1, &mark) == 0 && mark == 23936);
     /* the leader stands at or past the cut: the bind adopts what it captured, nothing to wait for */
-    const prefix_lead past[] = {{24000, 23936, 25078}};
-    TEST_ASSERT(server_prefix_wait_pick(8192, 24903, 128, G, past, 1, &mark) == -1 && mark == 0);
+    const unseamed_lead past[] = {{24000, 23936, 25078}};
+    TEST_ASSERT(unseamed_wait_pick(8192, 24903, 128, G, past, 1, &mark) == -1 && mark == 0);
     /* the adopt's threshold: a cut must start the sync more than G deeper than what serves the request now */
-    TEST_ASSERT(server_prefix_wait_pick(23936 - G, 24903, 128, G, fan, 1, &mark) == -1);
-    TEST_ASSERT(server_prefix_wait_pick(23936 - G - 1, 24903, 128, G, fan, 1, &mark) == 0 && mark == 23936);
+    TEST_ASSERT(unseamed_wait_pick(23936 - G, 24903, 128, G, fan, 1, &mark) == -1);
+    TEST_ASSERT(unseamed_wait_pick(23936 - G - 1, 24903, 128, G, fan, 1, &mark) == 0 && mark == 23936);
     /* an unrelated prompt: the template header only */
-    const prefix_lead other[] = {{41, 0, 30000}};
-    TEST_ASSERT(server_prefix_wait_pick(0, 25000, 128, G, other, 1, &mark) == -1);
+    const unseamed_lead other[] = {{41, 0, 30000}};
+    TEST_ASSERT(unseamed_wait_pick(0, 25000, 128, G, other, 1, &mark) == -1);
     /* short of either end: a request that is a prefix of the leader's prompt; a leader whose whole prompt it carries */
-    const prefix_lead longer[] = {{10000, 0, 30000}};
-    TEST_ASSERT(server_prefix_wait_pick(0, 10000, 128, G, longer, 1, &mark) == 0 && mark == 9984);
-    const prefix_lead whole[] = {{10000, 0, 10000}};
-    TEST_ASSERT(server_prefix_wait_pick(0, 20000, 128, G, whole, 1, &mark) == 0 && mark == 9984);
+    const unseamed_lead longer[] = {{10000, 0, 30000}};
+    TEST_ASSERT(unseamed_wait_pick(0, 10000, 128, G, longer, 1, &mark) == 0 && mark == 9984);
+    const unseamed_lead whole[] = {{10000, 0, 10000}};
+    TEST_ASSERT(unseamed_wait_pick(0, 20000, 128, G, whole, 1, &mark) == 0 && mark == 9984);
     /* several leads: the deepest cut; at the same cut the lead nearest it */
-    const prefix_lead three[] = {{12000, 0, 30000}, {20000, 4096, 30000}, {20000, 8192, 30000}};
-    TEST_ASSERT(server_prefix_wait_pick(0, 25000, 128, G, three, 3, &mark) == 2 && mark == 19968);
-    TEST_ASSERT(server_prefix_wait_pick(0, 25000, 128, G, three, 0, &mark) == -1 && mark == 0);
-    TEST_ASSERT(server_prefix_wait_pick(0, 25000, 0, G, three, 3, &mark) == -1);
+    const unseamed_lead three[] = {{12000, 0, 30000}, {20000, 4096, 30000}, {20000, 8192, 30000}};
+    TEST_ASSERT(unseamed_wait_pick(0, 25000, 128, G, three, 3, &mark) == 2 && mark == 19968);
+    TEST_ASSERT(unseamed_wait_pick(0, 25000, 128, G, three, 0, &mark) == -1 && mark == 0);
+    TEST_ASSERT(unseamed_wait_pick(0, 25000, 0, G, three, 3, &mark) == -1);
 }
 
 /* L329 (a): the release rule, the leader's cut, the setting. */
 static void test_l329_prefix_wait_release_rule(void) {
-    TEST_ASSERT(server_prefix_wait_check(true, 8192, 23936, 10.0, 60000.0) == PREFIX_WAIT_HOLD);
-    TEST_ASSERT(server_prefix_wait_check(true, 23936, 23936, 10.0, 60000.0) == PREFIX_WAIT_REACHED);
-    TEST_ASSERT(server_prefix_wait_check(true, 24576, 23936, 10.0, 60000.0) == PREFIX_WAIT_REACHED);
-    TEST_ASSERT(server_prefix_wait_check(false, 0, 23936, 10.0, 60000.0) == PREFIX_WAIT_LEFT);
-    TEST_ASSERT(server_prefix_wait_check(false, 0, 23936, 1e9, 60000.0) == PREFIX_WAIT_LEFT);
-    TEST_ASSERT(server_prefix_wait_check(true, 8192, 23936, 60000.0, 60000.0) == PREFIX_WAIT_TIMEOUT);
+    TEST_ASSERT(unseamed_wait_check(true, 8192, 23936, 10.0, 60000.0) == PREFIX_WAIT_HOLD);
+    TEST_ASSERT(unseamed_wait_check(true, 23936, 23936, 10.0, 60000.0) == PREFIX_WAIT_REACHED);
+    TEST_ASSERT(unseamed_wait_check(true, 24576, 23936, 10.0, 60000.0) == PREFIX_WAIT_REACHED);
+    TEST_ASSERT(unseamed_wait_check(false, 0, 23936, 10.0, 60000.0) == PREFIX_WAIT_LEFT);
+    TEST_ASSERT(unseamed_wait_check(false, 0, 23936, 1e9, 60000.0) == PREFIX_WAIT_LEFT);
+    TEST_ASSERT(unseamed_wait_check(true, 8192, 23936, 60000.0, 60000.0) == PREFIX_WAIT_TIMEOUT);
     /* the leader's cut: the shallowest pending one first, a stale one replaced */
-    TEST_ASSERT(server_prefix_mark_merge(0, 23936, 8192) == 23936);
-    TEST_ASSERT(server_prefix_mark_merge(19968, 23936, 8192) == 19968);
-    TEST_ASSERT(server_prefix_mark_merge(23936, 19968, 8192) == 19968);
-    TEST_ASSERT(server_prefix_mark_merge(19968, 23936, 19968) == 23936);
+    TEST_ASSERT(unseamed_mark_merge(0, 23936, 8192) == 23936);
+    TEST_ASSERT(unseamed_mark_merge(19968, 23936, 8192) == 19968);
+    TEST_ASSERT(unseamed_mark_merge(23936, 19968, 8192) == 19968);
+    TEST_ASSERT(unseamed_mark_merge(19968, 23936, 19968) == 23936);
     /* PULSAR_SERVER_PREFIX_WAIT_MS: unset or empty = the default, whole milliseconds, 0 = off, anything else refused */
     TEST_ASSERT(server_prefix_wait_parse(NULL) == PULSAR_SERVER_PREFIX_WAIT_MS_DEFAULT);
     TEST_ASSERT(server_prefix_wait_parse("") == PULSAR_SERVER_PREFIX_WAIT_MS_DEFAULT);
@@ -18939,9 +19003,10 @@ static void l329_fanout(const l329_req *rq, int n, int wait_ms, l329_out *o) {
             if (!w->leader || r[k].bound || r[k].cancelled || rq[k].arrive > t) continue;
             st *l = &r[w->slot];
             const bool live = l->bound && !l->finished && !l->cancelled;
-            const prefix_wait_verdict v = server_prefix_wait_check(live, l->pos, w->mark, (t - w->since) * 1e3, wait_ms);
+            const prefix_wait_verdict v =
+                unseamed_wait_check(live, l->pos, w->mark.raw(), (t - w->since) * 1e3, wait_ms);
             if (v == PREFIX_WAIT_HOLD) {
-                l->mark = server_prefix_mark_merge(l->mark, w->mark, l->pos);
+                l->mark = unseamed_mark_merge(l->mark, w->mark.raw(), l->pos);
                 continue;
             }
             o->outcomes[v]++;
@@ -18952,7 +19017,7 @@ static void l329_fanout(const l329_req *rq, int n, int wait_ms, l329_out *o) {
             for (int k = 0; k < n && !bound_one; k++) {
                 if (r[k].bound || r[k].cancelled || rq[k].arrive > t || r[k].pw.leader) continue;
                 int have = 0, nl = 0, lead_of[L329_N];
-                prefix_lead leads[L329_N];
+                unseamed_lead leads[L329_N];
                 for (int b = 0; b < n; b++) {
                     if (!r[b].bound || r[b].cancelled) continue;
                     const int c = l329_common(&rq[k], &rq[b]);
@@ -18966,12 +19031,13 @@ static void l329_fanout(const l329_req *rq, int n, int wait_ms, l329_out *o) {
                 if (!r[k].pw.decided) {
                     r[k].pw.decided = true;
                     int mark = 0;
-                    const int pick = wait_ms > 0 ? server_prefix_wait_pick(have, rq[k].len, grid, G, leads, nl, &mark)
+                    const int pick = wait_ms > 0 ? unseamed_wait_pick(have, rq[k].len, grid, G, leads, nl, &mark)
                                                  : -1;
                     if (pick >= 0) {
-                        r[k].pw = {true, (uint64_t)lead_of[pick] + 1u, lead_of[pick], mark, have, t};
+                        r[k].pw = {true, (uint64_t)lead_of[pick] + 1u, lead_of[pick], PromptPos{mark},
+                                   PromptToks{have}, t};
                         st *l = &r[lead_of[pick]];
-                        l->mark = server_prefix_mark_merge(l->mark, mark, l->pos);
+                        l->mark = unseamed_mark_merge(l->mark, mark, l->pos);
                         o->waited[k] = true;
                         o->outcomes[PREFIX_WAIT_HOLD]++;
                         continue;   /* passed over: the next queued request may bind */
@@ -22202,6 +22268,67 @@ static_assert(std::is_same_v<decltype(std::declval<server>().kv_chain_served(nul
                   !std::is_constructible_v<PromptToks, TokCount> && !std::is_constructible_v<TokPos, PromptToks>,
               "a chain's end and the request's tokens it holds are two types with no conversion, explicit or not");
 
+/* ---- L439: the request's prompt length, the routing predicates and the prefix wait, typed ------------------------
+ * The compile-fail checks: a prompt's length is PromptToks and its index PromptPos, never a position or a count on a
+ * bank's history; the all-int predicates take each value in its currency; the fused lanes read a prompt at a bank's
+ * position only through a fuse_witness. */
+/** Does prompt_view::at take this index type? */
+template <class I> concept l439_indexes_prompt = requires(prompt_view p, I i) { p.at(i); };
+/** Does fuse_witness::token take this position type? */
+template <class P> concept l439_witness_reads = requires(fuse_witness w, P p) { w.token(p); };
+/** Does request_exceeds_context take this context type? */
+template <class C> concept l439_ctx_takes = requires(const request *r, C c) { request_exceeds_context(r, c); };
+static_assert(std::is_same_v<decltype(request_prompt_toks(nullptr)), PromptToks> &&
+                  std::is_same_v<decltype(std::declval<prompt_view>().len()), PromptToks> &&
+                  std::is_same_v<decltype(std::declval<prompt_view>().end()), PromptPos> &&
+                  l439_indexes_prompt<PromptPos> && !l439_indexes_prompt<TokPos> && !l439_indexes_prompt<int> &&
+                  !l439_indexes_prompt<PromptToks> && l439_witness_reads<TokPos> && !l439_witness_reads<PromptPos> &&
+                  !l439_witness_reads<int> && !std::is_constructible_v<fuse_witness, prompt_view> &&
+                  !std::is_constructible_v<fuse_witness, const pulsar_tokens *> &&
+                  l439_ctx_takes<TokCount> && !l439_ctx_takes<int> && !l439_ctx_takes<PromptToks>,
+              "a prompt is read by its own index; a bank position reaches it only through the fused lanes' witness");
+static_assert(std::is_same_v<decltype(&server_slot_match_is_trivial), bool (*)(TokCount, TokPos, PromptToks, TokCount)> &&
+                  std::is_same_v<decltype(&server_slot_is_scratch), bool (*)(const session_slot *, TokPos, TokCount)> &&
+                  std::is_same_v<decltype(&kv_cache_anchor_cut), PromptToks (*)(const kv_disk_cache *, int, TokCount)> &&
+                  std::is_same_v<decltype(&server_prefix_wait_pick),
+                                 int (*)(PromptToks, PromptToks, TokCount, PromptToks, const prefix_lead *, int,
+                                         PromptPos *)> &&
+                  std::is_same_v<decltype(&server_prefix_wait_check),
+                                 prefix_wait_verdict (*)(bool, TokPos, PromptPos, double, double)> &&
+                  std::is_same_v<decltype(&server_prefix_mark_merge), PromptPos (*)(PromptPos, PromptPos, TokPos)> &&
+                  std::is_same_v<decltype(std::declval<server>().slot_common_prefix(nullptr, nullptr)), TokCount> &&
+                  std::is_same_v<decltype(&server::trace_begin),
+                                 uint64_t (server::*)(const job *, PromptToks, PromptToks, const trace_cache_diag *,
+                                                      const char *, PromptToks, const char *)>,
+              "the routing, scratch, anchor, prefix-wait and trace predicates take each count in its currency");
+static_assert(std::is_same_v<decltype(kv_req_line::prompt), PromptToks> &&
+                  std::is_same_v<decltype(kv_req_line::score), PromptToks> &&
+                  std::is_same_v<decltype(kv_req_line::reused), PromptToks> &&
+                  std::is_same_v<decltype(kv_req_line::common), TokCount> &&
+                  std::is_same_v<decltype(kv_req_line::deep), TokCount> &&
+                  std::is_same_v<decltype(kv_req_line::prefilled_now), TokCount> &&
+                  std::is_same_v<decltype(kv_req_line::evict_tokens), TokCount> &&
+                  std::is_same_v<decltype(kv_req_line::anchor), TokPos> &&
+                  std::is_same_v<decltype(kv_req_line::frontier), TokPos> &&
+                  std::is_same_v<decltype(kv_req_line::prefilled), TokPos> &&
+                  std::is_same_v<decltype(kv_req_line::at), TokPos> &&
+                  std::is_same_v<decltype(kv_req_line::bank), BankId> &&
+                  std::is_same_v<decltype(kv_req_line::best), BankId> &&
+                  std::is_same_v<decltype(kv_req_line::from), BankId> &&
+                  std::is_same_v<decltype(kv_req_line::evict), BankId> &&
+                  std::is_same_v<decltype(gen_state::prompt_tokens), PromptToks> &&
+                  std::is_same_v<decltype(gen_state::cold_store_len), PromptToks> &&
+                  std::is_same_v<decltype(gen_state::share_mark), PromptPos> &&
+                  std::is_same_v<decltype(gen_state::prompt_for_sync), prompt_view> &&
+                  std::is_same_v<decltype(gen_state::fuse), fuse_witness> &&
+                  std::is_same_v<decltype(gen_resolution::prompt_for_sync), prompt_view> &&
+                  std::is_same_v<decltype(prefix_wait::mark), PromptPos> &&
+                  std::is_same_v<decltype(prefix_wait::have), PromptToks> &&
+                  std::is_same_v<decltype(prefix_lead::shared), PromptToks> &&
+                  std::is_same_v<decltype(prefix_lead::pos), TokPos> &&
+                  std::is_same_v<decltype(prefix_lead::len), PromptToks>,
+              "the carriers are typed: the kv req line's fields, the prompt's carriers in gen_state, the prefix wait's");
+
 /* L434: the text walk -- a text position as a count on one tokenisation of that text.  The differing case: the chain's
  * writer sampled X + 100 x (a|b|cd) + Y, 302 tokens; the request spells the same 402 bytes X + 100 x (abc|d) + Y in
  * 202 tokens and goes on with Z. */
@@ -22430,18 +22557,18 @@ static void test_l434_kv_req_fields_are_consistent(void) {
     sl.bank = BankId{0};
     j.kvr.ep = "chat";
     j.kvr.cls = "";
-    j.kvr.prompt = 703;
-    j.kvr.reused = 202;
-    j.kvr.at = 302;
-    j.kvr.common = 302;
-    j.kvr.frontier = 302;
-    g.prompt_tokens = 703;
+    j.kvr.prompt = PromptToks{703};
+    j.kvr.reused = PromptToks{202};
+    j.kvr.at = TokPos{302};
+    j.kvr.common = TokCount{302};
+    j.kvr.frontier = TokPos{302};
+    g.prompt_tokens = PromptToks{703};
     g.prefill_end = TokPos{803};
     g.t0 = 1.0;
     g.decode_t0 = 2.0;
     s.kv_req_log(&j, &sl, "stop");
-    TEST_ASSERT(j.kvr.prefilled_now == 501);
-    TEST_ASSERT(j.kvr.at + j.kvr.prefilled_now == g.prefill_end.raw());   /* the live side adds up */
+    TEST_ASSERT(j.kvr.prefilled_now == TokCount{501});
+    TEST_ASSERT(j.kvr.at + j.kvr.prefilled_now == g.prefill_end);   /* the live side adds up */
     TEST_ASSERT(j.kvr.reused <= j.kvr.prompt);                             /* the request side holds */
     char line[KV_REQ_LINE_MAX];
     kv_req_format(&j.kvr, line, sizeof line);
@@ -22451,16 +22578,18 @@ static void test_l434_kv_req_fields_are_consistent(void) {
     g.decode_t0 = 0.0;
     sl.prefill_counted = 600;
     s.kv_req_log(&j, &sl, "failed");
-    TEST_ASSERT(j.kvr.prefilled_now == 298);
+    TEST_ASSERT(j.kvr.prefilled_now == TokCount{298});
     /* no seam: prefill_end is the prompt's length and the line is what it was */
-    j.kvr.prompt = 5000;
-    j.kvr.reused = 4096;
-    j.kvr.at = 4096;
-    g.prompt_tokens = 5000;
+    j.kvr.prompt = PromptToks{5000};
+    j.kvr.reused = PromptToks{4096};
+    j.kvr.at = TokPos{4096};
+    g.prompt_tokens = PromptToks{5000};
     g.prefill_end = TokPos{5000};
     g.decode_t0 = 2.0;
     s.kv_req_log(&j, &sl, "stop");
-    TEST_ASSERT(j.kvr.prefilled_now == 904 && j.kvr.reused + j.kvr.prefilled_now == j.kvr.prompt);
+    /* (no seam: the rows prefilled are that many of the prompt's tokens) */
+    TEST_ASSERT(j.kvr.prefilled_now == TokCount{904} &&
+                j.kvr.reused + PromptToks{j.kvr.prefilled_now.raw()} == j.kvr.prompt);
 }
 
 static void pulsar_server_unit_tests_run(void) {

@@ -202,13 +202,15 @@ static const char *context_length_error_param(const request *r) {
 
 /// Whether the prompt leaves no room to generate.
 /// @param r         the request (NULL: false)
-/// @param ctx_size  the context size, tokens
+/// @param ctx_size  the context size, rows of a bank
 /// @return true when the prompt's tokens reach `ctx_size`
-bool request_exceeds_context(const request *r, int ctx_size) {
+bool request_exceeds_context(const request *r, TokCount ctx_size) {
     /* pulsar_session_sync() rejects prompt->len >= ctx_size because generation
      * needs at least one free context slot.  Catch the same boundary here so
      * clients get a normal protocol error instead of a later backend failure. */
-    return r && r->prompt.len >= ctx_size;
+    /* L439 (typing; value unchanged): the context is rows of a bank and the engine caps the STITCHED prompt; this
+     * reads the request's own count against it */
+    return r && seam_unconverted_live(request_prompt_toks(r)) >= ctx_size;
 }
 
 

@@ -44,7 +44,7 @@
  *   takes).  Arithmetic and ordering on none() abort, and so does arithmetic that would land on it (-1 is never a
  *   computed position): fail closed; == / != none() and is_none() are how "no position" is asked.  Otherwise the
  *   arithmetic is int's, negative results included.  A count becomes KV rows only through pulsar_kv_rows (asserts >= 0).
- *   PromptToks has no point type: no prompt-side position crosses the API yet.
+ *   PromptToks' point type is PromptPos (L439, at the end of this file).
  *
  * The rules, enforced by the compiler:
  *   - no implicit conversion in or out: a value enters by an explicit constructor (KvBytes{n}) where it is MEASURED
@@ -983,5 +983,33 @@ static_assert(sizeof(ContentOff) == sizeof(size_t) && std::is_trivial<ContentOff
                   !std::is_convertible<size_t, ContentOff>::value && !std::is_convertible<ContentOff, size_t>::value,
               "a message content's offset is no offset of generated text and no length, and enters by name only");
 /* ==== L437: offsets into the texts of the OUTPUT path (end) ======================================================== */
+
+/* ==== L439: a position on a PROMPT (begin) ==========================================================================
+ * PromptToks had no point type (L334: "no prompt-side position crosses the API yet").  One does now: the shared-
+ * prefix wait cuts a prefill at a token of the prompt its sync was handed, the fused prefill lanes read that prompt
+ * at the bank's position, and both carried the index as the `int` that also held a position on the bank's history.
+ * Across a token seam (pulsar.h pulsar_prefix_match) the two are different numbers for the same byte of text:
+ *
+ *   PromptPos   a point on a prompt -- the request's own tokens, or the prompt a sync is handed
+ *               (pulsar_point<PromptToks>): an index into THAT token array, an end, a cut.  none() = no position.
+ *   PromptToks  the distance between two of them, or a length (as before).
+ *
+ * It mixes with nothing on the live side: a TokPos becomes a PromptPos only through the match that relates the two
+ * sequences (pulsar_prefix_match's stitch and its inverse, or a proof that no seam lies below: the server's
+ * fuse_witness), never by constructing one from the other's raw value. */
+
+/** A point on a prompt's own tokens: an index into the request's (or a sync prompt's) token array (L439). */
+typedef pulsar_point<PromptToks> PromptPos;
+
+static_assert(sizeof(PromptPos) == sizeof(int) && std::is_trivial<PromptPos>::value &&
+                  std::is_standard_layout<PromptPos>::value,
+              "a prompt position is as cheap as the int it replaces (memset / calloc-safe)");
+static_assert(!std::is_constructible<PromptPos, TokPos>::value && !std::is_constructible<TokPos, PromptPos>::value &&
+                  !std::is_constructible<PromptPos, TokCount>::value &&
+                  !std::is_constructible<PromptPos, PromptToks>::value &&
+                  !std::is_constructible<PromptToks, PromptPos>::value &&
+                  !std::is_convertible<int, PromptPos>::value && !std::is_convertible<PromptPos, int>::value,
+              "a prompt position is no live position and no count, not even explicitly, and no bare integer");
+/* ==== L439: a position on a PROMPT (end) ============================================================================ */
 
 #endif

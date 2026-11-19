@@ -734,39 +734,39 @@ int kv_cache_preamble_pos(const kv_disk_cache *kc, const pulsar_tokens *prompt, 
     return i >= kc->opt.min_tokens ? i : -1;
 }
 
-int kv_cache_anchor_cut(const kv_disk_cache *kc, int anchor, TokCount grid) {
-    if (grid.raw() <= 0 || anchor < kc->opt.min_tokens) return 0;
+PromptToks kv_cache_anchor_cut(const kv_disk_cache *kc, int anchor, TokCount grid) {
+    if (grid.raw() <= 0 || anchor < kc->opt.min_tokens) return PromptToks{0};
     const int cut = anchor - anchor % grid.raw();
-    return cut >= kc->opt.min_tokens ? cut : 0;
+    return PromptToks{cut >= kc->opt.min_tokens ? cut : 0};
 }
 
-bool server::kv_cache_anchor_due(const pulsar_tokens *prompt, int cut) {
-    if (!kv.enabled || !kv.st || cut <= 0 || cut > prompt->len) return false;
+bool server::kv_cache_anchor_due(prompt_view prompt, PromptToks cut) {
+    if (!kv.enabled || !kv.st || cut <= PromptToks{0} || cut > prompt.len()) return false;
     (void)kv_cache_commit_written(&kv);   /* L338: the rows an earlier request's writer finished since the last look */
     /* the anchor's text as a persist renders it (pulsar_kvchain_persist keys segments by their tokens' text) */
     pulsar_tokens head;
     memset(&head, 0, sizeof head);
-    head.v = prompt->v;
-    head.len = head.cap = cut;
+    head.v = prompt.tokens()->v;
+    head.len = head.cap = cut.raw();   /* a borrowed view of the prompt's first `cut` tokens */
     TextBytes len{0};
     char *text = pulsar_kvtext_render_tokens_text(engine, &head, &len);
     if (!text) return false;
     bool rp_at_cut = false;
     const bool covered = pulsar_segstore_covers(kv.st, text, len, &rp_at_cut);
     free(text);
-    server_log(PULSAR_LOG_KVCACHE, "pulsar-server: kv cache anchor at %d: rows %s, restore point %s -> %s", cut,
+    server_log(PULSAR_LOG_KVCACHE, "pulsar-server: kv cache anchor at %d: rows %s, restore point %s -> %s", cut.raw(),
                covered ? "stored (second sighting)" : "not stored (first sighting)", rp_at_cut ? "stored" : "none",
                covered && !rp_at_cut ? "write it" : "no write");
     return covered && !rp_at_cut;
 }
 
-bool server::kv_cache_pin_anchor(const pulsar_tokens *prompt, int cut) {
-    if (!kv.enabled || !kv.st || cut <= 0 || cut > prompt->len) return false;
+bool server::kv_cache_pin_anchor(prompt_view prompt, PromptToks cut) {
+    if (!kv.enabled || !kv.st || cut <= PromptToks{0} || cut > prompt.len()) return false;
     (void)kv_cache_commit_written(&kv);
     pulsar_tokens head;
     memset(&head, 0, sizeof head);
-    head.v = prompt->v;
-    head.len = head.cap = cut;
+    head.v = prompt.tokens()->v;
+    head.len = head.cap = cut.raw();   /* a borrowed view of the prompt's first `cut` tokens */
     TextBytes len{0};
     char *text = pulsar_kvtext_render_tokens_text(engine, &head, &len);
     if (!text) return false;
@@ -777,11 +777,11 @@ bool server::kv_cache_pin_anchor(const pulsar_tokens *prompt, int cut) {
     free(text);
     /* the cut is a position on the prompt's tokens; the anchor's chain was written by a cold prefill of that prompt,
      * whose live history is the prompt from position 0, so the cut is the chain's live end (L334 P7) */
-    if (n == 0 || chain[n - 1].text_end != len || chain[n - 1].G != TokPos{cut}) return false;
+    if (n == 0 || chain[n - 1].text_end != len || chain[n - 1].G != TokPos::after(TokCount{cut.raw()})) return false;
     if (!(chain[n - 1].rp_flags & PULSAR_SEGSTORE_RP_PINNED)) {
         const bool ok = pulsar_segstore_flag_rp(kv.st, chain[n - 1].key, PULSAR_SEGSTORE_RP_PINNED);
         server_log(ok ? PULSAR_LOG_KVCACHE : PULSAR_LOG_WARNING, "pulsar-server: kv cache anchor at %d (%.12s) %s "
-                   "(X-Pulsar-KV pin-anchor)", cut, chain[n - 1].key, ok ? "pinned" : "could not be pinned");
+                   "(X-Pulsar-KV pin-anchor)", cut.raw(), chain[n - 1].key, ok ? "pinned" : "could not be pinned");
         kv_cache_publish_store();
     }
     return true;

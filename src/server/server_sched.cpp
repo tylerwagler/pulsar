@@ -90,7 +90,9 @@ void server::queue_unlink(job *j) {
  * (startup) slot so every request can always run on slot 0. */
 int server::job_needed_ctx(const job *j) const {
     const auto *s = this; (void)s;
-    int64_t need = (int64_t)j->req.prompt.len +
+    /* L439: the request's own tokens (the stitch a bank's history makes of them is known only once it is bound: the
+     * plan's context check, gen_begin_plan, is the one that reads it) */
+    int64_t need = (int64_t)request_prompt_toks(&j->req).raw() +
                    (int64_t)(j->req.max_tokens > 0 ? j->req.max_tokens
                                                    : s->default_tokens) +
                    64;
@@ -320,12 +322,12 @@ pulsar_bank_resume server::slot_resume_at(const session_slot *sl, const pulsar_t
         images, n_images);
 }
 
-int server::slot_common_prefix(const session_slot *sl,
-                               const pulsar_tokens *prompt) const {
+TokCount server::slot_common_prefix(const session_slot *sl,
+                                    const pulsar_tokens *prompt) const {
     const auto *s = this;
     pulsar_prefix_match m;
     s->slot_prefix_match(sl, prompt, &m);
-    return m.live_cut.raw();
+    return m.live_cut;
 }
 
 /* L115: the one prefix-reuse question, asked of a slot.  Callers that need
@@ -716,14 +718,15 @@ int server::provision_ctx_for_job(const job *j) const {
  * holding only a sub-threshold warm tail past the match is now reused
  * (clobbered) rather than protected by a fresh provisioning — protecting
  * <threshold tokens of KV is never worth seconds of session create. */
-/// @param common tokens the job shares with the slot
+/// @param common the slot's tokens the job's text shares (the live side of the match)
 /// @param slot_pos the slot's frontier position
-/// @param share_ceiling the trivial-match threshold (the template header plus allowance, lifted per job)
-/// @param protect_floor the warm tail past the match that is worth protecting, tokens
+/// @param share_ceiling the trivial-match threshold, the job's prompt tokens (the template header plus allowance,
+///        lifted per job to its chat anchor)
+/// @param protect_floor the warm tail past the match that is worth protecting, the slot's tokens
 /// @return true when the match is trivial and the slot holds a warm tail worth protecting
-bool server_slot_match_is_trivial(int common, int slot_pos,
-                                  int share_ceiling, int protect_floor) {
-    return common < share_ceiling && slot_pos - common >= protect_floor;
+bool server_slot_match_is_trivial(TokCount common, TokPos slot_pos, PromptToks share_ceiling, TokCount protect_floor) {
+    /* L439 (typing; value unchanged): the ceiling is a count of the JOB's prompt tokens, `common` of the slot's */
+    return seam_unconverted_prompt(common) < share_ceiling && slot_pos - TokPos::after(common) >= protect_floor;
 }
 
 
@@ -817,16 +820,20 @@ int server_route_anchor(const pulsar_tokens *bank, int prefilled, const pulsar_t
  * every turn) -- diverges INSIDE the bank's first user turn, before any anchor,
  * so it takes a fresh bank, which restores the shared prefix from the disk
  * chain. */
-/// @param common tokens the job shares with the bank
-/// @param score where the sync would resume (the deepest grid checkpoint within the match)
+/// @param common the bank's tokens the job's text shares (the live side of the match)
+/// @param score the job's prompt tokens the bank's resume serves (the route's rank)
 /// @param frontier the bank's frontier position
-/// @param prefilled tokens the bank prefilled
-/// @param protect_floor the discard under which in-place reuse is always allowed, tokens
-/// @param anchor the bank's last-turn anchor (server_route_turn_anchor; -1: none)
+/// @param prefilled the bank's prefill frontier
+/// @param protect_floor the discard under which in-place reuse is always allowed, the bank's tokens
+/// @param anchor the bank's route anchor, on its history (server_route_anchor; none(): none)
 /// @return true when the job continues on the bank in place
-bool server_route_in_place(int common, int score, int frontier, int prefilled, int protect_floor,
-                           int anchor) {
-    return common >= prefilled || (anchor >= 0 && common > anchor) || frontier - score < protect_floor;
+bool server_route_in_place(TokCount common, PromptToks score, TokPos frontier, TokPos prefilled, TokCount protect_floor,
+                           TokPos anchor) {
+    const TokPos matched = TokPos::after(common);
+    /* L439 (typing; value unchanged): "what the resume would discard" takes the job's served prompt tokens for the
+     * position on the bank the resume starts at */
+    return matched >= prefilled || (!anchor.is_none() && matched > anchor) ||
+           frontier - TokPos::after(seam_unconverted_live(score)) < protect_floor;
 }
 
 /* L261 / L372: the phases in which a job whose client is gone ends by an abandon that keeps its bank's history, so a
@@ -885,7 +892,7 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
         owner = s->anthropic_live_slot_for_ids(&j->req.anthropic_live_call_ids);
     }
     if (owner) {
-        if (request_exceeds_context(&j->req, owner->ctx_size)) {
+        if (request_exceeds_context(&j->req, TokCount{owner->ctx_size})) {
             *reject_ctx = owner->ctx_size;
             return NULL;
         }
@@ -896,14 +903,16 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
 
     const int needed = s->job_needed_ctx(j);
     session_slot *best = NULL;
-    int best_common = -1, best_score = -1;
-    int deep = -1;                                         /* L378: the deepest match any free bank has */
+    /* L439: the match in the bank's tokens, the score in the job's; -1 = no bank yet (below every real count) */
+    TokCount best_common{-1};
+    PromptToks best_score{-1};
+    TokCount deep{-1};                                     /* L378: the deepest match any free bank has */
     pulsar_resume_why best_why = PULSAR_RESUME_WHY_NONE;   /* L378: why the best bank's score is what it is */
     static const int route_debug = getenv("PULSAR_ROUTE_DEBUG") != NULL;
     for (int i = 0; i < s->n_slots; i++) {
         session_slot *sl = &s->slots[i];
         if (sl->active_job || !sl->provisioned || sl->ctx_size < needed) continue;
-        const int common = s->slot_common_prefix(sl, &j->req.prompt);
+        const TokCount common = s->slot_common_prefix(sl, &j->req.prompt);
         /* L325: the bank scores where its sync resumes -- pulsar_session_bank_resume_at, the one resume rule over the
          * token-seam stitch that the bank's own resume reads and an adopt (bank_adopt_point, L322) reads too: its grid
          * checkpoints AND its records (prompt end, message endpoint) within the match and its prefill frontier, or
@@ -912,11 +921,11 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
          * thinned grid ranked below a shallower bank. */
         const pulsar_bank_resume resume =
             pulsar_session_bank_resume_at(s->sess, sl->bank, &j->req.prompt, j->req.images, j->req.n_images);
-        const int score = resume.served.raw();
+        const PromptToks score = resume.served;
         if (route_debug)
             server_log(PULSAR_LOG_DEFAULT,
                        "pulsar-server: route-scan slot %d bank %d: frontier=%d common=%d score=%d",
-                       i, sl->bank.raw(), s->slot_frontier_pos(sl).raw(), common, score);
+                       i, sl->bank.raw(), s->slot_frontier_pos(sl).raw(), common.raw(), score.raw());
         if (common > deep) deep = common;
         if (score > best_score || (score == best_score && common > best_common)) {
             best_score = score;
@@ -933,11 +942,12 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
      * template-deep match reads as "related" and clobbers an unrelated warm
      * slot (the round-robin bounce under Claude Code). protect_floor stays the
      * static threshold. */
-    int share_ceiling = s->slot_trivial_common_tokens;
+    /* L439: a count of the JOB's prompt tokens (the configured header length; its chat anchor, an index into its
+     * prompt, plus the allowance) */
+    PromptToks share_ceiling{s->slot_trivial_common_tokens};
     const int job_anchor = kv_cache_chat_anchor_pos(&s->kv, &j->req.prompt, &s->turn_markers);
     if (job_anchor > 0) {
-        const int anchor_ceiling =
-            job_anchor + PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS;
+        const PromptToks anchor_ceiling{job_anchor + PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS};
         if (anchor_ceiling > share_ceiling) share_ceiling = anchor_ceiling;
     }
     /* L261: an interrupted client re-sends before the server has seen the old
@@ -955,7 +965,7 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
      * extends (gen_gone_wait_phase). */
     {
         session_slot *gone = NULL;
-        int gone_common = -1;
+        TokCount gone_common{-1};
         for (int i = 0; i < s->n_slots; i++) {
             session_slot *sl = &s->slots[i];
             if (!sl->active_job || !sl->provisioned || sl->ctx_size < needed) continue;
@@ -965,37 +975,40 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
             if (sl->preempted) continue;
             const bool writer_failed = sl->gen->writer.failed;
             if (!writer_failed && !gen_client_disconnected(sl->active_job->fd)) continue;
-            const int common = s->slot_common_prefix(sl, &j->req.prompt);
+            const TokCount common = s->slot_common_prefix(sl, &j->req.prompt);
             if (common > gone_common) {
                 gone_common = common;
                 gone = sl;
             }
         }
-        if (gone && gone_common > best_common && gone_common >= share_ceiling) {
+        /* L439 (typing; value unchanged): the gone bank's match, in ITS tokens, against the best free bank's in its
+         * own, and against the ceiling in the job's */
+        if (gone && gone_common > best_common && seam_unconverted_prompt(gone_common) >= share_ceiling) {
             server_log(PULSAR_LOG_KVCACHE,
                        "pulsar-server: slot routing: deepest match is busy bank %d whose client "
                        "is gone (common=%d, best free %d); waiting for it to abandon",
-                       gone->bank.raw(), gone_common, best_common);
+                       gone->bank.raw(), gone_common.raw(), best_common.raw());
             *waiting_owner = true;
             return NULL;
         }
     }
-    const int frontier = best ? s->slot_frontier_pos(best).raw() : 0;
-    const int prefilled = best && s->sess ? pulsar_session_bank_prefill_frontier(s->sess, best->bank).raw() : 0;
+    const TokPos frontier = best ? s->slot_frontier_pos(best) : TokPos{0};
+    const TokPos prefilled = best && s->sess ? pulsar_session_bank_prefill_frontier(s->sess, best->bank) : TokPos{0};
     /* L275: the bank's last-turn anchor, from the history it prefilled; L311: or its generation header's; L322: the
      * shallower of the two */
-    const int anchor = best && s->sess
-        ? server_route_anchor(pulsar_session_bank_tokens(s->sess, best->bank), prefilled, &s->turn_markers)
-        : -1;
+    const TokPos anchor = best && s->sess
+        ? TokPos{server_route_anchor(pulsar_session_bank_tokens(s->sess, best->bank), prefilled.raw(),
+                                     &s->turn_markers)}
+        : TokPos::none();
     const bool in_place = best && server_route_in_place(best_common, best_score, frontier, prefilled,
-                                                        s->slot_trivial_common_tokens, anchor);
+                                                        TokCount{s->slot_trivial_common_tokens}, anchor);
     /* L378: the decision's numbers, for the request's `kv req:` line (the last routing of a head that waited) */
-    j->kvr.best = best ? best->bank.raw() : -1;
-    j->kvr.common = best ? best_common : -1;
-    j->kvr.score = best ? best_score : -1;
+    j->kvr.best = best ? best->bank : BankId::none();
+    j->kvr.common = best_common;        /* -1 with no bank: absent */
+    j->kvr.score = best_score;
     j->kvr.anchor = anchor;
-    j->kvr.frontier = best ? frontier : -1;
-    j->kvr.prefilled = best ? prefilled : -1;
+    j->kvr.frontier = best ? frontier : TokPos::none();
+    j->kvr.prefilled = best ? prefilled : TokPos::none();
     j->kvr.why = best_why;
     j->kvr.deep = deep;
     j->kvr.route = in_place ? KV_ROUTE_IN_PLACE : KV_ROUTE_NONE;
@@ -1003,7 +1016,8 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
      * where the bank's last turn starts (a head that waits re-routes every quantum; its line repeats only when the
      * decision changes). */
     const uint64_t route_key = best ? 1u + (((uint64_t)pulsar_bank_index(best->bank) << 1 | (in_place ? 1u : 0u)) ^
-                                            ((uint64_t)(uint32_t)best_common << 17) ^ ((uint64_t)(uint32_t)best_score << 40))
+                                            ((uint64_t)(uint32_t)best_common.raw() << 17) ^
+                                            ((uint64_t)(uint32_t)best_score.raw() << 40))
                                     : 0u;
     /* L379: the same decision ended "in place (the only bank to free is the matched one)" -- its own key, so a head
      * that re-routes every quantum says neither line twice */
@@ -1012,7 +1026,8 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
         server_log(PULSAR_LOG_KVCACHE,
                    "pulsar-server: route: best bank %d common %d resume %d frontier %d prefilled %d "
                    "anchor %d prompt %d -> %s",
-                   best->bank.raw(), best_common, best_score, frontier, prefilled, anchor, j->req.prompt.len, verdict);
+                   best->bank.raw(), best_common.raw(), best_score.raw(), frontier.raw(), prefilled.raw(), anchor.raw(),
+                   request_prompt_toks(&j->req).raw(), verdict);
     };
     if (best && route_key != j->route_logged && matched_key != j->route_logged) {
         j->route_logged = route_key;
@@ -1167,9 +1182,10 @@ KvBytes server_ledger_release(KvBytes committed_total, KvBytes slot_cost) {
 
 
 
-bool server_slot_is_scratch(const session_slot *sl, int frontier, int min_tokens) {
+bool server_slot_is_scratch(const session_slot *sl, TokPos frontier, TokCount min_tokens) {
+    /* the tier's minimum is a length of a bank's history: a frontier below the position after that many tokens */
     return sl->provisioned && !sl->active_job &&
-           ((sl->kv_flags & KV_HDR_READ_ONLY) != 0u || frontier < min_tokens);
+           ((sl->kv_flags & KV_HDR_READ_ONLY) != 0u || frontier < TokPos::after(min_tokens));
 }
 
 int server_victim_rank(bool dominated, bool scratch) { return dominated ? 0 : scratch ? 1 : 2; }
@@ -1414,7 +1430,7 @@ void server::victim_facts(bool dominated[PULSAR_SESSION_POOL_CAP], bool scratch[
         const session_slot *sl = &s->slots[i];
         /* L249 D / L353 no. 19: a dead prefix (its session compacted) goes first, like a dominated history */
         dominated[i] = dominated[i] || sl->hint_dead;
-        scratch[i] = server_slot_is_scratch(sl, s->slot_frontier_pos(sl).raw(), s->kv.opt.min_tokens);
+        scratch[i] = server_slot_is_scratch(sl, s->slot_frontier_pos(sl), TokCount{s->kv.opt.min_tokens});
     }
 }
 
@@ -1461,7 +1477,7 @@ void server::worker_evict(int vi, int rank, job *for_job) {
     const bool victim_ro = (sl->kv_flags & KV_HDR_READ_ONLY) != 0u;
     const uint64_t victim_conv =
         tokens ? server_kv_token_hash(tokens->v, server_prompt_conv_end(tokens, &s->turn_markers)) : 0u;
-    const int victim_bank = sl->bank.raw();   /* the route record's raw bank */
+    const BankId victim_bank = sl->bank;   /* the route record's bank */
     bool stored = false;
     kv_persist_rule rule = KV_PERSIST_RULE_NONE;
     if (switched && s->kv.enabled && live_tokens >= s->kv.opt.min_tokens) {
@@ -1531,7 +1547,7 @@ void server::worker_evict(int vi, int rank, job *for_job) {
     if (for_job) {
         kv_req_line *r = &for_job->kvr;
         r->evict = victim_bank;
-        r->evict_tokens = live_tokens;
+        r->evict_tokens = TokCount{live_tokens};   /* the victim's history, in its own tokens */
         r->evict_conv = victim_conv;
         r->evict_ro = victim_ro;
         snprintf(r->snapshot, sizeof r->snapshot, "%s", snapshot);
@@ -1717,37 +1733,43 @@ static bool slot_prefilling(const session_slot *c);
 
 const char *const prefix_wait_names[PREFIX_WAIT_OUTCOMES] = {"started", "reached", "left", "timeout"};
 
-int server_prefix_wait_pick(int have, int prompt_len, int grid, int min_gain, const prefix_lead *leads, int n,
-                            int *mark) {
+int server_prefix_wait_pick(PromptToks have, PromptToks prompt_len, TokCount grid, PromptToks min_gain,
+                            const prefix_lead *leads, int n, PromptPos *mark) {
     int best = -1;
-    *mark = 0;
-    if (grid <= 0) return -1;
+    *mark = PromptPos{0};
+    if (grid <= TokCount{0}) return -1;
+    const PromptToks one{1};
     for (int i = 0; i < n; i++) {
         const prefix_lead *l = &leads[i];
-        int cut = l->shared;
-        if (cut > prompt_len - 1) cut = prompt_len - 1;   /* the request's sync evaluates at least its last token */
-        if (cut > l->len - 1) cut = l->len - 1;           /* inside the leader's prompt: its prefill stops there */
-        cut = cut / grid * grid;
+        PromptToks cut = l->shared;
+        if (cut > prompt_len - one) cut = prompt_len - one;   /* the request's sync evaluates at least its last token */
+        if (cut > l->len - one) cut = l->len - one;           /* inside the leader's prompt: its prefill stops there */
+        /* L439 (typing; value unchanged): the bank's grid applied to an index of the prompt, and that index read as
+         * where the leader's bank stands */
+        cut = PromptToks{cut.raw() / grid.raw() * grid.raw()};
+        if (cut <= PromptToks{0}) continue;   /* no cut: every leader stands at or past position 0 (as before) */
         /* a cut the leader stands at or past is served now (have), and one the adopt would not take is not waited
          * for (server_resume_memory_depth: more than min_gain past what serves it) */
-        if (cut <= l->pos || cut <= have + min_gain) continue;
-        if (cut > *mark || (cut == *mark && l->pos > leads[best].pos)) {
+        if (seam_unconverted_live(PromptPos::after(cut)) <= l->pos || cut <= have + min_gain) continue;
+        if (PromptPos::after(cut) > *mark || (PromptPos::after(cut) == *mark && l->pos > leads[best].pos)) {
             best = i;
-            *mark = cut;
+            *mark = PromptPos::after(cut);
         }
     }
     return best;
 }
 
-prefix_wait_verdict server_prefix_wait_check(bool live, int leader_pos, int mark, double waited_ms, double bound_ms) {
+prefix_wait_verdict server_prefix_wait_check(bool live, TokPos leader_pos, PromptPos mark, double waited_ms,
+                                             double bound_ms) {
     if (!live) return PREFIX_WAIT_LEFT;
-    if (leader_pos >= mark) return PREFIX_WAIT_REACHED;
+    /* L439 (typing; value unchanged): the cut, an index of the prompt, against a position on the leader's bank */
+    if (leader_pos >= seam_unconverted_live(mark)) return PREFIX_WAIT_REACHED;
     if (waited_ms >= bound_ms) return PREFIX_WAIT_TIMEOUT;
     return PREFIX_WAIT_HOLD;
 }
 
-int server_prefix_mark_merge(int cur, int want, int pos) {
-    return cur <= pos || cur > want ? want : cur;
+PromptPos server_prefix_mark_merge(PromptPos cur, PromptPos want, TokPos pos) {
+    return seam_unconverted_live(cur) <= pos || cur > want ? want : cur;   /* L439: as the check above */
 }
 
 int server_prefix_wait_parse(const char *text) {
@@ -1769,7 +1791,7 @@ void server::prefix_wait_release(job *const *queued, int n) {
         if (!w->leader) continue;
         session_slot *ls = &s->slots[w->slot];
         const bool live = slot_prefilling(ls) && ls->active_job->seq == w->leader;
-        const int pos = live ? server_bank_pos(s->sess, ls->bank).raw() : 0;
+        const TokPos pos = live ? server_bank_pos(s->sess, ls->bank) : TokPos{0};
         const double waited_ms = (now - w->since) * 1e3;
         const prefix_wait_verdict v = server_prefix_wait_check(live, pos, w->mark, waited_ms, (double)s->prefix_wait_ms);
         if (v == PREFIX_WAIT_HOLD) {
@@ -1779,10 +1801,11 @@ void server::prefix_wait_release(job *const *queued, int n) {
         server_log(PULSAR_LOG_KVCACHE,
                    "pulsar-server: prefix wait %s after %.1f s: a queued request (prompt %d) waited for bank %d to "
                    "stand at %d (it stands at %d%s); it binds now", prefix_wait_names[v], waited_ms / 1e3,
-                   queued[k]->req.prompt.len, ls->bank.raw(), w->mark, pos, live ? "" : ", its prefill ended");
+                   request_prompt_toks(&queued[k]->req).raw(), ls->bank.raw(), w->mark.raw(), pos.raw(),
+                   live ? "" : ", its prefill ended");
         pthread_mutex_lock(&s->mu);
         s->m_prefix_waits[v]++;
-        if (v == PREFIX_WAIT_REACHED) s->m_prefix_wait_gain += (uint64_t)(w->mark - w->have);
+        if (v == PREFIX_WAIT_REACHED) s->m_prefix_wait_gain += (uint64_t)(w->mark.before() - w->have).raw();
         pthread_mutex_unlock(&s->mu);
         w->leader = 0;
     }
@@ -1797,31 +1820,32 @@ bool server::prefix_wait_decide(job *j) {
     /* the adopt is what serves the cut: a pooled, single-GPU text request that no live tool state pins to its bank
      * (pulsar_session_bank_adopt refuses a tensor-parallel engine and an image history) */
     if (s->prefix_wait_ms <= 0 || s->pool_banks <= 1 || !s->sess || pulsar_engine_is_tp(s->engine) ||
-        r->n_images > 0 || r->prompt.len <= 0 || r->responses_live_call_ids.len > 0 ||
+        r->n_images > 0 || request_prompt_toks(r) <= PromptToks{0} || r->responses_live_call_ids.len > 0 ||
         r->anthropic_live_call_ids.len > 0)
         return false;
     prefix_lead leads[PULSAR_SESSION_POOL_CAP];
     int lead_slot[PULSAR_SESSION_POOL_CAP];
-    int n = 0, have = 0;
+    int n = 0;
+    PromptToks have{0};
     for (int i = 0; i < s->n_slots; i++) {
         session_slot *sl = &s->slots[i];
         if (!sl->provisioned || sl->spilled || sl->preempted) continue;
         /* the deepest state a bank serves the prompt from now: its own resume, which is what an adopt of it reads
          * (L380: a decoder in the batch by the history it entered with, also when its bank is the installed one --
          * it read nothing, and a wait could start for a prefix an adopt from the decoder already serves) */
-        const int at = s->slot_resume_at(sl, &r->prompt, r->images, r->n_images).served.raw();
+        const PromptToks at = s->slot_resume_at(sl, &r->prompt, r->images, r->n_images).served;
         if (at > have) have = at;
         if (!slot_prefilling(sl) || sl->gen->j->req.n_images > 0 || !sl->gen->prompt_for_sync) continue;
-        const pulsar_tokens *lp = sl->gen->prompt_for_sync;
-        const int m = lp->len < r->prompt.len ? lp->len : r->prompt.len;
-        int shared = 0;
-        while (shared < m && lp->v[shared] == r->prompt.v[shared]) shared++;
-        leads[n] = {shared, server_bank_pos(s->sess, sl->bank).raw(), lp->len};
+        const prompt_view lp = sl->gen->prompt_for_sync;
+        /* the two prompts' common prefix by id: a length of either */
+        const PromptToks shared{pulsar_tokens_common_prefix(lp.tokens(), &r->prompt)};
+        leads[n] = {shared, server_bank_pos(s->sess, sl->bank), lp.len()};
         lead_slot[n++] = i;
     }
-    int mark = 0;
-    const int pick = server_prefix_wait_pick(have, r->prompt.len, (int)pulsar_session_resume_grid(s->sess),
-                                             PULSAR_SERVER_ADOPT_MIN_GAIN, leads, n, &mark);
+    PromptPos mark{0};
+    const int pick = server_prefix_wait_pick(have, request_prompt_toks(r),
+                                             TokCount{(int)pulsar_session_resume_grid(s->sess)},
+                                             PromptToks{PULSAR_SERVER_ADOPT_MIN_GAIN}, leads, n, &mark);
     if (pick < 0) return false;
     session_slot *ls = &s->slots[lead_slot[pick]];
     w->leader = ls->active_job->seq;
@@ -1836,8 +1860,8 @@ bool server::prefix_wait_decide(job *j) {
     server_log(PULSAR_LOG_KVCACHE,
                "pulsar-server: prefix wait: a queued request (prompt %d) waits for bank %d's prefill to stand at %d "
                "(shares %d of its %d; it stands at %d, the best state for the request now %d; bound %d ms)",
-               r->prompt.len, ls->bank.raw(), mark, leads[pick].shared, leads[pick].len, leads[pick].pos, have,
-               s->prefix_wait_ms);
+               request_prompt_toks(r).raw(), ls->bank.raw(), mark.raw(), leads[pick].shared.raw(),
+               leads[pick].len.raw(), leads[pick].pos.raw(), have.raw(), s->prefix_wait_ms);
     return true;
 }
 
@@ -1944,7 +1968,7 @@ bool server::worker_try_bind() {
                 if (room == MAKE_ROOM_IN_PLACE) {
                     server_log(PULSAR_LOG_KVCACHE,
                                "pulsar-server: route: best bank %d prompt %d -> in place (the only bank to free is the "
-                               "matched one)", sl->bank.raw(), j->req.prompt.len);
+                               "matched one)", sl->bank.raw(), request_prompt_toks(&j->req).raw());
                     j->kvr.route = KV_ROUTE_MATCHED;
                     clobbers = false;
                     break;
@@ -1963,11 +1987,11 @@ bool server::worker_try_bind() {
         s->queue_unlink(j);
         bool dead = false;
         if (!job_claim_writes(j, &dead)) {
-            http_error_context_length_exceeded(j->fd, &j->req, j->req.prompt.len, reject_ctx);
+            http_error_context_length_exceeded(j->fd, &j->req, request_prompt_toks(&j->req).raw(), reject_ctx);
         } else if (!dead) {
             /* L249 D: the stream opened while it waited -- the same message, as an error event */
             char msg[160];
-            context_length_message(msg, sizeof msg, &j->req, j->req.prompt.len, reject_ctx);
+            context_length_message(msg, sizeof msg, &j->req, request_prompt_toks(&j->req).raw(), reject_ctx);
             sse_error_event(j->fd, &j->req, 400, msg);
         }
         s->kv_req_log(j, NULL, "refused-context");   /* L378 */
@@ -2303,35 +2327,42 @@ void kv_req_format(const kv_req_line *r, char *out, size_t cap) {
     kv_line_word(&l, "parent", r->parent);
     kv_line_hash(&l, "pre", r->has_pre, r->pre);
     kv_line_hash(&l, "conv", true, r->conv);
-    kv_line_int(&l, "prompt", r->prompt);
-    kv_line_int(&l, "bank", r->bank);
+    /* L439: the fields leave their types here, each printed as the integer it was (absent: `-`) */
+    kv_line_int(&l, "prompt", r->prompt.raw());
+    kv_line_int(&l, "bank", r->bank.raw());
     kv_line_word(&l, "route", kv_route_names[r->route]);
-    kv_line_int(&l, "best", r->best);
-    kv_line_int(&l, "common", r->common);
-    kv_line_int(&l, "score", r->score);
-    kv_line_int(&l, "anchor", r->anchor);
-    kv_line_int(&l, "frontier", r->frontier);
-    kv_line_int(&l, "prefilled", r->prefilled);
+    kv_line_int(&l, "best", r->best.raw());
+    kv_line_int(&l, "common", r->common.raw());
+    kv_line_int(&l, "score", r->score.raw());
+    kv_line_int(&l, "anchor", r->anchor.raw());
+    kv_line_int(&l, "frontier", r->frontier.raw());
+    kv_line_int(&l, "prefilled", r->prefilled.raw());
     /* why the best bank's resume point is 0 inside a match -- only then */
-    kv_line_word(&l, "noresume", r->score == 0 && r->common > 0 ? kv_resume_why_names[r->why] : "");
+    kv_line_word(&l, "noresume",
+                 r->score == PromptToks{0} && r->common > TokCount{0} ? kv_resume_why_names[r->why] : "");
     kv_line_word(&l, "pick", kv_pick_names[r->pick]);
-    if (r->pick == KV_PICK_ADOPT) kv_line_int(&l, "from", r->from);
+    if (r->pick == KV_PICK_ADOPT) kv_line_int(&l, "from", r->from.raw());
     else kv_line_word(&l, "from", r->pick == KV_PICK_DISK ? "disk" : "");
-    kv_line_int(&l, "at", r->at);
-    kv_line_int(&l, "reused", r->reused);
-    kv_line_int(&l, "prefilled_now", r->prefilled_now);
-    /* what a resume at the deepest live match would have saved */
-    kv_line_int(&l, "below", r->deep >= 0 && r->at >= 0 ? (r->deep > r->at ? r->deep - r->at : 0) : -1);
+    kv_line_int(&l, "at", r->at.raw());
+    kv_line_int(&l, "reused", r->reused.raw());
+    kv_line_int(&l, "prefilled_now", r->prefilled_now.raw());
+    /* what a resume at the deepest live match would have saved: both on a bank's history (the deepest match's end
+     * as a position there, less where the sync started) */
+    {
+        const bool known = r->deep >= TokCount{0} && !r->at.is_none();
+        const TokPos deep_end = known ? TokPos::after(r->deep) : TokPos{0};
+        kv_line_int(&l, "below", !known ? -1 : deep_end > r->at ? (deep_end - r->at).raw() : 0);
+    }
     kv_line_int(&l, "epcut", r->epcut);
     kv_line_int(&l, "reply", r->reply);
-    kv_line_int(&l, "evict", r->evict);
-    kv_line_int(&l, "evict_tokens", r->evict >= 0 ? r->evict_tokens : -1);
-    kv_line_hash(&l, "evict_conv", r->evict >= 0, r->evict_conv);
-    kv_line_int(&l, "evict_ro", r->evict >= 0 ? (r->evict_ro ? 1 : 0) : -1);
+    kv_line_int(&l, "evict", r->evict.raw());
+    kv_line_int(&l, "evict_tokens", !r->evict.is_none() ? r->evict_tokens.raw() : -1);
+    kv_line_hash(&l, "evict_conv", !r->evict.is_none(), r->evict_conv);
+    kv_line_int(&l, "evict_ro", !r->evict.is_none() ? (r->evict_ro ? 1 : 0) : -1);
     {
         char word[sizeof r->snapshot];   /* "none (read-only)" -> "none(read-only)": no blank in a value */
         size_t n = 0;
-        for (size_t i = 0; r->evict >= 0 && r->snapshot[i]; i++)
+        for (size_t i = 0; !r->evict.is_none() && r->snapshot[i]; i++)
             if (r->snapshot[i] != ' ') word[n++] = r->snapshot[i];
         word[n] = '\0';
         kv_line_word(&l, "snapshot", word);
@@ -2365,7 +2396,7 @@ void server::kv_req_key(job *j) {
     r->has_pre = pre_end >= 0;
     r->pre = r->has_pre ? server_kv_token_hash(q->prompt.v, pre_end) : 0u;
     r->conv = server_kv_token_hash(q->prompt.v, server_prompt_conv_end(&q->prompt, &s->turn_markers));
-    r->prompt = q->prompt.len;
+    r->prompt = request_prompt_toks(q);
     r->has_temp = q->has_temperature;   /* L424: what the request asked the sampler for */
     r->has_top_p = q->has_top_p;
     r->has_top_k = q->has_top_k;
@@ -2377,8 +2408,12 @@ void server::kv_req_key(job *j) {
     r->top_k_used = q->top_k;
     r->min_p = q->asked_min_p;
     r->min_p_used = (double)q->min_p;
-    r->bank = r->best = r->common = r->score = r->anchor = r->frontier = r->prefilled = r->deep = -1;
-    r->from = r->at = r->reused = r->prefilled_now = r->epcut = r->reply = r->evict = r->evict_tokens = -1;
+    /* absent until known: a bank's and a position's none(), a count of -1 (each prints `-`) */
+    r->bank = r->best = r->from = r->evict = BankId::none();
+    r->anchor = r->frontier = r->prefilled = r->at = TokPos::none();
+    r->common = r->deep = r->prefilled_now = r->evict_tokens = TokCount{-1};
+    r->score = r->reused = PromptToks{-1};
+    r->epcut = r->reply = -1;
     r->qwait_ms = r->prefill_ms = r->ttft_ms = -1.0;
 }
 
@@ -2388,16 +2423,16 @@ void server::kv_req_log(job *j, const session_slot *sl, const char *finish) {
     const gen_state *g = sl ? sl->gen : NULL;
     r->finish = finish;
     if (g) {
-        r->bank = sl->bank.raw();
+        r->bank = sl->bank;
         if (g->decode_t0 > 0.0 && g->t0 > 0.0) r->prefill_ms = (g->decode_t0 - g->t0) * 1e3;
         if (g->first_token_t > 0.0) r->ttft_ms = (g->first_token_t - j->accepted_at) * 1e3;
         r->out = g->completion_total + g->completion;
-        if (r->at >= 0) {
+        if (!r->at.is_none()) {
             /* a prefill that ran to its end computed the prompt past `at`; one that stopped, to its last chunk */
             /* L434: both live-side, as `at` is -- where the prefill ended on the bank's history (the stitch's end).
              * It was the request's prompt length: across a seam, another count than the position it is taken from */
-            const int upto = g->decode_t0 > 0.0 ? g->prefill_end.raw() : sl->prefill_counted;
-            r->prefilled_now = upto > r->at ? upto - r->at : 0;
+            const TokPos upto = g->decode_t0 > 0.0 ? g->prefill_end : TokPos{sl->prefill_counted};
+            r->prefilled_now = upto > r->at ? upto - r->at : TokCount{0};
         }
         if (!finish) r->finish = g->kv_finish;
     }
@@ -3410,8 +3445,10 @@ KvBytes server::kv_reserved_bytes(const session_slot *except) {
     for (int i = 0; i < s->n_slots && n < PULSAR_SESSION_POOL_CAP; i++) {
         const session_slot *c = &s->slots[i];
         if (c == except || !server_slot_reserves(c)) continue;
-        const int len = c->active_job->req.prompt.len > 0 ? c->active_job->req.prompt.len : 0;
-        want[n] = pulsar_session_quantum_growth_bytes_per_bank(pool, KvRows{(uint32_t)len});
+        /* L439: the rows a prompt adds are its STITCH's (one a token of what the bank ends up holding); the price
+         * takes the request's own count -- a marked crossing, off by the seam's shift */
+        want[n] = pulsar_session_quantum_growth_bytes_per_bank(
+            pool, pulsar_kv_rows(seam_unconverted_live(request_prompt_toks(&c->active_job->req))));
         have[n] = pulsar_session_bank_touched_kv_bytes(pool, c->bank);
         n++;
     }
@@ -3818,8 +3855,9 @@ prompt_kv_verdict server::prompt_kv_check(const session_slot *sl, const job *j, 
     *need = KvBytes{};
     if (!s->guard_enabled || s->pool_banks <= 0) return PROMPT_KV_FITS;
     pulsar_session *pool = s->sess;
-    const int len = j->req.prompt.len > 0 ? j->req.prompt.len : 0;
-    const KvBytes want = pulsar_session_quantum_growth_bytes_per_bank(pool, KvRows{(uint32_t)len});
+    /* L439: as kv_reserved_bytes -- the request's own count for the rows its stitch adds (a marked crossing) */
+    const KvBytes want = pulsar_session_quantum_growth_bytes_per_bank(
+        pool, pulsar_kv_rows(seam_unconverted_live(request_prompt_toks(&j->req))));
     /* NULL: an empty bank */
     const KvBytes have = sl ? pulsar_session_bank_touched_kv_bytes(pool, sl->bank) : KvBytes{};
     *need = want > have ? want - have : KvBytes{};
@@ -3860,7 +3898,7 @@ bool server::prompt_kv_admit(session_slot *sl, job *j, bool *refused) {
             server_log(PULSAR_LOG_DEFAULT,
                        "pulsar-server: kv admission: a %d-token prompt adds %.2f GiB of KV to bank %d (resident %.2f + "
                        "%.2f > budget %.2f GiB): spilling %d idle bank(s) first",
-                       j->req.prompt.len, (double)need.raw() / gib, sl->bank.raw(), (double)touched.raw() / gib,
+                       request_prompt_toks(&j->req).raw(), (double)need.raw() / gib, sl->bank.raw(), (double)touched.raw() / gib,
                        (double)need.raw() / gib, (double)s->guard_budget().raw() / gib, n_spill);
         bool failed = false;
         for (int k = 0; k < n_spill && !failed; k++) {
@@ -3885,7 +3923,7 @@ bool server::prompt_kv_admit(session_slot *sl, job *j, bool *refused) {
             server_log(PULSAR_LOG_WARNING,
                        "pulsar-server: kv admission: a %d-token prompt adds %.2f GiB of KV to bank %d (resident %.2f + "
                        "%.2f > budget %.2f GiB) and no idle bank can be spilled: queued until a busy bank's job ends",
-                       j->req.prompt.len, (double)need.raw() / gib, sl->bank.raw(), (double)touched.raw() / gib,
+                       request_prompt_toks(&j->req).raw(), (double)need.raw() / gib, sl->bank.raw(), (double)touched.raw() / gib,
                        (double)need.raw() / gib, (double)s->guard_budget().raw() / gib);
         s->note_provision_refusal(j, PROVISION_REFUSED_KV_TOUCHED);
         return false;
@@ -3895,7 +3933,7 @@ bool server::prompt_kv_admit(session_slot *sl, job *j, bool *refused) {
              "not enough KV memory for this prompt now: its %d tokens need %.2f GiB of KV beside %.2f GiB the server "
              "keeps resident (budget %.2f GiB), and no idle conversation can be moved to disk to make room; retry "
              "later or shorten the prompt",
-             j->req.prompt.len, (double)need.raw() / gib, (double)touched.raw() / gib,
+             request_prompt_toks(&j->req).raw(), (double)need.raw() / gib, (double)touched.raw() / gib,
              (double)s->guard_budget().raw() / gib);
     server_log(PULSAR_LOG_WARNING, "pulsar-server: kv admission REFUSED (503): %s", msg);
     s->count_503(SERVER_503_ADMISSION);   /* L378 */
@@ -4056,7 +4094,7 @@ bool server::prefill_headroom_ok(session_slot *sl) {
     if (warn_limiter_due(&s->prefill_mem_warn, server_now_sec(), PULSAR_SERVER_MEM_FLOOR_WARN_SEC, &skipped))
         server_log(PULSAR_LOG_WARNING, "pulsar-server: prefill REFUSED (503) on bank %d at %d (a prompt of %d tokens) -- %s after "
                    "%d spill(s)%s: %s (%u more refused since the last line)", sl->bank.raw(),
-                   server_bank_pos(s->sess, sl->bank).raw(), g->prompt_tokens, why, spilled,
+                   server_bank_pos(s->sess, sl->bank).raw(), g->prompt_tokens.raw(), why, spilled,
                    preempt_tried ? " and a preemption try" : "", g->err, skipped);
     /* the bank is kept: the bindings on it stay only while they are still true of it (L372 O23) */
     s->live_bindings_settle(sl);
@@ -4588,11 +4626,15 @@ bool server::fuse_prepare(session_slot *sl) {
         return false;
     }
     const TokPos pos = pulsar_session_pos(pool);
+    /* L439: the id-prefix gate and its proof are one (fuse_witness): the bank's history is the prompt's first tokens
+     * by id (an empty bank's trivially), so the lanes may read the prompt at the bank's position */
+    const fuse_witness w = fuse_witness::when_history_is_prefix(
+        g->prompt_for_sync, pulsar_session_common_prefix(pool, g->prompt_for_sync.tokens()), pos);
     if (pos == TokPos{0}) {
         pulsar_session_invalidate(pool);     /* a fresh conversation: the bank empty on the device too */
-    } else if (TokPos::after(pulsar_session_common_prefix(pool, g->prompt_for_sync)) != pos) {
+    } else if (!w) {
         g->no_fuse = "needs a rewind/stitch";   /* the classic sync owns that */
-    } else if (const TokPos at = pulsar_session_bank_resume_at(pool, sl->bank, g->prompt_for_sync, NULL, 0).at;   /* fused: text only */
+    } else if (const TokPos at = pulsar_session_bank_resume_at(pool, sl->bank, g->prompt_for_sync.tokens(), NULL, 0).at;   /* fused: text only */
                !at.is_none() && at >= TokPos{0} && at != pos) {
         /* L284: a bank-pool family's sync would not continue this history where it stands (decode rows past
          * its prefill: it resumes from a checkpoint below); a fused chunk starts only where the sync would */
@@ -4608,8 +4650,8 @@ bool server::fuse_prepare(session_slot *sl) {
     }
     pulsar_session_bank_state_save(pool, sl->bank);
     s->live_bank = BankId::none();
-    g->fuse_ready = !g->no_fuse;
-    return g->fuse_ready;
+    g->fuse = g->no_fuse ? fuse_witness{} : w;
+    return (bool)g->fuse;
 }
 
 /* plan-34 inc 6: the SPEC batched quantum. Same skeleton as
@@ -4729,9 +4771,12 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             /* 2026-10-29: a rider's chunk is a prefill chunk -- the per-chunk memory re-check; short of it the
              * prompt leaves the fused lane, and its classic quantum runs the remedies or refuses it */
             if (!s->prefill_headroom_fused_ok(c)) { rv[k].why = pg->no_fuse; continue; }
-            if (!pg->fuse_ready && !s->fuse_prepare(c)) { rv[k].why = pg->no_fuse; continue; }
-            const int p0 = server_bank_pos(pool, c->bank).raw();
-            if (pg->prompt_for_sync->len - p0 <= 0) {
+            if (!pg->fuse && !s->fuse_prepare(c)) { rv[k].why = pg->no_fuse; continue; }
+            /* L439: from here the prompt is read at the bank's position, through the witness fuse_prepare made:
+             * its end is where the bank stands with the whole prompt in */
+            const TokPos p0_at = server_bank_pos(pool, c->bank);
+            const int p0 = p0_at.raw();
+            if (pg->fuse.end() <= p0_at) {
                 /* L372: the bank already stands at the prompt's end (a re-send of a prompt whose first attempt ended
                  * before a token): no chunk to ride, and the handoff to decode is the classic sync's.  Left fusable
                  * it was stepped by neither -- this loop skipped it and the classic pick leaves a fusable prefill to
@@ -4741,7 +4786,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             }
             ps[n_ps] = c;
             pgs[n_ps] = pg;
-            sp[n_ps] = {(uint32_t)p0, (uint32_t)pg->prompt_for_sync->len, pulsar_session_resume_grid(pool),
+            sp[n_ps] = {(uint32_t)p0, (uint32_t)pg->fuse.end().raw(), pulsar_session_resume_grid(pool),
                         pg->sched_inv_ms, pg->sched_last_ride};
             n_ps++;
         }
@@ -4861,7 +4906,8 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             /* L329 (a): a chunk that would cross the cut a queued request waits for ends on it (a resume-grid point,
              * so 128-aligned and captured: note_prefilled's grid rule); it cannot finish the prompt, which ends past
              * the cut */
-            const int mk = pgs[i]->share_mark;
+            /* L439: the cut is an index of the prompt; a rider's bank position is that index (its witness) */
+            const int mk = pgs[i]->fuse.live_at(pgs[i]->share_mark).raw();
             if (ch.q[i] > 0u && mk > (int)sp[i].p0 && sp[i].p0 + ch.q[i] > (uint32_t)mk) {
                 ch.q[i] = (uint32_t)mk - sp[i].p0;
                 ch.fin[i] = false;
@@ -5046,13 +5092,15 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             shape.n_pf = (uint32_t)n_fr;
             uint32_t at = rows;
             for (int r = 0; r < n_fr; r++) {
-                const pulsar_tokens *t = fr[r].sl->gen->prompt_for_sync;
+                /* L439: the rider's tokens at its bank's positions, by its witness */
+                const fuse_witness &w = fr[r].sl->gen->fuse;
                 /* L329 (b2): the rider's next chunk of PLE rows, read while this round computes */
-                (void)pulsar_session_prompt_read_ahead(pool, fr[r].sl->bank, t, fr[r].p0 + fr[r].k);
+                (void)pulsar_session_prompt_read_ahead(pool, fr[r].sl->bank, w.prompt().tokens(),
+                                                       w.at(TokPos{fr[r].p0 + fr[r].k}).raw());
                 for (int j = 0; j < fr[r].k; j++) {
                     fused_reqs[at].bank = fr[r].sl->bank;
                     fused_reqs[at].pos = TokPos{fr[r].p0 + j};
-                    fused_reqs[at].token = TokId{t->v[fr[r].p0 + j]};
+                    fused_reqs[at].token = w.token(TokPos{fr[r].p0 + j});
                     at++;
                 }
                 shape.head_last[r] = fr[r].fin ? 1u : 0u;
@@ -5132,7 +5180,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             gen_state *pg = c->gen;
             const int head = fr[r].fin ? fin_row++ : -1;
             if (!s->bank_switch(c->bank) ||
-                pulsar_session_note_prefilled(pool, pg->prompt_for_sync->v + fr[r].p0, fr[r].k, head) != 0) {
+                pulsar_session_note_prefilled(pool, pg->fuse.run(TokPos{fr[r].p0}), fr[r].k, head) != 0) {
                 snprintf(pg->err, sizeof pg->err, "bank %d: the fused prompt chunk could not be recorded",
                          c->bank.raw());
                 s->gen_prefill_fail(c);
@@ -5145,9 +5193,9 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                  * the per-slot watermark. */
                 /* L434: the total is live-side like the position: a prompt rides fused rounds only while the bank's
                  * history IS its first tokens by id (server::fuse_prepare: else "needs a rewind/stitch"), so its length
-                 * is the length of what the bank will hold */
+                 * is the length of what the bank will hold -- L439: read from that proof (fuse_witness::end) */
                 gen_prefill_progress_cb(pg, "prefill_chunk", TokPos{(int)(fr[r].p0 + fr[r].k)},
-                                        TokCount{pg->prompt_for_sync->len});
+                                        pg->fuse.end().before());
                 rider_verdict *v = &rv[c - s->slots];
                 v->rounds++;
                 v->rows += fr[r].k;
@@ -5430,7 +5478,9 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
     for (int k = 0; k < s->n_slots; k++) {
         if (!rv[k].rounds && !rv[k].why) continue;
         const session_slot *c = &s->slots[k];
-        const int len = c->gen && c->gen->prompt_for_sync ? c->gen->prompt_for_sync->len : -1;
+        /* L439 (typing; value unchanged): the prompt's own length printed as the total of the bank's position */
+        const int len = c->gen && c->gen->prompt_for_sync
+                            ? seam_unconverted_live(c->gen->prompt_for_sync.len()).raw() : -1;
         server_log(PULSAR_LOG_PREFILL, "pulsar-server: fuse: bank %d at %d/%d rode %d rows in %d of %d rounds%s%s",
                    c->bank.raw(), server_bank_pos(pool, c->bank).raw(), len, rv[k].rows, rv[k].rounds,
                    round_ix, rv[k].why ? "; last miss: " : "", rv[k].why ? rv[k].why : "");
@@ -5547,10 +5597,12 @@ session_slot *server::worker_find_fuse_prefill() {
         if (!sl->active_job || !g || g->phase != GEN_PREFILL_MAIN || !g->prompt_for_sync ||
             g->no_fuse)
             continue;
-        const int P = server_bank_pos(pool, sl->bank).raw();
-        const int len = g->prompt_for_sync->len;
-        if (P <= 0 || P >= len) continue;                       /* first chunk / done: classic */
-        if (g->share_mark > P) continue;                        /* L329 (a): the classic sync stops at the cut */
+        const TokPos P = server_bank_pos(pool, sl->bank);
+        /* L439 (typing; value unchanged): the prompt's own end and the cut, an index of it, against the bank's
+         * position */
+        const TokPos len = seam_unconverted_live(g->prompt_for_sync.end());
+        if (P <= TokPos{0} || P >= len) continue;               /* first chunk / done: classic */
+        if (seam_unconverted_live(g->share_mark) > P) continue; /* L329 (a): the classic sync stops at the cut */
         /* 2026-10-29: the fused run is prefill chunks too -- short of the floor it goes classic (prefill_headroom_ok) */
         if (!s->prefill_headroom_fused_ok(sl)) continue;
         return sl;                                              /* P=1: first qualifier */
@@ -5617,7 +5669,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
     pulsar_session *pool = s->sess;
     park_live_bank(s, dec, n, pf);
     gen_state *pg = pf->gen;
-    const pulsar_tokens *pp = pg->prompt_for_sync;
+    const prompt_view pp = pg->prompt_for_sync;
 
     session_slot *kept[PULSAR_SESSION_POOL_CAP];   /* L328: the decoders the guard did not preempt */
     n = s->guard_maybe_evict(dec, n, kept);
@@ -5670,7 +5722,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
             server_log(PULSAR_LOG_DEFAULT,
                        "pulsar-server: FUSED mixed quantum engaged (prefill bank %d at pos %d/%d, "
                        "%d decode banks, chunk %d/step)",
-                       pf->bank.raw(), P0, pp->len, n, s->mixed_chunk_tokens);
+                       pf->bank.raw(), P0, pp.len().raw(), n, s->mixed_chunk_tokens);
         }
     }
 
@@ -5678,7 +5730,9 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
     const int cap = pulsar_session_prefill_cap(pool).raw();   /* mixed-step row ceiling */
     if (kstep > cap - PULSAR_SESSION_POOL_CAP) kstep = cap - PULSAR_SESSION_POOL_CAP;
     if (kstep < 1) kstep = 1;
-    const int len = pp->len;
+    /* L439 (typing; value unchanged): this lane reads the prompt at the bank's position and takes the prompt's own
+     * length for the bank's end, with no test that the bank's history is the prompt's prefix */
+    const int len = seam_unconverted_live(pp.len()).raw();
     int pf_done = 0;
     bool reached_end = false;                     /* prefill reached len this quantum */
     bool pf_giveup = false;                        /* prefill rejected -> stop folding it */
@@ -5725,7 +5779,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
         for (int j = 0; j < kthis; j++) {
             reqs[m + j].bank = pf->bank;
             reqs[m + j].pos = TokPos{pos_now + j};
-            reqs[m + j].token = pp->v[pos_now + j];
+            reqs[m + j].token = pp.at(seam_unconverted_prompt(TokPos{pos_now + j}));
         }
         const int nrows = m + kthis;
         if (nrows == 0) break;
@@ -5800,7 +5854,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
          * bank's prefill frontier moves with them (a resume computes its grid
          * point from it) and a commit that ends on the grid is a checkpoint. */
         if (pulsar_session_bank_state_restore(pool, pf->bank) &&
-            pulsar_session_note_prefilled(pool, &pp->v[P0], pf_done, -1) == 0) {
+            pulsar_session_note_prefilled(pool, pp.from(seam_unconverted_prompt(TokPos{P0})), pf_done, -1) == 0) {
             pf->committed_pos = TokPos{P0 + pf_done};
             s->live_bank = pf->bank;
             if (reached_end) {
@@ -5844,10 +5898,11 @@ static int worker_decode_budget(server *s) {
         const session_slot *c = &s->slots[i];
         if (!slot_prefilling(c)) continue;
         const gen_state *g = c->gen;
-        const pulsar_tokens *target = g->phase == GEN_PREFILL_COLD ? &g->cold_prefix : g->prompt_for_sync;
+        const prompt_view target = g->phase == GEN_PREFILL_COLD ? prompt_view_of(&g->cold_prefix) : g->prompt_for_sync;
         if (!target) continue;
-        const int left = target->len - server_bank_pos(s->sess, c->bank).raw();
-        if (left <= cap) return 1;
+        /* L439 (typing; value unchanged): the target's own length less the bank's position */
+        const TokCount left = seam_unconverted_live(target.end()) - server_bank_pos(s->sess, c->bank);
+        if (left <= TokCount{cap}) return 1;
     }
     return PULSAR_SERVER_DECODE_QUANTUM_TOKENS;
 }
