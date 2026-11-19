@@ -20993,6 +20993,85 @@ static char *l334_text(void *, TokId id, size_t *len) {
     return server_xstrdup(t);
 }
 
+/* ---- L437: offsets into the texts of the output path ----------------------------------------------------------
+ * pulsar_units.h GenBytes / GenOff / StreamOff -- the compile-fail checks: an offset of the turn's text, an offset of a
+ * parser's stream and a length never pass for one another, for rendered-text bytes, a token type or a bare integer. */
+static_assert(!l334_passes<StreamOff, GenOff> && !l334_passes<GenOff, StreamOff> && !l334_passes<GenBytes, GenOff> &&
+                  !l334_passes<GenOff, GenBytes> && !l334_passes<size_t, GenOff> && !l334_passes<size_t, StreamOff> &&
+                  !l334_passes<size_t, GenBytes> && !l334_passes<GenOff, size_t> && !l334_passes<StreamOff, size_t> &&
+                  !l334_passes<int, GenOff> && !l334_passes<TextBytes, GenBytes> && !l334_passes<TextBytes, GenOff> &&
+                  !l334_passes<GenBytes, TextBytes> && !l334_passes<TokPos, GenOff> && !l334_passes<TokCount, GenBytes>,
+              "no output-path offset or length passes for another, for rendered text, a token type or an integer");
+static_assert(!std::is_constructible_v<GenOff, StreamOff> && !std::is_constructible_v<StreamOff, GenOff> &&
+                  !std::is_constructible_v<GenOff, GenBytes> && !std::is_constructible_v<GenBytes, StreamOff> &&
+                  !std::is_constructible_v<GenOff, TextBytes> && !std::is_constructible_v<GenBytes, TextBytes> &&
+                  !std::is_constructible_v<TextBytes, GenOff> && !std::is_constructible_v<GenOff, TokPos> &&
+                  !std::is_constructible_v<GenOff, TokId> && !std::is_constructible_v<StreamOff, TokCount> &&
+                  !std::is_constructible_v<GenOff, KvBytes> && !std::is_constructible_v<GenBytes, TensorBytes>,
+              "not even explicitly: a parser's stream offset becomes a text offset only through a named conversion");
+static_assert(std::is_constructible_v<GenOff, size_t> && std::is_constructible_v<StreamOff, int> &&
+                  std::is_constructible_v<GenBytes, size_t> && !std::is_constructible_v<GenOff, double> &&
+                  !std::is_constructible_v<GenBytes, bool>,
+              "the explicit integer entry exists; a float or a bool is no offset");
+static_assert(l333_adds<GenOff, GenBytes> && l333_adds<StreamOff, GenBytes> && l333_adds<GenBytes, GenBytes> &&
+                  !l333_adds<GenOff, GenOff> && !l333_adds<GenOff, StreamOff> && !l333_adds<GenOff, size_t> &&
+                  !l333_adds<GenOff, TextBytes> && !l333_adds<StreamOff, TextBytes> && !l333_adds<GenBytes, TextBytes> &&
+                  !l333_adds<GenOff, TokCount> && !l333_adds<GenBytes, size_t> && !l333_adds<GenBytes, GenOff>,
+              "an offset moves by a GenBytes only: not by an offset, an integer, rendered-text bytes or a token count");
+/** Does `a - b` compile for these operand types? */
+template <class A, class B> concept l437_subtracts = requires(A a, B b) { a - b; };
+static_assert(l437_subtracts<GenOff, GenOff> && l437_subtracts<StreamOff, StreamOff> && l437_subtracts<GenOff, GenBytes> &&
+                  !l437_subtracts<GenOff, StreamOff> && !l437_subtracts<StreamOff, GenOff> &&
+                  !l437_subtracts<GenBytes, GenOff> && !l437_subtracts<GenOff, size_t> &&
+                  std::is_same_v<decltype(GenOff{} - GenOff{}), GenBytes> &&
+                  std::is_same_v<decltype(StreamOff{} - StreamOff{}), GenBytes> &&
+                  std::is_same_v<decltype(GenOff{} - GenBytes{}), GenOff> &&
+                  std::is_same_v<decltype(StreamOff{} + GenBytes{}), StreamOff>,
+              "a distance is taken within one text only, and is a length; an offset less a length is an offset");
+static_assert(l333_orders<GenOff, GenOff> && l333_orders<StreamOff, StreamOff> && !l333_orders<GenOff, StreamOff> &&
+                  !l333_orders<GenOff, size_t> && !l333_orders<GenOff, GenBytes> && !l333_orders<GenBytes, TextBytes> &&
+                  l333_equates<GenOff, GenOff> && !l333_equates<GenOff, StreamOff> && !l333_equates<StreamOff, size_t> &&
+                  !l333_equates<GenBytes, TextBytes>,
+              "offsets order and equate within their own text only");
+static_assert(l333_assigns<GenOff &, GenOff> && !l333_assigns<GenOff &, StreamOff> && !l333_assigns<GenOff &, size_t> &&
+                  !l333_assigns<StreamOff &, GenOff> && !l333_assigns<GenBytes &, GenOff> &&
+                  !l333_assigns<size_t &, GenOff> && !l333_assigns<GenBytes &, TextBytes>,
+              "assignment within the type only");
+static_assert(std::is_same_v<decltype(GenOff{}.raw()), size_t> && std::is_same_v<decltype(GenBytes{}.raw()), size_t> &&
+                  GenOff::none().raw() == SIZE_MAX && StreamOff::none().raw() == std::string::npos &&
+                  GenOff::none().is_none() && !GenOff{0}.is_none() && GenOff{SIZE_MAX} == GenOff::none() &&
+                  (GenOff{9} - GenOff{4}).raw() == 5 && (GenOff{9} + GenBytes{4}).raw() == 13 &&
+                  (StreamOff{9} - GenBytes{4}).raw() == 5 && GenOff::after(GenBytes{7}).raw() == 7 &&
+                  GenOff{7}.before().raw() == 7,
+              "constexpr, size_t's arithmetic; none() is the SIZE_MAX / npos the size_t fields carried");
+/* L437: the types are the size_t they replaced -- every operation computes what the raw expression did. */
+static void test_l437_offset_units(void) {
+    const size_t vals[] = {0, 1, 2, 7, 4096, 1u << 20, (size_t)1 << 40, SIZE_MAX / 2};
+    for (size_t a : vals) {
+        TEST_ASSERT(GenOff{a}.raw() == a && StreamOff{a}.raw() == a && GenBytes{a}.raw() == a);
+        TEST_ASSERT(GenOff::after(GenBytes{a}).raw() == a && GenOff{a}.before().raw() == a);
+        for (size_t b : vals) {
+            const GenOff x{a}, y{b};
+            TEST_ASSERT((x < y) == (a < b) && (x <= y) == (a <= b) && (x > y) == (a > b) && (x >= y) == (a >= b));
+            TEST_ASSERT((x == y) == (a == b) && (x != y) == (a != b));
+            if (a + b != SIZE_MAX) {   /* a sum that would be none() is fatal by design */
+                TEST_ASSERT((x + GenBytes{b}).raw() == a + b);
+                GenOff z = x;
+                z += GenBytes{b};
+                TEST_ASSERT(z.raw() == a + b);
+                z -= GenBytes{b};
+                TEST_ASSERT(z == x);
+                StreamOff st{a};
+                st += GenBytes{b};
+                TEST_ASSERT(st.raw() == a + b && (st - StreamOff{a}).raw() == b);
+            }
+            if (a >= b) TEST_ASSERT((x - y).raw() == a - b && (x - GenBytes{b}).raw() == a - b);
+            TEST_ASSERT((GenBytes{a} + GenBytes{b}).raw() == a + b && (GenBytes{a} < GenBytes{b}) == (a < b));
+        }
+    }
+    TEST_ASSERT(GenOff{}.raw() == 0 && StreamOff{}.raw() == 0 && GenBytes{}.raw() == 0);   /* value-initialised: zero */
+}
+
 /* L334 fix: what a state at live position G serves of the request across a token seam -- the conversion both the
  * bank's own resume (pulsar_session_bank_resume_at) and an adopt's rank (pulsar_session_bank_adopt_score) now read.
  * Before, each answered G itself: a live-side position counted as the request's tokens. */
@@ -21212,6 +21291,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l428_turn_ends_at_its_first_call();
     test_l430_round_walks_match_reference();
     test_l431_stop_scan_matches_reference();
+    test_l437_offset_units();
     test_l428_next_prompt_extends_the_cut_turn();
     test_l420_stop_inside_reasoning_answers_with_it();
     test_l420_other_endings_are_unchanged();

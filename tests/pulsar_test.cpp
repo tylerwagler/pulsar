@@ -4451,12 +4451,14 @@ static void test_kv_identity(void) {
 
 /* L430: the host-only group the check tier runs (make gen-host-gate): the generation path's host work that must not
  * change a decision -- a speculative round's look ahead against its reading before L430 on thousands of random turns
- * (server_tests.cpp), the per-position rule it implements against the plain lane's (L296), and (L431) the
- * stop-string scan against its reading before L431 on thousands of random streams. */
+ * (server_tests.cpp), the per-position rule it implements against the plain lane's (L296), (L431) the
+ * stop-string scan against its reading before L431 on thousands of random streams, and (L437) the output path's
+ * offset types: the conversions against their open-coded forms and a parser started mid-text. */
 static void test_gen_host(void) {
     test_spec_greedy_rows_per_position();
     test_l430_round_walks_match_reference();
     test_l431_stop_scan_matches_reference();
+    test_l437_offset_units();
 }
 
 /* L335: a bank carry's restore is all or nothing -- a live row that does not restore (here: a bank past the device
