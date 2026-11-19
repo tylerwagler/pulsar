@@ -68,10 +68,10 @@ int main(int argc, char **argv) {
     for (auto &o : L.offset) o = r.get<uint64_t>();
     const uint64_t rows_per_part = r.get<uint64_t>();
     const uint32_t n_parts = r.get<uint32_t>();
-    std::vector<uint64_t> bases(n_parts);
+    std::vector<FileOff> bases(n_parts);   /* each part's first row, in its file */
     std::vector<std::string> paths(n_parts);
     for (uint32_t i = 0; i < n_parts; i++) {
-        bases[i] = r.get<uint64_t>();
+        bases[i] = FileOff{r.get<uint64_t>()};
         const uint16_t n = r.get<uint16_t>();
         paths[i].assign((const char *)r.take(n), n);
     }

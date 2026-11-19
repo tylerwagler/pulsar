@@ -2875,11 +2875,12 @@ uint64_t pulsar_gpu_sample_scratch_bytes(uint32_t n_vocab) {
     return sample_sr_off(n_vocab) + sr_scratch_bytes(n_vocab);
 }
 
-int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offset_bytes, uint32_t row_stride,
+int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, TensorBytes logits_offset_bytes_b, uint32_t row_stride,
                            uint32_t n_vocab, uint32_t logits_rows, uint32_t n_rows, const pulsar_gpu_sample_req *reqs,
                            const pulsar_gpu_tensor *mask, uint32_t mask_words, const pulsar_gpu_tensor *id_map,
-                           pulsar_gpu_tensor *scratch, pulsar_gpu_tensor *out, uint64_t out_offset_bytes,
+                           pulsar_gpu_tensor *scratch, pulsar_gpu_tensor *out, TensorBytes out_offset_bytes_b,
                            pulsar_gpu_tensor *dist, uint32_t dist_cap) {
+    const uint64_t logits_offset_bytes = logits_offset_bytes_b.raw(), out_offset_bytes = out_offset_bytes_b.raw();   /* L438: the typed bytes end at the launch */
     if (!logits || !reqs || !scratch || !out || n_rows == 0 || n_rows > PULSAR_GPU_SAMPLE_ROWS_MAX || n_vocab == 0 ||
         row_stride < n_vocab || logits_offset_bytes > logits->bytes ||
         logits_rows == 0 ||
@@ -3031,11 +3032,12 @@ uint64_t pulsar_gpu_logprobs_scratch_bytes(uint32_t n_vocab) {
     return lp_tk_off(n_vocab) + LP_TK_BYTES;
 }
 
-int pulsar_gpu_logprobs_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offset_bytes, uint32_t row_stride,
+int pulsar_gpu_logprobs_rows(const pulsar_gpu_tensor *logits, TensorBytes logits_offset_bytes_b, uint32_t row_stride,
                              uint32_t n_vocab, uint32_t n_rows, const pulsar_gpu_tensor *mask, uint32_t mask_words,
-                             const uint32_t *mask_rows, const pulsar_gpu_tensor *tokens, uint64_t tokens_offset_bytes,
+                             const uint32_t *mask_rows, const pulsar_gpu_tensor *tokens, TensorBytes tokens_offset_bytes_b,
                              uint32_t token_stride, uint32_t top_k, pulsar_gpu_tensor *scratch,
                              pulsar_gpu_tensor *out) {
+    const uint64_t logits_offset_bytes = logits_offset_bytes_b.raw(), tokens_offset_bytes = tokens_offset_bytes_b.raw();   /* L438: the typed bytes end at the launch */
     if (!logits || !out || !scratch || scratch->bytes < pulsar_gpu_logprobs_scratch_bytes(n_vocab) || n_rows == 0 || n_rows > PULSAR_GPU_SAMPLE_ROWS_MAX || n_vocab == 0 || row_stride < n_vocab ||
         top_k > PULSAR_GPU_LOGPROB_TOPK_MAX || logits_offset_bytes > logits->bytes ||
         (uint64_t)(n_rows - 1u) * row_stride * sizeof(float) + (uint64_t)n_vocab * sizeof(float) >
@@ -3100,9 +3102,10 @@ int pulsar_gpu_logprobs_rows(const pulsar_gpu_tensor *logits, uint64_t logits_of
     return 1;
 }
 
-int pulsar_gpu_spec_walk(const pulsar_gpu_tensor *rows, uint64_t rows_offset_bytes, uint32_t n_rows,
+int pulsar_gpu_spec_walk(const pulsar_gpu_tensor *rows, TensorBytes rows_offset_bytes_b, uint32_t n_rows,
                          const pulsar_gpu_spec_run *runs, uint32_t n_runs, pulsar_gpu_tensor *out,
-                         uint64_t out_offset_bytes) {
+                         TensorBytes out_offset_bytes_b) {
+    const uint64_t rows_offset_bytes = rows_offset_bytes_b.raw(), out_offset_bytes = out_offset_bytes_b.raw();   /* L438: the typed bytes end at the launch */
     bool ok = rows && runs && out && n_runs > 0 && n_runs <= PULSAR_GPU_SAMPLE_ROWS_MAX &&
               rows_offset_bytes + (uint64_t)n_rows * sizeof(row_out_t) <= rows->bytes &&
               out_offset_bytes + (uint64_t)n_runs * sizeof(pulsar_gpu_spec_walk_out) <= out->bytes;
@@ -3148,8 +3151,9 @@ __global__ static void __launch_bounds__(256) rows_digest_kernel(const uint64_t 
     }
 }
 
-int pulsar_gpu_rows_digest(const pulsar_gpu_tensor *rows, uint64_t offset_bytes, uint32_t n_rows, uint32_t width,
-                           pulsar_gpu_tensor *out, uint64_t out_offset_bytes) {
+int pulsar_gpu_rows_digest(const pulsar_gpu_tensor *rows, TensorBytes offset_bytes_b, uint32_t n_rows, uint32_t width,
+                           pulsar_gpu_tensor *out, TensorBytes out_offset_bytes_b) {
+    const uint64_t offset_bytes = offset_bytes_b.raw(), out_offset_bytes = out_offset_bytes_b.raw();   /* L438: the typed bytes end at the launch */
     const uint64_t bytes = (uint64_t)n_rows * width * sizeof(float);
     if (!rows || !out || (offset_bytes & 7u) || (bytes & 7u) || offset_bytes + bytes > rows->bytes ||
         out_offset_bytes + 8u > out->bytes || (out_offset_bytes & 7u)) {
@@ -3161,10 +3165,11 @@ int pulsar_gpu_rows_digest(const pulsar_gpu_tensor *rows, uint64_t offset_bytes,
     return cuda_ok(cudaGetLastError(), "rows digest");
 }
 
-int pulsar_gpu_sample_chains(const pulsar_gpu_tensor *cand, uint64_t cand_offset_bytes, const pulsar_gpu_tensor *scores,
-                             uint64_t scores_offset_bytes, uint32_t slots, uint32_t topk, uint32_t vocab,
+int pulsar_gpu_sample_chains(const pulsar_gpu_tensor *cand, TensorBytes cand_offset_bytes_b, const pulsar_gpu_tensor *scores,
+                             TensorBytes scores_offset_bytes_b, uint32_t slots, uint32_t topk, uint32_t vocab,
                              const pulsar_gpu_chain_req *reqs, uint32_t n_chains, pulsar_gpu_tensor *out,
-                             uint64_t out_offset_bytes) {
+                             TensorBytes out_offset_bytes_b) {
+    const uint64_t cand_offset_bytes = cand_offset_bytes_b.raw(), scores_offset_bytes = scores_offset_bytes_b.raw(), out_offset_bytes = out_offset_bytes_b.raw();   /* L438: the typed bytes end at the launch */
     bool ok = cand && scores && reqs && out && n_chains > 0 && n_chains <= PULSAR_GPU_CHAINS_MAX && slots > 0 &&
               slots <= PULSAR_GPU_CHAIN_SLOTS_MAX && topk > 0 && topk <= PULSAR_GPU_CHAIN_TOPK_MAX && vocab > 0 &&
               out_offset_bytes <= out->bytes && out->bytes - out_offset_bytes >= (uint64_t)n_chains * slots * 4u &&

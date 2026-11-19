@@ -376,12 +376,13 @@ int pulsar_gpu_csa2_comp_ape_add_tensor(
         pulsar_gpu_tensor *sc,
         const void        *model_map,
         uint64_t           model_size,
-        uint64_t           ape_offset,
+        MapOff             ape_offset_m,
         uint32_t           ape_type,
         uint32_t           width,
         uint32_t           ratio,
         uint32_t           pos0,
         uint32_t           n_tokens) {
+    const uint64_t ape_offset = ape_offset_m.raw();   /* L438: MapOff ends at the launch */
     /* The ape is a model-mapped table, not a device tensor: every other mapped
      * weight on this path (the norm, the matmul operands) reaches the kernels as
      * (map, size, offset, type) through cuda_model_range_ptr, and an ape that
@@ -421,13 +422,14 @@ int pulsar_gpu_csa2_compressor_prefill_tensor(
         pulsar_gpu_tensor       *state_score,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                norm_offset,
+        MapOff                  norm_offset_m,
         uint32_t                norm_type,
         uint32_t                head_dim,
         uint32_t                ratio,
         uint32_t                pos0,
         uint32_t                n_tokens,
         float                   rms_eps) {
+    const uint64_t norm_offset = norm_offset_m.raw();   /* L438: MapOff ends at the launch */
     const void *norm_w = NULL;
     const char *why = NULL;
     if (!latent)      why = "no staging buffer for the latent";
@@ -537,13 +539,14 @@ int pulsar_gpu_csa2_compressor_update_tensor(
         pulsar_gpu_tensor       *state_score,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                norm_offset,
+        MapOff                  norm_offset_m,
         uint32_t                norm_type,
         uint32_t                head_dim,
         uint32_t                ratio,
         uint32_t                pos,
         float                   rms_eps,
         int                    *emitted) {
+    const uint64_t norm_offset = norm_offset_m.raw();   /* L438: MapOff ends at the launch */
     const void *norm_w = NULL;
     if (emitted) *emitted = 0;
     const char *why = NULL;

@@ -264,9 +264,9 @@ static dev_out route(const router_case &rc, const std::vector<float> &lg, const 
                           *tt = pulsar_gpu_tensor_alloc(bytes_of<int32_t>(T));
         pulsar_gpu_tensor_write(tl, TensorBytes{0}, lg.data(), bytes_of<float>((uint64_t)T * E));
         pulsar_gpu_tensor_write(tt, TensorBytes{0}, tok.data(), bytes_of<int32_t>(T));
-        const int ok = pulsar_gpu_router_select_batch_tensor(ts, tw, tp, g_map.data(), g_map.size(), ob, !l.bias.empty(),
-                                                             oh, l.table.empty() ? 0 : (uint32_t)l.table_rows, tl, tt,
-                                                             (uint32_t)E, (uint32_t)K, c.route_scale, (uint32_t)T, ovl,
+        const int ok = pulsar_gpu_router_select_batch_tensor(ts, tw, tp, g_map.data(), g_map.size(), MapOff{ob}, !l.bias.empty(),
+                                                             MapOff{oh}, l.table.empty() ? 0 : (uint32_t)l.table_rows, tl, tt,
+                                                             (uint32_t)E, (uint32_t)K, c.route_scale, (uint32_t)T, MapOff{ovl},
                                                              kVocab, !l.alt_bias.empty());
         o.rc = ok ? 0 : -1;
         o.sel.resize((size_t)T * K); o.w.resize((size_t)T * K); o.probs.resize((size_t)T * E);

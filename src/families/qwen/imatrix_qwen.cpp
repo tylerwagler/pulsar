@@ -83,8 +83,8 @@ static float bf16_f32(uint16_t b) {
 /// @param[out] host destination
 /// @param bytes length
 /// @return false on a failed read
-static bool tap_read(pulsar_imatrix_tap *t, const void *dev, void *host, uint64_t bytes) {
-    if (pulsar_gpu_device_read(dev, host, TensorBytes{bytes})) return true;
+static bool tap_read(pulsar_imatrix_tap *t, const void *dev, void *host, TensorBytes bytes) {
+    if (pulsar_gpu_device_read(dev, host, bytes)) return true;
     t->failed = true;
     return false;
 }
@@ -105,7 +105,7 @@ static void add_row_sq(imatrix_acc *a, uint32_t expert, const uint16_t *row) {
 void pulsar_imatrix_note_dense(pulsar_imatrix_tap *tap, const pulsar_tensor *w, const uint16_t *x_dev, uint32_t rows,
                                uint32_t cols) {
     tap->row_buf.resize((size_t)rows * cols);
-    if (!tap_read(tap, x_dev, tap->row_buf.data(), (uint64_t)rows * cols * sizeof(uint16_t))) return;
+    if (!tap_read(tap, x_dev, tap->row_buf.data(), bytes_of<uint16_t>((uint64_t)rows * cols))) return;
     imatrix_acc *a = tap_acc(tap, w, 1, cols);
     for (uint32_t r = 0; r < rows; r++) add_row_sq(a, 0, tap->row_buf.data() + (size_t)r * cols);
 }
@@ -115,8 +115,8 @@ void pulsar_imatrix_note_routed_in(pulsar_imatrix_tap *tap, const pulsar_tensor 
                                    uint32_t n_expert, uint32_t cols) {
     tap->row_buf.resize((size_t)rows * cols);
     tap->sel_buf.resize((size_t)rows * k);
-    if (!tap_read(tap, x_dev, tap->row_buf.data(), (uint64_t)rows * cols * sizeof(uint16_t)) ||
-        !tap_read(tap, sel_dev, tap->sel_buf.data(), (uint64_t)rows * k * sizeof(int32_t)))
+    if (!tap_read(tap, x_dev, tap->row_buf.data(), bytes_of<uint16_t>((uint64_t)rows * cols)) ||
+        !tap_read(tap, sel_dev, tap->sel_buf.data(), bytes_of<int32_t>((uint64_t)rows * k)))
         return;
     imatrix_acc *a[2] = {tap_acc(tap, gate, n_expert, cols), up ? tap_acc(tap, up, n_expert, cols) : NULL};
     for (uint32_t r = 0; r < rows; r++)
@@ -138,8 +138,8 @@ void pulsar_imatrix_note_routed_mid(pulsar_imatrix_tap *tap, const pulsar_tensor
     }
     tap->row_buf.resize((size_t)rows * k * mid);
     tap->sel_buf.resize((size_t)rows * k);
-    if (!tap_read(tap, mid_dev, tap->row_buf.data(), (uint64_t)rows * k * mid * sizeof(uint16_t)) ||
-        !tap_read(tap, sel_dev, tap->sel_buf.data(), (uint64_t)rows * k * sizeof(int32_t)))
+    if (!tap_read(tap, mid_dev, tap->row_buf.data(), bytes_of<uint16_t>((uint64_t)rows * k * mid)) ||
+        !tap_read(tap, sel_dev, tap->sel_buf.data(), bytes_of<int32_t>((uint64_t)rows * k)))
         return;
     imatrix_acc *a = tap_acc(tap, down, n_expert, mid);
     for (uint32_t p = 0; p < rows * k; p++) {

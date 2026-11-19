@@ -195,7 +195,7 @@ enum vbuf { V_PATCH, V_RES, V_XN, V_QKV, V_ATT, V_MLP, V_STAGE, V_LWS, V_COUNT }
  *  front door's workspace. */
 struct pulsar_nemotron_h_vision_run {
     pulsar_gpu_tensor *t[V_COUNT];   ///< the buffers, indexed by vbuf
-    uint64_t bytes[V_COUNT];         ///< their sizes in bytes
+    TensorBytes bytes[V_COUNT];      ///< their sizes in bytes
     uint32_t n_max;   ///< prefix + the largest tile's patches
 };
 
@@ -229,23 +229,23 @@ bool pulsar_nemotron_h_vision_run_create(const pulsar_model *m, pulsar_nemotron_
             if (b > lws) lws = b;
         }
     }
-    r->bytes[V_PATCH] = (uint64_t)s.max_patches * P * 2u;
-    r->bytes[V_RES] = n * D * 4u;
-    r->bytes[V_XN] = n * D * 2u;            /* also the final LayerNorm's rows: [n_llm][S] */
-    r->bytes[V_QKV] = n * 3u * D * 2u;      /* also the LLM rows: [n_llm][4096] */
-    r->bytes[V_ATT] = n * D * 2u;           /* also the projector's RMSNorm rows: [n_llm][S] */
-    r->bytes[V_MLP] = (uint64_t)PROJ_CHUNK * s.proj_hidden * 2u;
-    r->bytes[V_STAGE] = (uint64_t)PROJ_CHUNK * s.proj_hidden * 4u;
-    r->bytes[V_LWS] = lws ? lws : 16u;
+    r->bytes[V_PATCH] = elt_bytes((uint64_t)s.max_patches * P, 2u);
+    r->bytes[V_RES] = elt_bytes(n * D, 4u);
+    r->bytes[V_XN] = elt_bytes(n * D, 2u);            /* also the final LayerNorm's rows: [n_llm][S] */
+    r->bytes[V_QKV] = elt_bytes(n * 3u * D, 2u);      /* also the LLM rows: [n_llm][4096] */
+    r->bytes[V_ATT] = elt_bytes(n * D, 2u);           /* also the projector's RMSNorm rows: [n_llm][S] */
+    r->bytes[V_MLP] = elt_bytes((uint64_t)PROJ_CHUNK * s.proj_hidden, 2u);
+    r->bytes[V_STAGE] = elt_bytes((uint64_t)PROJ_CHUNK * s.proj_hidden, 4u);
+    r->bytes[V_LWS] = TensorBytes{lws ? lws : 16u};   /* the launchers' sizing, raw at their boundary */
     static_assert(CHUNK * 5120u <= PROJ_CHUNK * 20480u, "the tower's stage fits the projector's");
     if ((uint64_t)CHUNK * s.mlp > (uint64_t)PROJ_CHUNK * s.proj_hidden ||
         (uint64_t)(s.max_patches / 4u) * LLM_WIDTH > n * 3u * D) {
         fprintf(stderr, "pulsar: " NHV "the scratch plan does not cover the profile -- refusing\n");
         return false;
     }
-    uint64_t total = 0;
+    TensorBytes total{};
     for (int b = 0; b < V_COUNT; b++) {
-        r->t[b] = pulsar_gpu_tensor_alloc(TensorBytes{r->bytes[b]});
+        r->t[b] = pulsar_gpu_tensor_alloc(r->bytes[b]);
         if (!r->t[b]) {
             fprintf(stderr, "pulsar: " NHV "the tower's scratch did not fit the device -- refusing\n");
             return false;
@@ -254,7 +254,7 @@ bool pulsar_nemotron_h_vision_run_create(const pulsar_model *m, pulsar_nemotron_
     }
     fprintf(stderr, "pulsar: " NHV "C-RADIO ViT-H/16 (%u blocks of %u, bf16 rows, the shared ViT encoder + bf16 FMHA) "
                     "+ vision_final_layernorm + pixel shuffle + mlp1 -> %u; scratch %.0f MiB for %u rows\n",
-            s.depth, s.width, LLM_WIDTH, (double)total / 1048576.0, r->n_max);
+            s.depth, s.width, LLM_WIDTH, (double)total.raw() / 1048576.0, r->n_max);
     return true;
 }
 
@@ -289,7 +289,7 @@ bool lin(const pulsar_model *m, const pulsar_nemotron_h_vision_run *r, const pul
          const uint16_t *x, uint32_t rows, const char *what) {
     pulsar_rows_linear l;
     return pulsar_linear_rows_ref(m, t, in, out, true, what, &l) &&
-           pulsar_rows_linear_launch(&l, x, (int)rows, dp<float>(r->t[V_STAGE]), dp(r->t[V_LWS]), r->bytes[V_LWS], 0) ==
+           pulsar_rows_linear_launch(&l, x, (int)rows, dp<float>(r->t[V_STAGE]), dp(r->t[V_LWS]), r->bytes[V_LWS].raw(), 0) ==
                0;
 }
 
@@ -336,7 +336,7 @@ bool pulsar_nemotron_h_vision_encode(const pulsar_model *m, const pulsar_nemotro
             return vfail(err, errlen, "the patch embedding refused");
     }
     const pulsar_vit_dims dims = {D, s.heads, s.head_dim, s.mlp, s.depth, s.eps};
-    const pulsar_vit_bufs bufs = {res, xn, qkv, att, mlp, stage, dp(r->t[V_LWS]), r->bytes[V_LWS], CHUNK};
+    const pulsar_vit_bufs bufs = {res, xn, qkv, att, mlp, stage, dp(r->t[V_LWS]), r->bytes[V_LWS].raw(), CHUNK};
     if (!pulsar_vit_encode(m, dims, {v->vit.data(), dims.depth}, PULSAR_ROWS_OUT_BF16, bufs, N, NULL, err, errlen)) return false;
     if (dbg) {   /* the tower's residual, the patches back in raster order */
         std::vector<float> all((size_t)N * D);

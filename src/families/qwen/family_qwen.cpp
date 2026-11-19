@@ -1166,25 +1166,25 @@ void qwen_state_plan(pulsar_engine *e) {
     pulsar_state_decl d[PULSAR_QWEN_STATE_COUNT] = {};
     d[PULSAR_QWEN_STATE_GDN_REC] = {"gdn_state", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_DELTA, false, false, 0,
                                     pulsar_qwen_gdn_state_bytes(s),
-                                    pulsar_gdn_upd_floats((int)pulsar_qwen_tp(s)) * sizeof(float), 0, qwen_gdn_commit,
+                                    bytes_of<float>(pulsar_gdn_upd_floats((int)pulsar_qwen_tp(s))), SlabOff{}, qwen_gdn_commit,
                                     NULL, NULL};
     d[PULSAR_QWEN_STATE_GDN_CONV] = {"gdn_conv", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_SNAPSHOT, false, false, 0,
-                                     pulsar_qwen_gdn_conv_bytes(s), 0, 0, NULL, NULL, NULL};
+                                     pulsar_qwen_gdn_conv_bytes(s), TensorBytes{}, SlabOff{}, NULL, NULL, NULL};
     d[PULSAR_QWEN_STATE_KV] = {"kv", PULSAR_STATE_POOL, PULSAR_STATE_CAPTURE_NONE, false, false, 1u,
-                               pulsar_qwen_kv_row_bytes(s), 0, 0, NULL, NULL, NULL};
+                               pulsar_qwen_kv_row_bytes(s), TensorBytes{}, SlabOff{}, NULL, NULL, NULL};
     d[PULSAR_QWEN_STATE_IDX_KEYS] = {"idx_keys", PULSAR_STATE_POOL, PULSAR_STATE_CAPTURE_NONE, false, false,
-                                     s->idx_block, pulsar_qwen_index_row_bytes(s), 0, 0, NULL, NULL, NULL};
+                                     s->idx_block, pulsar_qwen_index_row_bytes(s), TensorBytes{}, SlabOff{}, NULL, NULL, NULL};
     d[PULSAR_QWEN_STATE_IDX_TAIL] = {"idx_tail", PULSAR_STATE_STAGED, PULSAR_STATE_CAPTURE_STAGE, false, false,
-                                     s->idx_block, pulsar_qwen_index_tail_bytes(s) / s->idx_block,
-                                     (uint64_t)PULSAR_QSA_IDX_IN * sizeof(float),
-                                     (uint64_t)PULSAR_QSA_IDX_HEADS * PULSAR_QSA_IDX_DIM * sizeof(float), NULL, NULL,
-                                     NULL};
+                                     s->idx_block, TensorBytes{pulsar_qwen_index_tail_bytes(s).raw() / s->idx_block},   /* one of the block's rows */
+                                     bytes_of<float>(PULSAR_QSA_IDX_IN),
+                                     SlabOff::after(bytes_of<float>((uint64_t)PULSAR_QSA_IDX_HEADS * PULSAR_QSA_IDX_DIM)), NULL,
+                                     NULL, NULL};
     d[PULSAR_QWEN_STATE_PLE_CONV] = {"ple_conv", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_SNAPSHOT, false, false, 0,
-                                     pulsar_qwen_ple_conv_bytes(s), 0, 0, NULL, NULL, NULL};
+                                     pulsar_qwen_ple_conv_bytes(s), TensorBytes{}, SlabOff{}, NULL, NULL, NULL};
     d[PULSAR_QWEN_STATE_MTP_PEND] = {"mtp_pend", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_NONE, false, false, 0,
-                                     pulsar_qwen_hc_dim(s) * PULSAR_QWEN_STREAM_ELT_SIZE, 0, 0, NULL, NULL, NULL};
+                                     elt_bytes(pulsar_qwen_hc_dim(s), PULSAR_QWEN_STREAM_ELT_SIZE), TensorBytes{}, SlabOff{}, NULL, NULL, NULL};
     d[PULSAR_QWEN_STATE_NGRAM] = {"ngram_ctx", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_REPLAY, true, false, 0,
-                                  (uint64_t)(s->ngram_size - 1u) * sizeof(int32_t), 0, 0, NULL, qwen_ngram_replay,
+                                  bytes_of<int32_t>((uint64_t)(s->ngram_size - 1u)), TensorBytes{}, SlabOff{}, NULL, qwen_ngram_replay,
                                   qwen_ngram_init};
     for (uint32_t id = 0; id < PULSAR_QWEN_STATE_COUNT; id++) (void)pulsar_state_plan_add(p, d[id]);
     const uint32_t gdn = 1u << PULSAR_QWEN_STATE_GDN_REC | 1u << PULSAR_QWEN_STATE_GDN_CONV;
@@ -1248,10 +1248,10 @@ static pulsar_driver_state *qwen_create(pulsar_session *s, uint32_t n_banks) {
         const TensorBytes hc = elt_bytes(pulsar_qwen_hc_dim(sh), PULSAR_QWEN_STREAM_ELT_SIZE);
         st->mtp_streams = pulsar_gpu_tensor_alloc(hc.times(rows));
         st->mtp_tok     = pulsar_gpu_tensor_alloc(bytes_of<int32_t>(rows));
-        st->mtp_ws      = pulsar_gpu_tensor_alloc(TensorBytes{pulsar_qwen_s4_mtp_combine_ws_bytes()});
-        st->mtp_top     = pulsar_gpu_tensor_alloc(TensorBytes{pulsar_qwen_s4_draft_top_ws_bytes()});
+        st->mtp_ws      = pulsar_gpu_tensor_alloc(pulsar_qwen_s4_mtp_combine_ws_bytes());
+        st->mtp_top     = pulsar_gpu_tensor_alloc(pulsar_qwen_s4_draft_top_ws_bytes());
         /* per bank */
-        st->mtp_stage   = pulsar_gpu_tensor_alloc(TensorBytes{pulsar_qwen_index_tail_bytes(sh)}.times(nb));
+        st->mtp_stage   = pulsar_gpu_tensor_alloc(pulsar_qwen_index_tail_bytes(sh).times(nb));
         ok = st->mtp_streams && st->mtp_tok && st->mtp_ws && st->mtp_top && st->mtp_stage;
         st->mtp_pctx = (int32_t *)xcalloc(2u * n_banks, sizeof(int32_t));
     }
@@ -1370,7 +1370,7 @@ static bool qwen_step_end(const pulsar_driver_step *st, bool ok) { return pulsar
 /// @param max_rows the most rows a step carries
 /// @param ctx the session's context, in tokens
 /// @return bytes
-static uint64_t qwen_scratch_bytes(uint32_t arena, uint32_t max_rows, uint32_t ctx) {
+static TensorBytes qwen_scratch_bytes(uint32_t arena, uint32_t max_rows, uint32_t ctx) {
     return pulsar_qwen_s4_scratch_bytes((pulsar_qwen_op_id)arena, &g_qwen_shape, max_rows, ctx);
 }
 /// pulsar_driver_ops::artifact.
@@ -1550,8 +1550,8 @@ static bool qwen_mtp_forward(pulsar_session *s, pulsar_step_mode mode, const pul
 /// @return 1 with the MTP layer loaded, else 0
 static uint32_t qwen_mtp_modules(const pulsar_engine *e) { return pulsar_qwen_of(e)->weights->mtp.present ? 1u : 0u; }
 /// @return bytes of one conditioning row: n_hc x n_embd bf16
-static uint64_t qwen_mtp_cond_bytes(const pulsar_engine *) {
-    return pulsar_qwen_hc_dim(&g_qwen_shape) * PULSAR_QWEN_STREAM_ELT_SIZE;
+static TensorBytes qwen_mtp_cond_bytes(const pulsar_engine *) {
+    return elt_bytes(pulsar_qwen_hc_dim(&g_qwen_shape), PULSAR_QWEN_STREAM_ELT_SIZE);
 }
 /// @param e the engine
 /// @return logits per MTP row (n_draft)
@@ -1564,9 +1564,9 @@ static uint32_t qwen_mtp_head_width(const pulsar_engine *e) { return pulsar_qwen
 /// @param dst destination tensor
 /// @param off byte offset in dst
 /// @return false on a failed copy
-static bool qwen_mtp_trunk_rows(pulsar_session *s, uint32_t row0, uint32_t n, pulsar_gpu_tensor *dst, uint64_t off) {
-    const TensorBytes hc = TensorBytes{qwen_mtp_cond_bytes(s->engine)};
-    return pulsar_gpu_tensor_copy_async(dst, TensorBytes{off}, qwen_st(s)->streams, hc.times(row0), hc.times(n)) != 0;
+static bool qwen_mtp_trunk_rows(pulsar_session *s, uint32_t row0, uint32_t n, pulsar_gpu_tensor *dst, TensorBytes off) {
+    const TensorBytes hc = qwen_mtp_cond_bytes(s->engine);
+    return pulsar_gpu_tensor_copy_async(dst, off, qwen_st(s)->streams, hc.times(row0), hc.times(n)) != 0;
 }
 
 /// pulsar_mtp_ops::out_rows.
@@ -1606,7 +1606,7 @@ static const pulsar_gpu_tensor *qwen_mtp_q_rows(pulsar_session *s, const pulsar_
 /// @param bank the bank
 /// @return false on a failed copy
 static bool qwen_mtp_stage_save(pulsar_session *s, uint32_t bank) {
-    const TensorBytes itb = TensorBytes{pulsar_qwen_index_tail_bytes(&g_qwen_shape)};
+    const TensorBytes itb = pulsar_qwen_index_tail_bytes(&g_qwen_shape);
     return pulsar_gpu_tensor_copy_async(qwen_st(s)->mtp_stage, itb.times(bank),
                                         pulsar_state_tensor(s->states, pulsar_qwen_mtp_slot(&s->engine->plan),
                                                             PULSAR_QWEN_STATE_IDX_TAIL),
@@ -1617,7 +1617,7 @@ static bool qwen_mtp_stage_save(pulsar_session *s, uint32_t bank) {
 /// @param bank the bank
 /// @return false on a failed copy
 static bool qwen_mtp_stage_restore(pulsar_session *s, uint32_t bank) {
-    const TensorBytes itb = TensorBytes{pulsar_qwen_index_tail_bytes(&g_qwen_shape)};
+    const TensorBytes itb = pulsar_qwen_index_tail_bytes(&g_qwen_shape);
     return pulsar_gpu_tensor_copy_async(pulsar_state_tensor(s->states, pulsar_qwen_mtp_slot(&s->engine->plan),
                                                             PULSAR_QWEN_STATE_IDX_TAIL),
                                         itb.times(bank), qwen_st(s)->mtp_stage, itb.times(bank), itb) != 0;

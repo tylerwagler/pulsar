@@ -316,7 +316,7 @@ static bool run_built(pulsar_tp_plan *p, const pulsar_tp_slice *s, const char *h
 static bool run_slice(pulsar_engine *e, pulsar_tp_plan *p, const pulsar_tp_slice *s, pulsar_tp_op op, uint64_t *bytes) {
     const pulsar_model *m = s->m;
     const pulsar_tensor *t = s->t;
-    const unsigned long long off = (unsigned long long)t->abs_offset, lo = s->lo[0], hi = s->hi[0];
+    const unsigned long long off = (unsigned long long)t->abs_offset.raw(), lo = s->lo[0], hi = s->hi[0];   /* printed */
     char nm[256];
     tname(t, nm, sizeof(nm));
     switch (op) {
@@ -372,14 +372,15 @@ static bool run_slice(pulsar_engine *e, pulsar_tp_plan *p, const pulsar_tp_slice
         *bytes += (uint64_t)n_exp * hs;
         if (g_tp_record) {
             fprintf(g_tp_record, "mxfp4_half %s off %llu key %llu experts %u k %llu n %llu %s [%llu,%llu) src %llu/%llu "
-                                 "dst %llu/%llu\n", nm, off, (unsigned long long)pulsar_tp_expert_half_offset(m, t), n_exp,
+                                 "dst %llu/%llu\n", nm, off, (unsigned long long)pulsar_tp_expert_half_offset(m, t).raw(), n_exp,
                     (unsigned long long)k, (unsigned long long)n, k_half ? "kcols" : "rows", lo, hi,
                     (unsigned long long)ss, (unsigned long long)sd, (unsigned long long)hs, (unsigned long long)hd);
             return true;
         }
         return pulsar_gpu_register_mxfp4_expert_half(e, pulsar_tp_expert_half_offset(m, t), tensor_map_base(m, t),
-                                                     t->abs_offset, n_exp, k, n, k_half ? 1 : 0, lo, hi, ss, sd, hs,
-                                                     hd) != 0;
+                                                     t->abs_offset, n_exp, k, n, k_half ? 1 : 0, lo, hi,
+                                                     /* the byte model's (cutlass_mxfp4_expert_layout, raw) */
+                                                     TensorBytes{ss}, TensorBytes{sd}, TensorBytes{hs}, TensorBytes{hd}) != 0;
     }
     case PULSAR_TP_OP_EXL3_HALF: {
         /* a stack [k][n] x experts: OUT halves the n output columns (gate / up), IN the k input rows (down); the
@@ -397,7 +398,7 @@ static bool run_slice(pulsar_engine *e, pulsar_tp_plan *p, const pulsar_tp_slice
         *bytes += (uint64_t)n_exp * c.dst_stride;
         if (g_tp_record) {
             fprintf(g_tp_record, "exl3_half %s off %llu key %llu experts %u k %llu n %llu %s [%llu,%llu) k2 %d src "
-                                 "%llu/%llu dst %llu/%llu\n", nm, off, (unsigned long long)pulsar_tp_expert_half_offset(m, t),
+                                 "%llu/%llu dst %llu/%llu\n", nm, off, (unsigned long long)pulsar_tp_expert_half_offset(m, t).raw(),
                     n_exp, (unsigned long long)k, (unsigned long long)n, k_half ? "kcols" : "rows", lo, hi, k2,
                     (unsigned long long)c.src_stride, (unsigned long long)c.src_trellis,
                     (unsigned long long)c.dst_stride, (unsigned long long)c.dst_trellis);
@@ -414,7 +415,7 @@ static bool run_slice(pulsar_engine *e, pulsar_tp_plan *p, const pulsar_tp_slice
                     (unsigned long long)n);
             return true;
         }
-        return pulsar_gpu_weight_range_ptr(tensor_map_base(m, t), t->abs_offset + rel, n, "TP expert range") != NULL;
+        return pulsar_gpu_weight_range_ptr(tensor_map_base(m, t), t->abs_offset.raw() + rel, n, "TP expert range") != NULL;
     }
     case PULSAR_TP_OP_NONE: break;
     }

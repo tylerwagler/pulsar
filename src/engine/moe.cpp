@@ -79,7 +79,7 @@ bool pulsar_moe_routed_slot(const pulsar_moe_slot_call *c) {
     uint64_t mid = D->dim[0];
     const void *map = tensor_map_base(c->m, G);
     uint64_t size = tensor_map_size(c->m, G);
-    uint64_t gate_off = G->abs_offset, up_off = U->abs_offset, down_off = D->abs_offset;
+    MapOff gate_off = G->abs_offset, up_off = U->abs_offset, down_off = D->abs_offset;
     uint32_t split = 0;
     /* the rank's plan halved the stacks (expert tensor-parallel): every expert at the half intermediate width,
      * from the compact half stacks built at open, resolved under the engine key -- a partial the FFN exchange sums.
@@ -110,8 +110,10 @@ bool pulsar_moe_routed_slot(const pulsar_moe_slot_call *c) {
         return false;
     }
     return pulsar_gpu_routed_moe_batch_tensor(c->out, c->up_out, c->mid_out, c->experts_out, map, size, gate_off,
-                                              up_off, down_off, G->type, D->type, gate_expert, gate_row, down_expert,
-                                              down_row, (uint32_t)in, (uint32_t)mid, (uint32_t)out, c->selected,
+                                              up_off, down_off, G->type, D->type,
+                                              /* the byte model (routed_expert_side_layout) is raw: its sizes enter here */
+                                              TensorBytes{gate_expert}, TensorBytes{gate_row}, TensorBytes{down_expert},
+                                              TensorBytes{down_row}, (uint32_t)in, (uint32_t)mid, (uint32_t)out, c->selected,
                                               c->weights, c->n_expert_present, c->n_expert_used, c->clamp, c->x,
                                               c->layer, c->n_tokens, split) != 0;
 }
@@ -239,7 +241,7 @@ bool pulsar_moe_routed_rows(const pulsar_moe_rows_call *c) {
                     t->name.ptr, (unsigned long long)n_expert, tensor_type_name(t->type));
             return NULL;
         }
-        const void *p = pulsar_gpu_weight_range_ptr(tensor_map_base(c->m, t), t->abs_offset + lo * *stride,
+        const void *p = pulsar_gpu_weight_range_ptr(tensor_map_base(c->m, t), t->abs_offset.raw() + lo * *stride,
                                                     (hi - lo) * *stride, what);
         if (!p)
             fprintf(stderr, "pulsar: routed MoE: no device copy of experts [%llu, %llu) of %.*s -- refusing\n",

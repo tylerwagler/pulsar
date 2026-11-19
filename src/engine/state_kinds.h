@@ -97,9 +97,9 @@ typedef struct pulsar_state_decl {
     bool host;                     ///< FIXED, session-wide only: host memory (n-gram context)
     bool whole_rows;               ///< POOL: a row is written once its last token lands (kv_state.h pulsar_kv_pool)
     uint32_t tokens;               ///< POOL: tokens a row; STAGED: rows of the open block; RING: the window W
-    uint64_t bytes;                ///< POOL: a row; RING: a slot; FIXED: one bank's state; STAGED: one block row
-    uint64_t capture_bytes;        ///< DELTA: one row's update; STAGE: one row's input record
-    uint64_t capture_off;          ///< STAGE: where the block row sits in the record
+    TensorBytes bytes;             ///< POOL: a row; RING: a slot; FIXED: one bank's state; STAGED: one block row
+    TensorBytes capture_bytes;     ///< DELTA: one row's update; STAGE: one row's input record
+    SlabOff capture_off;           ///< STAGE: where the block row sits in the record
     /** DELTA: apply rows [0, keep) of `rows` (device, capture_bytes a row) to bank `bank` of `state` (device, the
      *  decl's whole tensor), on the session stream.  false = refused (said). */
     bool (*commit)(void *state, BankId bank, const void *rows, uint32_t keep);
@@ -147,7 +147,7 @@ typedef struct pulsar_state_plan {
 /** Bytes one bank of a non-POOL decl takes (FIXED: bytes; STAGED: the block; RING: W - 1 + the verify width slots). */
 /// @param d the decl (not POOL)
 /// @return bytes of one bank's state for `d`
-uint64_t pulsar_state_decl_bank_bytes(const pulsar_state_decl *d);
+TensorBytes pulsar_state_decl_bank_bytes(const pulsar_state_decl *d);
 /** Declare decl `id` (returns it): the table's next entry.  A full table counts the decl in n_overflow instead, and
  *  the create refuses the plan by name. */
 /// @param p the plan being built
@@ -308,7 +308,7 @@ static inline pulsar_gpu_tensor *pulsar_state_pool(const pulsar_state_set *ss, L
 /// @param bank the bank
 /// @return a pointer to the bank's decl[id].bytes host bytes (the set's)
 static inline void *pulsar_state_host(const pulsar_state_set *ss, uint32_t id, BankId bank) {
-    return ss->host[id] + (size_t)pulsar_bank_index(bank) * ss->plan->decl[id].bytes;
+    return ss->host[id] + ss->plan->decl[id].bytes.times(pulsar_bank_index(bank)).raw();
 }
 /** The verify capture's rows of decl `id` on slot `slot` (device; step row r at + r * the row's bytes): where a
  *  verify's op writes them -- as a pointer, or as its tensor and the byte offset into it (a copy's destination). */
@@ -324,7 +324,7 @@ void *pulsar_state_capture_rows(const pulsar_state_set *ss, LayerSlot slot, uint
  *              ordinal there -- it read 0, the first trunk slot's rows, until L436; now fatal, rule 9)
  *  @param id   the decl id
  *  @return the offset, in bytes */
-uint64_t pulsar_state_capture_offset(const pulsar_state_set *ss, LayerSlot slot, uint32_t id);
+SlabOff pulsar_state_capture_offset(const pulsar_state_set *ss, LayerSlot slot, uint32_t id);
 /** The capture tensor of decl `id` (every slot's rows, at pulsar_state_capture_offset).
  *  @param ss the set
  *  @param id the decl id

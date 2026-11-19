@@ -810,7 +810,7 @@ int main(int argc, char **argv) {
                 f8s[r] = pulsar_gpu_tensor_alloc(TensorBytes{f8_scale});
                 pulsar_gpu_tensor_write(f8d[r], TensorBytes{0}, hd.data(), TensorBytes{f8_data});
                 pulsar_gpu_tensor_write(f8s[r], TensorBytes{0}, hs.data(), TensorBytes{f8_scale});
-                if (!pulsar_gpu_register_fp8_lt_weight_resident(key, (uint64_t)r * f8_span, K, N, f8d[r], f8s[r])) {
+                if (!pulsar_gpu_register_fp8_lt_weight_resident(key, MapOff{(uint64_t)r * f8_span}, K, N, f8d[r], f8s[r])) {
                     fprintf(stderr, "resident MXFP8 registration refused\n"); return 2;
                 }
             }
@@ -874,7 +874,7 @@ int main(int argc, char **argv) {
                 bool f8_ok = true;
                 const double t_f8 = time_calls(n_it, [&](int i) {
                     const int r = i % n_f8;
-                    if (!pulsar_gpu_matmul_mxfp8_tensor(out, key, map_size, (uint64_t)r * f8_span, K, N, x, M)) f8_ok = false;
+                    if (!pulsar_gpu_matmul_mxfp8_tensor(out, key, map_size, MapOff{(uint64_t)r * f8_span}, K, N, x, M)) f8_ok = false;
                 });
                 pulsar_gpu_matmul_set_batch_decode_rows(0);
                 if (!f8_ok) { fprintf(stderr, "MXFP8 GEMV refused at M=%d\n", M); return 2; }

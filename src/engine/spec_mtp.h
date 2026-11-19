@@ -79,13 +79,13 @@ typedef struct pulsar_mtp_ops {
     /** The modules the opened artifact carries and drafts with (0 = none: no lane, no drafter). */
     uint32_t (*modules)(const pulsar_engine *e);
     /** Bytes of one conditioning row (the lane's staging rows and the pending decl's `bytes`). */
-    uint64_t (*cond_bytes)(const pulsar_engine *e);
+    TensorBytes (*cond_bytes)(const pulsar_engine *e);
     /** Floats a headed row's logits hold: the head's width (the vocabulary, or a draft head's rows). */
     uint32_t (*head_width)(const pulsar_engine *e);
     /** The conditioning rows of the LAST TRUNK STEP's rows [row0, row0 + n) into `dst` at byte `off` (one row each,
      *  cond_bytes apart), on the session stream: what the trunk hands a module (Nemotron: norm_f of the residual,
      *  vLLM's target hidden; Qwen: the HC streams).  Valid until the next trunk step. */
-    bool (*trunk_rows)(pulsar_session *s, uint32_t row0, uint32_t n, pulsar_gpu_tensor *dst, uint64_t off);
+    bool (*trunk_rows)(pulsar_session *s, uint32_t row0, uint32_t n, pulsar_gpu_tensor *dst, TensorBytes off);
     /** After a module step: its rows' OUTPUT conditioning (row i at i * cond_bytes) -- the next chain step's input. */
     pulsar_gpu_tensor *(*out_rows)(pulsar_session *s);
     /** One module step.  false (said) = refused or failed; the lane drops the rows' banks' parked rows. */
@@ -132,7 +132,7 @@ struct pulsar_mtp_lane {
     /// Banks the session holds: the length of pend_pos / stage_dirty.
     uint32_t n_banks;
     /// ops->cond_bytes(e): bytes of one conditioning row.
-    uint64_t cond_bytes;
+    TensorBytes cond_bytes;
     /// ops->head_width(e): floats in one headed row's logits.
     uint32_t head_width;
     pulsar_gpu_tensor *cond;    ///< [max_rows] the conditioning rows a module step reads

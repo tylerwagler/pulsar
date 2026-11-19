@@ -81,7 +81,7 @@ enum nh_arena { ARENA_ROWS = 0, ARENA_MIX, ARENA_FFN, ARENA_HEAD, ARENA_COUNT };
 
 /** @param x  a byte count
  *  @return x rounded up to a multiple of 256 (every arena region's alignment) */
-uint64_t a256(uint64_t x) { return (x + 255u) & ~(uint64_t)255u; }
+TensorBytes a256(TensorBytes x) { return pulsar_bytes_align(x, 256u); }
 /** @param t  a device tensor
  *  @return its device base address */
 void *dptr(pulsar_gpu_tensor *t) { return pulsar_gpu_tensor_device_ptr(t); }
@@ -214,7 +214,7 @@ pulsar_moe_block_shape moe_shape(const pulsar_nemotron_h_shape &s) {
  *  @param out   their output widths
  *  @param rows  the row count
  *  @return the multi launch's workspace bytes, 256-aligned */
-uint64_t multi_ws(int in, int n, const int *out, uint32_t rows) {
+TensorBytes multi_ws(int in, int n, const int *out, uint32_t rows) {
     pulsar_rows_linear l[4] = {};
     const pulsar_rows_linear *lp[4];
     for (int j = 0; j < n; j++) {
@@ -222,22 +222,26 @@ uint64_t multi_ws(int in, int n, const int *out, uint32_t rows) {
         l[j].out = out[j];
         lp[j] = &l[j];
     }
-    return a256(pulsar_rows_linear_multi_workspace_bytes(lp, n, (int)rows));
+    return a256(TensorBytes{pulsar_rows_linear_multi_workspace_bytes(lp, n, (int)rows)});
 }
 /** @param in    the input width
  *  @param out   the output width
  *  @param rows  the row count
  *  @return one linear's workspace bytes, 256-aligned */
-uint64_t lin_ws(int in, int out, uint32_t rows) {
+TensorBytes lin_ws(int in, int out, uint32_t rows) {
     pulsar_rows_linear l{};
     l.in = in;
     l.out = out;
-    return a256(pulsar_rows_linear_workspace_bytes(&l, (int)rows));
+    return a256(TensorBytes{pulsar_rows_linear_workspace_bytes(&l, (int)rows)});
 }
 /** @param a  a value
  *  @param b  a value
  *  @return the larger */
 uint64_t umax(uint64_t a, uint64_t b) { return a > b ? a : b; }
+/** @param a  a size
+ *  @param b  a size
+ *  @return the larger */
+TensorBytes umax(TensorBytes a, TensorBytes b) { return a > b ? a : b; }
 
 /* ---- scratch layouts: one function each, for sizing AND carving -------------------------------------------------- */
 
@@ -258,19 +262,19 @@ uint64_t umax(uint64_t a, uint64_t b) { return a > b ? a : b; }
  *  @var rows_scratch::total
  *  the arena's bytes */
 /** The ROWS arena's layout at R rows: each field a byte offset into the arena. */
-struct rows_scratch { uint64_t ids, first_a, slot_a, first_b, slot_b, nf, total; };
+struct rows_scratch { SlabOff ids, first_a, slot_a, first_b, slot_b, nf; TensorBytes total; };
 /** @param R  the step's row capacity (max_rows)
  *  @return the ROWS arena's offsets and size */
 rows_scratch rows_layout(uint32_t R) {
     rows_scratch r{};
-    uint64_t o = 0;
-    r.ids = o;     o += a256((uint64_t)R * 4u);
-    r.first_a = o; o += a256((uint64_t)(R + 1u) * 4u);
-    r.slot_a = o;  o += a256((uint64_t)R * 4u);
-    r.first_b = o; o += a256((uint64_t)(R + 1u) * 4u);
-    r.slot_b = o;  o += a256((uint64_t)R * 4u);
-    r.nf = o;      o += 256u;
-    r.total = o;
+    SlabOff o{};
+    r.ids = o;     o += a256(elt_bytes((uint64_t)R, 4u));
+    r.first_a = o; o += a256(elt_bytes((uint64_t)(R + 1u), 4u));
+    r.slot_a = o;  o += a256(elt_bytes((uint64_t)R, 4u));
+    r.first_b = o; o += a256(elt_bytes((uint64_t)(R + 1u), 4u));
+    r.slot_b = o;  o += a256(elt_bytes((uint64_t)R, 4u));
+    r.nf = o;      o += TensorBytes{256};
+    r.total = o.before();
     return r;
 }
 
@@ -305,7 +309,7 @@ rows_scratch rows_layout(uint32_t R) {
  *  @var mix_scratch::total
  *  the arena's bytes */
 /** The MIX arena's layout: the Mamba-2 and the attention views share it (a layer runs one mixer). */
-struct mix_scratch { uint64_t pf, pb, yb, of, db, m2, m2_bytes, lin, lin_bytes, gqa, gqa_bytes, total; };
+struct mix_scratch { SlabOff pf, pb, yb, of, db, m2; TensorBytes m2_bytes; SlabOff lin; TensorBytes lin_bytes; SlabOff gqa; TensorBytes gqa_bytes, total; };
 /** @param R    the step's row capacity (max_rows)
  *  @param ctx  the pools' capacity in tokens (F1's workspace; 0 = sized for 1)
  *  @return the MIX arena's offsets and size */
@@ -315,22 +319,22 @@ mix_scratch mix_layout(uint32_t R, uint32_t ctx) {
     const uint64_t E = s.n_embd, Q = (uint64_t)s.n_head * s.head_dim, KV = (uint64_t)s.n_head_kv * s.head_dim;
     const uint64_t P = umax(md.in, Q + 2u * KV), Y = umax(md.di, Q);
     mix_scratch t{};
-    uint64_t o = 0;
-    t.pf = o; o += a256((uint64_t)R * P * 4u);
-    t.pb = o; o += a256((uint64_t)R * P * 2u);
-    t.yb = o; o += a256((uint64_t)R * Y * 2u);
-    t.of = o; o += a256((uint64_t)R * E * 4u);
-    t.db = o; o += a256((uint64_t)R * E * 2u);
+    SlabOff o{};
+    t.pf = o; o += a256(elt_bytes((uint64_t)R * P, 4u));
+    t.pb = o; o += a256(elt_bytes((uint64_t)R * P, 2u));
+    t.yb = o; o += a256(elt_bytes((uint64_t)R * Y, 2u));
+    t.of = o; o += a256(elt_bytes((uint64_t)R * E, 4u));
+    t.db = o; o += a256(elt_bytes((uint64_t)R * E, 2u));
     const pulsar_mamba2_geom g = mamba_geom(s);
-    t.m2 = o; t.m2_bytes = a256(pulsar_mamba2_scratch_bytes(&g, R)); o += t.m2_bytes;
+    t.m2 = o; t.m2_bytes = a256(TensorBytes{pulsar_mamba2_scratch_bytes(&g, R)}); o += t.m2_bytes;
     const int qkv[3] = {(int)Q, (int)KV, (int)KV};
     t.lin = o;
     t.lin_bytes = umax(umax(lin_ws((int)E, (int)md.in, R), lin_ws((int)md.di, (int)E, R)),
                        umax(umax(multi_ws((int)E, 3, qkv, R), lin_ws((int)Q, (int)E, R)), lin_ws(2 * (int)E, (int)E, R)));
     o += t.lin_bytes;
     const pulsar_gqa_layer gd = gqa_decl(s);
-    t.gqa = o; t.gqa_bytes = a256(pulsar_gqa_workspace_bytes(&gd, R, ctx ? ctx : 1u)); o += t.gqa_bytes;
-    t.total = o;
+    t.gqa = o; t.gqa_bytes = a256(TensorBytes{pulsar_gqa_workspace_bytes(&gd, R, ctx ? ctx : 1u)}); o += t.gqa_bytes;
+    t.total = o.before();
     return t;
 }
 
@@ -346,19 +350,19 @@ mix_scratch mix_layout(uint32_t R, uint32_t ctx) {
  *  @var ffn_scratch::total
  *  the arena's bytes */
 /** The FFN arena's layout. */
-struct ffn_scratch { uint64_t fo, db, u, moe_bytes, total; };
+struct ffn_scratch { SlabOff fo, db, u; TensorBytes moe_bytes, total; };
 /** @param R  the step's row capacity (max_rows)
  *  @return the FFN arena's offsets and size */
 ffn_scratch ffn_layout(uint32_t R) {
     const pulsar_nemotron_h_shape &s = G();
     const uint64_t E = s.n_embd;
     ffn_scratch f{};
-    uint64_t o = 0;
-    f.fo = o; o += a256((uint64_t)R * E * 4u);
-    f.db = o; o += a256((uint64_t)R * E * 2u);
+    SlabOff o{};
+    f.fo = o; o += a256(elt_bytes((uint64_t)R * E, 4u));
+    f.db = o; o += a256(elt_bytes((uint64_t)R * E, 2u));
     const pulsar_moe_block_shape bs = moe_shape(s);
-    f.u = o; f.moe_bytes = a256(pulsar_moe_block_workspace_bytes(&bs, (int)R)); o += f.moe_bytes;
-    f.total = o;
+    f.u = o; f.moe_bytes = a256(TensorBytes{pulsar_moe_block_workspace_bytes(&bs, (int)R)}); o += f.moe_bytes;
+    f.total = o.before();
     return f;
 }
 
@@ -370,14 +374,14 @@ ffn_scratch ffn_layout(uint32_t R) {
  *  @var head_scratch::total
  *  the arena's bytes */
 /** The HEAD arena's layout. */
-struct head_scratch { uint64_t lin, lin_bytes, total; };
+struct head_scratch { SlabOff lin; TensorBytes lin_bytes, total; };
 /** @return the HEAD arena's offsets and size */
 head_scratch head_layout() {
     const pulsar_nemotron_h_shape &s = G();
     head_scratch h{};
-    h.lin = 0;
+    h.lin = SlabOff{};
     h.lin_bytes = lin_ws((int)s.n_embd, (int)s.n_vocab, PULSAR_DRIVER_HEADS_MAX);
-    h.total = h.lin + h.lin_bytes;
+    h.total = (h.lin + h.lin_bytes).before();
     return h;
 }
 
@@ -386,14 +390,14 @@ head_scratch head_layout() {
  *  @param max_rows  the step's row capacity
  *  @param ctx       the pools' capacity in tokens
  *  @return the arena's bytes (0 for an arena out of range) */
-uint64_t scratch_bytes(uint32_t arena, uint32_t max_rows, uint32_t ctx) {
+TensorBytes scratch_bytes(uint32_t arena, uint32_t max_rows, uint32_t ctx) {
     switch (arena) {
     case ARENA_ROWS: return rows_layout(max_rows).total;
     case ARENA_MIX:  return mix_layout(max_rows, ctx).total;
     case ARENA_FFN:  return ffn_layout(max_rows).total;
     case ARENA_HEAD: return head_layout().total;
     }
-    return 0;
+    return TensorBytes{};
 }
 
 /* ---- the session's state and the step ------------------------------------------------------------------------- */
@@ -457,13 +461,13 @@ struct nh_state : pulsar_driver_state {
     /// Host [n_calls]: each attention call's plan
     pulsar_indexed_view<pulsar_gqa_call, KindOrd> attn_call;   /* host [n_calls]: the calls' plans */
     /// Host [n_calls]: each call's descriptors' byte offset in attn_desc / attn_desc_host
-    pulsar_indexed_view<uint64_t, KindOrd> attn_off;   /* host [n_calls]: each call's descriptors' offset in attn_desc(_host) */
+    pulsar_indexed_view<SlabOff, KindOrd> attn_off;   /* host [n_calls]: each call's descriptors' offset in attn_desc(_host) */
     /// Host [n_calls * attn_desc_max]: the descriptors, staged
     uint8_t *attn_desc_host;      /* host [n_calls * attn_desc_max]: the descriptors, staged */
     /// Device, attn_desc_host's layout (NULL with no attention call)
     pulsar_gpu_tensor *attn_desc; /* device, the same layout */
     /// One call's descriptor bytes at max_rows, 256-aligned
-    uint64_t attn_desc_max;       /* a256(pulsar_gqa_desc_bytes(max_rows)) */
+    TensorBytes attn_desc_max;    /* a256(pulsar_gqa_desc_bytes(max_rows)) */
 };
 
 /** A step object: the driver's step (its base) plus the family's view -- the weights, the session state, the residual
@@ -560,11 +564,11 @@ pulsar_driver_state *create(pulsar_session *s, uint32_t n_banks) {
     for (TrunkLayer il{0u}; il.below(e->plan.n_layer); ++il)
         st->attn_slot[il] = e->plan.desc[il].mixer == PULSAR_MIXER_ATTN_FULL ? KindOrd{st->n_attn++} : KindOrd::none();
     const uint32_t n_calls = st->n_attn + (W(e)->drafting ? 1u : 0u);
-    st->attn_desc_max = a256(pulsar_gqa_desc_bytes((uint32_t)R));
+    st->attn_desc_max = a256(TensorBytes{pulsar_gqa_desc_bytes((uint32_t)R)});
     st->attn_call = {(pulsar_gqa_call *)xcalloc(n_calls ? n_calls : 1u, sizeof(pulsar_gqa_call)), n_calls};
-    st->attn_off = {(uint64_t *)xcalloc(n_calls ? n_calls : 1u, sizeof(uint64_t)), n_calls};
-    st->attn_desc_host = (uint8_t *)xmalloc(n_calls ? n_calls * st->attn_desc_max : 1u);
-    st->attn_desc = n_calls ? pulsar_gpu_tensor_alloc(TensorBytes{n_calls * st->attn_desc_max}) : NULL;
+    st->attn_off = {(SlabOff *)xcalloc(n_calls ? n_calls : 1u, sizeof(SlabOff)), n_calls};
+    st->attn_desc_host = (uint8_t *)xmalloc(n_calls ? st->attn_desc_max.times(n_calls).raw() : 1u);
+    st->attn_desc = n_calls ? pulsar_gpu_tensor_alloc(st->attn_desc_max.times(n_calls)) : NULL;
     bool ok = st->h && st->xn && (!n_calls || st->attn_desc);
     if (ok && W(e)->drafting) {
         st->mh = pulsar_gpu_tensor_alloc(bytes_of<uint16_t>(R * sh.n_embd));
@@ -646,7 +650,7 @@ bool arm_segments(const nh_step *st, uint32_t lo, uint32_t hi, Launch &&launch) 
  *  @return true = launched; false = a weight refused or a launch failed */
 bool step_linears(const nh_step *st, int n, const pulsar_tensor *const *t, int in, const int *out,
                   const char *const *what, const uint16_t *x, float *const *y, uint16_t *const *yb, void *ws,
-                  uint64_t ws_bytes) {
+                  TensorBytes ws_bytes) {
     return arm_segments(st, 0, st->n_rows, [&](bool prompt, uint32_t r0, uint32_t m) {
         pulsar_rows_linear l[3];
         const pulsar_rows_linear *lp[3];
@@ -658,7 +662,7 @@ bool step_linears(const nh_step *st, int n, const pulsar_tensor *const *t, int i
             yr[j] = y[j] + (size_t)r0 * (size_t)out[j];
             br[j] = yb[j] + (size_t)r0 * (size_t)out[j];
         }
-        return pulsar_rows_linear_multi_bf16_launch(lp, n, x + (size_t)r0 * in, (int)m, yr, br, ws, ws_bytes, 0) == 0;
+        return pulsar_rows_linear_multi_bf16_launch(lp, n, x + (size_t)r0 * in, (int)m, yr, br, ws, ws_bytes.raw(), 0) == 0;
     });
 }
 
@@ -722,17 +726,17 @@ bool build_tables(const nh_step *st) {
     const rows_scratch L = rows_layout(q->max_rows);
     static const uint32_t zero = 0;   /* L289: an enqueued write reads it later */
     bool ok = rt != NULL;
-    ok = ok && pulsar_gpu_tensor_write_async(rt, TensorBytes{L.ids}, st->tokens, bytes_of<int32_t>(n)) != 0;
-    ok = ok && pulsar_gpu_tensor_write_async(rt, TensorBytes{L.nf}, &zero, TensorBytes{sizeof(zero)}) != 0;
+    ok = ok && pulsar_gpu_tensor_write_async(rt, L.ids.before(), st->tokens, bytes_of<int32_t>(n)) != 0;
+    ok = ok && pulsar_gpu_tensor_write_async(rt, L.nf.before(), &zero, TensorBytes{sizeof(zero)}) != 0;
     if (ok && na) {
-        ok = pulsar_gpu_tensor_write_async(rt, TensorBytes{L.first_a}, q->tab_a,
+        ok = pulsar_gpu_tensor_write_async(rt, L.first_a.before(), q->tab_a,
                                            bytes_of<int32_t>((uint64_t)(na + 1u))) != 0 &&
-             pulsar_gpu_tensor_write_async(rt, TensorBytes{L.slot_a}, q->tab_a + na + 1, bytes_of<int32_t>(na)) != 0;
+             pulsar_gpu_tensor_write_async(rt, L.slot_a.before(), q->tab_a + na + 1, bytes_of<int32_t>(na)) != 0;
     }
     if (ok && nb) {
-        ok = pulsar_gpu_tensor_write_async(rt, TensorBytes{L.first_b}, q->tab_b,
+        ok = pulsar_gpu_tensor_write_async(rt, L.first_b.before(), q->tab_b,
                                            bytes_of<int32_t>((uint64_t)(nb + 1u))) != 0 &&
-             pulsar_gpu_tensor_write_async(rt, TensorBytes{L.slot_b}, q->tab_b + nb + 1, bytes_of<int32_t>(nb)) != 0;
+             pulsar_gpu_tensor_write_async(rt, L.slot_b.before(), q->tab_b + nb + 1, bytes_of<int32_t>(nb)) != 0;
     }
     return ok || fail("could not upload the step's tables");
 }
@@ -775,7 +779,7 @@ uint32_t attn_bound(const nh_step *st) {
  *  @param off     the descriptors' byte offset in attn_desc_host
  *  @param stride  one call's descriptor bytes
  *  @return true = planned; false = a pool is evicted or the plan refused (said) */
-bool plan_call(const nh_step *st, LayerSlot il, KindOrd k, uint32_t bound, uint64_t off, uint64_t stride) {
+bool plan_call(const nh_step *st, LayerSlot il, KindOrd k, uint32_t bound, SlabOff off, TensorBytes stride) {
     nh_state *q = st->st;
     const pulsar_gqa_layer G1 = gqa_decl(st->w->shape);
     const uint64_t tb = pulsar_gqa_kv_token_bytes(&G1);
@@ -788,8 +792,8 @@ bool plan_call(const nh_step *st, LayerSlot il, KindOrd k, uint32_t bound, uint6
         sq.cap = (uint32_t)(sq.bytes / tb);
     }
     q->attn_off[k] = off;
-    return pulsar_gqa_plan(&G1, q->seqs, q->n_seq, q->row_seq, q->row_pos, st->n_rows, bound, q->attn_desc_host + off,
-                           stride, &q->attn_call[k]) == 0 ||
+    return pulsar_gqa_plan(&G1, q->seqs, q->n_seq, q->row_seq, q->row_pos, st->n_rows, bound,
+                           pulsar_slab_at(q->attn_desc_host, off), stride.raw(), &q->attn_call[k]) == 0 ||
            failf("the attention's plan refused", il);
 }
 
@@ -801,14 +805,15 @@ bool plan_attention(const nh_step *st, uint32_t *bound_out) {
     *bound_out = 0;
     if (!q->n_attn) return true;
     const uint32_t bound = attn_bound(st);
-    const uint64_t stride = a256(pulsar_gqa_desc_bytes(st->n_rows));
+    const TensorBytes stride = a256(TensorBytes{pulsar_gqa_desc_bytes(st->n_rows)});
     for (TrunkLayer il{0u}; il.below(st->plan->n_layer); ++il) {
         const KindOrd k = attn_ord(q, il);
-        if (!k.is_none() && !plan_call(st, pulsar_layer_slot_of(il), k, bound, (uint64_t)k.raw() * stride, stride)) return false;
+        if (!k.is_none() && !plan_call(st, pulsar_layer_slot_of(il), k, bound, SlabOff::after(stride.times(k.raw())), stride))
+            return false;
     }
     *bound_out = bound;
     return pulsar_gpu_tensor_write_async(q->attn_desc, TensorBytes{0}, q->attn_desc_host,
-                                         TensorBytes{stride}.times(q->n_attn)) != 0 ||
+                                         stride.times(q->n_attn)) != 0 ||
            fail("could not upload the attention descriptors");
 }
 
@@ -822,10 +827,10 @@ bool mtp_stage(const nh_step *st, LayerSlot il) {
     for (uint32_t r = 0; r < st->n_rows; r++)
         if (!st->tokens[r].below(st->w->shape.n_vocab))
             return fail("a token id outside the vocabulary");
-    const uint64_t off = (uint64_t)q->n_attn * q->attn_desc_max;
+    const SlabOff off = SlabOff::after(q->attn_desc_max.times(q->n_attn));
     return build_tables(st) && plan_call(st, il, mtp_attn_ord(q), attn_bound(st), off, q->attn_desc_max) &&
-           (pulsar_gpu_tensor_write_async(q->attn_desc, TensorBytes{off}, q->attn_desc_host + off,
-                                          TensorBytes{q->attn_desc_max}) != 0 ||
+           (pulsar_gpu_tensor_write_async(q->attn_desc, off.before(), pulsar_slab_at(q->attn_desc_host, off),
+                                          q->attn_desc_max) != 0 ||
             fail("could not upload the MTP attention's descriptors"));
 }
 
@@ -883,7 +888,7 @@ bool embed(const pulsar_driver_step *st0) {
     const rows_scratch L = rows_layout(st->st->max_rows);
     if (!table) return false;
     return pulsar_head_embed_launch(&hd, table, s.n_vocab,
-                                    (const int32_t *)((uint8_t *)dptr(st->st->scratch[ARENA_ROWS]) + L.ids), st->n_rows,
+                                    pulsar_slab_at<const int32_t>(dptr(st->st->scratch[ARENA_ROWS]), L.ids), st->n_rows,
                                     (uint16_t *)dptr(st->res), s.n_embd, 0) == 0 ||
            fail("the embedding refused");
 }
@@ -911,11 +916,11 @@ bool image_rows(const pulsar_driver_step *st0, const uint16_t *rows, uint32_t n_
  *  @param off    the rows' byte offset in it
  *  @param width  the row width in bf16 values
  *  @param il     the layer slot the dump is tagged with (a drafter slot tags past the trunk's layers) */
-void dump_rows(const nh_step *st, const char *name, pulsar_gpu_tensor *arena, uint64_t off, uint32_t width,
+void dump_rows(const nh_step *st, const char *name, pulsar_gpu_tensor *arena, SlabOff off, uint32_t width,
                LayerSlot il) {
     if (!gpu_graph_debug_dump_enabled()) return;
     const uint64_t n = (uint64_t)st->n_rows * width;
-    pulsar_gpu_tensor *v = arena ? pulsar_gpu_tensor_view(arena, TensorBytes{off}, bytes_of<uint16_t>(n)) : NULL;
+    pulsar_gpu_tensor *v = arena ? pulsar_gpu_tensor_view(arena, off.before(), bytes_of<uint16_t>(n)) : NULL;
     if (v) gpu_graph_debug_dump_hc_tensor(name, v, n, il.raw(), (uint32_t)st->pos[st->n_rows - 1]);
     pulsar_gpu_tensor_free(v);
 }
@@ -935,8 +940,8 @@ bool mamba(const nh_step *st, LayerSlot il, uint8_t *base, const mix_scratch &M)
     const pulsar_nemotron_h_block &L = LW(st, il);
     const mamba_dims md = mamba_of(s);
     const uint32_t n = st->n_rows, E = s.n_embd;
-    float *pf = (float *)(base + M.pf), *of = (float *)(base + M.of);
-    uint16_t *pb = (uint16_t *)(base + M.pb), *yb = (uint16_t *)(base + M.yb), *db = (uint16_t *)(base + M.db);
+    float *pf = pulsar_slab_at<float>(base, M.pf), *of = pulsar_slab_at<float>(base, M.of);
+    uint16_t *pb = pulsar_slab_at<uint16_t>(base, M.pb), *yb = pulsar_slab_at<uint16_t>(base, M.yb), *db = pulsar_slab_at<uint16_t>(base, M.db);
     const uint16_t *xn = (const uint16_t *)dptr(q->xn);
     {
         const pulsar_tensor *t[1] = {L.ssm_in};
@@ -944,7 +949,7 @@ bool mamba(const nh_step *st, LayerSlot il, uint8_t *base, const mix_scratch &M)
         const char *what[1] = {"nemotron_h ssm_in"};
         float *y[1] = {pf};
         uint16_t *yb16[1] = {pb};
-        if (!step_linears(st, 1, t, (int)E, outs, what, xn, y, yb16, base + M.lin, M.lin_bytes))
+        if (!step_linears(st, 1, t, (int)E, outs, what, xn, y, yb16, pulsar_slab_at(base, M.lin), M.lin_bytes))
             return failf("the Mamba-2 in_proj refused", il);
     }
     pulsar_mamba2_layer ml{};
@@ -974,8 +979,8 @@ bool mamba(const nh_step *st, LayerSlot il, uint8_t *base, const mix_scratch &M)
         c.n_seqs = cap ? q->n_seq_cap : q->n_seq - q->n_seq_cap;
         c.n_rows = r1 - r0;
         c.max_seq_rows = cap ? q->max_run_a : q->max_run_b;
-        c.seq_first = (const int32_t *)(rt + (cap ? R.first_a : R.first_b));
-        c.seq_slot = (const int32_t *)(rt + (cap ? R.slot_a : R.slot_b));
+        c.seq_first = pulsar_slab_at<const int32_t>(rt, cap ? R.first_a : R.first_b);
+        c.seq_slot = pulsar_slab_at<const int32_t>(rt, cap ? R.slot_a : R.slot_b);
         /* the in_proj row [z | x B C | dt]: strided column ranges */
         const uint16_t *row = pb + (size_t)r0 * md.in;
         c.z = row;
@@ -993,8 +998,8 @@ bool mamba(const nh_step *st, LayerSlot il, uint8_t *base, const mix_scratch &M)
             c.ssm_capture = (float *)pulsar_state_capture_rows(st->states, il, PULSAR_NEMOTRON_H_STATE_SSM);
             if (!c.conv_capture || !c.ssm_capture) return failf("a verify step with no Mamba-2 capture", il);
         }
-        c.scratch = base + M.m2;
-        c.scratch_bytes = M.m2_bytes;
+        c.scratch = pulsar_slab_at(base, M.m2);
+        c.scratch_bytes = M.m2_bytes.raw();
         c.out = yb + (size_t)r0 * md.di;
         c.ld_out = md.di;
         if (pulsar_mamba2_forward(&ml, &c, 0) != 0) return failf("the Mamba-2 block refused", il);
@@ -1004,7 +1009,7 @@ bool mamba(const nh_step *st, LayerSlot il, uint8_t *base, const mix_scratch &M)
     const char *what[1] = {"nemotron_h ssm_out"};
     float *y[1] = {of};
     uint16_t *yb16[1] = {db};
-    if (!step_linears(st, 1, t, (int)md.di, outs, what, yb, y, yb16, base + M.lin, M.lin_bytes))
+    if (!step_linears(st, 1, t, (int)md.di, outs, what, yb, y, yb16, pulsar_slab_at(base, M.lin), M.lin_bytes))
         return failf("the Mamba-2 out_proj refused", il);
     return true;
 }
@@ -1020,10 +1025,10 @@ bool attention(const nh_step *st, LayerSlot il, uint8_t *base, const mix_scratch
     const pulsar_nemotron_h_shape &s = st->w->shape;
     const pulsar_nemotron_h_block &L = LW(st, il);
     const uint32_t n = st->n_rows, E = s.n_embd, Q = s.n_head * s.head_dim, KV = s.n_head_kv * s.head_dim;
-    float *qf = (float *)(base + M.pf), *kf = qf + (size_t)q->max_rows * Q, *vf = kf + (size_t)q->max_rows * KV;
-    uint16_t *qb = (uint16_t *)(base + M.pb), *kb = qb + (size_t)q->max_rows * Q, *vb = kb + (size_t)q->max_rows * KV;
-    uint16_t *ab = (uint16_t *)(base + M.yb), *db = (uint16_t *)(base + M.db);
-    float *of = (float *)(base + M.of);
+    float *qf = pulsar_slab_at<float>(base, M.pf), *kf = qf + (size_t)q->max_rows * Q, *vf = kf + (size_t)q->max_rows * KV;
+    uint16_t *qb = pulsar_slab_at<uint16_t>(base, M.pb), *kb = qb + (size_t)q->max_rows * Q, *vb = kb + (size_t)q->max_rows * KV;
+    uint16_t *ab = pulsar_slab_at<uint16_t>(base, M.yb), *db = pulsar_slab_at<uint16_t>(base, M.db);
+    float *of = pulsar_slab_at<float>(base, M.of);
     const uint16_t *xn = (const uint16_t *)dptr(q->xn);
     {
         const pulsar_tensor *t[3] = {L.attn_q, L.attn_k, L.attn_v};
@@ -1031,7 +1036,7 @@ bool attention(const nh_step *st, LayerSlot il, uint8_t *base, const mix_scratch
         const char *what[3] = {"nemotron_h q_proj", "nemotron_h k_proj", "nemotron_h v_proj"};
         float *y[3] = {qf, kf, vf};
         uint16_t *yb16[3] = {qb, kb, vb};
-        if (!step_linears(st, 3, t, (int)E, outs, what, xn, y, yb16, base + M.lin, M.lin_bytes))
+        if (!step_linears(st, 3, t, (int)E, outs, what, xn, y, yb16, pulsar_slab_at(base, M.lin), M.lin_bytes))
             return failf("the q / k / v projections refused", il);
     }
     const pulsar_gqa_layer G1 = gqa_decl(s);
@@ -1044,12 +1049,12 @@ bool attention(const nh_step *st, LayerSlot il, uint8_t *base, const mix_scratch
     io.v = {vb, KV, s.head_dim};
     io.out_bf16 = ab;
     io.ld_out = Q;
-    io.workspace = base + M.gqa;
-    io.workspace_bytes = M.gqa_bytes;
+    io.workspace = pulsar_slab_at(base, M.gqa);
+    io.workspace_bytes = M.gqa_bytes.raw();
     /* O59: the step's non-finite flag (step_end reads it); bit 23 marks an attention operand */
-    io.nf_flag = (uint32_t *)((uint8_t *)dptr(st->st->scratch[ARENA_ROWS]) + rows_layout(st->st->max_rows).nf);
+    io.nf_flag = pulsar_slab_at<uint32_t>(dptr(st->st->scratch[ARENA_ROWS]), rows_layout(st->st->max_rows).nf);
     io.nf_code = 0x4E800000u | il.raw();
-    if (pulsar_gqa_launch(&G1, &q->attn_call[slot], (const uint8_t *)dptr(q->attn_desc) + q->attn_off[slot],
+    if (pulsar_gqa_launch(&G1, &q->attn_call[slot], pulsar_slab_at<const uint8_t>(dptr(q->attn_desc), q->attn_off[slot]),
                           &io, 0) != 0)
         return failf("the attention refused", il);
     const pulsar_tensor *t[1] = {L.attn_o};
@@ -1057,7 +1062,7 @@ bool attention(const nh_step *st, LayerSlot il, uint8_t *base, const mix_scratch
     const char *what[1] = {"nemotron_h o_proj"};
     float *y[1] = {of};
     uint16_t *yb16[1] = {db};
-    if (!step_linears(st, 1, t, (int)Q, outs, what, ab, y, yb16, base + M.lin, M.lin_bytes))
+    if (!step_linears(st, 1, t, (int)Q, outs, what, ab, y, yb16, pulsar_slab_at(base, M.lin), M.lin_bytes))
         return failf("the o_proj refused", il);
     return true;
 }
@@ -1081,7 +1086,7 @@ bool moe_block(const nh_step *st, LayerSlot il, float *fo, uint8_t *base, const 
     const uint16_t *xn = (const uint16_t *)dptr(st->st->xn);
     const pulsar_moe_block_shape bs = moe_shape(s);
     pulsar_moe_block_parts parts;
-    if (pulsar_moe_block_carve(&bs, (int)n, base + F.u, F.moe_bytes, &parts) != 0) return failf("the MoE workspace", il);
+    if (pulsar_moe_block_carve(&bs, (int)n, pulsar_slab_at(base, F.u), F.moe_bytes.raw(), &parts) != 0) return failf("the MoE workspace", il);
     /* the shared expert, ungated: down(relu(up xn)^2) */
     const auto shared_q = [&](bool prompt, pulsar_rows_moe_shared &q) {
         q = pulsar_rows_moe_shared{};
@@ -1135,7 +1140,7 @@ bool moe_block(const nh_step *st, LayerSlot il, float *fo, uint8_t *base, const 
     c.top_k = (uint32_t)K;
     c.ws = parts.routed;
     c.ws_bytes = parts.routed_bytes;
-    c.nf_flag = (uint32_t *)((uint8_t *)dptr(st->st->scratch[ARENA_ROWS]) + R.nf);
+    c.nf_flag = pulsar_slab_at<uint32_t>(dptr(st->st->scratch[ARENA_ROWS]), R.nf);
     c.nf_code = 0x4E000000u | il.raw();
     c.stream = rs;
     if (!arm_segments(st, 0, n, [&](bool prompt, uint32_t r0, uint32_t rows) {
@@ -1233,19 +1238,19 @@ bool compose(const nh_step *st, LayerSlot il, bool is_mamba, bool is_moe, const 
     dump_rows(st, "nemotron_mix", q->scratch[ARENA_MIX], M.db, E, il);
     /* h += delta, and the pre-norm of the new h in the same launch: the MoE's, else the next reader's */
     const uint16_t *fn = is_moe ? (const uint16_t *)wp(st, L.ffn_norm, "nemotron_h ffn norm") : nn;
-    if (!fn || pulsar_rows_add_launch(h, E, (const uint16_t *)(mbase + M.db), E, n, E, fn, s.rms_eps, is_moe ? xn : nout, E,
+    if (!fn || pulsar_rows_add_launch(h, E, pulsar_slab_at<const uint16_t>(mbase, M.db), E, n, E, fn, s.rms_eps, is_moe ? xn : nout, E,
                                     0) != 0)
         return failf("the mixer's residual add refused", il);
     /* L298: a block drafter's taps after this HF block (the trunk's steps only) */
     if (!st->module && !pulsar_block_tap(q, pulsar_slot_trunk_layer(st->states->plan, il), PULSAR_BLOCK_TAP_MIXER, h, E, n))
         return failf("the drafter tap refused", il);
     if (!is_moe) return true;
-    dump_rows(st, "nemotron_mid", st->res, 0, E, il);
+    dump_rows(st, "nemotron_mid", st->res, SlabOff{}, E, il);
     /* the MoE's HF block */
     const ffn_scratch F = ffn_layout(q->max_rows);
     uint8_t *fbase = (uint8_t *)dptr(q->scratch[ARENA_FFN]);
-    float *fo = (float *)(fbase + F.fo);
-    uint16_t *db = (uint16_t *)(fbase + F.db);
+    float *fo = pulsar_slab_at<float>(fbase, F.fo);
+    uint16_t *db = pulsar_slab_at<uint16_t>(fbase, F.db);
     if (!moe(st, il, fo, fbase, F)) return false;
     if (!emit(fo, db, n, E)) return failf("the MoE bf16 emit refused", il);
     dump_rows(st, "nemotron_ffn", q->scratch[ARENA_FFN], F.db, E, il);
@@ -1290,7 +1295,7 @@ bool head_rows(const nh_step *st, const uint16_t *xb, uint32_t n, uint32_t out0)
     pulsar_rows_linear l{};
     float *logits = (float *)dptr(st->buf->logits) + (size_t)out0 * s.n_vocab;
     if (!pulsar_linear_rows_ref(st->model, st->w->head, (int)s.n_embd, (int)s.n_vocab, false, "nemotron_h lm_head", &l) ||
-        pulsar_rows_linear_launch(&l, xb, (int)n, logits, base + H.lin, H.lin_bytes, 0) != 0)
+        pulsar_rows_linear_launch(&l, xb, (int)n, logits, pulsar_slab_at(base, H.lin), H.lin_bytes.raw(), 0) != 0)
         return fail("the head linear refused");
     const pulsar_head_decl hd = head_decl(s);
     return pulsar_head_logits_finish_launch(&hd, logits, n, s.n_vocab, 0) == 0 || fail("the logits finish refused");
@@ -1324,7 +1329,7 @@ bool step_end(const pulsar_driver_step *st0, bool ok) {
     }
     const nh_step *st = S(st0);
     uint32_t nf = 0;
-    if (!pulsar_gpu_tensor_read(st->st->scratch[ARENA_ROWS], TensorBytes{rows_layout(st->st->max_rows).nf}, &nf,
+    if (!pulsar_gpu_tensor_read(st->st->scratch[ARENA_ROWS], rows_layout(st->st->max_rows).nf.before(), &nf,
                                 TensorBytes{sizeof(nf)}))
         return fail("could not read the MoE non-finite flag");
     if (nf & 0x800000u) {   /* O59: a build that widens the attention's bf16 operands to fp16 (sm_75) */
@@ -1384,7 +1389,7 @@ uint32_t mtp_modules(const pulsar_engine *e) { return W(e)->drafting ? 1u : 0u; 
 /** pulsar_mtp_ops::cond_bytes.
  *  @param e  the engine
  *  @return one bf16 conditioning row: n_embd * 2 bytes */
-uint64_t mtp_cond_bytes(const pulsar_engine *e) { return (uint64_t)W(e)->shape.n_embd * 2u; }
+TensorBytes mtp_cond_bytes(const pulsar_engine *e) { return bytes_of<uint16_t>(W(e)->shape.n_embd); }
 /** pulsar_mtp_ops::head_width.
  *  @param e  the engine
  *  @return n_vocab: the module heads through the target's head */
@@ -1398,15 +1403,15 @@ uint32_t mtp_head_width(const pulsar_engine *e) { return W(e)->shape.n_vocab; }
  *  @param dst   receives the n conditioning rows
  *  @param off   their byte offset in dst
  *  @return true = launched; false = out of range or refused (said) */
-bool mtp_trunk_rows(pulsar_session *s, uint32_t row0, uint32_t n, pulsar_gpu_tensor *dst, uint64_t off) {
+bool mtp_trunk_rows(pulsar_session *s, uint32_t row0, uint32_t n, pulsar_gpu_tensor *dst, TensorBytes off) {
     const nh_state *q = ST(s);
     const pulsar_nemotron_h_model *w = W(s->engine);
     const uint32_t E = w->shape.n_embd;
     const uint16_t *on = (const uint16_t *)pulsar_weight_device_ptr(&s->engine->model, w->output_norm, "nemotron_h norm_f");
-    if (!on || row0 + n > q->max_rows || off + (uint64_t)n * E * 2u > pulsar_gpu_tensor_bytes(dst).raw())
+    if (!on || row0 + n > q->max_rows || off + bytes_of<uint16_t>((uint64_t)n * E) > pulsar_gpu_tensor_bytes(dst))
         return fail("the MTP conditioning rows are out of range");
     return pulsar_rows_rmsnorm_launch((const uint16_t *)dptr(q->h) + (size_t)row0 * E, E, n, E, on, w->shape.rms_eps,
-                                      (uint16_t *)((uint8_t *)dptr(dst) + off), E, 0) == 0 ||
+                                      pulsar_slab_at<uint16_t>(dptr(dst), SlabOff::after(off)), E, 0) == 0 ||
            fail("the MTP conditioning norm refused");
 }
 
@@ -1468,8 +1473,8 @@ bool mtp_forward(pulsar_session *s, const pulsar_mtp_step *m) {
     const pulsar_nemotron_h_draft &D = w->mtp;
     const mix_scratch M = mix_layout(q->max_rows, s->states->ctx);
     uint8_t *mbase = (uint8_t *)dptr(q->scratch[ARENA_MIX]);
-    uint16_t *mh = (uint16_t *)dptr(q->mh), *mo = (uint16_t *)dptr(q->mo), *cat = (uint16_t *)(mbase + M.pb);
-    float *of = (float *)(mbase + M.of);
+    uint16_t *mh = (uint16_t *)dptr(q->mh), *mo = (uint16_t *)dptr(q->mo), *cat = pulsar_slab_at<uint16_t>(mbase, M.pb);
+    float *of = pulsar_slab_at<float>(mbase, M.of);
     const uint16_t *en = (const uint16_t *)wp(&st, D.embed_norm, "nemotron_h mtp enorm");
     const uint16_t *hn = (const uint16_t *)wp(&st, D.hidden_norm, "nemotron_h mtp hnorm");
     const uint16_t *fn = (const uint16_t *)wp(&st, D.out_norm, "nemotron_h mtp final_layernorm");
@@ -1488,12 +1493,12 @@ bool mtp_forward(pulsar_session *s, const pulsar_mtp_step *m) {
         const char *what[1] = {"nemotron_h mtp eh_proj"};
         float *y[1] = {of};
         uint16_t *yb16[1] = {mh};
-        ok = step_linears(&st, 1, t, 2 * (int)E, outs, what, cat, y, yb16, mbase + M.lin, M.lin_bytes) ||
+        ok = step_linears(&st, 1, t, 2 * (int)E, outs, what, cat, y, yb16, pulsar_slab_at(mbase, M.lin), M.lin_bytes) ||
              fail("the MTP eh_proj refused");
     }
     /* the module's {attention, MoE}; its last add writes final_layernorm(x) into mo */
     if (ok) ok = compose(&st, il, false, true, an, fn, mo);
-    if (ok && gpu_graph_debug_dump_enabled()) dump_rows(&st, "nemotron_mtp", q->mo, 0, E, il);
+    if (ok && gpu_graph_debug_dump_enabled()) dump_rows(&st, "nemotron_mtp", q->mo, SlabOff{}, E, il);
     if (ok && m->head_n) ok = head_rows(&st, mo, m->head_n, 0);
     /* L289: the picks reduced on the device, behind the head (every headed row in one launch) */
     if (ok && m->pick)
@@ -1562,14 +1567,14 @@ void pulsar_nemotron_h_state_plan(pulsar_engine *e) {
     const pulsar_gqa_layer gd = gqa_decl(*s);
     pulsar_state_decl d[PULSAR_NEMOTRON_H_STATE_COUNT] = {};
     d[PULSAR_NEMOTRON_H_STATE_SSM] = {"ssm", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_DELTA, false, false, 0,
-                                      pulsar_mamba2_ssm_state_floats(&g) * sizeof(float),
-                                      pulsar_mamba2_upd_floats(&g) * sizeof(float), 0, ssm_commit, NULL, NULL};
+                                      bytes_of<float>(pulsar_mamba2_ssm_state_floats(&g)),
+                                      bytes_of<float>(pulsar_mamba2_upd_floats(&g)), SlabOff{}, ssm_commit, NULL, NULL};
     d[PULSAR_NEMOTRON_H_STATE_CONV] = {"ssm_conv", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_SNAPSHOT, false, false, 0,
-                                       pulsar_mamba2_conv_state_elems(&g) * sizeof(uint16_t), 0, 0, NULL, NULL, NULL};
+                                       bytes_of<uint16_t>(pulsar_mamba2_conv_state_elems(&g)), TensorBytes{}, SlabOff{}, NULL, NULL, NULL};
     d[PULSAR_NEMOTRON_H_STATE_KV] = {"kv", PULSAR_STATE_POOL, PULSAR_STATE_CAPTURE_NONE, false, false, 1u,
-                                     pulsar_gqa_kv_token_bytes(&gd), 0, 0, NULL, NULL, NULL};
+                                     TensorBytes{pulsar_gqa_kv_token_bytes(&gd)}, TensorBytes{}, SlabOff{}, NULL, NULL, NULL};
     d[PULSAR_NEMOTRON_H_STATE_MTP_PEND] = {"mtp_pend", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_NONE, false, false, 0,
-                                           mtp_cond_bytes(e), 0, 0, NULL, NULL, NULL};
+                                           mtp_cond_bytes(e), TensorBytes{}, SlabOff{}, NULL, NULL, NULL};
     for (uint32_t id = 0; id < PULSAR_NEMOTRON_H_STATE_COUNT; id++) (void)pulsar_state_plan_add(p, d[id]);
     for (TrunkLayer il{0u}; il.below(lp->n_layer); ++il)
         p->slot[pulsar_layer_slot_of(il)] = lp->desc[il].mixer == PULSAR_MIXER_MAMBA2

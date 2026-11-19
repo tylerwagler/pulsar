@@ -159,9 +159,9 @@ int main(int argc, char **argv) {
     const uint32_t dn = bd ? (bd->full_layers ? 2u : 1u) : 0u, dl = bd ? bd->n_layer : 0u;   /* the drafter's rings */
     bool state_ok = sp->n_decl == PULSAR_GEMMA4_STATE_COUNT + dn && sp->split_invariant && sp->resume_grid > 0 &&
                     win.kind == PULSAR_STATE_RING && win.capture == PULSAR_STATE_CAPTURE_NONE && win.tokens == s->window &&
-                    win.bytes == 2ull * s->swa_n_head_kv * s->swa_head_dim * 2u &&
+                    win.bytes.raw() == 2ull * s->swa_n_head_kv * s->swa_head_dim * 2u &&
                     full.kind == PULSAR_STATE_POOL && full.capture == PULSAR_STATE_CAPTURE_NONE && full.tokens == 1u &&
-                    full.bytes == 2ull * s->n_head_kv * s->head_dim * 2u &&
+                    full.bytes.raw() == 2ull * s->n_head_kv * s->head_dim * 2u &&
                     sp->n_trunk == s->n_layer && sp->n_slots == s->n_layer + dl;
     for (uint32_t il = 0; state_ok && il < s->n_layer; il++)
         state_ok = sp->slot[LayerSlot{il}] == 1u << (pulsar_gemma4_is_full(s, TrunkLayer{il}) ? PULSAR_GEMMA4_STATE_KV_FULL
@@ -169,7 +169,7 @@ int main(int argc, char **argv) {
     for (uint32_t l = 0; state_ok && bd && l < bd->n_layer; l++)
         state_ok = sp->slot[LayerSlot{s->n_layer + l}] == 1u << (((bd->full_layers >> l) & 1u) ? bd->decl_kv_full : bd->decl_kv);
     check(state_ok, "the declared state: kv_win RING %u keys x %llu B a window layer, kv_full POOL %llu B a token a "
-          "global layer%s", win.tokens, (unsigned long long)win.bytes, (unsigned long long)full.bytes,
+          "global layer%s", win.tokens, (unsigned long long)win.bytes.raw(), (unsigned long long)full.bytes.raw(),
           bd ? "; the drafter's draft_kv RING (+ draft_kv_full for its full layer) a drafter layer" : "");
     check(e->family->caps == (PULSAR_FAMILY_CAP_CHAT | PULSAR_FAMILY_CAP_BANKS | PULSAR_FAMILY_CAP_SEGMENTS |
                               PULSAR_FAMILY_CAP_PAYLOAD | PULSAR_FAMILY_CAP_SPEC) &&

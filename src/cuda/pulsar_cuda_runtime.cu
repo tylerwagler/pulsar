@@ -1237,12 +1237,16 @@ static int cuda_register_expert_half(const void *key_map, uint64_t key_offset, c
  * destination layout is exactly cutlass_mxfp4_expert_layout of the half shape;
  * the caller passes both geometries so this file needs no byte model of its
  * own. */
-int pulsar_gpu_register_mxfp4_expert_half(const void *key_map, uint64_t key_offset,
-                                          const void *model_map, uint64_t src_offset,
+int pulsar_gpu_register_mxfp4_expert_half(const void *key_map, MapOff key_offset_m,
+                                          const void *model_map, MapOff src_offset_m,
                                           uint32_t n_expert, uint64_t k, uint64_t n, int k_half,
                                           uint64_t lo, uint64_t hi,
-                                          uint64_t src_stride, uint64_t src_data,
-                                          uint64_t dst_stride, uint64_t dst_data) {
+                                          TensorBytes src_stride_b, TensorBytes src_data_b,
+                                          TensorBytes dst_stride_b, TensorBytes dst_data_b) {
+    /* L438: the four byte counts beside the counts and indices end at the launch */
+    const uint64_t src_stride = src_stride_b.raw(), src_data = src_data_b.raw(), dst_stride = dst_stride_b.raw(),
+                   dst_data = dst_data_b.raw();
+    const uint64_t key_offset = key_offset_m.raw(), src_offset = src_offset_m.raw();   /* L438: MapOff ends at the launch */
     if (!key_map || !model_map || n_expert == 0 || hi <= lo || lo % 128 || hi % 128 ||
         (k_half ? hi > k : hi > n) || dst_data >= dst_stride || src_data >= src_stride) {
         fprintf(stderr, "pulsar: expert half refused: %s [%llu,%llu) of k=%llu n=%llu\n",
@@ -1283,10 +1287,11 @@ int pulsar_gpu_register_mxfp4_expert_half(const void *key_map, uint64_t key_offs
  * trellis run(s), suh and svh, three strided copies -- and the destination is
  * exl3_expert_layout of the half shape, which the EXL3 arms read unchanged at
  * expert_mid_dim = hi - lo. */
-int pulsar_gpu_register_exl3_expert_half(const void *key_map, uint64_t key_offset,
-                                         const void *model_map, uint64_t src_offset,
+int pulsar_gpu_register_exl3_expert_half(const void *key_map, MapOff key_offset_m,
+                                         const void *model_map, MapOff src_offset_m,
                                          uint32_t n_expert, uint64_t k, uint64_t n, int k2, int k_half,
                                          uint64_t lo, uint64_t hi) {
+    const uint64_t key_offset = key_offset_m.raw(), src_offset = src_offset_m.raw();   /* L438: MapOff ends at the launch */
     exl3_cut c;
     if (!key_map || !model_map || n_expert == 0 || !exl3_expert_cut(k, n, k2, k_half != 0, lo, hi, 0, hi - lo, &c)) {
         fprintf(stderr, "pulsar: EXL3 expert half refused: %s [%llu,%llu) of k=%llu n=%llu at K=%g (a 128-aligned "
@@ -2992,7 +2997,8 @@ int pulsar_gpu_set_model_fd_for_map(int fd, const void *model_map) {
 
 
 
-int pulsar_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
+int pulsar_gpu_cache_model_range(const void *model_map, uint64_t model_size, MapOff offset_m, uint64_t bytes, const char *label) {
+    const uint64_t offset = offset_m.raw();   /* L438: MapOff ends at the launch */
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
     if (cuda_model_range_is_cached(model_map, offset, bytes)) return 1;
@@ -3018,8 +3024,10 @@ int pulsar_gpu_cache_model_range(const void *model_map, uint64_t model_size, uin
  * the overlay's host map so cuda_model_range_ptr resolves them like any other
  * cached range. Runs at startup only (synchronous). */
 int pulsar_gpu_cache_external_range(const void *host_base_key, int fd,
-                                            uint64_t offset, uint64_t bytes,
+                                            FileOff offset_f, uint64_t bytes,
                                             const char *label) {
+    /* L438: a FileOff ends here -- the donor is mapped whole, so it is the span's key offset too */
+    const uint64_t offset = offset_f.raw();
     if (!host_base_key || fd < 0 || bytes == 0) return 0;
 
     /* L217 / PLAN 94 s2.5: the overlay is a SECOND allocation route into the

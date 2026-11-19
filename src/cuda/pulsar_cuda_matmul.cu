@@ -880,11 +880,12 @@ int pulsar_gpu_embed_tokens_hc_tensor(
         const pulsar_gpu_tensor *tokens_t,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                weight_offset,
+        MapOff                  weight_offset_m,
         uint32_t                n_vocab,
         uint32_t                n_tokens,
         uint32_t                n_embd,
         uint32_t                n_hc) {
+    const uint64_t weight_offset = weight_offset_m.raw();   /* L438: MapOff ends at the launch */
     if (!out_hc || !tokens_t || !model_map ||
         weight_offset > model_size ||
         (uint64_t)n_vocab * n_embd * sizeof(uint16_t) > model_size - weight_offset ||
@@ -2812,12 +2813,14 @@ __global__ static void mxfp8_mmvq_deint_nt_a8_kernel(OT *out, const __nv_fp8_e4m
 std::unordered_set<map_offset_key, map_offset_key_hash> g_fp8_offsets;
 
 
-void pulsar_gpu_register_fp8_weight(const void *model_map, uint64_t weight_offset) {
+void pulsar_gpu_register_fp8_weight(const void *model_map, MapOff weight_offset_m) {
+    const uint64_t weight_offset = weight_offset_m.raw();   /* L438: MapOff ends at the launch */
     g_fp8_offsets.insert({model_map, weight_offset});
 }
 
 
-void pulsar_gpu_register_fp8_lt_weight(const void *model_map, uint64_t weight_offset) {
+void pulsar_gpu_register_fp8_lt_weight(const void *model_map, MapOff weight_offset_m) {
+    const uint64_t weight_offset = weight_offset_m.raw();   /* L438: MapOff ends at the launch */
     g_mxfp8_lt_offsets.insert({model_map, weight_offset});
 }
 
@@ -2827,10 +2830,11 @@ void pulsar_gpu_register_fp8_lt_weight(const void *model_map, uint64_t weight_of
  * GEMM arm finds it by offset exactly like a staged model tensor.  map_key is
  * any pointer unique to the caller's weight set; the caller passes the same key
  * and a model_size covering [offset, offset + data + scale) to the GEMM. */
-int pulsar_gpu_register_fp8_lt_weight_resident(const void *map_key, uint64_t offset,
+int pulsar_gpu_register_fp8_lt_weight_resident(const void *map_key, MapOff offset_m,
                                                uint64_t in_dim, uint64_t out_dim,
                                                const pulsar_gpu_tensor *data,
                                                const pulsar_gpu_tensor *scale) {
+    const uint64_t offset = offset_m.raw();   /* L438: MapOff ends at the launch */
     if (!map_key || !data || !scale || in_dim == 0 || in_dim % 32 != 0 || out_dim == 0) return 0;
     const int KB = (int)(in_dim / 32), KBp = mx_rup(KB, 4);
     const size_t data_bytes = in_dim * out_dim;
@@ -2847,9 +2851,10 @@ int pulsar_gpu_register_fp8_lt_weight_resident(const void *map_key, uint64_t off
     return 1;
 }
 
-int pulsar_gpu_register_fp8_lt_row_slice(const void *model_map, uint64_t parent_offset,
+int pulsar_gpu_register_fp8_lt_row_slice(const void *model_map, MapOff parent_offset_m,
                                          uint64_t in_dim, uint64_t out_full,
                                          uint64_t row_lo, uint64_t row_hi) {
+    const uint64_t parent_offset = parent_offset_m.raw();   /* L438: MapOff ends at the launch */
     if (!model_map || in_dim == 0 || in_dim % 32 != 0 || row_hi <= row_lo || row_hi > out_full) {
         fprintf(stderr, "pulsar: MXFP8_LT row slice refused: rows [%llu,%llu) of %llu, in_dim %llu\n",
                 (unsigned long long)row_lo, (unsigned long long)row_hi,
@@ -2949,10 +2954,11 @@ __global__ static void mxfp8_lt_kslice_scale_kernel(unsigned char *dst, const un
     }
 }
 
-int pulsar_gpu_register_fp8_lt_kslice(const void *model_map, uint64_t parent_offset,
+int pulsar_gpu_register_fp8_lt_kslice(const void *model_map, MapOff parent_offset_m,
                                       uint64_t in_full, uint64_t out_dim,
                                       uint64_t k_lo, uint64_t k_hi,
-                                      const void *key_map, uint64_t key_offset) {
+                                      const void *key_map, MapOff key_offset_m) {
+    const uint64_t parent_offset = parent_offset_m.raw(), key_offset = key_offset_m.raw();   /* L438: MapOff ends at the launch */
     if (!model_map || !key_map || in_full == 0 || out_dim == 0 || k_hi <= k_lo || k_hi > in_full ||
         k_lo % 128 != 0 || k_hi % 128 != 0 || in_full % 32 != 0) {
         fprintf(stderr, "pulsar: MXFP8_LT K slice refused: K [%llu,%llu) of %llu (128-aligned bounds "
@@ -3410,7 +3416,8 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
 
 
 
-int pulsar_gpu_matmul_mxfp8_tensor(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok) {
+int pulsar_gpu_matmul_mxfp8_tensor(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, MapOff weight_offset_m, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok) {
+    const uint64_t weight_offset = weight_offset_m.raw();   /* L438: MapOff ends at the launch */
     return cuda_matmul_mxfp8_tensor_labeled(out, model_map, model_size, weight_offset,
                                            in_dim, out_dim, x, n_tok, "mxfp8");
 }
@@ -3958,7 +3965,8 @@ static int matmul_bf16_wptr(pulsar_gpu_tensor *out, const uint16_t *w,
 }
 
 
-int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok) {
+int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, MapOff weight_offset_m, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok) {
+    const uint64_t weight_offset = weight_offset_m.raw();   /* L438: MapOff ends at the launch */
     if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0)
         return cuda_refuse("pulsar_gpu_matmul_bf16_tensor", "a NULL operand or an empty shape (%llu rows of %llu -> "
                            "%llu)",
@@ -4055,7 +4063,8 @@ static const uint16_t *f32_weight_bf16_resolve(const void *model_map,
 
 
 
-int pulsar_gpu_matmul_f32_tensor(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok) {
+int pulsar_gpu_matmul_f32_tensor(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, MapOff weight_offset_m, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok) {
+    const uint64_t weight_offset = weight_offset_m.raw();   /* L438: MapOff ends at the launch */
     if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0 || out_dim > UINT64_MAX / in_dim)
         return cuda_refuse("pulsar_gpu_matmul_f32_tensor", "a NULL operand, an empty shape or one that overflows (%llu "
                            "rows of %llu -> %llu)", (unsigned long long)n_tok, (unsigned long long)in_dim,
@@ -4255,12 +4264,13 @@ int pulsar_gpu_attention_output_a_tensor(
         pulsar_gpu_tensor       *low,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                out_a_offset,
+        MapOff                  out_a_offset_m,
         uint64_t                group_dim,
         uint64_t                rank,
         uint32_t                n_groups,
         const pulsar_gpu_tensor *heads,
         uint32_t                n_tokens) {
+    const uint64_t out_a_offset = out_a_offset_m.raw();   /* L438: MapOff ends at the launch */
     if (!low || !heads || !model_map ||
         group_dim == 0 || rank == 0 || n_groups == 0 || n_tokens == 0) {
         return cuda_refuse("pulsar_gpu_attention_output_a_tensor", "a NULL operand or an empty shape (%u tokens, %u "
@@ -4279,7 +4289,7 @@ int pulsar_gpu_attention_output_a_tensor(
             pulsar_gpu_tensor low_suf = pulsar_tensor_subview(low, n_dec * lowb, low->bytes - n_dec * lowb);
             const int saved = g_batch_decode_rows;
             g_batch_decode_rows = (int)n_dec;
-            int r1 = pulsar_gpu_attention_output_a_tensor(&low_pre, model_map, model_size, out_a_offset,
+            int r1 = pulsar_gpu_attention_output_a_tensor(&low_pre, model_map, model_size, out_a_offset_m,
                                                           group_dim, rank, n_groups, &hd_pre, (uint32_t)n_dec);
             g_batch_decode_rows = 0;
             /* The suffix is a prefill run inside a step wider than the cap:
@@ -4337,11 +4347,12 @@ int pulsar_gpu_attention_output_b_tensor(
         pulsar_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                out_b_offset,
+        MapOff                  out_b_offset_m,
         uint64_t                low_dim,
         uint64_t                out_dim,
         pulsar_gpu_tensor       *low,
         uint32_t                n_tokens) {
+    const uint64_t out_b_offset = out_b_offset_m.raw();   /* L438: MapOff ends at the launch */
     if (!out || !low || !model_map || low_dim == 0 || out_dim == 0 || n_tokens == 0) return 0;
     {
         const uint64_t n_dec = (uint64_t)g_batch_decode_rows;
@@ -4354,7 +4365,7 @@ int pulsar_gpu_attention_output_b_tensor(
             pulsar_gpu_tensor low_suf = pulsar_tensor_subview(low, n_dec * lowb, low->bytes - n_dec * lowb);
             const int saved = g_batch_decode_rows;
             g_batch_decode_rows = (int)n_dec;
-            int r1 = pulsar_gpu_attention_output_b_tensor(&out_pre, model_map, model_size, out_b_offset,
+            int r1 = pulsar_gpu_attention_output_b_tensor(&out_pre, model_map, model_size, out_b_offset_m,
                                                           low_dim, out_dim, &low_pre, (uint32_t)n_dec);
             g_batch_decode_rows = 0;
             const uint32_t n_suf = n_tokens - (uint32_t)n_dec;

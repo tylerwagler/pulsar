@@ -140,7 +140,7 @@ static const void *qv_bind(const pulsar_model *m, bool *ok, const char *name, ui
         *ok = false;
         return NULL;
     }
-    return (const char *)tensor_map_base(m, t) + t->abs_offset;
+    return (const char *)pulsar_map_at(tensor_map_base(m, t), t->abs_offset);
 }
 
 /** @def QV1(field, nm, n0)

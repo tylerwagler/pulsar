@@ -87,8 +87,8 @@ struct pulsar_nemotron_parse_run {
     /// The device buffers, indexed by np_buf.
     pulsar_gpu_tensor *t[B_COUNT];
     /// Each buffer's size in bytes.
-    uint64_t bytes[B_COUNT];
-    uint64_t pool_bytes;       ///< one layer's KV pool: max_seq tokens
+    TensorBytes bytes[B_COUNT];
+    TensorBytes pool_bytes;    ///< one layer's KV pool: max_seq tokens
     const float *cls_rows;     ///< f32 [n_cls][vit_width] (the mapping's)
     /** @var pulsar_nemotron_parse_run::pos_h
      *  the cached position rows' canvas height (pixels; 0 = none cached)
@@ -188,7 +188,7 @@ struct ctx {
                   const char *what) {
         pulsar_rows_linear l;
         if (!pulsar_linear_rows_ref(&e->model, t, in, out, prompt, what, &l)) return fail(err, errlen, what);
-        return pulsar_rows_linear_launch(&l, x_bf16, (int)rows, stage(), dp(r->t[B_LWS]), r->bytes[B_LWS], 0) == 0 ||
+        return pulsar_rows_linear_launch(&l, x_bf16, (int)rows, stage(), dp(r->t[B_LWS]), r->bytes[B_LWS].raw(), 0) == 0 ||
                fail(err, errlen, what);
     }
     /* a stage for the grade: f32 rows of a buffer */
@@ -356,7 +356,7 @@ bool decoder(ctx &c, uint32_t pos0, uint32_t n, bool prompt) {
     io.out_bf16 = att;
     io.ld_out = E;
     io.workspace = dp(r->t[B_DAWS]);
-    io.workspace_bytes = r->bytes[B_DAWS];
+    io.workspace_bytes = r->bytes[B_DAWS].raw();
     for (TrunkLayer il{0u}; il.below(s.n_layer); ++il) {
         const pulsar_nemotron_parse_dec_layer &L = w->layer[il];
         for (uint32_t r0 = 0; r0 < n; r0 += NP_CHUNK) {
@@ -374,8 +374,8 @@ bool decoder(ctx &c, uint32_t pos0, uint32_t n, bool prompt) {
                 return fail(c.err, c.errlen, "the decoder's q / k / v refused");
         }
         pulsar_gqa_seq seq = {};
-        seq.kv = (uint8_t *)dp(r->t[B_POOLS]) + (uint64_t)il.raw() * r->pool_bytes;
-        seq.bytes = r->pool_bytes;
+        seq.kv = (uint8_t *)dp(r->t[B_POOLS]) + r->pool_bytes.times(il.raw()).raw();
+        seq.bytes = r->pool_bytes.raw();
         seq.cap = s.max_seq;
         if (pulsar_gqa_forward(&r->dec, &seq, 1, row_seq.data(), row_pos.data(), n, &io, 0) != 0)
             return fail(c.err, c.errlen, "the decoder's attention refused");
@@ -579,26 +579,26 @@ bool pulsar_nemotron_parse_run_create(pulsar_engine *e) {
     B.kv_fmt = PULSAR_GQA_KV_BF16;
     B.span = PULSAR_GQA_FULL;
     B.scale = 1.0f / sqrtf((float)(s.width / s.heads));
-    r->pool_bytes = (uint64_t)s.max_seq * pulsar_gqa_kv_token_bytes(&B);
+    r->pool_bytes = TensorBytes{pulsar_gqa_kv_token_bytes(&B)}.times(s.max_seq);
     const uint64_t n = r->n_max, sm = r->s_max;
-    r->bytes[B_PATCH] = (uint64_t)n_patch_max * 3u * P * P * 2u;
-    r->bytes[B_RES] = n * D * 4u;
-    r->bytes[B_XN] = n * D * 2u;
-    r->bytes[B_QKV] = n * 3u * HS * 2u;
-    r->bytes[B_ATT] = n * HS * 2u;
-    r->bytes[B_MLP] = (uint64_t)C * (M > F ? M : F) * 2u;
-    r->bytes[B_STAGE] = (uint64_t)C * (3u * HS > M ? 3u * HS : M) * 4u;
-    r->bytes[B_LWS] = pulsar_f16_rows_workspace_bytes((int)C, (int)E);   /* Wo over bf16 rows: the arm's prescale */
-    r->bytes[B_EMB] = r->bytes[B_H] = sm * E * 4u;
-    r->bytes[B_DXN] = r->bytes[B_Q] = r->bytes[B_DATT] = sm * E * 2u;
-    r->bytes[B_K] = r->bytes[B_V] = sm * KV * 2u;
-    r->bytes[B_DAWS] = pulsar_gqa_workspace_bytes(&B, (uint32_t)sm, s.max_seq);
-    r->bytes[B_IDS] = (uint64_t)NP_PROMPT_MAX * 4u;
-    r->bytes[B_LOGITS] = (uint64_t)s.vocab * 4u;
-    r->bytes[B_POOLS] = (uint64_t)s.n_layer * r->pool_bytes;
-    uint64_t total = 0;
+    r->bytes[B_PATCH] = elt_bytes((uint64_t)n_patch_max * 3u * P * P, 2u);
+    r->bytes[B_RES] = elt_bytes(n * D, 4u);
+    r->bytes[B_XN] = elt_bytes(n * D, 2u);
+    r->bytes[B_QKV] = elt_bytes(n * 3u * HS, 2u);
+    r->bytes[B_ATT] = elt_bytes(n * HS, 2u);
+    r->bytes[B_MLP] = elt_bytes((uint64_t)C * (M > F ? M : F), 2u);
+    r->bytes[B_STAGE] = elt_bytes((uint64_t)C * (3u * HS > M ? 3u * HS : M), 4u);
+    r->bytes[B_LWS] = TensorBytes{pulsar_f16_rows_workspace_bytes((int)C, (int)E)};   /* Wo over bf16 rows: the arm's prescale */
+    r->bytes[B_EMB] = r->bytes[B_H] = elt_bytes(sm * E, 4u);
+    r->bytes[B_DXN] = r->bytes[B_Q] = r->bytes[B_DATT] = elt_bytes(sm * E, 2u);
+    r->bytes[B_K] = r->bytes[B_V] = elt_bytes(sm * KV, 2u);
+    r->bytes[B_DAWS] = TensorBytes{pulsar_gqa_workspace_bytes(&B, (uint32_t)sm, s.max_seq)};
+    r->bytes[B_IDS] = elt_bytes((uint64_t)NP_PROMPT_MAX, 4u);
+    r->bytes[B_LOGITS] = elt_bytes((uint64_t)s.vocab, 4u);
+    r->bytes[B_POOLS] = r->pool_bytes.times(s.n_layer);
+    TensorBytes total{};
     for (int b = 0; b < B_COUNT; b++) {
-        r->t[b] = pulsar_gpu_tensor_alloc(TensorBytes{r->bytes[b]});
+        r->t[b] = pulsar_gpu_tensor_alloc(r->bytes[b]);
         if (!r->t[b]) {
             fprintf(stderr, "pulsar: %s: the forward's scratch did not fit the device -- refusing\n", ARCH);
             return false;
@@ -607,7 +607,7 @@ bool pulsar_nemotron_parse_run_create(pulsar_engine *e) {
     }
     r->cls_rows = (const float *)tensor_data(&e->model, w->cls);
     fprintf(stderr, "pulsar: %s: forward scratch %.0f MiB (tower %u rows, decoder prefill %u rows, KV pools %.0f MiB, "
-                    "decoder attention workspace %.0f MiB)\n", ARCH, (double)total / 1048576.0, r->n_max, r->s_max,
-            (double)r->bytes[B_POOLS] / 1048576.0, (double)r->bytes[B_DAWS] / 1048576.0);
+                    "decoder attention workspace %.0f MiB)\n", ARCH, (double)total.raw() / 1048576.0, r->n_max, r->s_max,
+            (double)r->bytes[B_POOLS].raw() / 1048576.0, (double)r->bytes[B_DAWS].raw() / 1048576.0);
     return true;
 }

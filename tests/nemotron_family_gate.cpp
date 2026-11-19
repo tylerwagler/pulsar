@@ -214,15 +214,15 @@ int main(int argc, char **argv) {
                           2ull * s->ssm_n_head + 3u) / 4u * 4u * 4u;
     bool state_ok = sp->n_decl == PULSAR_NEMOTRON_H_STATE_COUNT && sp->split_invariant && sp->resume_grid > 0 &&
                     ssm.kind == PULSAR_STATE_FIXED && ssm.capture == PULSAR_STATE_CAPTURE_DELTA && ssm.commit &&
-                    ssm.bytes == ssm_bytes && ssm.capture_bytes == upd &&
+                    ssm.bytes.raw() == ssm_bytes && ssm.capture_bytes.raw() == upd &&
                     conv.kind == PULSAR_STATE_FIXED && conv.capture == PULSAR_STATE_CAPTURE_SNAPSHOT &&
-                    conv.bytes == (uint64_t)(s->conv_k - 1u) * conv_ch * 2u &&
+                    conv.bytes.raw() == (uint64_t)(s->conv_k - 1u) * conv_ch * 2u &&
                     kv.kind == PULSAR_STATE_POOL && kv.tokens == 1u &&
-                    kv.bytes == 2ull * s->n_head_kv * s->head_dim * 2u &&
+                    kv.bytes.raw() == 2ull * s->n_head_kv * s->head_dim * 2u &&
                     sp->n_trunk == s->n_layer && sp->n_slots == s->n_layer + (s->mtp_written ? 1u : 0u);
     const pulsar_state_decl &pend = sp->decl[PULSAR_NEMOTRON_H_STATE_MTP_PEND];
     state_ok = state_ok && pend.kind == PULSAR_STATE_FIXED && pend.capture == PULSAR_STATE_CAPTURE_NONE && !pend.host &&
-               pend.bytes == (uint64_t)s->n_embd * 2u;
+               pend.bytes.raw() == (uint64_t)s->n_embd * 2u;
     for (uint32_t il = 0; state_ok && il < s->n_layer; il++)
         state_ok = sp->slot[LayerSlot{il}] == (p->desc[TrunkLayer{il}].mixer == PULSAR_MIXER_MAMBA2
                                         ? (1u << PULSAR_NEMOTRON_H_STATE_SSM | 1u << PULSAR_NEMOTRON_H_STATE_CONV)
@@ -231,8 +231,8 @@ int main(int argc, char **argv) {
         state_ok = sp->slot[LayerSlot{s->n_layer}] == (1u << PULSAR_NEMOTRON_H_STATE_KV | 1u << PULSAR_NEMOTRON_H_STATE_MTP_PEND) &&
                    sp->drafter_at == pulsar_mtp_drafter_at && sp->drafter_frontier == pulsar_mtp_drafter_frontier;
     check(state_ok, "the declared state: ssm FIXED DELTA %llu B (+ %llu B a verify row), ssm_conv FIXED SNAPSHOT %llu B "
-          "a Mamba-2 layer; kv POOL %llu B a token an attention layer%s", (unsigned long long)ssm.bytes,
-          (unsigned long long)ssm.capture_bytes, (unsigned long long)conv.bytes, (unsigned long long)kv.bytes,
+          "a Mamba-2 layer; kv POOL %llu B a token an attention layer%s", (unsigned long long)ssm.bytes.raw(),
+          (unsigned long long)ssm.capture_bytes.raw(), (unsigned long long)conv.bytes.raw(), (unsigned long long)kv.bytes.raw(),
           s->mtp_written ? "; the drafter's slot: kv POOL + mtp_pend FIXED (the parked row), the lane's hooks" : "");
     /* L331 (dev 309ed8fd): Nemotron 3.5 Super VL takes images -- PULSAR_FAMILY_CAP_VISION; still no TP */
     const uint32_t want = PULSAR_FAMILY_CAP_CHAT | PULSAR_FAMILY_CAP_BANKS | PULSAR_FAMILY_CAP_SEGMENTS |

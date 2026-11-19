@@ -1085,7 +1085,7 @@ static bool gpu_graph_indexed_attention_span(
         uint32_t                    spos0,
         uint64_t                    q_dim,
         uint32_t                    n_head,      // the OWNED heads (slice 4g)
-        uint64_t                    sinks_off,   // the first owned head's sink
+        MapOff                      sinks_off,   // the first owned head's sink
         uint32_t                    n_comp,
         uint32_t                    ratio,
         float                       index_scale,
@@ -1096,8 +1096,8 @@ static bool gpu_graph_indexed_attention_span(
      * n_head packed rows, in BYTES -- the element-size trap the sq_view
      * comment below warns about, avoided by construction. */
     pulsar_gpu_tensor *iq_view = pulsar_gpu_tensor_view(g->batch_indexer_qp,
-            TensorBytes{pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX)}.times((uint64_t)s0 * PULSAR_N_INDEXER_HEAD),
-            TensorBytes{pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX)}.times((uint64_t)sn * PULSAR_N_INDEXER_HEAD));
+            pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX).times((uint64_t)s0 * PULSAR_N_INDEXER_HEAD),
+            pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX).times((uint64_t)sn * PULSAR_N_INDEXER_HEAD));
     pulsar_gpu_tensor *iw_view = pulsar_gpu_tensor_view(g->batch_indexer_weights,
             bytes_of<float>((uint64_t)s0 * PULSAR_N_INDEXER_HEAD),
             bytes_of<float>((uint64_t)sn * PULSAR_N_INDEXER_HEAD));
@@ -1185,7 +1185,7 @@ static bool gpu_graph_indexed_attention_span(
             const uint32_t bank  = (uint32_t)g->ms_seq_id[s0 + r0];
             const uint32_t rpos0 = (uint32_t)g->ms_positions[s0 + r0];
             const TensorBytes qp_row =   /* one row's index-K heads */
-                    TensorBytes{pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX)}.times(PULSAR_N_INDEXER_HEAD);
+                    pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX).times(PULSAR_N_INDEXER_HEAD);
             pulsar_gpu_tensor *rq =
                     pulsar_gpu_tensor_view(g->batch_indexer_qp, qp_row.times(s0 + r0), qp_row.times(rn));
             pulsar_gpu_tensor *rw = pulsar_gpu_tensor_view(g->batch_indexer_weights,
@@ -1400,7 +1400,7 @@ static bool tp_attn_input_split(pulsar_gpu_graph *g, const pulsar_model *model,
     }
     pulsar_tp_row_lane_layout_t L;
     pulsar_tp_row_lane_layout(g->tp, &L);
-    const uint64_t vf = L.vec_bytes / sizeof(float);
+    const uint64_t vf = L.vec_bytes.raw() / sizeof(float);   /* floats a slot carries */
     const uint32_t msgs = (uint32_t)((elem0 + vf - 1u) / vf);
     if (ok && (msgs == 0 || msgs > PULSAR_TP_BATCH_MAX_ROWS)) {
         fprintf(stderr, "pulsar: layer %u: attention-input gather of %llu floats needs %u row-lane messages "
@@ -1411,13 +1411,13 @@ static bool tp_attn_input_split(pulsar_gpu_graph *g, const pulsar_model *model,
     uint8_t *slab = (uint8_t *)g->tp_slab_dev;
     uint64_t first = 0, exch = 0;
     pulsar_gpu_tensor *payload = ok ? pulsar_gpu_tensor_view(g->tp_ain_own, TensorBytes{0},
-                                                             TensorBytes{L.vec_bytes}.times(msgs)) : NULL;
+                                                             L.vec_bytes.times(msgs)) : NULL;
     if (ok) ok = payload && pulsar_tp_row_lane_begin(g->tp, msgs, &first, &exch) != 0;
     if (ok) ok = pulsar_gpu_tp_stage_publish(payload, NULL, slab, L.out_off, L.vec_bytes, first, L.n_slots,
-                                             msgs, slab + L.desc_off, exch, g->tp_stage_ticket) != 0;
+                                             msgs, pulsar_slab_at(slab, L.desc_off), exch, g->tp_stage_ticket) != 0;
     if (ok) ok = pulsar_gpu_tp_combine_gather_blocks(blocks, n, n_tokens, g->tp_ain_own, slab, L.in_off,
-                                                     L.vec_bytes, first, L.n_slots, slab + L.done_off, exch,
-                                                     slab + L.err_off) != 0;
+                                                     L.vec_bytes, first, L.n_slots, pulsar_slab_at(slab, L.done_off), exch,
+                                                     pulsar_slab_at(slab, L.err_off)) != 0;
     pulsar_gpu_tensor_free(payload);
     if (!ok) fprintf(stderr, "pulsar: layer %u: attention-input row split refused (%u rows, %u blocks)\n",
                      il.raw(), n_tokens, n);
@@ -1476,7 +1476,7 @@ bool gpu_graph_encode_layer_attention_batch(
     const uint32_t n_head = n_groups * group_heads;
     const uint32_t h_lo = g_lo * group_heads;
     const uint64_t q_dim = (uint64_t)n_head * PULSAR_N_HEAD_DIM;
-    const uint64_t sinks_off = layer->attn_sinks->abs_offset + (uint64_t)h_lo * sizeof(float);
+    const MapOff sinks_off = layer->attn_sinks->abs_offset + bytes_of<float>(h_lo);
     const uint32_t ratio = pulsar_layer_compress_ratio(il);
     const bool compressed = ratio != 0;
     /* CSA2 (L218): the pools this layer attends over live at its kv source. */
@@ -2435,8 +2435,8 @@ bool gpu_graph_encode_layer_attention_batch(
                     const float index_scale = 1.0f / sqrtf((float)(PULSAR_N_INDEXER_HEAD_DIM * PULSAR_N_INDEXER_HEAD));
                     pulsar_gpu_tensor *indexer_q_view = pulsar_gpu_tensor_view(
                             g->batch_indexer_qp,
-                            TensorBytes{pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX)}.times(PULSAR_N_INDEXER_HEAD).times(t),
-                            TensorBytes{pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX)}.times(PULSAR_N_INDEXER_HEAD));
+                            pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX).times(PULSAR_N_INDEXER_HEAD).times(t),
+                            pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX).times(PULSAR_N_INDEXER_HEAD));
                     pulsar_gpu_tensor *indexer_w_view = gpu_graph_tensor_row_view(
                             g->batch_indexer_weights, t, PULSAR_N_INDEXER_HEAD);
                     ok = indexer_q_view && indexer_w_view &&
@@ -2492,8 +2492,8 @@ bool gpu_graph_encode_layer_attention_batch(
                  * what attention read by construction. */
                 pulsar_gpu_tensor *kv_pack_view = pulsar_gpu_tensor_view(
                         g->batch_kv_pack,
-                        TensorBytes{pulsar_kv_row_bytes(PULSAR_KV_ROW_RING)}.times(t),
-                        TensorBytes{pulsar_kv_row_bytes(PULSAR_KV_ROW_RING)});
+                        pulsar_kv_row_bytes(PULSAR_KV_ROW_RING).times(t),
+                        pulsar_kv_row_bytes(PULSAR_KV_ROW_RING));
                 pulsar_gpu_tensor *heads_view = gpu_graph_heads_row_view(g->batch_heads, t, q_dim);
                 ok = ok && q_view && kv_pack_view && heads_view;
                 if (ok && !zero_prefix) {
@@ -2644,7 +2644,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                   tensor_map_base(model, layer->attn_output_a),
                                                   tensor_map_size(model, layer->attn_output_a),
                                                   layer->attn_output_a->abs_offset +
-                                                      (uint64_t)g_lo * rank * group_dim,
+                                                      bytes_of<uint8_t>((uint64_t)g_lo * rank * group_dim),
                                                   group_dim,
                                                   rank,
                                                   n_groups,
@@ -2906,10 +2906,10 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                       router_map,
                                                       router_map_size,
                                                       layer->ffn_exp_probs_b
-                                                          ? layer->ffn_exp_probs_b->abs_offset : 0,
+                                                          ? layer->ffn_exp_probs_b->abs_offset : MapOff{},
                                                       layer->ffn_exp_probs_b != NULL,
                                                       layer->ffn_gate_tid2eid
-                                                          ? layer->ffn_gate_tid2eid->abs_offset : 0,
+                                                          ? layer->ffn_gate_tid2eid->abs_offset : MapOff{},
                                                       layer->ffn_gate_tid2eid
                                                           ? (uint32_t)layer->ffn_gate_tid2eid->dim[1] : 0,
                                                       g->batch_router_logits,
@@ -2918,7 +2918,7 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                       layer->n_expert_used,
                                                       PULSAR_EXPERT_WEIGHT_SCALE,
                                                       n_tokens,
-                                                      layer->ffn_exp_probs_b_vl ? layer->ffn_exp_probs_b_vl->abs_offset : 0,
+                                                      layer->ffn_exp_probs_b_vl ? layer->ffn_exp_probs_b_vl->abs_offset : MapOff{},
                                                       PULSAR_N_VOCAB,
                                                       layer->ffn_exp_probs_b_vl != NULL) != 0;
     if (ok) {

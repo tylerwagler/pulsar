@@ -3497,10 +3497,10 @@ bool pulsar_tp_bulk_lane(const pulsar_tp *tp) {
 void pulsar_tp_bulk_layout(const pulsar_tp *tp, pulsar_tp_bulk_layout_t *out) {
     memset(out, 0, sizeof(*out));
     if (!tp) return;
-    out->cap_bytes = tp->bulk_cap;
-    out->out_off = 0;
-    out->in_off[0] = tp->bulk_cap;
-    out->in_off[1] = 2u * tp->bulk_cap;
+    out->cap_bytes = TensorBytes{tp->bulk_cap};   /* L438: the transport's raw sizes enter the exported layout */
+    out->out_off = SlabOff{};
+    out->in_off[0] = SlabOff::after(out->cap_bytes);
+    out->in_off[1] = SlabOff::after(out->cap_bytes.times(2u));
 }
 
 int pulsar_tp_bulk_begin(pulsar_tp *tp, uint64_t bytes, uint64_t *exch, uint32_t *buf) {
@@ -3543,12 +3543,13 @@ int pulsar_tp_bulk_begin(pulsar_tp *tp, uint64_t bytes, uint64_t *exch, uint32_t
 void pulsar_tp_row_lane_layout(const pulsar_tp *tp, pulsar_tp_row_lane_layout_t *out) {
     memset(out, 0, sizeof(*out));
     if (!tp) return;
-    out->out_off = tp->layout.out_off;
-    out->in_off = tp->layout.in_off;
-    out->desc_off = tp->layout.out_flags_off;
-    out->done_off = tp->layout.in_flags_off;
-    out->err_off = tp->layout.gpu_flags_off;
-    out->vec_bytes = tp->vec_bytes;
+    /* L438: the transport's raw slab layout (pulsar_tp_slab, the wire's) enters the exported, typed one here */
+    out->out_off = SlabOff{tp->layout.out_off};
+    out->in_off = SlabOff{tp->layout.in_off};
+    out->desc_off = SlabOff{tp->layout.out_flags_off};
+    out->done_off = SlabOff{tp->layout.in_flags_off};
+    out->err_off = SlabOff{tp->layout.gpu_flags_off};
+    out->vec_bytes = TensorBytes{tp->vec_bytes};
     out->n_slots = tp->n_slots;
 }
 

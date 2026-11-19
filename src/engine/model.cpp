@@ -463,9 +463,9 @@ static int accelerator_tensor_span_cmp(const void *a, const void *b) {
 
 
 /// @return the widest merged staging span (1 GiB)
-static uint64_t accelerator_cuda_preload_span_bytes(void) {
+static TensorBytes accelerator_cuda_preload_span_bytes(void) {
     /* 1 GiB spans; the env override had no caller (L159 inc 4). */
-    return 1024ull * 1048576ull;
+    return TensorBytes{1024ull * 1048576ull};
 }
 
 
@@ -578,11 +578,12 @@ static bool accelerator_prepare_model_tensor_spans(const pulsar_model *m,
             memcmp(t->name.ptr, skip_prefix, strlen(skip_prefix)) == 0) continue;
         const uint8_t *base = t->ext_map ? t->ext_map : m->map;
         const uint64_t map_size = t->ext_map ? t->ext_size : m->size;
-        if (t->abs_offset > map_size || t->bytes > map_size - t->abs_offset) {
+        const uint64_t at = t->abs_offset.raw();   /* checked raw: against the mapping's size and the filter's spans */
+        if (at > map_size || t->bytes > map_size - at) {
             free(spans);
             return false;
         }
-        if (!accelerator_span_filter_contains(t->abs_offset, t->bytes,
+        if (!accelerator_span_filter_contains(at, t->bytes,
                                               span_offsets, span_sizes, span_count)) {
             continue;
         }
@@ -593,7 +594,7 @@ static bool accelerator_prepare_model_tensor_spans(const pulsar_model *m,
             .base = base,
             .map_size = map_size,
             .off = t->abs_offset,
-            .end = t->abs_offset + t->bytes,
+            .end = t->abs_offset + pulsar_tensor_stored_bytes(t),
         };
     }
     if (nspan == 0) {
@@ -604,7 +605,7 @@ static bool accelerator_prepare_model_tensor_spans(const pulsar_model *m,
 
     qsort(spans, (size_t)nspan, sizeof(spans[0]), accelerator_tensor_span_cmp);
 
-    const uint64_t max_span = accelerator_cuda_preload_span_bytes();
+    const TensorBytes max_span = accelerator_cuda_preload_span_bytes();
     const int tty = pulsar_log_is_tty(stderr);
     const uint64_t progress_step = (tty ? 2ull : 16ull) * 1073741824ull;
     uint64_t next_progress = progress_step;
@@ -623,8 +624,8 @@ static bool accelerator_prepare_model_tensor_spans(const pulsar_model *m,
     for (uint64_t i = 0; i < nspan;) {
         const uint8_t *base = spans[i].base;
         const uint64_t map_size = spans[i].map_size;
-        uint64_t off = spans[i].off;
-        uint64_t end = spans[i].end;
+        const MapOff off = spans[i].off;
+        MapOff end = spans[i].end;
         i++;
         /* A tensor of 1 MiB or more starts its OWN span: the arena page-aligns
          * span bases (cuda_model_arena_alloc), and only a tensor at the head of
@@ -632,24 +633,24 @@ static bool accelerator_prepare_model_tensor_spans(const pulsar_model *m,
          * expert block sat 24 B into a page for all 256 experts (L239). */
         while (i < nspan &&
                spans[i].base == base &&
-               spans[i].off <= end + 65536u &&
+               spans[i].off <= end + TensorBytes{65536u} &&
                spans[i].end - off <= max_span &&
-               spans[i].end - spans[i].off < 1048576u) {
+               spans[i].end - spans[i].off < TensorBytes{1048576u}) {
             if (spans[i].end > end) end = spans[i].end;
             i++;
         }
         char label[96];
         snprintf(label, sizeof(label), "tensor-span:%" PRIu64, merged);
-        if (pulsar_gpu_cache_model_range(base, map_size, off, end - off, label) == 0) {
+        if (pulsar_gpu_cache_model_range(base, map_size, off, (end - off).raw(), label) == 0) {
             if (tty) fputc('\n', stderr);
             fprintf(stderr,
                     "pulsar: accelerator failed to prepare model tensor span %" PRIu64
                     " at offset %" PRIu64 "\n",
-                    merged, off);
+                    merged, off.raw());
             free(spans);
             return false;
         }
-        prepared += end - off;
+        prepared += (end - off).raw();
         merged++;
 
         const double now = now_sec();
@@ -743,7 +744,7 @@ bool accelerator_cache_model_tensors(pulsar_backend backend,
 /* Return the in-place tensor payload inside the mapped model (or inside the
  * overlay file's mapping for --expert-overlay swapped tensors). */
 const void *tensor_data(const pulsar_model *m, const pulsar_tensor *t) {
-    return (const uint8_t *)tensor_map_base(m, t) + t->abs_offset;
+    return pulsar_map_at(tensor_map_base(m, t), t->abs_offset);
 }
 
 
@@ -764,7 +765,7 @@ bool accelerator_prepare_expert_overlay(pulsar_backend backend,
         snprintf(label, sizeof(label), "overlay:%.*s",
                  (int)(t->name.len < 80 ? t->name.len : 80), t->name.ptr);
         if (pulsar_gpu_cache_external_range(overlay->map, overlay->fd,
-                                         t->abs_offset, t->bytes, label) == 0) {
+                                         pulsar_tensor_file_off(t), t->bytes, label) == 0) {
             fprintf(stderr, "pulsar: failed to prepare expert-overlay span for %.*s\n",
                     (int)t->name.len, t->name.ptr);
             return false;

@@ -1261,8 +1261,8 @@ pulsar_context_memory pulsar_context_memory_estimate(
     m.prefill_cap = gpu_graph_prefill_cap_for_prompt((int)ctx, prefill_chunk);
     m.raw_cap = gpu_graph_raw_cap_for_context((int)ctx, m.prefill_cap);
     m.comp_cap = gpu_graph_comp_cap_max(ctx);
-    m.raw_bytes = gpu_graph_raw_ring_bytes_for_context(m.raw_cap);
-    m.comp_index_bytes = gpu_graph_comp_index_bytes_for_context(ctx);
+    m.raw_bytes = gpu_graph_raw_ring_bytes_for_context(m.raw_cap).raw();   /* pulsar.h's estimate struct: printed */
+    m.comp_index_bytes = gpu_graph_comp_index_bytes_for_context(ctx).raw();
     uint64_t kv_bytes = 0;
     m.total_bytes = gpu_graph_context_bytes_for_kv_policy(ctx, m.raw_cap, m.prefill_cap, &kv_bytes);
     m.scratch_bytes = m.total_bytes - kv_bytes;

@@ -119,18 +119,18 @@ int pulsar_driver_session_create(pulsar_session *s, uint32_t n_banks) {
     if (ok) ok = (s->states = pulsar_state_create(e, &e->state_plan, d, n_banks, (uint32_t)s->ctx_size,
                                                   verifies ? PULSAR_STATE_VERIFY_ROWS : 0u)) != NULL;
     for (uint32_t a = 0; ok && a < ops->n_scratch; a++) {
-        const uint64_t b = ops->scratch_bytes(a, d->max_rows, s->states->ctx);
-        if (b) ok = (d->scratch[a] = pulsar_gpu_tensor_alloc(TensorBytes{b})) != NULL;
+        const TensorBytes b = ops->scratch_bytes(a, d->max_rows, s->states->ctx);
+        if (b != TensorBytes{}) ok = (d->scratch[a] = pulsar_gpu_tensor_alloc(b)) != NULL;
     }
     /* L266 step 7: under TP, the row all-reduce's stage ticket (one u32) and the vocab gather's own slice (its row
      * lane's; sized whatever the transport, so the price holds) -- allocated here so the dry run prices them */
     if (ok && e->model.tp_n_ranks > 1) {
         uint32_t nl = 0, ne = 0, nv = 0;
         e->family->tp_shape(e, &nl, &ne, &nv);
-        const uint64_t vb = pulsar_tp_vocab_own_bytes_for((uint32_t)e->model.tp_n_ranks, (uint64_t)ne * sizeof(float),
-                                                          nv, PULSAR_DRIVER_HEADS_MAX);
+        const TensorBytes vb = pulsar_tp_vocab_own_bytes_for((uint32_t)e->model.tp_n_ranks, (uint64_t)ne * sizeof(float),
+                                                             nv, PULSAR_DRIVER_HEADS_MAX);
         ok = (d->tp_ticket = pulsar_gpu_tensor_alloc(bytes_of<uint32_t>(1))) != NULL &&
-             (d->tp_vocab_own = pulsar_gpu_tensor_alloc(TensorBytes{vb})) != NULL;
+             (d->tp_vocab_own = pulsar_gpu_tensor_alloc(vb)) != NULL;
     }
     /* L338 P2: the per-bank adapter switch, every bank plain (host only: the family's stage reads it per step) */
     if (ok && ops->adapter && ops->adapter(e)) d->bank_adapter = (uint8_t *)xcalloc(n_banks, 1);
@@ -156,8 +156,8 @@ int pulsar_driver_session_create(pulsar_session *s, uint32_t n_banks) {
         for (uint32_t k = 0; k < p->n_slots; k++)
             for (uint32_t id = 0; id < p->n_decl; id++) {
                 if (!(p->slot[LayerSlot{k}] >> id & 1u)) continue;
-                if (p->decl[id].kind == PULSAR_STATE_POOL) per_token += (double)p->decl[id].bytes / p->decl[id].tokens;
-                else fixed += (double)pulsar_state_decl_bank_bytes(&p->decl[id]);
+                if (p->decl[id].kind == PULSAR_STATE_POOL) per_token += (double)p->decl[id].bytes.raw() / p->decl[id].tokens;
+                else fixed += (double)pulsar_state_decl_bank_bytes(&p->decl[id]).raw();
             }
         fprintf(stderr, "pulsar: %s session: %u bank(s) x %d tokens, %u-row steps "
                         "(%.1f MiB fixed per bank + %.1f KiB per token)\n",

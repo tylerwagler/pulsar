@@ -179,10 +179,10 @@ static int payload_write_images(payload_io *io, const pulsar_image_block *b, uin
 /// @param errlen bytes of `err`
 /// @return 0, or 1 when the span is out of range or a copy failed
 static int payload_write_tensor_span(payload_io *io, const pulsar_gpu_tensor *tensor,
-                                     uint64_t offset, uint64_t bytes,
+                                     SlabOff offset, TensorBytes bytes,
                                      uint8_t *buf, size_t cap, char *err, size_t errlen) {
-    const uint64_t have = pulsar_gpu_tensor_bytes(tensor).raw();
-    if (!tensor || offset > have || bytes > have - offset)
+    const TensorBytes have = pulsar_gpu_tensor_bytes(tensor);
+    if (!tensor || offset.before() > have || bytes > have - offset.before())
     {
         /* Name the numbers: a bare "smaller than the payload" says nothing about
          * WHICH span overran, and this is the refusal a checkpoint hits when a
@@ -190,19 +190,18 @@ static int payload_write_tensor_span(payload_io *io, const pulsar_gpu_tensor *te
         char msg[192];
         snprintf(msg, sizeof(msg),
                  "session tensor is smaller than the payload (offset %llu + %llu > %llu bytes)",
-                 (unsigned long long)offset, (unsigned long long)bytes,
-                 (unsigned long long)have);
+                 (unsigned long long)offset.raw(), (unsigned long long)bytes.raw(),
+                 (unsigned long long)have.raw());
         payload_set_err(err, errlen, msg);
         return 1;
     }
-    uint64_t done = 0;
-    while (done < bytes) {
-        const size_t n = bytes - done > (uint64_t)cap ? cap : (size_t)(bytes - done);
-        if (pulsar_gpu_tensor_read(tensor, TensorBytes{offset + done}, buf, TensorBytes{n}) == 0) {
+    for (TensorBytes done{}; done < bytes;) {   /* the span, a staging buffer at a time */
+        const TensorBytes n = bytes - done > TensorBytes{cap} ? TensorBytes{cap} : bytes - done;
+        if (pulsar_gpu_tensor_read(tensor, (offset + done).before(), buf, n) == 0) {
             payload_set_err(err, errlen, "failed to read accelerator session tensor");
             return 1;
         }
-        if (payload_write_bytes(io, buf, n, err, errlen) != 0) return 1;
+        if (payload_write_bytes(io, buf, n.raw(), err, errlen) != 0) return 1;
         done += n;
     }
     return 0;
@@ -222,25 +221,24 @@ static int payload_write_tensor_span(payload_io *io, const pulsar_gpu_tensor *te
  *  @param errlen    bytes of `err`
  *  @return 0, or 1 when the span is out of range or a copy failed */
 static int payload_read_tensor_span(payload_io *io, pulsar_gpu_tensor *tensor,
-                                    uint64_t offset, uint64_t bytes,
+                                    SlabOff offset, TensorBytes bytes,
                                     uint8_t *buf, size_t cap, uint64_t *remaining,
                                     char *err, size_t errlen) {
-    const uint64_t have = pulsar_gpu_tensor_bytes(tensor).raw();
-    if (!tensor || offset > have || bytes > have - offset)
+    const TensorBytes have = pulsar_gpu_tensor_bytes(tensor);
+    if (!tensor || offset.before() > have || bytes > have - offset.before())
     {
         char msg[192];
         snprintf(msg, sizeof(msg),
                  "session tensor is smaller than the payload (offset %llu + %llu > %llu bytes)",
-                 (unsigned long long)offset, (unsigned long long)bytes,
-                 (unsigned long long)have);
+                 (unsigned long long)offset.raw(), (unsigned long long)bytes.raw(),
+                 (unsigned long long)have.raw());
         payload_set_err(err, errlen, msg);
         return 1;
     }
-    uint64_t done = 0;
-    while (done < bytes) {
-        const size_t n = bytes - done > (uint64_t)cap ? cap : (size_t)(bytes - done);
-        if (payload_read_bytes(io, buf, n, remaining, err, errlen) != 0) return 1;
-        if (pulsar_gpu_tensor_write(tensor, TensorBytes{offset + done}, buf, TensorBytes{n}) == 0) {
+    for (TensorBytes done{}; done < bytes;) {   /* the span, a staging buffer at a time */
+        const TensorBytes n = bytes - done > TensorBytes{cap} ? TensorBytes{cap} : bytes - done;
+        if (payload_read_bytes(io, buf, n.raw(), remaining, err, errlen) != 0) return 1;
+        if (pulsar_gpu_tensor_write(tensor, (offset + done).before(), buf, n) == 0) {
             payload_set_err(err, errlen, "failed to restore accelerator session tensor");
             return 1;
         }
@@ -333,9 +331,9 @@ static uint64_t segment_layout_digest(pulsar_ckpt_store *st, BankId bank) {
     if (st->bank_adapter && st->bank_adapter[pulsar_bank_index(bank)])
         for (const char *c = "runtime-adapter"; *c; c++) mix((uint8_t)*c);
     mix(st->ops->resume_grid);
-    mix(st->slot_bytes);
+    mix(st->slot_bytes.raw());
     mix(n);
-    for (uint32_t i = 0; i < n; i++) { mix(pools[i].tokens_per_row.raw()); mix(pools[i].row_bytes); }
+    for (uint32_t i = 0; i < n; i++) { mix(pools[i].tokens_per_row.raw()); mix(pools[i].row_bytes.raw()); }
     return h;
 }
 
@@ -357,17 +355,19 @@ static pool_span pool_span_of(const pulsar_kv_pool &p, uint32_t t0, uint32_t t1)
     return {CompRow::after(from), to - from};
 }
 /** Bytes of `n` rows of pool `p`.  @param p the pool  @param n rows  @return bytes */
-static uint64_t pool_bytes(const pulsar_kv_pool &p, CompRows n) { return (uint64_t)n.raw() * p.row_bytes; }
+static TensorBytes pool_bytes(const pulsar_kv_pool &p, CompRows n) { return p.row_bytes.times((uint64_t)n.raw()); }
 /** Byte offset of row `r` in pool `p`'s tensor.  @param p the pool  @param r the row  @return its offset */
-static uint64_t pool_offset(const pulsar_kv_pool &p, CompRow r) { return (uint64_t)r.before().raw() * p.row_bytes; }
+static SlabOff pool_offset(const pulsar_kv_pool &p, CompRow r) {
+    return SlabOff::after(p.row_bytes.times((uint64_t)r.before().raw()));
+}
 
 /// @param pools [n] the pools
 /// @param n     pools
 /// @param t0    the span's start, in tokens
 /// @param t1    the span's end, in tokens
 /// @return the bytes of every pool's rows in the span
-static uint64_t pools_span_bytes(const pulsar_kv_pool *pools, uint32_t n, uint32_t t0, uint32_t t1) {
-    uint64_t bytes = 0;
+static TensorBytes pools_span_bytes(const pulsar_kv_pool *pools, uint32_t n, uint32_t t0, uint32_t t1) {
+    TensorBytes bytes{};
     for (uint32_t i = 0; i < n; i++) bytes += pool_bytes(pools[i], pool_span_of(pools[i], t0, t1).n);
     return bytes;
 }
@@ -394,7 +394,8 @@ static int pools_span_io(payload_io *io, const pulsar_kv_pool *pools, uint32_t n
             payload_set_err(err, errlen, "a KV pool of the installed bank has no physical (an evicted bank)");
             return 1;
         }
-        const uint64_t off = pool_offset(pools[i], sp.first), bytes = pool_bytes(pools[i], sp.n);
+        const SlabOff off = pool_offset(pools[i], sp.first);
+        const TensorBytes bytes = pool_bytes(pools[i], sp.n);
         rc = write ? payload_write_tensor_span(io, pools[i].rows, off, bytes, buf, PULSAR_SESSION_IO_CHUNK, err, errlen)
                    : payload_read_tensor_span(io, pools[i].rows, off, bytes, buf, PULSAR_SESSION_IO_CHUNK, remaining,
                                               err, errlen);
@@ -433,7 +434,7 @@ static uint64_t segment_bytes_for(pulsar_ckpt_store *st, uint32_t G_prev, uint32
     uint64_t bytes = (uint64_t)SEGMENT_U32_FIELDS * sizeof(uint32_t);
     bytes += (uint64_t)(G - G_prev) * sizeof(uint32_t);
     bytes += sizeof(uint32_t) + (uint64_t)n_images * SEGMENT_IMAGE_U32 * sizeof(uint32_t);
-    bytes += pools_span_bytes(pools, n, G_prev, G);
+    bytes += pools_span_bytes(pools, n, G_prev, G).raw();   /* tensor bytes enter the stream's length (L438) */
     return bytes + sizeof(uint64_t);   /* the rows' digest */
 }
 
@@ -448,7 +449,7 @@ static uint64_t segment_bytes_for(pulsar_ckpt_store *st, uint32_t G_prev, uint32
 
 /** The bytes of a restore point: header, slot, digest.  @param st the store (its slot size)  @return bytes */
 static uint64_t restore_point_bytes_for(const pulsar_ckpt_store *st) {
-    return (uint64_t)RESTORE_POINT_U32_FIELDS * sizeof(uint32_t) + st->slot_bytes + sizeof(uint64_t);
+    return (uint64_t)RESTORE_POINT_U32_FIELDS * sizeof(uint32_t) + st->slot_bytes.raw() + sizeof(uint64_t);
 }
 
 /* L353: a span's image content hashes, which its segment's key covers (pulsar_segstore_child_key_images) */
@@ -551,10 +552,10 @@ int pulsar_session::copy_out_restore_point(uint32_t G, uint8_t *dst, uint64_t by
     const uint64_t layout = segment_layout_digest(st, bank);
     const uint32_t header[RESTORE_POINT_U32_FIELDS] = {
         PULSAR_SESSION_RESTORE_POINT_MAGIC, PULSAR_SESSION_RESTORE_POINT_VERSION,
-        (uint32_t)layout, (uint32_t)(layout >> 32), (uint32_t)st->slot_bytes, st->ops->resume_grid, G, 0u,
+        (uint32_t)layout, (uint32_t)(layout >> 32), (uint32_t)st->slot_bytes.raw(), st->ops->resume_grid, G, 0u,
     };
     for (uint32_t i = 0; i < RESTORE_POINT_U32_FIELDS; i++) o.u32(header[i]);
-    uint8_t *slot_dst = o.take(st->slot_bytes);
+    uint8_t *slot_dst = o.take(st->slot_bytes.raw());
     uint8_t *dg = o.take(PULSAR_KVDIGEST_BYTES);
     if (!o.ok || o.at != bytes) {
         payload_set_err(err, errlen, "copy-out restore point: its layout overran the buffer");
@@ -602,7 +603,7 @@ int pulsar_session::copy_out_segment(uint32_t G_prev, uint32_t G, uint8_t *dst, 
     const uint64_t layout = segment_layout_digest(st, bank);
     const uint32_t header[SEGMENT_U32_FIELDS] = {
         PULSAR_SESSION_SEGMENT_MAGIC, PULSAR_SESSION_SEGMENT_VERSION,
-        (uint32_t)layout, (uint32_t)(layout >> 32), (uint32_t)st->slot_bytes, st->ops->resume_grid, G_prev, G,
+        (uint32_t)layout, (uint32_t)(layout >> 32), (uint32_t)st->slot_bytes.raw(), st->ops->resume_grid, G_prev, G,
         0u,
     };
     for (uint32_t i = 0; i < SEGMENT_U32_FIELDS; i++) o.u32(header[i]);
@@ -625,9 +626,8 @@ int pulsar_session::copy_out_segment(uint32_t G_prev, uint32_t G, uint8_t *dst, 
                                          "evicted bank)");
             return 1;
         }
-        const uint64_t span = pool_bytes(pools[i], sp.n);
-        spans[n_spans++] = { pools[i].rows, TensorBytes{pool_offset(pools[i], sp.first)}, o.take(span),
-                             TensorBytes{span} };
+        const TensorBytes span = pool_bytes(pools[i], sp.n);
+        spans[n_spans++] = { pools[i].rows, pool_offset(pools[i], sp.first).before(), o.take(span.raw()), span };
     }
     uint8_t *dg = o.take(PULSAR_KVDIGEST_BYTES);
     if (!o.ok || o.at != bytes) {
@@ -664,7 +664,7 @@ static int restore_point_header_read(mem_in *in, pulsar_ckpt_store *st, BankId b
         return 1;
     }
     const uint64_t layout = segment_layout_digest(st, bank);
-    if (h[2] != (uint32_t)layout || h[3] != (uint32_t)(layout >> 32) || h[4] != (uint32_t)st->slot_bytes ||
+    if (h[2] != (uint32_t)layout || h[3] != (uint32_t)(layout >> 32) || h[4] != (uint32_t)st->slot_bytes.raw() ||
         h[5] != st->ops->resume_grid) {
         payload_set_err(err, errlen, "load segment: restore point written for a different state layout");
         return 1;
@@ -725,7 +725,7 @@ static pulsar_segment_status segment_parse(pulsar_ckpt_store *st, BankId bank, i
         return PULSAR_SEGMENT_BAD_ROWS;
     }
     const uint64_t layout = segment_layout_digest(st, bank);
-    if (h[2] != (uint32_t)layout || h[3] != (uint32_t)(layout >> 32) || h[4] != (uint32_t)st->slot_bytes ||
+    if (h[2] != (uint32_t)layout || h[3] != (uint32_t)(layout >> 32) || h[4] != (uint32_t)st->slot_bytes.raw() ||
         h[5] != st->ops->resume_grid) {
         payload_set_err(err, errlen, "load segment: written for a different state layout");
         return PULSAR_SEGMENT_BAD_ROWS;
@@ -838,10 +838,9 @@ pulsar_segment_status pulsar_session::load_segment(const uint8_t *seg, uint64_t 
                                          "bank)");
             return fail(PULSAR_SEGMENT_TRANSIENT);
         }
-        const uint64_t span = pool_bytes(pools[i], sp.n);
-        const uint8_t *src = in.take(span);
-        if (!src || pulsar_gpu_tensor_write(pools[i].rows, TensorBytes{pool_offset(pools[i], sp.first)}, src,
-                                            TensorBytes{span}) == 0) {
+        const TensorBytes span = pool_bytes(pools[i], sp.n);
+        const uint8_t *src = in.take(span.raw());
+        if (!src || pulsar_gpu_tensor_write(pools[i].rows, pool_offset(pools[i], sp.first).before(), src, span) == 0) {
             payload_set_err(err, errlen, "load segment: restoring a pool's rows failed");
             return fail(src ? PULSAR_SEGMENT_TRANSIENT : PULSAR_SEGMENT_BAD_ROWS);
         }
@@ -853,7 +852,7 @@ pulsar_segment_status pulsar_session::load_segment(const uint8_t *seg, uint64_t 
     /* L347: the chain's last segment -- the state at G from its restore point */
     if (last) {
         pulsar_stall_mark("segment load: restore point to the checkpoint slot");
-        const uint8_t *slot_src = rin.take(st->slot_bytes);
+        const uint8_t *slot_src = rin.take(st->slot_bytes.raw());
         if (!slot_src || rp_bytes - rin.at != PULSAR_KVDIGEST_BYTES) {
             payload_set_err(err, errlen, "load segment: the restore point's slot does not end at its digest");
             return fail(PULSAR_SEGMENT_BAD_RP);
@@ -946,10 +945,10 @@ static void kvp_spec_unpack(const uint32_t (&rec)[KVP_SPEC_U32], pulsar_spec_car
 /* the frontier slot's size: the state model's frontier walk, aligned as a grid slot is (checkpoint.cpp) */
 /// @param st the store
 /// @return bytes
-static uint64_t kvp_frontier_bytes(const pulsar_ckpt_store *st) {
-    uint64_t bytes = 0;
-    (void)st->ops->walk(st->state, -1, true, NULL, 0, st->ops->min_checkpoint(st->state), &bytes);
-    return (bytes + 255u) & ~(uint64_t)255u;
+static TensorBytes kvp_frontier_bytes(const pulsar_ckpt_store *st) {
+    TensorBytes bytes{};
+    (void)st->ops->walk(st->state, -1, true, NULL, SlabOff{}, st->ops->min_checkpoint(st->state), &bytes);
+    return pulsar_bytes_align(bytes, 256u);
 }
 
 /* every pool, then every trailing pool; false past the bound */
@@ -981,10 +980,10 @@ static uint64_t kvp_layout_digest(pulsar_ckpt_store *st, const pulsar_kv_pool *p
     mix(n);
     for (uint32_t i = 0; i < n; i++) {
         mix(pools[i].tokens_per_row.raw());
-        mix(pools[i].row_bytes);
+        mix(pools[i].row_bytes.raw());
         mix(pools[i].whole_rows);
     }
-    mix(kvp_frontier_bytes(st));
+    mix(kvp_frontier_bytes(st).raw());
     mix(width);
     return h;
 }
@@ -1005,8 +1004,8 @@ static uint64_t kvp_bytes_for(const pulsar_ckpt_store *st, const pulsar_kv_pool 
     bytes += sizeof(uint32_t) + (uint64_t)n_img * SEGMENT_IMAGE_U32 * sizeof(uint32_t);
     bytes += (uint64_t)KVP_SPEC_U32 * sizeof(uint32_t);
     bytes += (uint64_t)width * sizeof(float);
-    bytes += (G ? st->slot_bytes : 0u) + kvp_frontier_bytes(st);   /* the resume checkpoint, the frontier */
-    bytes += pools_span_bytes(pools, n, 0u, T);
+    /* the resume checkpoint, the frontier, the pools' rows: tensor bytes enter the stream's length (L438) */
+    bytes += ((G ? st->slot_bytes : TensorBytes{}) + kvp_frontier_bytes(st) + pools_span_bytes(pools, n, 0u, T)).raw();
     return bytes + sizeof(uint64_t);   /* the trailing digest */
 }
 
@@ -1098,10 +1097,11 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
     /* the frontier's slot, staged: the state model's frontier walk at T, over zeros (the slot's alignment tail
      * -- and DeepSeek's window head below its first raw_window positions -- is written too, so the same state
      * always saves the same bytes) */
-    const uint64_t fb = kvp_frontier_bytes(st);
-    pulsar_gpu_tensor *front = pulsar_gpu_tensor_alloc(TensorBytes{fb});
-    if (!front || pulsar_gpu_tensor_fill_f32(front, 0.0f, fb / sizeof(float)) == 0 ||
-        !st->ops->walk(st->state, 0, true, front, 0, pulsar_ckpt_pos(p.T), NULL) || pulsar_gpu_synchronize() == 0) {
+    const TensorBytes fb = kvp_frontier_bytes(st);
+    pulsar_gpu_tensor *front = pulsar_gpu_tensor_alloc(fb);
+    if (!front || pulsar_gpu_tensor_fill_f32(front, 0.0f, fb.raw() / sizeof(float)) == 0 ||
+        !st->ops->walk(st->state, 0, true, front, SlabOff{}, pulsar_ckpt_pos(p.T), NULL) ||
+        pulsar_gpu_synchronize() == 0) {
         pulsar_gpu_tensor_free(front);
         payload_set_err(err, errlen, "session payload: staging the frontier's state failed");
         return 1;
@@ -1131,10 +1131,10 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
     if (rc == 0) rc = payload_write_bytes(&io, live, (uint64_t)p.width * sizeof(float), err, errlen);
     uint8_t *buf = s->io_buf;   /* pinned once at create (pulsar_session::io_buf) */
     if (rc == 0 && p.G)   /* L347 I4: a host-tier slot is written from its pinned bytes */
-        rc = at.host ? payload_write_bytes(&io, at.host, st->slot_bytes, err, errlen)
+        rc = at.host ? payload_write_bytes(&io, at.host, st->slot_bytes.raw(), err, errlen)
                      : payload_write_tensor_span(&io, at.slab, at.off, st->slot_bytes, buf, PULSAR_SESSION_IO_CHUNK, err,
                                                  errlen);
-    if (rc == 0) rc = payload_write_tensor_span(&io, front, 0, fb, buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
+    if (rc == 0) rc = payload_write_tensor_span(&io, front, SlabOff{}, fb, buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
     if (rc == 0) rc = pools_span_io(&io, p.pools, p.n_pools, 0u, p.T, true, buf, NULL, err, errlen);
     pulsar_gpu_tensor_free(front);
     if (rc != 0) return rc;
@@ -1242,8 +1242,8 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         payload_set_err(err, errlen, "session payload: no grid-checkpoint slot");
         return fail();
     }
-    const uint64_t fb = kvp_frontier_bytes(st);
-    front = pulsar_gpu_tensor_alloc(TensorBytes{fb});
+    const TensorBytes fb = kvp_frontier_bytes(st);
+    front = pulsar_gpu_tensor_alloc(fb);
     if (!front) {
         payload_set_err(err, errlen, "session payload: staging the frontier's state failed");
         return fail();
@@ -1251,10 +1251,10 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     uint8_t *buf = s->io_buf;   /* pinned once at create (pulsar_session::io_buf) */
     int rc = 0;
     if (G)   /* L347 I4: a host-tier slot is read into its pinned bytes */
-        rc = at.host ? payload_read_bytes(&io, at.host, st->slot_bytes, &remaining, err, errlen)
+        rc = at.host ? payload_read_bytes(&io, at.host, st->slot_bytes.raw(), &remaining, err, errlen)
                      : payload_read_tensor_span(&io, at.slab, at.off, st->slot_bytes, buf, PULSAR_SESSION_IO_CHUNK,
                                                 &remaining, err, errlen);
-    if (rc == 0) rc = payload_read_tensor_span(&io, front, 0, fb, buf, PULSAR_SESSION_IO_CHUNK,
+    if (rc == 0) rc = payload_read_tensor_span(&io, front, SlabOff{}, fb, buf, PULSAR_SESSION_IO_CHUNK,
                                                &remaining, err, errlen);
     if (rc == 0) rc = pools_span_io(&io, pools, n, 0u, T, false, buf, &remaining, err, errlen);
     if (rc != 0) return fail();
@@ -1266,7 +1266,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     }
     /* Commit: the frontier's counters, its lanes from the staged slot, then the resume checkpoint. */
     if (!st->ops->install_frontier(st->state, pulsar_ckpt_pos(T), TokCount{(int)PF}) ||
-        !st->ops->walk(st->state, 1, true, front, 0, pulsar_ckpt_pos(T), NULL) ||
+        !st->ops->walk(st->state, 1, true, front, SlabOff{}, pulsar_ckpt_pos(T), NULL) ||
         pulsar_gpu_synchronize() == 0) {
         payload_set_err(err, errlen, "session payload: installing the frontier's state failed");
         return fail();

@@ -719,11 +719,12 @@ static pulsar_router_cfg ds4_router_cfg(uint32_t n_expert, uint32_t n_expert_use
 int pulsar_gpu_router_select_batch_tensor(
         pulsar_gpu_tensor *selected, pulsar_gpu_tensor *weights, pulsar_gpu_tensor *probs,
         const void *model_map, uint64_t model_size,
-        uint64_t bias_offset, bool has_bias,
-        uint64_t tid2eid_offset, uint32_t tid2eid_rows,
+        MapOff bias_offset_m, bool has_bias,
+        MapOff tid2eid_offset_m, uint32_t tid2eid_rows,
         const pulsar_gpu_tensor *logits, const pulsar_gpu_tensor *tokens,
         uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens,
-        uint64_t vl_bias_offset, uint32_t n_vocab, bool has_vl_bias) {
+        MapOff vl_bias_offset_m, uint32_t n_vocab, bool has_vl_bias) {
+    const uint64_t bias_offset = bias_offset_m.raw(), tid2eid_offset = tid2eid_offset_m.raw(), vl_bias_offset = vl_bias_offset_m.raw();   /* L438: MapOff ends at the launch */
     if (!selected || !weights || !logits || !model_map || n_tokens == 0 ||
         logits->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
         (probs && probs->bytes < (uint64_t)n_tokens * n_expert * sizeof(float)) ||
@@ -910,11 +911,12 @@ int pulsar_gpu_output_hc_weights_tensor(
         const pulsar_gpu_tensor *pre,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                scale_offset,
-        uint64_t                base_offset,
+        MapOff                  scale_offset_m,
+        MapOff                  base_offset_m,
         uint32_t                n_hc,
         float                   eps,
         uint32_t                n_tokens) {
+    const uint64_t scale_offset = scale_offset_m.raw(), base_offset = base_offset_m.raw();   /* L438: MapOff ends at the launch */
     if (!out || !pre || !model_map || n_hc == 0 || n_tokens == 0) return 0;
     const uint64_t row_bytes = (uint64_t)n_hc * sizeof(float);
     /* L334 P5 S4: the caller's live rows, never out's allocation (f3a617af / d0b2fdb5); both must hold them */
@@ -941,12 +943,13 @@ int pulsar_gpu_hc_norm_mix_tensor(
         pulsar_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                weight_offset,
+        MapOff                  weight_offset_m,
         uint64_t                in_dim,
         uint64_t                out_dim,
         const pulsar_gpu_tensor *x,
         float                   eps,
         uint32_t                w_type) {
+    const uint64_t weight_offset = weight_offset_m.raw();   /* L438: MapOff ends at the launch */
     if (!out || !x || !model_map || in_dim == 0 || out_dim == 0) return 0;
     if (in_dim > UINT32_MAX || out_dim > UINT32_MAX) return 0;
     if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
@@ -1007,9 +1010,9 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
         const pulsar_gpu_tensor *residual_hc,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                scale_offset,
-        uint64_t                base_offset,
-        uint64_t                norm_weight_offset,
+        MapOff                  scale_offset_m,
+        MapOff                  base_offset_m,
+        MapOff                  norm_weight_offset_m,
         uint32_t                n_rows_in,
         uint32_t                n_embd,
         uint32_t                n_hc,
@@ -1017,6 +1020,7 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
         float                   eps,
         float                   norm_eps,
         int                     norm_w_bf16) {
+    const uint64_t scale_offset = scale_offset_m.raw(), base_offset = base_offset_m.raw(), norm_weight_offset = norm_weight_offset_m.raw();   /* L438: MapOff ends at the launch */
     /* `out` is OPTIONAL: it is the pre-norm carrier, which nothing reads except
      * a debug dump, so callers pass NULL unless a dump was requested. */
     if (!norm_out || !split || !pre_carry || !mix || !residual_hc || !model_map ||

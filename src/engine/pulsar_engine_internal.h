@@ -595,7 +595,7 @@ void pulsar_engram_hash_pos(const pulsar_engram_layout *L, uint32_t layer,
 /** One row-contiguous range of a table: rows [i * rows_per_part, ...) at `base`. */
 typedef struct {
     int fd;                 ///< shared by the parts that live in one file
-    uint64_t base;          ///< byte offset of the part's first row
+    FileOff base;           ///< where the part's first row sits in that file (L438: a file offset)
 } pulsar_engram_part;
 
 /** One Engram layer's row table on disk: the file ranges its rows live in, read row by row through the
@@ -635,13 +635,13 @@ int  pulsar_engram_table_open(pulsar_engram_table *t, const char *path, uint32_t
 /// @param layer          the model layer the table serves
 /// @param n_parts        parts, == ceil(n_rows / rows_per_part)
 /// @param paths          n_parts file paths
-/// @param bases          n_parts byte offsets of each part's first row
+/// @param bases          n_parts file offsets of each part's first row (in its file)
 /// @param rows_per_part  rows in every part but possibly the last
 /// @param row_bytes      bytes per row record
 /// @param n_rows         rows in the table
 /// @return 1 = open, 0 = refused (said).
 int  pulsar_engram_table_open_parts(pulsar_engram_table *t, uint32_t layer, uint32_t n_parts,
-                                    const char *const *paths, const uint64_t *bases,
+                                    const char *const *paths, const FileOff *bases,
                                     uint64_t rows_per_part, uint32_t row_bytes, uint64_t n_rows);
 /** L426: a digest of the table's rows -- its row count and record size, then each part's rows sampled
  *  (pulsar_content_sample).  A row table is weights kept beside the container, so a family that opens one binds this
@@ -871,7 +871,7 @@ typedef struct {
     uint64_t dim[PULSAR_MAX_DIMS];  ///< extents, fastest-varying first
     uint32_t type;        ///< storage type (see the PULSAR_TENSOR_* family)
     uint64_t rel_offset;  ///< offset from the file's tensor-data section start
-    uint64_t abs_offset;  ///< offset from the start of the mapping -- what the kernels take
+    MapOff abs_offset;    ///< offset from the start of the mapping -- what the kernels take (L438: a map offset)
     uint64_t elements;    ///< product of dim[0..ndim)
     uint64_t bytes;       ///< on-disk size, quantisation included
     /** Set only when this entry was swapped in from an overlay GGUF
@@ -894,6 +894,35 @@ typedef struct {
     /// bind_layer is valid (the record carries a `layer`).
     bool has_bind_layer, has_bind_index;
 } pulsar_tensor;
+
+/** L438: a file's offset as an offset into its mapping -- the model layer maps every file it reads weights from (a
+ *  shard, an overlay donor) whole, from its first byte, so the two are one number; the one crossing from a file's
+ *  offsets into the GPU API's model map (the loader's directory entries).
+ *  @param off the offset in the file */
+/// @return the same offset in the file's mapping
+static inline MapOff pulsar_map_off_of_file(FileOff off) { return MapOff{off.raw()}; }
+/** L438: the reverse of pulsar_map_off_of_file, for a map offset into a mapped FILE (never a key a TP half is
+ *  registered under, which no file holds).
+ *  @param off the offset in the file's mapping */
+/// @return the same offset in the file
+static inline FileOff pulsar_file_off_of_map(MapOff off) { return FileOff{off.raw()}; }
+/** L438: where tensor t's stored bytes start in the file they are read from (a shard or an overlay donor): the
+ *  readers that pread instead of mapping (the content sample).
+ *  @param t the directory entry */
+/// @return its file offset
+static inline FileOff pulsar_tensor_file_off(const pulsar_tensor *t) { return pulsar_file_off_of_map(t->abs_offset); }
+/** L438: the host address of a map offset: `map + off` -- where an offset into a model map meets a pointer (a
+ *  host-side read of a weight, a bounds check against the mapping).
+ *  @param map the mapping's first byte (tensor_map_base)
+ *  @param off the offset into it */
+/// @return the address
+static inline const uint8_t *pulsar_map_at(const void *map, MapOff off) {
+    return static_cast<const uint8_t *>(map) + off.before().raw();
+}
+/** L438: tensor t's stored bytes, as the one byte unit (pulsar_tensor::bytes is a bare count, read in ~90 places).
+ *  @param t the directory entry */
+/// @return its bytes on disk, quantisation included
+static inline TensorBytes pulsar_tensor_stored_bytes(const pulsar_tensor *t) { return TensorBytes{t->bytes}; }
 
 /** A memory-mapped GGUF file plus its parsed directory.
  *
@@ -1027,8 +1056,8 @@ typedef struct {
      * layer 6's offset. */
     const uint8_t *base;
     uint64_t map_size;  ///< that mapping's length, for the bounds check
-    uint64_t off;       ///< first byte, offset into that mapping
-    uint64_t end;       ///< one past the last byte
+    MapOff off;         ///< first byte, offset into that mapping
+    MapOff end;         ///< one past the last byte
 } accelerator_tensor_span;
 
 /** Every weight tensor for ONE transformer layer, resolved from the GGUF at
@@ -3193,8 +3222,8 @@ struct pulsar_session {
      * resumes from (pulsar_session_dirty_view_drop). */
     bool mseq_dirty;
     /** GPU bytes this session's create actually allocated (tensor-allocator
-     * delta across pulsar_session_create); the server ledger commits this. */
-    uint64_t resident_bytes;
+     * delta across pulsar_session_create); the server ledger commits this (through kv_bytes_of, L438). */
+    TensorBytes resident_bytes;
     /** Live speculative/DSpark shadow; see pulsar_spec_carry_state. */
     pulsar_spec_carry_state spec;
     /** Tier-2 PATH A: per-bank host carry, one entry per pool bank.  Lazily
@@ -3311,8 +3340,8 @@ struct pulsar_session {
     /// @param n           chains
     /// @param tokens      receives n * slots tokens (read back from the device)
     /// @return false when the launch or the readback fails.
-    bool draw_chains(const pulsar_gpu_tensor *cand, uint64_t cand_off, const pulsar_gpu_tensor *scores,
-                     uint64_t scores_off, uint32_t slots, uint32_t topk, uint32_t vocab,
+    bool draw_chains(const pulsar_gpu_tensor *cand, SlabOff cand_off, const pulsar_gpu_tensor *scores,
+                     SlabOff scores_off, uint32_t slots, uint32_t topk, uint32_t vocab,
                      const pulsar_gpu_chain_req *reqs, uint32_t n, int32_t *tokens);
     /** The launch alone (masks as draw_rows'), the outs left in dev.out (a walk reads them there). */
     /// @param rows       the device rows, logits-width f32 each
@@ -3765,18 +3794,17 @@ bool pulsar_layer_subset(void);
  *
  * plans/96-two-profiles-one-engine.md s10. */
 /// @param kind  RING, COMP or INDEX
-/// @return the row's bytes under the loaded profile.
-static inline uint64_t pulsar_kv_row_bytes(pulsar_kv_row_kind kind) {
+/// @return the row's bytes under the loaded profile (L438: tensor bytes; rows scale them with .times).
+static inline TensorBytes pulsar_kv_row_bytes(pulsar_kv_row_kind kind) {
     /* The index-K row is the same FP4 row in both families. */
     if (kind == PULSAR_KV_ROW_INDEX) {
-        return (uint64_t)PULSAR_MXKV_FP4_ROWBYTES((uint64_t)PULSAR_N_INDEXER_HEAD_DIM);
+        return TensorBytes{(uint64_t)PULSAR_MXKV_FP4_ROWBYTES((uint64_t)PULSAR_N_INDEXER_HEAD_DIM)};
     }
     if (g_pulsar_shape.kv_row_style == PULSAR_KV_ROWS_UNIFIED) {
-        return (uint64_t)PULSAR_ATTN_PACK_ROWBYTES((uint64_t)PULSAR_N_HEAD_DIM);
+        return TensorBytes{(uint64_t)PULSAR_ATTN_PACK_ROWBYTES((uint64_t)PULSAR_N_HEAD_DIM)};
     }
-    return kind == PULSAR_KV_ROW_RING
-               ? (uint64_t)PULSAR_WINKV_ROWBYTES((uint64_t)PULSAR_N_HEAD_DIM)
-               : (uint64_t)PULSAR_MAINKV_ROWBYTES((uint64_t)PULSAR_N_HEAD_DIM);
+    return TensorBytes{kind == PULSAR_KV_ROW_RING ? (uint64_t)PULSAR_WINKV_ROWBYTES((uint64_t)PULSAR_N_HEAD_DIM)
+                                                  : (uint64_t)PULSAR_MAINKV_ROWBYTES((uint64_t)PULSAR_N_HEAD_DIM)};
 }
 
 /* The L218 row-format refactor replaced these two macros with
@@ -3790,11 +3818,11 @@ static inline uint64_t pulsar_kv_row_bytes(pulsar_kv_row_kind kind) {
  * index row is the FP4 index row.  A caller that needs the raw RING row should
  * call pulsar_kv_row_bytes(PULSAR_KV_ROW_RING) directly. */
 /// Legacy name: bytes of a compressed attention (COMP) KV row.
-#define PULSAR_ENGINE_MAINKV_ROWBYTES  (pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP))
+#define PULSAR_ENGINE_MAINKV_ROWBYTES  (pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP).raw())
 /// Legacy name: bytes of an FP4 index-key (INDEX) row.
-#define PULSAR_ENGINE_IDXFP4_ROWBYTES  (pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX))
+#define PULSAR_ENGINE_IDXFP4_ROWBYTES  (pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX).raw())
 /// Legacy name: bytes of a raw sliding-window (RING) KV row.
-#define PULSAR_ENGINE_WINKV_ROWBYTES   (pulsar_kv_row_bytes(PULSAR_KV_ROW_RING))
+#define PULSAR_ENGINE_WINKV_ROWBYTES   (pulsar_kv_row_bytes(PULSAR_KV_ROW_RING).raw())
 
 /// The layer whose caches layer `il` reads (see the CSA2 ownership comment above pulsar_kv_row_bytes).
 /// @param il  the layer
@@ -4099,8 +4127,8 @@ void pulsar_engine_bind_kv_source(pulsar_engine *e, const char *what, uint64_t d
 /** One read of a content sample: `bytes` (<= PULSAR_CONTENT_SAMPLE_BLOCK) at `off` of `fd`. */
 typedef struct pulsar_content_read {
     int fd;          ///< the open file (borrowed)
-    uint64_t off;    ///< the read's first byte
-    uint32_t bytes;  ///< its length
+    FileOff off;     ///< the read's first byte, in that file
+    uint32_t bytes;  ///< its length (a u32: the digest folds its four bytes, pulsar_content_sample_fold)
 } pulsar_content_read;
 /** L426: the content sample of the file span [off, off + bytes), appended to `plan`: its first block, its last, and
  *  one for every PULSAR_CONTENT_SAMPLE_STRIDE bytes spread evenly between them (blocks of PULSAR_CONTENT_SAMPLE_BLOCK
@@ -4113,10 +4141,10 @@ typedef struct pulsar_content_read {
  *  every sampled block and differ only between them (an edit inside a large tensor that leaves its first and last
  *  4 KiB and each 64 MiB mark alone).
  *  @param fd    the open file
- *  @param off   the span's first byte
+ *  @param off   the span's first byte, in that file
  *  @param bytes the span's length
  *  @param plan  receives the reads, in offset order */
-void pulsar_content_sample(int fd, uint64_t off, uint64_t bytes, std::vector<pulsar_content_read> *plan);
+void pulsar_content_sample(int fd, FileOff off, TensorBytes bytes, std::vector<pulsar_content_read> *plan);
 /** L426: read a plan (pulsar_content_sample) with pread on PULSAR_CONTENT_SAMPLE_READERS threads -- no mapping is
  *  touched and nothing is read ahead -- and fold each read's length and bytes into `d`, in plan order.
  *  @param plan the reads
@@ -5617,13 +5645,13 @@ static inline uint32_t gpu_graph_comp_cap(uint32_t ctx_size, uint32_t ratio) {
  * (steering.cpp); the demand-paged term of the overcommit split. */
 /// @param ctx_size the context, tokens
 /// @return bytes
-uint64_t gpu_graph_comp_index_bytes_for_context(uint32_t ctx_size);
+TensorBytes gpu_graph_comp_index_bytes_for_context(uint32_t ctx_size);
 /** One bank's raw SWA ring across every layer at raw_cap rows, in the stored
  * WINDOW / MAIN row formats (steering.cpp): the eager term of the KV
  * sizing, the same bytes gpu_graph_bank_slabs_alloc lays out per layer. */
 /// @param raw_cap the ring's rows
 /// @return bytes
-uint64_t gpu_graph_raw_ring_bytes_for_context(uint32_t raw_cap);
+TensorBytes gpu_graph_raw_ring_bytes_for_context(uint32_t raw_cap);
 /** The deepest compressed pool any layer holds at ctx_size (the smallest
  * non-zero compress ratio's gpu_graph_comp_cap): the row count the
  * indexer_scores scratch is sized by and the one the boot line reports as
@@ -6062,8 +6090,8 @@ typedef std::function<bool(uint32_t lo, uint32_t width, pulsar_gpu_tensor *dst)>
 /// @param n_vocab vocab width
 /// @param max_rows rows
 /// @return bytes
-uint64_t pulsar_tp_vocab_own_bytes(pulsar_tp *tp, uint32_t n_vocab, uint32_t max_rows);
-uint64_t pulsar_tp_vocab_own_bytes_for(uint32_t n_ranks, uint64_t vec_bytes, uint32_t n_vocab, uint32_t max_rows);
+TensorBytes pulsar_tp_vocab_own_bytes(pulsar_tp *tp, uint32_t n_vocab, uint32_t max_rows);
+TensorBytes pulsar_tp_vocab_own_bytes_for(uint32_t n_ranks, uint64_t vec_bytes, uint32_t n_vocab, uint32_t max_rows);
 /** Every rank's vocab range gathered into out [n_rows][n_vocab] (rank order). */
 /// @param x the transport and buffers
 /// @param n_rows rows (<= max_rows)
@@ -6446,11 +6474,11 @@ uint32_t pulsar_spec_depth_start(const pulsar_engine *e);
 /* The K-half registry key's offset for one tensor (L241 4g-2): the tensor
  * object's address, unique per tensor per engine -- abs_offsets repeat across
  * safetensors shards.  One authority for registration and lookup. */
-/// The K-half registry key's offset for one tensor: its address.
+/// The K-half registry key's offset for one tensor: its address (L438: a key offset under the engine's map).
 /// @param t the tensor
 /// @return the offset
-static inline uint64_t pulsar_tp_kslice_key_offset(const pulsar_tensor *t) {
-    return (uint64_t)(uintptr_t)t;
+static inline MapOff pulsar_tp_kslice_key_offset(const pulsar_tensor *t) {
+    return MapOff{(uint64_t)(uintptr_t)t};
 }
 
 /* The expert tensor-parallel half-stack key's offset for one routed stack
@@ -6458,12 +6486,12 @@ static inline uint64_t pulsar_tp_kslice_key_offset(const pulsar_tensor *t) {
  * no two half-stacks' ranges overlap under the one engine key.  The drafter
  * aliases the target's table, so indices are unique across both.  One
  * authority for registration (open) and lookup (the FFN encoder). */
-/// The expert half-stack key's offset: (index + 1) << 32.
+/// The expert half-stack key's offset: (index + 1) << 32 (L438: a key offset under the engine's map).
 /// @param m the model
 /// @param t one of its tensors
 /// @return the offset
-static inline uint64_t pulsar_tp_expert_half_offset(const pulsar_model *m, const pulsar_tensor *t) {
-    return ((uint64_t)(t - m->tensors) + 1u) << 32;
+static inline MapOff pulsar_tp_expert_half_offset(const pulsar_model *m, const pulsar_tensor *t) {
+    return MapOff{((uint64_t)(t - m->tensors) + 1u) << 32};
 }
 
 #endif /* PULSAR_ENGINE_INTERNAL_H */

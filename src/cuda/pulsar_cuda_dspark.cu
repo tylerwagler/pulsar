@@ -290,13 +290,14 @@ int pulsar_gpu_dspark_markov_step_model(
         const pulsar_gpu_tensor *base_logits,
         const void *dspark_model_map,
         uint64_t dspark_model_size,
-        uint64_t markov_w1_offset,
-        uint64_t markov_w2_offset,
+        MapOff markov_w1_offset_m,
+        MapOff markov_w2_offset_m,
         int32_t prev_token,
         uint32_t vocab_size,
         uint32_t embed_dim,
         int w1_bf16,
         int w2_fmt) {
+    const uint64_t markov_w1_offset = markov_w1_offset_m.raw(), markov_w2_offset = markov_w2_offset_m.raw();   /* L438: MapOff ends at the launch */
     DSPARK_REFUSE_IF(!refined_logits || !refined_id_dst || !base_logits || !dspark_model_map);
     DSPARK_REFUSE_IF(vocab_size == 0 || embed_dim == 0 || embed_dim > 1024);
     DSPARK_REFUSE_IF(refined_logits->bytes < (uint64_t)vocab_size * sizeof(float));
@@ -463,10 +464,11 @@ int pulsar_gpu_dspark_confidence_score_model(
         const pulsar_gpu_tensor *token_ids,
         const void *dspark_model_map,
         uint64_t dspark_model_size,
-        uint64_t markov_w1_offset,
-        uint64_t proj_offset,
+        MapOff markov_w1_offset_m,
+        MapOff proj_offset_m,
         uint32_t n_positions, uint32_t hidden_dim, uint32_t embed_dim, uint32_t vocab_size,
         int w1_bf16, int proj_bf16) {
+    const uint64_t markov_w1_offset = markov_w1_offset_m.raw(), proj_offset = proj_offset_m.raw();   /* L438: MapOff ends at the launch */
     DSPARK_REFUSE_IF(!scores || !hidden || !token_ids || !dspark_model_map);
     DSPARK_REFUSE_IF(n_positions == 0 || hidden_dim == 0 || embed_dim == 0 || vocab_size == 0);
     DSPARK_REFUSE_IF(scores->bytes < (uint64_t)n_positions * sizeof(float));
@@ -1011,9 +1013,10 @@ int pulsar_gpu_dspark_markov_chain_banks_model(
         const pulsar_gpu_tensor *base_logits, uint64_t base_row_stride_bytes,
         const pulsar_gpu_tensor *base_row_dev,
         const void *dspark_model_map, uint64_t dspark_model_size,
-        uint64_t markov_w1_offset, uint64_t markov_w2_offset,
+        MapOff markov_w1_offset_m, MapOff markov_w2_offset_m,
         uint32_t n_banks, uint32_t n_draft, uint32_t vocab_size, uint32_t embed_dim,
         int w1_bf16, int w2_fmt) {
+    const uint64_t markov_w1_offset = markov_w1_offset_m.raw(), markov_w2_offset = markov_w2_offset_m.raw();   /* L438: MapOff ends at the launch */
     if (!dspark_markov_banks_args_ok(refined_logits, ids_dev, ids_stride, base_logits,
                                      base_row_stride_bytes, base_row_dev, n_banks, n_draft,
                                      vocab_size, embed_dim))
@@ -1030,9 +1033,10 @@ int pulsar_gpu_dspark_markov_step_banks_model(
         const pulsar_gpu_tensor *base_logits, uint64_t base_row_stride_bytes,
         const pulsar_gpu_tensor *base_row_dev, const pulsar_gpu_tensor *prev_dev,
         const void *dspark_model_map, uint64_t dspark_model_size,
-        uint64_t markov_w1_offset, uint64_t markov_w2_offset,
+        MapOff markov_w1_offset_m, MapOff markov_w2_offset_m,
         uint32_t n_banks, uint32_t pos, uint32_t vocab_size, uint32_t embed_dim,
         int w1_bf16, int w2_fmt) {
+    const uint64_t markov_w1_offset = markov_w1_offset_m.raw(), markov_w2_offset = markov_w2_offset_m.raw();   /* L438: MapOff ends at the launch */
     DSPARK_REFUSE_IF(!prev_dev || prev_dev->bytes < (uint64_t)n_banks * sizeof(int32_t));
     if (!dspark_markov_banks_args_ok(refined_logits, ids_dev, ids_stride, base_logits,
                                      base_row_stride_bytes, base_row_dev, n_banks, pos + 1,

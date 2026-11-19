@@ -1236,8 +1236,8 @@ static int vision_span_assemble(const pulsar_vision_weights *w, const pulsar_mod
             memcpy(dst, aligner + (size_t)row * T, (size_t)T * sizeof(uint16_t));
         } else {
             if (ty < 0 || ty > 4 || !param[ty]) return 0;
-            const uint16_t *src = (const uint16_t *)(const void *)
-                ((const char *)tensor_map_base(m, param[ty]) + param[ty]->abs_offset);
+            const uint16_t *src = (const uint16_t *)(const void *)pulsar_map_at(tensor_map_base(m, param[ty]),
+                                                                                 param[ty]->abs_offset);
             memcpy(dst, src, (size_t)T * sizeof(uint16_t));
         }
     }

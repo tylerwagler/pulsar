@@ -71,12 +71,12 @@ static void plan_inkling(pulsar_state_plan *p) {
     p->resume_grid = 128;
     p->split_invariant = true;
     p->ckpt_slots = 2;
-    pulsar_state_plan_add(p, {"sconv", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_SNAPSHOT, false, false, 0, SCONV_BYTES,
-                              0, 0, NULL, NULL, NULL});
-    pulsar_state_plan_add(p, {"kv_global", PULSAR_STATE_POOL, PULSAR_STATE_CAPTURE_NONE, false, false, 1, KV_ROW, 0, 0,
-                              NULL, NULL, NULL});
-    pulsar_state_plan_add(p, {"kv_window", PULSAR_STATE_RING, PULSAR_STATE_CAPTURE_NONE, false, false, WINDOW, KV_ROW,
-                              0, 0, NULL, NULL, NULL});
+    pulsar_state_plan_add(p, {"sconv", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_SNAPSHOT, false, false, 0, TensorBytes{SCONV_BYTES},
+                              TensorBytes{0}, SlabOff{0}, NULL, NULL, NULL});
+    pulsar_state_plan_add(p, {"kv_global", PULSAR_STATE_POOL, PULSAR_STATE_CAPTURE_NONE, false, false, 1, TensorBytes{KV_ROW},
+                              TensorBytes{}, SlabOff{}, NULL, NULL, NULL});
+    pulsar_state_plan_add(p, {"kv_window", PULSAR_STATE_RING, PULSAR_STATE_CAPTURE_NONE, false, false, WINDOW, TensorBytes{KV_ROW},
+                              TensorBytes{0}, SlabOff{0}, NULL, NULL, NULL});
     p->n_trunk = p->n_slots = 42;
     for (uint32_t il = 0; il < 42; il++)
         p->slot[LayerSlot{il}] = 1u << A_SCONV | (il % 6 == 5 ? 1u << A_KV_GLOBAL : 1u << A_KV_WINDOW);
@@ -88,10 +88,10 @@ static void plan_a(void) {
     plan_inkling(&p);
     const uint32_t banks = 2, ctx = 8190;   /* off a row boundary: the pools need no rounding at 1 token a row */
     const uint64_t ring = (uint64_t)(WINDOW - 1u + PULSAR_STATE_VERIFY_ROWS) * KV_ROW;
-    check(pulsar_state_decl_bank_bytes(&p.decl[A_SCONV]) == 61440 && 42 * SCONV_BYTES / 1048576.0 > 2.45 &&
+    check(pulsar_state_decl_bank_bytes(&p.decl[A_SCONV]).raw() == 61440 && 42 * SCONV_BYTES / 1048576.0 > 2.45 &&
           42 * SCONV_BYTES / 1048576.0 < 2.47, "SConv: 60 KiB a layer, %.2f MiB a sequence (plan 120: 2.5 MiB)",
           42 * SCONV_BYTES / 1048576.0);
-    check(pulsar_state_decl_bank_bytes(&p.decl[A_KV_WINDOW]) == ring, "the window ring holds W - 1 + %u slots: %llu B",
+    check(pulsar_state_decl_bank_bytes(&p.decl[A_KV_WINDOW]).raw() == ring, "the window ring holds W - 1 + %u slots: %llu B",
           PULSAR_STATE_VERIFY_ROWS, (unsigned long long)ring);
     /* the price is the create run dry */
     uint64_t dry = 0, managed = 0;
@@ -115,13 +115,13 @@ static void plan_a(void) {
           "a bank's 1000 touched tokens: %llu B of pool",
           (unsigned long long)pulsar_state_pool_bytes_at(ss, KvRows{1000}).raw());
     const uint64_t slot = 42 * SCONV_BYTES + 35 * ring;
-    check(ss->ckpt.slot_bytes == ((slot + 255u) & ~255ull), "a checkpoint slot: every SConv state and ring (%llu B)",
-          (unsigned long long)ss->ckpt.slot_bytes);
+    check(ss->ckpt.slot_bytes.raw() == ((slot + 255u) & ~255ull), "a checkpoint slot: every SConv state and ring (%llu B)",
+          (unsigned long long)ss->ckpt.slot_bytes.raw());
     pulsar_kv_pool pools[PULSAR_KV_POOLS_MAX];
     const uint32_t np = ss->ops.pools(ss, pools, PULSAR_KV_POOLS_MAX);
     bool pools_ok = np == 7;
     for (uint32_t i = 0; pools_ok && i < np; i++)
-        pools_ok = pools[i].tokens_per_row == TokPerRow{1u} && pools[i].row_bytes == KV_ROW &&
+        pools_ok = pools[i].tokens_per_row == TokPerRow{1u} && pools[i].row_bytes.raw() == KV_ROW &&
                    pools[i].rows == pulsar_state_pool(ss, LayerSlot{5 + 6 * i}, A_KV_GLOBAL, BankId{0});
     check(pools_ok, "the installed bank's pools: the 7 global layers' KV in layer order (%u)", np);
     check(ss->ops.trailing_pools(ss, pools, PULSAR_KV_POOLS_MAX) == 0, "no drafter slot: no trailing pool");
@@ -133,10 +133,11 @@ static void plan_a(void) {
         ok = wr(pulsar_state_tensor(ss, LayerSlot{k}, A_SCONV), SCONV_BYTES, pattern(SCONV_BYTES, 2 * k));
         if (ok && k % 6 != 5) ok = wr(pulsar_state_tensor(ss, LayerSlot{k}, A_KV_WINDOW), ring, pattern(ring, 2 * k + 1));
     }
-    pulsar_gpu_tensor *slab = pulsar_gpu_tensor_alloc(TensorBytes{ss->ckpt.slot_bytes});
-    uint64_t walked = 0;
-    ok = ok && slab && ss->ops.walk(ss, 0, false, slab, 0, pulsar_ckpt_pos(128u), &walked) && pulsar_gpu_synchronize();
-    check(ok && walked == slot, "the walk copies %llu B (the slot's)", (unsigned long long)walked);
+    pulsar_gpu_tensor *slab = pulsar_gpu_tensor_alloc(ss->ckpt.slot_bytes);
+    TensorBytes walked{};
+    ok = ok && slab && ss->ops.walk(ss, 0, false, slab, SlabOff{}, pulsar_ckpt_pos(128u), &walked) &&
+         pulsar_gpu_synchronize();
+    check(ok && walked.raw() == slot, "the walk copies %llu B (the slot's)", (unsigned long long)walked.raw());
     uint64_t off = 0;
     bool order = ok;
     for (uint32_t k = 0; order && k < 42; k++) {
@@ -152,7 +153,7 @@ static void plan_a(void) {
     check(ok && all_zero(rd(pulsar_state_tensor(ss, LayerSlot{7u}, A_SCONV), SCONV_BYTES, SCONV_BYTES)) &&
           all_zero(rd(pulsar_state_tensor(ss, LayerSlot{7u}, A_KV_WINDOW), ring, ring)) && ss->bank_pos[1] == TokPos{0},
           "a reset zeroes the bank's state and its counters");
-    ok = ok && ss->ops.walk(ss, 1, false, slab, 0, pulsar_ckpt_pos(128u), NULL) && pulsar_gpu_synchronize();
+    ok = ok && ss->ops.walk(ss, 1, false, slab, SlabOff{}, pulsar_ckpt_pos(128u), NULL) && pulsar_gpu_synchronize();
     check(ok && rd(pulsar_state_tensor(ss, LayerSlot{41u}, A_SCONV), SCONV_BYTES, SCONV_BYTES) == pattern(SCONV_BYTES, 82) &&
           rd(pulsar_state_tensor(ss, LayerSlot{40u}, A_KV_WINDOW), ring, ring) == pattern(ring, 81) &&
           all_zero(rd(pulsar_state_tensor(ss, LayerSlot{41u}, A_SCONV), 0, SCONV_BYTES)),
@@ -178,7 +179,7 @@ static void plan_a(void) {
     ok = pulsar_state_verify_capture(ss);
     for (uint32_t r = 0; ok && r < 8; r++)   /* what the op writes: the state after each row, at its step row */
         ok = wr(pulsar_state_capture_tensor(ss, A_SCONV),
-                pulsar_state_capture_offset(ss, LayerSlot{11u}, A_SCONV) + r * SCONV_BYTES, pattern(SCONV_BYTES, 500 + r));
+                pulsar_state_capture_offset(ss, LayerSlot{11u}, A_SCONV).raw() + r * SCONV_BYTES, pattern(SCONV_BYTES, 500 + r));
     ok = ok && wr(pulsar_state_tensor(ss, LayerSlot{11u}, A_SCONV), SCONV_BYTES, pattern(SCONV_BYTES, 999));   /* the verify's end */
     ok = ok && pulsar_state_commit(ss, BankId{1}, tok + 3, 2) && pulsar_gpu_synchronize();
     check(ok && rd(pulsar_state_tensor(ss, LayerSlot{11u}, A_SCONV), SCONV_BYTES, SCONV_BYTES) == pattern(SCONV_BYTES, 504),
@@ -219,15 +220,15 @@ static void plan_others(pulsar_state_plan *p) {
     p->resume_grid = 128;
     p->split_invariant = true;
     p->ckpt_slots = 1;
-    pulsar_state_plan_add(p, {"stage", PULSAR_STATE_STAGED, PULSAR_STATE_CAPTURE_STAGE, false, false, 4, STAGE_ROW,
-                              STAGE_REC, STAGE_OFF, NULL, NULL, NULL});
-    pulsar_state_plan_add(p, {"pool", PULSAR_STATE_POOL, PULSAR_STATE_CAPTURE_NONE, false, false, 4, 256, 0, 0, NULL,
+    pulsar_state_plan_add(p, {"stage", PULSAR_STATE_STAGED, PULSAR_STATE_CAPTURE_STAGE, false, false, 4, TensorBytes{STAGE_ROW},
+                              TensorBytes{STAGE_REC}, SlabOff{STAGE_OFF}, NULL, NULL, NULL});
+    pulsar_state_plan_add(p, {"pool", PULSAR_STATE_POOL, PULSAR_STATE_CAPTURE_NONE, false, false, 4, TensorBytes{256}, TensorBytes{0}, SlabOff{0}, NULL,
                               NULL, NULL});
-    pulsar_state_plan_add(p, {"delta", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_DELTA, false, false, 0, DELTA_BYTES,
-                              DELTA_UPD, 0, delta_commit, NULL, NULL});
-    pulsar_state_plan_add(p, {"host", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_REPLAY, true, false, 0, 8, 0, 0, NULL,
+    pulsar_state_plan_add(p, {"delta", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_DELTA, false, false, 0, TensorBytes{DELTA_BYTES},
+                              TensorBytes{DELTA_UPD}, SlabOff{0}, delta_commit, NULL, NULL});
+    pulsar_state_plan_add(p, {"host", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_REPLAY, true, false, 0, TensorBytes{8}, TensorBytes{0}, SlabOff{0}, NULL,
                               host_replay, host_init});
-    pulsar_state_plan_add(p, {"trail", PULSAR_STATE_POOL, PULSAR_STATE_CAPTURE_NONE, false, false, 1, 128, 0, 0, NULL,
+    pulsar_state_plan_add(p, {"trail", PULSAR_STATE_POOL, PULSAR_STATE_CAPTURE_NONE, false, false, 1, TensorBytes{128}, TensorBytes{0}, SlabOff{0}, NULL,
                               NULL, NULL});
     p->n_trunk = 3;
     p->n_slots = 4;
@@ -250,7 +251,7 @@ static void plan_b(void) {
     pulsar_kv_pool pools[8];
     check(ss->ops.pools(ss, pools, 8) == 1 && pools[0].tokens_per_row == TokPerRow{4u} &&
           ss->ops.trailing_pools(ss, pools, 8) == 1 && pools[0].tokens_per_row == TokPerRow{1u} &&
-              pools[0].row_bytes == 128,
+              pools[0].row_bytes.raw() == 128,
           "the trunk's pool is a segment's; the drafter slot's trails");
     pulsar_state_bank_free(ss, BankId{1});
     check(pulsar_state_bank_evicted(ss, BankId{1}) && pulsar_state_pool(ss, LayerSlot{3u}, B_TRAIL, BankId{1}) != NULL,
@@ -277,7 +278,7 @@ static void plan_b(void) {
     h[0] = h[1] = 0;   /* the step advanced it */
     ok = ok && wr(pulsar_state_tensor(ss, LayerSlot{1u}, B_STAGE), blk, pattern(blk, 8));   /* ... and wrote the block */
     std::vector<uint8_t> recs = pattern(6 * STAGE_REC, 9);
-    ok = ok && wr(pulsar_state_capture_tensor(ss, B_STAGE), pulsar_state_capture_offset(ss, LayerSlot{1u}, B_STAGE), recs);
+    ok = ok && wr(pulsar_state_capture_tensor(ss, B_STAGE), pulsar_state_capture_offset(ss, LayerSlot{1u}, B_STAGE).raw(), recs);
     pulsar_state_step_end(ss, bank, 6, ok);
     g_delta = {};
     ok = ok && pulsar_state_commit(ss, BankId{1}, tok, 4) && pulsar_gpu_synchronize();
@@ -290,7 +291,7 @@ static void plan_b(void) {
     check(ss->fold_host && g_delta.calls == 0 && ss->fold_host[1 + 2 * 1] == (int32_t)gen * VR &&
               ss->fold_host[2 + 2 * 1] == 4 && ss->fold_host[0] == (int32_t)gen * VR,
           "DELTA (L339): the commit launches nothing; bank 1's 4 kept rows are pending in the verify's generation %u", gen);
-    check(pulsar_state_capture_offset(ss, LayerSlot{2u}, B_DELTA) == 2ull * VR * DELTA_UPD &&
+    check(pulsar_state_capture_offset(ss, LayerSlot{2u}, B_DELTA).raw() == 2ull * VR * DELTA_UPD &&
               pulsar_gpu_tensor_bytes(ss->cap_rows[B_DELTA]) >= TensorBytes{2ull * 2 * VR * DELTA_UPD},
           "DELTA: two generations a slot ([slot][gen][verify rows])");
     ok = pulsar_state_fold_flush(ss, BankId{1}) && pulsar_gpu_synchronize();
@@ -335,12 +336,12 @@ static void plan_b(void) {
     pulsar_state_step_end(ss, b0, 1, ok);
     ok = ok && pulsar_state_commit(ss, BankId{0}, tok, 1);
     /* the walk: out flushes the live bank, in drops its rows; a reset drops them */
-    uint64_t wb = 0;
-    (void)ss->ops.walk(ss, -1, false, NULL, 0, pulsar_ckpt_pos(0u), &wb);
-    pulsar_gpu_tensor *slab = pulsar_gpu_tensor_alloc(TensorBytes{wb});
+    TensorBytes wb{};
+    (void)ss->ops.walk(ss, -1, false, NULL, SlabOff{}, pulsar_ckpt_pos(0u), &wb);
+    pulsar_gpu_tensor *slab = pulsar_gpu_tensor_alloc(wb);
     ss->live_bank = BankId{0};
     g_delta = {};
-    ok = ok && slab && ss->ops.walk(ss, 0, false, slab, 0, pulsar_ckpt_pos(0u), NULL) && pulsar_gpu_synchronize();
+    ok = ok && slab && ss->ops.walk(ss, 0, false, slab, SlabOff{}, pulsar_ckpt_pos(0u), NULL) && pulsar_gpu_synchronize();
     check(ok && g_delta.calls == 2 && g_delta.bank == 0 && ss->fold_host[2 + 2 * 0] == 0,
           "a walk out applies the live bank's pending rows first");
     pulsar_state_verify_begin(ss, 1, rf0, b0, p0);
@@ -348,7 +349,7 @@ static void plan_b(void) {
     pulsar_state_step_end(ss, b0, 1, ok);
     ok = ok && pulsar_state_commit(ss, BankId{0}, tok, 1);
     g_delta = {};
-    ok = ok && ss->ops.walk(ss, 1, false, slab, 0, pulsar_ckpt_pos(0u), NULL) && pulsar_gpu_synchronize();
+    ok = ok && ss->ops.walk(ss, 1, false, slab, SlabOff{}, pulsar_ckpt_pos(0u), NULL) && pulsar_gpu_synchronize();
     check(ok && g_delta.calls == 0 && ss->fold_host[2 + 2 * 0] == 0, "a walk in drops the live bank's pending rows");
     pulsar_state_verify_begin(ss, 1, rf0, b0, p0);
     ok = ok && pulsar_state_step_begin(ss, true);
@@ -364,7 +365,7 @@ static void plan_b(void) {
     bad.decl[B_POOL].tokens = 3;
     check(!pulsar_state_create(NULL, &bad, NULL, 1, 64, 0), "a pool whose rows the resume grid does not close: refused");
     plan_others(&bad);
-    bad.decl[B_STAGE].capture_off = STAGE_REC;
+    bad.decl[B_STAGE].capture_off = SlabOff{STAGE_REC};
     check(!pulsar_state_create(NULL, &bad, NULL, 1, 64, 0), "a STAGE record without room for its row: refused");
     plan_others(&bad);
     bad.slot[LayerSlot{0}] |= 1u << B_HOST;

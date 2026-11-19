@@ -175,7 +175,7 @@ static void case_embed_sentinel(void) {
     pulsar_gpu_tensor *out = pulsar_gpu_tensor_alloc(bytes_of<uint16_t>((uint64_t)n_tok * n_hc * n_embd));
     if (!tok || !out || !pulsar_gpu_tensor_write(tok, TensorBytes{0}, ids, TensorBytes{sizeof(ids)})) {
         fail("embed-sentinel: alloc / upload");
-    } else if (!pulsar_gpu_embed_tokens_hc_tensor(out, tok, table, sizeof(table), 0, n_vocab, n_tok, n_embd, n_hc) ||
+    } else if (!pulsar_gpu_embed_tokens_hc_tensor(out, tok, table, sizeof(table), MapOff{0}, n_vocab, n_tok, n_embd, n_hc) ||
                !pulsar_gpu_synchronize()) {
         fail("embed-sentinel: launch");
     } else {
@@ -379,7 +379,7 @@ static void case_hc_fused_width(void) {
     const uint32_t n_hc = 4u, mix = 2u * n_hc + n_hc * n_hc, rows = 2u, wmax = 5120u;
     static float slab[3 + 24 + 5120];
     for (float &v : slab) v = 0.5f;
-    const uint64_t off_scale = 0, off_base = 3u * 4u, off_norm = (3u + mix) * 4u;
+    const MapOff off_scale{0}, off_base{3u * 4u}, off_norm{(3u + mix) * 4u};
     int bad = 0;
     for (uint32_t n_embd : {4096u, 4352u, 5120u}) {
         pulsar_gpu_tensor *norm_out = pulsar_gpu_tensor_alloc(bytes_of<float>((uint64_t)rows * wmax));
