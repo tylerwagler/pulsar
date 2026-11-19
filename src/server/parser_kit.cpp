@@ -27,14 +27,18 @@ kit_gen::~kit_gen() {
     delete ahead;
 }
 
-/* L437 (L435 S2-9): the ONE crossing, value unchanged.  An offset of the parser's STREAM -- the bytes fed to it since
- * its init (out_parser::raw_span, first_call_at) -- taken for an offset of g->text.  The two are equal only because
- * every parser is fed g->text from its first byte: a decode attempt resets the text and creates its parser together
- * (gen_decode_init), and a forced seed is read from byte 0 (parser_kit_seed).  Nothing checks it here; the parser's
- * side is typed next, and this becomes the kit state's conversion. */
-/// @param stream_off  an offset in the bytes the attempt's parser was fed
-/// @return the same number as an offset of g->text
-static GenOff kit_stream_off_as_text(size_t stream_off) { return GenOff{stream_off}; }
+/* L437: a parser's stream offset in the turn's text.  The parser counts the bytes it was fed since its init(); this
+ * state feeds it g->text[.., fed) in order, so the stream's end is text offset `fed` and a stream offset lies as far
+ * before `fed` as it lies before the stream's end.  Every parser is fed from the text's first byte today (a decode
+ * attempt resets g->text and creates its parser together, gen_decode_init; a forced seed is read from byte 0), which
+ * makes the two offsets equal -- but that is this state's fact, not the parser's, and it is no longer assumed. */
+GenOff kit_gen::text_at(StreamOff at) const {
+    const StreamOff end = parser->stream_end();
+    if (at > end) pulsar_die("output parser: a stream offset past the bytes the parser was fed");
+    const GenBytes back = end - at;
+    if (back > fed.before()) pulsar_die("output parser: a stream offset before the turn's text");
+    return fed - back;
+}
 
 /// Feed `q`'s parser text[fed, upto) and advance `fed` (nothing when `upto` is at or below it).
 /// @param q     the kit state (the attempt's, or a probe's)
@@ -356,21 +360,22 @@ bool parser_kit_finish(void *st, server *s, session_slot *sl, gen_state *g, serv
     out->reasoning = p.reasoning().empty() ? NULL : server_xstrdup(p.reasoning().c_str());
     out->calls = q->calls;
     memset(&q->calls, 0, sizeof(q->calls));
-    size_t span_lo = 0, span_hi = 0;
+    StreamOff span_lo{0}, span_hi{0};
     /* the sampled bytes are the tool memory's key only when they are exactly the kept calls: a dropped
      * undeclared call is in them, so that turn re-renders canonically (a prefix miss, never a wrong prompt) */
     if (out->calls.len && q->undeclared == 0 && p.raw_span(&span_lo, &span_hi)) {
-        const GenOff raw_lo = kit_stream_off_as_text(span_lo), raw_hi = kit_stream_off_as_text(span_hi);
+        /* L437: the parser's span is of its stream; the text's bytes are at this state's offsets of it */
+        const GenOff raw_lo = q->text_at(span_lo), raw_hi = q->text_at(span_hi);
         if (raw_hi > gen_text_end(g->text.len) || raw_lo >= raw_hi)
             pulsar_die("output parser: raw span outside the turn's text");
         out->calls.raw_calls = server_xstrndup(gen_text_at(g->text.ptr, raw_lo), (raw_hi - raw_lo).raw());
     }
     /* as text, the stream stopped at the first call's marker: the rest goes out at the finish.  The parser says
      * where that was (L419: a marker quoted in Markdown code before it was text, and streamed as text) */
-    const size_t call = p.first_call_at();
+    const StreamOff call = p.first_call_at();
     std::string open_reasoning;   /* L420: the turn ended inside its reasoning */
     const bool open = p.open_reasoning(&open_reasoning);
     return parser_finish_turn(s, sl, g, out, p.errors() > 0 || q->undeclared > 0, q->last_error.c_str(),
-                              /*logged=*/true, call == std::string::npos ? GenOff::none() : kit_stream_off_as_text(call), ok,
+                              /*logged=*/true, call.is_none() ? GenOff::none() : q->text_at(call), ok,
                               open ? open_reasoning.c_str() : NULL);
 }

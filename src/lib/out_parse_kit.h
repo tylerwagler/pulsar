@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "md_code_scan.h"
+#include "pulsar_units.h"
 
 /** One thing the parser recognised. */
 struct out_event {
@@ -323,15 +324,20 @@ public:
     bool in_payload() const { return state_ == OUT_CALL && body_->in_payload(); }
     /** The turn's calls as SAMPLED: [lo, hi) in the fed stream, from where the first call's bytes start to
      * the end of the last call that closed (a malformed one among them included -- these are the bytes the
-     * live KV holds).  false until a call was read. */
+     * live KV holds).  false until a call was read.  Offsets of THIS parser's stream (L437): whoever fed it owns
+     * where that stream starts in its own text (the server's kit_gen::text_at). */
     /// @param lo receives the stream offset where the first call's bytes start
     /// @param hi receives the stream offset one past the last closed call's closer
     /// @return true when at least one well-formed call was read (then `*lo`, `*hi` are set)
-    bool raw_span(size_t *lo, size_t *hi) const;
+    bool raw_span(StreamOff *lo, StreamOff *hi) const;
     /** Where the turn's first call opened: the stream offset of the marker that opened it -- a marker quoted in
-     *  Markdown code (L419) is text and opens none -- or std::string::npos when no call opened. */
-    /// @return the first call-opening marker's offset in the fed stream, or std::string::npos
-    size_t first_call_at() const { return block_seen_ ? call_at_ : std::string::npos; }
+     *  Markdown code (L419) is text and opens none -- or none() when no call opened. */
+    /// @return the first call-opening marker's offset in the fed stream, or StreamOff::none()
+    StreamOff first_call_at() const { return block_seen_ ? call_at_ : StreamOff::none(); }
+    /** L437: the end of the stream so far -- the bytes fed since init(), as an offset: what a feeder measures a
+     *  stream offset back from to place it in its own text. */
+    /// @return the offset one past the last byte fed
+    StreamOff stream_end() const { return fed_; }
 
 protected:
     /** A configuration's clone: the base's reading copied, then pointed at the copy's own body. */
@@ -386,6 +392,11 @@ private:
     void close_call(std::vector<out_event> *ev);
     /// A call opens: its body starts empty.  A probe's borrowed body is set aside first (probe_end() returns it).
     void new_block();
+    /** L437: the stream offset of byte `at` of hold_ -- hold_ is the stream's unclassified tail, so its byte `at` is
+     *  `hold_.size() - at` bytes before the stream's end.  The one crossing from the held bytes to the stream. */
+    /// @param at an offset in hold_ (at most its size)
+    /// @return that byte's offset in the fed stream
+    StreamOff stream_at(size_t at) const { return fed_ - GenBytes{hold_.size() - at}; }
 
     /// The bound grammar (not owned).
     const out_grammar *g_ = nullptr;
@@ -394,14 +405,14 @@ private:
     /// The machine's current state.
     out_state state_ = OUT_CONTENT;
     std::string hold_;         ///< bytes not yet classified
-    size_t fed_ = 0;           ///< bytes fed so far; hold_ is the stream's unclassified tail
+    StreamOff fed_ = StreamOff{0};   ///< the stream's end: bytes fed so far; hold_ is the stream's unclassified tail
     std::string header_;       ///< HEADER's buffered text
-    size_t header_at_ = 0;     ///< stream offset of the current header's text (past the marker that opened it)
+    StreamOff header_at_ = StreamOff{0};   ///< stream offset of the current header's text (past the marker that opened it)
     bool block_seen_ = false;  ///< a call opened: raw_lo_ is set
-    size_t raw_lo_ = 0;        ///< stream offset of the first call's bytes
-    size_t call_at_ = 0;       ///< stream offset of the marker that opened the first call
+    StreamOff raw_lo_ = StreamOff{0};    ///< stream offset of the first call's bytes
+    StreamOff call_at_ = StreamOff{0};   ///< stream offset of the marker that opened the first call
     md_code_scan code_;        ///< L419: the current CONTENT / REASONING section's Markdown code state
-    size_t raw_hi_ = 0;        ///< stream offset past the last call's closer
+    StreamOff raw_hi_ = StreamOff{0};    ///< stream offset past the last call's closer
     section sec_[2];           ///< [0] content, [1] reasoning
     std::string block_;        ///< the open call's body
     /// The next call's index (counts malformed calls too).

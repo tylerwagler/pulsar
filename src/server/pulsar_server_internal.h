@@ -4594,6 +4594,13 @@ struct kit_gen {
      *  their open call bodies (out_parser::probe).  NULL for an attempt's own state. */
     kit_gen *lender = nullptr;
     ~kit_gen();                      ///< frees `calls` and the parsers (parser_kit.cpp)
+    /** L437: where byte `at` of `parser`'s stream is in g->text -- the ONE crossing from a parser's stream offsets
+     *  (its calls' span, where its first call opened) to the turn's text.  This state feeds the parser g->text's
+     *  bytes in order and `fed` says how far, so the stream's end IS text offset `fed`, and `at` is as far before
+     *  it in the text as in the stream -- wherever in the text the parser was started (parser_kit.cpp). */
+    /// @param at  an offset in the bytes `parser` was fed (fatal past its end, or before the text's first byte)
+    /// @return that byte's offset in g->text
+    GenOff text_at(StreamOff at) const;
 };
 /** The kit's server_output_parser_ops hooks (parser_kit.cpp): a family whose parser is a kit configuration
  *  fills its table with these and its own `create`, which builds the configured parser (per request: its

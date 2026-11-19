@@ -56,11 +56,11 @@ void out_parser::init(const out_grammar *g, out_call_body *body, out_state initi
     body_ = body;
     state_ = initial;
     hold_.clear();
-    fed_ = 0;
+    fed_ = StreamOff{0};
     header_.clear();
-    header_at_ = 0;
+    header_at_ = StreamOff{0};
     block_seen_ = false;
-    raw_lo_ = raw_hi_ = call_at_ = 0;
+    raw_lo_ = raw_hi_ = call_at_ = StreamOff{0};
     code_.reset();
     sec_[0] = sec_[1] = section();
     block_.clear();
@@ -292,7 +292,7 @@ void out_parser::close_call(std::vector<out_event> *ev) {
 void out_parser::feed(const char *p, size_t n, std::vector<out_event> *ev) {
     if (lent_out_) kit_die("feed() while a probe holds the open call's body");
     hold_.append(p, n);
-    fed_ += n;
+    fed_ += GenBytes{n};
     for (;;) {
         const out_transition *tr = nullptr;
         size_t len = 0, keep = 0;
@@ -317,12 +317,12 @@ void out_parser::feed(const char *p, size_t n, std::vector<out_event> *ev) {
                 hold_.erase(0, at + len);
                 continue;
             }
-            raw_hi_ = fed_ - hold_.size() + at + len;
-            const size_t marker_at = fed_ - hold_.size() + at;
+            const StreamOff marker_at = stream_at(at);
+            raw_hi_ = marker_at + GenBytes{len};
             hold_.erase(0, at + len);
             body_->grow(block_, 0, true, index_, ev);
             close_call(ev);
-            if (tr->to == OUT_HEADER) header_at_ = marker_at + len;
+            if (tr->to == OUT_HEADER) header_at_ = marker_at + GenBytes{len};
             state_ = tr->to;
             continue;
         }
@@ -337,7 +337,7 @@ void out_parser::feed(const char *p, size_t n, std::vector<out_event> *ev) {
             hold_.erase(0, at + len);
             continue;
         }
-        const size_t marker_at = fed_ - hold_.size() + at;
+        const StreamOff marker_at = stream_at(at);
         /* the scanner follows the section's sampled bytes: a marker that keeps the state is among them (it reads no
          * backtick, but it is on the line); one that leaves the state starts the next section afresh */
         if (tr->to == state_) code_.feed(hold_.data() + at, len);
@@ -364,7 +364,7 @@ void out_parser::feed(const char *p, size_t n, std::vector<out_event> *ev) {
             new_block();
             body_->open();
         }
-        if (tr->to == OUT_HEADER) header_at_ = marker_at + len;
+        if (tr->to == OUT_HEADER) header_at_ = marker_at + GenBytes{len};
         hold_.erase(0, at + len);
         state_ = tr->to;
     }
@@ -409,7 +409,7 @@ bool out_parser::open_reasoning(std::string *as_content) const {
     return true;
 }
 
-bool out_parser::raw_span(size_t *lo, size_t *hi) const {
+bool out_parser::raw_span(StreamOff *lo, StreamOff *hi) const {
     if (calls_.empty()) return false;
     *lo = raw_lo_;
     *hi = raw_hi_;

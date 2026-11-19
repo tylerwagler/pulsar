@@ -4459,6 +4459,8 @@ static void test_gen_host(void) {
     test_l430_round_walks_match_reference();
     test_l431_stop_scan_matches_reference();
     test_l437_offset_units();
+    test_l437_stream_offsets_and_conversion();
+    test_l437_parser_started_mid_text();
 }
 
 /* L335: a bank carry's restore is all or nothing -- a live row that does not restore (here: a bank past the device
