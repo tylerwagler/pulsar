@@ -3801,7 +3801,7 @@ struct server {
     /// @param err        receives the refusal (the numbers, and how many banks were spilled)
     /// @param errlen     its size
     /// @return true when the chunk may run; false = the floor still stands (the caller answers 503)
-    bool floor_admits_chunk(int rows, char *err, size_t errlen);
+    bool floor_admits_chunk(KvRows rows, char *err, size_t errlen);
     /** L372 (O12): the guard's KV budget for a prefill that is no slot's -- the judge's.  The bank's growth to
      *  `end_rows` tokens must fit the budget beside the resident KV and the admitted prompts' reservations (the
      *  prompt admission's arithmetic, server_prompt_kv_verdict); short of it the idle chat banks the plan names are

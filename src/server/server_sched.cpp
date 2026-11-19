@@ -2829,6 +2829,12 @@ static bool slot_is_batchable_decode(const session_slot *sl) {
  * (L284 lane cost, lane_price_pick): the spec lane is offered to this pick only
  * when it is the faster, and decoders left in the plain batch rejoin it through
  * server::batch_leave before this pick (L271, L284). */
+/* L443: the verify rows `n_dec` decoders take at least -- each its round's base row, one a decoder: the one crossing
+ * from the lanes' decoder count to the verify width they are weighed against. */
+/// @param n_dec decoders (>= 0)
+/// @return their base rows
+static StepRows lane_base_rows(int n_dec) { return StepRows{n_dec}; }
+
 /* L271 / L284: whether the spec lane could take every decoder: the drafter runs behind the round API, they are
  * no more than one verify forward carries, and each speculates (the lane pick's own conditions, batch membership
  * aside: a decoder in the plain batch leaves it when the price picks spec, so a leave is never undone by the next
@@ -2838,8 +2844,8 @@ static bool slot_is_batchable_decode(const session_slot *sl) {
 /// @param dec the decoders
 /// @param n_dec how many
 /// @return true when the spec lane could take every decoder
-static bool server_spec_lane_carries(bool spec_rounds, uint32_t verify_rows, session_slot *const *dec, int n_dec) {
-    if (!spec_rounds || n_dec <= 0 || (uint32_t)n_dec > verify_rows) return false;
+static bool server_spec_lane_carries(bool spec_rounds, StepRows verify_rows, session_slot *const *dec, int n_dec) {
+    if (!spec_rounds || n_dec <= 0 || lane_base_rows(n_dec) > verify_rows) return false;
     for (int i = 0; i < n_dec; i++) {
         const gen_state *dg = dec[i]->gen;
         if (!dg || !dg->spec_enabled) return false;
@@ -2954,11 +2960,11 @@ static void lane_price_rekey(lane_price *lp, int n, int band) {
 /// @param n decoders (a new count resets the measurements)
 /// @param tokens tokens committed
 /// @param ms the step's wall time, ms
-static void lane_price_measure(lane_price *lp, int li, int n, int tokens, double ms) {
-    if (n <= 0 || tokens < 0 || !(ms > 0.0)) return;
+static void lane_price_measure(lane_price *lp, int li, int n, TokCount tokens, double ms) {
+    if (n <= 0 || tokens < TokCount{0} || !(ms > 0.0)) return;
     if (n != lp->meas_n) lane_price_rekey(lp, n, lp->meas_depth);
     const double a = lp->meas_steps[li] ? (double)LANE_PRICE_ALPHA : 1.0;
-    lp->meas_tok[li] += a * ((double)tokens - lp->meas_tok[li]);
+    lp->meas_tok[li] += a * ((double)tokens.raw() - lp->meas_tok[li]);
     lp->meas_ms[li] += a * (ms - lp->meas_ms[li]);
     lp->meas_steps[li]++;
 }
@@ -2968,7 +2974,7 @@ static void lane_price_measure(lane_price *lp, int li, int n, int tokens, double
 /// @param n decoders
 /// @param ms the step's wall time, ms
 static void lane_price_observe_plain(lane_price *lp, int n, double ms) {
-    lane_price_measure(lp, PULSAR_LANE_PLAIN, n, n, ms);
+    lane_price_measure(lp, PULSAR_LANE_PLAIN, n, TokCount{n} /* a token a decoder: the plain step */, ms);
 }
 
 /* One spec decode round: `tokens` committed by `banks` banks over `rows` verify rows in `ms`. */
@@ -2978,10 +2984,11 @@ static void lane_price_observe_plain(lane_price *lp, int n, double ms) {
 /// @param rows verify rows
 /// @param banks banks in the round
 /// @param ms the round's wall time, ms
-static void lane_price_observe_spec(lane_price *lp, int tokens, int rows, int banks, double ms) {
-    if (banks <= 0 || rows <= 0 || tokens < 0) return;
+static void lane_price_observe_spec(lane_price *lp, TokCount tokens, StepRows rows, int banks, double ms) {
+    if (banks <= 0 || rows <= StepRows{0} || tokens < TokCount{0}) return;
     lane_price_measure(lp, PULSAR_LANE_SPEC, banks, tokens, ms);
-    const float tau = (float)tokens / (float)banks, rho = (float)rows / (float)banks;
+    /* the yield per bank (tokens) and the rows per bank (the verify's): two ratios, never mixed */
+    const float tau = (float)tokens.raw() / (float)banks, rho = (float)rows.raw() / (float)banks;
     if (lp->tau <= 0.0f) {
         lp->tau = tau;
         lp->rho = rho;
@@ -3006,13 +3013,16 @@ static double lane_price_plain(const pulsar_lane_cost *c, int n) {
 /// @param n decoders
 /// @param verify_rows the verify width
 /// @return tokens/s
-static double lane_price_spec(const pulsar_lane_cost *c, const lane_price *lp, int n, uint32_t verify_rows) {
+static double lane_price_spec(const pulsar_lane_cost *c, const lane_price *lp, int n, StepRows verify_rows) {
     if (!(lp->tau > 0.0f) || !(lp->rho >= 1.0f)) return 0.0;
+    /* the cost model in doubles: rows (n * rho, the verify width) and tokens (n * tau); n decoders are n base rows
+     * (lane_base_rows) and n base tokens, so the drafts past the width are prorated in both */
+    const double width = (double)verify_rows.raw(), base = (double)lane_base_rows(n).raw();
     double rows = (double)n * lp->rho, toks = (double)n * lp->tau;
-    if (rows > (double)verify_rows) {
-        const double drafts = rows - (double)n, kept = (double)verify_rows - (double)n;
+    if (rows > width) {
+        const double drafts = rows - base, kept = width - base;
         toks = (double)n + (toks - (double)n) * (kept > 0.0 ? kept / drafts : 0.0);
-        rows = (double)verify_rows;
+        rows = width;
     }
     const double ms = pulsar_lane_cost_ms(c, rows);
     return ms > 0.0 ? 1000.0 * toks / ms : 0.0;
@@ -3045,7 +3055,7 @@ static int lane_depth_band(uint32_t depth) {
 /// @param verify_rows the verify width
 /// @return the lane: 2 plain or 3 spec
 static int lane_price_weigh(lane_price *lp, const pulsar_lane_cost *plain, const pulsar_lane_cost *spec, int n,
-                            uint32_t verify_rows) {
+                            StepRows verify_rows) {
     if (lp->lane == 0) {   /* the spec lane until a price says otherwise */
         lp->lane = 3;
         lp->held_n0 = spec->n;
@@ -3137,7 +3147,7 @@ static int lane_price_weigh(lane_price *lp, const pulsar_lane_cost *plain, const
 /// @param depth the decoders' mean depth, tokens (server::slot_frontier_pos; a new band drops the measured prices)
 /// @return the lane: 2 plain or 3 spec
 static int lane_price_pick(lane_price *lp, const pulsar_lane_cost *plain, const pulsar_lane_cost *spec, int n,
-                           uint32_t verify_rows, uint32_t depth) {
+                           StepRows verify_rows, uint32_t depth) {
     const int band = lane_depth_band(depth);
     if (n != lp->meas_n || band != lp->meas_depth) lane_price_rekey(lp, n, band);
     const int lane = lane_price_weigh(lp, plain, spec, n, verify_rows);
@@ -3159,9 +3169,9 @@ static int lane_price_pick(lane_price *lp, const pulsar_lane_cost *plain, const 
 /// @param n_dec how many
 /// @param n_batched decoders in the plain multiseq batch
 /// @return the lane
-static int server_pick_decode_lane(int pool_banks, bool spec_rounds, uint32_t verify_rows,
+static int server_pick_decode_lane(int pool_banks, bool spec_rounds, StepRows verify_rows,
                                    session_slot *const *dec, int n_dec, int n_batched) {
-    bool all_spec = spec_rounds && n_dec >= 1 && (uint32_t)n_dec <= verify_rows && n_batched == 0;
+    bool all_spec = spec_rounds && n_dec >= 1 && lane_base_rows(n_dec) <= verify_rows && n_batched == 0;
     for (int i = 0; all_spec && i < n_dec; i++) {
         const gen_state *dg = dec[i]->gen;
         if (!dg || !dg->spec_enabled || dg->batch_active)
@@ -3997,10 +4007,10 @@ KvBytes server::prefill_chunk_need() {
     return pulsar_session_quantum_growth_bytes_per_bank(sess, pulsar_kv_rows(pulsar_session_prefill_cap(sess)));
 }
 
-bool server::floor_admits_chunk(int rows, char *err, size_t errlen) {
+bool server::floor_admits_chunk(KvRows rows, char *err, size_t errlen) {
     auto *s = this;
     /* a host-only server (the unit tests) has no session to price a row by: the floor alone decides */
-    const KvBytes need = s->sess ? pulsar_session_quantum_growth_bytes_per_bank(s->sess, KvRows{(uint32_t)rows})
+    const KvBytes need = s->sess ? pulsar_session_quantum_growth_bytes_per_bank(s->sess, rows)
                                  : KvBytes{};
     const double gib = 1024.0 * 1024.0 * 1024.0;
     server_mem_reading mem = s->mem_reading();
@@ -5523,7 +5533,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             pulsar_engine_lane_cost_observe(s->engine, PULSAR_LANE_SPEC, rows, round_ms);
             /* L284 lane cost: the same round's yield, per bank -- what the lane choice prices the spec lane's
              * rows by (lane_price_pick) */
-            lane_price_observe_spec(&s->w_lane_price, emitted_total - round_emitted0, (int)rows, m, round_ms);
+            lane_price_observe_spec(&s->w_lane_price, TokCount{emitted_total - round_emitted0}, step_rows, m, round_ms);
             /* L301: and the verify curve's online correction -- the forward against its profile, the rest of the
              * round outside the forward and the drafting, the drafting */
             pulsar_engine_verify_curve_observe(s->engine, (uint32_t)m, rows, fwd_ms, round_ms - fwd_ms - draft_ms,
@@ -6209,7 +6219,8 @@ void *server_worker_main(void *arg) {
          * prompt took the classic sync, none rode a fused step -- when the price picks the spec lane (below) */
         /* L284 lane cost: where the spec lane could carry every decoder, the faster lane by measured price takes
          * them (lane_price_pick, one rule for every family) */
-        const uint32_t verify_rows = pulsar_engine_fused_heads_max(s->engine);
+        /* the verify width: the rows one verify step heads (the engine's uint32) */
+        const StepRows verify_rows{pulsar_engine_fused_heads_max(s->engine)};
         const bool spec_carries = s->pool_banks > 0 &&
                                   server_spec_lane_carries(pulsar_engine_has_spec_rounds(s->engine), verify_rows,
                                                            dec, n_dec);
