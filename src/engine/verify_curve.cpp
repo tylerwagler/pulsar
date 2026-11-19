@@ -680,13 +680,13 @@ bool pulsar_session_verify_profile_local(pulsar_session *s, uint32_t rows_max, d
             ok = spec_bank_restore(s, bank) && (!t->snapshot || t->snapshot(s, r, err, errlen));
             if (!ok) break;
             spec_bank_save(s, bank);
-            pulsar_session_spec_arm_capture_local(s, rows);
+            pulsar_session_spec_arm_capture_local(s, StepRows{rows});
             uint32_t got = 0;
             const double t0 = pulsar_mono_sec();
             ok = fs->decode_mixed(s, reqs, rows, logits.data(), (int)((size_t)rows * V), &got,
                                   PULSAR_MSEQ_HEAD_ALL_ROWS, err, errlen) == 0 && got == rows;
             const double t1 = pulsar_mono_sec();
-            pulsar_session_spec_arm_capture_local(s, 0u);
+            pulsar_session_spec_arm_capture_local(s, StepRows{0});
             if (!ok) break;
             pulsar_gpu_seg_stats_get(&g1);
             const bool replayed = g1.misses == g0.misses;

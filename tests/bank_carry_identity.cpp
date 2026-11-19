@@ -121,7 +121,8 @@ int GATE_ENTRY(int argc, char **argv) {
     for (int t = 0; t < ticks; t++) {
         pulsar_multiseq_req reqs[ROWS];
         int first[NB];
-        uint32_t row0[NB], rows = 0;
+        StepRow row0[NB];
+        StepRows step_rows{0};
         double t0 = now_us();
         if (batch) {
             for (int b = 0; b < NB; b++) {
@@ -131,11 +132,11 @@ int GATE_ENTRY(int argc, char **argv) {
                 steps[b].temperature = temp; steps[b].top_k = top_k;
                 steps[b].top_p = top_p; steps[b].min_p = min_p;
                 steps[b].rng = &rngs[b];
-                steps[b].max_tokens = 64;
-                steps[b].k_alloc = -1;
-                steps[b].accepted_cap = 17;
+                steps[b].max_tokens = TokCount{64};
+                steps[b].k_alloc = TokCount{-1};
+                steps[b].accepted_cap = TokCount{17};
             }
-            if (pulsar_session_spec_assemble_batch(s, steps, NB, ROWS, reqs, &rows) != 0) {
+            if (pulsar_session_spec_assemble_batch(s, steps, NB, StepRows{(int)ROWS}, reqs, &step_rows) != 0) {
                 fprintf(stderr, "tick %d assemble batch refused\n", t);
                 return 1;
             }
@@ -152,21 +153,22 @@ int GATE_ENTRY(int argc, char **argv) {
             if (!timed_restore(s, (uint32_t)b)) { fprintf(stderr, "restore %d\n", b); return 1; }
             first[b] = pulsar_session_spec_next_base(s, temp, top_k, top_p, min_p, &rngs[b]).raw();
             if (first[b] < 0 ||
-                pulsar_session_spec_round_begin(s, r[b], TokId{first[b]}, 64, 17, temp, top_k, top_p, min_p,
+                pulsar_session_spec_round_begin(s, r[b], TokId{first[b]}, TokCount{64}, TokCount{17}, temp, top_k, top_p, min_p,
                                                 err, sizeof(err)) != 0) {
                 fprintf(stderr, "tick %d bank %d begin: %s\n", t, b, err);
                 return 1;
             }
-            row0[b] = rows;
-            rows += pulsar_spec_round_fill_reqs(r[b], BankId{b}, reqs + rows);
+            row0[b] = StepRow::after(step_rows);
+            step_rows += pulsar_spec_round_fill_reqs(r[b], BankId{b}, reqs + step_rows.raw());
             timed_save(s, (uint32_t)b);
         }
         ph_us[0] += now_us() - t0;
-        pulsar_session_spec_arm_capture(s, rows);
+        const uint32_t rows = (uint32_t)step_rows.raw();   /* decode_mixed's row count */
+        pulsar_session_spec_arm_capture(s, step_rows);
         uint32_t got = 0;
         const int rc = pulsar_session_decode_mixed(s, reqs, rows, logits, (int)(rows * (uint32_t)vocab), &got,
                                                    PULSAR_MSEQ_HEAD_ALL_ROWS, err, sizeof(err));
-        pulsar_session_spec_arm_capture(s, 0u);
+        pulsar_session_spec_arm_capture(s, StepRows{0});
         if (rc != 0 || got != rows) { fprintf(stderr, "tick %d forward: %s\n", t, err); return 1; }
         int na_b[NB];
         t0 = now_us();
@@ -175,7 +177,7 @@ int GATE_ENTRY(int argc, char **argv) {
                 steps[b].first_token = TokId{first[b]};
                 steps[b].row0 = row0[b];
                 steps[b].accepted = acc_b[b];
-                steps[b].accepted_cap = 17;
+                steps[b].accepted_cap = TokCount{17};
             }
             if (pulsar_session_spec_round_end_batch(s, steps, NB) != 0) {
                 fprintf(stderr, "tick %d round_end batch refused\n", t);
@@ -186,13 +188,13 @@ int GATE_ENTRY(int argc, char **argv) {
                     fprintf(stderr, "tick %d bank %d end status %d: %s\n", t, b, steps[b].status, steps[b].err);
                     return 1;
                 }
-                na_b[b] = steps[b].n_accepted;
+                na_b[b] = steps[b].n_accepted.raw();
             }
         }
         for (int b = 0; !batch && b < NB; b++) {
             if (!timed_restore(s, (uint32_t)b)) { fprintf(stderr, "restore %d\n", b); return 1; }
             na_b[b] = pulsar_session_spec_round_end(s, r[b], TokId{first[b]}, temp, top_k, top_p, min_p, &rngs[b],
-                                                    row0[b], acc_b[b], 17, err, sizeof(err));
+                                                    row0[b], acc_b[b], TokCount{17}, err, sizeof(err));
             if (na_b[b] < 0) { fprintf(stderr, "tick %d bank %d end: %s\n", t, b, err); return 1; }
             timed_save(s, (uint32_t)b);
         }

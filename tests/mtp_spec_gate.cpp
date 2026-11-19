@@ -284,14 +284,15 @@ static void batched_lane(pulsar_engine *e, const std::vector<pulsar_tokens> &P, 
             st[m].temperature = pos_greedy(greedy_run, got[b].size()) ? 0.0f : temp;   /* the base's position */
             st[m].top_p = 1.0f;
             st[m].rng = &rngs[b];
-            st[m].max_tokens = n - (int)got[b].size();
-            st[m].k_alloc = -1;
-            st[m].accepted_cap = (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
+            st[m].max_tokens = TokCount{n - (int)got[b].size()};
+            st[m].k_alloc = TokCount{-1};
+            st[m].accepted_cap = TokCount{PULSAR_SPEC_LOGITS_ROWS + 1};
             bank_of[m++] = (uint32_t)b;
         }
         if (m == 0) break;
-        uint32_t rows = 0;
-        (void)pulsar_session_spec_assemble_batch(s, st, m, width, reqs.data(), &rows);
+        StepRows step_rows{0};
+        (void)pulsar_session_spec_assemble_batch(s, st, m, StepRows{width}, reqs.data(), &step_rows);
+        const uint32_t rows = (uint32_t)step_rows.raw();   /* decode_mixed's row count */
         /* as the server's lane: a bank whose base is a stop token emits it and ends (never evaluated); a bank
          * over the row budget sits the tick out untouched; the rest verify (a deep chain -- the drafter's cap 7,
          * a copy chain -- can fill the width) */
@@ -314,31 +315,32 @@ static void batched_lane(pulsar_engine *e, const std::vector<pulsar_tokens> &P, 
         if (m == 0 || rows == 0) continue;
         std::vector<float> logits((size_t)rows * W);
         uint32_t gotr = 0;
-        pulsar_session_spec_arm_capture(s, rows);
+        pulsar_session_spec_arm_capture(s, step_rows);
         ok = pulsar_session_decode_mixed(s, reqs.data(), rows, logits.data(), (int)rows * W, &gotr,
                                          PULSAR_MSEQ_HEAD_ALL_ROWS, err, sizeof(err)) == 0 && gotr == rows;
-        pulsar_session_spec_arm_capture(s, 0u);
+        pulsar_session_spec_arm_capture(s, StepRows{0});
         if (!ok) break;
         for (int i = 0; i < m; i++) {
             st[i].accepted = acc[i];
-            st[i].accepted_cap = (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
+            st[i].accepted_cap = TokCount{PULSAR_SPEC_LOGITS_ROWS + 1};
             /* row j: the token after the base (position got.size()) and j drafts */
             st[i].temperature = temp;
             st[i].greedy_rows = 0u;
             const size_t base_pos = got[bank_of[i]].size();
-            for (uint32_t j = 0; j < st[i].n_rows; j++)
+            const uint32_t nr = (uint32_t)st[i].n_rows.raw();   /* the step's rows: one token a row */
+            for (uint32_t j = 0; j < nr; j++)
                 if (pos_greedy(greedy_run, base_pos + 1u + j)) st[i].greedy_rows |= 1u << j;
-            const uint32_t all = st[i].n_rows >= 32u ? ~0u : (1u << st[i].n_rows) - 1u;
-            crossing += st[i].n_rows > 1u && st[i].greedy_rows != 0u && st[i].greedy_rows != all;
+            const uint32_t all = nr >= 32u ? ~0u : (1u << nr) - 1u;
+            crossing += nr > 1u && st[i].greedy_rows != 0u && st[i].greedy_rows != all;
         }
         ok = pulsar_session_spec_round_end_batch(s, st, m) == 0;
         for (int i = 0; ok && i < m; i++) {
             ok = st[i].status == PULSAR_SPEC_STEP_OK;
             if (!ok) { snprintf(err, sizeof err, "round_end bank %d: %s", st[i].bank.raw(), st[i].err); break; }
             const uint32_t b = bank_of[i];
-            for (int k = 0; k < st[i].n_accepted; k++) got[b].push_back(acc[i][k].raw());
+            for (int k = 0; k < st[i].n_accepted.raw(); k++) got[b].push_back(acc[i][k].raw());
             if ((int)got[b].size() >= n ||
-                (st[i].n_accepted && pulsar_token_is_stop(e, acc[i][st[i].n_accepted - 1])))
+                (st[i].n_accepted.raw() && pulsar_token_is_stop(e, acc[i][st[i].n_accepted.raw() - 1])))
                 done[b] = true;
         }
         if (!ok) break;

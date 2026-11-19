@@ -844,7 +844,7 @@ static void part_fused_runs(pulsar_engine *e, int W) {
             /* F8: the record, then a divergent sync of bank 2 from the checkpoint the record left */
             char err[256] = "";
             bool ok = pulsar_session_bank_state_restore(x, BankId{2}) &&
-                      pulsar_session_note_prefilled(x, L2.v, m2, ord[0] == 2 ? 0 : 1) == 0;
+                      pulsar_session_note_prefilled(x, L2.v, TokCount{m2}, PromptHead{ord[0] == 2 ? 0 : 1}) == 0;
             double d = 0;
             CHECK(ok && pulsar_session_pos(x).raw() == m2 && same(logits_of(x, W), cl2[0], &d),
                   "F8 bank 2's record: %d tokens, its headed row as the next-token logits (max |diff| %.3g)",
@@ -859,7 +859,7 @@ static void part_fused_runs(pulsar_engine *e, int W) {
                   "(max |diff| %.3g) %s", d, ok ? "" : err);
             if (ok) pulsar_session_bank_state_save(x, BankId{2});
             ok = pulsar_session_bank_state_restore(x, BankId{1}) &&
-                 pulsar_session_note_prefilled(x, L.v + pre_len, m1, ord[0] == 1 ? 0 : 1) == 0;
+                 pulsar_session_note_prefilled(x, L.v + pre_len, TokCount{m1}, PromptHead{ord[0] == 1 ? 0 : 1}) == 0;
             CHECK(ok && pulsar_session_pos(x).raw() == pre_len + m1 && same(logits_of(x, W), cl1[0], &d),
                   "F8 bank 1's record: %d tokens, its headed row as the next-token logits (max |diff| %.3g)",
                   pulsar_session_pos(x).raw(), d);
@@ -1032,12 +1032,14 @@ static bool spec_lane_round(pulsar_session *s, const uint32_t *banks, const int 
         st[i].round = rounds[i];
         st[i].top_p = 1.0f;
         st[i].rng = &rngs[i];
-        st[i].max_tokens = 64;
-        st[i].k_alloc = k_alloc[i];
-        st[i].accepted_cap = k_alloc[i] >= 0 ? k_alloc[i] + 1 : (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
+        st[i].max_tokens = TokCount{64};
+        st[i].k_alloc = TokCount{k_alloc[i]};
+        st[i].accepted_cap = TokCount{k_alloc[i] >= 0 ? k_alloc[i] + 1 : (int)(PULSAR_SPEC_LOGITS_ROWS + 1)};
     }
-    uint32_t rows = 0;
-    if (pulsar_session_spec_assemble_batch(s, st, n, width, reqs.data(), &rows) != 0 || rows == 0) {
+    StepRows step_rows{0};
+    const bool assembled = pulsar_session_spec_assemble_batch(s, st, n, StepRows{width}, reqs.data(), &step_rows) == 0;
+    const uint32_t rows = (uint32_t)step_rows.raw();   /* decode_mixed's row count */
+    if (!assembled || rows == 0) {
         snprintf(err, errlen, "assemble refused (%u rows)", rows);
         return false;
     }
@@ -1048,13 +1050,13 @@ static bool spec_lane_round(pulsar_session *s, const uint32_t *banks, const int 
         }
     std::vector<float> logits((size_t)rows * W);
     uint32_t got = 0;
-    pulsar_session_spec_arm_capture(s, rows);
+    pulsar_session_spec_arm_capture(s, step_rows);
     const int rc = pulsar_session_decode_mixed(s, reqs.data(), rows, logits.data(), (int)rows * W, &got,
                                                PULSAR_MSEQ_HEAD_ALL_ROWS, err, errlen);
-    pulsar_session_spec_arm_capture(s, 0u);
+    pulsar_session_spec_arm_capture(s, StepRows{0});
     if (rc != 0 || got != rows) return false;
     for (int i = 0; i < n; i++) {
-        const uint32_t row0 = st[i].row0;
+        const StepRow row0 = st[i].row0;
         const int first = st[i].first_token.raw();
         memset(&st[i], 0, sizeof st[i]);
         st[i].bank = BankId{banks[i]};
@@ -1064,7 +1066,7 @@ static bool spec_lane_round(pulsar_session *s, const uint32_t *banks, const int 
         st[i].first_token = TokId{first};
         st[i].row0 = row0;
         st[i].accepted = acc[i];
-        st[i].accepted_cap = (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
+        st[i].accepted_cap = TokCount{PULSAR_SPEC_LOGITS_ROWS + 1};
     }
     if (pulsar_session_spec_round_end_batch(s, st, n) != 0) {
         snprintf(err, errlen, "round_end refused");
@@ -1075,7 +1077,7 @@ static bool spec_lane_round(pulsar_session *s, const uint32_t *banks, const int 
             snprintf(err, errlen, "round_end bank %u: %s", banks[i], st[i].err);
             return false;
         }
-        na[i] = st[i].n_accepted;
+        na[i] = st[i].n_accepted.raw();
     }
     return true;
 }

@@ -195,11 +195,11 @@ static int sampled_plain_batch(pulsar_session *s, const start_state *snap,
             return -1;
         }
         /* every bank's row drawn in one device launch, each at its own stream's key (L302) */
-        uint32_t qrow[SAMPLED_BANKS_PLAIN];
+        HeadRow qrow[SAMPLED_BANKS_PLAIN];   /* one row a bank, all headed (max_head_runs 0): head row q */
         pulsar_row_draw d[SAMPLED_BANKS_PLAIN];
         TokId drawn[SAMPLED_BANKS_PLAIN];
         for (uint32_t q = 0; q < m; q++) {
-            qrow[q] = q;
+            qrow[q] = HeadRow{q};
             d[q] = pulsar_row_draw{temp, 0, top_p, min_p, &rng[who[q]], false, NULL};
         }
         if (pulsar_session_draw_rows(s, qrow, d, m, drawn) != 0) {
@@ -239,8 +239,8 @@ static int sampled_spec_batch(pulsar_session *s, const start_state *snap,
     for (;;) {
         pulsar_multiseq_req reqs[SAMPLED_ROWS_MAX + 17];
         int first[SAMPLED_BANKS_SPEC], begun[SAMPLED_BANKS_SPEC];
-        uint32_t row0[SAMPLED_BANKS_SPEC];
-        uint32_t rows = 0;
+        StepRow row0[SAMPLED_BANKS_SPEC];
+        StepRows step_rows{0};
         int any = 0;
         for (int b = 0; b < nb; b++) {
             begun[b] = 0;
@@ -255,27 +255,28 @@ static int sampled_spec_batch(pulsar_session *s, const start_state *snap,
                 pulsar_session_bank_state_save(s, BankId{b});
                 continue;
             }
-            if (pulsar_session_spec_round_begin(s, r[b], TokId{first[b]}, DEPTH - got[b], 17,
+            if (pulsar_session_spec_round_begin(s, r[b], TokId{first[b]}, TokCount{DEPTH - got[b]}, TokCount{17},
                                                 temp, 0, top_p, min_p, err, errlen) != 0)
                 return -1;
             begun[b] = 1;
-            const uint32_t nr = pulsar_spec_round_n_rows(r[b]);
-            if (rows + nr > SAMPLED_ROWS_MAX) {
-                snprintf(err, errlen, "round rows %u + %u exceed the %d-row batch (bank %d)",
-                         rows, nr, SAMPLED_ROWS_MAX, b);
+            const StepRows nr = pulsar_spec_round_n_rows(r[b]);
+            if (step_rows + nr > StepRows{SAMPLED_ROWS_MAX}) {
+                snprintf(err, errlen, "round rows %d + %d exceed the %d-row batch (bank %d)",
+                         step_rows.raw(), nr.raw(), SAMPLED_ROWS_MAX, b);
                 return -1;
             }
-            row0[b] = rows;
-            rows += pulsar_spec_round_fill_reqs(r[b], BankId{b}, reqs + rows);
+            row0[b] = StepRow::after(step_rows);
+            step_rows += pulsar_spec_round_fill_reqs(r[b], BankId{b}, reqs + step_rows.raw());
             pulsar_session_bank_state_save(s, BankId{b});
             any = 1;
         }
         if (!any) break;
-        pulsar_session_spec_arm_capture(s, rows);
+        const uint32_t rows = (uint32_t)step_rows.raw();   /* decode_mixed's row count */
+        pulsar_session_spec_arm_capture(s, step_rows);
         uint32_t out_rows = 0;
         const int rc = pulsar_session_decode_mixed(s, reqs, rows, logits, (int)(rows * (uint32_t)vocab),
                                                    &out_rows, PULSAR_MSEQ_HEAD_ALL_ROWS, err, errlen);
-        pulsar_session_spec_arm_capture(s, 0u);
+        pulsar_session_spec_arm_capture(s, StepRows{0});
         if (rc != 0 || out_rows != rows) {
             for (int b = 0; b < nb; b++) if (begun[b]) {
                 pulsar_session_bank_state_restore(s, BankId{b});
@@ -295,7 +296,7 @@ static int sampled_spec_batch(pulsar_session *s, const start_state *snap,
             }
             TokId accepted[17];
             const int na = pulsar_session_spec_round_end(s, r[b], TokId{first[b]}, temp, 0, top_p, min_p,
-                                                         &rng[b], row0[b], accepted, 17,
+                                                         &rng[b], row0[b], accepted, TokCount{17},
                                                          err, errlen);
             if (na < 0) return -1;
             for (int i = 0; i < na && got[b] < DEPTH; i++) seq[t0 + b][got[b]++] = accepted[i].raw();

@@ -1431,14 +1431,14 @@ TokId pulsar_session_draw(pulsar_session *s, const pulsar_row_draw *d);
  *  @param d n draws' knobs, d[k] for rows[k]
  *  @param n the count
  *  @param tokens receives n tokens */
-int pulsar_session_draw_rows(pulsar_session *s, const uint32_t *rows, const pulsar_row_draw *d, uint32_t n,
+int pulsar_session_draw_rows(pulsar_session *s, const HeadRow *rows, const pulsar_row_draw *d, uint32_t n,
                              TokId *tokens);
 /** The last batched step's headed row `row` becomes `bank`'s next-token row (a mixed step's finished prompt run: the
  * bank's restore installs it).  On the device.  @return 0, or 1. */
 /** @param s the session
  *  @param row the headed row
  *  @param bank the bank it becomes the next-token row of */
-int pulsar_session_step_row_to_bank(pulsar_session *s, uint32_t row, BankId bank);
+int pulsar_session_step_row_to_bank(pulsar_session *s, HeadRow row, BankId bank);
 /** pulsar_session_draw with no mask and no greedy override. @return the token, or -1. */
 /** @param s the session
  *  @param temperature as pulsar_row_draw
@@ -1480,7 +1480,7 @@ int pulsar_session_token_logprob(pulsar_session *s, TokId token, pulsar_token_sc
  *  @param top receives k entries
  *  @param k entries wanted
  *  @param n_top receives the real entries */
-int pulsar_session_step_row_logprobs(pulsar_session *s, uint32_t row, TokId token, pulsar_token_score *chosen,
+int pulsar_session_step_row_logprobs(pulsar_session *s, HeadRow row, TokId token, pulsar_token_score *chosen,
                                      int *have_chosen, pulsar_token_score *top, int k, int *n_top);
 /** Copy the live logits row to the host.
  *  @param s the session
@@ -1757,8 +1757,8 @@ void pulsar_spec_round_free(pulsar_spec_round *r);
  * consumes the carry, and a rejection-residual carry must be emitted exactly
  * (the acceptance proof depends on it), not discarded and redrawn. */
 /** @param s the session
- *  @return 1 + the live bank's pending drafts (at most 17) */
-uint32_t pulsar_session_spec_next_rows_max(const pulsar_session *s);
+ *  @return 1 + the live bank's pending drafts (at most 17), in step rows (one token a row) */
+StepRows pulsar_session_spec_next_rows_max(const pulsar_session *s);
 /** The position the round began at (its base token's position).  After
  * pulsar_session_spec_round_end the bank's frontier must equal this plus the
  * accepted count it returned (L155); the server checks exactly that. */
@@ -1818,15 +1818,15 @@ TokId pulsar_session_spec_next_base(pulsar_session *s, float temperature,
  *  @param errlen bytes at err
  *  @return 0, or -1 (snapshot failure; the session is poisoned) */
 int pulsar_session_spec_round_begin(pulsar_session *s, pulsar_spec_round *r,
-                                 TokId first_token, int max_tokens, int accepted_cap,
+                                 TokId first_token, TokCount max_tokens, TokCount accepted_cap,
                                  float temperature, int top_k, float top_p,
                                  float min_p, char *err, size_t errlen);
 /** Rows a begun round will occupy (1 + surviving drafts). Check the caller's
  * buffer space against this BEFORE fill_reqs -- fill_reqs writes this many
  * entries unconditionally. */
 /** @param r a begun round
- *  @return its rows */
-uint32_t pulsar_spec_round_n_rows(const pulsar_spec_round *r);
+ *  @return its rows (step rows of the forward it rides) */
+StepRows pulsar_spec_round_n_rows(const pulsar_spec_round *r);
 /** Rows this round contributes to the shared forward: n_batch reqs (the
  * round's base token at the pre-round frontier, then the pending drafts) --
  * every verify's rows, the single lane's included.  Returns the row count
@@ -1835,9 +1835,9 @@ uint32_t pulsar_spec_round_n_rows(const pulsar_spec_round *r);
  *  @param bank the bank the rows name
  *  @param out receives pulsar_spec_round_n_rows entries
  *  @return rows written */
-uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, BankId bank, pulsar_multiseq_req *out);
-/** Finish the round against the last shared forward's rows: this round's rows start at the step's headed row
- * `row0` (they stay on the device, L302).  Emits into accepted[] and returns the count, or -1 (session poisoned).
+StepRows pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, BankId bank, pulsar_multiseq_req *out);
+/** Finish the round against the last shared forward's rows: this round's rows start at the step's row `row0`, every
+ * row of a verify headed so its logits sit at the same index (they stay on the device, L302).  Emits into accepted[] and returns the count, or -1 (session poisoned).
  * The walk -- on the device -- draws each row's token at its own key in `rng` (the stream at the round's base) and
  * steps the stream past every token it emits (L288 sdet). */
 /** @param s the session
@@ -1848,7 +1848,7 @@ uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, BankId bank, pu
  *  @param top_p as pulsar_row_draw
  *  @param min_p as pulsar_row_draw
  *  @param rng the request's stream at the round's base (stepped)
- *  @param row0 the round's first headed row in the step
+ *  @param row0 the round's first row in the step (a step row: where fill_reqs' rows went)
  *  @param accepted receives the emitted tokens
  *  @param accepted_cap slots at accepted
  *  @param err receives the failure
@@ -1858,8 +1858,8 @@ int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                                TokId first_token,
                                float temperature, int top_k, float top_p,
                                float min_p, uint64_t *rng,
-                               uint32_t row0,
-                               TokId *accepted, int accepted_cap,
+                               StepRow row0,
+                               TokId *accepted, TokCount accepted_cap,
                                char *err, size_t errlen);
 /** Gate-facing (L182): pulsar_session_spec_round_end with the acceptance walk
  * replaced by TEACHER FORCING.  Draft i is accepted iff it equals truth[i]; the
@@ -1878,7 +1878,7 @@ int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r,
  *  @param top_p as pulsar_row_draw
  *  @param min_p as pulsar_row_draw
  *  @param rng untouched
- *  @param row0 the round's first headed row
+ *  @param row0 the round's first row in the step
  *  @param truth K + 1 true ids
  *  @param accepted receives the emitted tokens
  *  @param accepted_cap slots at accepted
@@ -1889,9 +1889,9 @@ int pulsar_session_spec_round_end_forced(pulsar_session *s, pulsar_spec_round *r
                                       TokId first_token,
                                       float temperature, int top_k, float top_p,
                                       float min_p, uint64_t *rng,
-                                      uint32_t row0,
+                                      StepRow row0,
                                       const TokId *truth,
-                                      TokId *accepted, int accepted_cap,
+                                      TokId *accepted, TokCount accepted_cap,
                                       char *err, size_t errlen);
 /** Abort a begun round whose forward failed: drop its frontier snapshot and its unverified rows.
  *  @param s the session
@@ -1903,7 +1903,7 @@ void pulsar_session_spec_round_abort(pulsar_session *s, pulsar_spec_round *r);
  * loop does around its own forward. */
 /** @param s the session
  *  @param n_rows rows of the next forward; 0 disarms */
-void pulsar_session_spec_arm_capture(pulsar_session *s, uint32_t n_rows);
+void pulsar_session_spec_arm_capture(pulsar_session *s, StepRows n_rows);
 /** L150: the batched lane's round_end DEFERS drafting; after every bank's
  * round_end (and bank_state_save) call this once with the live rounds, their
  * banks and each bank's rng (read, never stepped: a sampled draft is drawn at
@@ -1959,12 +1959,13 @@ typedef struct {
     int top_k;
     /** The request's sampler stream (assemble: the base draw; round_end: the walk).  Borrowed. */
     uint64_t *rng;           /* assemble (base draw), round_end (walk) */
-    /** assemble: tokens left in the request. */
-    int max_tokens;          /* assemble: tokens left in the request */
-    /** assemble: drafts allocated under overflow (the verify pick); -1 = no allocation. */
-    int k_alloc;             /* assemble: drafts allocated under overflow; -1 = no allocation */
-    /** assemble: round_begin's cap; round_end: capacity of `accepted`, tokens. */
-    int accepted_cap;        /* assemble: round_begin's cap; round_end: accepted[] capacity */
+    /** assemble: tokens the request may still generate (L443: a token count). */
+    TokCount max_tokens;
+    /** assemble: draft TOKENS allocated under overflow (the verify pick; the round's rows are 1 + these, one token a
+     *  row); TokCount{-1} = no allocation. */
+    TokCount k_alloc;
+    /** assemble: round_begin's cap; round_end: capacity of `accepted`, in tokens. */
+    TokCount accepted_cap;
     /** round_end: receives this bank's accepted tokens (caller-owned, accepted_cap slots). */
     TokId *accepted;         /* round_end: this bank's accepted tokens */
     /* round_end (L296): bit i set = verify row i -- the token after the base and drafts 0..i-1; row K is a full
@@ -1983,20 +1984,21 @@ typedef struct {
      * the masks do not cross it (the step fails by name). */
     /** Token mask rows, [mask_rows][ceil(pulsar_engine_logits_width / 32)] words; NULL = unconstrained (see above).  Borrowed. */
     const uint32_t *masks;
-    /** Rows in `masks`. */
-    uint32_t mask_rows;
+    /** Rows in `masks`: the round's verify rows (L443). */
+    VerifyRows mask_rows;
     /* assemble out, round_end in */
     /** The round's base token, drawn by assemble; none() when the step drew none (L334 P3: was -1). */
     TokId first_token;
-    /** The bank's first row in the shared forward. */
-    uint32_t row0;           /* the bank's first row in the shared forward */
+    /** The bank's first row in the shared forward: a STEP row (reqs[row0 ..)); the forward heads every row of a
+     *  verify, so the walk reads its logits at the same index (L443). */
+    StepRow row0;
     /** Rows the bank contributed to the shared forward (base + drafts). */
-    uint32_t n_rows;         /* base + drafts it contributed */
+    StepRows n_rows;
     /* out */
     /** The step's outcome, a pulsar_spec_step_status. */
     int status;              /* pulsar_spec_step_status */
     /** round_end: tokens written to `accepted`. */
-    int n_accepted;          /* round_end */
+    TokCount n_accepted;
     /** round_end: the round's base position (L155). */
     TokPos pos_before;       /* round_end: the round's base position (L155) */
     /** round_end: the bank's frontier after the round. */
@@ -2024,8 +2026,8 @@ typedef struct {
  *  @param n_rows_out receives the rows written
  *  @return 0 or -1 */
 int pulsar_session_spec_assemble_batch(pulsar_session *s, pulsar_spec_step *steps, int n,
-                                       uint32_t row_budget,
-                                       pulsar_multiseq_req *reqs, uint32_t *n_rows_out);
+                                       StepRows row_budget,
+                                       pulsar_multiseq_req *reqs, StepRows *n_rows_out);
 /** Every step's walk over the last shared forward's rows in one device launch, then per step: restore, round_end
  * (the step's row0 / first_token from assemble), save.  0 or -1 as above. */
 /** @param s the session
@@ -2152,9 +2154,9 @@ void pulsar_session_note_committed_tokens(pulsar_session *s, const TokId *toks, 
 /** @param s the session
  *  @param toks the chunk's tokens
  *  @param n their count
- *  @param head the headed run's index, or -1
+ *  @param head the headed prompt run, or none() (L443: was -1)
  *  @return 0, or 1 on a refusal */
-int pulsar_session_note_prefilled(pulsar_session *s, const TokId *toks, int n, int head);
+int pulsar_session_note_prefilled(pulsar_session *s, const TokId *toks, TokCount n, PromptHead head);
 /** One speculative round (or a plain step when the drafter is quenched or absent); returns the tokens emitted.
  *  A round -- here, in the round API and in the batched phases -- stops at the family's whole stop set
  *  (pulsar_token_is_stop): nothing is committed past a stop (L284: the callers' single eos id is gone). */

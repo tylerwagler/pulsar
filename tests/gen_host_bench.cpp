@@ -170,7 +170,7 @@ struct attempt {
     /// @param text  the generated text
     void emit(const std::string &text) {
         for (size_t at = 0; at < text.size(); at += 64)
-            if (srv.gen_emit_piece(g, 0, text.data() + at, std::min<size_t>(64, text.size() - at)))
+            if (srv.gen_emit_piece(g, TokId{0}, text.data() + at, std::min<size_t>(64, text.size() - at)))
                 bench_die("the emit path ended the turn before the measured point");
     }
 };
@@ -194,8 +194,8 @@ void walk_cells(attempt *a, bool chain) {
     const double ref = (cpu_s() - t0) / (double)ref_n * 1e6;
     t0 = cpu_s();
     for (long i = 0; i < live_n; i++)
-        sink_live += chain ? gen_turn_draft_prefix_text(a->g, k_round, lens, 4)
-                           : (long)gen_spec_greedy_rows_text(a->g, k_round, lens, 5, false);
+        sink_live += chain ? gen_turn_draft_prefix_text(a->g, k_round, lens, TokCount{4}).raw()
+                           : (long)gen_spec_greedy_rows_text(a->g, k_round, lens, TokCount{5}, false);
     const double live = (cpu_s() - t0) / (double)live_n * 1e6;
     if (sink_ref / ref_n != sink_live / live_n || a->g->text.len != size)
         bench_die("the reference and the live walk read the round differently");

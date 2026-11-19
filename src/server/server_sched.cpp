@@ -2669,8 +2669,9 @@ static bool gen_draw_req(server *s, gen_state *g, float temp, int top_k, float t
         if (!gen_constrain_mask(s, g, mask->data())) return false;
     }
     /* L344: the budget spent -- this draw is the close token */
-    if (gen_think_close_row(s, g, NULL, 0, 0) == 0) {
-        const uint32_t *f = gen_think_masks(s, g, 0, 1, live ? mask->data() : NULL, live ? 1 : 0);
+    if (gen_think_close_row(s, g, NULL, TokCount{0}, false) == VerifyRow{0}) {
+        const uint32_t *f = gen_think_masks(s, g, VerifyRow{0}, VerifyRows{1}, live ? mask->data() : NULL,
+                                            VerifyRows{live ? 1 : 0});
         if (!f) return false;
         mask->assign(f, f + gen_think_mask_words(s));
         *d = pulsar_row_draw{temp, top_k, top_p, min_p, &g->rng, false, mask->data()};
@@ -2692,26 +2693,28 @@ size_t gen_think_mask_words(const server *s) {
  * accept walk) and a draft that disagrees is rejected as any refused draft is.  Inside the block the grammar gate
  * masks nothing (its THINK phase), so the forced row never meets a grammar row. */
 
-/// @brief The draw at which the budget closes the block, pure: row i follows the round's first i + `off` tokens
-/// (`toks`; off = 1 when toks[0] is a base not yet emitted -- gen_constrain_round's rows).  Rows past a pending
-/// token that closes the block itself are never forced.
+/// @brief The draw at which the budget closes the block, pure: verify row i follows the round's first
+/// pulsar_verify_tokens_before(i) pending tokens (`toks`; the base among them while pending -- gen_constrain_round's
+/// rows).  Rows past a pending token that closes the block itself are never forced.  L443: the budget and the tokens
+/// are counted in tokens, the answer is a verify row; the two meet only through the named crossings.
 /// @param budget        request::think_budget (0: none)
 /// @param open          the attempt's block is open (inside it, not latched closed)
 /// @param think_tokens  reasoning tokens emitted so far
 /// @param close         the family's close token
 /// @param toks          the round's tokens not yet emitted, in order (may be NULL when n is 0)
 /// @param n             how many
-/// @param off           1 when toks[0] is the base (row 0 follows it), else 0
-/// @return the row to force, or -1 (no budget, block closed, or the budget not reached within the round)
-int think_close_row(int budget, bool open, int think_tokens, TokId close, const TokId *toks, int n, int off) {
-    if (budget <= 0 || !open) return -1;
-    const int rows = n - off + 1;
-    for (int i = 0; i < rows; i++) {
-        const int pre = i + off;   /* the round's tokens before row i */
-        if (pre > 0 && toks[pre - 1] == close) return -1;
+/// @param base_pending  toks[0] is the base (row 0 follows it)
+/// @return the row to force, or none() (no budget, block closed, or the budget not reached within the round)
+VerifyRow think_close_row(TokCount budget, bool open, TokCount think_tokens, TokId close, const TokId *toks, TokCount n,
+                          bool base_pending) {
+    if (budget <= TokCount{0} || !open) return VerifyRow::none();
+    const VerifyRows rows = pulsar_verify_rows(n, base_pending);
+    for (VerifyRow i{0}; i < VerifyRow::after(rows); i += VerifyRows{1}) {
+        const TokCount pre = pulsar_verify_tokens_before(i, base_pending);   /* the round's tokens before row i */
+        if (pre > TokCount{0} && toks[pre.raw() - 1] == close) return VerifyRow::none();
         if (think_tokens + pre >= budget) return i;
     }
-    return -1;
+    return VerifyRow::none();
 }
 
 /// @brief think_close_row for a slot's generation.
@@ -2719,13 +2722,13 @@ int think_close_row(int budget, bool open, int think_tokens, TokId close, const 
 /// @param g     the slot's generation
 /// @param toks  the round's tokens not yet emitted, in order (may be NULL when n is 0)
 /// @param n     how many
-/// @param off   1 when toks[0] is the base, else 0
-/// @return the row to force, or -1
-int gen_think_close_row(server *s, const gen_state *g, const TokId *toks, int n, int off) {
+/// @param base_pending  toks[0] is the base
+/// @return the row to force, or none()
+VerifyRow gen_think_close_row(server *s, const gen_state *g, const TokId *toks, TokCount n, bool base_pending) {
     const int budget = g->j->req.think_budget;
-    if (budget <= 0) return -1;
-    return think_close_row(budget, g->thinking.inside && !g->think_closed, g->think_tokens,
-                           pulsar_token_think_close(s->engine), toks, n, off);
+    if (budget <= 0) return VerifyRow::none();
+    return think_close_row(TokCount{budget}, g->thinking.inside && !g->think_closed, TokCount{g->think_tokens},
+                           pulsar_token_think_close(s->engine), toks, n, base_pending);
 }
 
 /// @brief Lay `rows` mask rows of `W` words into `out`: each the grammar's (`gram`, `gram_rows` of them) or
@@ -2737,14 +2740,15 @@ int gen_think_close_row(server *s, const gen_state *g, const TokId *toks, int n,
 /// @param close      the token row `row` allows
 /// @param gram       the grammar's rows (NULL: none)
 /// @param gram_rows  rows in `gram`
-void think_masks_lay(uint32_t *out, size_t W, int row, int rows, TokId close, const uint32_t *gram, int gram_rows) {
+void think_masks_lay(uint32_t *out, size_t W, VerifyRow row, VerifyRows rows, TokId close, const uint32_t *gram,
+                     VerifyRows gram_rows) {
     const uint32_t bit = (uint32_t)close.raw();   /* its bit (the caller bounded it by W * 32) */
-    for (int i = 0; i < rows; i++) {
+    for (int i = 0; i < rows.raw(); i++) {   /* the rows' memory, indexed by row */
         uint32_t *r = out + (size_t)i * W;
-        if (gram && i < gram_rows) memcpy(r, gram + (size_t)i * W, W * sizeof(uint32_t));
+        if (gram && i < gram_rows.raw()) memcpy(r, gram + (size_t)i * W, W * sizeof(uint32_t));
         else memset(r, 0xff, W * sizeof(uint32_t));
     }
-    uint32_t *f = out + (size_t)row * W;
+    uint32_t *f = out + (size_t)row.raw() * W;
     memset(f, 0, W * sizeof(uint32_t));
     f[bit >> 5] = 1u << (bit & 31u);
 }
@@ -2759,7 +2763,8 @@ void think_masks_lay(uint32_t *out, size_t W, int row, int rows, TokId close, co
 /// @param gram       the grammar's rows (NULL: none)
 /// @param gram_rows  rows in `gram`
 /// @return the rows (rows x the engine's mask width); NULL with g->err set when a grammar row is another width
-const uint32_t *gen_think_masks(server *s, gen_state *g, int row, int rows, const uint32_t *gram, int gram_rows) {
+const uint32_t *gen_think_masks(server *s, gen_state *g, VerifyRow row, VerifyRows rows, const uint32_t *gram,
+                                VerifyRows gram_rows) {
     const size_t W = gen_think_mask_words(s);
     const TokId close = pulsar_token_think_close(s->engine);
     /* chat_resolve_thinking refused a budget without one; the mask rows' width is this check's vocab authority
@@ -2773,7 +2778,7 @@ const uint32_t *gen_think_masks(server *s, gen_state *g, int row, int rows, cons
                  (unsigned)gen_constrain_words(s), W);
         return NULL;
     }
-    const size_t need = (size_t)rows * W;
+    const size_t need = (size_t)rows.raw() * W;
     if (g->think_rows_cap < need) {
         g->think_rows = (uint32_t *)server_xrealloc(g->think_rows, need * sizeof(uint32_t));
         g->think_rows_cap = need;
@@ -2782,7 +2787,7 @@ const uint32_t *gen_think_masks(server *s, gen_state *g, int row, int rows, cons
     return g->think_rows;
 }
 
-/* the slot's draw from the pool session's live row.  -1 with g->err set: the sampler refused the row, or the
+/* the slot's draw from the pool session's live row.  none() with g->err set: the sampler refused the row, or the
  * grammar failed. */
 /// @param s the server
 /// @param g the slot's generation
@@ -2791,14 +2796,14 @@ const uint32_t *gen_think_masks(server *s, gen_state *g, int row, int rows, cons
 /// @param top_k top-k (0: off)
 /// @param top_p top-p
 /// @param min_p min-p
-/// @return the token, or -1
-static int gen_sample_pool(server *s, gen_state *g, pulsar_session *pool, float temp, int top_k, float top_p,
-                           float min_p) {
+/// @return the token, or none()
+static TokId gen_sample_pool(server *s, gen_state *g, pulsar_session *pool, float temp, int top_k, float top_p,
+                             float min_p) {
     std::vector<uint32_t> mask;
     pulsar_row_draw d;
-    if (!gen_draw_req(s, g, temp, top_k, top_p, min_p, &mask, &d)) return -1;
-    const int tok = pulsar_session_draw(pool, &d).raw();   /* none(): PULSAR_SAMPLE_REFUSED */
-    if (tok < 0) snprintf(g->err, sizeof g->err, "sampler refused a degenerate logits row (L188)");
+    if (!gen_draw_req(s, g, temp, top_k, top_p, min_p, &mask, &d)) return TokId::none();
+    const TokId tok = pulsar_session_draw(pool, &d);   /* none(): PULSAR_SAMPLE_REFUSED */
+    if (!tok.is_token()) snprintf(g->err, sizeof g->err, "sampler refused a degenerate logits row (L188)");
     return tok;
 }
 
@@ -2837,6 +2842,12 @@ static bool slot_is_batchable_decode(const session_slot *sl) {
  * (L284 lane cost, lane_price_pick): the spec lane is offered to this pick only
  * when it is the faster, and decoders left in the plain batch rejoin it through
  * server::batch_leave before this pick (L271, L284). */
+/* L443: the verify rows `n_dec` decoders take at least -- each its round's base row, one a decoder: the one crossing
+ * from the lanes' decoder count to the verify width they are weighed against. */
+/// @param n_dec decoders (>= 0)
+/// @return their base rows
+static StepRows lane_base_rows(int n_dec) { return StepRows{n_dec}; }
+
 /* L271 / L284: whether the spec lane could take every decoder: the drafter runs behind the round API, they are
  * no more than one verify forward carries, and each speculates (the lane pick's own conditions, batch membership
  * aside: a decoder in the plain batch leaves it when the price picks spec, so a leave is never undone by the next
@@ -2846,8 +2857,8 @@ static bool slot_is_batchable_decode(const session_slot *sl) {
 /// @param dec the decoders
 /// @param n_dec how many
 /// @return true when the spec lane could take every decoder
-static bool server_spec_lane_carries(bool spec_rounds, uint32_t verify_rows, session_slot *const *dec, int n_dec) {
-    if (!spec_rounds || n_dec <= 0 || (uint32_t)n_dec > verify_rows) return false;
+static bool server_spec_lane_carries(bool spec_rounds, StepRows verify_rows, session_slot *const *dec, int n_dec) {
+    if (!spec_rounds || n_dec <= 0 || lane_base_rows(n_dec) > verify_rows) return false;
     for (int i = 0; i < n_dec; i++) {
         const gen_state *dg = dec[i]->gen;
         if (!dg || !dg->spec_enabled) return false;
@@ -2962,11 +2973,11 @@ static void lane_price_rekey(lane_price *lp, int n, int band) {
 /// @param n decoders (a new count resets the measurements)
 /// @param tokens tokens committed
 /// @param ms the step's wall time, ms
-static void lane_price_measure(lane_price *lp, int li, int n, int tokens, double ms) {
-    if (n <= 0 || tokens < 0 || !(ms > 0.0)) return;
+static void lane_price_measure(lane_price *lp, int li, int n, TokCount tokens, double ms) {
+    if (n <= 0 || tokens < TokCount{0} || !(ms > 0.0)) return;
     if (n != lp->meas_n) lane_price_rekey(lp, n, lp->meas_depth);
     const double a = lp->meas_steps[li] ? (double)LANE_PRICE_ALPHA : 1.0;
-    lp->meas_tok[li] += a * ((double)tokens - lp->meas_tok[li]);
+    lp->meas_tok[li] += a * ((double)tokens.raw() - lp->meas_tok[li]);
     lp->meas_ms[li] += a * (ms - lp->meas_ms[li]);
     lp->meas_steps[li]++;
 }
@@ -2976,7 +2987,7 @@ static void lane_price_measure(lane_price *lp, int li, int n, int tokens, double
 /// @param n decoders
 /// @param ms the step's wall time, ms
 static void lane_price_observe_plain(lane_price *lp, int n, double ms) {
-    lane_price_measure(lp, PULSAR_LANE_PLAIN, n, n, ms);
+    lane_price_measure(lp, PULSAR_LANE_PLAIN, n, TokCount{n} /* a token a decoder: the plain step */, ms);
 }
 
 /* One spec decode round: `tokens` committed by `banks` banks over `rows` verify rows in `ms`. */
@@ -2986,10 +2997,11 @@ static void lane_price_observe_plain(lane_price *lp, int n, double ms) {
 /// @param rows verify rows
 /// @param banks banks in the round
 /// @param ms the round's wall time, ms
-static void lane_price_observe_spec(lane_price *lp, int tokens, int rows, int banks, double ms) {
-    if (banks <= 0 || rows <= 0 || tokens < 0) return;
+static void lane_price_observe_spec(lane_price *lp, TokCount tokens, StepRows rows, int banks, double ms) {
+    if (banks <= 0 || rows <= StepRows{0} || tokens < TokCount{0}) return;
     lane_price_measure(lp, PULSAR_LANE_SPEC, banks, tokens, ms);
-    const float tau = (float)tokens / (float)banks, rho = (float)rows / (float)banks;
+    /* the yield per bank (tokens) and the rows per bank (the verify's): two ratios, never mixed */
+    const float tau = (float)tokens.raw() / (float)banks, rho = (float)rows.raw() / (float)banks;
     if (lp->tau <= 0.0f) {
         lp->tau = tau;
         lp->rho = rho;
@@ -3014,13 +3026,16 @@ static double lane_price_plain(const pulsar_lane_cost *c, int n) {
 /// @param n decoders
 /// @param verify_rows the verify width
 /// @return tokens/s
-static double lane_price_spec(const pulsar_lane_cost *c, const lane_price *lp, int n, uint32_t verify_rows) {
+static double lane_price_spec(const pulsar_lane_cost *c, const lane_price *lp, int n, StepRows verify_rows) {
     if (!(lp->tau > 0.0f) || !(lp->rho >= 1.0f)) return 0.0;
+    /* the cost model in doubles: rows (n * rho, the verify width) and tokens (n * tau); n decoders are n base rows
+     * (lane_base_rows) and n base tokens, so the drafts past the width are prorated in both */
+    const double width = (double)verify_rows.raw(), base = (double)lane_base_rows(n).raw();
     double rows = (double)n * lp->rho, toks = (double)n * lp->tau;
-    if (rows > (double)verify_rows) {
-        const double drafts = rows - (double)n, kept = (double)verify_rows - (double)n;
+    if (rows > width) {
+        const double drafts = rows - base, kept = width - base;
         toks = (double)n + (toks - (double)n) * (kept > 0.0 ? kept / drafts : 0.0);
-        rows = (double)verify_rows;
+        rows = width;
     }
     const double ms = pulsar_lane_cost_ms(c, rows);
     return ms > 0.0 ? pulsar_per_sec(toks, ms) : 0.0;
@@ -3053,7 +3068,7 @@ static int lane_depth_band(uint32_t depth) {
 /// @param verify_rows the verify width
 /// @return the lane: 2 plain or 3 spec
 static int lane_price_weigh(lane_price *lp, const pulsar_lane_cost *plain, const pulsar_lane_cost *spec, int n,
-                            uint32_t verify_rows) {
+                            StepRows verify_rows) {
     if (lp->lane == 0) {   /* the spec lane until a price says otherwise */
         lp->lane = 3;
         lp->held_n0 = spec->n;
@@ -3145,7 +3160,7 @@ static int lane_price_weigh(lane_price *lp, const pulsar_lane_cost *plain, const
 /// @param depth the decoders' mean depth, tokens (server::slot_frontier_pos; a new band drops the measured prices)
 /// @return the lane: 2 plain or 3 spec
 static int lane_price_pick(lane_price *lp, const pulsar_lane_cost *plain, const pulsar_lane_cost *spec, int n,
-                           uint32_t verify_rows, uint32_t depth) {
+                           StepRows verify_rows, uint32_t depth) {
     const int band = lane_depth_band(depth);
     if (n != lp->meas_n || band != lp->meas_depth) lane_price_rekey(lp, n, band);
     const int lane = lane_price_weigh(lp, plain, spec, n, verify_rows);
@@ -3167,9 +3182,9 @@ static int lane_price_pick(lane_price *lp, const pulsar_lane_cost *plain, const 
 /// @param n_dec how many
 /// @param n_batched decoders in the plain multiseq batch
 /// @return the lane
-static int server_pick_decode_lane(BankCount pool_banks, bool spec_rounds, uint32_t verify_rows,
+static int server_pick_decode_lane(BankCount pool_banks, bool spec_rounds, StepRows verify_rows,
                                    session_slot *const *dec, int n_dec, int n_batched) {
-    bool all_spec = spec_rounds && n_dec >= 1 && (uint32_t)n_dec <= verify_rows && n_batched == 0;
+    bool all_spec = spec_rounds && n_dec >= 1 && lane_base_rows(n_dec) <= verify_rows && n_batched == 0;
     for (int i = 0; all_spec && i < n_dec; i++) {
         const gen_state *dg = dec[i]->gen;
         if (!dg || !dg->spec_enabled || dg->batch_active)
@@ -4010,10 +4025,10 @@ KvBytes server::prefill_chunk_need() {
     return pulsar_session_quantum_growth_bytes_per_bank(sess, pulsar_kv_rows(pulsar_session_prefill_cap(sess)));
 }
 
-bool server::floor_admits_chunk(int rows, char *err, size_t errlen) {
+bool server::floor_admits_chunk(KvRows rows, char *err, size_t errlen) {
     auto *s = this;
     /* a host-only server (the unit tests) has no session to price a row by: the floor alone decides */
-    const KvBytes need = s->sess ? pulsar_session_quantum_growth_bytes_per_bank(s->sess, KvRows{(uint32_t)rows})
+    const KvBytes need = s->sess ? pulsar_session_quantum_growth_bytes_per_bank(s->sess, rows)
                                  : KvBytes{};
     server_mem_reading mem = s->mem_reading();
     int spilled = 0;
@@ -4322,6 +4337,41 @@ static void lane_abandon(gen_state *g, bool drop_feed) {
     g->phase = GEN_FINISH;
 }
 
+/* L443: the plain and mixed lanes' row map, owned here where they build their steps.  A lane lays its m decode
+ * requests first (reqs[0 .. m)), one row a bank -- each its own run -- and heads every decode run: the plain lane
+ * heads all runs, the mixed lane caps its heads at the decode runs or heads all (mixed_head_cap).  So decode request
+ * q is step row q AND head row q, and a prefill run after them (the mixed lane's) has its one headed row right after
+ * the decode heads: head row m, though its step row is m + k - 1.  These two are the only ways from a lane's request
+ * ordinals to the rows the engine's row API takes; each is fatal outside the layout it relies on. */
+/// @brief Decode request q's head row (= its step row) in a lane step that heads its decode runs.
+/// @param q the request's ordinal among the step's decode requests
+/// @param n_dec the step's decode requests (rows [0, n_dec) of the step)
+/// @param max_head_runs the step's head cap as passed to pulsar_session_decode_mixed (0 or
+///        PULSAR_MSEQ_HEAD_ALL_ROWS = every run; else the runs headed, which must cover the decode runs)
+/// @return head row q
+static HeadRow lane_decode_head_row(int q, int n_dec, uint32_t max_head_runs) {
+    if (q < 0 || q >= n_dec || (max_head_runs != 0u && max_head_runs < (uint32_t)n_dec)) {
+        char msg[160];
+        snprintf(msg, sizeof msg, "lane row map: decode request %d of %d with %u runs headed is no head row", q, n_dec,
+                 max_head_runs);
+        pulsar_die(msg);
+    }
+    return HeadRow{q};
+}
+/// @brief The mixed lane's prefill run's head row: the next after the n_dec decode heads.
+/// @param n_dec the step's decode requests (each one headed run, ahead of the prefill run)
+/// @param n_heads the runs the step headed (pulsar_session_decode_mixed's *out_n_rows)
+/// @return head row n_dec
+static HeadRow lane_prefill_head_row(int n_dec, uint32_t n_heads) {
+    if (n_dec < 0 || n_heads != (uint32_t)n_dec + 1u) {
+        char msg[160];
+        snprintf(msg, sizeof msg, "lane row map: a prefill run after %d decode runs, but the step headed %u runs", n_dec,
+                 n_heads);
+        pulsar_die(msg);
+    }
+    return HeadRow{n_dec};
+}
+
 /* The plain and mixed batched lanes' step epilogue: every decode row's committed token emitted, then the rows of
  * the slots that go on drawn in ONE device launch (THE sampler over the step's headed rows: row q is dec[live_idx[q]]'s,
  * each at its own stream's key, a live grammar region through its mask -- L302, L303), and each draw's logprobs captured
@@ -4330,9 +4380,11 @@ static void lane_abandon(gen_state *g, bool drop_feed) {
 /// @param dec the quantum's decoders
 /// @param live_idx the decoders this step stepped, as indexes into `dec`; row q of the step is dec[live_idx[q]]'s
 /// @param m how many
+/// @param max_head_runs the step's head cap (lane_decode_head_row)
 /// @param pool the pool session
-static void lane_emit_and_draw(server *s, session_slot **dec, const int *live_idx, int m, pulsar_session *pool) {
-    uint32_t rows[PULSAR_SESSION_POOL_CAP];
+static void lane_emit_and_draw(server *s, session_slot **dec, const int *live_idx, int m, uint32_t max_head_runs,
+                               pulsar_session *pool) {
+    HeadRow rows[PULSAR_SESSION_POOL_CAP];
     pulsar_row_draw d[PULSAR_SESSION_POOL_CAP];
     std::vector<uint32_t> masks[PULSAR_SESSION_POOL_CAP];
     gen_state *who[PULSAR_SESSION_POOL_CAP];
@@ -4340,11 +4392,11 @@ static void lane_emit_and_draw(server *s, session_slot **dec, const int *live_id
     for (int q = 0; q < m; q++) {
         session_slot *sl = dec[live_idx[q]];
         gen_state *g = sl->gen;
-        const int committed = g->batch_feed_token.raw(); /* committed at batch_feed_pos */
+        const TokId committed = g->batch_feed_token; /* committed at batch_feed_pos */
         g->batch_feed_pos += TokCount{1};
         sl->committed_pos = g->batch_feed_pos;
         sl->tokens_emitted++;   /* L118: classic-loop accounting parity */
-        pulsar_tokens_push(&g->batch_pending, TokId{committed});
+        pulsar_tokens_push(&g->batch_pending, committed);
         if (g->first_token_t == 0.0) g->first_token_t = pulsar_mono_sec();
         /* Route THIS slot's stream writes through its own deferral queue
          * (the worker-thread-local writer is shared across slots). */
@@ -4360,7 +4412,7 @@ static void lane_emit_and_draw(server *s, session_slot **dec, const int *live_id
             g->finish = "error"; g->batch_feed_valid = false; g->phase = GEN_FINISH;
             continue;
         }
-        rows[nd] = (uint32_t)q;
+        rows[nd] = lane_decode_head_row(q, m, max_head_runs);
         who[nd++] = g;
     }
     if (nd == 0) return;
@@ -4377,7 +4429,7 @@ static void lane_emit_and_draw(server *s, session_slot **dec, const int *live_id
         }
         /* This bank's row IS the target distribution at batch_feed_pos, and
          * it is overwritten by the next step's sweep. */
-        logprob_capture_row(&g->logprobs, pool, rows[k], tok[k].raw());
+        logprob_capture_row(&g->logprobs, pool, rows[k], tok[k]);
     }
 }
 
@@ -4433,7 +4485,7 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n, int quantu
         }
         float temp, top_p, min_p; int top_k;
         gen_resolve_sampling_decode(g, &temp, &top_k, &top_p, &min_p);
-        g->batch_feed_token = TokId{gen_sample_pool(s, g, pool, temp, top_k, top_p, min_p)};
+        g->batch_feed_token = gen_sample_pool(s, g, pool, temp, top_k, top_p, min_p);
         if (!g->batch_feed_token.is_token()) {
             g->finish = "error"; g->batch_feed_valid = false; g->phase = GEN_FINISH;
             continue;
@@ -4441,7 +4493,7 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n, int quantu
         /* The bank is live and its classic logits are what this token was drawn
          * from; after the multiseq step below they describe nothing (the step
          * leaves s->logits untouched by contract), so capture here or never. */
-        logprob_capture_session(&g->logprobs, pool, g->batch_feed_token.raw());
+        logprob_capture_session(&g->logprobs, pool, g->batch_feed_token);
         g->batch_feed_pos = pulsar_session_pos(pool);
         pulsar_session_bank_state_save(pool, sl->bank);
         g->batch_feed_valid = true;
@@ -4466,7 +4518,7 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n, int quantu
             }
             reqs[m].bank = sl->bank;
             reqs[m].pos = g->batch_feed_pos;
-            reqs[m].token = TokId{g->batch_feed_token};
+            reqs[m].token = g->batch_feed_token;
             live_idx[m] = i;
             m++;
         }
@@ -4491,7 +4543,7 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n, int quantu
             break;
         }
 
-        lane_emit_and_draw(s, dec, live_idx, m, pool);
+        lane_emit_and_draw(s, dec, live_idx, m, 0u /* every run headed: the decode_mixed call above */, pool);
         /* L284: the plain lane's step cost, measured as the spec lane's round is -- the rows the forward
          * carried against the step's wall, sampling and emission included -- into the same fit structure
          * (pulsar_engine_lane_cost), so the lane choice weighs one clock against the other */
@@ -4726,9 +4778,9 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
     }
 
     pulsar_spec_round *rounds[PULSAR_SESSION_POOL_CAP] = {0};
-    int first_tok[PULSAR_SESSION_POOL_CAP];
-    uint32_t row0s[PULSAR_SESSION_POOL_CAP];
-    int row_nb[PULSAR_SESSION_POOL_CAP];   /* rows this bank contributed (base+K) */
+    TokId first_tok[PULSAR_SESSION_POOL_CAP];   /* each round's base (assemble's first_token) */
+    StepRow row0s[PULSAR_SESSION_POOL_CAP];    /* each round's first step row (the engine's assemble laid them) */
+    StepRows row_nb[PULSAR_SESSION_POOL_CAP];  /* rows this bank contributed (base+K) */
     int live_idx[PULSAR_SESSION_POOL_CAP];
     pulsar_multiseq_req reqs[PULSAR_SPEC_LOGITS_ROWS];
     /* L260: one step per bank per phase; each bank keeps its own accepted[]
@@ -4847,7 +4899,8 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             uint32_t np = pulsar_session_bank_pendings(pool, dec[i]->bank, &pbase, ptok, conf);
             /* L309: a chain under a grammar ends before its first draft the grammar refuses */
             if (np > 0 && ag->gate) {
-                const int legal = gen_constrain_draft_prefix(s, ag, pbase, ptok, (int)np);
+                /* L443: the engine's pending count (uint32) in and out of the walk as a token count */
+                const int legal = gen_constrain_draft_prefix(s, ag, pbase, ptok, TokCount{(int)np}).raw();
                 if (legal < 0) {
                     ag->finish = "error";
                     ag->phase = GEN_FINISH;
@@ -4861,7 +4914,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             }
             /* L428: a chain in a turn that may make one call ends with the token that closes that call */
             if (np > 0) {
-                const int usable = gen_turn_draft_prefix(s, ag, pbase, ptok, (int)np);
+                const int usable = gen_turn_draft_prefix(s, ag, pbase, ptok, TokCount{(int)np}).raw();
                 if ((uint32_t)usable < np && !s->w_spec_turn_cut_said) {   /* rule 5: the cut ran */
                     s->w_spec_turn_cut_said = true;
                     server_log(PULSAR_LOG_DEFAULT, "pulsar-server: a turn limited to one tool call cut a pending "
@@ -5008,7 +5061,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             /* L303: a fresh base draw goes through the grammar's mask (a carry was drawn under one) */
             if (gen_constrain_live(g)) {
                 st->masks = gen_constrain_base_mask(s, g);
-                st->mask_rows = 1u;
+                st->mask_rows = VerifyRows{1};
                 if (!st->masks) {
                     g->finish = "error";
                     g->phase = GEN_FINISH;
@@ -5016,22 +5069,22 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 }
             }
             /* L344: the budget spent -- a fresh base is the close token (a carry was drawn under its row's mask) */
-            if (gen_think_close_row(s, g, NULL, 0, 0) == 0) {
-                st->masks = gen_think_masks(s, g, 0, 1, st->masks, st->masks ? 1 : 0);
-                st->mask_rows = 1u;
+            if (gen_think_close_row(s, g, NULL, TokCount{0}, false) == VerifyRow{0}) {
+                st->masks = gen_think_masks(s, g, VerifyRow{0}, VerifyRows{1}, st->masks, VerifyRows{st->masks ? 1 : 0});
+                st->mask_rows = VerifyRows{1};
                 if (!st->masks) {
                     g->finish = "error";
                     g->phase = GEN_FINISH;
                     continue;
                 }
             }
-            st->max_tokens = g->max_tokens - g->completion;
+            st->max_tokens = TokCount{g->max_tokens - g->completion};   /* the request's tokens still to generate */
             /* accepted_cap = allocated K + the base token: round_begin's own
              * trim (K <= accepted_cap-1) enforces the allocation, and its
              * validity checks may trim further -- the allocation is an
              * upper bound, never a promise. */
-            st->k_alloc = k_alloc[i];
-            st->accepted_cap = k_alloc[i] + 1;
+            st->k_alloc = TokCount{k_alloc[i]};   /* the pick's drafts (-1: none allocated) */
+            st->accepted_cap = TokCount{k_alloc[i] + 1};
             step_slot[ns++] = i;
         }
         /* The batch's first restore overwrites whatever is installed: park the
@@ -5041,10 +5094,14 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             pulsar_session_bank_state_save(pool, s->live_bank);
             s->live_bank = BankId::none();
         }
-        uint32_t rows = 0;
+        StepRows step_rows{0};   /* the verify's rows, all headed: rows [0, step_rows) of the step */
+        /* the verify's row budget: the head width less the finishing chunks' heads (sched_choose keeps n_fin
+         * <= heads_max - n_dec, so this never wraps) */
         if (ns > 0)
-            (void)pulsar_session_spec_assemble_batch(pool, steps, ns,
-                                                     heads_max - (uint32_t)n_fin, reqs, &rows);
+            (void)pulsar_session_spec_assemble_batch(pool, steps, ns, StepRows{(int)(heads_max - (uint32_t)n_fin)},
+                                                     reqs, &step_rows);
+        /* the uint32 the forward's shape, the decode_mixed row count and the cost fit take */
+        const uint32_t rows = (uint32_t)step_rows.raw();
         int m = 0;
         for (int j = 0; j < ns; j++) {
             const pulsar_spec_step *st = &steps[j];
@@ -5054,8 +5111,8 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             switch (st->status) {
             case PULSAR_SPEC_STEP_OK:
                 row0s[m] = st->row0;
-                row_nb[m] = (int)st->n_rows;
-                first_tok[m] = st->first_token.raw();
+                row_nb[m] = st->n_rows;
+                first_tok[m] = st->first_token;
                 live_idx[m] = i;
                 m++;
                 break;
@@ -5065,7 +5122,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 /* generate_speculative's short-circuit: emit EOS, never eval it. */
                 slot_writer_install(&g->writer);
                 if (g->first_token_t == 0.0) g->first_token_t = pulsar_mono_sec();
-                (void)s->gen_emit_token(sl, st->first_token.raw());
+                (void)s->gen_emit_token(sl, st->first_token);
                 g->phase = GEN_FINISH;
                 emitted_total++;
                 break;
@@ -5110,7 +5167,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
         /* ---- ONE shared forward over every bank's rows ------------------- */
         const double fwd_t0 = pulsar_mono_sec();   /* L288: the round's phases (server::w_spec_phase_ms) */
         char err[160] = "";
-        pulsar_session_spec_arm_capture(pool, rows);
+        pulsar_session_spec_arm_capture(pool, step_rows);
         uint32_t got = 0;
         int rc;
         if (n_fr > 0) {
@@ -5165,7 +5222,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             rc = pulsar_session_decode_mixed(pool, reqs, rows, NULL, 0, &got, PULSAR_MSEQ_HEAD_ALL_ROWS, err,
                                              sizeof err);
         }
-        pulsar_session_spec_arm_capture(pool, 0u);
+        pulsar_session_spec_arm_capture(pool, StepRows{0});
         const double fwd_t1 = pulsar_mono_sec();
         s->live_bank = BankId::none();   /* pool is multiseq-poisoned until a bank_switch */
         if (rc == 0 && got != rows) {   /* the plain step: every row headed, or the round is refused by name */
@@ -5208,12 +5265,17 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
          * prefill frontier); a finished prompt takes its head row as the bank's
          * next-token logits and starts its stream (the classic sync's epilogue),
          * then decodes from the next pass. */
-        for (int r = 0, fin_row = 0; r < n_fr; r++) {
+        PromptHeads fin_heads{0};   /* L443: the finishing runs so far: shape.head_last's runs, headed in run order */
+        for (int r = 0; r < n_fr; r++) {
             session_slot *c = fr[r].sl;
             gen_state *pg = c->gen;
-            const int head = fr[r].fin ? fin_row++ : -1;
+            PromptHead head = PromptHead::none();
+            if (fr[r].fin) {
+                head = PromptHead::after(fin_heads);
+                fin_heads += PromptHeads{1};
+            }
             if (!s->bank_switch(c->bank) ||
-                pulsar_session_note_prefilled(pool, pg->fuse.run(TokPos{fr[r].p0}), fr[r].k, head) != 0) {
+                pulsar_session_note_prefilled(pool, pg->fuse.run(TokPos{fr[r].p0}), TokCount{fr[r].k}, head) != 0) {
                 snprintf(pg->err, sizeof pg->err, "bank %d: the fused prompt chunk could not be recorded",
                          c->bank.raw());
                 s->gen_prefill_fail(c);
@@ -5260,42 +5322,43 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             {
                 TokId toks[PULSAR_SPEC_LOGITS_ROWS];
                 int nt = 0;
-                for (int i = base_sent[q] ? 1 : 0; i < row_nb[q]; i++) toks[nt++] = reqs[row0s[q] + (uint32_t)i].token;
-                st->greedy_rows = gen_spec_greedy_rows(s, g, toks, nt, base_sent[q]);
+                for (int i = base_sent[q] ? 1 : 0; i < row_nb[q].raw(); i++)
+                    toks[nt++] = reqs[(row0s[q] + StepRows{i}).raw()].token;   /* reqs is indexed by step row */
+                st->greedy_rows = gen_spec_greedy_rows(s, g, toks, TokCount{nt}, base_sent[q]);
                 /* L303: each verify row's mask -- the gate walked through the round's tokens and back */
-                const int mr = gen_constrain_round(s, g, toks, nt, base_sent[q], &st->masks);
-                if (mr < 0) {
+                const VerifyRows mr = gen_constrain_round(s, g, toks, TokCount{nt}, base_sent[q], &st->masks);
+                if (mr < VerifyRows{0}) {
                     /* the grammar failed (g->err says how): masks with no rows make the round refuse and undo
                      * itself, so this request fails and the others' rounds go on */
                     static const uint32_t no_rows = 0;
                     st->masks = &no_rows;
-                    st->mask_rows = 0u;
+                    st->mask_rows = VerifyRows{0};
                     constrain_failed[q] = true;
                 } else {
-                    st->mask_rows = (uint32_t)mr;
+                    st->mask_rows = mr;
                     /* L344: the row where the budget runs out draws the close token */
-                    const int off = base_sent[q] ? 0 : 1;
-                    const int fr_row = gen_think_close_row(s, g, toks, nt, off);
-                    if (fr_row >= 0) {
-                        const int rows = nt - off + 1;
-                        const uint32_t *t = gen_think_masks(s, g, fr_row, rows, mr > 0 ? st->masks : NULL, mr);
+                    const bool base_pending = !base_sent[q];
+                    const VerifyRow fr_row = gen_think_close_row(s, g, toks, TokCount{nt}, base_pending);
+                    if (!fr_row.is_none()) {
+                        const VerifyRows rows = pulsar_verify_rows(TokCount{nt}, base_pending);
+                        const uint32_t *t = gen_think_masks(s, g, fr_row, rows, mr > VerifyRows{0} ? st->masks : NULL, mr);
                         if (t) {
                             st->masks = t;
-                            st->mask_rows = (uint32_t)rows;
+                            st->mask_rows = rows;
                         } else {   /* as a grammar failure: rows-less masks make the round undo itself */
                             static const uint32_t no_rows = 0;
                             st->masks = &no_rows;
-                            st->mask_rows = 0u;
+                            st->mask_rows = VerifyRows{0};
                             constrain_failed[q] = true;
                         }
                     }
                 }
             }
             st->rng = &g->rng;
-            st->first_token = TokId{first_tok[q]};
+            st->first_token = first_tok[q];
             st->row0 = row0s[q];
             st->accepted = accepted[q];
-            st->accepted_cap = (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
+            st->accepted_cap = TokCount{PULSAR_SPEC_LOGITS_ROWS + 1};
         }
         (void)pulsar_session_spec_round_end_batch(pool, steps, m);
         const double end_t1 = pulsar_mono_sec();
@@ -5317,7 +5380,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 g->phase = GEN_FINISH;
                 continue;
             }
-            const int na = st->n_accepted;
+            const int na = st->n_accepted.raw();
             /* L155 tripwire: the round must hand back exactly the positions it
              * committed (the engine clamps commit at EOS and trims to the
              * accepted count).  The ghost rewind below counts na - emitted and
@@ -5341,7 +5404,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             for (int t = t0; !stopped && t < na; t++) {
                 if (g->first_token_t == 0.0) g->first_token_t = pulsar_mono_sec();
                 done = t + 1;
-                if (s->gen_emit_token(sl, st->accepted[t].raw())) { stopped = true; break; }
+                if (s->gen_emit_token(sl, st->accepted[t])) { stopped = true; break; }
             }
             if (stopped) g->phase = GEN_FINISH;
             /* L264 S4: decode creates no grid checkpoints, so there is nothing
@@ -5385,7 +5448,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
              * accumulated here where it is unambiguous (row_nb = base+K rows
              * this bank contributed; na = base + accepted drafts). */
             g->req_spec_rounds++;
-            if (row_nb[q] > 1) g->req_spec_draft += (uint64_t)(row_nb[q] - 1);
+            if (row_nb[q] > StepRows{1}) g->req_spec_draft += (uint64_t)(row_nb[q] - StepRows{1}).raw();
             if (na > 1) g->req_spec_accepted += (uint64_t)(na - 1);
             g->req_spec_gen += (uint64_t)done;
             emitted_total += done;
@@ -5487,7 +5550,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             pulsar_engine_lane_cost_observe(s->engine, PULSAR_LANE_SPEC, rows, round_ms);
             /* L284 lane cost: the same round's yield, per bank -- what the lane choice prices the spec lane's
              * rows by (lane_price_pick) */
-            lane_price_observe_spec(&s->w_lane_price, emitted_total - round_emitted0, (int)rows, m, round_ms);
+            lane_price_observe_spec(&s->w_lane_price, TokCount{emitted_total - round_emitted0}, step_rows, m, round_ms);
             /* L301: and the verify curve's online correction -- the forward against its profile, the rest of the
              * round outside the forward and the drafting, the drafting */
             pulsar_engine_verify_curve_observe(s->engine, (uint32_t)m, rows, fwd_ms, round_ms - fwd_ms - draft_ms,
@@ -5553,10 +5616,10 @@ bool server::batch_leave(session_slot *sl) {
     /* the token the batch sampled (its logprob already captured) is committed here as the batch's next
      * step would have: fed, counted, emitted -- so the session's logits are fresh for the family's
      * generate, which draws the token after it */
-    const int tok = g->batch_feed_token.raw();
+    const TokId tok = g->batch_feed_token;
     g->batch_feed_valid = false;
     char err[160] = "";
-    if (pulsar_session_eval(pool, TokId{tok}, err, sizeof err) != 0) {
+    if (pulsar_session_eval(pool, tok, err, sizeof err) != 0) {
         if (!g->err[0]) snprintf(g->err, sizeof g->err, "leaving the batch: %s", err);
         g->finish = "error";
         g->phase = GEN_FINISH;
@@ -5741,12 +5804,12 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
         }
         float temp, top_p, min_p; int top_k;
         gen_resolve_sampling_decode(g, &temp, &top_k, &top_p, &min_p);
-        g->batch_feed_token = TokId{gen_sample_pool(s, g, pool, temp, top_k, top_p, min_p)};
+        g->batch_feed_token = gen_sample_pool(s, g, pool, temp, top_k, top_p, min_p);
         if (!g->batch_feed_token.is_token()) {
             g->finish = "error"; g->batch_feed_valid = false; g->phase = GEN_FINISH;
             continue;
         }
-        logprob_capture_session(&g->logprobs, pool, g->batch_feed_token.raw());
+        logprob_capture_session(&g->logprobs, pool, g->batch_feed_token);
         g->batch_feed_pos = pulsar_session_pos(pool);
         pulsar_session_bank_state_save(pool, sl->bank);
         g->batch_feed_valid = true; g->batch_active = true;
@@ -5800,7 +5863,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
                 g->batch_feed_valid = false; g->finish = "length"; g->phase = GEN_FINISH; continue;
             }
             reqs[m].bank = sl->bank; reqs[m].pos = g->batch_feed_pos;
-            reqs[m].token = TokId{g->batch_feed_token}; live_idx[m] = i; m++;
+            reqs[m].token = g->batch_feed_token; live_idx[m] = i; m++;
         }
         /* Fold this step's ascending prefill sub-chunk from P0+pf_done, all the way
          * to len (the FINAL sub-chunk carries the last-position logits used for the
@@ -5832,7 +5895,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
         char err[96];
         uint32_t n_runs = 0;
         /* LEVER 1: the head cap is mixed_head_cap's (see it). */
-        const uint32_t head_cap = mixed_head_cap(kthis, m, pos_now, len);
+        uint32_t head_cap = mixed_head_cap(kthis, m, pos_now, len);
         int rc = pulsar_session_decode_mixed(pool, reqs, (uint32_t)nrows, NULL, 0, &n_runs, head_cap, err,
                                              sizeof err);
         const int verdict = mixed_prefill_giveup(rc, kthis, m);
@@ -5845,7 +5908,8 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
                        "pulsar-server: fused prefill rejected (%s): this prefill runs classic "
                        "from now on; the %d decode bank(s) retry this step alone", err, m);
             if (verdict == MIXED_GIVEUP_RETRY_DECODE) {
-                rc = pulsar_session_decode_mixed(pool, reqs, (uint32_t)m, NULL, 0, &n_runs, 0u, err, sizeof err);
+                head_cap = 0u;   /* L443: the retry heads every run (the row map lane_emit_and_draw reads) */
+                rc = pulsar_session_decode_mixed(pool, reqs, (uint32_t)m, NULL, 0, &n_runs, head_cap, err, sizeof err);
             } else { s->live_bank = BankId::none(); break; }   /* only prefill this step: just stop */
             kthis = 0;                              /* prefill did not advance */
         }
@@ -5873,20 +5937,20 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
         if (kthis > 0 && pos_now + kthis == len) {
             /* final prefill sub-chunk: the len-1 row (the prefill run's, headed row m, last-of-run) becomes the
              * prefill bank's next-token row -- the decode seed for the handoff, on the device (L302) */
-            if (pulsar_session_step_row_to_bank(pool, (uint32_t)m, pf->bank) != 0) {
+            if (pulsar_session_step_row_to_bank(pool, lane_prefill_head_row(m, n_runs), pf->bank) != 0) {
                 snprintf(pg->err, sizeof pg->err, "prefill bank %d: its last row could not be kept", pf->bank.raw());
                 /* L372: the step is committed for the decode banks whatever became of the prefill's row -- their
                  * tokens are emitted and their next drawn before the quantum stops.  The break alone dropped the step:
                  * each bank's KV had advanced a row its slot never counted or emitted, and the next quantum fed the
                  * same token at the same position again.  Before the prefill's epilogue, which installs its bank. */
-                lane_emit_and_draw(s, dec, live_idx, m, pool);
+                lane_emit_and_draw(s, dec, live_idx, m, head_cap, pool);
                 s->gen_prefill_fail(pf);   /* L372: as the bank install above */
                 break;
             }
             reached_end = true;
         }
 
-        lane_emit_and_draw(s, dec, live_idx, m, pool);
+        lane_emit_and_draw(s, dec, live_idx, m, head_cap, pool);
     }
     free(reqs);
 
@@ -5899,7 +5963,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
          * bank's prefill frontier moves with them (a resume computes its grid
          * point from it) and a commit that ends on the grid is a checkpoint. */
         if (pulsar_session_bank_state_restore(pool, pf->bank) &&
-            pulsar_session_note_prefilled(pool, w.run(TokPos{P0}), pf_done, -1) == 0) {
+            pulsar_session_note_prefilled(pool, w.run(TokPos{P0}), TokCount{pf_done}, PromptHead::none()) == 0) {
             pf->committed_pos = TokPos{P0 + pf_done};
             s->live_bank = pf->bank;
             if (reached_end) {
@@ -6165,7 +6229,8 @@ void *server_worker_main(void *arg) {
          * prompt took the classic sync, none rode a fused step -- when the price picks the spec lane (below) */
         /* L284 lane cost: where the spec lane could carry every decoder, the faster lane by measured price takes
          * them (lane_price_pick, one rule for every family) */
-        const uint32_t verify_rows = pulsar_engine_fused_heads_max(s->engine);
+        /* the verify width: the rows one verify step heads (the engine's uint32) */
+        const StepRows verify_rows{pulsar_engine_fused_heads_max(s->engine)};
         const bool spec_carries = s->pool_banks.any() &&
                                   server_spec_lane_carries(pulsar_engine_has_spec_rounds(s->engine), verify_rows,
                                                            dec, n_dec);

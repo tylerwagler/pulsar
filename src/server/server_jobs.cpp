@@ -2195,8 +2195,9 @@ struct gen_walk {
  * in_tool_call says once the tokens before it are emitted.  Past a token that ends the stream (a stop token, a stop
  * sequence) nothing is emitted: those bits repeat the last, and the server never streams the rows they govern.  0 for
  * a request the override never touches (not a chat with tools) or that is greedy throughout. */
-uint32_t gen_spec_greedy_rows_text(gen_state *g, const char *const *pieces, const size_t *piece_lens, int n,
+uint32_t gen_spec_greedy_rows_text(gen_state *g, const char *const *pieces, const size_t *piece_lens, TokCount n_toks,
                                    bool base_emitted) {
+    const int n = n_toks.raw();   /* L443: typed at the boundary, the walk's index inside */
     if (!gen_tool_override_varies(g)) return 0u;
     gen_walk w(g);
     bool greedy = g->parser->in_tool_call(w.probe, g);
@@ -2215,8 +2216,9 @@ uint32_t gen_spec_greedy_rows_text(gen_state *g, const char *const *pieces, cons
 }
 
 /* gen_spec_greedy_rows_text over the round's token ids (the engine's texts and stop set). */
-uint32_t gen_spec_greedy_rows(server *s, gen_state *g, const TokId *toks, int n, bool base_emitted) {
+uint32_t gen_spec_greedy_rows(server *s, gen_state *g, const TokId *toks, TokCount n_toks, bool base_emitted) {
     if (!gen_tool_override_varies(g)) return 0u;
+    const int n = n_toks.raw();
     char *pieces[PULSAR_SPEC_LOGITS_ROWS + 1] = {};
     size_t lens[PULSAR_SPEC_LOGITS_ROWS + 1] = {};
     if (n > (int)PULSAR_SPEC_LOGITS_ROWS + 1) pulsar_die("gen_spec_greedy_rows: more tokens than a round's rows");
@@ -2224,7 +2226,7 @@ uint32_t gen_spec_greedy_rows(server *s, gen_state *g, const TokId *toks, int n,
         const TokId t = toks[i];
         pieces[i] = pulsar_token_is_stop(s->engine, t) ? NULL : pulsar_token_text(s->engine, t, &lens[i]);
     }
-    const uint32_t bits = gen_spec_greedy_rows_text(g, pieces, lens, n, base_emitted);
+    const uint32_t bits = gen_spec_greedy_rows_text(g, pieces, lens, n_toks, base_emitted);
     for (int i = 0; i < n; i++) free(pieces[i]);
     return bits;
 }
@@ -2235,22 +2237,24 @@ uint32_t gen_spec_greedy_rows(server *s, gen_state *g, const TokId *toks, int n,
  * after each token (turn_complete).  The chain is cut after the token that says yes: the round then verifies nothing
  * the server would commit and not emit.  A stop token or a stop string ends the walk (the round clamps or the emit
  * stops there as before). */
-int gen_turn_draft_prefix_text(gen_state *g, const char *const *pieces, const size_t *piece_lens, int n) {
+TokCount gen_turn_draft_prefix_text(gen_state *g, const char *const *pieces, const size_t *piece_lens, TokCount n_drafts) {
     const request *req = &g->j->req;
-    if (n <= 0 || !req->single_tool_call || req->kind != REQ_CHAT || !req->has_tools || !g->parser_st) return n;
+    const int n = n_drafts.raw();   /* L443: typed at the boundary, the walk's index inside */
+    if (n <= 0 || !req->single_tool_call || req->kind != REQ_CHAT || !req->has_tools || !g->parser_st) return n_drafts;
     gen_walk w(g);
     for (int i = 0; i <= n; i++) {   /* pieces[0] is the base, pieces[i] draft i - 1 */
         GenOff end{0};
         if (!pieces[i] || !w.step(pieces[i], piece_lens[i])) break;
-        if (g->parser->turn_complete(w.probe, g, &end)) return i;
+        if (g->parser->turn_complete(w.probe, g, &end)) return TokCount{i};   /* the drafts before piece i */
     }
-    return n;
+    return n_drafts;
 }
 
 /* gen_turn_draft_prefix_text over the chain's token ids (the engine's texts and stop set). */
-int gen_turn_draft_prefix(server *s, gen_state *g, TokId base_id, const TokId *drafts, int n) {
+TokCount gen_turn_draft_prefix(server *s, gen_state *g, TokId base_id, const TokId *drafts, TokCount n_drafts) {
     const request *req = &g->j->req;
-    if (n <= 0 || !req->single_tool_call || req->kind != REQ_CHAT || !req->has_tools || !g->parser_st) return n;
+    const int n = n_drafts.raw();
+    if (n <= 0 || !req->single_tool_call || req->kind != REQ_CHAT || !req->has_tools || !g->parser_st) return n_drafts;
     char *pieces[PULSAR_SPEC_LOGITS_ROWS + 1] = {};
     size_t lens[PULSAR_SPEC_LOGITS_ROWS + 1] = {};
     if (n > (int)PULSAR_SPEC_LOGITS_ROWS) pulsar_die("gen_turn_draft_prefix: more drafts than a round's rows");
@@ -2258,7 +2262,7 @@ int gen_turn_draft_prefix(server *s, gen_state *g, TokId base_id, const TokId *d
         const TokId t = i ? drafts[i - 1] : base_id;
         pieces[i] = pulsar_token_is_stop(s->engine, t) ? NULL : pulsar_token_text(s->engine, t, &lens[i]);
     }
-    const int keep = gen_turn_draft_prefix_text(g, pieces, lens, n);
+    const TokCount keep = gen_turn_draft_prefix_text(g, pieces, lens, n_drafts);
     for (int i = 0; i <= n; i++) free(pieces[i]);
     return keep;
 }
@@ -2281,10 +2285,10 @@ int gen_turn_draft_prefix(server *s, gen_state *g, TokId base_id, const TokId *d
  * thinking-recovery, and stop handling here runs identically in every lane.
  * Behavior for the single-session path is byte-identical to the
  * pre-factoring inner loop. */
-bool server::gen_emit_token(session_slot *sl, int token) {
+bool server::gen_emit_token(session_slot *sl, TokId token) {
     auto *s = this;
     gen_state *g = sl->gen;
-    if (pulsar_token_is_stop(s->engine, TokId{token})) {
+    if (pulsar_token_is_stop(s->engine, token)) {
         g->finish = "stop";
         return true;
     }
@@ -2295,13 +2299,13 @@ bool server::gen_emit_token(session_slot *sl, int token) {
     }
 
     size_t piece_len = 0;
-    char *piece = pulsar_token_text(s->engine, TokId{token}, &piece_len);
+    char *piece = pulsar_token_text(s->engine, token, &piece_len);
     const bool stop = s->gen_emit_piece(g, token, piece, piece_len);
     free(piece);
     return stop;
 }
 
-bool server::gen_emit_piece(gen_state *g, int token, const char *piece, size_t piece_len) {
+bool server::gen_emit_piece(gen_state *g, TokId token, const char *piece, size_t piece_len) {
     auto *s = this;
     job *j = g->j;
     g->completion++;

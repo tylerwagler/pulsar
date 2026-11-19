@@ -153,19 +153,20 @@ int GATE_ENTRY(int argc, char **argv) {
                     goto done;
                 }
             }
-            if (pulsar_session_spec_round_begin(s, r, TokId{first}, 17, 17, temperature, top_k, top_p, min_p, err,
+            if (pulsar_session_spec_round_begin(s, r, TokId{first}, TokCount{17}, TokCount{17}, temperature, top_k, top_p, min_p, err,
                                                 sizeof err) != 0) {
                 fprintf(stderr, "round_begin at %d: %s\n", pos, err);
                 goto done;
             }
             pulsar_multiseq_req reqs[17];
-            const uint32_t rows = pulsar_spec_round_fill_reqs(r, BankId{bank0}, reqs);
+            const StepRows step_rows = pulsar_spec_round_fill_reqs(r, BankId{bank0}, reqs);
+            const uint32_t rows = (uint32_t)step_rows.raw();   /* decode_mixed's row count */
             pulsar_session_bank_state_save(s, BankId{bank0});
-            pulsar_session_spec_arm_capture(s, rows);
+            pulsar_session_spec_arm_capture(s, step_rows);
             uint32_t out_rows = 0;
             const int drc = pulsar_session_decode_mixed(s, reqs, rows, logits, (int)(rows * (uint32_t)width),
                                                         &out_rows, PULSAR_MSEQ_HEAD_ALL_ROWS, err, sizeof err);
-            pulsar_session_spec_arm_capture(s, 0u);
+            pulsar_session_spec_arm_capture(s, StepRows{0});
             if (drc != 0 || out_rows != rows) {
                 pulsar_session_bank_state_restore(s, BankId{bank0});
                 pulsar_session_spec_round_abort(s, r);
@@ -178,7 +179,7 @@ int GATE_ENTRY(int argc, char **argv) {
             if (have_q) {
                 uint64_t at = rng;
                 pulsar_sample_advance(&at, 1u);
-                const uint32_t row0 = 0;
+                const HeadRow row0{0};
                 const pulsar_row_draw dp = {temperature, top_k, top_p, min_p, &at, false, NULL};
                 const pulsar_row_draw dm = {temperature, top_k, top_p, min_p, NULL, true, NULL};
                 TokId tp_id = TokId::none(), tm_id = TokId::none();
@@ -202,7 +203,7 @@ int GATE_ENTRY(int argc, char **argv) {
                                                                                 "bank restore failed\n"); goto done; }
             TokId accepted[17];
             const int na = pulsar_session_spec_round_end_forced(s, r, TokId{first}, temperature, top_k, top_p, min_p,
-                                                                rngp, 0u, toks.v + pos + 1, accepted, 17,
+                                                                rngp, StepRow{0}, toks.v + pos + 1, accepted, TokCount{17},
                                                                 err, sizeof err);
             if (na < 0) { fprintf(stderr, "round_end_forced at %d: %s\n", pos, err); goto done; }
             for (int i = 0; i < na; i++) {

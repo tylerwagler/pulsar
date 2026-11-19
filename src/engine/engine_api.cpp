@@ -1111,18 +1111,20 @@ TokId pulsar_session_sample(pulsar_session *s, float temperature, int top_k, flo
 TokId pulsar_session_draw(pulsar_session *s, const pulsar_row_draw *d) {
     return s && d ? TokId{s->draw(d)} : TokId::none();
 }
-int pulsar_session_draw_rows(pulsar_session *s, const uint32_t *rows, const pulsar_row_draw *d, uint32_t n,
+int pulsar_session_draw_rows(pulsar_session *s, const HeadRow *rows, const pulsar_row_draw *d, uint32_t n,
                              TokId *tokens) {
     return s && rows && d && tokens && n ? s->draw_step_rows(rows, d, n, tokens) : 1;
 }
-int pulsar_session_step_row_to_bank(pulsar_session *s, uint32_t row, BankId bank_id) {
+int pulsar_session_step_row_to_bank(pulsar_session *s, HeadRow row, BankId bank_id) {
     const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */
-    return s && s->step_row_to_bank(row, bank) ? 0 : 1;
+    /* L443: the head row raw inside, as the uint32 it was (none() is past every step's rows: refused there) */
+    return s && s->step_row_to_bank((uint32_t)row.raw(), bank) ? 0 : 1;
 }
-int pulsar_session_step_row_logprobs(pulsar_session *s, uint32_t row, TokId token, pulsar_token_score *chosen,
+int pulsar_session_step_row_logprobs(pulsar_session *s, HeadRow row, TokId token, pulsar_token_score *chosen,
                                      int *have_chosen, pulsar_token_score *top, int k, int *n_top) {
+    /* L443: the head row raw inside, as the uint32 it was (none() is past every step's rows: refused there) */
     return s && chosen && have_chosen && n_top && (top || k == 0)
-               ? s->step_row_logprobs(row, token.raw(), chosen, have_chosen, top, k, n_top) : 1;
+               ? s->step_row_logprobs((uint32_t)row.raw(), token.raw(), chosen, have_chosen, top, k, n_top) : 1;
 }
 int pulsar_session_top_logprobs(pulsar_session *s, pulsar_token_score *out, int k) { return s && tp_mirror_settle(s, NULL, 0) ? s->top_logprobs(out, k) : 0; }
 int pulsar_session_token_logprob(pulsar_session *s, TokId token, pulsar_token_score *out) {
@@ -1610,7 +1612,8 @@ const pulsar_tokens *pulsar_session_bank_tokens_as(pulsar_session *s, BankId ban
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "per-bank state", NULL);
     return pulsar_bank_history_as(s, bank, view);
 }
-int pulsar_session_note_prefilled(pulsar_session *s, const TokId *toks, int n, int head) {
+int pulsar_session_note_prefilled(pulsar_session *s, const TokId *toks, TokCount n_toks, PromptHead head) {
+    const int n = n_toks.raw();   /* L443: raw inside; the head stays typed to the session's crossing */
     PULSAR_NVTX_FN();
     if (!s) return 1;
     pulsar_tp *tp = tp_mirror_target(s);
@@ -1626,7 +1629,7 @@ int pulsar_session_note_prefilled(pulsar_session *s, const TokId *toks, int n, i
      * block, whose digest the step's ack already matched across ranks. */
     if (!tp_mirror_sent(tp, "note prefilled",
                         pulsar_tp_send_note_prefilled(tp, s->tp_session_id, pulsar_tok_ids_raw(toks), (uint32_t)n,
-                                                      head),
+                                                      head.raw()),   /* the wire's int32 (-1 = none()) */
                         NULL, 0)) return 1;
     return tp_mirror_bank_verdict(s, tp, "note prefilled", s->note_prefilled(toks, n, head), 1);
 }
@@ -1740,9 +1743,10 @@ TokId pulsar_session_spec_next_base(pulsar_session *s, float temperature, int to
                                     uint64_t *rng) {
     return TokId{spec_next_base_raw(s, temperature, top_k, top_p, min_p, rng)};   /* -1 enters as none() */
 }
-int pulsar_session_spec_round_begin(pulsar_session *s, pulsar_spec_round *r, TokId first_token_id, int max_tokens, int accepted_cap, float temperature, int top_k, float top_p, float min_p, char *err, size_t errlen) {
+int pulsar_session_spec_round_begin(pulsar_session *s, pulsar_spec_round *r, TokId first_token_id, TokCount max_toks, TokCount accepted_toks, float temperature, int top_k, float top_p, float min_p, char *err, size_t errlen) {
     PULSAR_NVTX_FN();
     const int first_token = first_token_id.raw();   /* L334 P3: the local rounds and the TP wire take the raw id */
+    const int max_tokens = max_toks.raw(), accepted_cap = accepted_toks.raw();   /* L443: raw inside, as before */
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", -1);
     if (!s) return -1;
     pulsar_tp *tp = NULL;
@@ -1757,9 +1761,11 @@ int pulsar_session_spec_round_begin(pulsar_session *s, pulsar_spec_round *r, Tok
     const int own = pulsar_session_spec_round_begin_local(s, r, first_token, max_tokens, accepted_cap, temperature, top_k, top_p, min_p, err, errlen);
     return tp_mirror_bank_verdict(s, tp, "spec_round_begin", own == 0 ? 0 : 1, -1) < 0 ? -1 : own;
 }
-int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r, TokId first_token_id, float temperature, int top_k, float top_p, float min_p, uint64_t *rng, uint32_t row0, TokId *accepted, int accepted_cap, char *err, size_t errlen) {
+int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r, TokId first_token_id, float temperature, int top_k, float top_p, float min_p, uint64_t *rng, StepRow row0_at, TokId *accepted, TokCount accepted_toks, char *err, size_t errlen) {
+    const int accepted_cap = accepted_toks.raw();   /* L443: raw inside */
     PULSAR_NVTX_FN();
     const int first_token = first_token_id.raw();   /* L334 P3: the local rounds and the TP wire take the raw id */
+    const uint32_t row0 = pulsar_row_index(row0_at);   /* L443: the walk's index (raw inside, as the field was) */
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", -1);
     if (!s) return -1;
     pulsar_tp *tp = NULL;
@@ -1792,7 +1798,7 @@ void pulsar_session_spec_round_abort(pulsar_session *s, pulsar_spec_round *r) {
                         pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_SPEC_ROUND_ABORT, &c, NULL, NULL), NULL, 0)) return;
     pulsar_session_spec_round_abort_local(s, r);
 }
-void pulsar_session_spec_arm_capture(pulsar_session *s, uint32_t n_rows) {
+void pulsar_session_spec_arm_capture(pulsar_session *s, StepRows n_rows) {
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", (void)0);
     if (!s) return;
@@ -1802,7 +1808,7 @@ void pulsar_session_spec_arm_capture(pulsar_session *s, uint32_t n_rows) {
     if (route == 0) { pulsar_tp_mirror_fail_void(tp, "spec_arm_capture", err); return; }
     if (route == 1) { pulsar_session_spec_arm_capture_local(s, n_rows); return; }
     pulsar_tp_spec_command c = tp_spec_cmd(s, tp_spec_live_bank(s));
-    c.i0 = (int32_t)n_rows;
+    c.i0 = (int32_t)n_rows.raw();   /* the wire's int32 */
     if (!tp_mirror_sent(tp, "spec_arm_capture",
                         pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_SPEC_ARM_CAPTURE, &c, NULL, NULL), NULL, 0)) return;
     pulsar_session_spec_arm_capture_local(s, n_rows);
@@ -1900,10 +1906,11 @@ static int tp_spec_steps_mirror(pulsar_session *s, pulsar_tp *tp, uint32_t frame
         r->temperature = st->temperature; r->top_k = st->top_k;
         r->top_p = st->top_p; r->min_p = st->min_p;
         r->rng = st->rng ? *st->rng : 0;
-        r->i0 = frame_type == PULSAR_TP_FRAME_SPEC_ASSEMBLE_BATCH ? st->max_tokens : st->first_token.raw();
-        r->i1 = st->k_alloc;
-        r->i2 = st->accepted_cap;
-        r->i3 = (int32_t)st->row0;
+        /* the wire's int32 fields */
+        r->i0 = frame_type == PULSAR_TP_FRAME_SPEC_ASSEMBLE_BATCH ? st->max_tokens.raw() : st->first_token.raw();
+        r->i1 = st->k_alloc.raw();
+        r->i2 = st->accepted_cap.raw();
+        r->i3 = (int32_t)st->row0.raw();   /* the wire's int32 */
         r->greedy_rows = st->greedy_rows;
     }
     return tp_mirror_sent(tp, operation, pulsar_tp_send_spec_steps(tp, frame_type, &c, recs), NULL, 0);
@@ -1946,10 +1953,10 @@ static int spec_steps_refuse_family(pulsar_spec_step *steps, int n) {
     return -1;
 }
 int pulsar_session_spec_assemble_batch(pulsar_session *s, pulsar_spec_step *steps, int n,
-                                       uint32_t row_budget, pulsar_multiseq_req *reqs, uint32_t *n_rows_out) {
+                                       StepRows row_budget, pulsar_multiseq_req *reqs, StepRows *n_rows_out) {
     PULSAR_NVTX_FN();
     const char *operation = "spec_assemble_batch";
-    *n_rows_out = 0;
+    *n_rows_out = StepRows{0};
     if (!s || n < 0 || (n > 0 && (!steps || !reqs))) return -1;
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", spec_steps_refuse_family(steps, n));
     char err[256];
@@ -1962,11 +1969,11 @@ int pulsar_session_spec_assemble_batch(pulsar_session *s, pulsar_spec_step *step
     }
     if (tp_spec_steps_masked(steps, n)) return tp_spec_steps_refuse_masks(steps, n);
     if (!tp_spec_steps_mirror(s, tp, PULSAR_TP_FRAME_SPEC_ASSEMBLE_BATCH, operation, steps, n,
-                              (int32_t)row_budget, 0, 0)) return tp_spec_steps_fail(steps, n, operation);
+                              (int32_t)row_budget.raw(), 0, 0)) return tp_spec_steps_fail(steps, n, operation);
     pulsar_session_spec_assemble_batch_local(s, steps, n, row_budget, reqs, n_rows_out);
     const int own = pulsar_spec_steps_verdict(PULSAR_SPEC_PHASE_ASSEMBLE, steps, n, *n_rows_out);
     if (tp_mirror_bank_verdict(s, tp, operation, own, -1) < 0) {
-        *n_rows_out = 0;
+        *n_rows_out = StepRows{0};
         return tp_spec_steps_fail(steps, n, operation);
     }
     return 0;
@@ -1995,7 +2002,7 @@ int pulsar_session_spec_round_end_batch(pulsar_session *s, pulsar_spec_step *ste
                               cost->flat_us, cost->row_us, cost->valid ? 1 : 0))
         return tp_spec_steps_fail(steps, n, operation);
     pulsar_session_spec_round_end_batch_local(s, steps, n);
-    const int own = pulsar_spec_steps_verdict(PULSAR_SPEC_PHASE_ROUND_END, steps, n, 0u);
+    const int own = pulsar_spec_steps_verdict(PULSAR_SPEC_PHASE_ROUND_END, steps, n, StepRows{0});
     return tp_mirror_bank_verdict(s, tp, operation, own, -1) < 0 ? tp_spec_steps_fail(steps, n, operation) : 0;
 }
 int pulsar_session_spec_redraft_commit_batch(pulsar_session *s, pulsar_spec_step *steps, int n) {
@@ -2014,7 +2021,7 @@ int pulsar_session_spec_redraft_commit_batch(pulsar_session *s, pulsar_spec_step
     if (!tp_spec_steps_mirror(s, tp, PULSAR_TP_FRAME_SPEC_REDRAFT_COMMIT_BATCH, operation, steps, n,
                               0, 0, 0)) return tp_spec_steps_fail(steps, n, operation);
     pulsar_session_spec_redraft_commit_batch_local(s, steps, n);
-    const int own = pulsar_spec_steps_verdict(PULSAR_SPEC_PHASE_REDRAFT_COMMIT, steps, n, 0u);
+    const int own = pulsar_spec_steps_verdict(PULSAR_SPEC_PHASE_REDRAFT_COMMIT, steps, n, StepRows{0});
     return tp_mirror_bank_verdict(s, tp, operation, own, -1) < 0 ? tp_spec_steps_fail(steps, n, operation) : 0;
 }
 int pulsar_session_eval_speculative_block(pulsar_session *s, TokId first_token_id, int max_tokens, TokId *accepted, int accepted_cap, char *err, size_t errlen) {

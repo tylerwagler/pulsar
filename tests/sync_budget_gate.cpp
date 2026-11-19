@@ -89,15 +89,16 @@ static void run(pulsar_engine *e, int NB, float temp, int rounds_max, bool repor
             st[m].top_p = 1.0f;
             st[m].min_p = 0.05f;
             st[m].rng = &rngs[b];
-            st[m].max_tokens = 1 << 20;
-            st[m].k_alloc = -1;
-            st[m].accepted_cap = (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
+            st[m].max_tokens = TokCount{1 << 20};
+            st[m].k_alloc = TokCount{-1};
+            st[m].accepted_cap = TokCount{PULSAR_SPEC_LOGITS_ROWS + 1};
             bank_of[m++] = (uint32_t)b;
         }
         pulsar_gpu_sync_stats c0, c1, c2, c3, c4;
         pulsar_gpu_sync_stats_get(&c0);
-        uint32_t rows = 0;
-        (void)pulsar_session_spec_assemble_batch(s, st, m, width, reqs.data(), &rows);
+        StepRows step_rows{0};
+        (void)pulsar_session_spec_assemble_batch(s, st, m, StepRows{width}, reqs.data(), &step_rows);
+        const uint32_t rows = (uint32_t)step_rows.raw();   /* decode_mixed's row count */
         pulsar_gpu_sync_stats_get(&c1);
         int live = 0;
         char why[200] = "";
@@ -114,15 +115,15 @@ static void run(pulsar_engine *e, int NB, float temp, int rounds_max, bool repor
             break;
         }
         uint32_t gotr = 0;
-        pulsar_session_spec_arm_capture(s, rows);
+        pulsar_session_spec_arm_capture(s, step_rows);
         ok = pulsar_session_decode_mixed(s, reqs.data(), rows, NULL, 0, &gotr, PULSAR_MSEQ_HEAD_ALL_ROWS, err,
                                          sizeof(err)) == 0 && gotr == rows;
-        pulsar_session_spec_arm_capture(s, 0u);
+        pulsar_session_spec_arm_capture(s, StepRows{0});
         pulsar_gpu_sync_stats_get(&c2);
         if (!ok) break;
         for (int i = 0; i < m; i++) {
             st[i].accepted = acc[i];
-            st[i].accepted_cap = (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
+            st[i].accepted_cap = TokCount{PULSAR_SPEC_LOGITS_ROWS + 1};
         }
         ok = pulsar_session_spec_round_end_batch(s, st, m) == 0;
         pulsar_gpu_sync_stats_get(&c3);
