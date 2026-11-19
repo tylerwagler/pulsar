@@ -27,6 +27,30 @@ kit_gen::~kit_gen() {
     delete ahead;
 }
 
+/* L437: a parser's stream offset in the turn's text.  The parser counts the bytes it was fed since its init(); this
+ * state feeds it g->text[.., fed) in order, so the stream's end is text offset `fed` and a stream offset lies as far
+ * before `fed` as it lies before the stream's end.  Every parser is fed from the text's first byte today (a decode
+ * attempt resets g->text and creates its parser together, gen_decode_init; a forced seed is read from byte 0), which
+ * makes the two offsets equal -- but that is this state's fact, not the parser's, and it is no longer assumed. */
+GenOff kit_gen::text_at(StreamOff at) const {
+    const StreamOff end = parser->stream_end();
+    if (at > end) pulsar_die("output parser: a stream offset past the bytes the parser was fed");
+    const GenBytes back = end - at;
+    if (back > fed.before()) pulsar_die("output parser: a stream offset before the turn's text");
+    return fed - back;
+}
+
+/// Feed `q`'s parser text[fed, upto) and advance `fed` (nothing when `upto` is at or below it).
+/// @param q     the kit state (the attempt's, or a probe's)
+/// @param text  the generated text
+/// @param upto  the offset to read up to
+/// @param ev    receives the parser's events
+static void kit_feed_text(kit_gen *q, const char *text, GenOff upto, std::vector<out_event> *ev) {
+    if (upto <= q->fed) return;
+    q->parser->feed(gen_text_at(text, q->fed), (upto - q->fed).raw(), ev);
+    q->fed = upto;
+}
+
 /* L428: a turn that may make one call ends where its first call closes -- a well-formed call naming a declared
  * tool, the call the finish keeps (a malformed or undeclared one is dropped, and the turn goes on to its next) --
  * and the family's template has written what it writes after a call (server_family_ops::call_tail: Nemotron-H's
@@ -52,15 +76,19 @@ static void kit_read_ahead(kit_gen *q, const gen_state *g, const char *text, siz
         q->ahead_fed = q->fed;
     }
     const char *tail = r->family->call_tail;
+    const GenOff end = gen_text_end(len);
+    const GenBytes one{1};
+    /* the next byte of the family's call_tail to match (tail_at is a length of the tail, not an offset of the text) */
+    auto tail_next = [&]() { return tail[q->tail_at.raw()]; };
     std::vector<out_event> ev;
-    while (!q->cut && (q->ahead_fed < len || (q->call_closed && !tail[q->tail_at]))) {
+    while (!q->cut && (q->ahead_fed < end || (q->call_closed && !tail_next()))) {
         if (q->call_closed) {
-            if (!tail[q->tail_at]) {   /* the call and the template's bytes after it: the turn */
+            if (!tail_next()) {   /* the call and the template's bytes after it: the turn */
                 q->cut = true;
                 q->cut_at = q->ahead_fed;
-            } else if (text[q->ahead_fed] == tail[q->tail_at]) {
-                q->ahead_fed++;
-                q->tail_at++;
+            } else if (*gen_text_at(text, q->ahead_fed) == tail_next()) {
+                q->ahead_fed += one;
+                q->tail_at += one;
             } else {                   /* not the template's bytes: the turn is the call */
                 q->cut = true;
                 q->cut_at = q->call_end;
@@ -68,8 +96,8 @@ static void kit_read_ahead(kit_gen *q, const gen_state *g, const char *text, siz
             continue;
         }
         ev.clear();
-        q->ahead->feed(text + q->ahead_fed, 1, &ev);
-        q->ahead_fed++;
+        q->ahead->feed(gen_text_at(text, q->ahead_fed), 1, &ev);
+        q->ahead_fed += one;
         for (const out_event &e : ev) {
             char undeclared[512];
             if (e.kind != out_event::TOOL_END ||
@@ -86,7 +114,7 @@ static void kit_read_ahead(kit_gen *q, const gen_state *g, const char *text, siz
 /// @param final  the turn's end is being fed
 /// @return how many of them the parser reads: none past the turn's end (L428), nor -- while the turn goes on -- past
 ///         its first call's close until the bytes after it say where the turn ends
-static size_t kit_read_limit(const kit_gen *q, size_t upto, bool final) {
+static GenOff kit_read_limit(const kit_gen *q, GenOff upto, bool final) {
     if (q->cut) return upto < q->cut_at ? upto : q->cut_at;
     if (q->call_closed && !final && upto > q->call_end) return q->call_end;
     return upto;
@@ -106,8 +134,8 @@ void *parser_kit_start(out_parser *p) {
 void parser_kit_seed(void *st, gen_state *g) {
     kit_gen *q = (kit_gen *)st;
     q->ev.clear();
-    q->parser->feed(g->text.ptr, g->text.len, &q->ev);
-    q->fed = g->text.len;
+    q->parser->feed(g->text.ptr, g->text.len, &q->ev);   /* the whole seed, from the text's first byte */
+    q->fed = gen_text_end(g->text.len);
     for (const out_event &e : q->ev)
         if (e.kind != out_event::TOOL_BEGIN) pulsar_die("output parser: the forced-call seed is not an open call");
     q->pending = q->ev;
@@ -158,14 +186,13 @@ void *parser_kit_probe_new(void *st) {
 /// @param text   the generated text with the round's tokens so far
 /// @param len    its length (L428: the read-ahead's bytes)
 /// @param upto   bytes the stop-string scan released (nothing is fed at or below what the probe already read)
-void parser_kit_probe_feed(void *probe, const gen_state *g, const char *text, size_t len, size_t upto) {
+void parser_kit_probe_feed(void *probe, const gen_state *g, const char *text, size_t len, GenOff upto) {
     kit_gen *p = (kit_gen *)probe;
     kit_read_ahead(p, g, text, len);
     upto = kit_read_limit(p, upto, false);
     if (upto <= p->fed) return;
     p->ev.clear();
-    p->parser->feed(text + p->fed, upto - p->fed, &p->ev);
-    p->fed = upto;
+    kit_feed_text(p, text, upto, &p->ev);
 }
 
 /// server_output_parser_ops::probe_free: the borrowed bodies go back to the state the probe was taken from.
@@ -187,7 +214,7 @@ void parser_kit_probe_free(void *probe) {
 /// @param st   the kit state, or a probe
 /// @param end  receives the offset where that turn ends: past the call and the family's call_tail
 /// @return true once that turn has ended
-bool parser_kit_turn_complete(const void *st, const gen_state *, size_t *end) {
+bool parser_kit_turn_complete(const void *st, const gen_state *, GenOff *end) {
     const kit_gen *q = (const kit_gen *)st;
     if (q->cut) *end = q->cut_at;
     return q->cut;
@@ -224,7 +251,7 @@ static bool kit_close_open_call(kit_gen *q, gen_state *g) {
 /// @param upto   bytes of g->text released by the stop-string scan
 /// @param final  end the turn after feeding
 /// @return false when a client write failed (sticky: later calls after the finish return it)
-bool parser_kit_feed(void *st, server *s, gen_state *g, size_t upto, bool final) {
+bool parser_kit_feed(void *st, server *s, gen_state *g, GenOff upto, bool final) {
     kit_gen *q = (kit_gen *)st;
     job *j = g->j;
     if (q->finished) return q->stream_ok;   /* the finish fed the end of the turn already */
@@ -233,10 +260,7 @@ bool parser_kit_feed(void *st, server *s, gen_state *g, size_t upto, bool final)
     /* L428: a turn that may make one call ends at its first call; the parser reads nothing past the turn's end */
     kit_read_ahead(q, g, g->text.ptr, g->text.len);
     upto = kit_read_limit(q, upto, final);
-    if (upto > q->fed) {
-        q->parser->feed(g->text.ptr + q->fed, upto - q->fed, &q->ev);
-        q->fed = upto;
-    }
+    kit_feed_text(q, g->text.ptr, upto, &q->ev);
     if (final) {
         q->parser->finish(&q->ev);
         q->finished = true;
@@ -248,8 +272,12 @@ bool parser_kit_feed(void *st, server *s, gen_state *g, size_t upto, bool final)
         switch (e.kind) {
         case out_event::REASONING:
         case out_event::CONTENT:
+            /* L437: the sink's release watermark (chat_sink::text: the logprob ledger's) is where THIS delta's text
+             * ends in g->text -- the parser says where in its stream (out_event::end), this state where that is in
+             * the text.  Not q->fed: the parser may still hold the last bytes it was fed (a marker's prefix,
+             * whitespace a section policy keeps back), and a feed can yield more than one delta. */
             if (j->req.stream && k->text &&
-                !k->text(k, e.kind == out_event::REASONING, e.text.data(), e.text.size(), q->fed))
+                !k->text(k, e.kind == out_event::REASONING, e.text.data(), e.text.size(), q->text_at(e.end)))
                 return q->stream_ok = false;
             break;
         case out_event::TOOL_BEGIN: {
@@ -329,25 +357,28 @@ bool parser_kit_finish(void *st, server *s, session_slot *sl, gen_state *g, serv
     out->finish = g->finish;
     if (j->req.kind != REQ_CHAT) return true;
     bool ok = true;
-    if (strcmp(g->finish, "error") != 0) ok = parser_kit_feed(q, s, g, g->text.len, true);
+    if (strcmp(g->finish, "error") != 0) ok = parser_kit_feed(q, s, g, gen_text_end(g->text.len), true);
     const out_parser &p = *q->parser;
     out->content = server_xstrdup(p.content().c_str());
     out->reasoning = p.reasoning().empty() ? NULL : server_xstrdup(p.reasoning().c_str());
     out->calls = q->calls;
     memset(&q->calls, 0, sizeof(q->calls));
-    size_t raw_lo = 0, raw_hi = 0;
+    StreamOff span_lo{0}, span_hi{0};
     /* the sampled bytes are the tool memory's key only when they are exactly the kept calls: a dropped
      * undeclared call is in them, so that turn re-renders canonically (a prefix miss, never a wrong prompt) */
-    if (out->calls.len && q->undeclared == 0 && p.raw_span(&raw_lo, &raw_hi)) {
-        if (raw_hi > g->text.len || raw_lo >= raw_hi) pulsar_die("output parser: raw span outside the turn's text");
-        out->calls.raw_calls = server_xstrndup(g->text.ptr + raw_lo, raw_hi - raw_lo);
+    if (out->calls.len && q->undeclared == 0 && p.raw_span(&span_lo, &span_hi)) {
+        /* L437: the parser's span is of its stream; the text's bytes are at this state's offsets of it */
+        const GenOff raw_lo = q->text_at(span_lo), raw_hi = q->text_at(span_hi);
+        if (raw_hi > gen_text_end(g->text.len) || raw_lo >= raw_hi)
+            pulsar_die("output parser: raw span outside the turn's text");
+        out->calls.raw_calls = server_xstrndup(gen_text_at(g->text.ptr, raw_lo), (raw_hi - raw_lo).raw());
     }
     /* as text, the stream stopped at the first call's marker: the rest goes out at the finish.  The parser says
      * where that was (L419: a marker quoted in Markdown code before it was text, and streamed as text) */
-    const size_t call = p.first_call_at();
+    const StreamOff call = p.first_call_at();
     std::string open_reasoning;   /* L420: the turn ended inside its reasoning */
     const bool open = p.open_reasoning(&open_reasoning);
     return parser_finish_turn(s, sl, g, out, p.errors() > 0 || q->undeclared > 0, q->last_error.c_str(),
-                              /*logged=*/true, call == std::string::npos ? SIZE_MAX : call, ok,
+                              /*logged=*/true, call.is_none() ? GenOff::none() : q->text_at(call), ok,
                               open ? open_reasoning.c_str() : NULL);
 }

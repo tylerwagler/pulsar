@@ -129,7 +129,7 @@ void logprob_capture_row(logprob_ledger *lg, pulsar_session *sess, uint32_t row,
 /// @param end_off byte offset in the generated text where the token's piece ends (the release watermark it rides)
 /// @return false when no capture was pending: the ledger is then disabled for the request
 bool logprob_commit(logprob_ledger *lg, pulsar_engine *engine, int token,
-                    const char *piece, size_t piece_len, size_t end_off) {
+                    const char *piece, size_t piece_len, GenOff end_off) {
     if (!lg || !lg->enabled) return true;
     if (!lg->pending_valid) {
         logprob_ledger_reset(lg);
@@ -167,15 +167,24 @@ bool logprob_commit(logprob_ledger *lg, pulsar_engine *engine, int token,
 
 /* How many not-yet-streamed entries are fully covered by a release watermark:
  * the count of leading unstreamed entries whose piece ends at or before `upto`.
- * SIZE_MAX is the final flush (everything still held). */
+ * The final flush (everything still held) is logprob_stream_all: no offset means "everything" (L437; it was
+ * SIZE_MAX passed for the watermark). */
 /// @param lg the ledger (disabled or NULL: 0)
-/// @param upto the release watermark in bytes; SIZE_MAX = the final flush
+/// @param upto the release watermark: an offset of the generated text
 /// @return the entry index the stream may send up to (exclusive): streamed + the newly covered count
-int logprob_stream_ready(const logprob_ledger *lg, size_t upto) {
+int logprob_stream_ready(const logprob_ledger *lg, GenOff upto) {
     if (!lg || !lg->enabled) return 0;
     int n = lg->streamed;
     while (n < lg->len && lg->v[n].end_off <= upto) n++;
     return n;
+}
+
+/// @brief The final flush's count: every entry (what a watermark past every piece's end released).
+/// @param lg the ledger (disabled or NULL: 0)
+/// @return the entry index the stream may send up to (exclusive): all of them
+int logprob_stream_all(const logprob_ledger *lg) {
+    if (!lg || !lg->enabled) return 0;
+    return lg->len > lg->streamed ? lg->len : lg->streamed;
 }
 
 
@@ -362,11 +371,11 @@ bool turn_answers_with_reasoning(const gen_state *g, const server_turn *out, con
 
 bool turn_stream_reasoning_answer(gen_state *g, const server_turn *turn) {
     if (!turn->reasoning_answer || !g->sink.text) return true;
-    return g->sink.text(&g->sink, false, turn->content, strlen(turn->content), 0);
+    return g->sink.text(&g->sink, false, turn->content, strlen(turn->content), GenOff{0});   /* releases no entry */
 }
 
 bool parser_finish_turn(server *s, session_slot *sl, gen_state *g, server_turn *out, bool broken,
-                        const char *why, bool logged, size_t tail_from, bool ok, const char *open_reasoning) {
+                        const char *why, bool logged, GenOff tail_from, bool ok, const char *open_reasoning) {
     const request *r = &g->j->req;
     const char *detail = why;
     char dropped[512];
@@ -429,10 +438,11 @@ bool parser_finish_turn(server *s, session_slot *sl, gen_state *g, server_turn *
         out->content = out->reasoning = NULL;
         if (turn_tool_retry_allowed(g)) return turn_tool_retry(s, sl, g, detail, out);
         turn_as_text(g, out);
-        if (tail_from < g->text.len) {
+        const GenOff text_end = gen_text_end(g->text.len);
+        if (!tail_from.is_none() && tail_from < text_end) {
             /* the stream stopped at the call; the rest goes out as text at the finish */
-            out->tail = g->text.ptr + tail_from;
-            out->tail_len = g->text.len - tail_from;
+            out->tail = gen_text_at(g->text.ptr, tail_from);
+            out->tail_len = (text_end - tail_from).raw();
         }
         return ok;
     }

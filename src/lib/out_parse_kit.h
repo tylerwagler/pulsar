@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "md_code_scan.h"
+#include "pulsar_units.h"
 
 /** One thing the parser recognised. */
 struct out_event {
@@ -61,6 +62,12 @@ struct out_event {
     std::string name;
     /// The call's whole arguments object as JSON text (TOOL_END only).
     std::string arguments;
+    /** L437: where the delta's text ENDS in the parser's stream (REASONING, CONTENT): one past the last fed byte it
+     *  reports.  The parser holds bytes back (a marker's prefix, whitespace a section policy has not proved
+     *  interior, a split UTF-8 sequence), so this can lie before the stream's end; a delta of text the turn's end
+     *  releases ends at the stream's end.  What a consumer that pairs deltas with the stream's bytes needs (the
+     *  server's logprob entries ride with the delta that carries their token's last byte).  none() otherwise. */
+    StreamOff end = StreamOff::none();
 };
 
 /** One complete tool call the parser read. */
@@ -171,6 +178,13 @@ typedef std::shared_ptr<const pyjson_value> out_tools;
 /// @return "string", "other", or NULL (no tools, or the tool or the property is not declared)
 const char *out_tool_param_type(const out_tools &tools, const std::string &fn, const std::string &key);
 
+/** L437: a call body's cursor as the index the string functions under a body reader take (std::string's find /
+ *  compare / substr, pyjson_parse): the ONE place a BodyOff leaves its type.  A reader sets a cursor with
+ *  BodyOff{index}. */
+/// @param at  an offset into the open call's body
+/// @return it as the byte index into the body's string
+inline size_t body_ix(BodyOff at) { return at.raw(); }
+
 /** The reader of a call's body: the bytes between the marker that opened the call and the marker that
  * closes it.  The kit owns the call's index, the events' order and the call list; the reader owns the
  * body's syntax. */
@@ -183,11 +197,12 @@ public:
      *  `closing` = the closer was found and `b` is complete.  Announce the call (TOOL_BEGIN) once its name is
      *  known and stream TOOL_ARGS fragments as they become final. */
     /// @param b       the call's body so far (all of it, from just past the opening marker)
-    /// @param held    bytes after `b` that the kit holds back as a possible closing marker (0 when `closing`)
+    /// @param held    bytes after `b` that the kit holds back as a possible closing marker (0 when `closing`): a
+    ///                length of the kit's held bytes, not of the body
     /// @param closing true once the closing marker was found: `b` is the whole body
     /// @param index   the call's index within the turn, for the events
     /// @param ev      receives the TOOL_BEGIN / TOOL_ARGS events
-    virtual void grow(const std::string &b, size_t held, bool closing, int index, std::vector<out_event> *ev) = 0;
+    virtual void grow(const std::string &b, GenBytes held, bool closing, int index, std::vector<out_event> *ev) = 0;
     /** The next byte is a call's PAYLOAD (a string value), not its structure (the shared decode rule, L284
      *  P6: structure decodes greedily, payload is sampled). */
     /// @return true when the next byte is payload (sampled), false when it is structure (greedy)
@@ -211,7 +226,7 @@ public:
     /// @param at    on failure, the byte offset in `b` where reading stopped
     /// @return true when the body is a well-formed call
     virtual bool close(const std::string &b, int index, std::vector<out_event> *ev, out_call *call, const char **why,
-                       size_t *at) = 0;
+                       BodyOff *at) = 0;
 };
 
 /** The shared JSON call body: one object `{"name": NAME, "args": {...}}` (other members ignored; no "args"
@@ -221,10 +236,10 @@ public:
 class out_json_call_body : public out_call_body {
 public:
     void open() override;
-    void grow(const std::string &b, size_t held, bool closing, int index, std::vector<out_event> *ev) override;
+    void grow(const std::string &b, GenBytes held, bool closing, int index, std::vector<out_event> *ev) override;
     bool in_payload() const override { return payload_; }
     bool close(const std::string &b, int index, std::vector<out_event> *ev, out_call *call, const char **why,
-               size_t *at) override;
+               BodyOff *at) override;
 
 private:
     /// Advance the scanner over `b`'s bytes past pos_: the depth-1 member keys, "name"'s string value, and
@@ -239,19 +254,19 @@ private:
     /// @param ev      receives the fragment
     void stream_args(const std::string &b, bool closing, int index, std::vector<out_event> *ev);
 
-    size_t pos_ = 0;            ///< bytes of the body scanned
+    BodyOff pos_ = BodyOff{0};  ///< bytes of the body scanned
     int depth_ = 0;             ///< object / array depth at pos_
     bool in_str_ = false;       ///< inside a string literal
     bool esc_ = false;          ///< the previous byte was a backslash in it
-    size_t str_lo_ = 0;         ///< where the open string literal starts (its quote)
+    BodyOff str_lo_ = BodyOff{0};   ///< where the open string literal starts (its quote)
     std::string key_;           ///< the last depth-1 string closed (a member key until its value starts)
     bool want_value_ = false;   ///< a depth-1 ':' was seen: the next value is key_'s
     std::string value_key_;     ///< the member whose value is being read at depth 1
     bool name_done_ = false;    ///< "name"'s string value closed
     std::string name_;          ///< its decoded text
-    size_t args_lo_ = std::string::npos;  ///< where the "args" object starts
-    size_t args_hi_ = std::string::npos;  ///< one past its closing "}"
-    size_t args_sent_ = 0;      ///< args bytes streamed (from args_lo_)
+    BodyOff args_lo_ = BodyOff::none();   ///< where the "args" object starts (none(): not yet)
+    BodyOff args_hi_ = BodyOff::none();   ///< one past its closing "}" (none(): not yet)
+    GenBytes args_sent_ = GenBytes{0};    ///< args bytes streamed (from args_lo_): a length
     bool began_ = false;        ///< TOOL_BEGIN sent
     /// The next byte is inside a string at depth >= 2 (the args value), with no closer held: payload.
     bool payload_ = false;
@@ -323,15 +338,20 @@ public:
     bool in_payload() const { return state_ == OUT_CALL && body_->in_payload(); }
     /** The turn's calls as SAMPLED: [lo, hi) in the fed stream, from where the first call's bytes start to
      * the end of the last call that closed (a malformed one among them included -- these are the bytes the
-     * live KV holds).  false until a call was read. */
+     * live KV holds).  false until a call was read.  Offsets of THIS parser's stream (L437): whoever fed it owns
+     * where that stream starts in its own text (the server's kit_gen::text_at). */
     /// @param lo receives the stream offset where the first call's bytes start
     /// @param hi receives the stream offset one past the last closed call's closer
     /// @return true when at least one well-formed call was read (then `*lo`, `*hi` are set)
-    bool raw_span(size_t *lo, size_t *hi) const;
+    bool raw_span(StreamOff *lo, StreamOff *hi) const;
     /** Where the turn's first call opened: the stream offset of the marker that opened it -- a marker quoted in
-     *  Markdown code (L419) is text and opens none -- or std::string::npos when no call opened. */
-    /// @return the first call-opening marker's offset in the fed stream, or std::string::npos
-    size_t first_call_at() const { return block_seen_ ? call_at_ : std::string::npos; }
+     *  Markdown code (L419) is text and opens none -- or none() when no call opened. */
+    /// @return the first call-opening marker's offset in the fed stream, or StreamOff::none()
+    StreamOff first_call_at() const { return block_seen_ ? call_at_ : StreamOff::none(); }
+    /** L437: the end of the stream so far -- the bytes fed since init(), as an offset: what a feeder measures a
+     *  stream offset back from to place it in its own text. */
+    /// @return the offset one past the last byte fed
+    StreamOff stream_end() const { return fed_; }
 
 protected:
     /** A configuration's clone: the base's reading copied, then pointed at the copy's own body. */
@@ -352,8 +372,9 @@ private:
     /// @param st the state the text belongs to
     /// @param p  the bytes
     /// @param n  their count
+    /// @param at where `p` starts in the fed stream (L437: the delta's out_event::end is measured from it)
     /// @param ev receives the deltas
-    void emit_text(out_state st, const char *p, size_t n, std::vector<out_event> *ev);
+    void emit_text(out_state st, const char *p, size_t n, StreamOff at, std::vector<out_event> *ev);
     /// A section of state `st` ends (the state is left): drop a dangling partial sequence; STRIP resets.
     /// @param st the state being left (a no-op unless CONTENT or REASONING)
     void end_section(out_state st);
@@ -365,8 +386,9 @@ private:
     /// Append `text` to the reading and emit it as one delta (nothing when empty).
     /// @param reasoning true: a REASONING delta; false: CONTENT
     /// @param text      the delta (moved from)
+    /// @param end       where its text ends in the fed stream (out_event::end)
     /// @param ev        receives the event
-    void send(bool reasoning, std::string &&text, std::vector<out_event> *ev);
+    void send(bool reasoning, std::string &&text, StreamOff end, std::vector<out_event> *ev);
     /** The earliest marker in hold_ with a transition from the current state (`*tr`) or dropped everywhere
      *  (`*tr` NULL): its offset (npos if none) and length, and the bytes at hold_'s end that could still
      *  start one. */
@@ -386,6 +408,11 @@ private:
     void close_call(std::vector<out_event> *ev);
     /// A call opens: its body starts empty.  A probe's borrowed body is set aside first (probe_end() returns it).
     void new_block();
+    /** L437: the stream offset of byte `at` of hold_ -- hold_ is the stream's unclassified tail, so its byte `at` is
+     *  `hold_.size() - at` bytes before the stream's end.  The one crossing from the held bytes to the stream. */
+    /// @param at an offset in hold_ (at most its size)
+    /// @return that byte's offset in the fed stream
+    StreamOff stream_at(size_t at) const { return fed_ - GenBytes{hold_.size() - at}; }
 
     /// The bound grammar (not owned).
     const out_grammar *g_ = nullptr;
@@ -394,14 +421,14 @@ private:
     /// The machine's current state.
     out_state state_ = OUT_CONTENT;
     std::string hold_;         ///< bytes not yet classified
-    size_t fed_ = 0;           ///< bytes fed so far; hold_ is the stream's unclassified tail
+    StreamOff fed_ = StreamOff{0};   ///< the stream's end: bytes fed so far; hold_ is the stream's unclassified tail
     std::string header_;       ///< HEADER's buffered text
-    size_t header_at_ = 0;     ///< stream offset of the current header's text (past the marker that opened it)
+    StreamOff header_at_ = StreamOff{0};   ///< stream offset of the current header's text (past the marker that opened it)
     bool block_seen_ = false;  ///< a call opened: raw_lo_ is set
-    size_t raw_lo_ = 0;        ///< stream offset of the first call's bytes
-    size_t call_at_ = 0;       ///< stream offset of the marker that opened the first call
+    StreamOff raw_lo_ = StreamOff{0};    ///< stream offset of the first call's bytes
+    StreamOff call_at_ = StreamOff{0};   ///< stream offset of the marker that opened the first call
     md_code_scan code_;        ///< L419: the current CONTENT / REASONING section's Markdown code state
-    size_t raw_hi_ = 0;        ///< stream offset past the last call's closer
+    StreamOff raw_hi_ = StreamOff{0};    ///< stream offset past the last call's closer
     section sec_[2];           ///< [0] content, [1] reasoning
     std::string block_;        ///< the open call's body
     /// The next call's index (counts malformed calls too).
@@ -424,7 +451,7 @@ private:
     };
     bool lent_out_ = false;     ///< L430: a probe() holds this parser's block_ until probe_end(); it is not fed meanwhile
     loan_t loan_ = LOAN_NONE;   ///< L430: this parser is a probe()
-    size_t loan_len_ = 0;       ///< L430: the borrowed body's length when it was lent
+    GenBytes loan_len_ = GenBytes{0};   ///< L430: the borrowed body's length when it was lent
     std::string parked_;        ///< L430: the borrowed body, set aside (LOAN_PARKED)
 };
 

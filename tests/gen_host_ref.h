@@ -24,6 +24,11 @@
  *   tests/gen_host_bench.cpp     what a round's copies and a token's scan cost.
  * Delete it with those when the walks' or the release's answers change on purpose (the reference would then be wrong).
  *
+ * L437 typed the offsets this code reads and writes (GenOff / GenBytes in kit_gen and gen_state, the parser hooks'
+ * `upto` and `end`).  The reference's arithmetic stays the bare size_t arithmetic of b1a217d6: it works on a bare
+ * copy of the kit state's offsets (kit_bare_ref, written back when the function returns) and on bare copies of
+ * gen_state's two cursors, and the values cross to the typed hooks only where a hook is called.
+ *
  * Included after the server's sources by a unit that compiles the server whole (pulsar_test.cpp, gen_host_bench.cpp). */
 #pragma once
 
@@ -65,6 +70,55 @@ inline size_t gen_release_ref(const stop_list *stops, const char *text, size_t l
     return stream_len;
 }
 
+/// L437 plumbing: the LIVE release (server_jobs.cpp's gen_release, typed offsets) behind the reference's bare
+/// signature, so a comparison calls both the same way and compares raw values.
+/// @param stops             the request's stop strings
+/// @param text              the generated text, `piece` already appended (NUL-terminated)
+/// @param len               its length, bytes
+/// @param piece             the token's bytes
+/// @param piece_len         their length
+/// @param plain_stream_pos  bytes already released
+/// @param thinking          the reasoning tracker, fed `piece`
+/// @param stop_scan_from    the stop scan's resume offset, advanced
+/// @param hit_stop          set when a stop string matched
+/// @param stop_pos          receives its offset (untouched without a match, as the live release leaves it)
+/// @param stop_len          receives its length
+/// @return how far into `text` the stream may send, bytes
+inline size_t gen_release_bare(const stop_list *stops, const char *text, size_t len, const char *piece,
+                               size_t piece_len, size_t plain_stream_pos, thinking_state *thinking,
+                               size_t *stop_scan_from, bool *hit_stop, size_t *stop_pos, size_t *stop_len) {
+    GenOff from{*stop_scan_from}, pos{*stop_pos};
+    const GenOff up = gen_release(stops, text, len, piece, piece_len, GenOff{plain_stream_pos}, thinking, &from,
+                                  hit_stop, &pos, stop_len);
+    *stop_scan_from = from.raw();
+    *stop_pos = pos.raw();
+    return up.raw();
+}
+
+/// L437 plumbing: a kit state's offsets as the bare size_t the reference was written on -- read at construction,
+/// written back at destruction, so the reference's own lines compute on bare integers as they did.
+struct kit_bare_ref {
+    kit_gen *q;        ///< the kit state mirrored
+    size_t fed;        ///< kit_gen::fed
+    size_t ahead_fed;  ///< kit_gen::ahead_fed
+    size_t call_end;   ///< kit_gen::call_end
+    size_t tail_at;    ///< kit_gen::tail_at
+    size_t cut_at;     ///< kit_gen::cut_at
+    /// @param k  the kit state
+    explicit kit_bare_ref(kit_gen *k)
+        : q(k), fed(k->fed.raw()), ahead_fed(k->ahead_fed.raw()), call_end(k->call_end.raw()),
+          tail_at(k->tail_at.raw()), cut_at(k->cut_at.raw()) {}
+    kit_bare_ref(const kit_bare_ref &) = delete;
+    kit_bare_ref &operator=(const kit_bare_ref &) = delete;
+    ~kit_bare_ref() {
+        q->fed = GenOff{fed};
+        q->ahead_fed = GenOff{ahead_fed};
+        q->call_end = GenOff{call_end};
+        q->tail_at = GenBytes{tail_at};
+        q->cut_at = GenOff{cut_at};
+    }
+};
+
 /// parser_kit.cpp's kit_read_ahead at b1a217d6 (L428: the read-ahead copy, fed a byte at a time up to the first
 /// declared call's close and the family's call_tail).
 /// @param q     the kit state (the attempt's, or a probe's)
@@ -74,36 +128,37 @@ inline size_t gen_release_ref(const stop_list *stops, const char *text, size_t l
 inline void kit_read_ahead_ref(kit_gen *q, const gen_state *g, const char *text, size_t len) {
     const request *r = &g->j->req;
     if (!r->single_tool_call || r->kind != REQ_CHAT || !r->has_tools || q->cut) return;
+    kit_bare_ref b(q);   /* L437 plumbing: the offsets, bare */
     if (!q->ahead) {
         q->ahead = q->parser->clone();
-        q->ahead_fed = q->fed;
+        b.ahead_fed = b.fed;
     }
     const char *tail = r->family->call_tail;
     std::vector<out_event> ev;
-    while (!q->cut && (q->ahead_fed < len || (q->call_closed && !tail[q->tail_at]))) {
+    while (!q->cut && (b.ahead_fed < len || (q->call_closed && !tail[b.tail_at]))) {
         if (q->call_closed) {
-            if (!tail[q->tail_at]) {   /* the call and the template's bytes after it: the turn */
+            if (!tail[b.tail_at]) {   /* the call and the template's bytes after it: the turn */
                 q->cut = true;
-                q->cut_at = q->ahead_fed;
-            } else if (text[q->ahead_fed] == tail[q->tail_at]) {
-                q->ahead_fed++;
-                q->tail_at++;
+                b.cut_at = b.ahead_fed;
+            } else if (text[b.ahead_fed] == tail[b.tail_at]) {
+                b.ahead_fed++;
+                b.tail_at++;
             } else {                   /* not the template's bytes: the turn is the call */
                 q->cut = true;
-                q->cut_at = q->call_end;
+                b.cut_at = b.call_end;
             }
             continue;
         }
         ev.clear();
-        q->ahead->feed(text + q->ahead_fed, 1, &ev);
-        q->ahead_fed++;
+        q->ahead->feed(text + b.ahead_fed, 1, &ev);
+        b.ahead_fed++;
         for (const out_event &e : ev) {
             char undeclared[512];
             if (e.kind != out_event::TOOL_END ||
                 !tool_call_declared(r, e.name.c_str(), undeclared, sizeof(undeclared)))
                 continue;
             q->call_closed = true;
-            q->call_end = q->ahead_fed;
+            b.call_end = b.ahead_fed;
         }
     }
 }
@@ -114,8 +169,9 @@ inline void kit_read_ahead_ref(kit_gen *q, const gen_state *g, const char *text,
 /// @param final  the turn's end is being fed
 /// @return how many of them the parser reads
 inline size_t kit_read_limit_ref(const kit_gen *q, size_t upto, bool final) {
-    if (q->cut) return upto < q->cut_at ? upto : q->cut_at;
-    if (q->call_closed && !final && upto > q->call_end) return q->call_end;
+    const size_t cut_at = q->cut_at.raw(), call_end = q->call_end.raw();   /* L437 plumbing: the offsets, bare */
+    if (q->cut) return upto < cut_at ? upto : cut_at;
+    if (q->call_closed && !final && upto > call_end) return call_end;
     return upto;
 }
 
@@ -148,10 +204,11 @@ inline void kit_probe_feed_ref(void *probe, const gen_state *g, const char *text
     kit_gen *p = (kit_gen *)probe;
     kit_read_ahead_ref(p, g, text, len);
     upto = kit_read_limit_ref(p, upto, false);
-    if (upto <= p->fed) return;
+    kit_bare_ref b(p);   /* L437 plumbing: the offsets, bare */
+    if (upto <= b.fed) return;
     p->ev.clear();
-    p->parser->feed(text + p->fed, upto - p->fed, &p->ev);
-    p->fed = upto;
+    p->parser->feed(text + b.fed, upto - b.fed, &p->ev);
+    b.fed = upto;
 }
 
 /// parser_kit.cpp's parser_kit_probe_free at b1a217d6.
@@ -174,7 +231,7 @@ inline void *gen_probe_new_ref(const gen_state *g) {
 /// @param upto   bytes the stop-string scan released
 inline void gen_probe_feed_ref(void *probe, const gen_state *g, const char *text, size_t len, size_t upto) {
     if (g->parser->probe_new == parser_kit_probe_new) kit_probe_feed_ref(probe, g, text, len, upto);
-    else g->parser->probe_feed(probe, g, text, len, upto);
+    else g->parser->probe_feed(probe, g, text, len, GenOff{upto});   /* L437 plumbing: the family's typed hook */
 }
 
 /// g->parser->probe_free at b1a217d6.
@@ -212,8 +269,8 @@ inline uint32_t gen_spec_greedy_rows_text_ref(const gen_state *g, const char *co
     memset(&text, 0, sizeof text);
     if (g->text.len) buf_append(&text, g->text.ptr, g->text.len);
     thinking_state thinking = g->thinking;
-    size_t stop_scan_from = g->stop_scan_from;
-    size_t plain_stream_pos = g->plain_stream_pos;
+    size_t stop_scan_from = g->stop_scan_from.raw();       /* L437 plumbing: the two cursors, bare */
+    size_t plain_stream_pos = g->plain_stream_pos.raw();
     bool greedy = g->parser->in_tool_call(probe, g);
     uint32_t bits = base_emitted && greedy ? 1u : 0u;   /* row 0 follows a streamed base: the state as it stands */
     int row = base_emitted ? 1 : 0;
@@ -257,13 +314,14 @@ inline int gen_turn_draft_prefix_text_ref(const gen_state *g, const char *const 
     memset(&text, 0, sizeof text);
     if (g->text.len) buf_append(&text, g->text.ptr, g->text.len);
     thinking_state thinking = g->thinking;
-    size_t stop_scan_from = g->stop_scan_from;
-    size_t plain_stream_pos = g->plain_stream_pos;
+    size_t stop_scan_from = g->stop_scan_from.raw();       /* L437 plumbing: the two cursors, bare */
+    size_t plain_stream_pos = g->plain_stream_pos.raw();
     int keep = n;
     for (int i = 0; i <= n; i++) {   /* pieces[0] is the base, pieces[i] draft i - 1 */
         if (!pieces[i]) break;
         buf_append(&text, pieces[i], piece_lens[i]);
-        size_t stop_pos = 0, stop_len = 0, end = 0;
+        size_t stop_pos = 0, stop_len = 0;
+        GenOff end{0};   /* L437 plumbing: the typed hook's out-parameter (not read) */
         bool hit_stop = false;
         const size_t upto = gen_release_ref(&req->stops, text.ptr, text.len, pieces[i], piece_lens[i],
                                             plain_stream_pos, &thinking, &stop_scan_from, &hit_stop, &stop_pos,

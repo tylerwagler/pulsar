@@ -336,52 +336,53 @@ void dsml_decode_tracker_update(dsml_decode_tracker *dt,
         if (dt->mode == DSML_TRACK_SEARCH) {
             size_t pos = 0;
             const pulsar_dsml_syntax *syn = NULL;
-            if (!dsml_find_tool_start_from(raw, raw_len, dt->pos, &pos, &syn)) {
+            if (!dsml_find_tool_start_from(raw, raw_len, walk_ix(dt->pos), &pos, &syn)) {
                 size_t hold = dsml_max_tool_start_len();
-                dt->pos = raw_len > hold ? raw_len - hold : 0;
+                dt->pos = GenOff{raw_len > hold ? raw_len - hold : 0};
                 dt->decode = DSML_DECODE_OUTSIDE;
                 return;
             }
             dt->syn = syn;
-            dt->pos = pos;
+            dt->pos = GenOff{pos};
             dt->mode = DSML_TRACK_STRUCTURAL;
             dt->decode = DSML_DECODE_STRUCTURAL;
         }
 
         if (dt->mode == DSML_TRACK_STRING_BODY) {
-            while (dt->pos < raw_len) {
-                if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->param_end)) {
-                    dt->pos += strlen(dt->syn->param_end);
+            while (walk_ix(dt->pos) < raw_len) {
+                if (raw_full_lit(raw, raw_len, walk_ix(dt->pos), dt->syn->param_end)) {
+                    dt->pos += GenBytes{strlen(dt->syn->param_end)};
                     dt->mode = DSML_TRACK_STRUCTURAL;
                     dt->decode = DSML_DECODE_STRUCTURAL;
                     goto structural;
                 }
-                if (raw_partial_lit_min(raw, raw_len, dt->pos, dt->syn->param_end, 2)) {
+                if (raw_partial_lit_min(raw, raw_len, walk_ix(dt->pos), dt->syn->param_end, 2)) {
                     dt->decode = DSML_DECODE_STRUCTURAL;
                     return;
                 }
-                dt->pos++;
+                dt->pos += GenBytes{1};
             }
             dt->decode = DSML_DECODE_STRING_BODY;
             return;
         }
 
         if (dt->mode == DSML_TRACK_JSON_PARAM) {
-            while (dt->pos < raw_len) {
+            while (walk_ix(dt->pos) < raw_len) {
                 if (!dt->json_in_string) {
-                    if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->param_end)) {
-                        dt->pos += strlen(dt->syn->param_end);
+                    if (raw_full_lit(raw, raw_len, walk_ix(dt->pos), dt->syn->param_end)) {
+                        dt->pos += GenBytes{strlen(dt->syn->param_end)};
                         dt->mode = DSML_TRACK_STRUCTURAL;
                         dt->decode = DSML_DECODE_STRUCTURAL;
                         goto structural;
                     }
-                    if (raw_partial_lit_min(raw, raw_len, dt->pos, dt->syn->param_end, 2)) {
+                    if (raw_partial_lit_min(raw, raw_len, walk_ix(dt->pos), dt->syn->param_end, 2)) {
                         dt->decode = DSML_DECODE_STRUCTURAL;
                         return;
                     }
                 }
 
-                unsigned char c = (unsigned char)raw[dt->pos++];
+                unsigned char c = (unsigned char)raw[walk_ix(dt->pos)];
+                dt->pos += GenBytes{1};
                 if (dt->json_in_string) {
                     if (dt->json_escaped) {
                         dt->json_escaped = false;
@@ -401,41 +402,44 @@ void dsml_decode_tracker_update(dsml_decode_tracker *dt,
 
 structural:
         while (dt->mode == DSML_TRACK_STRUCTURAL) {
-            while (dt->pos < raw_len && isspace((unsigned char)raw[dt->pos])) dt->pos++;
-            if (dt->pos >= raw_len) {
+            while (walk_ix(dt->pos) < raw_len && isspace((unsigned char)raw[walk_ix(dt->pos)]))
+                dt->pos += GenBytes{1};
+            if (walk_ix(dt->pos) >= raw_len) {
                 dt->decode = DSML_DECODE_STRUCTURAL;
                 return;
             }
 
-            if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->tool_calls_end)) {
+            if (raw_full_lit(raw, raw_len, walk_ix(dt->pos), dt->syn->tool_calls_end)) {
                 dt->mode = DSML_TRACK_DONE;
-                dt->pos += strlen(dt->syn->tool_calls_end);
+                dt->pos += GenBytes{strlen(dt->syn->tool_calls_end)};
                 dt->decode = DSML_DECODE_OUTSIDE;
                 return;
             }
-            if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->invoke_end)) {
-                dt->pos += strlen(dt->syn->invoke_end);
+            if (raw_full_lit(raw, raw_len, walk_ix(dt->pos), dt->syn->invoke_end)) {
+                dt->pos += GenBytes{strlen(dt->syn->invoke_end)};
                 continue;
             }
-            if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->invoke_start)) {
-                const char *tag_end = (const char *)memchr(raw + dt->pos, '>', raw_len - dt->pos);
+            if (raw_full_lit(raw, raw_len, walk_ix(dt->pos), dt->syn->invoke_start)) {
+                const char *tag_end =
+                    (const char *)memchr(raw + walk_ix(dt->pos), '>', raw_len - walk_ix(dt->pos));
                 if (!tag_end) {
                     dt->decode = DSML_DECODE_STRUCTURAL;
                     return;
                 }
-                dt->pos = (size_t)(tag_end - raw) + 1;
+                dt->pos = GenOff{(size_t)(tag_end - raw) + 1};
                 continue;
             }
-            if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->param_start)) {
-                size_t tag_start = dt->pos;
-                const char *tag_end = (const char *)memchr(raw + dt->pos, '>', raw_len - dt->pos);
+            if (raw_full_lit(raw, raw_len, walk_ix(dt->pos), dt->syn->param_start)) {
+                size_t tag_start = walk_ix(dt->pos);
+                const char *tag_end =
+                    (const char *)memchr(raw + walk_ix(dt->pos), '>', raw_len - walk_ix(dt->pos));
                 if (!tag_end) {
                     dt->decode = DSML_DECODE_STRUCTURAL;
                     return;
                 }
                 size_t tag_after = (size_t)(tag_end - raw) + 1;
                 bool string_value = dsml_attr_is_string_true(raw, raw_len, tag_start, tag_after);
-                dt->pos = tag_after;
+                dt->pos = GenOff{tag_after};
                 if (string_value) {
                     dt->mode = DSML_TRACK_STRING_BODY;
                     dt->decode = DSML_DECODE_STRING_BODY;
@@ -448,11 +452,11 @@ structural:
                 break;
             }
 
-            if (raw_partial_lit(raw, raw_len, dt->pos, dt->syn->tool_calls_end) ||
-                raw_partial_lit(raw, raw_len, dt->pos, dt->syn->invoke_start) ||
-                raw_partial_lit(raw, raw_len, dt->pos, dt->syn->invoke_end) ||
-                raw_partial_lit(raw, raw_len, dt->pos, dt->syn->param_start) ||
-                raw_partial_lit(raw, raw_len, dt->pos, dt->syn->param_end))
+            if (raw_partial_lit(raw, raw_len, walk_ix(dt->pos), dt->syn->tool_calls_end) ||
+                raw_partial_lit(raw, raw_len, walk_ix(dt->pos), dt->syn->invoke_start) ||
+                raw_partial_lit(raw, raw_len, walk_ix(dt->pos), dt->syn->invoke_end) ||
+                raw_partial_lit(raw, raw_len, walk_ix(dt->pos), dt->syn->param_start) ||
+                raw_partial_lit(raw, raw_len, walk_ix(dt->pos), dt->syn->param_end))
             {
                 dt->decode = DSML_DECODE_STRUCTURAL;
                 return;
@@ -592,6 +596,34 @@ const char *find_any_tool_end(const char *s) {
     const char *best = NULL;
     for (size_t i = 0; i < PULSAR_DSML_SYNTAXES; i++) {
         const char *p = strstr(s, pulsar_dsml_syntaxes[i].tool_calls_end);
+        if (p && (!best || p < best)) best = p;
+    }
+    return best;
+}
+
+
+
+/// find_any_tool_start over `n` bytes: the walk's form, which reads only the bytes it was given (L437).
+/// @param s  the bytes
+/// @param n  how many
+/// @return the earliest opener that lies whole inside them, or NULL
+const char *find_any_tool_start_n(const char *s, size_t n) {
+    const char *best = NULL;
+    for (size_t i = 0; i < PULSAR_DSML_SYNTAXES; i++) {
+        const char *p = find_lit_bounded(s, n, pulsar_dsml_syntaxes[i].tool_calls_start);
+        if (p && (!best || p < best)) best = p;
+    }
+    return best;
+}
+
+/// find_any_tool_end over `n` bytes (L437).
+/// @param s  the bytes
+/// @param n  how many
+/// @return the earliest closer that lies whole inside them, or NULL
+const char *find_any_tool_end_n(const char *s, size_t n) {
+    const char *best = NULL;
+    for (size_t i = 0; i < PULSAR_DSML_SYNTAXES; i++) {
+        const char *p = find_lit_bounded(s, n, pulsar_dsml_syntaxes[i].tool_calls_end);
         if (p && (!best || p < best)) best = p;
     }
     return best;
@@ -1034,16 +1066,16 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
 /// @param scan_from  in/out: where the scan resumes
 /// @return true when a complete tool block sits at or after the scan point
 bool complete_tool_call_inside_thinking(const char *text, size_t len,
-                                        size_t *scan_from) {
+                                        GenOff *scan_from) {
     if (!text || !scan_from) return false;
-    if (*scan_from > len) *scan_from = len;
-    const char *start = find_any_tool_start(text + *scan_from);
+    if (walk_ix(*scan_from) > len) *scan_from = GenOff{len};
+    const char *start = find_any_tool_start(text + walk_ix(*scan_from));
     if (!start) {
         const size_t hold = 80; /* > longest stanza opening */
-        *scan_from = len > hold ? len - hold : 0;
+        *scan_from = GenOff{len > hold ? len - hold : 0};
         return false;
     }
-    *scan_from = (size_t)(start - text);
+    *scan_from = GenOff{(size_t)(start - text)};
     return find_any_tool_end(start) != NULL;
 }
 
@@ -1066,7 +1098,7 @@ size_t text_stream_safe_limit(const char *raw, size_t start,
 
     size_t limit = raw_len;
     if (has_tools) {
-        const char *tool = find_any_tool_start(raw + start);
+        const char *tool = find_any_tool_start_n(raw + start, raw_len - start);   /* L437: inside raw_len only */
         if (tool) {
             limit = trim_tool_separator_ws(raw, start, (size_t)(tool - raw));
             return utf8_stream_safe_len(raw, start, limit, true);
@@ -1129,16 +1161,16 @@ void dsml_tool_stream_free(dsml_tool_stream *ts) {
 /// @param raw_len  bytes of `raw` available
 /// @param pos      the opener's offset
 /// @return false when no syntax's opener is there (the projection is then inactive, in error)
-bool dsml_tool_stream_init(dsml_tool_stream *ts, const char *raw, size_t raw_len, size_t pos) {
+bool dsml_tool_stream_init(dsml_tool_stream *ts, const char *raw, size_t raw_len, GenOff pos) {
     dsml_tool_stream_free(ts);
     memset(ts, 0, sizeof(*ts));
     ts->active = true;
     ts->state = DSML_TOOL_BETWEEN_INVOKES;
     for (size_t i = 0; i < PULSAR_DSML_SYNTAXES; i++) {
         const pulsar_dsml_syntax *syn = &pulsar_dsml_syntaxes[i];
-        if (raw_full_lit(raw, raw_len, pos, syn->tool_calls_start)) {
+        if (raw_full_lit(raw, raw_len, walk_ix(pos), syn->tool_calls_start)) {
             ts->syn = syn;
-            ts->parse_pos = pos + strlen(syn->tool_calls_start);
+            ts->parse_pos = pos + GenBytes{strlen(syn->tool_calls_start)};
             return true;
         }
     }
@@ -1261,9 +1293,10 @@ static bool dsml_tool_emit_param_prefix(dsml_tool_stream *ts, chat_sink *k, cons
 /// @param raw_len  bytes of `raw` available
 /// @return false when a client write failed (true while the tag is incomplete)
 static bool dsml_tool_start_invoke(dsml_tool_stream *ts, chat_sink *k, const char *raw, size_t raw_len) {
-    const char *tag_end = (const char *)memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
+    const char *tag_end = (const char *)memchr(raw + walk_ix(ts->parse_pos), '>', raw_len - walk_ix(ts->parse_pos));
     if (!tag_end) return true;
-    char *tag = server_xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
+    char *tag = server_xstrndup(raw + walk_ix(ts->parse_pos),
+                                (size_t)(tag_end - (raw + walk_ix(ts->parse_pos)) + 1));
     char *name = pulsar_dsml_attr(tag, "name");
     free(tag);
     if (!name) return dsml_tool_stream_fail(ts, k);
@@ -1285,7 +1318,7 @@ static bool dsml_tool_start_invoke(dsml_tool_stream *ts, chat_sink *k, const cha
     ts->emitted_any = true;
     ts->args_open = true;
     ts->first_param = true;
-    ts->parse_pos = (size_t)(tag_end - raw) + 1;
+    ts->parse_pos = GenOff{(size_t)(tag_end - raw) + 1};
     ts->state = DSML_TOOL_BETWEEN_PARAMS;
     return true;
 }
@@ -1299,9 +1332,10 @@ static bool dsml_tool_start_invoke(dsml_tool_stream *ts, chat_sink *k, const cha
 /// @param raw_len  bytes of `raw` available
 /// @return false when a client write failed (true while the tag is incomplete)
 static bool dsml_tool_start_param(dsml_tool_stream *ts, chat_sink *k, const char *raw, size_t raw_len) {
-    const char *tag_end = (const char *)memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
+    const char *tag_end = (const char *)memchr(raw + walk_ix(ts->parse_pos), '>', raw_len - walk_ix(ts->parse_pos));
     if (!tag_end) return true;
-    char *tag = server_xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
+    char *tag = server_xstrndup(raw + walk_ix(ts->parse_pos),
+                                (size_t)(tag_end - (raw + walk_ix(ts->parse_pos)) + 1));
     char *name = pulsar_dsml_attr(tag, "name");
     char *is_string = pulsar_dsml_attr(tag, "string");
     free(tag);
@@ -1317,7 +1351,7 @@ static bool dsml_tool_start_param(dsml_tool_stream *ts, chat_sink *k, const char
     if (!ok) return false;
 
     ts->param_is_string = string_value;
-    ts->parse_pos = (size_t)(tag_end - raw) + 1;
+    ts->parse_pos = GenOff{(size_t)(tag_end - raw) + 1};
     ts->state = DSML_TOOL_PARAM_VALUE;
     return true;
 }
@@ -1331,10 +1365,10 @@ static bool dsml_tool_start_param(dsml_tool_stream *ts, chat_sink *k, const char
 /// @param value_end  one past the last byte to emit
 /// @return false when a client write failed
 static bool dsml_tool_emit_value(dsml_tool_stream *ts, chat_sink *k, const char *raw, size_t value_end) {
-    if (value_end <= ts->parse_pos) return true;
+    if (value_end <= walk_ix(ts->parse_pos)) return true;
     return ts->param_is_string ?
-        dsml_tool_emit_string_value(ts, k, raw + ts->parse_pos, value_end - ts->parse_pos) :
-        k->tool_ops->args(k, ts->index, raw + ts->parse_pos, value_end - ts->parse_pos);
+        dsml_tool_emit_string_value(ts, k, raw + walk_ix(ts->parse_pos), value_end - walk_ix(ts->parse_pos)) :
+        k->tool_ops->args(k, ts->index, raw + walk_ix(ts->parse_pos), value_end - walk_ix(ts->parse_pos));
 }
 
 
@@ -1348,7 +1382,7 @@ static bool dsml_tool_emit_value(dsml_tool_stream *ts, chat_sink *k, const char 
 static bool dsml_tool_finish_param(dsml_tool_stream *ts, chat_sink *k, const char *raw, size_t value_end) {
     if (!dsml_tool_emit_value(ts, k, raw, value_end)) return false;
     if (ts->param_is_string && !k->tool_ops->args(k, ts->index, "\"", 1)) return false;
-    ts->parse_pos = value_end + strlen(ts->syn->param_end);
+    ts->parse_pos = GenOff{value_end + strlen(ts->syn->param_end)};
     ts->state = DSML_TOOL_BETWEEN_PARAMS;
     return true;
 }
@@ -1392,10 +1426,10 @@ bool dsml_tool_stream_finalize(dsml_tool_stream *ts, chat_sink *k,
          * content.  Dropping it beats the non-stream repair here, which
          * keeps the fragment in the value. */
         size_t limit = tool_param_value_stream_safe_len(
-                raw, ts->parse_pos, raw_len, ts->syn->param_end, ts->param_is_string);
-        limit = trim_truncated_dsml_close_tail(raw, ts->parse_pos, limit);
+                raw, walk_ix(ts->parse_pos), raw_len, ts->syn->param_end, ts->param_is_string);
+        limit = trim_truncated_dsml_close_tail(raw, walk_ix(ts->parse_pos), limit);
         if (!dsml_tool_emit_value(ts, k, raw, limit)) return false;
-        if (limit > ts->parse_pos) ts->parse_pos = limit;
+        if (limit > walk_ix(ts->parse_pos)) ts->parse_pos = GenOff{limit};
         if (ts->param_is_string && !k->tool_ops->args(k, ts->index, "\"", 1)) return false;
         ts->state = DSML_TOOL_BETWEEN_PARAMS;
     }
@@ -1416,58 +1450,62 @@ bool dsml_tool_stream_finalize(dsml_tool_stream *ts, chat_sink *k,
 bool dsml_tool_stream_update(dsml_tool_stream *ts, chat_sink *k,
                              const char *raw, size_t raw_len) {
     const pulsar_dsml_syntax *syn = ts->syn;
-    while (ts->active && ts->parse_pos < raw_len) {
+    while (ts->active && walk_ix(ts->parse_pos) < raw_len) {
         if (ts->state == DSML_TOOL_BETWEEN_INVOKES) {
-            while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
-            if (ts->parse_pos >= raw_len) return true;
-            if (raw_full_lit(raw, raw_len, ts->parse_pos, syn->tool_calls_end)) {
-                ts->parse_pos += strlen(syn->tool_calls_end);
+            while (walk_ix(ts->parse_pos) < raw_len && isspace((unsigned char)raw[walk_ix(ts->parse_pos)]))
+                ts->parse_pos += GenBytes{1};
+            if (walk_ix(ts->parse_pos) >= raw_len) return true;
+            if (raw_full_lit(raw, raw_len, walk_ix(ts->parse_pos), syn->tool_calls_end)) {
+                ts->parse_pos += GenBytes{strlen(syn->tool_calls_end)};
                 ts->active = false;
                 ts->state = DSML_TOOL_DONE;
                 return true;
             }
-            if (raw_partial_any(raw, raw_len, ts->parse_pos, syn->tool_calls_end, syn->invoke_start)) return true;
-            if (raw_full_lit(raw, raw_len, ts->parse_pos, syn->invoke_start)) {
-                size_t before_pos = ts->parse_pos;
+            if (raw_partial_any(raw, raw_len, walk_ix(ts->parse_pos), syn->tool_calls_end, syn->invoke_start))
+                return true;
+            if (raw_full_lit(raw, raw_len, walk_ix(ts->parse_pos), syn->invoke_start)) {
+                size_t before_pos = walk_ix(ts->parse_pos);
                 dsml_tool_stream_state before_state = ts->state;
                 if (!dsml_tool_start_invoke(ts, k, raw, raw_len)) return false;
-                if (ts->parse_pos == before_pos && ts->state == before_state) return true;
+                if (walk_ix(ts->parse_pos) == before_pos && ts->state == before_state) return true;
                 continue;
             }
             return dsml_tool_stream_fail(ts, k);
         }
 
         if (ts->state == DSML_TOOL_BETWEEN_PARAMS) {
-            while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
-            if (ts->parse_pos >= raw_len) return true;
-            if (raw_full_lit(raw, raw_len, ts->parse_pos, syn->invoke_end)) {
+            while (walk_ix(ts->parse_pos) < raw_len && isspace((unsigned char)raw[walk_ix(ts->parse_pos)]))
+                ts->parse_pos += GenBytes{1};
+            if (walk_ix(ts->parse_pos) >= raw_len) return true;
+            if (raw_full_lit(raw, raw_len, walk_ix(ts->parse_pos), syn->invoke_end)) {
                 if (!dsml_tool_close_invoke(ts, k)) return false;
-                ts->parse_pos += strlen(syn->invoke_end);
+                ts->parse_pos += GenBytes{strlen(syn->invoke_end)};
                 ts->state = DSML_TOOL_BETWEEN_INVOKES;
                 continue;
             }
-            if (raw_partial_any(raw, raw_len, ts->parse_pos, syn->invoke_end, syn->param_start)) return true;
-            if (raw_full_lit(raw, raw_len, ts->parse_pos, syn->param_start)) {
-                size_t before_pos = ts->parse_pos;
+            if (raw_partial_any(raw, raw_len, walk_ix(ts->parse_pos), syn->invoke_end, syn->param_start))
+                return true;
+            if (raw_full_lit(raw, raw_len, walk_ix(ts->parse_pos), syn->param_start)) {
+                size_t before_pos = walk_ix(ts->parse_pos);
                 dsml_tool_stream_state before_state = ts->state;
                 if (!dsml_tool_start_param(ts, k, raw, raw_len)) return false;
-                if (ts->parse_pos == before_pos && ts->state == before_state) return true;
+                if (walk_ix(ts->parse_pos) == before_pos && ts->state == before_state) return true;
                 continue;
             }
             return dsml_tool_stream_fail(ts, k);
         }
 
         if (ts->state == DSML_TOOL_PARAM_VALUE) {
-            const char *end = find_lit_bounded(raw + ts->parse_pos, raw_len - ts->parse_pos,
+            const char *end = find_lit_bounded(raw + walk_ix(ts->parse_pos), raw_len - walk_ix(ts->parse_pos),
                                                syn->param_end);
             if (end) {
                 if (!dsml_tool_finish_param(ts, k, raw, (size_t)(end - raw))) return false;
                 continue;
             }
-            size_t limit = tool_param_value_stream_safe_len(raw, ts->parse_pos, raw_len,
+            size_t limit = tool_param_value_stream_safe_len(raw, walk_ix(ts->parse_pos), raw_len,
                                                             syn->param_end, ts->param_is_string);
             if (!dsml_tool_emit_value(ts, k, raw, limit)) return false;
-            if (limit > ts->parse_pos) ts->parse_pos = limit;
+            if (limit > walk_ix(ts->parse_pos)) ts->parse_pos = GenOff{limit};
             return true;
         }
 

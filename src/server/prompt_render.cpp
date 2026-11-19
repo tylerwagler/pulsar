@@ -134,7 +134,7 @@ static void buf_puts_content_images(buf *b, const chat_msg *m) {
     }
     size_t pos = 0;
     for (int i = 0; i < m->images_len; i++) {
-        const size_t off = m->image_ph_off[i];
+        const size_t off = content_ix(m->image_ph_off[i]);
         buf_puts_content_n(b, s + pos, off - pos);
         buf_puts(b, PULSAR_IMAGE_PLACEHOLDER);
         pos = off + ph;
@@ -1071,13 +1071,13 @@ void anthropic_fold_tool_results(chat_msgs *msgs) {
             /* the part's text, escaped when it is a result's, around its images' placeholders */
             size_t at = 0;
             for (int im = 0; im <= m->images_len; im++) {
-                const size_t ph = im < m->images_len ? m->image_ph_off[im] : strlen(c);
+                const size_t ph = im < m->images_len ? content_ix(m->image_ph_off[im]) : strlen(c);
                 char *run = server_xstrndup(c + at, ph - at);
                 if (result) append_tool_result_text(&content, run);
                 else buf_puts(&content, run);
                 free(run);
                 if (im == m->images_len) break;
-                chat_msg_add_image(&f, m->images[im].bytes, m->images[im].len, content.len);
+                chat_msg_add_image(&f, m->images[im].bytes, m->images[im].len, content_end(content.len));
                 m->images[im].bytes = NULL;
                 buf_puts(&content, PULSAR_IMAGE_PLACEHOLDER);
                 at = ph + strlen(PULSAR_IMAGE_PLACEHOLDER);

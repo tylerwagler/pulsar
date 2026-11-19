@@ -37,11 +37,37 @@ public:
     bool python_scalars = false;
 
     void open() override;
-    void grow(const std::string &b, size_t held, bool closing, int index, std::vector<out_event> *ev) override;
+    /// L437 plumbing: the kit's typed hook; the reference's own reading (grow_ref) takes the bare count it was written on.
+    void grow(const std::string &b, GenBytes held, bool closing, int index, std::vector<out_event> *ev) override {
+        grow_ref(b, held.raw(), closing, index, ev);
+    }
+    /// out_call_body::grow as it read at the reference's commit.
+    /// @param b       the call's body so far
+    /// @param held    bytes the kit holds back as a possible closing marker
+    /// @param closing the closing marker was found
+    /// @param index   the call's index
+    /// @param ev      receives the events
+    void grow_ref(const std::string &b, size_t held, bool closing, int index, std::vector<out_event> *ev);
     bool in_payload() const override { return pay_.value && pay_.payload; }
     bool holds_closer(const std::string &b) override;   /* the kit's L429 signature; the reading is const */
+    /// L437 plumbing: the kit's typed hook; the reference's own reading (close_ref) reports a bare offset.
     bool close(const std::string &b, int index, std::vector<out_event> *ev, out_call *call, const char **why,
-               size_t *at) override;
+               BodyOff *at) override {
+        size_t bare = 0;
+        const bool ok = close_ref(b, index, ev, call, why, &bare);
+        *at = BodyOff{bare};
+        return ok;
+    }
+    /// out_call_body::close as it read at the reference's commit.
+    /// @param b     the call's complete body
+    /// @param index the call's index
+    /// @param ev    receives TOOL_BEGIN if grow never sent it
+    /// @param call  receives the call on success
+    /// @param why   on failure, what is missing or wrong
+    /// @param at    on failure, the byte of the body where reading stopped
+    /// @return true when the body is a well-formed call
+    bool close_ref(const std::string &b, int index, std::vector<out_event> *ev, out_call *call, const char **why,
+                   size_t *at);
 
 private:
     /// Advance pay_ over the body's new bytes and set pay_.payload for the next byte.
@@ -254,7 +280,7 @@ inline bool xml_call_body_ref::holds_closer(const std::string &b) {
     return !(e >= strlen(kFnEnd) && !b.compare(e - strlen(kFnEnd), strlen(kFnEnd), kFnEnd));
 }
 
-inline void xml_call_body_ref::grow(const std::string &b, size_t held, bool closing, int index,
+inline void xml_call_body_ref::grow_ref(const std::string &b, size_t held, bool closing, int index,
                          std::vector<out_event> *ev) {
     if (!began_) {
         /* announce the call as soon as its name is complete */
@@ -283,7 +309,7 @@ inline void xml_call_body_ref::grow(const std::string &b, size_t held, bool clos
 }
 
 /* The body of one <tool_call> ... </tool_call>. */
-inline bool xml_call_body_ref::close(const std::string &b, int index, std::vector<out_event> *ev, out_call *call,
+inline bool xml_call_body_ref::close_ref(const std::string &b, int index, std::vector<out_event> *ev, out_call *call,
                           const char **why, size_t *at) {
     size_t i = 0;
     auto skip_ws = [&]() {

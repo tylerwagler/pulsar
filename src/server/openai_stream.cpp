@@ -511,18 +511,31 @@ void append_openai_logprobs_json(buf *b, const logprob_ledger *lg, int from, int
 
 
 /* Streaming form: attach the entries whose token bytes this chunk RELEASES
- * (piece ending at or before the watermark; SIZE_MAX on the final chunk) and
+ * (piece ending at or before the watermark; every entry left on the final chunk) and
  * mark them streamed, so the entries concatenated over a stream reproduce the
  * non-streaming array exactly once. */
+/// Append logprob entries [lp->streamed, to) and mark them streamed.
+/// @param b   the chunk being built
+/// @param lp  the ledger (enabled); lp->streamed advances
+/// @param to  the entry index to send up to (exclusive)
+static void append_openai_logprobs_to(buf *b, logprob_ledger *lp, int to) {
+    append_openai_logprobs_json(b, lp, lp->streamed, to);
+    lp->streamed = to;
+}
 /// Append the logprob entries a chunk releases and mark them streamed.
 /// @param b             the chunk being built
 /// @param lp            the ledger (NULL or disabled: nothing); lp->streamed advances
-/// @param release_upto  the byte offset in the completion the chunk releases (SIZE_MAX: everything left)
-static void append_openai_logprobs_delta(buf *b, logprob_ledger *lp, size_t release_upto) {
+/// @param release_upto  the offset in the completion the chunk releases
+static void append_openai_logprobs_delta(buf *b, logprob_ledger *lp, GenOff release_upto) {
     if (!lp || !lp->enabled) return;
-    const int to = logprob_stream_ready(lp, release_upto);
-    append_openai_logprobs_json(b, lp, lp->streamed, to);
-    lp->streamed = to;
+    append_openai_logprobs_to(b, lp, logprob_stream_ready(lp, release_upto));
+}
+/// Append every logprob entry not yet streamed (the final chunk) and mark them streamed.
+/// @param b   the chunk being built
+/// @param lp  the ledger (NULL or disabled: nothing); lp->streamed advances
+static void append_openai_logprobs_rest(buf *b, logprob_ledger *lp) {
+    if (!lp || !lp->enabled) return;
+    append_openai_logprobs_to(b, lp, logprob_stream_all(lp));
 }
 
 
@@ -651,7 +664,7 @@ void openai_stream_start(const request *r, openai_stream *st) {
 /// @return false when the write failed
 static bool sse_chat_delta_n(int fd, const request *r, const char *id,
                              const char *field, const char *text, size_t len,
-                             logprob_ledger *lp, size_t release_upto) {
+                             logprob_ledger *lp, GenOff release_upto) {
     if (len == 0) return true;
     buf b = {0};
     long now = (long)time(NULL);
@@ -740,7 +753,7 @@ static bool sse_chat_tool_call_args_delta_n(int fd, const request *r, const char
 /// @param len           bytes at `text`
 /// @param release_upto  the completion byte offset the delta releases
 /// @return false when the write failed
-static bool openai_sink_text_cb(chat_sink *k, bool reasoning, const char *text, size_t len, size_t release_upto) {
+static bool openai_sink_text_cb(chat_sink *k, bool reasoning, const char *text, size_t len, GenOff release_upto) {
     openai_stream *st = (openai_stream *)k->st;
     if (!st->active) return true;
     if (!sse_chat_delta_n(k->fd, k->r, k->id, reasoning ? "reasoning_content" : "content", text, len, st->lp,
@@ -821,7 +834,7 @@ static bool openai_sse_send_final(int fd, const request *r, const char *id, long
      * bytes, suppressed protocol markers, a held tail) are still this
      * completion's tokens: flush the remainder here so the streamed logprobs
      * concatenate to the non-streaming array. */
-    append_openai_logprobs_delta(b, lp, SIZE_MAX);
+    append_openai_logprobs_rest(b, lp);
     buf_puts(b, ",\"finish_reason\":");
     json_escape(b, finish);
     buf_puts(b, "}]}\n\n");

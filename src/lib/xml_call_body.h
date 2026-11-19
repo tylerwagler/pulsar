@@ -46,17 +46,17 @@ public:
     bool python_scalars = false;
 
     void open() override;
-    void grow(const std::string &b, size_t held, bool closing, int index, std::vector<out_event> *ev) override;
+    void grow(const std::string &b, GenBytes held, bool closing, int index, std::vector<out_event> *ev) override;
     bool in_payload() const override { return pay_.value && pay_.payload; }
     bool holds_closer(const std::string &b) override;
     bool close(const std::string &b, int index, std::vector<out_event> *ev, out_call *call, const char **why,
-               size_t *at) override;
+               BodyOff *at) override;
 
 private:
     /// Advance pay_ over the body's new bytes and set pay_.payload for the next byte.
     /// @param b    the call's body so far
     /// @param held bytes the kit holds back as a possible "</tool_call>"
-    void scan_payload(const std::string &b, size_t held);
+    void scan_payload(const std::string &b, GenBytes held);
     struct value_scan;
     /// Advance a value scan over the body's new bytes: where parameter values open ("<parameter=KEY>") and
     /// close (the first "</parameter>" after it), and inside one, whether a JSON string literal is open.  The
@@ -67,8 +67,8 @@ private:
     /// Where the stream's reading of the one parameter it waits on stands (L429): what read_param found so far, so
     /// its next reading of the same parameter in a longer body starts there.
     struct param_resume {
-        size_t key_end = 0;    ///< the offset of the key's '>', once found (0: not yet; a key never ends at 0)
-        size_t seen = 0;       ///< no key end (before key_end is known) or value closer (after) starts before it
+        BodyOff key_end = BodyOff{0};   ///< the offset of the key's '>', once found (0: not yet; a key never ends at 0)
+        BodyOff seen = BodyOff{0};      ///< no key end (before key_end is known) or value closer (after) starts before it
     };
     /// Read one "<parameter=KEY>\nVALUE\n</parameter>" of function `fn` at b[*i] (the reading close() and the
     /// stream share).
@@ -81,7 +81,7 @@ private:
     /// @param r   NULL (close(): a whole reading), or the stream's resume state for THIS parameter: read on 0,
     ///            updated on 0 -- the same answers as a whole reading, without rescanning what a 0 already covered
     /// @return 1 = read, 0 = not complete yet, -1 = not a parameter
-    int read_param(const std::string &b, size_t *i, const std::string &fn, std::string *key, pyjson_value *v,
+    int read_param(const std::string &b, BodyOff *i, const std::string &fn, std::string *key, pyjson_value *v,
                    const char **why, param_resume *r) const;
     /// Emit a TOOL_ARGS fragment for each parameter that closed since the last call.
     /// @param b     the call's body so far
@@ -90,19 +90,19 @@ private:
     void stream_params(const std::string &b, int index, std::vector<out_event> *ev);
 
     bool began_ = false;       ///< TOOL_BEGIN sent for the open call
-    size_t head_ws_ = 0;       ///< leading whitespace of the body skipped so far (before began_)
-    size_t head_seen_ = 0;     ///< no '>' or newline of "<function=NAME>" before this offset (before began_)
+    BodyOff head_ws_ = BodyOff{0};     ///< leading whitespace of the body skipped so far (before began_)
+    BodyOff head_seen_ = BodyOff{0};   ///< no '>' or newline of "<function=NAME>" before this offset (before began_)
     std::string fn_;           ///< the open call's function name, once complete
-    size_t arg_pos_ = 0;       ///< body offset past the last parameter streamed (TOOL_ARGS) and the whitespace after it
+    BodyOff arg_pos_ = BodyOff{0};   ///< body offset past the last parameter streamed (TOOL_ARGS) and the whitespace after it
     param_resume arg_resume_;  ///< the reading of the parameter at arg_pos_ so far
     int arg_n_ = 0;            ///< parameters streamed for the open call
     bool arg_stop_ = false;    ///< the open call stopped streaming: its next bytes are not a parameter
     /// An incremental scan of the open call's parameter values (scan_values).
     struct value_scan {
-        size_t pos = 0;        ///< bytes of the body classified
-        size_t key_seen = 0;   ///< an open "<parameter=" tag at pos has no '>' before this offset
+        BodyOff pos = BodyOff{0};        ///< bytes of the body classified
+        BodyOff key_seen = BodyOff{0};   ///< an open "<parameter=" tag at pos has no '>' before this offset
         bool value = false;    ///< inside a parameter value
-        size_t vstart = 0;     ///< where its text starts (past the tag)
+        BodyOff vstart = BodyOff{0};     ///< where its text starts (past the tag)
         bool is_string = false;///< the schema declares it a string
         bool json_str = false; ///< inside a JSON string literal of a non-string value
         bool esc = false;      ///< the previous byte was a backslash in that literal

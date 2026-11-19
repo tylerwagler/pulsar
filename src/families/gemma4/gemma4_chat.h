@@ -155,15 +155,15 @@ public:
      *  stays the raw text); shared with the parser's copies (L430). */
     out_tools tools;
     void open() override;
-    void grow(const std::string &b, size_t held, bool closing, int index, std::vector<out_event> *ev) override;
+    void grow(const std::string &b, GenBytes held, bool closing, int index, std::vector<out_event> *ev) override;
     bool in_payload() const override { return in_str_; }
     bool close(const std::string &b, int index, std::vector<out_event> *ev, out_call *call, const char **why,
-               size_t *at) override;
+               BodyOff *at) override;
 
 private:
     bool began_ = false;       ///< TOOL_BEGIN sent
-    size_t args_lo_ = 0;       ///< where the arguments start (past the "{" / "("); 0 = not yet
-    size_t scan_ = 0;          ///< bytes of the arguments scanned for quotes
+    BodyOff args_lo_ = BodyOff{0};   ///< where the arguments start (past the "{" / "("); 0 = not yet
+    BodyOff scan_ = BodyOff{0};      ///< bytes of the arguments scanned for quotes
     bool in_str_ = false;      ///< inside a <|"|> string: the next byte is payload
 };
 

@@ -1517,7 +1517,7 @@ item_fail:
                 char *raw = json_object_member_raw(line, "name");
                 const char *rp = raw;
                 char *tool_name = NULL;
-                if (rp && json_string(&rp, &tool_name)) chat_msg_add_tool_ref(&msg, strlen(body), tool_name);
+                if (rp && json_string(&rp, &tool_name)) chat_msg_add_tool_ref(&msg, content_end(strlen(body)), tool_name);
                 free(tool_name);
                 free(raw);
                 free(line);

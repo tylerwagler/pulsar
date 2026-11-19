@@ -49,6 +49,19 @@ static server_mem_reading test_mem_discrete(uint64_t dev_free, uint64_t dev_floo
 
 /* L335: request_init sets no family and no model (the loaded engine's, in the server).  A hand-built test request
  * says which it is: the DeepSeek V4.1 family and its served id, unless the test sets another. */
+/// L437 plumbing: a parser's raw span as the raw stream offsets the tests below compare (out_parser::raw_span).
+/// @param p   the parser
+/// @param lo  receives the span's start in the parser's stream (untouched on false)
+/// @param hi  receives its end (untouched on false)
+/// @return whether a call was read
+static bool test_raw_span(const out_parser &p, size_t *lo, size_t *hi) {
+    StreamOff l{0}, h{0};
+    if (!p.raw_span(&l, &h)) return false;
+    *lo = l.raw();
+    *hi = h.raw();
+    return true;
+}
+
 static void test_request_init(request *r, req_kind kind, int max_tokens) {
     request_init(r, kind, max_tokens);
     r->family = server_family_for_format(PULSAR_CHAT_DS4_V41);
@@ -368,7 +381,7 @@ static void test_responses_input_tool_search_output_loads_tools(void) {
     TEST_ASSERT(!strcmp(msgs.v[0].calls.v[0].name, "tool_search"));
     /* L326: the item's message references the loaded tool (rendered there, chat_expand_tool_refs), not its JSON */
     TEST_ASSERT(msgs.v[1].content && !msgs.v[1].content[0]);
-    TEST_ASSERT(msgs.v[1].tool_refs_len == 1 && msgs.v[1].tool_ref_off[0] == 0 &&
+    TEST_ASSERT(msgs.v[1].tool_refs_len == 1 && msgs.v[1].tool_ref_off[0] == ContentOff{0} &&
                 !strcmp(msgs.v[1].tool_ref_name[0], "mcp__perplexity__perplexity_search"));
 
     buf_free(&loaded);
@@ -689,10 +702,10 @@ static void test_context_length_error_uses_protocol_standard_shape(void) {
  * double-emits or drops a token's logprobs across a chunk boundary. */
 static void test_logprob_stream_ready_watermark(void) {
     logprob_entry v[4] = {0};
-    v[0].end_off = 3;
-    v[1].end_off = 7;
-    v[2].end_off = 7;   /* two entries share a watermark (a multi-token piece) */
-    v[3].end_off = 12;
+    v[0].end_off = GenOff{3};
+    v[1].end_off = GenOff{7};
+    v[2].end_off = GenOff{7};   /* two entries share a watermark (a multi-token piece) */
+    v[3].end_off = GenOff{12};
     logprob_ledger lg = {0};
     lg.enabled = true;
     lg.v = v;
@@ -701,28 +714,28 @@ static void test_logprob_stream_ready_watermark(void) {
 
     /* disabled ledger releases nothing */
     lg.enabled = false;
-    TEST_ASSERT(logprob_stream_ready(&lg, SIZE_MAX) == 0);
+    TEST_ASSERT(logprob_stream_all(&lg) == 0);
     lg.enabled = true;
 
     /* watermark below the first entry: nothing ready */
-    TEST_ASSERT(logprob_stream_ready(&lg, 2) == 0);
+    TEST_ASSERT(logprob_stream_ready(&lg, GenOff{2}) == 0);
     /* exactly at an end_off releases that entry (<=, not <) */
-    TEST_ASSERT(logprob_stream_ready(&lg, 3) == 1);
+    TEST_ASSERT(logprob_stream_ready(&lg, GenOff{3}) == 1);
     /* between entries: only those fully covered */
-    TEST_ASSERT(logprob_stream_ready(&lg, 6) == 1);
+    TEST_ASSERT(logprob_stream_ready(&lg, GenOff{6}) == 1);
     /* both entries sharing end_off=7 release together, never split */
-    TEST_ASSERT(logprob_stream_ready(&lg, 7) == 3);
-    TEST_ASSERT(logprob_stream_ready(&lg, 11) == 3);
-    /* the terminal SIZE_MAX chunk releases the remainder */
-    TEST_ASSERT(logprob_stream_ready(&lg, SIZE_MAX) == 4);
+    TEST_ASSERT(logprob_stream_ready(&lg, GenOff{7}) == 3);
+    TEST_ASSERT(logprob_stream_ready(&lg, GenOff{11}) == 3);
+    /* the terminal chunk releases the remainder (L437: logprob_stream_all, once SIZE_MAX for the watermark) */
+    TEST_ASSERT(logprob_stream_all(&lg) == 4);
 
     /* advancing streamed makes it resume, not re-release: entries [0,streamed)
      * are already on the wire and must not appear again. */
     lg.streamed = 3;
-    TEST_ASSERT(logprob_stream_ready(&lg, 7) == 3);      /* nothing new at 7 */
-    TEST_ASSERT(logprob_stream_ready(&lg, SIZE_MAX) == 4);
+    TEST_ASSERT(logprob_stream_ready(&lg, GenOff{7}) == 3);      /* nothing new at 7 */
+    TEST_ASSERT(logprob_stream_all(&lg) == 4);
     lg.streamed = 4;
-    TEST_ASSERT(logprob_stream_ready(&lg, SIZE_MAX) == 4); /* all streamed, none left */
+    TEST_ASSERT(logprob_stream_all(&lg) == 4); /* all streamed, none left */
 }
 
 
@@ -2152,8 +2165,9 @@ static void greedy_rows_run(const greedy_rows_case &c, bool with_stop) {
     auto emit = [&](gen_state *g, int k) {
         buf_append(&g->text, pieces[(size_t)k].data(), pieces[(size_t)k].size());
         bool hit = false;
-        size_t sp = 0, sl = 0;
-        const size_t upto = gen_release(&j.req.stops, g->text.ptr, g->text.len, pieces[(size_t)k].data(),
+        GenOff sp{0};
+        size_t sl = 0;
+        const GenOff upto = gen_release(&j.req.stops, g->text.ptr, g->text.len, pieces[(size_t)k].data(),
                                         pieces[(size_t)k].size(), g->plain_stream_pos, &g->thinking,
                                         &g->stop_scan_from, &hit, &sp, &sl);
         TEST_ASSERT(!hit);
@@ -3248,7 +3262,7 @@ static void test_broken_call_one_rule_every_family(void) {
         for (const char *p = c.raw; *p; p++) {   /* a token at a time */
             buf_append(&g.text, p, 1);
             g.thinking.feed(p, 1);
-            r->family->output->feed(ps, &srv, &g, g.text.len, false);
+            r->family->output->feed(ps, &srv, &g, gen_text_end(g.text.len), false);
         }
         g.finish = c.gen_finish;
         server_turn turn;
@@ -3843,8 +3857,8 @@ static chat_msg qwen_test_image_msg(const char *role, const char *before, const 
     std::string c = std::string(before) + PULSAR_IMAGE_PLACEHOLDER + after;
     chat_msg m = qwen_test_msg(role, c.c_str());
     m.images = (chat_image *)calloc(1, sizeof(chat_image));
-    m.image_ph_off = (size_t *)malloc(sizeof(size_t));
-    m.image_ph_off[0] = strlen(before);
+    m.image_ph_off = (ContentOff *)malloc(sizeof(ContentOff));
+    m.image_ph_off[0] = content_end(strlen(before));
     m.images_len = m.images_cap = 1;
     return m;
 }
@@ -3908,8 +3922,8 @@ static void test_image_offsets_out_of_order_refuse(void) {
         for (int o = 0; o < 3; o++) {
             chat_conversation c = {};
             chat_msg m = qwen_test_msg("user", text.c_str());
-            chat_msg_add_image(&m, NULL, 0, orders[o][0]);
-            chat_msg_add_image(&m, NULL, 0, orders[o][1]);
+            chat_msg_add_image(&m, NULL, 0, ContentOff{orders[o][0]});
+            chat_msg_add_image(&m, NULL, 0, ContentOff{orders[o][1]});
             chat_msgs_push(&c.msgs, m);
             c.tool_choice = CHAT_TOOL_CHOICE_AUTO;
             request r;
@@ -3949,7 +3963,7 @@ static void test_qwen_raw_calls_replay_verbatim(void) {
     TEST_ASSERT(p.calls()[0].arguments == "{\"cmd\": \"pwd\"}");   /* the normal form: last value wins */
     TEST_ASSERT(p.calls()[1].arguments == "{\"n\": \"007\"}");     /* not tojson's spelling: a string */
     size_t lo = 0, hi = 0;
-    TEST_ASSERT(p.raw_span(&lo, &hi));
+    TEST_ASSERT(test_raw_span(p, &lo, &hi));
     const char *first = strstr(sampled, "<tool_call>");
     TEST_ASSERT(lo == (size_t)(first - sampled) && hi == strlen(sampled));   /* the broken block included */
 
@@ -5049,7 +5063,7 @@ static l428_run l428_turn(server *srv, const l303_vocab &v, pulsar_chat_format f
     if (r->force_tool_call && r->family->forced_call_seed) {
         r->family->forced_call_seed(r, &g->text);
         if (g->parser->seed) g->parser->seed(g->parser_st, g);
-        g->plain_stream_pos = g->text.len;
+        g->plain_stream_pos = gen_text_end(g->text.len);
     }
     TEST_ASSERT(gen_constrain_begin(srv, g));
     res.gated = g->gate != NULL;
@@ -5087,7 +5101,7 @@ static l428_run l428_turn(server *srv, const l303_vocab &v, pulsar_chat_format f
     }
     r->timings.valid = true;
     if (stream) {
-        TEST_ASSERT(g->parser->feed(g->parser_st, srv, g, g->text.len, true));
+        TEST_ASSERT(g->parser->feed(g->parser_st, srv, g, gen_text_end(g->text.len), true));
         if (api == API_ANTHROPIC)
             TEST_ASSERT(anthropic_sse_finish(&g->sink, &turn.calls, turn.finish, g->stop_sequence, g->completion));
         else if (api == API_RESPONSES)
@@ -5373,7 +5387,7 @@ static void test_l428_turn_ends_at_its_first_call(void) {
         const size_t lens2[3] = {pieces[11].size(), pieces[12].size(), pieces[13].size()};
         TEST_ASSERT(gen_turn_draft_prefix_text(g, chain2, lens2, 2) == 0);
         /* the walk left the attempt where it was: the call is still open, and its close still ends the turn */
-        size_t end = 0;
+        GenOff end{0};
         TEST_ASSERT(!g->parser->turn_complete(g->parser_st, g, &end));
         TEST_ASSERT(srv.gen_emit_piece(g, 0, pieces[11].data(), pieces[11].size()));
         TEST_ASSERT(!strcmp(g->finish, "tool_calls") && g->completion == 12);
@@ -5689,7 +5703,7 @@ static bool l430_start(l430_side *s, server *srv, const l430_cfg &c, const std::
     if (r->force_tool_call && r->family->forced_call_seed) {
         r->family->forced_call_seed(r, &g->text);
         if (g->parser->seed) g->parser->seed(g->parser_st, g);
-        g->plain_stream_pos = g->text.len;
+        g->plain_stream_pos = gen_text_end(g->text.len);
     }
     return true;
 }
@@ -5727,19 +5741,21 @@ static l430_state l430_read(l430_side *s) {
     st.finish = g->finish;
     st.think_tail.assign(g->thinking.tail, (size_t)g->thinking.tail_len);
     st.stop_sequence = g->stop_sequence ? g->stop_sequence : "";
-    st.plain_stream_pos = g->plain_stream_pos;
+    st.plain_stream_pos = g->plain_stream_pos.raw();   /* L437: the state compares the raw values, as before */
     st.completion = g->completion;
     st.stopped = s->stopped;
     st.cut_short = g->turn_cut_short;
     st.thinking = g->thinking.inside;
     st.in_tool_call = g->parser->in_tool_call(g->parser_st, g);
-    st.turn_complete = g->parser->turn_complete(g->parser_st, g, &st.end);
+    GenOff end{0};
+    st.turn_complete = g->parser->turn_complete(g->parser_st, g, &end);
+    st.end = end.raw();
     st.wire = s->wire.size();
     if (g->parser->probe_new == parser_kit_probe_new) {
         const kit_gen *q = (const kit_gen *)g->parser_st;
-        st.fed = q->fed;
+        st.fed = q->fed.raw();
         st.cut = q->cut;
-        st.cut_at = q->cut_at;
+        st.cut_at = q->cut_at.raw();
         st.calls = q->calls.len;
         st.errors = q->parser->errors();
         st.in_call = q->parser->in_tool_call();
@@ -5784,7 +5800,7 @@ static void l430_finish(l430_side *s, server *srv, std::string *out) {
                 (turn.calls.v[i].arguments ? turn.calls.v[i].arguments : "(null)");
     r->timings.valid = true;
     if (g->structured_stream) {
-        TEST_ASSERT(g->parser->feed(g->parser_st, srv, g, g->text.len, true));
+        TEST_ASSERT(g->parser->feed(g->parser_st, srv, g, gen_text_end(g->text.len), true));
         TEST_ASSERT(openai_sse_finish(&g->sink, &turn.calls, turn.finish, 10, g->completion));
     } else if (!r->stream) {
         TEST_ASSERT(final_response(s->sv[0], r, g->id, turn.content, turn.reasoning, &turn.calls, turn.finish, 10,
@@ -5851,7 +5867,7 @@ static bool l430_one_turn(server *srv, l430_rng *r, const l430_cfg &c, l430_coun
         return false;
     };
     bool ok = true;
-    size_t a_from = a.g->stop_scan_from;   /* where side A's next stop scan starts */
+    size_t a_from = a.g->stop_scan_from.raw();   /* where side A's next stop scan starts */
     if (!(l430_read(&a) == l430_read(&b))) ok = differ("the two sides start apart", 0);
     for (int pos = 0; ok && pos < nt && !a.stopped;) {
         /* the round: its tokens not yet streamed -- the base unless it went out before the forward, then drafts */
@@ -5943,17 +5959,17 @@ static bool l430_one_turn(server *srv, l430_rng *r, const l430_cfg &c, l430_coun
             std::string grown(b.g->text.ptr ? b.g->text.ptr : "", b.g->text.len);
             grown += t;
             thinking_state think = b.g->thinking;
-            size_t from = b.g->stop_scan_from, sp = 0, sl = 0;
+            size_t from = b.g->stop_scan_from.raw(), sp = 0, sl = 0;
             bool hit = false;
             if (b.j.req.stops.len) {
                 n->scanned_old += (long)(grown.size() - std::min(from, grown.size()));
                 n->scanned_new += (long)(grown.size() - std::min(a_from, grown.size()));
             }
-            gen_release_ref(&b.j.req.stops, grown.c_str(), grown.size(), t.data(), t.size(), b.g->plain_stream_pos,
-                            &think, &from, &hit, &sp, &sl);
+            gen_release_ref(&b.j.req.stops, grown.c_str(), grown.size(), t.data(), t.size(),
+                            b.g->plain_stream_pos.raw(), &think, &from, &hit, &sp, &sl);
             b.stopped = srv->gen_emit_piece(b.g, 0, t.data(), t.size());
-            b.g->stop_scan_from = from;
-            a_from = a.g->stop_scan_from;
+            b.g->stop_scan_from = GenOff{from};
+            a_from = a.g->stop_scan_from.raw();
             n->tokens++;
             const bool b_hit = b.stopped && !strcmp(b.g->finish, "stop");
             if (hit != b_hit || (hit && (b.g->text.len != sp || grown.substr(sp, sl) != b.g->stop_sequence)))
@@ -6123,8 +6139,8 @@ static bool l431_one_stream(l430_rng *r, l431_counts *n, std::string *why) {
         }
         const size_t up_old = gen_release_ref(&stops, sofar.c_str(), sofar.size(), toks[k].data(), toks[k].size(), sent_old,
                                               &t_old, &from_old, &hit_old, &pos_old, &len_old);
-        const size_t up_new = gen_release(&stops, sofar.c_str(), sofar.size(), toks[k].data(), toks[k].size(), sent_new,
-                                          &t_new, &from_new, &hit_new, &pos_new, &len_new);
+        const size_t up_new = gen_release_bare(&stops, sofar.c_str(), sofar.size(), toks[k].data(), toks[k].size(),
+                                               sent_new, &t_new, &from_new, &hit_new, &pos_new, &len_new);
         n->tokens++;
         was_inside = was_inside || t_new.inside;
         n->closes += inside_before && !t_new.inside;
@@ -6180,8 +6196,8 @@ static void test_l431_stop_scan_matches_reference(void) {
             const size_t up_old = gen_release_ref(&stops, sofar.c_str(), sofar.size(), "word ", 5, 0, &t_old, &from_old,
                                                   &hit, &pos, &len);
             TEST_ASSERT(!hit && up_old == sofar.size());
-            const size_t up_new = gen_release(&stops, sofar.c_str(), sofar.size(), "word ", 5, 0, &t_new, &from_new, &hit,
-                                              &pos, &len);
+            const size_t up_new = gen_release_bare(&stops, sofar.c_str(), sofar.size(), "word ", 5, 0, &t_new, &from_new,
+                                                   &hit, &pos, &len);
             TEST_ASSERT(!hit && up_new == sofar.size());
         }
         TEST_ASSERT(from_old == 0);                 /* the old resume point never moved: every scan read the turn */
@@ -6192,7 +6208,7 @@ static void test_l431_stop_scan_matches_reference(void) {
         size_t pos_new = 0, len_new = 0;
         bool hit_new = false;
         gen_release_ref(&stops, sofar.c_str(), sofar.size(), "end.", 4, 0, &t_old, &from_old, &hit, &pos, &len);
-        gen_release(&stops, sofar.c_str(), sofar.size(), "end.", 4, 0, &t_new, &from_new, &hit_new, &pos_new, &len_new);
+        gen_release_bare(&stops, sofar.c_str(), sofar.size(), "end.", 4, 0, &t_new, &from_new, &hit_new, &pos_new, &len_new);
         TEST_ASSERT(hit && hit_new && pos == sofar.size() - 1 && pos_new == pos && len == 1 && len_new == 1);
         stop_list_clear(&stops);
         free(stops.v);
@@ -6223,6 +6239,616 @@ static std::string l428_json(const std::string &s) {
     std::string out(b.ptr, b.len);
     buf_free(&b);
     return out;
+}
+
+/* L437: the types are the size_t they replaced -- every operation computes what the raw expression did. */
+static void test_l437_offset_units(void) {
+    const size_t vals[] = {0, 1, 2, 7, 4096, 1u << 20, (size_t)1 << 40, SIZE_MAX / 2};
+    for (size_t a : vals) {
+        TEST_ASSERT(GenOff{a}.raw() == a && StreamOff{a}.raw() == a && GenBytes{a}.raw() == a);
+        TEST_ASSERT(GenOff::after(GenBytes{a}).raw() == a && GenOff{a}.before().raw() == a);
+        for (size_t b : vals) {
+            const GenOff x{a}, y{b};
+            TEST_ASSERT((x < y) == (a < b) && (x <= y) == (a <= b) && (x > y) == (a > b) && (x >= y) == (a >= b));
+            TEST_ASSERT((x == y) == (a == b) && (x != y) == (a != b));
+            if (a + b != SIZE_MAX) {   /* a sum that would be none() is fatal by design */
+                TEST_ASSERT((x + GenBytes{b}).raw() == a + b);
+                GenOff z = x;
+                z += GenBytes{b};
+                TEST_ASSERT(z.raw() == a + b);
+                z -= GenBytes{b};
+                TEST_ASSERT(z == x);
+                StreamOff st{a};
+                st += GenBytes{b};
+                TEST_ASSERT(st.raw() == a + b && (st - StreamOff{a}).raw() == b);
+            }
+            if (a >= b) TEST_ASSERT((x - y).raw() == a - b && (x - GenBytes{b}).raw() == a - b);
+            TEST_ASSERT((GenBytes{a} + GenBytes{b}).raw() == a + b && (GenBytes{a} < GenBytes{b}) == (a < b));
+        }
+    }
+    TEST_ASSERT(GenOff{}.raw() == 0 && StreamOff{}.raw() == 0 && GenBytes{}.raw() == 0);   /* value-initialised: zero */
+    gen_state g;
+    memset((void *)&g, 0, sizeof g);   /* a zeroed attempt's cursors are offset 0, as the size_t fields were */
+    TEST_ASSERT(g.plain_stream_pos == GenOff{0} && g.stop_scan_from == GenOff{0});
+    const char text[] = "0123456789";
+    TEST_ASSERT(gen_text_end(10) == GenOff{10} && gen_text_at(text, GenOff{4}) == text + 4);
+}
+
+/* L437: a parser's stream offsets are those of the bytes IT was fed -- the first call's marker and the calls' span,
+ * found here by searching the fed bytes, under every chunking -- and the kit state's conversion places them in the
+ * turn's text for a parser started anywhere in it: text_at(at) == origin + at, the expression the code used to leave
+ * out (it passed `at` for the text offset, right only at origin 0). */
+static void test_l437_stream_offsets_and_conversion(void) {
+    const char *tools = "[{\"type\":\"function\",\"function\":{\"name\":\"search\",\"parameters\":{\"type\":\"object\","
+                        "\"properties\":{\"q\":{\"type\":\"string\"}}}}}]";
+    const std::string call = "<tool_call>\n<function=search>\n<parameter=q>\npulsars\n</parameter>\n</function>\n"
+                             "</tool_call>";
+    /* a quoted marker first (L419: text, it opens nothing), then two calls */
+    const std::string turn = "Use `<tool_call>` like this.\n\n" + call + "\n" + call;
+    const size_t first = turn.find(call), last_end = turn.rfind(call) + call.size();
+    for (size_t chunk : {(size_t)1, (size_t)3, (size_t)7, turn.size()}) {
+        qwen_output_parser p;
+        char err[200];
+        TEST_ASSERT(p.init(false, tools, err, sizeof err));
+        std::vector<out_event> ev;
+        TEST_ASSERT(p.first_call_at().is_none() && p.stream_end() == StreamOff{0});
+        for (size_t at = 0; at < turn.size(); at += chunk) {
+            const size_t n = std::min(chunk, turn.size() - at);
+            p.feed(turn.data() + at, n, &ev);
+            TEST_ASSERT(p.stream_end() == StreamOff{at + n});   /* the stream's end: the bytes fed */
+        }
+        p.finish(&ev);
+        StreamOff lo{0}, hi{0};
+        TEST_ASSERT(p.calls().size() == 2 && p.raw_span(&lo, &hi));
+        TEST_ASSERT(p.first_call_at() == StreamOff{first} && lo == StreamOff{first} && hi == StreamOff{last_end});
+        TEST_ASSERT((hi - lo).raw() == last_end - first);
+
+        /* the conversion, against the open-coded origin + at: the same parser as the reader of a text it was started
+         * `origin` bytes into (the kit state's `fed` is then origin + the bytes fed) */
+        kit_gen q;
+        q.parser = &p;
+        for (size_t origin : {(size_t)0, (size_t)1, (size_t)13, (size_t)4096}) {
+            q.fed = GenOff{origin + turn.size()};
+            for (size_t at : {(size_t)0, first, last_end, turn.size()})
+                TEST_ASSERT(q.text_at(StreamOff{at}) == GenOff{origin + at});
+            TEST_ASSERT(q.text_at(p.first_call_at()).raw() == origin + first);
+        }
+        q.parser = nullptr;   /* the parser is this scope's, not the kit state's to delete */
+    }
+}
+
+/* What one turn read by a kit parser started `origin` bytes into the turn's text left (l437_turn). */
+struct l437_run {
+    std::string text;        ///< gen_state::text after the turn
+    std::string raw_calls;   ///< the calls' sampled bytes the finish kept (the tool memory's key)
+    std::string content, reasoning, finish;   ///< the turn's reading
+    std::string tail;        ///< server_turn::tail: the text the stream had not sent
+    size_t tail_at = SIZE_MAX;   ///< where that tail starts in the text (SIZE_MAX: none)
+    int calls = 0;           ///< calls the finish kept
+    bool stopped = false;    ///< the emit path ended the turn itself
+    bool cut_short = false;  ///< gen_state::turn_cut_short
+};
+
+/* L437: one turn as l428_turn decodes it, read by a parser that was STARTED `origin` bytes into gen_state::text: the
+ * text holds `origin` bytes the parser is never fed (`lead`), and the kit state and the attempt's cursors start past
+ * them.  No such turn exists today -- gen_decode_init resets the text and creates the parser together -- which is
+ * the point: the offsets must be right because of the conversion, not because every origin is 0. */
+/// @param srv         the server
+/// @param fmt         the family (a kit family)
+/// @param body        the request
+/// @param lead        the bytes of the text before the parser's first byte
+/// @param toks        the turn's tokens
+/// @param retry_spent the attempt's one tool-error retry is used up (a broken call is then text)
+/// @return what the turn left
+static l437_run l437_turn(server *srv, pulsar_chat_format fmt, const std::string &body, const std::string &lead,
+                          const std::vector<std::string> &toks, bool retry_spent) {
+    l437_run res;
+    job j;
+    memset(&j, 0, sizeof j);
+    j.fd = -1;
+    request *r = &j.req;
+    char err[300];
+    TEST_ASSERT(l303_request(srv, fmt, API_OPENAI, body.c_str(), r, err, sizeof err));
+    gen_state *g = new gen_state();
+    g->j = &j;
+    snprintf(g->id, sizeof g->id, "id_l437");
+    g->finish = "length";
+    g->next_decode_log = 1 << 30;   /* no progress lines */
+    g->thinking = thinking_state_from_prompt(r);
+    g->recovery_attempted = retry_spent;
+    g->parser = r->family->output;
+    g->parser_st = g->parser->create(srv, g, err, sizeof err);
+    TEST_ASSERT(g->parser_st != NULL && g->parser->probe_new == parser_kit_probe_new && !g->gate);
+    /* the parser starts here: `lead` is in the text, and was never the parser's */
+    buf_append(&g->text, lead.data(), lead.size());
+    const GenOff origin = gen_text_end(g->text.len);
+    ((kit_gen *)g->parser_st)->fed = origin;
+    g->plain_stream_pos = g->stop_scan_from = origin;
+    for (const std::string &t : toks) {
+        res.stopped = srv->gen_emit_piece(g, 0, t.data(), t.size());
+        if (res.stopped) break;
+    }
+    if (!res.stopped) g->finish = "stop";
+    res.cut_short = g->turn_cut_short;
+    server_turn turn;
+    memset(&turn, 0, sizeof turn);
+    turn.finish = g->finish;
+    TEST_ASSERT(g->parser->finish(g->parser_st, srv, NULL, g, &turn) && !turn.retry);
+    res.text.assign(g->text.ptr ? g->text.ptr : "", g->text.len);
+    res.raw_calls = turn.calls.raw_calls ? turn.calls.raw_calls : "";
+    res.content = turn.content ? turn.content : "";
+    res.reasoning = turn.reasoning ? turn.reasoning : "";
+    res.finish = turn.finish;
+    res.calls = turn.calls.len;
+    if (turn.tail) {
+        res.tail.assign(turn.tail, turn.tail_len);
+        res.tail_at = (size_t)(turn.tail - g->text.ptr);
+    }
+    g->parser->destroy(g->parser_st);
+    free(turn.content);
+    free(turn.reasoning);
+    tool_calls_free(&turn.calls);
+    free(g->stop_sequence);
+    buf_free(&g->text);
+    delete g;
+    request_free(r);
+    return res;
+}
+
+/* L437 (L435 S2-9): a parser's stream offset is not an offset into the turn's text.  The finish used the parser's
+ * offsets -- where the first call opened (the unsent tail of a broken call), the calls' sampled span (the tool
+ * memory's key) -- as offsets of gen_state::text; equal only while the parser is fed the text from its first byte.
+ * Here the parser starts 13 bytes into the text, and each reading must be the origin-0 turn's, moved by 13 bytes:
+ * the kept calls' bytes are the call's own, the tail starts at the call's marker, and the single-call cut (L428)
+ * lands on the byte past the call's close and the family's call_tail.  With the stream offset passed for the text
+ * offset the key is 13 bytes early (text before the call) and the tail starts 13 bytes before the marker. */
+static void test_l437_parser_started_mid_text(void) {
+    l303_vocab v;
+    server srv;
+    l303_server(&srv, v);
+    const std::string lead = "0123456789abc";   /* 13 bytes that hold no marker */
+    const std::string msgs = "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],";
+    for (const l428_fam &f : k_l428_fams) {
+        if (server_family_for_format(f.fmt)->output->probe_new != parser_kit_probe_new) continue;   /* the kit's */
+        const std::string say = f.fmt == PULSAR_CHAT_INKLING ? "" : "Checking.";
+        const std::string first = std::string(f.before) + say + (say.empty() ? "" : f.gap) + f.open + f.call;
+        const std::string whole = first + f.tail() + f.between + f.now + f.tail() + f.close;
+        /* the turn's two calls, kept: the sampled span is the calls' own bytes */
+        {
+            const std::string body = msgs + L428_TOOLS + "}";
+            const l437_run at0 = l437_turn(&srv, f.fmt, body, "", l428_bytes(whole), false);
+            const l437_run at13 = l437_turn(&srv, f.fmt, body, lead, l428_bytes(whole), false);
+            TEST_ASSERT(at0.calls == 2 && at13.calls == 2 && !at0.raw_calls.empty());
+            if (at13.raw_calls != at0.raw_calls)
+                fprintf(stderr, "l437 fmt %d: the key at origin 13 is \"%s\"\n", (int)f.fmt, at13.raw_calls.c_str());
+            TEST_ASSERT(at13.raw_calls == at0.raw_calls && at13.text == lead + at0.text);
+            TEST_ASSERT(at0.text.find(at0.raw_calls) != std::string::npos);
+            TEST_ASSERT(at13.content == at0.content && at13.reasoning == at0.reasoning && at13.finish == at0.finish);
+        }
+        /* a turn that may make one call: the cut is past the first call's close and the family's call_tail */
+        {
+            const std::string body = msgs + L428_TOOLS + ",\"parallel_tool_calls\":false}";
+            const std::string kept = first + f.close + f.tail();
+            const l437_run at0 = l437_turn(&srv, f.fmt, body, "", l428_bytes(whole), false);
+            const l437_run at13 = l437_turn(&srv, f.fmt, body, lead, l428_bytes(whole), false);
+            TEST_ASSERT(at0.stopped && at13.stopped && at0.calls == 1 && at13.calls == 1);
+            TEST_ASSERT(at0.text == kept && at13.text == lead + kept);
+            TEST_ASSERT(at13.raw_calls == at0.raw_calls && !at0.raw_calls.empty() && at13.cut_short == at0.cut_short);
+        }
+        /* a broken call with its retry spent is text: the unsent tail starts at the marker that opened the call */
+        {
+            const std::string body = msgs + L428_TOOLS + "}";
+            const std::string broken = first.substr(0, first.size() - 3);   /* the turn ends inside the call */
+            const l437_run at0 = l437_turn(&srv, f.fmt, body, "", l428_bytes(broken), true);
+            const l437_run at13 = l437_turn(&srv, f.fmt, body, lead, l428_bytes(broken), true);
+            TEST_ASSERT(at0.calls == 0 && at13.calls == 0 && at0.tail_at != SIZE_MAX && at13.tail_at != SIZE_MAX);
+            if (at13.tail != at0.tail)
+                fprintf(stderr, "l437 fmt %d: the tail at origin 13 is \"%s\"\n", (int)f.fmt, at13.tail.c_str());
+            TEST_ASSERT(at13.tail_at == at0.tail_at + lead.size() && at13.tail == at0.tail && !at0.tail.empty());
+            TEST_ASSERT(at0.text.compare(at0.tail_at, std::string::npos, at0.tail) == 0);
+        }
+    }
+    l303_server_free(&srv);
+}
+
+/* One chunk of an OpenAI chat stream with logprobs, as l437_logprob_stream read it. */
+struct l437_chunk {
+    size_t text = 0;      ///< bytes of content / reasoning_content the chunk's delta carries
+    size_t lp_bytes = 0;  ///< bytes of the tokens whose logprob entries the chunk carries
+    int lp_n = 0;         ///< those entries
+    bool final = false;   ///< the chunk with the finish_reason
+};
+
+/* L437: one streamed OpenAI chat turn with logprobs on, through the real emit path (server::gen_emit_piece), the
+ * family's kit parser and the real sink writer (openai_stream.cpp), a token at a time; each token gets a captured
+ * distribution as a decode lane's draw gives it one.  The wire is read back a chunk at a time. */
+/// @param srv   the server
+/// @param fmt   the family
+/// @param toks  the turn's tokens
+/// @param stop  a client stop string that never matches (its hold-back moves the feeds' boundaries), or NULL
+/// @return the stream's chunks that carry text or logprobs, in order
+static std::vector<l437_chunk> l437_logprob_stream(server *srv, pulsar_chat_format fmt,
+                                                   const std::vector<std::string> &toks, const char *stop) {
+    std::vector<l437_chunk> out;
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    job j;
+    memset(&j, 0, sizeof j);
+    j.fd = sv[0];
+    request *r = &j.req;
+    char err[300];
+    TEST_ASSERT(l303_request(srv, fmt, API_OPENAI,
+                             "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"enable_thinking\":false}", r, err,
+                             sizeof err));
+    r->stream = true;
+    r->logprobs = true;
+    if (stop) stop_list_push(&r->stops, server_xstrdup(stop));
+    gen_state *g = new gen_state();
+    g->j = &j;
+    snprintf(g->id, sizeof g->id, "id_l437");
+    g->finish = "length";
+    g->next_decode_log = 1 << 30;
+    g->thinking = thinking_state_from_prompt(r);
+    g->structured_stream = request_uses_structured_stream(r);
+    TEST_ASSERT(g->structured_stream);
+    g->logprobs.enabled = true;
+    openai_stream_start(r, &g->openai_live);
+    openai_sink_init(&g->sink, sv[0], NULL, r, g->id, &g->openai_live);
+    g->openai_live.lp = &g->logprobs;
+    g->parser = r->family->output;
+    g->parser_st = g->parser->create(srv, g, err, sizeof err);
+    TEST_ASSERT(g->parser_st != NULL);
+    bool stopped = false;
+    for (const std::string &t : toks) {
+        g->logprobs.pending_valid = true;   /* the draw's capture: one a token */
+        g->logprobs.pending_logprob = -0.5f;
+        g->logprobs.pending_n_top = 0;
+        stopped = srv->gen_emit_piece(g, 0, t.data(), t.size());
+        TEST_ASSERT(!stopped);
+    }
+    g->finish = "stop";
+    server_turn turn;
+    memset(&turn, 0, sizeof turn);
+    turn.finish = g->finish;
+    TEST_ASSERT(g->parser->finish(g->parser_st, srv, NULL, g, &turn) && !turn.retry);
+    TEST_ASSERT(g->parser->feed(g->parser_st, srv, g, gen_text_end(g->text.len), true));
+    TEST_ASSERT(openai_sse_finish(&g->sink, &turn.calls, turn.finish, 10, g->completion));
+    TEST_ASSERT(g->logprobs.len == (int)toks.size() && g->logprobs.streamed == g->logprobs.len);
+    shutdown(sv[0], SHUT_WR);
+    char *wire = read_socket_text(sv[1]);
+    for (const char *line = wire ? strstr(wire, "data: {") : NULL; line; line = strstr(line + 1, "data: {")) {
+        const char *end = strchr(line, '\n');
+        pyjson_value v;
+        char jerr[100];
+        TEST_ASSERT(end && pyjson_parse(line + 6, (size_t)(end - line - 6), &v, jerr, sizeof jerr));
+        const pyjson_value *choices = v.get("choices");
+        if (!choices || choices->a.empty()) continue;
+        const pyjson_value &c = choices->a[0];
+        l437_chunk k;
+        if (const pyjson_value *d = c.get("delta"))
+            for (const char *f : {"content", "reasoning_content"})
+                if (const pyjson_value *t = d->get(f); t && t->kind == pyjson_value::STR) k.text += t->s.size();
+        const pyjson_value *lp = c.get("logprobs");
+        if (const pyjson_value *arr = lp ? lp->get("content") : NULL)
+            for (const pyjson_value &e : arr->a) {
+                const pyjson_value *bytes = e.get("bytes");
+                TEST_ASSERT(bytes != NULL);
+                k.lp_bytes += bytes ? bytes->a.size() : 0;
+                k.lp_n++;
+            }
+        const pyjson_value *fin = c.get("finish_reason");
+        k.final = fin && fin->kind == pyjson_value::STR;
+        if (k.text || k.lp_n || k.final) out.push_back(k);
+    }
+    free(wire);
+    close(sv[0]);
+    close(sv[1]);
+    g->parser->destroy(g->parser_st);
+    free(turn.content);
+    free(turn.reasoning);
+    tool_calls_free(&turn.calls);
+    logprob_ledger_free(&g->logprobs);
+    buf_free(&g->text);
+    delete g;
+    request_free(r);
+    return out;
+}
+
+/* L437: a streamed chunk carries a token's logprob entry only once it has carried that token's text.  The kit gave
+ * the sink the text FED to the parser for the release watermark; the parser holds back the bytes that may start a
+ * marker ("<"), whitespace its section policy has not proved interior, and with a stop string's hold-back a feed ends
+ * anywhere in a token -- so a chunk carried entries for bytes it had not sent: a token's last byte (" wor<" with the
+ * delta " wor"), or a whole token ("<" released with the delta "o").  The turns here are plain content with thinking
+ * off, so the text sent so far IS the offset the stream has reached in the generated text: at every chunk the bytes
+ * of the tokens whose entries were sent may not exceed the bytes of text sent.  The totals are the turn's: every
+ * token's entry exactly once, every byte of text. */
+static void test_l437_logprobs_ride_with_their_text(void) {
+    l303_vocab v;
+    server srv;
+    l303_server(&srv, v);
+    struct lcase {
+        std::vector<std::string> toks;
+        const char *stop;
+    };
+    const lcase cases[] = {
+        {{"Hello", " wor<", "ld", "."}, NULL},                 /* a token's last byte held as a marker's prefix */
+        {{"Hi ", "there", " ", "you"}, NULL},                  /* trailing whitespace held by the section policy */
+        {{"Hello", "<", "tool", " x", " done"}, "XYZ"},        /* a stop string's hold-back: a whole token held */
+        {{"a", "<tool_", "x<", "y", "z"}, NULL},               /* a held prefix that turns out to be text */
+        {{"plain", " text", " only"}, NULL},                   /* nothing held: every entry rides its own chunk */
+    };
+    for (pulsar_chat_format fmt : {PULSAR_CHAT_QWEN, PULSAR_CHAT_NEMOTRON_H}) {
+        for (const lcase &c : cases) {
+            size_t total = 0;
+            for (const std::string &t : c.toks) total += t.size();
+            const std::vector<l437_chunk> chunks = l437_logprob_stream(&srv, fmt, c.toks, c.stop);
+            size_t text = 0, lp_bytes = 0;
+            int lp_n = 0;
+            for (const l437_chunk &k : chunks) {
+                text += k.text;
+                lp_bytes += k.lp_bytes;
+                lp_n += k.lp_n;
+                if (!k.final && lp_bytes > text)
+                    fprintf(stderr, "l437 fmt %d \"%s...\": a chunk carries entries through byte %zu with %zu bytes "
+                            "of text sent\n", (int)fmt, c.toks[0].c_str(), lp_bytes, text);
+                TEST_ASSERT(k.final || lp_bytes <= text);
+            }
+            TEST_ASSERT(!chunks.empty() && chunks.back().final);
+            TEST_ASSERT(lp_n == (int)c.toks.size() && lp_bytes == total && text == total);
+        }
+    }
+    l303_server_free(&srv);
+}
+
+/* L437: a sink that writes down what DeepSeek's walk tells it. */
+struct l437_walk_log {
+    std::string events;        ///< every event, in order
+    const char *raw = NULL;    ///< the text the walk was given
+    size_t released = 0;       ///< bytes of it released when the event arrived
+    bool past = false;         ///< an event carried text, or a watermark, past the released bytes
+};
+static bool l437_log_text(chat_sink *k, bool reasoning, const char *text, size_t len, GenOff upto) {
+    l437_walk_log *lg = (l437_walk_log *)k->st;
+    lg->events += (reasoning ? "R[" : "C[") + std::string(text, len) + "]@" + std::to_string(upto.raw()) + " ";
+    if (upto.raw() > lg->released || (text >= lg->raw && (size_t)(text - lg->raw) + len > lg->released)) lg->past = true;
+    return true;
+}
+static bool l437_log_end(chat_sink *k, bool think_closed) {
+    ((l437_walk_log *)k->st)->events += think_closed ? "END(close) " : "END ";
+    return true;
+}
+static bool l437_log_tool_begin(chat_sink *k, int index, const char *, const char *name) {
+    ((l437_walk_log *)k->st)->events += "CALL" + std::to_string(index) + "(" + name + ") ";
+    return true;
+}
+static bool l437_log_tool_args(chat_sink *k, int index, const char *text, size_t len) {
+    ((l437_walk_log *)k->st)->events += "ARGS" + std::to_string(index) + "[" + std::string(text, len) + "] ";
+    return true;
+}
+static bool l437_log_tool_end(chat_sink *k, int index) {
+    ((l437_walk_log *)k->st)->events += "DONE" + std::to_string(index) + " ";
+    return true;
+}
+
+/* L437: DeepSeek's walk is given the generated text and how many of its bytes the stop-string scan has RELEASED
+ * (raw_len); the bytes past that are held because a client stop string may still claim them.  The walk looked for
+ * "</think>" and for a DSML block's opener with strstr, to the text's NUL -- so it acted on a marker inside the
+ * hold-back: it closed the reasoning section, or left the answer for a block, before those bytes were released (the
+ * block's projection then found its opener past raw_len, gave up, and the calls were not streamed live).  The walk's
+ * reading may depend only on text[0, raw_len): at every step of a walk fed the whole text with a lagging raw_len,
+ * the events must be those of a walk fed a copy CUT at raw_len, and none may carry text or a watermark past it. */
+static void test_l437_deepseek_walk_reads_released_bytes_only(void) {
+    l303_vocab v;
+    server srv;
+    l303_server(&srv, v);
+    const l428_fam *ds = NULL;
+    for (const l428_fam &f : k_l428_fams)
+        if (f.fmt == PULSAR_CHAT_DS4_V41) ds = &f;
+    TEST_ASSERT(ds != NULL);
+    const std::string turn = std::string(ds->before) + "Checking." + ds->open + ds->call + ds->between + ds->now +
+                             ds->close + "\n\nafter";
+    static const sink_tool_ops tool_ops = {l437_log_tool_begin, l437_log_tool_args, l437_log_tool_end};
+    int steps = 0, differed = 0;
+    for (int tools = 0; tools < 2; tools++) {
+        for (size_t hold : {(size_t)0, (size_t)3, (size_t)12, (size_t)40}) {
+            job j;
+            memset(&j, 0, sizeof j);
+            char err[300];
+            const std::string body = std::string("{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]") +
+                                     (tools ? "," L428_TOOLS : "") + "}";
+            TEST_ASSERT(l303_request(&srv, PULSAR_CHAT_DS4_V41, API_OPENAI, body.c_str(), &j.req, err, sizeof err));
+            TEST_ASSERT(pulsar_think_mode_enabled(j.req.think_mode));
+            deepseek_stream_walk whole, cut;
+            deepseek_stream_walk_init(&whole, &j.req);
+            deepseek_stream_walk_init(&cut, &j.req);
+            l437_walk_log lw, lc;
+            chat_sink kw = {-1, NULL, &j.req, "id", &lw, l437_log_text, l437_log_end, &tool_ops, false};
+            chat_sink kc = kw;
+            kc.st = &lc;
+            for (size_t len = 1; len <= turn.size(); len++) {   /* a byte a token: `len` generated, `hold` held */
+                const size_t released = len > hold ? len - hold : 0;
+                const std::string seen = turn.substr(0, len), prefix = turn.substr(0, released);
+                lw.raw = seen.c_str();
+                lc.raw = prefix.c_str();
+                lw.released = lc.released = released;
+                TEST_ASSERT(deepseek_stream_update(&whole, &kw, seen.c_str(), released, false));
+                TEST_ASSERT(deepseek_stream_update(&cut, &kc, prefix.c_str(), released, false));
+                steps++;
+                if (lw.events != lc.events || whole.mode != cut.mode || whole.emit_pos != cut.emit_pos) differed++;
+                TEST_ASSERT(whole.emit_pos <= gen_text_end(released));
+            }
+            if (lw.events != lc.events)
+                fprintf(stderr, "l437 walk (tools %d, hold %zu):\n  whole text: %s\n  cut text:   %s\n", tools, hold,
+                        lw.events.c_str(), lc.events.c_str());
+            TEST_ASSERT(lw.events == lc.events && whole.mode == cut.mode && !lw.past && !lc.past);
+            if (hold == 0) TEST_ASSERT(lw.events.find(tools ? "CALL0(search)" : "C[") != std::string::npos);
+            deepseek_stream_walk_free(&whole);
+            deepseek_stream_walk_free(&cut);
+            request_free(&j.req);
+        }
+    }
+    TEST_ASSERT(steps > 0 && differed == 0);
+    l303_server_free(&srv);
+}
+
+/* ==== L437: the shared JSON call body against its reading before its offsets were typed ======================= */
+
+#include <functional>
+
+#include "json_call_body_ref.h"
+
+/// Inkling's grammar around a JSON call body of type `Body` (the live one, or the reference).
+template <class Body> class l437_json_parser : public out_parser {
+public:
+    /// Start a turn after the generation prompt's role marker.
+    void start() { out_parser::init(&inkling_output_grammar(), &body_, OUT_HEADER); }
+    out_parser *clone() const override {
+        l437_json_parser *p = new l437_json_parser(*this);
+        p->rebind_body(&p->body_);
+        return p;
+    }
+
+private:
+    Body body_;   ///< the call-body reader
+};
+
+/// @param r  the generator
+/// @return one Inkling turn: thinking, text and 0..3 tool calls with random JSON bodies, some broken
+static std::string l437_json_turn(l430_rng *r) {
+    static const std::vector<std::string> frag = {
+        "x", "pulsars", " ", "\n", "\\\"", "\\\\", "\\n", "\\u00e9", "\xc3\xa9", "\xe2\x82\xac", "\xf0\x9f\x9a\x80", "{", "}",
+        "[", "]", ":", ",", "<|end_message|>", "<|end_", "<", "args", "name", "\"", "<|content_invoke_tool_json|>"};
+    auto str = [&]() {
+        std::string v = "\"";
+        for (uint32_t k = r->below(6); k > 0; k--) {
+            const std::string &f = r->pick(frag);
+            v += (f == "\"" || f == "\n") ? "q" : f;   /* a bare quote or newline would end / break the literal */
+        }
+        return v + "\"";
+    };
+    std::function<std::string(int)> value = [&](int depth) -> std::string {
+        switch (r->below(depth > 2 ? 4 : 7)) {
+        case 0: return std::to_string(r->below(1000));
+        case 1: return r->chance(50) ? "true" : "null";
+        case 2:
+        case 3: return str();
+        case 4: {
+            std::string o = "{";
+            for (uint32_t k = r->below(4), i = 0; i < k; i++) o += (i ? ", " : "") + str() + ": " + value(depth + 1);
+            return o + "}";
+        }
+        default: {
+            std::string a = "[";
+            for (uint32_t k = r->below(4), i = 0; i < k; i++) a += (i ? "," : "") + value(depth + 1);
+            return a + "]";
+        }
+        }
+    };
+    std::string out;
+    if (r->chance(40)) out += "<|content_thinking|>plan " + r->pick(frag) + "<|end_message|><|message_model|>";
+    if (r->chance(50)) out += "<|content_text|>On it" + r->pick(frag) + "<|end_message|><|message_model|>";
+    for (uint32_t c = r->below(4); c > 0; c--) {
+        out += r->chance(90) ? "search" : "";
+        out += "<|content_invoke_tool_json|>";
+        std::string body = "{";
+        std::vector<std::string> members;
+        if (!r->chance(8)) members.push_back(std::string("\"name\"") + (r->chance(20) ? " : " : ":") +
+                                            (r->chance(92) ? "\"search\"" : value(1)));
+        if (!r->chance(15)) {
+            std::string args = "{";
+            for (uint32_t k = r->below(4), i = 0; i < k; i++) args += (i ? ", " : "") + str() + ": " + value(1);
+            members.push_back("\"args\":" + (r->chance(92) ? args + "}" : value(1)));
+        }
+        if (r->chance(20)) members.push_back(str() + ":" + value(1));
+        if (r->chance(30) && members.size() > 1) std::swap(members[0], members[1]);
+        for (size_t i = 0; i < members.size(); i++) body += (i ? "," : "") + members[i];
+        body += "}";
+        if (r->chance(12) && !body.empty()) {   /* break it */
+            const size_t at = r->below((uint32_t)body.size());
+            if (r->chance(50)) body.erase(at, 1 + r->below(6));
+            else body.insert(at, r->pick(frag));
+        }
+        out += body;
+        if (!r->chance(5)) out += "<|end_message|>";
+        if (c > 1) out += "<|message_model|>";
+    }
+    if (r->chance(10) && !out.empty()) out.resize(r->below((uint32_t)out.size()));
+    return out;
+}
+
+/* L437: the JSON call body (Inkling's: `{"name": NAME, "args": {...}}`) has no kept earlier reading of its own, as
+ * the XML body has (the chat gates' P3), so the retyping of its cursors gets one here: the kit is run twice over the
+ * same bytes in the same chunks, around the live body and around the body as it was (tests/json_call_body_ref.h),
+ * and after EVERY feed the two must have produced the same events and give the same in_tool_call() / in_payload();
+ * at the end the same calls, text, error count and sampled span.  Clones taken mid-turn go on as the originals. */
+static void test_l437_json_call_body_matches_reference(void) {
+    l430_rng r = {0x4c343337ull};
+    long feeds = 0, begins = 0, fragments = 0, ends = 0, errors = 0, payload = 0;
+    int bad = 0;
+    const int streams = 3000;
+    for (int n = 0; n < streams && !bad; n++) {
+        const std::string out = l437_json_turn(&r);
+        auto *live0 = new l437_json_parser<out_json_call_body>();
+        auto *ref0 = new l437_json_parser<out_json_call_body_ref>();
+        std::unique_ptr<out_parser> live(live0), ref(ref0);
+        live0->start();
+        ref0->start();
+        const int clone_at = r.chance(30) ? (int)r.below(40) : -1;
+        const uint32_t mode = r.below(3);   /* a byte a feed, random chunks, or whole */
+        std::vector<out_event> el, er;
+        int k = 0;
+        for (size_t at = 0; at < out.size() && !bad; k++) {
+            const size_t step = mode == 0 ? 1 : mode == 1 ? 1 + r.below(9) : out.size();
+            const size_t end = std::min(out.size(), at + step);
+            if (k == clone_at) {
+                live.reset(live->clone());
+                ref.reset(ref->clone());
+            }
+            el.clear();
+            er.clear();
+            live->feed(out.data() + at, end - at, &el);
+            ref->feed(out.data() + at, end - at, &er);
+            feeds++;
+            payload += live->in_payload();
+            bool same = el.size() == er.size();
+            for (size_t i = 0; same && i < el.size(); i++) {
+                same = el[i].kind == er[i].kind && el[i].index == er[i].index && el[i].name == er[i].name &&
+                       el[i].text == er[i].text && el[i].arguments == er[i].arguments;
+                begins += el[i].kind == out_event::TOOL_BEGIN;
+                fragments += el[i].kind == out_event::TOOL_ARGS;
+                ends += el[i].kind == out_event::TOOL_END;
+                errors += el[i].kind == out_event::ERROR;
+            }
+            if (!same || live->in_payload() != ref->in_payload() || live->in_tool_call() != ref->in_tool_call()) {
+                fprintf(stderr, "l437 json body: stream %d differs after the feed ending at byte %zu:\n%s\n", n, end,
+                        out.c_str());
+                bad++;
+            }
+            at = end;
+        }
+        el.clear();
+        er.clear();
+        live->finish(&el);
+        ref->finish(&er);
+        size_t llo = 0, lhi = 0, rlo = 0, rhi = 0;
+        const bool lspan = test_raw_span(*live, &llo, &lhi), rspan = test_raw_span(*ref, &rlo, &rhi);
+        bool same = el.size() == er.size() && live->content() == ref->content() &&
+                    live->reasoning() == ref->reasoning() && live->errors() == ref->errors() &&
+                    live->calls().size() == ref->calls().size() && lspan == rspan && llo == rlo && lhi == rhi;
+        for (size_t i = 0; same && i < el.size(); i++) same = el[i].kind == er[i].kind && el[i].text == er[i].text;
+        for (size_t i = 0; same && i < live->calls().size(); i++)
+            same = live->calls()[i].name == ref->calls()[i].name &&
+                   live->calls()[i].arguments == ref->calls()[i].arguments;
+        if (!same && !bad) {
+            fprintf(stderr, "l437 json body: stream %d differs at the finish:\n%s\n", n, out.c_str());
+            bad++;
+        }
+    }
+    fprintf(stderr, "  L437 JSON call body vs its untyped reading: %d streams, %ld feeds (in_payload after %ld); %ld "
+            "calls announced, %ld argument fragments, %ld calls closed, %ld errors; %d differ\n", streams, feeds,
+            payload, begins, fragments, ends, errors, bad);
+    TEST_ASSERT(bad == 0);
+    TEST_ASSERT(begins > 1000 && fragments > 1000 && ends > 1000 && errors > 100 && payload > 1000);   /* it reached them */
 }
 
 /* L428, the prefix: after a turn the server ended at its first call, the bank holds the prompt and the turn's tokens
@@ -6411,7 +7037,7 @@ static l420_result l420_run(const l420_case &c) {
     for (const char *p = c.raw; *p; p++) {   /* a token at a time */
         buf_append(&g->text, p, 1);
         g->thinking.feed(p, 1);
-        TEST_ASSERT(r->family->output->feed(ps, &srv, g, g->text.len, false));
+        TEST_ASSERT(r->family->output->feed(ps, &srv, g, gen_text_end(g->text.len), false));
     }
     g->finish = c.gen_finish;
     g->abandoned = c.abandoned;
@@ -6429,7 +7055,7 @@ static l420_result l420_run(const l420_case &c) {
     r->timings.valid = true;
     r->timings.reasoning_as_content = turn.reasoning_answer;
     if (c.stream) {
-        TEST_ASSERT(r->family->output->feed(ps, &srv, g, g->text.len, true));
+        TEST_ASSERT(r->family->output->feed(ps, &srv, g, gen_text_end(g->text.len), true));
         TEST_ASSERT(turn_stream_reasoning_answer(g, &turn));
         if (c.api == API_ANTHROPIC)
             TEST_ASSERT(anthropic_sse_finish(&g->sink, &turn.calls, turn.finish, g->stop_sequence, 5));
@@ -7437,7 +8063,7 @@ static void test_inkling_raw_calls_replay_and_key(void) {
     TEST_ASSERT(p.calls().size() == 2 && p.errors() == 0);
     TEST_ASSERT(p.calls()[0].arguments == "{\"cmd\": \"ls   -la\"}");   /* as sampled */
     size_t lo = 1, hi = 0;
-    TEST_ASSERT(p.raw_span(&lo, &hi) && lo == 0 && hi == strlen(sampled));
+    TEST_ASSERT(test_raw_span(p, &lo, &hi) && lo == 0 && hi == strlen(sampled));
     const server_family_ops *ink = server_family_for_format(PULSAR_CHAT_INKLING);
     const char *end = NULL;
     TEST_ASSERT(ink->find_call_block(sampled, &end) == sampled && end == sampled + hi);
@@ -7447,7 +8073,7 @@ static void test_inkling_raw_calls_replay_and_key(void) {
     ev.clear();
     p.feed(later.data(), later.size(), &ev);
     p.finish(&ev);
-    TEST_ASSERT(p.raw_span(&lo, &hi) && later.compare(lo, hi - lo, sampled) == 0);
+    TEST_ASSERT(test_raw_span(p, &lo, &hi) && later.compare(lo, hi - lo, sampled) == 0);
 
     /* the replay: the raw bytes where the calls go, after the content */
     chat_msgs msgs = {0};
@@ -7693,7 +8319,7 @@ static void test_nemotron_raw_calls_replay_and_key(void) {
     TEST_ASSERT(p.calls().size() == 2 && p.errors() == 0);
     TEST_ASSERT(p.reasoning() == "Plan it." && p.content() == "On it.");   /* trimmed beside the calls */
     size_t lo = 0, hi = 0;
-    TEST_ASSERT(p.raw_span(&lo, &hi) && sampled.compare(lo, hi - lo, calls) == 0);
+    TEST_ASSERT(test_raw_span(p, &lo, &hi) && sampled.compare(lo, hi - lo, calls) == 0);
     const server_family_ops *nem = server_family_for_format(PULSAR_CHAT_NEMOTRON_H);
     const char *end = NULL;
     TEST_ASSERT(nem->find_call_block(sampled.c_str(), &end) == sampled.c_str() + lo && end == sampled.c_str() + hi);
@@ -9632,7 +10258,7 @@ static void test_responses_input_image_blocks(void) {
          * but not the offset renders as one client span, so the placeholder never
          * becomes an image token (the L226 defect). */
         TEST_ASSERT(msgs.v[0].image_ph_off != NULL);
-        TEST_ASSERT(!strncmp(msgs.v[0].content + msgs.v[0].image_ph_off[0],
+        TEST_ASSERT(!strncmp(msgs.v[0].content + content_ix(msgs.v[0].image_ph_off[0]),
                              PULSAR_IMAGE_PLACEHOLDER, strlen(PULSAR_IMAGE_PLACEHOLDER)));
         /* Text first, then the sentinel where the image block sat. */
         TEST_ASSERT(strstr(msgs.v[0].content, "look") == msgs.v[0].content);
@@ -9749,7 +10375,7 @@ static void test_multi_image_blocks_and_offsets(void) {
              * a placeholder. */
             TEST_ASSERT(msgs.v[0].image_ph_off[0] < msgs.v[0].image_ph_off[1]);
             for (int i = 0; i < 2; i++) {
-                TEST_ASSERT(!strncmp(msgs.v[0].content + msgs.v[0].image_ph_off[i],
+                TEST_ASSERT(!strncmp(msgs.v[0].content + content_ix(msgs.v[0].image_ph_off[i]),
                                      PULSAR_IMAGE_PLACEHOLDER, ph_len));
             }
             int occurrences = 0;
@@ -9805,7 +10431,7 @@ static void test_multi_image_blocks_and_offsets(void) {
     if (rmsgs.v[0].image_ph_off) {
         TEST_ASSERT(rmsgs.v[0].image_ph_off[0] < rmsgs.v[0].image_ph_off[1]);
         for (int i = 0; i < rmsgs.v[0].images_len; i++) {
-            TEST_ASSERT(!strncmp(rmsgs.v[0].content + rmsgs.v[0].image_ph_off[i],
+            TEST_ASSERT(!strncmp(rmsgs.v[0].content + content_ix(rmsgs.v[0].image_ph_off[i]),
                                  PULSAR_IMAGE_PLACEHOLDER, ph_len));
         }
     }
@@ -9844,7 +10470,7 @@ static void test_image_placeholder_is_not_client_text(void) {
         /* The parser recorded where IT put the placeholder (the content keeps
          * going after it: "before" + placeholder + "after"). */
         TEST_ASSERT(msgs.v[0].image_ph_off != NULL);
-        TEST_ASSERT(!strncmp(msgs.v[0].content + msgs.v[0].image_ph_off[0],
+        TEST_ASSERT(!strncmp(msgs.v[0].content + content_ix(msgs.v[0].image_ph_off[0]),
                              PULSAR_IMAGE_PLACEHOLDER, ph_len));
 
         pulsar_text_span *spans = NULL;
@@ -17690,9 +18316,9 @@ static void test_l184_every_consumer_loops_the_syntax_table(void) {
         /* the stream projection opens on this row and binds to it */
         dsml_tool_stream ts;
         memset(&ts, 0, sizeof ts);
-        TEST_ASSERT(dsml_tool_stream_init(&ts, text.ptr, text.len, 4));
+        TEST_ASSERT(dsml_tool_stream_init(&ts, text.ptr, text.len, GenOff{4}));
         TEST_ASSERT(ts.syn == syn);
-        TEST_ASSERT(ts.parse_pos == 4 + strlen(syn->tool_calls_start));
+        TEST_ASSERT(ts.parse_pos.raw() == 4 + strlen(syn->tool_calls_start));
         dsml_tool_stream_free(&ts);
 
         /* a truncated closing tag of this row is trimmed as tag debris */
@@ -17781,7 +18407,7 @@ static void test_dsml_stream_never_announces_an_undeclared_tool(void) {
     chat_sink k = capture_sink(&r, &c);
     dsml_tool_stream ts;
     memset(&ts, 0, sizeof ts);
-    TEST_ASSERT(dsml_tool_stream_init(&ts, raw, n, 0));
+    TEST_ASSERT(dsml_tool_stream_init(&ts, raw, n, GenOff{0}));
     for (size_t len = 1; len <= n; len++) TEST_ASSERT(dsml_tool_stream_update(&ts, &k, raw, len));
     TEST_ASSERT(!ts.active && ts.state == DSML_TOOL_ERROR);
     TEST_ASSERT(c.begins == 0 && c.ends == 0 && !c.args.ptr);
@@ -17812,7 +18438,7 @@ static void test_l184_shared_tool_stream_drives_protocol_emitters(void) {
     chat_sink k = capture_sink(&r, &c);
     dsml_tool_stream ts;
     memset(&ts, 0, sizeof ts);
-    TEST_ASSERT(dsml_tool_stream_init(&ts, raw, n, 0));
+    TEST_ASSERT(dsml_tool_stream_init(&ts, raw, n, GenOff{0}));
     for (size_t len = 1; len <= n; len++) {
         TEST_ASSERT(dsml_tool_stream_update(&ts, &k, raw, len));
     }
@@ -17836,7 +18462,7 @@ static void test_l184_shared_tool_stream_drives_protocol_emitters(void) {
         PULSAR_PARAM_START " name=\"command\" string=\"true\">ls -la</";
     memset(&c, 0, sizeof c);
     memset(&ts, 0, sizeof ts);
-    TEST_ASSERT(dsml_tool_stream_init(&ts, cut, strlen(cut), 0));
+    TEST_ASSERT(dsml_tool_stream_init(&ts, cut, strlen(cut), GenOff{0}));
     TEST_ASSERT(dsml_tool_stream_update(&ts, &k, cut, strlen(cut)));
     TEST_ASSERT(ts.active && ts.state == DSML_TOOL_PARAM_VALUE);
     TEST_ASSERT(dsml_tool_stream_finalize(&ts, &k, cut, strlen(cut)));
@@ -21358,6 +21984,105 @@ static char *l334_text(void *, TokId id, size_t *len) {
     return server_xstrdup(t);
 }
 
+/* ---- L437: offsets into the texts of the output path ----------------------------------------------------------
+ * pulsar_units.h GenBytes / GenOff / StreamOff -- the compile-fail checks: an offset of the turn's text, an offset of a
+ * parser's stream and a length never pass for one another, for rendered-text bytes, a token type or a bare integer. */
+static_assert(!l334_passes<StreamOff, GenOff> && !l334_passes<GenOff, StreamOff> && !l334_passes<GenBytes, GenOff> &&
+                  !l334_passes<GenOff, GenBytes> && !l334_passes<size_t, GenOff> && !l334_passes<size_t, StreamOff> &&
+                  !l334_passes<size_t, GenBytes> && !l334_passes<GenOff, size_t> && !l334_passes<StreamOff, size_t> &&
+                  !l334_passes<int, GenOff> && !l334_passes<TextBytes, GenBytes> && !l334_passes<TextBytes, GenOff> &&
+                  !l334_passes<GenBytes, TextBytes> && !l334_passes<TokPos, GenOff> && !l334_passes<TokCount, GenBytes>,
+              "no output-path offset or length passes for another, for rendered text, a token type or an integer");
+static_assert(!std::is_constructible_v<GenOff, StreamOff> && !std::is_constructible_v<StreamOff, GenOff> &&
+                  !std::is_constructible_v<GenOff, GenBytes> && !std::is_constructible_v<GenBytes, StreamOff> &&
+                  !std::is_constructible_v<GenOff, TextBytes> && !std::is_constructible_v<GenBytes, TextBytes> &&
+                  !std::is_constructible_v<TextBytes, GenOff> && !std::is_constructible_v<GenOff, TokPos> &&
+                  !std::is_constructible_v<GenOff, TokId> && !std::is_constructible_v<StreamOff, TokCount> &&
+                  !std::is_constructible_v<GenOff, KvBytes> && !std::is_constructible_v<GenBytes, TensorBytes>,
+              "not even explicitly: a parser's stream offset becomes a text offset only through kit_gen::text_at");
+static_assert(std::is_constructible_v<GenOff, size_t> && std::is_constructible_v<StreamOff, int> &&
+                  std::is_constructible_v<GenBytes, size_t> && !std::is_constructible_v<GenOff, double> &&
+                  !std::is_constructible_v<GenBytes, bool>,
+              "the explicit integer entry exists; a float or a bool is no offset");
+static_assert(l333_adds<GenOff, GenBytes> && l333_adds<StreamOff, GenBytes> && l333_adds<GenBytes, GenBytes> &&
+                  !l333_adds<GenOff, GenOff> && !l333_adds<GenOff, StreamOff> && !l333_adds<GenOff, size_t> &&
+                  !l333_adds<GenOff, TextBytes> && !l333_adds<StreamOff, TextBytes> && !l333_adds<GenBytes, TextBytes> &&
+                  !l333_adds<GenOff, TokCount> && !l333_adds<GenBytes, size_t> && !l333_adds<GenBytes, GenOff>,
+              "an offset moves by a GenBytes only: not by an offset, an integer, rendered-text bytes or a token count");
+/** Does `a - b` compile for these operand types? */
+template <class A, class B> concept l437_subtracts = requires(A a, B b) { a - b; };
+static_assert(l437_subtracts<GenOff, GenOff> && l437_subtracts<StreamOff, StreamOff> && l437_subtracts<GenOff, GenBytes> &&
+                  !l437_subtracts<GenOff, StreamOff> && !l437_subtracts<StreamOff, GenOff> &&
+                  !l437_subtracts<GenBytes, GenOff> && !l437_subtracts<GenOff, size_t> &&
+                  std::is_same_v<decltype(GenOff{} - GenOff{}), GenBytes> &&
+                  std::is_same_v<decltype(StreamOff{} - StreamOff{}), GenBytes> &&
+                  std::is_same_v<decltype(GenOff{} - GenBytes{}), GenOff> &&
+                  std::is_same_v<decltype(StreamOff{} + GenBytes{}), StreamOff>,
+              "a distance is taken within one text only, and is a length; an offset less a length is an offset");
+static_assert(l333_orders<GenOff, GenOff> && l333_orders<StreamOff, StreamOff> && !l333_orders<GenOff, StreamOff> &&
+                  !l333_orders<GenOff, size_t> && !l333_orders<GenOff, GenBytes> && !l333_orders<GenBytes, TextBytes> &&
+                  l333_equates<GenOff, GenOff> && !l333_equates<GenOff, StreamOff> && !l333_equates<StreamOff, size_t> &&
+                  !l333_equates<GenBytes, TextBytes>,
+              "offsets order and equate within their own text only");
+static_assert(l333_assigns<GenOff &, GenOff> && !l333_assigns<GenOff &, StreamOff> && !l333_assigns<GenOff &, size_t> &&
+                  !l333_assigns<StreamOff &, GenOff> && !l333_assigns<GenBytes &, GenOff> &&
+                  !l333_assigns<size_t &, GenOff> && !l333_assigns<GenBytes &, TextBytes>,
+              "assignment within the type only");
+static_assert(std::is_same_v<decltype(GenOff{}.raw()), size_t> && std::is_same_v<decltype(GenBytes{}.raw()), size_t> &&
+                  GenOff::none().raw() == SIZE_MAX && StreamOff::none().raw() == std::string::npos &&
+                  GenOff::none().is_none() && !GenOff{0}.is_none() && GenOff{SIZE_MAX} == GenOff::none() &&
+                  (GenOff{9} - GenOff{4}).raw() == 5 && (GenOff{9} + GenBytes{4}).raw() == 13 &&
+                  (StreamOff{9} - GenBytes{4}).raw() == 5 && GenOff::after(GenBytes{7}).raw() == 7 &&
+                  GenOff{7}.before().raw() == 7,
+              "constexpr, size_t's arithmetic; none() is the SIZE_MAX / npos the size_t fields carried");
+static_assert(std::is_same_v<decltype(gen_state{}.plain_stream_pos), GenOff> &&
+                  std::is_same_v<decltype(gen_state{}.stop_scan_from), GenOff> &&
+                  std::is_same_v<decltype(kit_gen{}.fed), GenOff> && std::is_same_v<decltype(kit_gen{}.cut_at), GenOff> &&
+                  std::is_same_v<decltype(kit_gen{}.call_end), GenOff> &&
+                  std::is_same_v<decltype(kit_gen{}.tail_at), GenBytes> &&
+                  std::is_same_v<decltype(std::declval<const out_parser &>().first_call_at()), StreamOff> &&
+                  std::is_same_v<decltype(std::declval<const out_parser &>().stream_end()), StreamOff> &&
+                  std::is_same_v<decltype(std::declval<const kit_gen &>().text_at(StreamOff{})), GenOff>,
+              "the output path carries the pair: the turn's cursors and the kit's are text offsets, the call_tail's is "
+              "a length, the parser reports stream offsets, and the kit state converts them");
+
+/* L437: a call body's offsets (BodyOff) -- no offset of the stream or the turn's text passes for one, nor a length;
+ * the body readers' interface carries the pair (the kit's held bytes are a length, the failure point an offset). */
+static_assert(!l334_passes<BodyOff, GenOff> && !l334_passes<GenOff, BodyOff> && !l334_passes<BodyOff, StreamOff> &&
+                  !l334_passes<StreamOff, BodyOff> && !l334_passes<size_t, BodyOff> && !l334_passes<BodyOff, size_t> &&
+                  !l334_passes<GenBytes, BodyOff> && !l334_passes<TextBytes, BodyOff> &&
+                  !std::is_constructible_v<BodyOff, GenOff> && !std::is_constructible_v<BodyOff, StreamOff> &&
+                  !std::is_constructible_v<StreamOff, BodyOff> && !std::is_constructible_v<BodyOff, GenBytes> &&
+                  !l333_orders<BodyOff, StreamOff> && !l333_equates<BodyOff, GenOff> && !l437_subtracts<BodyOff, GenOff> &&
+                  l437_subtracts<BodyOff, BodyOff> && l333_adds<BodyOff, GenBytes> &&
+                  std::is_same_v<decltype(BodyOff{} - BodyOff{}), GenBytes>,
+              "a call body's offset mixes with no other text's, and moves by a length");
+static_assert(std::is_invocable_v<decltype(&out_call_body::grow), out_call_body &, const std::string &, GenBytes, bool,
+                                  int, std::vector<out_event> *> &&
+                  !std::is_invocable_v<decltype(&out_call_body::grow), out_call_body &, const std::string &, size_t,
+                                       bool, int, std::vector<out_event> *> &&
+                  std::is_invocable_v<decltype(&out_call_body::close), out_call_body &, const std::string &, int,
+                                      std::vector<out_event> *, out_call *, const char **, BodyOff *> &&
+                  std::is_same_v<decltype(body_ix(BodyOff{})), size_t>,
+              "the body readers take the kit's held bytes as a length and report where a reading stopped as a BodyOff");
+
+/* L437: a chat message's content offsets (ContentOff: where an image's placeholder or a tool reference sits) -- no
+ * offset of generated text, of a call body or of a parser's stream passes for one, nor a length or an integer; it
+ * moves by rendered text's TextBytes, not by GenBytes. */
+static_assert(!l334_passes<ContentOff, GenOff> && !l334_passes<GenOff, ContentOff> && !l334_passes<size_t, ContentOff> &&
+                  !l334_passes<ContentOff, size_t> && !l334_passes<TextBytes, ContentOff> &&
+                  !l334_passes<ContentOff, TextBytes> && !l334_passes<BodyOff, ContentOff> &&
+                  !std::is_constructible_v<ContentOff, GenOff> && !std::is_constructible_v<ContentOff, TextBytes> &&
+                  !std::is_constructible_v<TextBytes, ContentOff> && !std::is_constructible_v<ContentOff, StreamOff> &&
+                  l333_adds<ContentOff, TextBytes> && !l333_adds<ContentOff, GenBytes> && !l333_adds<GenOff, TextBytes> &&
+                  !l333_adds<ContentOff, size_t> && !l333_orders<ContentOff, GenOff> && !l333_equates<ContentOff, size_t> &&
+                  std::is_same_v<decltype(ContentOff{} - ContentOff{}), TextBytes> &&
+                  std::is_same_v<decltype(ContentOff{}.before()), TextBytes> &&
+                  std::is_same_v<decltype(chat_msg{}.image_ph_off), ContentOff *> &&
+                  std::is_same_v<decltype(chat_msg{}.tool_ref_off), ContentOff *> &&
+                  (ContentOff{9} + TextBytes{4}).raw() == 13 && ContentOff::after(TextBytes{7}) == ContentOff{7},
+              "a message content's offset mixes with no other text's and moves by TextBytes; the message carries them");
+
 /* L334 fix: what a state at live position G serves of the request across a token seam -- the conversion both the
  * bank's own resume (pulsar_session_bank_resume_at) and an adopt's rank (pulsar_session_bank_adopt_score) now read.
  * Before, each answered G itself: a live-side position counted as the request's tokens. */
@@ -21577,6 +22302,12 @@ static void pulsar_server_unit_tests_run(void) {
     test_l428_turn_ends_at_its_first_call();
     test_l430_round_walks_match_reference();
     test_l431_stop_scan_matches_reference();
+    test_l437_offset_units();
+    test_l437_stream_offsets_and_conversion();
+    test_l437_parser_started_mid_text();
+    test_l437_logprobs_ride_with_their_text();
+    test_l437_deepseek_walk_reads_released_bytes_only();
+    test_l437_json_call_body_matches_reference();
     test_l428_next_prompt_extends_the_cut_turn();
     test_l420_stop_inside_reasoning_answers_with_it();
     test_l420_other_endings_are_unchanged();

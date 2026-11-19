@@ -317,7 +317,7 @@ static std::string run_family(const gcase &c, proto p, size_t piece, pulsar_chat
         if (usage) reasoning_usage_note(&g, was_inside);   /* gen_emit_token's count, a piece a token */
         fed++;
         at = to;
-        ok = ops->feed(ps, &srv, &g, g.text.len, false);
+        ok = ops->feed(ps, &srv, &g, gen_text_end(g.text.len), false);
         drain(sv[1], &out);
     }
     server_turn turn;
@@ -326,7 +326,7 @@ static std::string run_family(const gcase &c, proto p, size_t piece, pulsar_chat
         g.finish = c.finish;
         turn.finish = g.finish;
         const bool stream_ok = ops->finish(ps, &srv, NULL, &g, &turn);
-        if (ok) ok = stream_ok && ops->feed(ps, &srv, &g, g.text.len, true);
+        if (ok) ok = stream_ok && ops->feed(ps, &srv, &g, gen_text_end(g.text.len), true);
         if (ok) {
             switch (p) {
             case P_OPENAI: ok = openai_sse_finish(&g.sink, &turn.calls, turn.finish, 10, usage ? fed : 20); break;

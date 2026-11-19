@@ -1506,7 +1506,7 @@ static void test_think_tool_recovery(void) {
         PULSAR_TOOL_CALLS_END;
 
     buf text = {0};
-    size_t scan_from = 0;
+    GenOff scan_from{0};
     bool complete = false;
     for (size_t i = 0; generated[i]; i++) {
         buf_append(&text, generated + i, 1);
@@ -1592,8 +1592,8 @@ static void test_tool_call_quality_one(void) {
         buf_append(&g.text, piece, piece_len);
         g.thinking.feed(piece, piece_len);
         free(piece);
-        if (!ops->feed(ps, &srv, &g, g.text.len, false)) { decode_ok = false; break; }
-        size_t turn_end = g.text.len;   /* L428: where the turn ends (its whole text: no single-call request here) */
+        if (!ops->feed(ps, &srv, &g, gen_text_end(g.text.len), false)) { decode_ok = false; break; }
+        GenOff turn_end = gen_text_end(g.text.len);   /* L428: where the turn ends (its whole text: no single-call request here) */
         if (ops->turn_complete(ps, &g, &turn_end)) {
             g.finish = "stop";
             break;
@@ -4451,12 +4451,19 @@ static void test_kv_identity(void) {
 
 /* L430: the host-only group the check tier runs (make gen-host-gate): the generation path's host work that must not
  * change a decision -- a speculative round's look ahead against its reading before L430 on thousands of random turns
- * (server_tests.cpp), the per-position rule it implements against the plain lane's (L296), and (L431) the
- * stop-string scan against its reading before L431 on thousands of random streams. */
+ * (server_tests.cpp), the per-position rule it implements against the plain lane's (L296), (L431) the
+ * stop-string scan against its reading before L431 on thousands of random streams, and (L437) the output path's
+ * offset types: the conversions against their open-coded forms and a parser started mid-text. */
 static void test_gen_host(void) {
     test_spec_greedy_rows_per_position();
     test_l430_round_walks_match_reference();
     test_l431_stop_scan_matches_reference();
+    test_l437_offset_units();
+    test_l437_stream_offsets_and_conversion();
+    test_l437_parser_started_mid_text();
+    test_l437_logprobs_ride_with_their_text();
+    test_l437_deepseek_walk_reads_released_bytes_only();
+    test_l437_json_call_body_matches_reference();
 }
 
 /* L335: a bank carry's restore is all or nothing -- a live row that does not restore (here: a bank past the device

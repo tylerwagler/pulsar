@@ -532,7 +532,7 @@ static bool anthropic_sse_finish_tail(int fd, const request *r, const char *id, 
 /// @param text       the bytes
 /// @param len        bytes at `text` (0, or an inactive stream: nothing sent)
 /// @return false when a write failed
-static bool anthropic_sink_text_cb(chat_sink *k, bool reasoning, const char *text, size_t len, size_t) {
+static bool anthropic_sink_text_cb(chat_sink *k, bool reasoning, const char *text, size_t len, GenOff) {
     anthropic_stream *st = (anthropic_stream *)k->st;
     if (!st->active || len == 0) return true;
     const anthropic_block_type type = reasoning ? ANTH_BLOCK_THINKING : ANTH_BLOCK_TEXT;

@@ -38,6 +38,13 @@ void deepseek_stream_walk_free(deepseek_stream_walk *w) {
 bool deepseek_stream_update(deepseek_stream_walk *w, chat_sink *k, const char *raw, size_t raw_len, bool final) {
     if (!raw) return true;
     const request *r = k->r;
+    /* L437: the walk reads raw[0, raw_len) and nothing after it.  The bytes past raw_len are generated but not
+     * released: the stop-string scan holds them, and a stop string may still cut them off.  The marker scans below
+     * were strstr's to the text's NUL, so a "</think>" or a block's opener inside the hold-back was acted on early
+     * (and the block's projection, which does honour raw_len, then found no opener and gave the calls up). */
+    if (walk_ix(w->emit_pos) > raw_len) return true;   /* a cursor past the released bytes has nothing to read */
+    /* the bytes from the cursor to the end of the released text */
+    auto left = [&]() { return raw_len - walk_ix(w->emit_pos); };
 
     if (w->mode == DS_WALK_THINKING) {
         if (!w->checked_think_prefix) {
@@ -51,27 +58,27 @@ bool deepseek_stream_update(deepseek_stream_walk *w, chat_sink *k, const char *r
                 return true;
             }
             if (raw_len >= open_len && !strncmp(raw, open, open_len)) {
-                w->emit_pos = open_len;
+                w->emit_pos = GenOff{open_len};
             }
             w->checked_think_prefix = true;
         }
 
-        const char *close = strstr(raw + w->emit_pos, "</think>");
+        const char *close = find_lit_bounded(raw + walk_ix(w->emit_pos), left(), "</think>");
         /* A tool call starting before any </think> is the unclosed-reasoning
          * recovery case (upstream ds4 51a1c14): stream only the prose before
          * the marker as reasoning, hold until the block completes, and keep
          * the protocol bytes off every channel. */
         const char *tool = r->has_tools ?
-            find_any_tool_start(raw + w->emit_pos) : NULL;
+            find_any_tool_start_n(raw + walk_ix(w->emit_pos), left()) : NULL;
         const bool tool_before_close = tool && (!close || tool < close);
         /* The END must also land before </think>: a block whose end falls past
          * the close straddles the reasoning boundary and is NOT an executable
          * call (upstream ds4 0ead8a8). */
-        const char *tool_end = tool_before_close ? find_any_tool_end(tool) : NULL;
+        const char *tool_end = tool_before_close ? find_any_tool_end_n(tool, (size_t)(raw + raw_len - tool)) : NULL;
         const bool complete_tool = tool_end && (!close || tool_end < close);
         size_t limit;
         if (complete_tool) {
-            limit = trim_tool_separator_ws(raw, w->emit_pos,
+            limit = trim_tool_separator_ws(raw, walk_ix(w->emit_pos),
                                            (size_t)(tool - raw));
         } else if (close) {
             /* An incomplete marker that remains inside a closed think block is
@@ -81,22 +88,23 @@ bool deepseek_stream_update(deepseek_stream_walk *w, chat_sink *k, const char *r
             /* Match non-stream parsing: flush incomplete DSML as reasoning. */
             limit = raw_len;
         } else if (tool_before_close) {
-            limit = trim_tool_separator_ws(raw, w->emit_pos,
+            limit = trim_tool_separator_ws(raw, walk_ix(w->emit_pos),
                                            (size_t)(tool - raw));
         } else {
             const size_t hold = strlen("</think>") - 1;
-            limit = raw_len > hold ? raw_len - hold : w->emit_pos;
-            limit = utf8_stream_safe_len(raw, w->emit_pos, limit, false);
+            limit = raw_len > hold ? raw_len - hold : walk_ix(w->emit_pos);
+            limit = utf8_stream_safe_len(raw, walk_ix(w->emit_pos), limit, false);
         }
 
-        if (limit > w->emit_pos) {
-            if (!k->text(k, true, raw + w->emit_pos, limit - w->emit_pos, limit)) return false;
-            w->emit_pos = limit;
+        if (limit > walk_ix(w->emit_pos)) {
+            if (!k->text(k, true, raw + walk_ix(w->emit_pos), limit - walk_ix(w->emit_pos), GenOff{limit}))
+                return false;
+            w->emit_pos = GenOff{limit};
         }
 
         if (complete_tool) {
             if (!k->end(k, false)) return false;
-            w->emit_pos = (size_t)(tool - raw);
+            w->emit_pos = GenOff{(size_t)(tool - raw)};
             w->mode = DS_WALK_SUPPRESS;
             return true;
         }
@@ -107,7 +115,7 @@ bool deepseek_stream_update(deepseek_stream_walk *w, chat_sink *k, const char *r
                 w->mode = DS_WALK_SUPPRESS;
                 return true;
             }
-            w->emit_pos = (size_t)(close - raw) + strlen("</think>");
+            w->emit_pos = GenOff{(size_t)(close - raw) + strlen("</think>")};
             w->mode = DS_WALK_TEXT;
         } else {
             return true;
@@ -119,15 +127,16 @@ bool deepseek_stream_update(deepseek_stream_walk *w, chat_sink *k, const char *r
             /* A second </think> before any tool marker means the held text
              * was another reasoning pass -- reroute it. A tool marker or the
              * final flush releases the hold as genuine answer text. */
-            const char *close = strstr(raw + w->emit_pos, "</think>");
+            const char *close = find_lit_bounded(raw + walk_ix(w->emit_pos), left(), "</think>");
             const char *tool2 = r->has_tools ?
-                find_any_tool_start(raw + w->emit_pos) : NULL;
+                find_any_tool_start_n(raw + walk_ix(w->emit_pos), left()) : NULL;
             if (close && (!tool2 || close < tool2)) {
                 const size_t limit = (size_t)(close - raw);
-                if (limit > w->emit_pos &&
-                    !k->text(k, true, raw + w->emit_pos, limit - w->emit_pos, limit)) return false;
+                if (limit > walk_ix(w->emit_pos) &&
+                    !k->text(k, true, raw + walk_ix(w->emit_pos), limit - walk_ix(w->emit_pos), GenOff{limit}))
+                    return false;
                 if (!k->end(k, false)) return false;
-                w->emit_pos = limit + strlen("</think>");
+                w->emit_pos = GenOff{limit + strlen("</think>")};
                 w->guard_second_reasoning = false;
             } else if (!tool2 && !final) {
                 return true;
@@ -136,18 +145,19 @@ bool deepseek_stream_update(deepseek_stream_walk *w, chat_sink *k, const char *r
             }
         }
 
-        const char *tool = r->has_tools ? find_any_tool_start(raw + w->emit_pos) : NULL;
-        size_t limit = text_stream_safe_limit(raw, w->emit_pos, raw_len,
+        const char *tool = r->has_tools ? find_any_tool_start_n(raw + walk_ix(w->emit_pos), left()) : NULL;
+        size_t limit = text_stream_safe_limit(raw, walk_ix(w->emit_pos), raw_len,
                                               r->has_tools, final);
 
-        if (limit > w->emit_pos) {
-            if (!k->text(k, false, raw + w->emit_pos, limit - w->emit_pos, limit)) return false;
-            w->emit_pos = limit;
+        if (limit > walk_ix(w->emit_pos)) {
+            if (!k->text(k, false, raw + walk_ix(w->emit_pos), limit - walk_ix(w->emit_pos), GenOff{limit}))
+                return false;
+            w->emit_pos = GenOff{limit};
         }
 
         if (tool) {
             if (!k->end(k, false)) return false;
-            w->emit_pos = (size_t)(tool - raw);
+            w->emit_pos = GenOff{(size_t)(tool - raw)};
             /* Switch to the live tool-call projection as soon as the DSML block
              * starts -- on a protocol that streams calls; one first seen in the
              * final flush goes to the finish unless the protocol streams it then

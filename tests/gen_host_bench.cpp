@@ -246,7 +246,7 @@ void stop_row(const char *what, const std::vector<std::string> &stops, size_t n)
             const size_t k = std::min<size_t>(4, text.size() - at);
             buf_append(&b, text.data() + at, k);
             const double t0 = cpu_s();
-            up = live ? gen_release(&list, b.ptr, b.len, text.data() + at, k, sent, &thinking, &from, &hit, &pos, &len)
+            up = live ? gen_release_bare(&list, b.ptr, b.len, text.data() + at, k, sent, &thinking, &from, &hit, &pos, &len)
                       : gen_release_ref(&list, b.ptr, b.len, text.data() + at, k, sent, &thinking, &from, &hit, &pos, &len);
             t_last = cpu_s() - t0;
             in_release += t_last;

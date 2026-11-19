@@ -403,7 +403,7 @@ typedef struct {
      * to resolve them to the image token -- the surrounding client text keeps
      * its BPE-only span.  A placeholder occurrence the CLIENT typed is not in
      * this list and therefore stays ordinary text (the L223 invariant). */
-    size_t *image_ph_off; ///< owned, `images_len` entries
+    ContentOff *image_ph_off; ///< owned, `images_len` entries
     char *reasoning;      ///< the assistant's reasoning for this turn, owned; NULL when absent
     char *tool_call_id;   ///< for a tool-result message, the call it answers, owned
     char **tool_call_ids; ///< for a multi-result message, the calls it answers, owned
@@ -428,7 +428,7 @@ typedef struct {
      * prompt's tools block -- so a tool loaded mid-conversation leaves every earlier byte as it was;
      * chat_expand_tool_refs writes them into `content` before the family renders (any other name renders its
      * notice).  Parallel arrays, owned. */
-    size_t *tool_ref_off;
+    ContentOff *tool_ref_off;
     /// per reference: the tool it names (owned, NUL-terminated); parallel to tool_ref_off
     char **tool_ref_name;
     /// references present
@@ -556,7 +556,7 @@ typedef struct {
  * response, and the alternatives considered at that position. */
 typedef struct {
     logprob_token tok;  ///< the token that was actually emitted
-    size_t end_off;  ///< byte watermark: where this token's text ends in the response
+    GenOff end_off;  ///< byte watermark: where this token's text ends in the response
     int    n_top;    ///< alternatives recorded in `top`
     logprob_token *top;  ///< owned; n_top alternatives, descending
 } logprob_entry;
@@ -763,7 +763,7 @@ typedef struct server_output_parser_ops {
     /** Per emitted token, after g->text grew: `upto` = the bytes the stop-string scan released, to be
      *  projected into the sink (final = false); at the finish, `final` flushes what the projection held.
      *  false = a client write failed. */
-    bool (*feed)(void *st, server *s, struct gen_state *g, size_t upto, bool final);
+    bool (*feed)(void *st, server *s, struct gen_state *g, GenOff upto, bool final);
     /** The decode sits on a tool call's STRUCTURE: greedy.  A call's payload -- a string-typed value, or a
      *  JSON string inside any other value -- is sampled (L284 P6: one rule, every family). */
     bool (*in_tool_call)(const void *st, const struct gen_state *g);
@@ -772,7 +772,7 @@ typedef struct server_output_parser_ops {
      *  a call).  `*end` then receives the bytes of g->text the turn keeps (gen_turn_complete cuts the text there);
      *  a parser whose turn is its whole text leaves it as passed.  Reads a probe too (probe_new / probe_feed),
      *  where `*end` is an offset in the text the probe was fed. */
-    bool (*turn_complete)(const void *st, const struct gen_state *g, size_t *end);
+    bool (*turn_complete)(const void *st, const struct gen_state *g, GenOff *end);
     /** Optional, diagnostics: a call has opened / closed in this attempt. */
     void (*tool_progress)(const void *st, bool *opened, bool *closed);
     /** The turn's final reading (repair, parse, ids, the family's own retry and memory).  false = a
@@ -787,7 +787,7 @@ typedef struct server_output_parser_ops {
     void *(*probe_new)(void *st);
     /** Advance a probe as `feed` advances the state (no sink, no events kept): `text` (len bytes) is the
      *  generated text with the round's tokens so far appended, `upto` the bytes the stop-string scan released. */
-    void (*probe_feed)(void *probe, const struct gen_state *g, const char *text, size_t len, size_t upto);
+    void (*probe_feed)(void *probe, const struct gen_state *g, const char *text, size_t len, GenOff upto);
     /// frees a probe `probe_new` returned
     void (*probe_free)(void *probe);
 } server_output_parser_ops;
@@ -1441,7 +1441,7 @@ struct chat_sink {
     void *st;              ///< the protocol's stream state
     /** Reasoning or answer text; `release_upto` is the byte offset in the generation the text ends at
      * (OpenAI's logprob entries ride with the delta that releases their bytes). */
-    bool (*text)(chat_sink *k, bool reasoning, const char *text, size_t len, size_t release_upto);
+    bool (*text)(chat_sink *k, bool reasoning, const char *text, size_t len, GenOff release_upto);
     /** The current section ended; `think_closed`: at the model's own \</think\>. */
     bool (*end)(chat_sink *k, bool think_closed);
     /** Live tool-call events; NULL: calls go out with the finish. */
@@ -4644,7 +4644,7 @@ typedef enum {
 struct kit_gen {
     out_parser *parser = nullptr;    ///< owned: the family's configured parser (its create's)
     std::vector<out_event> ev;       ///< scratch, reused per feed
-    size_t fed = 0;                  ///< bytes of g->text fed to the parser
+    GenOff fed = GenOff{0};          ///< bytes of g->text fed to the parser
     tool_calls calls = {};           ///< completed calls, ids assigned, in emission order
     bool finished = false;           ///< the end of the turn was fed (the finish did it)
     bool stream_ok = true;           ///< no client write failed while projecting
@@ -4659,20 +4659,27 @@ struct kit_gen {
      *  a copy of `parser` fed every byte of g->text as it is generated, so the turn's end is known at the token that
      *  closes its first call and not `stops.max_len - 1` bytes later.  NULL until that turn's first feed. */
     out_parser *ahead = nullptr;
-    size_t ahead_fed = 0;            ///< bytes of g->text `ahead` has read
+    GenOff ahead_fed = GenOff{0};    ///< bytes of g->text `ahead` has read
     /** L428: the turn's first call closed -- well formed, naming a declared tool -- at `call_end`; the family's
      *  call_tail is read from there. */
     bool call_closed = false;
-    size_t call_end = 0;             ///< one past that call's closing marker in g->text
-    size_t tail_at = 0;              ///< bytes of the family's call_tail read after it
+    GenOff call_end = GenOff{0};     ///< one past that call's closing marker in g->text
+    GenBytes tail_at = GenBytes{0};  ///< bytes of the family's call_tail read after it (a length: ahead_fed - call_end)
     /** L428: the turn ends at `cut_at`: past the call and the family's call_tail, or at the call's close when the
      *  model wrote something else there. */
     bool cut = false;
-    size_t cut_at = 0;               ///< where the turn's text ends in g->text; `parser` reads no further
+    GenOff cut_at = GenOff{0};       ///< where the turn's text ends in g->text; `parser` reads no further
     /** L430: this kit_gen is a probe (parser_kit_probe_new): the state it was taken from, whose parsers lent it
      *  their open call bodies (out_parser::probe).  NULL for an attempt's own state. */
     kit_gen *lender = nullptr;
     ~kit_gen();                      ///< frees `calls` and the parsers (parser_kit.cpp)
+    /** L437: where byte `at` of `parser`'s stream is in g->text -- the ONE crossing from a parser's stream offsets
+     *  (its calls' span, where its first call opened) to the turn's text.  This state feeds the parser g->text's
+     *  bytes in order and `fed` says how far, so the stream's end IS text offset `fed`, and `at` is as far before
+     *  it in the text as in the stream -- wherever in the text the parser was started (parser_kit.cpp). */
+    /// @param at  an offset in the bytes `parser` was fed (fatal past its end, or before the text's first byte)
+    /// @return that byte's offset in g->text
+    GenOff text_at(StreamOff at) const;
 };
 /** The kit's server_output_parser_ops hooks (parser_kit.cpp): a family whose parser is a kit configuration
  *  fills its table with these and its own `create`, which builds the configured parser (per request: its
@@ -4682,7 +4689,7 @@ struct kit_gen {
 void *parser_kit_start(out_parser *p);
 void parser_kit_destroy(void *st);
 void parser_kit_seed(void *st, struct gen_state *g);
-bool parser_kit_feed(void *st, server *s, struct gen_state *g, size_t upto, bool final);
+bool parser_kit_feed(void *st, server *s, struct gen_state *g, GenOff upto, bool final);
 /// server_output_parser_ops::in_tool_call: inside a call's structure and not its payload.
 /// @param st  the kit state, or a probe (parser_kit_probe_new)
 /// @param g   unused
@@ -4694,7 +4701,7 @@ bool parser_kit_in_tool_call(const void *st, const struct gen_state *g);
 /// @param g    unused
 /// @param end  receives the offset where that turn ends: past the call and the family's call_tail
 /// @return true once that turn has ended
-bool parser_kit_turn_complete(const void *st, const struct gen_state *g, size_t *end);
+bool parser_kit_turn_complete(const void *st, const struct gen_state *g, GenOff *end);
 void parser_kit_tool_progress(const void *st, bool *opened, bool *closed);
 bool parser_kit_finish(void *st, server *s, struct session_slot *sl, struct gen_state *g, server_turn *out);
 void *parser_kit_probe_new(void *st);
@@ -4705,7 +4712,7 @@ void *parser_kit_probe_new(void *st);
 /// @param text   the generated text with the round's tokens so far
 /// @param len    its length
 /// @param upto   bytes the stop-string scan released
-void parser_kit_probe_feed(void *probe, const struct gen_state *g, const char *text, size_t len, size_t upto);
+void parser_kit_probe_feed(void *probe, const struct gen_state *g, const char *text, size_t len, GenOff upto);
 void parser_kit_probe_free(void *probe);
 
 /** Everything one in-flight generation needs, for the whole life of the
@@ -4792,11 +4799,11 @@ struct gen_state {
     /** decode attempt state (reset by GEN_DECODE_INIT) */
     buf text;                 ///< generated text so far, this attempt
     logprob_ledger logprobs;  ///< per-token target distributions; see the type
-    size_t plain_stream_pos;  ///< bytes of `text` already streamed to the client
+    GenOff plain_stream_pos;  ///< bytes of `text` already streamed to the client
     /** Where the stop-sequence scan resumes. A stop string can straddle a
      * chunk boundary, so the scan restarts behind the frontier rather than at
      * it, and this is that backed-up position. */
-    size_t stop_scan_from;
+    GenOff stop_scan_from;
     const char *finish;       ///< finish reason once known ("stop", "length", ...); NULL while running
     /// L378: how the job ended in the server's own words, for its `kv req:` line ("" until it ends; gen_kv_finish)
     char kv_finish[24];
@@ -4895,6 +4902,16 @@ struct gen_state {
  * PULSAR_SERVER_HEARTBEAT_MS). Returns true if one was written. Non-blocking
  * and idempotent-by-clock, so it is safe to call every worker pass. */
 bool gen_stream_heartbeat(gen_state *g);
+
+/** L437: the end of a generated text of `len` bytes, as an offset into it (where its next byte goes). */
+/// @param len  the text's length, bytes
+/// @return the offset one past its last byte
+static inline GenOff gen_text_end(size_t len) { return GenOff::after(GenBytes{len}); }
+/** L437: the bytes of a generated text from offset `at` -- where a GenOff indexes the buffer it is an offset of. */
+/// @param text  the generated text (gen_state::text's bytes, or a look ahead's view of them)
+/// @param at    an offset into it
+/// @return `text` at that offset
+static inline const char *gen_text_at(const char *text, GenOff at) { return text + at.raw(); }
 
 /** A parsed HTTP request line and body. Method and path are fixed-size because
  * anything longer than these bounds is rejected rather than allocated for. */
@@ -5012,7 +5029,7 @@ void chat_msg_add_tool_call_id(chat_msg *m, const char *id);
 /// @param bytes            the encoded file, ownership taken
 /// @param len              its length, bytes
 /// @param placeholder_off  the placeholder's byte offset in m->content
-void chat_msg_add_image(chat_msg *m, uint8_t *bytes, size_t len, size_t placeholder_off);
+void chat_msg_add_image(chat_msg *m, uint8_t *bytes, size_t len, ContentOff placeholder_off);
 /** L335: every image's placeholder sits at its recorded offset, the offsets ascending without overlap. */
 /// @param m       the message (its content, images_len and image_ph_off)
 /// @param err     receives the reason on false
@@ -5023,7 +5040,16 @@ bool chat_msg_image_offsets_check(const chat_msg *m, char *err, size_t errlen);
 /// @param m     the message
 /// @param off   the byte offset in m->content
 /// @param name  the tool named (copied; NULL = "")
-void chat_msg_add_tool_ref(chat_msg *m, size_t off, const char *name);
+void chat_msg_add_tool_ref(chat_msg *m, ContentOff off, const char *name);
+/** L437: the end of a content text of `len` bytes, as an offset into it (where a placeholder about to be appended
+ *  will sit). */
+/// @param len  the content's length so far, bytes
+/// @return the offset one past its last byte
+static inline ContentOff content_end(size_t len) { return ContentOff::after(TextBytes{len}); }
+/** L437: a content offset as the index the string functions under a reader take -- the ONE place it leaves its type. */
+/// @param at  an offset into a message's content
+/// @return it as a byte index
+static inline size_t content_ix(ContentOff at) { return at.raw(); }
 /** L325: drop the message's tool_reference records (chat_expand_tool_refs has written them). */
 /// @param m  the message
 void chat_msg_clear_tool_refs(chat_msg *m);
@@ -5549,14 +5575,14 @@ bool turn_tool_retry_allowed(const struct gen_state *g);
 /// @param broken  the family's reading found a broken call
 /// @param why  its detail (the retry's tool error)
 /// @param logged  the family already logged it
-/// @param tail_from  where the stream's unsent tail starts in g->text, bytes
+/// @param tail_from  where the stream's unsent tail starts in g->text (none(): the stream sent no text)
 /// @param ok  the family's stream status
 /// @param open_reasoning  L420: the turn ended inside its reasoning block: that reasoning as the family's content
 ///                        path reports text; NULL when the block closed (or the turn has none).  The turn then
 ///                        answers with it when turn_answers_with_reasoning says so
 /// @return the retry's result when one ran, else `ok`
 bool parser_finish_turn(server *s, struct session_slot *sl, struct gen_state *g, server_turn *out, bool broken,
-                        const char *why, bool logged, size_t tail_from, bool ok, const char *open_reasoning);
+                        const char *why, bool logged, GenOff tail_from, bool ok, const char *open_reasoning);
 /** L420: whether a turn that ended inside its reasoning block answers with that reasoning -- the ONE decision
  *  every family's parser and every protocol share (parser_finish_turn applies it).  All of: a chat turn; the
  *  reasoning never closed (`open_reasoning`) and holds more than whitespace; the model ended the turn with its
@@ -6379,9 +6405,9 @@ int gen_turn_draft_prefix_text(gen_state *g, const char *const *pieces, const si
 /// @param stop_pos  receives its offset
 /// @param stop_len  receives its length
 /// @return how far into `text` the stream may send, bytes (a stop string, a held stop prefix and a split UTF-8 sequence excluded)
-size_t gen_release(const stop_list *stops, const char *text, size_t len, const char *piece, size_t piece_len,
-                   size_t plain_stream_pos, thinking_state *thinking, size_t *stop_scan_from,
-                   bool *hit_stop, size_t *stop_pos, size_t *stop_len);
+GenOff gen_release(const stop_list *stops, const char *text, size_t len, const char *piece, size_t piece_len,
+                   GenOff plain_stream_pos, thinking_state *thinking, GenOff *stop_scan_from,
+                   bool *hit_stop, GenOff *stop_pos, size_t *stop_len);
 /** The request streams g->text raw as it is released. */
 /// @param g  the request's generation state
 /// @return true for a raw (plain) stream
@@ -6396,8 +6422,9 @@ void logprob_ledger_free(logprob_ledger *lg);
 void logprob_capture_session(logprob_ledger *lg, pulsar_session *sess, int token);
 void logprob_capture_row(logprob_ledger *lg, pulsar_session *sess, uint32_t row, int token);
 bool logprob_commit(logprob_ledger *lg, pulsar_engine *engine, int token,
-                    const char *piece, size_t piece_len, size_t end_off);
-int  logprob_stream_ready(const logprob_ledger *lg, size_t upto);
+                    const char *piece, size_t piece_len, GenOff end_off);
+int  logprob_stream_ready(const logprob_ledger *lg, GenOff upto);
+int  logprob_stream_all(const logprob_ledger *lg);
 /* The OpenAI logprobs object for ledger entries [from, to), leading comma
  * included (append_openai_timings_json's convention); nothing when the client
  * did not ask for logprobs. */
