@@ -4587,6 +4587,17 @@ static void test_disk_depth(void) {
     test_l334_prompt_held_across_a_seam();
 }
 
+/* L440: the host-only group the check tier runs (make prompt-offsets-gate): the rendered prompt's offsets and spans
+ * are the uint32 pair they replaced (layout, every operation and helper against the raw expression, the public slice
+ * and the kit's against the loop before L440), a part's spans land where its renderer says, and on a conversation of
+ * several messages with images and a tool reference each text's offsets convert to the next by the open-coded
+ * relation -- checked against the rendered bytes of the Qwen and DeepSeek renders (server_tests.cpp). */
+static void test_prompt_offsets(void) {
+    test_l440_prompt_offset_units();
+    test_l440_parts_land_where_the_renderer_says();
+    test_l440_message_offsets_shift_by_where_the_message_lands();
+}
+
 /* L430: the host-only group the check tier runs (make gen-host-gate): the generation path's host work that must not
  * change a decision -- a speculative round's look ahead against its reading before L430 on thousands of random turns
  * (server_tests.cpp), the per-position rule it implements against the plain lane's (L296), (L431) the
@@ -6969,6 +6980,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--driver-head-rows", "driver-head-rows", "the step's head list and its crossings: a span heads consecutive rows, a verify's head row is its step row by name, a run maps rows to positions (L334 P2b S7b)", test_driver_head_rows},
     {"--driver-context-bound", "driver-context-bound", "the driver's one context bound: a decode, eval or verify row at or past the pool's capacity is refused before the family's trunk (L375)", test_driver_context_bound},
     {"--spec-env", "spec-env", "PULSAR_SPEC_DEPTH / PULSAR_SPEC_TAU: one parse, an unparsable value refused by name at the open (L375)", test_spec_env},
+    {"--prompt-offsets", "prompt-offsets", "the rendered prompt's offsets and client spans against the uint32 pair they replaced: layout, arithmetic, slice / cut / place against the open-coded loops, and on a conversation with images and a tool reference each text's offsets against the rendered bytes (L440)", test_prompt_offsets},
     {"--gen-host", "gen-host", "the generation path's host work against its earlier reading, on random turns of every family: a speculative round's look ahead (greedy rows, the usable chain) answers the same and leaves the attempt as it was (L430); the stop-string scan finds the same stop at the same byte and releases the same text (L431)", test_gen_host},
     {"--disk-depth", "disk-depth", "a stored chain's depth against the request's own tokens, on cases where the two differ: the text walk, the lookup's end-of-prompt rule on a real store, the resume pick's rank, usage, the prefill progress line and the kv req fields (L434)", test_disk_depth},
     {"--kv-identity", "kv-identity", "the disk KV identity's weights and tokenizer words: the container content digest (stable across opens and copies, moved by a weight byte of the same layout, its sampling limit) and a store of another identity set aside and said once (L426)", test_kv_identity},
