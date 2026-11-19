@@ -447,7 +447,9 @@ bool chat_strip_image_markers(const chat_msg *m, chat_msg_images *out, char *err
     for (int k = 0; k < m->images_len; k++) {
         const size_t off = content_ix(m->image_ph_off[k]);
         out->content.append(c + at, off - at);
-        out->at.push_back((uint32_t)out->content.size());
+        /* L440: the ContentOff -> StrippedOff crossing -- image k sits where the content cut so far ends, which is its
+         * content offset less the k markers cut before it */
+        out->at.push_back(StrippedOff::after(TextBytes{out->content.size()}));
         at = off + ph;
     }
     out->content.append(c + at, n - at);

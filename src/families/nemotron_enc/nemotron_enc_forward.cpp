@@ -278,12 +278,12 @@ uint32_t max_tokens(const pulsar_engine *e) { return W(e)->shape.rope_orig_ctx; 
  *  @param spans  receives the byte range of the appended client text (ZWNJs included)
  *  @param text   the client text, NUL-terminated */
 void mark(std::string *out, std::vector<pulsar_text_span> *spans, const char *text) {
-    const uint32_t lo = (uint32_t)out->size();
+    const PromptOff lo = PromptOff::after(TextBytes{out->size()});
     for (const char *p = text; *p; p++) {
         out->push_back(*p);
         if (*p == '[' || *p == '<') out->append(ZWNJ);
     }
-    spans->push_back({lo, (uint32_t)out->size()});
+    spans->push_back({lo, PromptOff::after(TextBytes{out->size()})});
 }
 
 /** pulsar_family_encoder::render: the template's text for one input, tokenized with its client spans.

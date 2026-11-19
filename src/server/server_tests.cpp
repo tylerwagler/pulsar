@@ -3956,8 +3956,8 @@ static void test_qwen_tail_carries_a_tool_result_image(void) {
         TEST_ASSERT(lit != NULL && strstr(tail, PULSAR_IMAGE_PLACEHOLDER) == NULL);
         /* the literal is the template's, not the client's: no client range covers it */
         for (uint32_t k = 0; lit && k < tail_n; k++)
-            TEST_ASSERT(tail + tail_spans[k].hi <= lit ||
-                        tail + tail_spans[k].lo >= lit + strlen("<|vision_start|><|image_pad|><|vision_end|>"));
+            TEST_ASSERT(tail + tail_spans[k].hi.raw() <= lit ||
+                        tail + tail_spans[k].lo.raw() >= lit + strlen("<|vision_start|><|image_pad|><|vision_end|>"));
     }
     char *full_text = qwen_test_full_render(&full, false);
     char *prefix_text = qwen_test_full_render(&prefix, false);
@@ -6307,6 +6307,383 @@ static std::string l428_json(const std::string &s) {
     return out;
 }
 
+/* ---- L440: the rendered prompt's offsets (PromptOff, pulsar_text_span) and a renderer's input content (StrippedOff) */
+
+/* The span as it was before L440: the layout the typed one must keep, and the open-coded arithmetic it replaced. */
+struct l440_old_span {
+    uint32_t lo;
+    uint32_t hi;
+};
+static_assert(sizeof(pulsar_text_span) == sizeof(l440_old_span) && alignof(pulsar_text_span) == alignof(l440_old_span) &&
+                  offsetof(pulsar_text_span, lo) == offsetof(l440_old_span, lo) &&
+                  offsetof(pulsar_text_span, hi) == offsetof(l440_old_span, hi),
+              "L440: pulsar_text_span keeps the size, alignment and member offsets of the uint32 pair");
+static_assert(std::is_same_v<decltype(pulsar_text_span{}.lo), PromptOff> &&
+                  std::is_same_v<decltype(buf{}.span_lo), PromptOff> &&
+                  std::is_same_v<decltype(chat_msg_images{}.at), std::vector<StrippedOff>> &&
+                  std::is_same_v<decltype(qwen_msg_in{}.image_at), const StrippedOff *> &&
+                  std::is_same_v<decltype(nemotron_msg_in{}.image_at), const StrippedOff *> &&
+                  std::is_same_v<decltype(chat_msg{}.image_ph_off), ContentOff *>,
+              "L440: each text's offsets are declared in its own type");
+static_assert(!std::is_constructible_v<PromptOff, ContentOff> && !std::is_constructible_v<PromptOff, StrippedOff> &&
+                  !std::is_constructible_v<StrippedOff, ContentOff> && !std::is_constructible_v<PromptOff, GenOff> &&
+                  !std::is_constructible_v<PromptOff, StreamOff> && !std::is_constructible_v<PromptOff, BodyOff> &&
+                  !std::is_constructible_v<PromptOff, TextBytes> && !std::is_constructible_v<PromptOff, TokPos> &&
+                  !std::is_constructible_v<PromptOff, TokCount> && !std::is_constructible_v<PromptOff, TokId> &&
+                  !std::is_convertible_v<uint32_t, PromptOff> && !std::is_convertible_v<PromptOff, size_t> &&
+                  !std::is_assignable_v<PromptOff &, uint32_t> && !std::is_assignable_v<uint32_t &, PromptOff> &&
+                  !std::is_assignable_v<pulsar_text_span &, l440_old_span>,
+              "L440: a prompt offset is no other text's offset, no length, no token quantity and no bare integer");
+
+/* pulsar_text_spans_slice as it read before L440, on the raw pair. */
+static std::vector<l440_old_span> l440_ref_slice(const std::vector<l440_old_span> &spans, size_t skip, size_t len) {
+    std::vector<l440_old_span> out;
+    if (spans.empty() || !len) return out;
+    const size_t end = skip + len;
+    for (const l440_old_span &s : spans) {
+        size_t lo = s.lo, hi = s.hi;
+        if (hi <= skip || lo >= end) continue;
+        if (lo < skip) lo = skip;
+        if (hi > end) hi = end;
+        if (hi <= lo) continue;
+        out.push_back({(uint32_t)(lo - skip), (uint32_t)(hi - skip)});
+    }
+    return out;
+}
+
+static bool l440_same(const pulsar_text_span &a, const l440_old_span &b) {
+    return a.lo.raw() == b.lo && a.hi.raw() == b.hi && !memcmp(&a, &b, sizeof a);
+}
+
+/* The types are the uint32_t they replaced: every operation and every span helper computes what the raw expression
+ * did, wrap included; the bytes of a span are those of the pair. */
+static void test_l440_prompt_offset_units(void) {
+    const uint32_t vals[] = {0, 1, 2, 7, 4096, 1u << 20, 0x7fffffffu, 0xfffffff0u, UINT32_MAX};
+    for (uint32_t a : vals) {
+        TEST_ASSERT(PromptOff{a}.raw() == a && StrippedOff{a}.raw() == a && PromptOff{a}.before().raw() == a);
+        TEST_ASSERT(PromptOff::after(TextBytes{a}).raw() == a);
+        TEST_ASSERT(PromptOff::after(TextBytes{((uint64_t)1 << 32) + a}).raw() == (uint32_t)(((uint64_t)1 << 32) + a));
+        for (uint32_t b : vals) {
+            const PromptOff x{a}, y{b};
+            TEST_ASSERT((x < y) == (a < b) && (x <= y) == (a <= b) && (x > y) == (a > b) && (x >= y) == (a >= b));
+            TEST_ASSERT((x == y) == (a == b) && (x != y) == (a != b));
+            TEST_ASSERT((x + TextBytes{b}).raw() == (uint32_t)(a + b) && (x - TextBytes{b}).raw() == (uint32_t)(a - b));
+            TEST_ASSERT((x - y).raw() == (uint32_t)(a - b));
+            PromptOff z = x;
+            z += TextBytes{b};
+            TEST_ASSERT(z.raw() == (uint32_t)(a + b));
+            z -= TextBytes{b};
+            TEST_ASSERT(z == x);
+            const pulsar_text_span sp = pulsar_text_span::of(a, b);
+            const l440_old_span old = {a, b};
+            TEST_ASSERT(l440_same(sp, old));
+            TEST_ASSERT(sp.len().raw() == (uint32_t)(b - a) && sp.empty() == (b <= a));
+            for (uint32_t p : vals) {
+                TEST_ASSERT(sp.contains(PromptOff{p}) == (a <= p && p < b));
+                /* placed: {base + lo, base + hi} as chat_piece::add / buf_spans_carry wrote it */
+                const l440_old_span moved = {p + a, p + b};
+                TEST_ASSERT(l440_same(sp.placed(PromptOff{p}), moved));
+                /* cut_to: request.cpp's / server_jobs.cpp's loop body -- lo >= keep drops it, hi clips to keep */
+                for (uint64_t keep : {(uint64_t)p, (uint64_t)p + ((uint64_t)1 << 32)}) {
+                    pulsar_text_span cut = pulsar_text_span::of(77, 78);
+                    const bool kept = sp.cut_to(TextBytes{keep}, &cut);
+                    TEST_ASSERT(kept == !(a >= keep));
+                    l440_old_span want = old;
+                    if (want.hi > keep) want.hi = (uint32_t)keep;
+                    TEST_ASSERT(kept ? l440_same(cut, want) : l440_same(cut, l440_old_span{77, 78}));
+                }
+            }
+        }
+    }
+    TEST_ASSERT(PromptOff{}.raw() == 0 && StrippedOff{}.raw() == 0);   /* value-initialised: zero */
+    pulsar_text_span *z = (pulsar_text_span *)calloc(2, sizeof *z);     /* a zeroed array is spans at offset 0 */
+    TEST_ASSERT(z[1].lo == PromptOff{0} && z[1].hi == PromptOff{0} && z[1].empty());
+    free(z);
+
+    /* slice: the public pulsar_text_spans_slice and the kit's chat_piece::sub against the pre-L440 loop */
+    uint64_t rng = 0x4c343430u;
+    auto next = [&](uint32_t n) {
+        rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+        return (uint32_t)((rng >> 33) % n);
+    };
+    int sliced = 0;
+    for (int it = 0; it < 4000; it++) {
+        std::vector<l440_old_span> old;
+        std::vector<pulsar_text_span> typed;
+        uint32_t at = 0;
+        const int n = (int)next(6);
+        for (int i = 0; i < n; i++) {
+            const uint32_t lo = at + next(8), hi = lo + next(10);   /* ascending; empty ones included */
+            old.push_back({lo, hi});
+            typed.push_back(pulsar_text_span::of(lo, hi));
+            at = hi;
+        }
+        const size_t skip = next(40), len = it % 97 == 0 ? ((size_t)1 << 33) : next(50);
+        const std::vector<l440_old_span> want = l440_ref_slice(old, skip, len);
+        uint32_t got_n = 99;
+        pulsar_text_span *got =
+            pulsar_text_spans_slice(typed.data(), (uint32_t)typed.size(), TextBytes{skip}, TextBytes{len}, &got_n);
+        TEST_ASSERT(got_n == want.size() && (got != NULL) == !want.empty());
+        for (uint32_t i = 0; got && i < got_n; i++) TEST_ASSERT(l440_same(got[i], want[i]));
+        free(got);
+        sliced += (int)want.size();
+        /* the kit: a piece over a text of 64 bytes, cut to [skip, skip + len) -- its spans are the same slice (non-empty
+         * spans only: the kit's old loop dropped an empty span, as the slice does) */
+        chat_piece pc;
+        pc.s.assign(64, 'x');
+        pc.spans = typed;
+        const size_t lo = skip < 64 ? skip : 64, hi = lo + len < 64 ? lo + len : 64;
+        const chat_piece sub = pc.sub(lo, hi);
+        const std::vector<l440_old_span> sub_want = l440_ref_slice(old, lo, hi - lo);
+        TEST_ASSERT(sub.s.size() == hi - lo && sub.spans.size() == sub_want.size());
+        for (size_t i = 0; i < sub.spans.size() && i < sub_want.size(); i++) TEST_ASSERT(l440_same(sub.spans[i], sub_want[i]));
+    }
+    TEST_ASSERT(sliced > 1000);
+}
+
+/* The render buffers place a part's spans where the part lands: the kit's piece / writer and DeepSeek's buf, each
+ * against the open-coded `base + lo`, and the end of what is written against the `(uint32_t)size` it was. */
+static void test_l440_parts_land_where_the_renderer_says(void) {
+    TEST_ASSERT(prompt_end(std::string()) == PromptOff{0} && prompt_end(std::string("abcde")) == PromptOff{5});
+    chat_piece inner;
+    inner.lit("<a>");
+    inner.client("one");
+    inner.lit("|");
+    inner.client("two");
+    TEST_ASSERT(inner.spans.size() == 2 && l440_same(inner.spans[0], l440_old_span{3, 6}) &&
+                l440_same(inner.spans[1], l440_old_span{7, 10}));
+    chat_piece outer;
+    outer.lit("HEAD:");
+    outer.client("xy");                /* [5, 7) */
+    chat_piece abut;
+    abut.client("zz");                 /* [0, 2) of its own text: lands at 7 and abuts -> merges into [5, 9) */
+    outer.add(abut);
+    outer.add(inner);                  /* lands at 9: {9 + 3, 9 + 6}, {9 + 7, 9 + 10} */
+    TEST_ASSERT(outer.s == "HEAD:xyzz<a>one|two" && outer.spans.size() == 3);
+    TEST_ASSERT(l440_same(outer.spans[0], l440_old_span{5, 9}) && l440_same(outer.spans[1], l440_old_span{12, 15}) &&
+                l440_same(outer.spans[2], l440_old_span{16, 19}));
+    chat_render_out ro;
+    chat_writer w{&ro};
+    w.lit("<<");
+    w.client("c");
+    w.add(outer);                      /* lands at 3; its first span starts at 3 + 5 = 8, no abutment */
+    TEST_ASSERT(ro.text == "<<cHEAD:xyzz<a>one|two" && ro.spans.size() == 4);
+    for (size_t i = 0; i < 3; i++)
+        TEST_ASSERT(l440_same(ro.spans[i + 1], l440_old_span{3 + outer.spans[i].lo.raw(), 3 + outer.spans[i].hi.raw()}));
+    for (const pulsar_text_span &sp : ro.spans)   /* every span is the client bytes it names */
+        TEST_ASSERT(ro.text.find_first_not_of("cxyzonetw", sp.lo.raw()) >= sp.hi.raw());
+    const chat_piece trimmed = outer.sub(7, 14);   /* "zz<a>on": [5,9) -> [0,2), [12,15) -> [5,7), [16,19) gone */
+    TEST_ASSERT(trimmed.s == "zz<a>on" && trimmed.spans.size() == 2 && l440_same(trimmed.spans[0], l440_old_span{0, 2}) &&
+                l440_same(trimmed.spans[1], l440_old_span{5, 7}));
+
+    /* DeepSeek's buf: a region rendered on its own, carried behind 11 bytes; then a spanned text appended, its
+     * spans cut to the appended bytes and placed at the buffer's end */
+    buf region = {0}, out = {0};
+    buf_puts(&region, "ab");
+    buf_text_begin(&region);
+    buf_puts(&region, "CLIENT");
+    buf_text_begin(&region);            /* nested: the outer range is the one recorded */
+    buf_puts(&region, "!");
+    buf_text_end(&region);
+    buf_text_end(&region);
+    buf_text_begin(&region);            /* an empty range is dropped */
+    buf_text_end(&region);
+    TEST_ASSERT(region.n_spans == 1 && l440_same(region.spans[0], l440_old_span{2, 9}));
+    buf_puts(&out, "0123456789A");
+    buf_spans_carry(&out, &region, PromptOff::after(TextBytes{out.len}));
+    buf_puts(&out, region.ptr);
+    TEST_ASSERT(out.n_spans == 1 && l440_same(out.spans[0], l440_old_span{11 + 2, 11 + 9}) && region.spans == NULL);
+    TEST_ASSERT(!strncmp(out.ptr + out.spans[0].lo.raw(), "CLIENT!", out.spans[0].len().raw()));
+    const pulsar_text_span tail_spans[3] = {pulsar_text_span::of(1, 3), pulsar_text_span::of(4, 9),
+                                            pulsar_text_span::of(9, 12)};   /* the text has 6 bytes */
+    const size_t at = out.len;
+    buf_puts_spanned(&out, "tAIlXY", tail_spans, 3);
+    TEST_ASSERT(out.n_spans == 3 && l440_same(out.spans[1], l440_old_span{(uint32_t)at + 1, (uint32_t)at + 3}) &&
+                l440_same(out.spans[2], l440_old_span{(uint32_t)at + 4, (uint32_t)at + 6}));
+    buf_free(&region);
+    free(out.spans);
+    out.spans = NULL;
+    buf_free(&out);
+}
+
+/* A user message whose content is `parts` joined by the parser's image marker, one image a joint. */
+static chat_msg l440_image_msg(const char *role, const std::vector<std::string> &parts) {
+    std::string c;
+    chat_msg m = qwen_test_msg(role, "");
+    const int n = (int)parts.size() - 1;
+    m.images = (chat_image *)calloc((size_t)n, sizeof(chat_image));
+    m.image_ph_off = (ContentOff *)malloc((size_t)n * sizeof(ContentOff));
+    m.images_len = m.images_cap = n;
+    for (size_t i = 0; i < parts.size(); i++) {
+        c += parts[i];
+        if ((int)i < n) {
+            m.image_ph_off[i] = content_end(c.size());
+            c += PULSAR_IMAGE_PLACEHOLDER;
+        }
+    }
+    free(m.content);
+    m.content = server_xstrdup(c.c_str());
+    return m;
+}
+
+/* The four texts of one conversation and the relations between their offsets, on a conversation of several messages
+ * with images and a tool reference:
+ *   content -> stripped   (chat_strip_image_markers): image k's StrippedOff is its ContentOff less the k markers before
+ *                         it -- not the ContentOff for any image but a message's first;
+ *   stripped -> prompt    (the Qwen renderer): the message's text lands at a shift that differs message to message,
+ *                         and each image before a byte adds the template's literal;
+ *   content -> prompt     (DeepSeek's renderer, which keeps the marker): the same per-message shift, no per-image
+ *                         term;
+ *   and Nemotron-H's renderer, the other reader of StrippedOff, whose image text varies with the bytes around it.
+ * Each is checked against the bytes: the offset computed by the open-coded expression is where the rendered prompt
+ * holds the image's literal, the text runs between images are exactly the client spans, and no span contains an
+ * image. */
+static void test_l440_message_offsets_shift_by_where_the_message_lands(void) {
+    static const char kLit[] = "<|vision_start|><|image_pad|><|vision_end|>";
+    const size_t ph = strlen(PULSAR_IMAGE_PLACEHOLDER), lit = sizeof kLit - 1;
+    const std::vector<std::vector<std::string>> parts = {
+        {"Alpha one ", " then ", " end A."},       /* two images */
+        {"Beta ", " tail B."},                     /* one image, and a tool reference written at its front */
+        {"", "Gamma after."},                      /* an image at content offset 0 */
+    };
+    const pulsar_chat_format fmts[3] = {PULSAR_CHAT_QWEN, PULSAR_CHAT_DS4_V41, PULSAR_CHAT_NEMOTRON_H};
+    for (int family = 0; family < 3; family++) {
+        chat_conversation c = {};
+        c.tool_choice = CHAT_TOOL_CHOICE_AUTO;
+        chat_msgs_push(&c.msgs, qwen_test_msg("system", "Be terse."));
+        chat_msgs_push(&c.msgs, l440_image_msg("user", parts[0]));
+        chat_msgs_push(&c.msgs, qwen_test_msg("assistant", "Seen."));
+        chat_msgs_push(&c.msgs, l440_image_msg("user", parts[1]));
+        chat_msg_add_tool_ref(&c.msgs.v[3], content_end(0), "lookup");
+        chat_msgs_push(&c.msgs, qwen_test_msg("assistant", "Both."));
+        chat_msgs_push(&c.msgs, l440_image_msg("user", parts[2]));
+        request r;
+        test_request_init(&r, REQ_CHAT, 128);
+        r.api = API_OPENAI;
+        r.family = server_family_for_format(fmts[family]);
+        char err[200] = {0};
+        /* the tool reference becomes text at the front of message 3's content, and its image's ContentOff moves */
+        const ContentOff ph_before = c.msgs.v[3].image_ph_off[0];
+        TEST_ASSERT(chat_expand_tool_refs(&c, &r, err, sizeof err));
+        const char notice[] = "[tool available: lookup]";
+        TEST_ASSERT(!strncmp(c.msgs.v[3].content, notice, sizeof notice - 1));
+        TEST_ASSERT(c.msgs.v[3].image_ph_off[0] == ph_before + TextBytes{sizeof notice - 1});
+
+        /* content -> stripped, per message */
+        const int user_at[3] = {1, 3, 5};
+        std::vector<chat_msg_images> stripped(3);
+        std::vector<std::string> content(3);
+        std::vector<std::vector<size_t>> content_off(3);
+        for (int u = 0; u < 3; u++) {
+            const chat_msg *m = &c.msgs.v[user_at[u]];
+            content[(size_t)u] = m->content;
+            TEST_ASSERT(chat_strip_image_markers(m, &stripped[(size_t)u], err, sizeof err));
+            TEST_ASSERT((int)stripped[(size_t)u].at.size() == m->images_len);
+            for (int k = 0; k < m->images_len; k++) {
+                const size_t off = content_ix(m->image_ph_off[k]);
+                content_off[(size_t)u].push_back(off);
+                TEST_ASSERT(!strncmp(m->content + off, PULSAR_IMAGE_PLACEHOLDER, ph));
+                TEST_ASSERT(stripped[(size_t)u].at[(size_t)k].raw() == off - (size_t)k * ph);
+                if (k) TEST_ASSERT(stripped[(size_t)u].at[(size_t)k].raw() != off);   /* the two texts' offsets differ */
+            }
+            TEST_ASSERT(stripped[(size_t)u].content.find(PULSAR_IMAGE_PLACEHOLDER) == std::string::npos);
+        }
+
+        std::string text;
+        std::vector<pulsar_text_span> spans;
+        if (family != 1) {
+            const bool ok = render_chat_conversation(NULL, fmts[family], NULL, &c, &r, err, sizeof err);
+            if (!ok) fprintf(stderr, "l440: %s render refused: %s\n", r.family->name, err);
+            TEST_ASSERT(ok);
+            if (ok) {
+                text = r.prompt_text;
+                spans.assign(r.prompt_spans, r.prompt_spans + r.prompt_n_spans);
+            }
+        } else {
+            pulsar_text_span *sp = NULL;
+            uint32_t n_sp = 0;
+            char *t = render_chat_prompt_text_spans(&c.msgs, NULL, PULSAR_THINK_HIGH, true, &sp, &n_sp);
+            TEST_ASSERT(t != NULL);
+            if (t) {
+                text = t;
+                spans.assign(sp, sp + n_sp);
+            }
+            free(t);
+            free(sp);
+        }
+        std::vector<size_t> shift(3, 0);
+        for (int u = 0; u < 3 && !text.empty(); u++) {
+            const chat_msg_images &mi = stripped[(size_t)u];
+            /* where the message's text landed: its first non-empty run is unique in the prompt */
+            const std::string first = mi.at[0].raw() ? mi.content.substr(0, mi.at[0].raw()) : std::string();
+            const std::string probe = first.empty() ? mi.content : first;
+            const size_t found = text.find(probe);
+            TEST_ASSERT(found != std::string::npos && text.find(probe, found + 1) == std::string::npos);
+            if (found == std::string::npos) continue;
+            /* the offset of the message's byte 0 in the prompt (an image at offset 0 renders before the probe) */
+            const size_t marker = family == 0 ? lit : ph;
+            shift[(size_t)u] = first.empty() ? found - marker : found;
+            const size_t n_img = mi.at.size();
+            if (family == 2) {
+                /* Nemotron-H's template writes a newline and a numbered tag around its image literal, so there is
+                 * no one formula: each run of the stripped content, cut at the StrippedOffs, is found where it
+                 * landed and is exactly one client span */
+                for (size_t k = 0; k <= n_img; k++) {
+                    const size_t s_lo = k ? mi.at[k - 1].raw() : 0, s_hi = k < n_img ? mi.at[k].raw() : mi.content.size();
+                    if (s_hi == s_lo) continue;
+                    const size_t run = text.find(mi.content.substr(s_lo, s_hi - s_lo));
+                    TEST_ASSERT(run != std::string::npos);
+                    int exact = 0;
+                    for (const pulsar_text_span &sp : spans)
+                        if (sp.lo == PromptOff{run} && sp.len() == TextBytes{s_hi - s_lo}) exact++;
+                    TEST_ASSERT(exact == 1);
+                }
+                continue;
+            }
+            for (size_t k = 0; k <= n_img; k++) {
+                /* the open-coded conversions: stripped -> prompt adds the shift and k literals (Qwen); content ->
+                 * prompt adds the shift alone (DeepSeek keeps the markers, so the content's own offsets hold) */
+                auto prompt_at = [&](size_t kk) {
+                    return family == 0 ? shift[(size_t)u] + mi.at[kk].raw() + kk * lit
+                                       : shift[(size_t)u] + content_off[(size_t)u][kk];
+                };
+                if (prompt_at(k < n_img ? k : n_img - 1) + marker > text.size()) {   /* a conversion that left the text */
+                    TEST_ASSERT(false);
+                    break;
+                }
+                auto s_hi_of = [&](size_t kk) { return kk < n_img ? (size_t)mi.at[kk].raw() : mi.content.size(); };
+                if (k < n_img) {
+                    const size_t img = prompt_at(k);
+                    TEST_ASSERT(!text.compare(img, marker, family == 0 ? kLit : PULSAR_IMAGE_PLACEHOLDER));
+                    for (const pulsar_text_span &sp : spans)   /* an image is the template's, never client data */
+                        for (size_t b = 0; b < marker; b++) TEST_ASSERT(!sp.contains(PromptOff{img + b}));
+                }
+                /* the text run before image k (or after the last): exactly one client span */
+                const size_t run_lo = k ? prompt_at(k - 1) + marker : shift[(size_t)u];
+                const size_t run_hi = k < n_img ? prompt_at(k)
+                                                : shift[(size_t)u] + (family == 0 ? mi.content.size() + n_img * lit
+                                                                                  : content[(size_t)u].size());
+                if (run_hi == run_lo) continue;   /* an image at the content's first byte: no run before it */
+                if (run_hi < run_lo || run_hi > text.size() || s_hi_of(k) > mi.content.size()) {
+                    TEST_ASSERT(false);
+                    break;
+                }
+                int exact = 0;
+                for (const pulsar_text_span &sp : spans)
+                    if (sp.lo == PromptOff{run_lo} && sp.hi == PromptOff{run_hi}) exact++;
+                TEST_ASSERT(exact == 1);
+                const size_t s_lo = k ? mi.at[k - 1].raw() : 0, s_hi = s_hi_of(k);
+                TEST_ASSERT(!text.compare(run_lo, run_hi - run_lo, mi.content, s_lo, s_hi - s_lo));
+            }
+        }
+        /* the shift is the message's own: a content offset is no prompt offset, and no one constant converts them */
+        TEST_ASSERT(shift[0] > 0 && shift[1] > shift[0] && shift[2] > shift[1]);
+        TEST_ASSERT(shift[1] - shift[0] != shift[2] - shift[1]);
+        request_free(&r);
+        chat_conversation_free(&c);
+    }
+}
+
 /* L437: the types are the size_t they replaced -- every operation computes what the raw expression did. */
 static void test_l437_offset_units(void) {
     const size_t vals[] = {0, 1, 2, 7, 4096, 1u << 20, (size_t)1 << 40, SIZE_MAX / 2};
@@ -8045,7 +8422,7 @@ static void test_inkling_effort_map(void) {
     TEST_ASSERT(effort_case(PULSAR_CHAT_INKLING, EFFORT_BODY(""), &r, err, sizeof err));
     TEST_ASSERT(!strcmp(r.prompt_text, "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>"
                                        "<|message_user|><|content_text|>x<|end_message|><|message_model|>"));
-    TEST_ASSERT(r.prompt_n_spans == 1 && r.prompt_spans[0].hi - r.prompt_spans[0].lo == 1);
+    TEST_ASSERT(r.prompt_n_spans == 1 && r.prompt_spans[0].len() == TextBytes{1});
     request_free(&r);
 }
 
@@ -8297,7 +8674,7 @@ static void test_nemotron_effort_map(void) {
     TEST_ASSERT(effort_case(PULSAR_CHAT_NEMOTRON_H, EFFORT_BODY(""), &r, err, sizeof err));
     TEST_ASSERT(!strcmp(r.prompt_text, "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nx<|im_end|>\n"
                                        "<|im_start|>assistant\n<think>\n"));
-    TEST_ASSERT(r.prompt_n_spans == 1 && r.prompt_spans[0].hi - r.prompt_spans[0].lo == 1);
+    TEST_ASSERT(r.prompt_n_spans == 1 && r.prompt_spans[0].len() == TextBytes{1});
     request_free(&r);
 }
 
@@ -8495,8 +8872,8 @@ static void test_nemotron_refusals(void) {
         const char *lit = r.prompt_text ? strstr(r.prompt_text, "<img>") : NULL;
         bool outside = lit != NULL;
         for (uint32_t i = 0; lit && i < r.prompt_n_spans; i++)
-            outside &= !(r.prompt_spans[i].lo < (uint32_t)(lit - r.prompt_text) + 18u &&
-                         r.prompt_spans[i].hi > (uint32_t)(lit - r.prompt_text));
+            outside &= !(r.prompt_spans[i].lo.raw() < (uint32_t)(lit - r.prompt_text) + 18u &&
+                         r.prompt_spans[i].hi.raw() > (uint32_t)(lit - r.prompt_text));
         TEST_ASSERT(outside);
         request_free(&r);
         chat_conversation_free(&c);
@@ -8518,8 +8895,8 @@ static void test_nemotron_refusals(void) {
         bool typed_in = false, lit_out = lit != NULL;
         for (uint32_t i = 0; typed && lit && i < r.prompt_n_spans; i++) {
             const uint32_t t0 = (uint32_t)(typed - r.prompt_text) + 4u, l0 = (uint32_t)(lit - r.prompt_text);
-            typed_in |= r.prompt_spans[i].lo <= t0 && r.prompt_spans[i].hi >= t0 + 7u;
-            lit_out &= !(r.prompt_spans[i].lo < l0 + 18u && r.prompt_spans[i].hi > l0);
+            typed_in |= r.prompt_spans[i].lo.raw() <= t0 && r.prompt_spans[i].hi.raw() >= t0 + 7u;
+            lit_out &= !(r.prompt_spans[i].lo.raw() < l0 + 18u && r.prompt_spans[i].hi.raw() > l0);
         }
         TEST_ASSERT(typed_in && lit_out);
         request_free(&r);
@@ -8581,7 +8958,7 @@ static void test_gemma4_effort_map(void) {
     TEST_ASSERT(effort_case(PULSAR_CHAT_GEMMA4, EFFORT_BODY(""), &r, err, sizeof err));
     TEST_ASSERT(r.family_effort == 1 && r.think_mode == PULSAR_THINK_DEFAULT);
     TEST_ASSERT(!strcmp(r.prompt_text, "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nx<turn|>\n<|turn>model\n"));
-    TEST_ASSERT(r.prompt_n_spans == 1 && r.prompt_spans[0].hi - r.prompt_spans[0].lo == 1);
+    TEST_ASSERT(r.prompt_n_spans == 1 && r.prompt_spans[0].len() == TextBytes{1});
     request_free(&r);
     static const char *const off[] = {",\"reasoning_effort\":\"none\"",
                                       ",\"chat_template_kwargs\":{\"enable_thinking\":false}"};
@@ -9337,7 +9714,7 @@ static void test_live_tail_joins_before_a_committed_stop(void) {
         const uint32_t at = (uint32_t)strlen(prompt);
         const std::string live_text = std::string(prompt) + turn;
         std::vector<chat_text_span> live_spans = prompt_spans;
-        for (uint32_t i = 0; i < turn_n; i++) live_spans.push_back({turn_spans[i].lo + at, turn_spans[i].hi + at});
+        for (uint32_t i = 0; i < turn_n; i++) live_spans.push_back(pulsar_text_span::of(turn_spans[i].lo.raw() + at, turn_spans[i].hi.raw() + at));
         const std::vector<int> sampled = qwen_test_encode(tok, live_text.c_str(), live_spans.data(), live_spans.size());
         const std::vector<int> tail_toks = qwen_test_encode(tok, tail, tail_spans, tail_n);
         const std::vector<int> want = qwen_test_encode(tok, want_text, full_spans.data(), full_spans.size());
@@ -10461,7 +10838,7 @@ static void test_multi_image_blocks_and_offsets(void) {
                     const uint32_t lo = (uint32_t)(q - text);
                     bool inside = false;
                     for (uint32_t i = 0; i < n_spans; i++) {
-                        if (spans[i].lo <= lo && spans[i].hi >= lo + (uint32_t)ph_len) inside = true;
+                        if (spans[i].lo.raw() <= lo && spans[i].hi.raw() >= lo + (uint32_t)ph_len) inside = true;
                     }
                     if (inside) spanned++; else unspanned++;
                 }
@@ -10553,7 +10930,7 @@ static void test_image_placeholder_is_not_client_text(void) {
                 for (uint32_t i = 0; i < n_spans; i++) {
                     /* No span may overlap the parser's placeholder: it must be
                      * resolvable to the image token. */
-                    TEST_ASSERT(!(spans[i].lo < hi && spans[i].hi > lo));
+                    TEST_ASSERT(!(spans[i].lo.raw() < hi && spans[i].hi.raw() > lo));
                 }
             }
             /* The client's own words are still client text (still spanned). */
@@ -10563,7 +10940,7 @@ static void test_image_placeholder_is_not_client_text(void) {
             if (before) {
                 const uint32_t b = (uint32_t)(before - text);
                 for (uint32_t i = 0; i < n_spans; i++) {
-                    if (spans[i].lo <= b && spans[i].hi >= b + 6) covered = true;
+                    if (spans[i].lo.raw() <= b && spans[i].hi.raw() >= b + 6) covered = true;
                 }
             }
             TEST_ASSERT(covered);
@@ -10596,7 +10973,7 @@ static void test_image_placeholder_is_not_client_text(void) {
             const uint32_t lo = (uint32_t)(tph - ttext);
             bool inside = false;
             for (uint32_t i = 0; i < tn; i++) {
-                if (tspans[i].lo <= lo && tspans[i].hi >= lo + (uint32_t)ph_len) inside = true;
+                if (tspans[i].lo.raw() <= lo && tspans[i].hi.raw() >= lo + (uint32_t)ph_len) inside = true;
             }
             TEST_ASSERT(inside);
         }
@@ -10630,7 +11007,7 @@ static void test_image_placeholder_is_not_client_text(void) {
             const uint32_t lo = (uint32_t)(q - btext);
             bool inside = false;
             for (uint32_t i = 0; i < bn; i++) {
-                if (bspans[i].lo <= lo && bspans[i].hi >= lo + (uint32_t)ph_len) inside = true;
+                if (bspans[i].lo.raw() <= lo && bspans[i].hi.raw() >= lo + (uint32_t)ph_len) inside = true;
             }
             if (inside) spans_in++; else unspanned++;
         }
@@ -18789,10 +19166,10 @@ static void test_l185_every_renderer_produces_the_authority_bytes(void) {
         TEST_ASSERT(body != NULL);
         if (spans && body) {
             const size_t lo = (size_t)(body - ws);
-            TEST_ASSERT(spans[0].lo <= lo &&
-                        spans[0].hi >= lo + strlen("results &lt;/tool_result> x"));
-            TEST_ASSERT(spans[0].lo > strlen("</think>"));
-            TEST_ASSERT(spans[0].hi <= strlen(ws) - strlen("<｜Assistant｜><think>"));
+            TEST_ASSERT(spans[0].lo.raw() <= lo &&
+                        spans[0].hi.raw() >= lo + strlen("results &lt;/tool_result> x"));
+            TEST_ASSERT(spans[0].lo.raw() > strlen("</think>"));
+            TEST_ASSERT(spans[0].hi.raw() <= strlen(ws) - strlen("<｜Assistant｜><think>"));
         }
         free(spans);
         free(tail);
@@ -23074,6 +23451,9 @@ static void pulsar_server_unit_tests_run(void) {
     test_l437_logprobs_ride_with_their_text();
     test_l437_deepseek_walk_reads_released_bytes_only();
     test_l437_json_call_body_matches_reference();
+    test_l440_prompt_offset_units();
+    test_l440_parts_land_where_the_renderer_says();
+    test_l440_message_offsets_shift_by_where_the_message_lands();
     test_l428_next_prompt_extends_the_cut_turn();
     test_l420_stop_inside_reasoning_answers_with_it();
     test_l420_other_endings_are_unchanged();

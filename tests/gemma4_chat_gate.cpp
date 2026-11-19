@@ -152,7 +152,7 @@ static std::string spans_text(const std::vector<pulsar_text_span> &spans) {
     std::string s;
     char b[32];
     for (size_t i = 0; i < spans.size(); i++) {
-        snprintf(b, sizeof b, "%s%u-%u", i ? "," : "", spans[i].lo, spans[i].hi);
+        snprintf(b, sizeof b, "%s%u-%u", i ? "," : "", spans[i].lo.raw(), spans[i].hi.raw());
         s += b;
     }
     return s;
@@ -163,7 +163,7 @@ static std::vector<pulsar_text_span> message_spans(const std::string &text, cons
     const size_t lo = text.find("<|tool>"), hi = text.rfind("<tool|>");
     std::vector<pulsar_text_span> out;
     for (const auto &s : spans)
-        if (lo == std::string::npos || hi == std::string::npos || s.hi <= lo || s.lo >= hi) out.push_back(s);
+        if (lo == std::string::npos || hi == std::string::npos || s.hi.raw() <= lo || s.lo.raw() >= hi) out.push_back(s);
     return out;
 }
 

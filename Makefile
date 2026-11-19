@@ -705,6 +705,13 @@ kv-identity-gate: pulsar_test
 disk-depth-gate: pulsar_test
 	./pulsar_test --disk-depth
 
+# L440: the rendered prompt's offsets and client-data spans (pulsar_test --prompt-offsets; host-only, no model): the
+# typed span is the uint32 pair it replaced, its helpers compute what the open-coded loops did, and a conversation with
+# images and a tool reference renders each image where the per-message conversion says (Qwen and DeepSeek renders).
+.PHONY: prompt-offsets-gate
+prompt-offsets-gate: pulsar_test
+	./pulsar_test --prompt-offsets
+
 # L430: the generation path's host work against its earlier reading (pulsar_test --gen-host; host-only, no model): a
 # speculative round's look ahead -- which rows are a call's structure, where a single-call turn's chain ends -- on
 # thousands of random turns of every family, against the walks as they were (tests/gen_host_ref.h); and (L431) the
@@ -1281,7 +1288,7 @@ QWEN_RENDER_CASES ?= $(call need_path,QWEN_RENDER_CASES)
 QWEN_CALIB ?= $(call need_path,QWEN_CALIB)
 QWEN_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/families/qwen/qwen_chat.cpp src/families/qwen/qwen_output.cpp src/lib/out_parse_kit.cpp
 tests/qwen_chat_gate: tests/qwen_chat_gate.cpp tests/bpe_gate_util.h $(QWEN_CHAT_SRCS) src/lib/bpe_tokenizer.h \
-                      src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/families/qwen/qwen_chat.h src/lib/out_parse_kit.h src/lib/md_code_scan.h src/lib/xml_call_body.h src/lib/pulsar_utf8.h src/lib/chat_refuse.h \
+                      src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/families/qwen/qwen_chat.h src/lib/chat_render_kit.h src/lib/out_parse_kit.h src/lib/md_code_scan.h src/lib/xml_call_body.h src/lib/pulsar_utf8.h src/lib/chat_refuse.h \
                       src/lib/sha1.hpp tests/xml_call_body_ref.h Makefile
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/lib -o $@ tests/qwen_chat_gate.cpp $(QWEN_CHAT_SRCS)
 .PHONY: qwen-chat-gate

@@ -270,6 +270,12 @@ overlap = true
 budget = 60   # L434: host walks and one store in /tmp; seconds
 
 [[test]]
+name = "prompt-offsets-gate"
+tier = "check"
+overlap = true
+budget = 60   # L440: host arithmetic and two renders of one conversation; seconds
+
+[[test]]
 name = "gen-host-gate"
 tier = "check"
 overlap = true

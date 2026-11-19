@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "chat_refuse.h"
+#include "chat_render_kit.h"
 #include "pulsar_utf8.h"
 
 /* ---- effort ---------------------------------------------------------------- */
@@ -109,9 +110,9 @@ struct writer {
     /// @param s the client's text (nothing is recorded when empty)
     void client(const std::string &s) {
         if (s.empty()) return;
-        const uint32_t lo = (uint32_t)out->text.size();
+        const PromptOff lo = prompt_end(out->text);
         out->text += s;
-        out->spans.push_back({lo, (uint32_t)out->text.size()});
+        out->spans.push_back({lo, prompt_end(out->text)});
     }
 };
 
@@ -222,7 +223,8 @@ void content_with_images(writer &w, const qwen_msg_in &m) {
     std::vector<std::pair<size_t, size_t>> lits;   /* the literals' ranges in r */
     size_t at = 0;
     for (int k = 0; k < m.n_images; k++) {
-        const size_t off = m.image_at[k] < n ? m.image_at[k] : n;
+        const size_t at_k = m.image_at[k].raw();   /* L440: an index into `c`, the content this renderer was handed */
+        const size_t off = at_k < n ? at_k : n;
         r.append(c + at, off - at);
         lits.push_back({r.size(), r.size() + sizeof kVisionLiteral - 1});
         r += kVisionLiteral;

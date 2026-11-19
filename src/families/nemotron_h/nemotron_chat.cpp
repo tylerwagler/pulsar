@@ -230,7 +230,8 @@ void write_content(writer &w, const nemotron_msg_in &m) {
     bool after_text = false;
     char last = 0;   /* the content so far's last byte (render_content's content_ns.val) */
     for (int k = 0; k < m.n_images; k++) {
-        const size_t off = m.image_at[k] < c.size() ? m.image_at[k] : c.size();
+        const size_t at_k = m.image_at[k].raw();   /* L440: an index into `c`, the content this renderer was handed */
+        const size_t off = at_k < c.size() ? at_k : c.size();
         if (off > at) {
             w.client(c.substr(at, off - at));
             last = c[off - 1];

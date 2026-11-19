@@ -18,30 +18,34 @@
  * (a depth counter and the outermost start) and a range that emitted nothing is
  * dropped, so the list is disjoint and ascending -- which is what the tokeniser's
  * single forward pass relies on. */
+/** Where the next byte appended to `b` lands (L440): this renderer's one conversion from what it has written to an
+ *  offset of the rendered text (prompt_end() for the kit renderers' strings).
+ *  @param b the prompt buffer */
+/// @return the offset just past its bytes
+static PromptOff buf_end(const buf *b) { return PromptOff::after(TextBytes{b->len}); }
+
 void buf_text_begin(buf *b) {
     if (!b) return;
-    if (!b->span_open) b->span_lo = (uint32_t)b->len;
+    if (!b->span_open) b->span_lo = buf_end(b);
     b->span_open++;
 }
 
 void buf_text_end(buf *b) {
     if (!b || !b->span_open) return;
     if (--b->span_open) return;             /* an inner range closed; keep the outer open */
-    const uint32_t lo = b->span_lo;
-    const uint32_t hi = (uint32_t)b->len;
-    if (hi <= lo) return;
+    const chat_text_span sp = {b->span_lo, buf_end(b)};
+    if (sp.empty()) return;
     if (b->n_spans == b->cap_spans) {
         const uint32_t cap = b->cap_spans ? b->cap_spans * 2u : 16u;
         chat_text_span *grown = (chat_text_span *)server_xrealloc(b->spans, (size_t)cap * sizeof *grown);
         b->spans = grown;
         b->cap_spans = cap;
     }
-    b->spans[b->n_spans].lo = lo;
-    b->spans[b->n_spans].hi = hi;
+    b->spans[b->n_spans] = sp;
     b->n_spans++;
 }
 
-void buf_spans_carry(buf *dst, buf *src, size_t offset) {
+void buf_spans_carry(buf *dst, buf *src, PromptOff at) {
     if (!dst || !src || !src->n_spans) { if (src) { free(src->spans); src->spans = NULL; src->n_spans = src->cap_spans = 0; } return; }
     for (uint32_t i = 0; i < src->n_spans; i++) {
         if (dst->n_spans == dst->cap_spans) {
@@ -50,8 +54,7 @@ void buf_spans_carry(buf *dst, buf *src, size_t offset) {
             dst->spans = grown;
             dst->cap_spans = cap;
         }
-        dst->spans[dst->n_spans].lo = (uint32_t)offset + src->spans[i].lo;
-        dst->spans[dst->n_spans].hi = (uint32_t)offset + src->spans[i].hi;
+        dst->spans[dst->n_spans] = src->spans[i].placed(at);
         dst->n_spans++;
     }
     free(src->spans);
@@ -62,21 +65,21 @@ void buf_spans_carry(buf *dst, buf *src, size_t offset) {
 void buf_puts_spanned(buf *dst, const char *text, const pulsar_text_span *spans,
                       uint32_t n_spans) {
     if (!dst || !text) return;
-    const size_t at = dst->len;
+    const PromptOff at = buf_end(dst);
+    const size_t before = dst->len;
     buf_puts(dst, text);
-    const size_t appended = dst->len - at;
+    const TextBytes appended{dst->len - before};
     for (uint32_t i = 0; i < n_spans; i++) {
-        if (spans[i].lo >= appended) continue;      /* past the appended bytes */
-        const uint32_t hi = spans[i].hi > appended ? (uint32_t)appended : spans[i].hi;
-        if (hi <= spans[i].lo) continue;
+        pulsar_text_span sp;
+        if (!spans[i].cut_to(appended, &sp)) continue;      /* past the appended bytes */
+        if (sp.empty()) continue;
         if (dst->n_spans == dst->cap_spans) {
             const uint32_t cap = dst->cap_spans ? dst->cap_spans * 2u : 16u;
             chat_text_span *grown = (chat_text_span *)server_xrealloc(dst->spans, (size_t)cap * sizeof *grown);
             dst->spans = grown;
             dst->cap_spans = cap;
         }
-        dst->spans[dst->n_spans].lo = (uint32_t)at + spans[i].lo;
-        dst->spans[dst->n_spans].hi = (uint32_t)at + hi;
+        dst->spans[dst->n_spans] = sp.placed(at);
         dst->n_spans++;
     }
 }
@@ -765,7 +768,7 @@ char *render_chat_prompt_text_spans(const chat_msgs *msgs, const char *tool_sche
             if (system.len) buf_puts(&tools_first, "\n\n");
             /* V4 renders the schemas FIRST; the system content moves behind
              * them, so its ranges shift by the tools text's length. */
-            buf_spans_carry(&tools_first, &system, tools_first.len);
+            buf_spans_carry(&tools_first, &system, buf_end(&tools_first));
             buf_append(&tools_first, system.ptr, system.len);
             buf_free(&system);
             system = tools_first;
@@ -785,7 +788,7 @@ char *render_chat_prompt_text_spans(const chat_msgs *msgs, const char *tool_sche
     if (v41 && (effort[0] || system.len)) buf_puts(&out, PULSAR_RENDER_SYSTEM);
     buf_puts(&out, effort);
     /* The system region's client ranges land after everything written so far. */
-    buf_spans_carry(&out, &system, out.len);
+    buf_spans_carry(&out, &system, buf_end(&out));
     buf_puts(&out, system.ptr ? system.ptr : "");
 
     for (int i = 0; i < msgs->len; i++) {

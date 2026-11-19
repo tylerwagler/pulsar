@@ -86,7 +86,7 @@ static std::vector<int> json_ids(const pyjson_value &v) {
 
 static std::vector<pulsar_text_span> json_spans(const pyjson_value &v) {
     std::vector<pulsar_text_span> spans;
-    for (const auto &x : v.a) spans.push_back({(uint32_t)atoi(x.a[0].num.c_str()), (uint32_t)atoi(x.a[1].num.c_str())});
+    for (const auto &x : v.a) spans.push_back(pulsar_text_span::of((uint32_t)atoi(x.a[0].num.c_str()), (uint32_t)atoi(x.a[1].num.c_str())));
     return spans;
 }
 

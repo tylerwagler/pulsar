@@ -140,7 +140,7 @@ static std::string spans_text(const std::vector<pulsar_text_span> &spans) {
     std::string s;
     char b[32];
     for (size_t i = 0; i < spans.size(); i++) {
-        snprintf(b, sizeof b, "%s%u-%u", i ? "," : "", spans[i].lo, spans[i].hi);
+        snprintf(b, sizeof b, "%s%u-%u", i ? "," : "", spans[i].lo.raw(), spans[i].hi.raw());
         s += b;
     }
     return s;
@@ -151,7 +151,7 @@ static std::vector<pulsar_text_span> message_spans(const std::string &text, cons
     const size_t lo = text.find("# Tools\n\nYou have access"), hi = text.find("</IMPORTANT>");
     std::vector<pulsar_text_span> out;
     for (const auto &s : spans)
-        if (lo == std::string::npos || hi == std::string::npos || s.hi <= lo || s.lo >= hi) out.push_back(s);
+        if (lo == std::string::npos || hi == std::string::npos || s.hi.raw() <= lo || s.lo.raw() >= hi) out.push_back(s);
     return out;
 }
 
@@ -870,7 +870,7 @@ static void r3_images(const bpe_tokenizer *t, const std::string &dir) {
         conv cv;
         build_conv(*c.get("messages"), NULL, &cv);
         std::deque<std::string> joined;
-        std::vector<std::vector<uint32_t>> at(cv.msgs.size());
+        std::vector<std::vector<StrippedOff>> at(cv.msgs.size());
         bool other_part = false;
         for (size_t i = 0; i < cv.msgs.size(); i++) {
             const pyjson_value *content = c.get("messages")->a[i].get("content");
@@ -879,7 +879,7 @@ static void r3_images(const bpe_tokenizer *t, const std::string &dir) {
             for (const auto &p : content->a) {
                 const std::string &ty = p.get("type")->s;
                 if (ty == "text") s += p.get("text")->s;
-                else if (ty == "image") at[i].push_back((uint32_t)s.size());
+                else if (ty == "image") at[i].push_back(StrippedOff::after(TextBytes{s.size()}));
                 else other_part = true;
             }
             joined.push_back(s);

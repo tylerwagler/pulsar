@@ -17,6 +17,13 @@
 #include "pulsar.h"
 #include "pyjson.h"
 
+/** Where the next byte appended to a render lands (L440): the renderer's one conversion from what it has written to
+ *  an offset of the rendered text.  A span of client data runs from here to the same place after the write; a
+ *  part's spans are placed here (pulsar_text_span::placed) when the part is appended.
+ *  @param text the text written so far */
+/// @return the offset just past it
+inline PromptOff prompt_end(const std::string &text) { return PromptOff::after(TextBytes{text.size()}); }
+
 /// A render's result: the prompt text and the client-data span map.
 struct chat_render_out {
     /// The rendered text (UTF-8; at most UINT32_MAX bytes, else prompt_too_large).
@@ -37,7 +44,7 @@ struct chat_piece {
     /// Append client data, recording its span.
     /// @param t the client's text (nothing is recorded when empty)
     void client(const std::string &t);
-    /// Append another piece, its spans rebased (an abutting span merges).
+    /// Append another piece, its spans placed where it lands (an abutting span merges).
     /// @param p the piece
     void add(const chat_piece &p);
     /// @param lo the first byte kept

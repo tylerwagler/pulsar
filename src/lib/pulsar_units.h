@@ -541,10 +541,10 @@ static_assert(sizeof(TensorBytes) == sizeof(uint64_t) && std::is_trivial<TensorB
  * The rules are the P1 ones: no implicit conversion, arithmetic and ordering only within the unit (uint64_t's), .raw()
  * where the bytes leave the type system (a memcmp / memcpy, a hash's update, a printf, a file offset).  A token
  * position or count never becomes a byte length: the two meet only where a chain is checked (a stored text_end against
- * the length its G tokens render to).  pulsar_text_span {lo, hi} (pulsar.h) stays a renderer's uint32 pair; a span
- * built from TextBytes crosses with .raw().  Out of scope: a segment file's header / payload / trailer offsets (the
- * file format's arithmetic, HDR + text_len + payload via .raw()), byte offsets inside the tokenizer and BPE, JSON body
- * offsets. */
+ * the length its G tokens render to).  A renderer's client-data span (pulsar_text_span, below) holds offsets of its
+ * own type since L440 (PromptOff); a length enters one by name (PromptOff::after).  Out of scope: a segment file's
+ * header / payload / trailer offsets (the file format's arithmetic, HDR + text_len + payload via .raw()), byte offsets
+ * inside the tokenizer and BPE, JSON body offsets. */
 /** Tag of TextBytes (never instantiated). */
 struct pulsar_text_bytes_tag;
 /** Bytes of rendered text: a length, or an offset from byte 0 (the length up to it) (L334 P7). */
@@ -828,8 +828,8 @@ static_assert(sizeof(pulsar_indexed<uint32_t, TrunkLayer, 7>) == sizeof(uint32_t
  *               the content is later copied into, nor of the content a family renderer is handed with its markers
  *               stripped.
  *
- * The rendered prompt's own offsets stay as L334 P7 left them: TextBytes where a chain's or a prompt's text is
- * measured, and the renderer's pulsar_text_span {lo, hi} uint32 pair, which the engine's tokenizers read. */
+ * The rendered prompt's own offsets: TextBytes where a chain's or a prompt's text is measured (L334 P7), and the
+ * renderer's pulsar_text_span {lo, hi}, typed in the L440 section below. */
 
 /** Tag of GenBytes (never instantiated). */
 struct pulsar_gen_bytes_tag;
@@ -984,7 +984,7 @@ static_assert(sizeof(ContentOff) == sizeof(size_t) && std::is_trivial<ContentOff
               "a message content's offset is no offset of generated text and no length, and enters by name only");
 /* ==== L437: offsets into the texts of the OUTPUT path (end) ======================================================== */
 
-/* ==== L439: a position on a PROMPT (begin) ==========================================================================
+/* ==== L439: a position on a PROMPT (begin) ===================================================================
  * PromptToks had no point type (L334: "no prompt-side position crosses the API yet").  One does now: the shared-
  * prefix wait cuts a prefill at a token of the prompt its sync was handed, the fused prefill lanes read that prompt
  * at the bank's position, and both carried the index as the `int` that also held a position on the bank's history.
@@ -1011,5 +1011,199 @@ static_assert(!std::is_constructible<PromptPos, TokPos>::value && !std::is_const
                   !std::is_convertible<int, PromptPos>::value && !std::is_convertible<PromptPos, int>::value,
               "a prompt position is no live position and no count, not even explicitly, and no bare integer");
 /* ==== L439: a position on a PROMPT (end) ============================================================================ */
+=======
+/* ==== L440: offsets into the RENDERED PROMPT and into a renderer's input content (begin) ============================
+ * A chat renderer writes one text -- the rendered prompt, the string the tokenizer consumes -- and records the byte
+ * ranges it copied from client data (pulsar_text_span), where the tokenizers match no control token.  Those offsets
+ * were a bare uint32 pair, beside three other texts' offsets that were bare too: a message's own content (ContentOff,
+ * L437), the content a family renderer is handed with the parser's image markers cut out of it (qwen_msg_in /
+ * nemotron_msg_in::image_at), and the generated text (GenOff).  None is an offset of another: a message's content
+ * lands in the prompt wherever the template has got to, a different place for each message.
+ *
+ *   PromptOff     an offset into ONE rendered text, in bytes from its first byte: the rendered prompt, or a part of it
+ *                 that is rendered on its own and has its own byte 0 (a renderer's piece, a system block, a live
+ *                 turn's suffix, the tail of a prompt past a restored chain).  Distances are TextBytes (L334 P7: a
+ *                 length of rendered text).  Held in 32 bits, so pulsar_text_span keeps its layout; arithmetic is
+ *                 uint32_t's, exactly the `(uint32_t)` casts it replaces (a kit render past UINT32_MAX bytes is
+ *                 refused by chat_render_finish).  No sentinel: an offset of a rendered text is never "none".
+ *   StrippedOff   an offset into the content a family renderer is HANDED for one message (its `content` field): the
+ *                 server's chat_msg::content with the parser's image markers removed.  Where an image sits
+ *                 (image_at).  Not a ContentOff -- each marker before it shortens the text by the marker's length --
+ *                 and not a PromptOff.
+ *
+ * The relations, each with one name:
+ *   - a part's offset -> the enclosing text's: pulsar_text_span::placed(at), `at` being where the part's first byte
+ *     landed -- known only to the renderer that appended it (chat_piece::add, chat_writer::add, buf_spans_carry,
+ *     buf_puts_spanned: at = prompt_end() of what is written so far);
+ *   - the enclosing text's -> a part's: pulsar_text_span::slice(skip, len) (clipped to the part, rebased to its first
+ *     byte: chat_piece::sub, pulsar_text_spans_slice) and cut_to(n) (the text cut to its first n bytes);
+ *   - a length of rendered text -> the offset where it ends: PromptOff::after(len), off.before() back.  A chain's
+ *     text is a prefix of the prompt it serves, so its TextBytes length is the prompt offset its tail starts at;
+ *     TextBytes keeps that doubling (P7) and the span slice takes the prefix as the LENGTH it is;
+ *   - ContentOff -> StrippedOff: only chat_strip_image_markers (the server's chat_family.cpp), which cuts the
+ *     markers out and so knows what is left before each image;
+ *   - PromptOff -> a token index: no arithmetic, only through a tokenizer reading the text with its spans.
+ * An offset becomes a buffer index with .raw(), where a tokenizer's byte cursor (a size_t over the whole text) is
+ * compared with it: the comparison stays the size_t one it was. */
+
+/** An offset into the text named by `Tag`, held in 32 bits, with TextBytes distances and no sentinel (L440): the
+ *  uint32_t a renderer's span map stored, with uint32_t's (modular) arithmetic. */
+template <class Tag>
+class pulsar_text_off32 {
+public:
+    /** Uninitialised, as the integer it replaces (value-initialise for offset 0). */
+    pulsar_text_off32() = default;
+    /** Enter from a raw integer (explicit only; bool and floating point are refused), converted as the `(uint32_t)`
+     *  cast at the old field was.
+     *  @param v the raw offset */
+    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    constexpr explicit pulsar_text_off32(I v) : v_(static_cast<uint32_t>(v)) {}
+    /** The raw offset, where the value leaves the type system (a buffer index, printf, a golden file). */
+    /// @return the offset as uint32_t
+    constexpr uint32_t raw() const { return v_; }
+    /** The offset past the first `n` bytes: where a text of that length ends, and where the next byte written lands.
+     *  @param n the bytes before it */
+    /// @return offset n (as uint32_t)
+    static constexpr pulsar_text_off32 after(TextBytes n) { return pulsar_text_off32(n.raw()); }
+    /** The bytes before this offset (it minus offset 0). */
+    /// @return the distance from offset 0
+    constexpr TextBytes before() const { return TextBytes{v_}; }
+
+    /** An offset moved forward by a length. */
+    friend constexpr pulsar_text_off32 operator+(pulsar_text_off32 p, TextBytes d) {
+        return pulsar_text_off32(p.v_ + d.raw());
+    }
+    /** An offset moved back by a length. */
+    friend constexpr pulsar_text_off32 operator-(pulsar_text_off32 p, TextBytes d) {
+        return pulsar_text_off32(p.v_ - d.raw());
+    }
+    /** The distance from b to a (uint32_t's: callers that must not wrap compare first, as before). */
+    friend constexpr TextBytes operator-(pulsar_text_off32 a, pulsar_text_off32 b) {
+        return TextBytes{static_cast<uint32_t>(a.v_ - b.v_)};
+    }
+    /** Move forward in place. */
+    /// @param d the length to move by
+    /// @return `*this`
+    constexpr pulsar_text_off32 &operator+=(TextBytes d) { return *this = *this + d; }
+    /** Move back in place. */
+    /// @param d the length to move by
+    /// @return `*this`
+    constexpr pulsar_text_off32 &operator-=(TextBytes d) { return *this = *this - d; }
+    /** Equal. */
+    friend constexpr bool operator==(pulsar_text_off32 a, pulsar_text_off32 b) { return a.v_ == b.v_; }
+    /** Not equal. */
+    friend constexpr bool operator!=(pulsar_text_off32 a, pulsar_text_off32 b) { return a.v_ != b.v_; }
+    /** Earlier. */
+    friend constexpr bool operator<(pulsar_text_off32 a, pulsar_text_off32 b) { return a.v_ < b.v_; }
+    /** Earlier or the same. */
+    friend constexpr bool operator<=(pulsar_text_off32 a, pulsar_text_off32 b) { return a.v_ <= b.v_; }
+    /** Later. */
+    friend constexpr bool operator>(pulsar_text_off32 a, pulsar_text_off32 b) { return a.v_ > b.v_; }
+    /** Later or the same. */
+    friend constexpr bool operator>=(pulsar_text_off32 a, pulsar_text_off32 b) { return a.v_ >= b.v_; }
+
+private:
+    uint32_t v_;  ///< the offset, in bytes from the text's first byte
+};
+
+/** Tag of PromptOff (never instantiated). */
+struct pulsar_prompt_off_tag;
+/** Tag of StrippedOff (never instantiated). */
+struct pulsar_stripped_off_tag;
+/** An offset into one rendered text -- the rendered prompt, or a part of it rendered on its own (L440). */
+typedef pulsar_text_off32<pulsar_prompt_off_tag> PromptOff;
+/** An offset into the content a family renderer is handed for one message: chat_msg::content less the parser's image
+ *  markers (L440). */
+typedef pulsar_text_off32<pulsar_stripped_off_tag> StrippedOff;
+
+/** A half-open [lo, hi) byte range of CLIENT-supplied text in a rendered prompt (the engine's public span type: its
+ *  tokenizer API is in pulsar.h).  The renderer produces these; the tokeniser treats them as plain text.  The uint32
+ *  pair it always was (the static_asserts below), an aggregate: `{lo, hi}`, memcpy, malloc'd arrays as before. */
+struct pulsar_text_span {
+    PromptOff lo;   ///< first byte
+    PromptOff hi;   ///< one past the last byte
+
+    /** A span from raw byte offsets (a test's literal, a fixture's numbers).
+     *  @param lo the first byte
+     *  @param hi one past the last byte */
+    /// @return the span {lo, hi}
+    template <class I, class J>
+    static constexpr pulsar_text_span of(I lo, J hi) { return {PromptOff{lo}, PromptOff{hi}}; }
+    /** The span's length (uint32_t's hi - lo: empty() first where it could wrap). */
+    /// @return the bytes from lo to hi
+    constexpr TextBytes len() const { return hi - lo; }
+    /** Is there no byte in it? */
+    /// @return true when hi <= lo
+    constexpr bool empty() const { return hi <= lo; }
+    /** Is the byte at `p` client data of this span?
+     *  @param p an offset of the same text */
+    /// @return true when lo <= p < hi
+    constexpr bool contains(PromptOff p) const { return lo <= p && p < hi; }
+    /** This span of a part, as a span of the text the part was appended to.
+     *  @param at where the part's first byte landed in that text */
+    /// @return the span moved by the bytes before `at`
+    constexpr pulsar_text_span placed(PromptOff at) const { return {lo + at.before(), hi + at.before()}; }
+    /** This span after its text is cut to its first `n` bytes.
+     *  @param n   the bytes kept
+     *  @param out receives the span, its end clipped to n (may be `this`; untouched on false) */
+    /// @return false when the span starts at or past the cut: nothing of it is left
+    constexpr bool cut_to(TextBytes n, pulsar_text_span *out) const {
+        if (lo.before() >= n) return false;
+        *out = {lo, hi.before() > n ? PromptOff::after(n) : hi};
+        return true;
+    }
+    /** This span within the part [skip, skip + len) of its text, as a span of that part: clipped to it and rebased
+     *  to its first byte.
+     *  @param skip the bytes of the text before the part
+     *  @param len  the part's length
+     *  @param out  receives the span (untouched on false) */
+    /// @return false when no byte of the span is in the part
+    constexpr bool slice(TextBytes skip, TextBytes len, pulsar_text_span *out) const {
+        const TextBytes end = skip + len;
+        TextBytes a = lo.before(), b = hi.before();
+        if (b <= skip || a >= end) return false;
+        if (a < skip) a = skip;
+        if (b > end) b = end;
+        if (b <= a) return false;
+        *out = {PromptOff::after(a - skip), PromptOff::after(b - skip)};
+        return true;
+    }
+};
+
+static_assert(sizeof(PromptOff) == sizeof(uint32_t) && alignof(PromptOff) == alignof(uint32_t) &&
+                  std::is_trivial<PromptOff>::value && std::is_standard_layout<PromptOff>::value &&
+                  sizeof(StrippedOff) == sizeof(uint32_t) && std::is_trivial<StrippedOff>::value,
+              "a prompt or stripped-content offset is the uint32_t it replaces");
+static_assert(sizeof(pulsar_text_span) == 2 * sizeof(uint32_t) && alignof(pulsar_text_span) == alignof(uint32_t) &&
+                  offsetof(pulsar_text_span, lo) == 0 && offsetof(pulsar_text_span, hi) == sizeof(uint32_t) &&
+                  std::is_standard_layout<pulsar_text_span>::value && std::is_trivial<pulsar_text_span>::value &&
+                  std::is_aggregate<pulsar_text_span>::value,
+              "pulsar_text_span is the {uint32_t lo, hi} pair it was: same size, alignment and member offsets");
+static_assert(!std::is_constructible<PromptOff, ContentOff>::value && !std::is_constructible<ContentOff, PromptOff>::value &&
+                  !std::is_constructible<PromptOff, StrippedOff>::value &&
+                  !std::is_constructible<StrippedOff, PromptOff>::value &&
+                  !std::is_constructible<StrippedOff, ContentOff>::value &&
+                  !std::is_constructible<ContentOff, StrippedOff>::value &&
+                  !std::is_constructible<PromptOff, GenOff>::value && !std::is_constructible<GenOff, PromptOff>::value &&
+                  !std::is_constructible<PromptOff, StreamOff>::value &&
+                  !std::is_constructible<StreamOff, PromptOff>::value &&
+                  !std::is_constructible<PromptOff, BodyOff>::value && !std::is_constructible<BodyOff, PromptOff>::value &&
+                  !std::is_constructible<StrippedOff, GenOff>::value && !std::is_constructible<GenOff, StrippedOff>::value,
+              "an offset of one text is no offset of another, not even explicitly");
+static_assert(!std::is_constructible<PromptOff, TextBytes>::value && !std::is_constructible<TextBytes, PromptOff>::value &&
+                  !std::is_constructible<PromptOff, GenBytes>::value &&
+                  !std::is_constructible<StrippedOff, TextBytes>::value &&
+                  !std::is_constructible<PromptOff, TokPos>::value && !std::is_constructible<TokPos, PromptOff>::value &&
+                  !std::is_constructible<PromptOff, TokCount>::value &&
+                  !std::is_constructible<TokCount, PromptOff>::value &&
+                  !std::is_constructible<PromptOff, PromptToks>::value &&
+                  !std::is_constructible<PromptOff, TokId>::value && !std::is_constructible<TokId, PromptOff>::value,
+              "a length enters a prompt offset by name only (after / before); a token position, count or id never");
+static_assert(!std::is_convertible<uint32_t, PromptOff>::value && !std::is_convertible<PromptOff, uint32_t>::value &&
+                  !std::is_convertible<size_t, PromptOff>::value && !std::is_convertible<PromptOff, size_t>::value &&
+                  !std::is_convertible<int, PromptOff>::value && !std::is_convertible<uint32_t, StrippedOff>::value &&
+                  !std::is_convertible<StrippedOff, uint32_t>::value && !std::is_convertible<int, StrippedOff>::value,
+              "no implicit way in or out of a bare integer");
+/* ==== L440: offsets into the RENDERED PROMPT and into a renderer's input content (end) ============================== */
 
 #endif

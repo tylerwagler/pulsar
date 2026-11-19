@@ -268,7 +268,7 @@ typedef struct {
     uint32_t n_spans;              ///< ranges recorded
     uint32_t cap_spans;            ///< ranges allocated
     uint32_t span_open;            ///< >0 while a range is being recorded (nesting depth)
-    uint32_t span_lo;              ///< where the outermost open range started
+    PromptOff span_lo;             ///< where the outermost open range started
 } buf;
 
 /// Open a client-data range at `b`'s current end (nests: only the outermost range is recorded).
@@ -277,13 +277,13 @@ void buf_text_begin(buf *b);
 /// Close the innermost open range; closing the outermost records [start, len) unless empty.
 /// @param b  the buffer (NULL or none open: ignored)
 void buf_text_end(buf *b);
-/** Move `src`'s ranges into `dst`, shifted by `offset` (the number of bytes `src`
- * will occupy in front of them), and free `src`'s array.  Used when a region is
+/** Move `src`'s ranges into `dst`, placed at `at` (where `src`'s first byte
+ * will land in `dst`: L440), and free `src`'s array.  Used when a region is
  * assembled in its own buffer and then concatenated. */
 /// @param dst     the buffer that receives the ranges
 /// @param src     the buffer whose ranges move (its array is freed)
-/// @param offset  bytes to shift each range by
-void buf_spans_carry(buf *dst, buf *src, size_t offset);
+/// @param at      where `src`'s text will start in `dst`
+void buf_spans_carry(buf *dst, buf *src, PromptOff at);
 /** Append `text` (whose CLIENT-DATA ranges are `spans`, in `text`'s own
  * coordinates) and shift those ranges into `dst`.  Ranges past the appended
  * bytes are dropped, so the result stays in bounds and ascending. */
@@ -442,7 +442,7 @@ typedef struct {
  *  (byte offsets, ascending) -- what a family renderer places its image literal at (chat_family.cpp). */
 struct chat_msg_images {
     std::string content;
-    std::vector<uint32_t> at;
+    std::vector<StrippedOff> at;
 };
 /** false + err: an image whose marker is not at its offset. */
 bool chat_strip_image_markers(const chat_msg *m, chat_msg_images *out, char *err, size_t errlen);

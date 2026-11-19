@@ -13,6 +13,7 @@
 #include <map>
 
 #include "chat_refuse.h"
+#include "chat_render_kit.h"
 #include "pulsar_utf8.h"
 #include "pyjson.h"
 
@@ -95,9 +96,9 @@ struct writer {
     /// @param s the client's text (nothing is recorded when empty)
     void client(const std::string &s) {
         if (s.empty()) return;
-        const uint32_t lo = (uint32_t)out->text.size();
+        const PromptOff lo = prompt_end(out->text);
         out->text += s;
-        const uint32_t hi = (uint32_t)out->text.size();
+        const PromptOff hi = prompt_end(out->text);
         if (!out->spans.empty() && out->spans.back().hi == lo) out->spans.back().hi = hi;
         else out->spans.push_back({lo, hi});
     }
@@ -363,7 +364,7 @@ bool inkling_chat_tool_defs(const char *tools_json, inkling_render_out *out, cha
     std::string declare;
     if (!tool_declare_json(tools_json, &declare, err, errlen)) return false;
     out->text = declare;
-    out->spans.push_back({0, (uint32_t)declare.size()});
+    out->spans.push_back({PromptOff{0}, prompt_end(declare)});
     return true;
 }
 
@@ -454,8 +455,8 @@ bool inkling_chat_render_assistant_turn(const inkling_msg_in &m, inkling_render_
                       "the generation prompt's <|message_model|> has no replay");
     out->text.erase(0, lm);
     for (pulsar_text_span &s : out->spans) {
-        s.lo -= (uint32_t)lm;
-        s.hi -= (uint32_t)lm;
+        s.lo -= TextBytes{lm};   /* the text lost its first lm bytes */
+        s.hi -= TextBytes{lm};
     }
     return fits(out, err, errlen);
 }
