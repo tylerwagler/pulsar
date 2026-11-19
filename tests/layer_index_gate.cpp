@@ -36,8 +36,10 @@
 #include "families/nemotron_parse/nemotron_parse.h"
 #include "families/qwen/family_qwen.h"
 
+#include <signal.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <sys/wait.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -307,6 +309,54 @@ static void model_free(void) {
     check(nh_ok, "Nemotron-H's block -> layer reads the shape's table (a block is not its layer: block 5 is layer 3)");
 }
 
+/** L436 piece 2, the fail-closed checks: a second drafter's slots are refused at the plan (the load's
+ *  pulsar_state_plan_slots_fit says so; the create's plan check refuses it too), and a drafter's slot has no verify capture
+ *  (fatal, graded in a child process). */
+static void refusal_checks(void) {
+    fprintf(stderr, "layer-index gate: the fail-closed checks (the refusal lines below are expected)\n");
+    pulsar_block_drafter d{};
+    d.n_layer = 3u;
+    d.n_head = d.n_kv = 4u;
+    d.head_dim = 64u;
+    d.hidden = 256u;
+    d.window = 128u;
+    d.head_kind = PULSAR_BLOCK_HEAD_PLAIN;
+    pulsar_engine *e = (pulsar_engine *)calloc(1, sizeof(pulsar_engine));
+    e->block_drafter = &d;
+    /* a trunk of 6 layers and the block drafter alone: its 3 slots follow the trunk's */
+    pulsar_state_plan a{};
+    a.name = "layer-index-gate";
+    a.n_trunk = a.n_slots = 6u;
+    pulsar_block_drafter_plan(e, &a);
+    check(a.drafter_conflict == 0 && a.n_slots == 9u && pulsar_state_plan_slots_fit(&a, "test") &&
+              (a.slot[pulsar_drafter_slot(&a, DraftLayer{2u})] >> d.decl_kv & 1u),
+          "a block drafter alone takes slots n_trunk .. n_trunk + 2 and the plan fits");
+    /* the same trunk with an MTP-style drafter slot already appended: the block drafter is refused, nothing declared */
+    pulsar_state_plan b{};
+    b.name = "layer-index-gate";
+    b.n_trunk = b.n_slots = 6u;
+    (void)pulsar_state_plan_add_slot(&b, 0u);
+    const uint32_t n_decl = b.n_decl;
+    pulsar_block_drafter_plan(e, &b);
+    check(b.drafter_conflict == 1u && b.n_slots == 7u && b.n_decl == n_decl,
+          "a block drafter after another drafter's slot is refused at the plan: no slot, no decl added");
+    check(!pulsar_state_plan_slots_fit(&b, "test"), "and the load's verdict refuses the model");
+    free(e);
+    /* a drafter's slot has no verify capture: the offset is fatal, never the first trunk slot's */
+    pulsar_state_set ss{};
+    ss.plan = &a;
+    check(pulsar_state_capture_offset(&ss, LayerSlot{5u}, 0u) == 0u, "a trunk slot's capture offset is read (ordinal 0 here)");
+    fflush(stderr);
+    const pid_t pid = fork();
+    if (pid == 0) {
+        (void)pulsar_state_capture_offset(&ss, pulsar_drafter_slot(&a, DraftLayer{0u}), 0u);
+        _exit(0);
+    }
+    int st = 0;
+    const bool waited = pid > 0 && waitpid(pid, &st, 0) == pid;
+    check(waited && WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT, "a drafter slot's capture offset is fatal (SIGABRT), not slot 0's rows");
+}
+
 /** The engine's declared state against the plan: assumptions a and b, and the conversions on the real shape.
  *  @param e the opened engine
  *  @return the drafter slots the state plan holds past the trunk's */
@@ -545,6 +595,7 @@ int main(int argc, char **argv) {
         }
     }
     model_free();
+    refusal_checks();
     for (int i = 1; i < argc; i++) model_checks(argv[i]);
     if (own_lock) unlink(lock);
     fprintf(stderr, "LAYER INDEX GATE: %s (%d container(s), %d failure(s))\n", n_fail ? "FAIL" : "PASS", argc - 1, n_fail);

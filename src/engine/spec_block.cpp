@@ -539,6 +539,9 @@ pulsar_gqa_layer gqa_decl(const pulsar_block_drafter *d, DraftLayer li, const ui
 
 void pulsar_block_drafter_plan(pulsar_engine *e, pulsar_state_plan *p) {
     pulsar_block_drafter *d = e->block_drafter;
+    /* L436: the rings and the anchor are read at pulsar_drafter_slot(plan, l) -- the slots right after the trunk's.  A
+     * plan that already holds another drafter's slots (an MTP layer's) is refused, nothing declared */
+    if (!pulsar_state_plan_drafter_first(p, "the block drafter")) return;
     const pulsar_gqa_layer g = gqa_decl(d, DraftLayer{0u}, NULL, NULL, false);
     pulsar_state_decl kv{"draft_kv", PULSAR_STATE_RING, PULSAR_STATE_CAPTURE_NONE, false, false, d->window,
                          pulsar_gqa_kv_token_bytes(&g), 0, 0, NULL, NULL, NULL};

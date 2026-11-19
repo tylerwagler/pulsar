@@ -51,7 +51,21 @@ LayerSlot pulsar_state_plan_add_slot(pulsar_state_plan *p, uint32_t mask) {
     return LayerSlot{p->n_slots++};
 }
 
+bool pulsar_state_plan_drafter_first(pulsar_state_plan *p, const char *who) {
+    if (p->n_slots == p->n_trunk) return true;
+    fprintf(stderr, "pulsar: the state plan %s: %s asks for its slots after %u slot(s) of another drafter (slots %u .. %u "
+                    "past the %u trunk layers) -- a drafter's layer l is read at slot n_trunk + l, so two drafters "
+                    "cannot share a plan\n", p->name ? p->name : "?", who, p->n_slots - p->n_trunk, p->n_trunk,
+            p->n_slots - 1u, p->n_trunk);
+    p->drafter_conflict++;
+    return false;
+}
+
 bool pulsar_state_plan_slots_fit(const pulsar_state_plan *p, const char *arch) {
+    if (p->drafter_conflict) {   /* L436: said where it was found (pulsar_state_plan_drafter_first) */
+        fprintf(stderr, "pulsar: %s: the state plan holds two drafters' slots -- refusing the model\n", arch);
+        return false;
+    }
     if (!p->slot_overflow) return true;
     fprintf(stderr, "pulsar: %s: the %u trunk layers and the drafter's need %u layer slots, the state plan holds %u "
                     "(PULSAR_STATE_SLOTS_MAX) -- refusing the model\n", arch, p->n_trunk,
@@ -80,6 +94,11 @@ static const char *plan_refusal(const pulsar_state_plan *p) {
     if (p->n_overflow) {
         snprintf(why, sizeof why, "the decl table is full: %u decl(s) past its PULSAR_STATE_DECLS_MAX (%u) entries",
                  p->n_overflow, (unsigned)PULSAR_STATE_DECLS_MAX);
+        return why;
+    }
+    if (p->drafter_conflict) {   /* L436: the load refuses this first (pulsar_state_plan_slots_fit) */
+        snprintf(why, sizeof why, "two drafters asked for the slots past the trunk's (a drafter's layer l is read at "
+                 "slot n_trunk + l)");
         return why;
     }
     if (p->slot_overflow) {   /* L375 O48: the load refuses this first (pulsar_state_plan_slots_fit) */
@@ -267,13 +286,20 @@ static KindOrd pulsar_state_slot_ord(const pulsar_state_set *ss, LayerSlot slot,
 }
 
 uint64_t pulsar_state_capture_offset(const pulsar_state_set *ss, LayerSlot slot, uint32_t id) {
+    if (!pulsar_slot_is_trunk(ss->plan, slot)) {   /* L436: the capture holds the trunk slots only */
+        fprintf(stderr, "pulsar: the state plan %s: layer slot %u is a drafter's (the trunk has %u) -- it has no verify "
+                        "capture; refusing to read a trunk slot's rows for it\n", ss->plan->name ? ss->plan->name : "?",
+                slot.raw(), ss->plan->n_trunk);
+        abort();
+    }
     const pulsar_state_decl *d = &ss->plan->decl[id];
     return (uint64_t)pulsar_state_slot_ord(ss, slot, id).raw() * capture_gens(d) * ss->verify_rows * capture_row_bytes(d);
 }
 
 void *pulsar_state_capture_rows(const pulsar_state_set *ss, LayerSlot slot, uint32_t id) {
+    const uint64_t off = pulsar_state_capture_offset(ss, slot, id);   /* first: a drafter's slot is refused either way */
     if (!ss->cap_rows[id]) return NULL;
-    return (uint8_t *)dptr(ss->cap_rows[id]) + pulsar_state_capture_offset(ss, slot, id);
+    return (uint8_t *)dptr(ss->cap_rows[id]) + off;
 }
 
 void pulsar_state_verify_begin(pulsar_state_set *ss, uint32_t n_runs, const uint32_t *run_first, const BankId *bank,

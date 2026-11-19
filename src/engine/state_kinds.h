@@ -126,6 +126,10 @@ typedef struct pulsar_state_plan {
     /// L375 O48: drafter slots pulsar_state_plan_add_slot refused because slot[] was full; nonzero = the family's load
     /// refuses (pulsar_state_plan_slots_fit), and so does the create
     uint32_t slot_overflow;
+    /// L436: a drafter asked for its slots after ANOTHER drafter's (pulsar_state_plan_drafter_first): its layer l would
+    /// not sit at pulsar_drafter_slot(plan, l) = n_trunk + l.  Nonzero = the family's load refuses
+    /// (pulsar_state_plan_slots_fit), and so does the create
+    uint32_t drafter_conflict;
     uint32_t n_slots;              ///< [0, n_trunk) the trunk's layers, [n_trunk, n_slots) a drafter's
     /// layer slots belonging to the trunk; slots [n_trunk, n_slots) are a drafter's
     uint32_t n_trunk;
@@ -158,6 +162,14 @@ uint32_t pulsar_state_plan_add(pulsar_state_plan *p, const pulsar_state_decl &d)
 /// @param mask the slot's decl ids, bit i = decl[i]
 /// @return the new slot, or slot PULSAR_STATE_SLOTS_MAX (past the table) when the table is full
 LayerSlot pulsar_state_plan_add_slot(pulsar_state_plan *p, uint32_t mask);
+/** L436: a drafter about to append its layers' slots asks that they START at the first drafter slot -- the one
+ *  place its layers are read back (pulsar_drafter_slot = n_trunk + l).  A plan that already holds another drafter's
+ *  slots is refused: counted in drafter_conflict (the load's pulsar_state_plan_slots_fit says it and refuses the
+ *  model; the create refuses too), and the caller appends nothing. */
+/// @param p   the plan being built (its trunk slots set)
+/// @param who the drafter asking, for the message
+/// @return true when the next appended slot is pulsar_drafter_slot(p, DraftLayer{0})
+bool pulsar_state_plan_drafter_first(pulsar_state_plan *p, const char *who);
 
 /* ---- L436: the layer slot's crossings (the state layout owns them: slots [0, n_trunk) ARE the trunk's layers in
  * order, slots [n_trunk, n_slots) a drafter's layers in order) ---------------------------------------------------- */
@@ -301,15 +313,15 @@ static inline void *pulsar_state_host(const pulsar_state_set *ss, uint32_t id, B
 /** The verify capture's rows of decl `id` on slot `slot` (device; step row r at + r * the row's bytes): where a
  *  verify's op writes them -- as a pointer, or as its tensor and the byte offset into it (a copy's destination). */
 /// @param ss   the set
-/// @param slot the layer slot (a trunk layer's: the capture holds the trunk slots only)
+/// @param slot the layer slot (a trunk layer's: the capture holds the trunk slots only -- a drafter's slot is fatal)
 /// @param id   the decl id
 /// @return the device pointer of the slot's capture rows, NULL when the decl has no capture tensor
 void *pulsar_state_capture_rows(const pulsar_state_set *ss, LayerSlot slot, uint32_t id);
 /** The byte offset of slot `slot`'s capture rows of decl `id` in pulsar_state_capture_tensor(ss, id): the slot's
  *  index among the decl's slots x verify_rows x one capture row's bytes.
  *  @param ss   the set
- *  @param slot the layer slot (a trunk layer's: the capture holds the trunk slots only, and a drafter's slot has no
- *              ordinal -- it would read 0, the first trunk slot's rows)
+ *  @param slot the layer slot (a trunk layer's: the capture holds the trunk slots only.  A drafter's slot has no
+ *              ordinal there -- it read 0, the first trunk slot's rows, until L436; now fatal, rule 9)
  *  @param id   the decl id
  *  @return the offset, in bytes */
 uint64_t pulsar_state_capture_offset(const pulsar_state_set *ss, LayerSlot slot, uint32_t id);
