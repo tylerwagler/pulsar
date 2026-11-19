@@ -272,12 +272,12 @@ bool parser_kit_feed(void *st, server *s, gen_state *g, GenOff upto, bool final)
         switch (e.kind) {
         case out_event::REASONING:
         case out_event::CONTENT:
-            /* L437, ONE named crossing, value unchanged: the sink's release watermark (chat_sink::text: the logprob
-             * ledger's) is given q->fed -- the text FED to the parser, not where this delta's text ends.  The parser
-             * may still hold its last bytes (a marker's prefix, whitespace a section policy keeps back, a split
-             * UTF-8 sequence), so the watermark can run ahead of the delta by what is held. */
+            /* L437: the sink's release watermark (chat_sink::text: the logprob ledger's) is where THIS delta's text
+             * ends in g->text -- the parser says where in its stream (out_event::end), this state where that is in
+             * the text.  Not q->fed: the parser may still hold the last bytes it was fed (a marker's prefix,
+             * whitespace a section policy keeps back), and a feed can yield more than one delta. */
             if (j->req.stream && k->text &&
-                !k->text(k, e.kind == out_event::REASONING, e.text.data(), e.text.size(), q->fed))
+                !k->text(k, e.kind == out_event::REASONING, e.text.data(), e.text.size(), q->text_at(e.end)))
                 return q->stream_ok = false;
             break;
         case out_event::TOOL_BEGIN: {

@@ -120,7 +120,7 @@ void out_parser::new_block() {
     block_.clear();
 }
 
-void out_parser::send(bool reasoning, std::string &&text, std::vector<out_event> *ev) {
+void out_parser::send(bool reasoning, std::string &&text, StreamOff end, std::vector<out_event> *ev) {
     if (text.empty()) return;
     if (reasoning && !prefix_done_) {   /* L338: the grammar's reasoning label, dropped once */
         prefix_held_ += text;
@@ -135,12 +135,13 @@ void out_parser::send(bool reasoning, std::string &&text, std::vector<out_event>
     out_event e;
     e.kind = reasoning ? out_event::REASONING : out_event::CONTENT;
     e.text = std::move(text);
+    e.end = end;
     ev->push_back(std::move(e));
 }
 
 /* A text state's bytes under its section's policy.  Works on whole codepoints; a split sequence waits; an
  * invalid byte is text.  HEADER buffers. */
-void out_parser::emit_text(out_state st, const char *p, size_t n, std::vector<out_event> *ev) {
+void out_parser::emit_text(out_state st, const char *p, size_t n, StreamOff at, std::vector<out_event> *ev) {
     if (st == OUT_HEADER) {
         header_.append(p, n);
         return;
@@ -150,6 +151,11 @@ void out_parser::emit_text(out_state st, const char *p, size_t n, std::vector<ou
     section &s = sec_[reasoning ? 1 : 0];
     if (st == state_) code_.feed(p, n);   /* L419: the section's bytes as sampled (not a header's text sent as content) */
     std::string buf = s.partial + std::string(p, n);
+    /* L437: where the delta ends in the stream.  buf is the section's held partial sequence, then p; `sent` is the
+     * end in buf of the last codepoint that went out (held whitespace goes out only ahead of one).  The partial
+     * bytes were fed just before p (a dropped marker between them aside: the end is then early by it, never late). */
+    const size_t carried = s.partial.size();
+    size_t sent = 0;
     s.partial.clear();
     std::string out;
     const unsigned char *u = (const unsigned char *)buf.data();
@@ -167,6 +173,7 @@ void out_parser::emit_text(out_state st, const char *p, size_t n, std::vector<ou
             k = 1;
             space = false;
         }
+        const size_t had = out.size();
         switch (policy) {
         case OUT_TEXT_STRIP:
             if (space) {
@@ -211,8 +218,12 @@ void out_parser::emit_text(out_state st, const char *p, size_t n, std::vector<ou
             break;
         }
         i += (size_t)k;
+        if (out.size() > had) sent = i;   /* every policy sends this codepoint last, whatever it sends ahead of it */
     }
-    send(reasoning, std::move(out), ev);
+    StreamOff end = at;
+    if (sent >= carried) end += GenBytes{sent - carried};
+    else end -= GenBytes{std::min(carried - sent, at.before().raw())};   /* ends inside the carried bytes (invalid) */
+    send(reasoning, std::move(out), end, ev);
 }
 
 /* A section ends (its state is left for another).  A dangling partial sequence is not text either side can
@@ -234,8 +245,9 @@ void out_parser::finish_section(out_state st, std::vector<out_event> *ev) {
     section &s = sec_[reasoning ? 1 : 0];
     s.partial.clear();
     const out_text_policy policy = reasoning ? g_->reasoning : g_->content;
-    if (policy == OUT_TEXT_KEEP_UNLESS_BLANK && !s.started && calls_.empty()) send(reasoning, std::move(s.ws), ev);
-    if (policy == OUT_TEXT_TRIM_AT_CALLS && !block_seen_) send(reasoning, std::move(s.ws), ev);
+    /* the turn's end releases what was held: that text ends where the stream does */
+    if (policy == OUT_TEXT_KEEP_UNLESS_BLANK && !s.started && calls_.empty()) send(reasoning, std::move(s.ws), fed_, ev);
+    if (policy == OUT_TEXT_TRIM_AT_CALLS && !block_seen_) send(reasoning, std::move(s.ws), fed_, ev);
     s.ws.clear();
 }
 
@@ -299,7 +311,7 @@ void out_parser::feed(const char *p, size_t n, std::vector<out_event> *ev) {
         const size_t at = find_marker(&tr, &len, &keep);
         if (at != std::string::npos && !tr) {   /* a dropped marker: the bytes around it join */
             if (state_ == OUT_CALL) block_.append(hold_, 0, at);
-            else emit_text(state_, hold_.data(), at, ev);
+            else emit_text(state_, hold_.data(), at, stream_at(0), ev);
             if (state_ == OUT_CONTENT || state_ == OUT_REASONING) code_.feed(hold_.data() + at, len);
             hold_.erase(0, at + len);
             continue;
@@ -327,13 +339,13 @@ void out_parser::feed(const char *p, size_t n, std::vector<out_event> *ev) {
             continue;
         }
         if (at == std::string::npos) {
-            emit_text(state_, hold_.data(), hold_.size() - keep, ev);
+            emit_text(state_, hold_.data(), hold_.size() - keep, stream_at(0), ev);
             hold_.erase(0, hold_.size() - keep);
             return;
         }
-        emit_text(state_, hold_.data(), at, ev);
+        emit_text(state_, hold_.data(), at, stream_at(0), ev);
         if (quoted(*tr)) {   /* L419: quoted in Markdown code, the marker is the section's text */
-            emit_text(state_, hold_.data() + at, len, ev);
+            emit_text(state_, hold_.data() + at, len, stream_at(at), ev);
             hold_.erase(0, at + len);
             continue;
         }
@@ -344,7 +356,7 @@ void out_parser::feed(const char *p, size_t n, std::vector<out_event> *ev) {
         else code_.reset();
         if (state_ == OUT_HEADER) {
             /* a header is a call's name (dropped) or, closed with no content kind, text */
-            if (tr->act & OUT_ACT_HEADER_TEXT) emit_text(OUT_CONTENT, header_.data(), header_.size(), ev);
+            if (tr->act & OUT_ACT_HEADER_TEXT) emit_text(OUT_CONTENT, header_.data(), header_.size(), header_at_, ev);
             header_.clear();
         } else if (tr->to != state_) {
             end_section(state_);
@@ -386,10 +398,10 @@ void out_parser::finish(std::vector<out_event> *ev) {
         index_++;
     } else {
         /* a held marker prefix at the end was text after all; a header the turn ended in is text */
-        emit_text(state_, hold_.data(), hold_.size(), ev);
+        emit_text(state_, hold_.data(), hold_.size(), stream_at(0), ev);
         hold_.clear();
         if (state_ == OUT_HEADER) {
-            emit_text(OUT_CONTENT, header_.data(), header_.size(), ev);
+            emit_text(OUT_CONTENT, header_.data(), header_.size(), header_at_, ev);
             header_.clear();
         }
         end_section(state_);

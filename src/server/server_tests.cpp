@@ -6441,6 +6441,155 @@ static void test_l437_parser_started_mid_text(void) {
     l303_server_free(&srv);
 }
 
+/* One chunk of an OpenAI chat stream with logprobs, as l437_logprob_stream read it. */
+struct l437_chunk {
+    size_t text = 0;      ///< bytes of content / reasoning_content the chunk's delta carries
+    size_t lp_bytes = 0;  ///< bytes of the tokens whose logprob entries the chunk carries
+    int lp_n = 0;         ///< those entries
+    bool final = false;   ///< the chunk with the finish_reason
+};
+
+/* L437: one streamed OpenAI chat turn with logprobs on, through the real emit path (server::gen_emit_piece), the
+ * family's kit parser and the real sink writer (openai_stream.cpp), a token at a time; each token gets a captured
+ * distribution as a decode lane's draw gives it one.  The wire is read back a chunk at a time. */
+/// @param srv   the server
+/// @param fmt   the family
+/// @param toks  the turn's tokens
+/// @param stop  a client stop string that never matches (its hold-back moves the feeds' boundaries), or NULL
+/// @return the stream's chunks that carry text or logprobs, in order
+static std::vector<l437_chunk> l437_logprob_stream(server *srv, pulsar_chat_format fmt,
+                                                   const std::vector<std::string> &toks, const char *stop) {
+    std::vector<l437_chunk> out;
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    job j;
+    memset(&j, 0, sizeof j);
+    j.fd = sv[0];
+    request *r = &j.req;
+    char err[300];
+    TEST_ASSERT(l303_request(srv, fmt, API_OPENAI,
+                             "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"enable_thinking\":false}", r, err,
+                             sizeof err));
+    r->stream = true;
+    r->logprobs = true;
+    if (stop) stop_list_push(&r->stops, server_xstrdup(stop));
+    gen_state *g = new gen_state();
+    g->j = &j;
+    snprintf(g->id, sizeof g->id, "id_l437");
+    g->finish = "length";
+    g->next_decode_log = 1 << 30;
+    g->thinking = thinking_state_from_prompt(r);
+    g->structured_stream = request_uses_structured_stream(r);
+    TEST_ASSERT(g->structured_stream);
+    g->logprobs.enabled = true;
+    openai_stream_start(r, &g->openai_live);
+    openai_sink_init(&g->sink, sv[0], NULL, r, g->id, &g->openai_live);
+    g->openai_live.lp = &g->logprobs;
+    g->parser = r->family->output;
+    g->parser_st = g->parser->create(srv, g, err, sizeof err);
+    TEST_ASSERT(g->parser_st != NULL);
+    bool stopped = false;
+    for (const std::string &t : toks) {
+        g->logprobs.pending_valid = true;   /* the draw's capture: one a token */
+        g->logprobs.pending_logprob = -0.5f;
+        g->logprobs.pending_n_top = 0;
+        stopped = srv->gen_emit_piece(g, 0, t.data(), t.size());
+        TEST_ASSERT(!stopped);
+    }
+    g->finish = "stop";
+    server_turn turn;
+    memset(&turn, 0, sizeof turn);
+    turn.finish = g->finish;
+    TEST_ASSERT(g->parser->finish(g->parser_st, srv, NULL, g, &turn) && !turn.retry);
+    TEST_ASSERT(g->parser->feed(g->parser_st, srv, g, gen_text_end(g->text.len), true));
+    TEST_ASSERT(openai_sse_finish(&g->sink, &turn.calls, turn.finish, 10, g->completion));
+    TEST_ASSERT(g->logprobs.len == (int)toks.size() && g->logprobs.streamed == g->logprobs.len);
+    shutdown(sv[0], SHUT_WR);
+    char *wire = read_socket_text(sv[1]);
+    for (const char *line = wire ? strstr(wire, "data: {") : NULL; line; line = strstr(line + 1, "data: {")) {
+        const char *end = strchr(line, '\n');
+        pyjson_value v;
+        char jerr[100];
+        TEST_ASSERT(end && pyjson_parse(line + 6, (size_t)(end - line - 6), &v, jerr, sizeof jerr));
+        const pyjson_value *choices = v.get("choices");
+        if (!choices || choices->a.empty()) continue;
+        const pyjson_value &c = choices->a[0];
+        l437_chunk k;
+        if (const pyjson_value *d = c.get("delta"))
+            for (const char *f : {"content", "reasoning_content"})
+                if (const pyjson_value *t = d->get(f); t && t->kind == pyjson_value::STR) k.text += t->s.size();
+        const pyjson_value *lp = c.get("logprobs");
+        if (const pyjson_value *arr = lp ? lp->get("content") : NULL)
+            for (const pyjson_value &e : arr->a) {
+                const pyjson_value *bytes = e.get("bytes");
+                TEST_ASSERT(bytes != NULL);
+                k.lp_bytes += bytes ? bytes->a.size() : 0;
+                k.lp_n++;
+            }
+        const pyjson_value *fin = c.get("finish_reason");
+        k.final = fin && fin->kind == pyjson_value::STR;
+        if (k.text || k.lp_n || k.final) out.push_back(k);
+    }
+    free(wire);
+    close(sv[0]);
+    close(sv[1]);
+    g->parser->destroy(g->parser_st);
+    free(turn.content);
+    free(turn.reasoning);
+    tool_calls_free(&turn.calls);
+    logprob_ledger_free(&g->logprobs);
+    buf_free(&g->text);
+    delete g;
+    request_free(r);
+    return out;
+}
+
+/* L437: a streamed chunk carries a token's logprob entry only once it has carried that token's text.  The kit gave
+ * the sink the text FED to the parser for the release watermark; the parser holds back the bytes that may start a
+ * marker ("<"), whitespace its section policy has not proved interior, and with a stop string's hold-back a feed ends
+ * anywhere in a token -- so a chunk carried entries for bytes it had not sent: a token's last byte (" wor<" with the
+ * delta " wor"), or a whole token ("<" released with the delta "o").  The turns here are plain content with thinking
+ * off, so the text sent so far IS the offset the stream has reached in the generated text: at every chunk the bytes
+ * of the tokens whose entries were sent may not exceed the bytes of text sent.  The totals are the turn's: every
+ * token's entry exactly once, every byte of text. */
+static void test_l437_logprobs_ride_with_their_text(void) {
+    l303_vocab v;
+    server srv;
+    l303_server(&srv, v);
+    struct lcase {
+        std::vector<std::string> toks;
+        const char *stop;
+    };
+    const lcase cases[] = {
+        {{"Hello", " wor<", "ld", "."}, NULL},                 /* a token's last byte held as a marker's prefix */
+        {{"Hi ", "there", " ", "you"}, NULL},                  /* trailing whitespace held by the section policy */
+        {{"Hello", "<", "tool", " x", " done"}, "XYZ"},        /* a stop string's hold-back: a whole token held */
+        {{"a", "<tool_", "x<", "y", "z"}, NULL},               /* a held prefix that turns out to be text */
+        {{"plain", " text", " only"}, NULL},                   /* nothing held: every entry rides its own chunk */
+    };
+    for (pulsar_chat_format fmt : {PULSAR_CHAT_QWEN, PULSAR_CHAT_NEMOTRON_H}) {
+        for (const lcase &c : cases) {
+            size_t total = 0;
+            for (const std::string &t : c.toks) total += t.size();
+            const std::vector<l437_chunk> chunks = l437_logprob_stream(&srv, fmt, c.toks, c.stop);
+            size_t text = 0, lp_bytes = 0;
+            int lp_n = 0;
+            for (const l437_chunk &k : chunks) {
+                text += k.text;
+                lp_bytes += k.lp_bytes;
+                lp_n += k.lp_n;
+                if (!k.final && lp_bytes > text)
+                    fprintf(stderr, "l437 fmt %d \"%s...\": a chunk carries entries through byte %zu with %zu bytes "
+                            "of text sent\n", (int)fmt, c.toks[0].c_str(), lp_bytes, text);
+                TEST_ASSERT(k.final || lp_bytes <= text);
+            }
+            TEST_ASSERT(!chunks.empty() && chunks.back().final);
+            TEST_ASSERT(lp_n == (int)c.toks.size() && lp_bytes == total && text == total);
+        }
+    }
+    l303_server_free(&srv);
+}
+
 /* L428, the prefix: after a turn the server ended at its first call, the bank holds the prompt and the turn's tokens
  * through the call's close -- gen_emit_token is the one place a decoded token reaches the client, and the lanes
  * commit what it took (a speculative round's later drafts are cut before the round, gen_turn_draft_prefix, and a
@@ -21503,6 +21652,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l437_offset_units();
     test_l437_stream_offsets_and_conversion();
     test_l437_parser_started_mid_text();
+    test_l437_logprobs_ride_with_their_text();
     test_l428_next_prompt_extends_the_cut_turn();
     test_l420_stop_inside_reasoning_answers_with_it();
     test_l420_other_endings_are_unchanged();

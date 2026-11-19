@@ -62,6 +62,12 @@ struct out_event {
     std::string name;
     /// The call's whole arguments object as JSON text (TOOL_END only).
     std::string arguments;
+    /** L437: where the delta's text ENDS in the parser's stream (REASONING, CONTENT): one past the last fed byte it
+     *  reports.  The parser holds bytes back (a marker's prefix, whitespace a section policy has not proved
+     *  interior, a split UTF-8 sequence), so this can lie before the stream's end; a delta of text the turn's end
+     *  releases ends at the stream's end.  What a consumer that pairs deltas with the stream's bytes needs (the
+     *  server's logprob entries ride with the delta that carries their token's last byte).  none() otherwise. */
+    StreamOff end = StreamOff::none();
 };
 
 /** One complete tool call the parser read. */
@@ -358,8 +364,9 @@ private:
     /// @param st the state the text belongs to
     /// @param p  the bytes
     /// @param n  their count
+    /// @param at where `p` starts in the fed stream (L437: the delta's out_event::end is measured from it)
     /// @param ev receives the deltas
-    void emit_text(out_state st, const char *p, size_t n, std::vector<out_event> *ev);
+    void emit_text(out_state st, const char *p, size_t n, StreamOff at, std::vector<out_event> *ev);
     /// A section of state `st` ends (the state is left): drop a dangling partial sequence; STRIP resets.
     /// @param st the state being left (a no-op unless CONTENT or REASONING)
     void end_section(out_state st);
@@ -371,8 +378,9 @@ private:
     /// Append `text` to the reading and emit it as one delta (nothing when empty).
     /// @param reasoning true: a REASONING delta; false: CONTENT
     /// @param text      the delta (moved from)
+    /// @param end       where its text ends in the fed stream (out_event::end)
     /// @param ev        receives the event
-    void send(bool reasoning, std::string &&text, std::vector<out_event> *ev);
+    void send(bool reasoning, std::string &&text, StreamOff end, std::vector<out_event> *ev);
     /** The earliest marker in hold_ with a transition from the current state (`*tr`) or dropped everywhere
      *  (`*tr` NULL): its offset (npos if none) and length, and the bytes at hold_'s end that could still
      *  start one. */
