@@ -1054,7 +1054,7 @@ static bool spec_lane_round(pulsar_session *s, const uint32_t *banks, const int 
     pulsar_session_spec_arm_capture(s, 0u);
     if (rc != 0 || got != rows) return false;
     for (int i = 0; i < n; i++) {
-        const uint32_t row0 = st[i].row0;
+        const StepRow row0 = st[i].row0;
         const int first = st[i].first_token.raw();
         memset(&st[i], 0, sizeof st[i]);
         st[i].bank = BankId{banks[i]};

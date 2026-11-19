@@ -326,10 +326,11 @@ static void batched_lane(pulsar_engine *e, const std::vector<pulsar_tokens> &P, 
             st[i].temperature = temp;
             st[i].greedy_rows = 0u;
             const size_t base_pos = got[bank_of[i]].size();
-            for (uint32_t j = 0; j < st[i].n_rows; j++)
+            const uint32_t nr = (uint32_t)st[i].n_rows.raw();   /* the step's rows: one token a row */
+            for (uint32_t j = 0; j < nr; j++)
                 if (pos_greedy(greedy_run, base_pos + 1u + j)) st[i].greedy_rows |= 1u << j;
-            const uint32_t all = st[i].n_rows >= 32u ? ~0u : (1u << st[i].n_rows) - 1u;
-            crossing += st[i].n_rows > 1u && st[i].greedy_rows != 0u && st[i].greedy_rows != all;
+            const uint32_t all = nr >= 32u ? ~0u : (1u << nr) - 1u;
+            crossing += nr > 1u && st[i].greedy_rows != 0u && st[i].greedy_rows != all;
         }
         ok = pulsar_session_spec_round_end_batch(s, st, m) == 0;
         for (int i = 0; ok && i < m; i++) {

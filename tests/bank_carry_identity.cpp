@@ -145,7 +145,7 @@ int GATE_ENTRY(int argc, char **argv) {
                     return 1;
                 }
                 first[b] = steps[b].first_token.raw();
-                row0[b] = steps[b].row0;
+                row0[b] = (uint32_t)steps[b].row0.raw();   /* round_end's uint32 row0 */
             }
         }
         for (int b = 0; !batch && b < NB; b++) {
@@ -173,7 +173,7 @@ int GATE_ENTRY(int argc, char **argv) {
         if (batch) {
             for (int b = 0; b < NB; b++) {
                 steps[b].first_token = TokId{first[b]};
-                steps[b].row0 = row0[b];
+                steps[b].row0 = StepRow{row0[b]};
                 steps[b].accepted = acc_b[b];
                 steps[b].accepted_cap = 17;
             }
