@@ -17899,8 +17899,8 @@ static void test_l442_mem_split_values_unchanged(void) {
                     .raw() == 7900ull * MiB - PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES - DF);
     TEST_ASSERT(server_discrete_working_set_bytes(devb(7900ull * MiB), devb(2250ull * MiB), kvb(4900ull * MiB)).raw() ==
                 750ull * MiB);
-    /* the floor's step: a chunk's KV and a persist's host bytes, summed as before (L442's marked crossing) */
-    TEST_ASSERT(server_floor_step_bytes(kvb(80ull * MiB), server_persist_host_bytes(131072)).raw() ==
+    /* the floor's step on unified memory: a chunk's KV and a persist's host bytes, summed as before */
+    TEST_ASSERT(server_floor_step_bytes(false, kvb(80ull * MiB), server_persist_host_bytes(131072)).raw() ==
                 80ull * MiB + PULSAR_WRITEBACK_STEP + 2ull * 131072ull * PERSIST_TEXT_BYTES_PER_TOKEN);
     /* a server reads where its KV lives: unified -- the host's reading as the device's, the one pool; discrete -- the
      * device beside the host */
@@ -17933,6 +17933,31 @@ static void test_l442_mem_split_values_unchanged(void) {
     }
     pthread_mutex_destroy(&s.tool_mu);
     pthread_mutex_destroy(&s.mu);
+}
+
+/* L442 finding: the memory floor's step held a prefill chunk's KV on a discrete card too, though there the chunk's
+ * pages are the DEVICE's (checked per chunk against the device and its own floor, L391) -- the host floor sat one
+ * chunk's KV of one bank too high (Gemma 4 on CT 130: a 4096-token chunk is 80 MiB), so a host MemAvailable in
+ * [floor - chunk, floor) refused provisions, chunks and persists that had their room.  The step is now the persist
+ * alone there; unified memory keeps both terms (the chunk's pages come out of MemAvailable). */
+static void test_l442_discrete_floor_step_holds_no_device_kv(void) {
+    const uint64_t MiB = 1024ull * 1024ull;
+    const KvBytes chunk = kvb(4096ull * 20480ull);                      /* 80 MiB of Gemma KV */
+    const HostBytes persist = server_persist_host_bytes(131072);
+    TEST_ASSERT(server_floor_step_bytes(true, chunk, persist) == persist);
+    TEST_ASSERT(server_floor_step_bytes(false, chunk, persist).raw() == chunk.raw() + persist.raw());
+    TEST_ASSERT(server_floor_step_bytes(true, kvb(0), persist) == server_floor_step_bytes(false, kvb(0), persist));
+    /* the shape it changes: a discrete host 40 MiB over the corrected floor -- refused before, admitted now (a chunk
+     * asks the host only to be at its floor) */
+    const uint64_t zone = 486ull * MiB;
+    const HostBytes was = server_mem_floor_init(hostb(zone), server_floor_step_bytes(false, chunk, persist));
+    const HostBytes is = server_mem_floor_init(hostb(zone), server_floor_step_bytes(true, chunk, persist));
+    TEST_ASSERT(was - is == hostb(chunk.raw()));
+    const server_mem_reading d = test_mem_discrete(8ull * 1024ull * MiB, PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES,
+                                                   is.raw() + 40ull * MiB, is.raw());
+    TEST_ASSERT(server_kv_headroom_admits(d, chunk));
+    TEST_ASSERT(!server_headroom_admits(d.host_avail, hostb(0), was));   /* the old floor refused it */
+    (void)server_mem_floor_init(hostb(0), hostb(0));   /* back to the OS margin for the tests after this one */
 }
 
 /* 2026-09-29 -- which free bank provision_bank takes: the most resident pages,
@@ -23760,6 +23785,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l391_provision_demand_is_demand_paged();
     test_l391_discrete_reads_the_device();
     test_l442_mem_split_values_unchanged();
+    test_l442_discrete_floor_step_holds_no_device_kv();
     test_bank_pick_prefers_resident_hole();
     test_refusal_evictable();
     test_l179_park_live_bank_only_when_not_in_quantum();

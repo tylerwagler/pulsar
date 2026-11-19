@@ -468,10 +468,9 @@ HostBytes server_mem_floor_init(HostBytes zone_high_bytes, HostBytes step_bytes)
     return g_server_mem_floor;
 }
 
-HostBytes server_floor_step_bytes(KvBytes chunk_kv, HostBytes persist) {
-    /* L442 FINDING (a marked crossing, value unchanged): a chunk's KV pages are host memory only on unified memory,
-     * where the device allocates from the host's pool.  On a discrete card they land in the device's memory, and this
-     * adds them to the HOST's floor all the same -- the floor sits one chunk's KV (one bank) too high there. */
+HostBytes server_floor_step_bytes(bool discrete, KvBytes chunk_kv, HostBytes persist) {
+    /* a chunk's KV pages are host memory only on unified memory, where the device allocates from the host's pool */
+    if (discrete) return persist;
     return pulsar_unified_host_bytes(pulsar_kv_device_bytes(chunk_kv)) + persist;
 }
 
@@ -1252,7 +1251,7 @@ int main(int argc, char **argv) {
         const KvBytes chunk_kv = pulsar_session_quantum_growth_bytes_per_bank(
             session, pulsar_kv_rows(pulsar_session_prefill_cap(session)));
         const HostBytes persist = server_persist_host_bytes(cfg.ctx_size);
-        const HostBytes step = server_floor_step_bytes(chunk_kv, persist);
+        const HostBytes step = server_floor_step_bytes(discrete, chunk_kv, persist);
         const HostBytes floor = server_mem_floor_init(zone_high, step);
         const double mib = 1024.0 * 1024.0;
         server_log(PULSAR_LOG_DEFAULT,
@@ -1260,7 +1259,8 @@ int main(int argc, char **argv) {
                    "step's demand %.0f (a %d-token prefill chunk's KV %.0f + a persist at %d tokens %.0f)",
                    (double)floor.raw() / mib, (double)PULSAR_SERVER_MEM_FLOOR_BYTES / mib,
                    (double)zone_high.raw() / mib, zone_high != HostBytes{} ? "" : " (/proc/zoneinfo unreadable)",
-                   (double)step.raw() / mib, pulsar_session_prefill_cap(session).raw(), (double)chunk_kv.raw() / mib,
+                   (double)step.raw() / mib, pulsar_session_prefill_cap(session).raw(),
+                   (double)(step - persist).raw() / mib,   /* the chunk's KV the floor holds: none on a discrete card */
                    cfg.ctx_size, (double)persist.raw() / mib);
     }
     KvBytes kv_budget_final = kv_budget;

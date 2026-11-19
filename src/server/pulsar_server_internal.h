@@ -6334,11 +6334,15 @@ HostBytes server_mem_floor(void);
 /// @return the floor, bytes
 HostBytes server_mem_floor_init(HostBytes zone_high_bytes, HostBytes step_bytes);
 /** The floor's step term (server_mem_floor_init): the largest host demand one worker step makes between two checks --
- *  a prefill chunk's new KV pages on one bank (`chunk_kv`) and a persist's (`persist`). */
+ *  a persist's (`persist`), and on unified memory a prefill chunk's new KV pages on one bank (`chunk_kv`).  On a
+ *  discrete card the chunk's KV is the device's (its floor is PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES and every
+ *  chunk is checked against the device, server_kv_headroom_admits), so it is no host demand (L442; before, it was
+ *  added to the host floor there too). */
+/// @param discrete  the KV is a discrete card's (pulsar_gpu_integrated() == 0)
 /// @param chunk_kv  one prefill chunk's KV growth on one bank (the family's growth price)
 /// @param persist   a persist's host bytes at the full context (server_persist_host_bytes)
 /// @return the step, bytes
-HostBytes server_floor_step_bytes(KvBytes chunk_kv, HostBytes persist);
+HostBytes server_floor_step_bytes(bool discrete, KvBytes chunk_kv, HostBytes persist);
 /** Sum of every zone's `high` watermark in a /proc/zoneinfo text, in bytes (pages of `page_bytes`); 0 when none
  *  parses (the caller logs it and the floor keeps the OS margin). */
 /// @param zoneinfo  the file's text
