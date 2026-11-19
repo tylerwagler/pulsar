@@ -255,7 +255,7 @@ static int sampled_spec_batch(pulsar_session *s, const start_state *snap,
                 pulsar_session_bank_state_save(s, BankId{b});
                 continue;
             }
-            if (pulsar_session_spec_round_begin(s, r[b], TokId{first[b]}, DEPTH - got[b], 17,
+            if (pulsar_session_spec_round_begin(s, r[b], TokId{first[b]}, TokCount{DEPTH - got[b]}, TokCount{17},
                                                 temp, 0, top_p, min_p, err, errlen) != 0)
                 return -1;
             begun[b] = 1;
@@ -296,7 +296,7 @@ static int sampled_spec_batch(pulsar_session *s, const start_state *snap,
             }
             TokId accepted[17];
             const int na = pulsar_session_spec_round_end(s, r[b], TokId{first[b]}, temp, 0, top_p, min_p,
-                                                         &rng[b], row0[b], accepted, 17,
+                                                         &rng[b], row0[b], accepted, TokCount{17},
                                                          err, errlen);
             if (na < 0) return -1;
             for (int i = 0; i < na && got[b] < DEPTH; i++) seq[t0 + b][got[b]++] = accepted[i].raw();

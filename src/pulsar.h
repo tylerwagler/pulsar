@@ -1817,7 +1817,7 @@ TokId pulsar_session_spec_next_base(pulsar_session *s, float temperature,
  *  @param errlen bytes at err
  *  @return 0, or -1 (snapshot failure; the session is poisoned) */
 int pulsar_session_spec_round_begin(pulsar_session *s, pulsar_spec_round *r,
-                                 TokId first_token, int max_tokens, int accepted_cap,
+                                 TokId first_token, TokCount max_tokens, TokCount accepted_cap,
                                  float temperature, int top_k, float top_p,
                                  float min_p, char *err, size_t errlen);
 /** Rows a begun round will occupy (1 + surviving drafts). Check the caller's
@@ -1858,7 +1858,7 @@ int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                                float temperature, int top_k, float top_p,
                                float min_p, uint64_t *rng,
                                StepRow row0,
-                               TokId *accepted, int accepted_cap,
+                               TokId *accepted, TokCount accepted_cap,
                                char *err, size_t errlen);
 /** Gate-facing (L182): pulsar_session_spec_round_end with the acceptance walk
  * replaced by TEACHER FORCING.  Draft i is accepted iff it equals truth[i]; the
@@ -1890,7 +1890,7 @@ int pulsar_session_spec_round_end_forced(pulsar_session *s, pulsar_spec_round *r
                                       float min_p, uint64_t *rng,
                                       StepRow row0,
                                       const TokId *truth,
-                                      TokId *accepted, int accepted_cap,
+                                      TokId *accepted, TokCount accepted_cap,
                                       char *err, size_t errlen);
 /** Abort a begun round whose forward failed: drop its frontier snapshot and its unverified rows.
  *  @param s the session
@@ -1958,12 +1958,13 @@ typedef struct {
     int top_k;
     /** The request's sampler stream (assemble: the base draw; round_end: the walk).  Borrowed. */
     uint64_t *rng;           /* assemble (base draw), round_end (walk) */
-    /** assemble: tokens left in the request. */
-    int max_tokens;          /* assemble: tokens left in the request */
-    /** assemble: drafts allocated under overflow (the verify pick); -1 = no allocation. */
-    int k_alloc;             /* assemble: drafts allocated under overflow; -1 = no allocation */
-    /** assemble: round_begin's cap; round_end: capacity of `accepted`, tokens. */
-    int accepted_cap;        /* assemble: round_begin's cap; round_end: accepted[] capacity */
+    /** assemble: tokens the request may still generate (L443: a token count). */
+    TokCount max_tokens;
+    /** assemble: draft TOKENS allocated under overflow (the verify pick; the round's rows are 1 + these, one token a
+     *  row); TokCount{-1} = no allocation. */
+    TokCount k_alloc;
+    /** assemble: round_begin's cap; round_end: capacity of `accepted`, in tokens. */
+    TokCount accepted_cap;
     /** round_end: receives this bank's accepted tokens (caller-owned, accepted_cap slots). */
     TokId *accepted;         /* round_end: this bank's accepted tokens */
     /* round_end (L296): bit i set = verify row i -- the token after the base and drafts 0..i-1; row K is a full
@@ -1996,7 +1997,7 @@ typedef struct {
     /** The step's outcome, a pulsar_spec_step_status. */
     int status;              /* pulsar_spec_step_status */
     /** round_end: tokens written to `accepted`. */
-    int n_accepted;          /* round_end */
+    TokCount n_accepted;
     /** round_end: the round's base position (L155). */
     TokPos pos_before;       /* round_end: the round's base position (L155) */
     /** round_end: the bank's frontier after the round. */

@@ -22162,7 +22162,7 @@ static_assert(std::is_same_v<decltype(pulsar_spec_step{}.row0), StepRow> &&
 /* L443 (2): the rest of the speculative round API -- every row it takes or returns is a step row / a step-row count */
 static_assert(std::is_same_v<decltype(&pulsar_session_spec_round_end),
                              int (*)(pulsar_session *, pulsar_spec_round *, TokId, float, int, float, float, uint64_t *,
-                                     StepRow, TokId *, int, char *, size_t)> &&
+                                     StepRow, TokId *, TokCount, char *, size_t)> &&
                   std::is_same_v<decltype(&pulsar_session_spec_assemble_batch),
                                  int (*)(pulsar_session *, pulsar_spec_step *, int, StepRows, pulsar_multiseq_req *,
                                          StepRows *)> &&
@@ -22171,6 +22171,23 @@ static_assert(std::is_same_v<decltype(&pulsar_session_spec_round_end),
                   std::is_same_v<decltype(pulsar_spec_round_fill_reqs(nullptr, BankId{}, nullptr)), StepRows> &&
                   std::is_same_v<decltype(pulsar_session_spec_next_rows_max(nullptr)), StepRows>,
               "the round API's rows are step rows");
+/* L443 (2): the spec step's and round API's counts are token counts; the step's layout is pinned (an aggregate the
+ * TP frames rebuild field by field, memset whole: the offsets are those the int fields had) */
+static_assert(std::is_same_v<decltype(pulsar_spec_step{}.max_tokens), TokCount> &&
+                  std::is_same_v<decltype(pulsar_spec_step{}.k_alloc), TokCount> &&
+                  std::is_same_v<decltype(pulsar_spec_step{}.accepted_cap), TokCount> &&
+                  std::is_same_v<decltype(pulsar_spec_step{}.n_accepted), TokCount> &&
+                  std::is_same_v<decltype(&pulsar_session_spec_round_begin),
+                                 int (*)(pulsar_session *, pulsar_spec_round *, TokId, TokCount, TokCount, float, int,
+                                         float, float, char *, size_t)> &&
+                  !l334_passes<int, TokCount> && !l334_passes<StepRows, TokCount>,
+              "a round's caps and counts are tokens");
+static_assert(sizeof(pulsar_spec_step) == 272 && offsetof(pulsar_spec_step, max_tokens) == 40 &&
+                  offsetof(pulsar_spec_step, k_alloc) == 44 && offsetof(pulsar_spec_step, accepted_cap) == 48 &&
+                  offsetof(pulsar_spec_step, first_token) == 84 && offsetof(pulsar_spec_step, row0) == 88 &&
+                  offsetof(pulsar_spec_step, n_rows) == 92 && offsetof(pulsar_spec_step, n_accepted) == 100 &&
+                  offsetof(pulsar_spec_step, err) == 112,
+              "pulsar_spec_step's layout as it was with int / uint32 fields (L443 probe, x86-64)");
 /* L443: token ids and the walks' counts at the server's emit boundary -- an id is a TokId, a chain's length a TokCount */
 static_assert(std::is_same_v<decltype(&server::gen_emit_token), bool (server::*)(session_slot *, TokId)> &&
                   std::is_same_v<decltype(&server::gen_emit_piece),

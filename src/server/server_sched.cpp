@@ -5046,13 +5046,13 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                     continue;
                 }
             }
-            st->max_tokens = g->max_tokens - g->completion;
+            st->max_tokens = TokCount{g->max_tokens - g->completion};   /* the request's tokens still to generate */
             /* accepted_cap = allocated K + the base token: round_begin's own
              * trim (K <= accepted_cap-1) enforces the allocation, and its
              * validity checks may trim further -- the allocation is an
              * upper bound, never a promise. */
-            st->k_alloc = k_alloc[i];
-            st->accepted_cap = k_alloc[i] + 1;
+            st->k_alloc = TokCount{k_alloc[i]};   /* the pick's drafts (-1: none allocated) */
+            st->accepted_cap = TokCount{k_alloc[i] + 1};
             step_slot[ns++] = i;
         }
         /* The batch's first restore overwrites whatever is installed: park the
@@ -5321,7 +5321,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             st->first_token = first_tok[q];
             st->row0 = row0s[q];
             st->accepted = accepted[q];
-            st->accepted_cap = (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
+            st->accepted_cap = TokCount{PULSAR_SPEC_LOGITS_ROWS + 1};
         }
         (void)pulsar_session_spec_round_end_batch(pool, steps, m);
         const double end_t1 = server_now_sec();
@@ -5343,7 +5343,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 g->phase = GEN_FINISH;
                 continue;
             }
-            const int na = st->n_accepted;
+            const int na = st->n_accepted.raw();
             /* L155 tripwire: the round must hand back exactly the positions it
              * committed (the engine clamps commit at EOS and trims to the
              * accepted count).  The ghost rewind below counts na - emitted and

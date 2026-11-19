@@ -148,9 +148,9 @@ run_rec run(pulsar_engine *e, const std::vector<pulsar_tokens> &P, int n, bool p
             st[m].temperature = 0.0f;
             st[m].top_p = 1.0f;
             st[m].rng = &rngs[b];
-            st[m].max_tokens = n - (int)R.out[b].size();
-            st[m].k_alloc = -1;
-            st[m].accepted_cap = (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
+            st[m].max_tokens = TokCount{n - (int)R.out[b].size()};
+            st[m].k_alloc = TokCount{-1};
+            st[m].accepted_cap = TokCount{PULSAR_SPEC_LOGITS_ROWS + 1};
             bank_of[m++] = (uint32_t)b;
         }
         if (!ok) {
@@ -200,7 +200,7 @@ run_rec run(pulsar_engine *e, const std::vector<pulsar_tokens> &P, int n, bool p
         T.logits = gate_fnv1a(logits.data(), logits.size() * sizeof(float));
         for (int i = 0; i < m; i++) {
             st[i].accepted = acc[i];
-            st[i].accepted_cap = (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
+            st[i].accepted_cap = TokCount{PULSAR_SPEC_LOGITS_ROWS + 1};
             st[i].temperature = 0.0f;
             st[i].greedy_rows = 0u;
         }
@@ -213,13 +213,13 @@ run_rec run(pulsar_engine *e, const std::vector<pulsar_tokens> &P, int n, bool p
             }
             const uint32_t b = bank_of[i];
             T.acc.push_back((int32_t)b);
-            T.acc.push_back(st[i].n_accepted);
-            for (int k = 0; k < st[i].n_accepted; k++) {
+            T.acc.push_back(st[i].n_accepted.raw());
+            for (int k = 0; k < st[i].n_accepted.raw(); k++) {
                 T.acc.push_back(acc[i][k].raw());
                 R.out[b].push_back(acc[i][k].raw());
             }
             if ((int)R.out[b].size() >= n ||
-                (st[i].n_accepted && pulsar_token_is_stop(e, TokId{acc[i][st[i].n_accepted - 1]})))
+                (st[i].n_accepted.raw() && pulsar_token_is_stop(e, TokId{acc[i][st[i].n_accepted.raw() - 1]})))
                 done[b] = true;
         }
         R.ticks.push_back(T);

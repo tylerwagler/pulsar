@@ -89,9 +89,9 @@ static void run(pulsar_engine *e, int NB, float temp, int rounds_max, bool repor
             st[m].top_p = 1.0f;
             st[m].min_p = 0.05f;
             st[m].rng = &rngs[b];
-            st[m].max_tokens = 1 << 20;
-            st[m].k_alloc = -1;
-            st[m].accepted_cap = (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
+            st[m].max_tokens = TokCount{1 << 20};
+            st[m].k_alloc = TokCount{-1};
+            st[m].accepted_cap = TokCount{PULSAR_SPEC_LOGITS_ROWS + 1};
             bank_of[m++] = (uint32_t)b;
         }
         pulsar_gpu_sync_stats c0, c1, c2, c3, c4;
@@ -123,7 +123,7 @@ static void run(pulsar_engine *e, int NB, float temp, int rounds_max, bool repor
         if (!ok) break;
         for (int i = 0; i < m; i++) {
             st[i].accepted = acc[i];
-            st[i].accepted_cap = (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
+            st[i].accepted_cap = TokCount{PULSAR_SPEC_LOGITS_ROWS + 1};
         }
         ok = pulsar_session_spec_round_end_batch(s, st, m) == 0;
         pulsar_gpu_sync_stats_get(&c3);

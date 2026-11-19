@@ -153,7 +153,7 @@ int GATE_ENTRY(int argc, char **argv) {
                     goto done;
                 }
             }
-            if (pulsar_session_spec_round_begin(s, r, TokId{first}, 17, 17, temperature, top_k, top_p, min_p, err,
+            if (pulsar_session_spec_round_begin(s, r, TokId{first}, TokCount{17}, TokCount{17}, temperature, top_k, top_p, min_p, err,
                                                 sizeof err) != 0) {
                 fprintf(stderr, "round_begin at %d: %s\n", pos, err);
                 goto done;
@@ -203,7 +203,7 @@ int GATE_ENTRY(int argc, char **argv) {
                                                                                 "bank restore failed\n"); goto done; }
             TokId accepted[17];
             const int na = pulsar_session_spec_round_end_forced(s, r, TokId{first}, temperature, top_k, top_p, min_p,
-                                                                rngp, StepRow{0}, toks.v + pos + 1, accepted, 17,
+                                                                rngp, StepRow{0}, toks.v + pos + 1, accepted, TokCount{17},
                                                                 err, sizeof err);
             if (na < 0) { fprintf(stderr, "round_end_forced at %d: %s\n", pos, err); goto done; }
             for (int i = 0; i < na; i++) {

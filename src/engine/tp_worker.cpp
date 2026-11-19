@@ -786,10 +786,10 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
                 st->top_p = r->top_p; st->min_p = r->min_p;
                 rngs[i] = r->rng;
                 st->rng = &rngs[i];
-                st->max_tokens = r->i0;
+                st->max_tokens = TokCount{r->i0};   /* the wire's int32 fields */
                 st->first_token = TokId{r->i0};
-                st->k_alloc = r->i1;
-                st->accepted_cap = r->i2;
+                st->k_alloc = TokCount{r->i1};
+                st->accepted_cap = TokCount{r->i2};
                 st->accepted = acc + off;
                 st->row0 = StepRow{r->i3};   /* the wire's int32, as the uint32 field held it */
                 st->greedy_rows = r->greedy_rows;

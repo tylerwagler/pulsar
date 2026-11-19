@@ -284,9 +284,9 @@ static void batched_lane(pulsar_engine *e, const std::vector<pulsar_tokens> &P, 
             st[m].temperature = pos_greedy(greedy_run, got[b].size()) ? 0.0f : temp;   /* the base's position */
             st[m].top_p = 1.0f;
             st[m].rng = &rngs[b];
-            st[m].max_tokens = n - (int)got[b].size();
-            st[m].k_alloc = -1;
-            st[m].accepted_cap = (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
+            st[m].max_tokens = TokCount{n - (int)got[b].size()};
+            st[m].k_alloc = TokCount{-1};
+            st[m].accepted_cap = TokCount{PULSAR_SPEC_LOGITS_ROWS + 1};
             bank_of[m++] = (uint32_t)b;
         }
         if (m == 0) break;
@@ -322,7 +322,7 @@ static void batched_lane(pulsar_engine *e, const std::vector<pulsar_tokens> &P, 
         if (!ok) break;
         for (int i = 0; i < m; i++) {
             st[i].accepted = acc[i];
-            st[i].accepted_cap = (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
+            st[i].accepted_cap = TokCount{PULSAR_SPEC_LOGITS_ROWS + 1};
             /* row j: the token after the base (position got.size()) and j drafts */
             st[i].temperature = temp;
             st[i].greedy_rows = 0u;
@@ -338,9 +338,9 @@ static void batched_lane(pulsar_engine *e, const std::vector<pulsar_tokens> &P, 
             ok = st[i].status == PULSAR_SPEC_STEP_OK;
             if (!ok) { snprintf(err, sizeof err, "round_end bank %d: %s", st[i].bank.raw(), st[i].err); break; }
             const uint32_t b = bank_of[i];
-            for (int k = 0; k < st[i].n_accepted; k++) got[b].push_back(acc[i][k].raw());
+            for (int k = 0; k < st[i].n_accepted.raw(); k++) got[b].push_back(acc[i][k].raw());
             if ((int)got[b].size() >= n ||
-                (st[i].n_accepted && pulsar_token_is_stop(e, acc[i][st[i].n_accepted - 1])))
+                (st[i].n_accepted.raw() && pulsar_token_is_stop(e, acc[i][st[i].n_accepted.raw() - 1])))
                 done[b] = true;
         }
         if (!ok) break;

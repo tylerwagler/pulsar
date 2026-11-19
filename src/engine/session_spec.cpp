@@ -1386,8 +1386,9 @@ int pulsar_session_spec_round_end_forced(pulsar_session *s, pulsar_spec_round *r
                                       float min_p, uint64_t *rng,
                                       StepRow row0_at,
                                       const TokId *truth,
-                                      TokId *accepted, int accepted_cap,
+                                      TokId *accepted, TokCount accepted_toks,
                                       char *err, size_t errlen) {
+    const int accepted_cap = accepted_toks.raw();   /* L443: raw inside */
     const int first_token = first_token_id.raw();   /* L334 P3: the round's body is raw (its fields: S2 next) */
     const uint32_t row0 = pulsar_row_index(row0_at);   /* L443: the walk's index (raw inside) */
     if (spec_no_drafter(s, "spec round_end_forced", err, errlen)) return -1;   /* no round can have begun */
@@ -1464,11 +1465,20 @@ void pulsar_spec_redraft_stamp(pulsar_session *s, spec_redraft_req *q) {
  * Each is the per-bank sequence the server ran, in the same order on the same
  * state: restore, the phase, save.  The public wrappers (engine_api.cpp) send
  * ONE frame per phase and collect ONE verdict, pulsar_spec_steps_verdict. */
+/* L443: a round's tokens and its rows in the shared forward are one for one (the base, then each draft, a row each):
+ * the two crossings between a round's token counts (its drafts, an accepted[] capacity) and its step rows. */
+/// @param drafts the round's draft tokens (>= 0)
+/// @return its rows: the base's and one a draft
+static StepRows spec_round_rows(TokCount drafts) { return StepRows{1u + (uint32_t)drafts.raw()}; }
+/// @param rows a round's rows
+/// @return the tokens they hold, one a row
+static TokCount spec_round_tokens(StepRows rows) { return TokCount{rows.raw()}; }
+
 /// Reset a step's verdict fields (status OK, nothing accepted, no error).
 /// @param st the step
 static void spec_step_reset(pulsar_spec_step *st) {
     st->status = PULSAR_SPEC_STEP_OK;
-    st->n_accepted = 0;
+    st->n_accepted = TokCount{0};
     st->err[0] = '\0';
 }
 
@@ -1512,8 +1522,8 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
             st->status = PULSAR_SPEC_STEP_RESTORE_FAILED;
             continue;
         }
-        const StepRows cap_rows = st->k_alloc >= 0 ? StepRows{1u + (uint32_t)st->k_alloc}
-                                                   : pulsar_session_spec_next_rows_max(s);
+        const StepRows cap_rows = st->k_alloc >= TokCount{0} ? spec_round_rows(st->k_alloc)
+                                                             : pulsar_session_spec_next_rows_max(s);
         if (s->pos() >= s->ctx()) {
             st->status = PULSAR_SPEC_STEP_LENGTH;
         } else if (rows + cap_rows > row_budget) {
@@ -1530,12 +1540,13 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
                 snprintf(st->err, sizeof st->err, "sampler refused a degenerate logits row (L188)");
             } else if (pulsar_token_is_stop(s->engine, TokId{first})) {
                 st->status = PULSAR_SPEC_STEP_EOS;
-            } else if (pulsar_session_spec_round_begin_local(s, st->round, first, st->max_tokens,
+            } else if (pulsar_session_spec_round_begin_local(s, st->round, first, st->max_tokens.raw(),
                                                              /* the round's rows are at most the cap_rows the budget
                                                               * was checked against: begin cuts K to this cap - 1,
                                                               * whatever accepted_cap the step carries */
-                                                             st->accepted_cap < cap_rows.raw() ? st->accepted_cap
-                                                                                               : cap_rows.raw(),
+                                                             (st->accepted_cap < spec_round_tokens(cap_rows)
+                                                                  ? st->accepted_cap
+                                                                  : spec_round_tokens(cap_rows)).raw(),
                                                              st->temperature, st->top_k, st->top_p, st->min_p,
                                                              st->err, sizeof st->err) != 0) {
                 st->status = PULSAR_SPEC_STEP_FAILED;
@@ -1633,9 +1644,9 @@ void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_st
             na = spec_round_end_walked(s, st->round, st->first_token.raw(), st->temperature, st->top_k, st->top_p,
                                        st->min_p, st->greedy_rows, st->masks, st->mask_rows, st->rng,
                                        &wv[widx[i]], pulsar_row_index(st->row0), n /* L263: the step's flat cost is shared n ways */,
-                                       NULL, st->accepted, st->accepted_cap, st->err, sizeof st->err);
+                                       NULL, st->accepted, st->accepted_cap.raw(), st->err, sizeof st->err);
         if (na < 0) st->status = PULSAR_SPEC_STEP_FAILED;
-        else st->n_accepted = na;
+        else st->n_accepted = TokCount{na};
         st->pos_after = TokPos{s->pos()};
         spec_bank_save(s, st->bank);
     }
@@ -1682,8 +1693,8 @@ int pulsar_spec_steps_verdict(pulsar_spec_phase phase, const pulsar_spec_step *s
             h = spec_fp(h, (uint32_t)st->n_rows.raw());
         } else if (phase == PULSAR_SPEC_PHASE_ROUND_END) {
             h = spec_fp(h, (uint32_t)st->pos_after.raw());
-            h = spec_fp(h, (uint32_t)st->n_accepted);
-            for (int t = 0; t < st->n_accepted; t++) h = spec_fp(h, (uint32_t)st->accepted[t].raw());
+            h = spec_fp(h, (uint32_t)st->n_accepted.raw());
+            for (int t = 0; t < st->n_accepted.raw(); t++) h = spec_fp(h, (uint32_t)st->accepted[t].raw());
         }
     }
     return (int)(h & 0x3fffffffu) + 1;

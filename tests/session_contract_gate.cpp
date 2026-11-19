@@ -1032,9 +1032,9 @@ static bool spec_lane_round(pulsar_session *s, const uint32_t *banks, const int 
         st[i].round = rounds[i];
         st[i].top_p = 1.0f;
         st[i].rng = &rngs[i];
-        st[i].max_tokens = 64;
-        st[i].k_alloc = k_alloc[i];
-        st[i].accepted_cap = k_alloc[i] >= 0 ? k_alloc[i] + 1 : (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
+        st[i].max_tokens = TokCount{64};
+        st[i].k_alloc = TokCount{k_alloc[i]};
+        st[i].accepted_cap = TokCount{k_alloc[i] >= 0 ? k_alloc[i] + 1 : (int)(PULSAR_SPEC_LOGITS_ROWS + 1)};
     }
     StepRows step_rows{0};
     const bool assembled = pulsar_session_spec_assemble_batch(s, st, n, StepRows{width}, reqs.data(), &step_rows) == 0;
@@ -1066,7 +1066,7 @@ static bool spec_lane_round(pulsar_session *s, const uint32_t *banks, const int 
         st[i].first_token = TokId{first};
         st[i].row0 = row0;
         st[i].accepted = acc[i];
-        st[i].accepted_cap = (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
+        st[i].accepted_cap = TokCount{PULSAR_SPEC_LOGITS_ROWS + 1};
     }
     if (pulsar_session_spec_round_end_batch(s, st, n) != 0) {
         snprintf(err, errlen, "round_end refused");
@@ -1077,7 +1077,7 @@ static bool spec_lane_round(pulsar_session *s, const uint32_t *banks, const int 
             snprintf(err, errlen, "round_end bank %u: %s", banks[i], st[i].err);
             return false;
         }
-        na[i] = st[i].n_accepted;
+        na[i] = st[i].n_accepted.raw();
     }
     return true;
 }

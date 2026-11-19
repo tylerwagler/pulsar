@@ -5147,7 +5147,7 @@ static void test_spec_round_refusals(void) {
                 strstr(err, "no drafter") != NULL && s->checkpoint.len == 3 && s->checkpoint_valid);
     TEST_ASSERT(pulsar_session_spec_round_end_local(s, r, 4, 0.0f, 0, 1.0f, 0.0f, 0u, NULL, 0u, NULL, 0u, acc, 17, err,
                                                     sizeof err) == -1 && strstr(err, "no drafter") != NULL);
-    TEST_ASSERT(pulsar_session_spec_round_end_forced(s, r, TokId{4}, 0.0f, 0, 1.0f, 0.0f, NULL, StepRow{0}, truth, acc, 17, err,
+    TEST_ASSERT(pulsar_session_spec_round_end_forced(s, r, TokId{4}, 0.0f, 0, 1.0f, 0.0f, NULL, StepRow{0}, truth, acc, TokCount{17}, err,
                                                      sizeof err) == -1 && strstr(err, "no drafter") != NULL);
     pulsar_spec_step st[2] = {};
     st[0].bank = BankId{0};
@@ -5172,7 +5172,7 @@ static void test_spec_round_refusals(void) {
     TEST_ASSERT(pulsar_spec_round_n_rows(r) == StepRows{3} && s->checkpoint.len == 6 &&
                 pulsar_spec_round_saved_len(r) == TokPos{3});
     /* L155: accepted[] of 2 for a round of 3 rows -- refused before anything commits, the round undone */
-    TEST_ASSERT(pulsar_session_spec_round_end_forced(s, r, TokId{4}, 0.0f, 0, 1.0f, 0.0f, NULL, StepRow{0}, truth, acc, 2, err,
+    TEST_ASSERT(pulsar_session_spec_round_end_forced(s, r, TokId{4}, 0.0f, 0, 1.0f, 0.0f, NULL, StepRow{0}, truth, acc, TokCount{2}, err,
                                                      sizeof err) == -1 && strstr(err, "accepted[]") != NULL);
     TEST_ASSERT(s->checkpoint.len == 3 && !s->checkpoint_valid);
     /* O37: a begun round whose end cannot walk (sampled, no stream) is undone */

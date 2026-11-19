@@ -1742,9 +1742,10 @@ TokId pulsar_session_spec_next_base(pulsar_session *s, float temperature, int to
                                     uint64_t *rng) {
     return TokId{spec_next_base_raw(s, temperature, top_k, top_p, min_p, rng)};   /* -1 enters as none() */
 }
-int pulsar_session_spec_round_begin(pulsar_session *s, pulsar_spec_round *r, TokId first_token_id, int max_tokens, int accepted_cap, float temperature, int top_k, float top_p, float min_p, char *err, size_t errlen) {
+int pulsar_session_spec_round_begin(pulsar_session *s, pulsar_spec_round *r, TokId first_token_id, TokCount max_toks, TokCount accepted_toks, float temperature, int top_k, float top_p, float min_p, char *err, size_t errlen) {
     PULSAR_NVTX_FN();
     const int first_token = first_token_id.raw();   /* L334 P3: the local rounds and the TP wire take the raw id */
+    const int max_tokens = max_toks.raw(), accepted_cap = accepted_toks.raw();   /* L443: raw inside, as before */
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", -1);
     if (!s) return -1;
     pulsar_tp *tp = NULL;
@@ -1759,7 +1760,8 @@ int pulsar_session_spec_round_begin(pulsar_session *s, pulsar_spec_round *r, Tok
     const int own = pulsar_session_spec_round_begin_local(s, r, first_token, max_tokens, accepted_cap, temperature, top_k, top_p, min_p, err, errlen);
     return tp_mirror_bank_verdict(s, tp, "spec_round_begin", own == 0 ? 0 : 1, -1) < 0 ? -1 : own;
 }
-int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r, TokId first_token_id, float temperature, int top_k, float top_p, float min_p, uint64_t *rng, StepRow row0_at, TokId *accepted, int accepted_cap, char *err, size_t errlen) {
+int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r, TokId first_token_id, float temperature, int top_k, float top_p, float min_p, uint64_t *rng, StepRow row0_at, TokId *accepted, TokCount accepted_toks, char *err, size_t errlen) {
+    const int accepted_cap = accepted_toks.raw();   /* L443: raw inside */
     PULSAR_NVTX_FN();
     const int first_token = first_token_id.raw();   /* L334 P3: the local rounds and the TP wire take the raw id */
     const uint32_t row0 = pulsar_row_index(row0_at);   /* L443: the walk's index (raw inside, as the field was) */
@@ -1903,9 +1905,10 @@ static int tp_spec_steps_mirror(pulsar_session *s, pulsar_tp *tp, uint32_t frame
         r->temperature = st->temperature; r->top_k = st->top_k;
         r->top_p = st->top_p; r->min_p = st->min_p;
         r->rng = st->rng ? *st->rng : 0;
-        r->i0 = frame_type == PULSAR_TP_FRAME_SPEC_ASSEMBLE_BATCH ? st->max_tokens : st->first_token.raw();
-        r->i1 = st->k_alloc;
-        r->i2 = st->accepted_cap;
+        /* the wire's int32 fields */
+        r->i0 = frame_type == PULSAR_TP_FRAME_SPEC_ASSEMBLE_BATCH ? st->max_tokens.raw() : st->first_token.raw();
+        r->i1 = st->k_alloc.raw();
+        r->i2 = st->accepted_cap.raw();
         r->i3 = (int32_t)st->row0.raw();   /* the wire's int32 */
         r->greedy_rows = st->greedy_rows;
     }
