@@ -38,8 +38,8 @@
  * reads the whole body once, from its start, and is the authority on the call. */
 class xml_call_body : public out_call_body {
 public:
-    /** The request's tools (the schema that types arguments). */
-    pyjson_value tools;
+    /** The request's tools (the schema that types arguments); shared with the parser's copies (L430). */
+    out_tools tools;
     /** How the template spelt a non-string SCALAR: false = tojson (Qwen: true / false / null), true = Python's str()
      *  (L296 Nemotron-H's `args_value | string`: True / False / None; numbers spell the same either way; mappings and
      *  lists are tojson in both).  A value is typed only from its template's own spelling. */

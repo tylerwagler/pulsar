@@ -4,6 +4,7 @@
 #include "out_parse_kit.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <algorithm>
@@ -39,6 +40,13 @@ size_t utf8_whole_end(const std::string &b, size_t lo, size_t hi) {
     return want > 1 && (k - 1) + (size_t)want > hi ? k - 1 : hi;
 }
 
+/// A broken invariant of the parser's use: say it and stop (the lib has no pulsar_die).
+/// @param what the invariant
+[[noreturn]] void kit_die(const char *what) {
+    fprintf(stderr, "out_parse_kit: %s\n", what);
+    abort();
+}
+
 }  // namespace
 
 /* ---- the parser ---------------------------------------------------------------------------- */
@@ -62,6 +70,54 @@ void out_parser::init(const out_grammar *g, out_call_body *body, out_state initi
     calls_.clear();
     prefix_held_.clear();
     prefix_done_ = !g->reasoning_prefix;
+    lent_out_ = false;
+    loan_ = LOAN_NONE;
+    loan_len_ = 0;
+    parked_.clear();
+}
+
+/* L430: the probe.  clone() copies everything the parser holds; a probe is taken every speculative round, and two of
+ * the things a clone copies grow with the turn -- the text reported so far (reasoning_, content_, calls_: feed() only
+ * appends to them) and the open call's body (block_: the body reader reads it whole, from cursors that only move
+ * forward).  So the family's clone() is run with those four moved out of the way: it copies the bounded rest, the
+ * body reader included.  The reported text goes back; the body goes to the probe, which appends to it as it reads
+ * (amortised: the string grows geometrically, and comes back with its capacity).  probe_end() cuts what the probe
+ * appended and returns it. */
+out_parser *out_parser::probe() {
+    if (lent_out_ || loan_ != LOAN_NONE) kit_die("probe() of a parser that lent its body, or of a probe");
+    std::string block, reasoning, content;
+    std::vector<out_call> calls;
+    block.swap(block_);
+    reasoning.swap(reasoning_);
+    content.swap(content_);
+    calls.swap(calls_);
+    out_parser *p = clone();
+    reasoning.swap(reasoning_);
+    content.swap(content_);
+    calls.swap(calls_);
+    p->block_.swap(block);
+    p->loan_ = LOAN_HELD;
+    p->loan_len_ = p->block_.size();
+    lent_out_ = true;
+    return p;
+}
+
+void out_parser::probe_end(out_parser *probe) {
+    if (!lent_out_ || probe->loan_ == LOAN_NONE) kit_die("probe_end() without its probe()");
+    std::string &lent = probe->loan_ == LOAN_PARKED ? probe->parked_ : probe->block_;
+    if (lent.size() < probe->loan_len_) kit_die("a probe lost bytes of the body it borrowed");
+    lent.resize(probe->loan_len_);
+    block_.swap(lent);
+    lent_out_ = false;
+    delete probe;
+}
+
+void out_parser::new_block() {
+    if (loan_ == LOAN_HELD) {   /* the lender's body is not this probe's to clear */
+        parked_.swap(block_);
+        loan_ = LOAN_PARKED;
+    }
+    block_.clear();
 }
 
 void out_parser::send(bool reasoning, std::string &&text, std::vector<out_event> *ev) {
@@ -234,6 +290,7 @@ void out_parser::close_call(std::vector<out_event> *ev) {
 }
 
 void out_parser::feed(const char *p, size_t n, std::vector<out_event> *ev) {
+    if (lent_out_) kit_die("feed() while a probe holds the open call's body");
     hold_.append(p, n);
     fed_ += n;
     for (;;) {
@@ -304,7 +361,7 @@ void out_parser::feed(const char *p, size_t n, std::vector<out_event> *ev) {
                 call_at_ = marker_at;
                 block_seen_ = true;
             }
-            block_.clear();
+            new_block();
             body_->open();
         }
         if (tr->to == OUT_HEADER) header_at_ = marker_at + len;
@@ -314,6 +371,7 @@ void out_parser::feed(const char *p, size_t n, std::vector<out_event> *ev) {
 }
 
 void out_parser::finish(std::vector<out_event> *ev) {
+    if (lent_out_ || loan_ != LOAN_NONE) kit_die("finish() of a probe, or while a probe holds the open call's body");
     if (state_ == OUT_CALL) {
         block_ += hold_;
         hold_.clear();
@@ -436,6 +494,10 @@ const char *out_tool_param_type(const pyjson_value &tools, const std::string &fn
         return schema_declares_string(*params, *prop, chain, 0, &budget) ? "string" : "other";
     }
     return NULL;
+}
+
+const char *out_tool_param_type(const out_tools &tools, const std::string &fn, const std::string &key) {
+    return tools ? out_tool_param_type(*tools, fn, key) : NULL;
 }
 
 /* ---- the shared JSON call body ----------------------------------------------------------------- */

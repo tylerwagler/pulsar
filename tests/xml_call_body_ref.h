@@ -3,7 +3,8 @@
 /* xml_call_body_ref.h -- src/lib's xml_call_body (xml_call_body.h, out_parse_kit.cpp) as it stood at 718c5848, the
  * commit before L429 made its per-feed readings resume: every grow() read the open parameter from its start
  * (read_param's finds), and holds_closer read every parameter from the body's start.  Its code is that commit's,
- * byte for byte, but for the class name, `inline`, and holds_closer's const (the kit's signature changed).
+ * byte for byte, but for the class name, `inline`, and holds_closer's const (the kit's signature changed).  (L430: the
+ * live body now shares its tools with its copies; the harness below gives each body its tools in its own form.)
  *
  * It is the REFERENCE of two instruments and is not to be edited with the live body:
  *   tests/qwen_chat_gate.cpp  P3: the live body must produce this one's events, in_payload() answers and calls at
@@ -18,8 +19,12 @@
 #include <string>
 #include <vector>
 
+#include <memory>
+#include <utility>
+
 #include "out_parse_kit.h"
 #include "pyjson.h"
+#include "xml_call_body.h"
 
 /** xml_call_body before L429 (see xml_call_body.h for the format and the rules). */
 class xml_call_body_ref : public out_call_body {
@@ -327,6 +332,17 @@ inline bool xml_call_body_ref::close(const std::string &b, int index, std::vecto
     return true;
 }
 
+/// Give a body its request's tools: the reference keeps its own copy, as it did.
+/// @param b     the reference body
+/// @param tools the parsed tools array
+inline void call_body_set_tools(xml_call_body_ref *b, pyjson_value &&tools) { b->tools = std::move(tools); }
+/// Give a body its request's tools: the live body shares them with its copies (L430).
+/// @param b     the live body
+/// @param tools the parsed tools array
+inline void call_body_set_tools(xml_call_body *b, pyjson_value &&tools) {
+    b->tools = std::make_shared<const pyjson_value>(std::move(tools));
+}
+
 /** A kit parser around one call body `Body` (xml_call_body or xml_call_body_ref): the same kit, the same grammar,
  *  so two of them differ only in the body's reading. */
 template <class Body> class call_body_parser : public out_parser {
@@ -339,11 +355,12 @@ public:
     /// @param initial        the state the turn starts in
     /// @return false when `tools_json` is not a JSON array
     bool start(const out_grammar &g, const char *tools_json, bool python_scalars, out_state initial) {
-        body.tools = pyjson_value();
+        pyjson_value tools;
         char jerr[160];
-        if (tools_json && (!pyjson_parse(tools_json, strlen(tools_json), &body.tools, jerr, sizeof jerr) ||
-                           body.tools.kind != pyjson_value::ARR))
+        if (tools_json && (!pyjson_parse(tools_json, strlen(tools_json), &tools, jerr, sizeof jerr) ||
+                           tools.kind != pyjson_value::ARR))
             return false;
+        call_body_set_tools(&body, std::move(tools));
         body.python_scalars = python_scalars;
         init(&g, &body, initial);
         return true;

@@ -697,6 +697,13 @@ segstore-tsan: tests/segstore_tsan
 kv-identity-gate: pulsar_test
 	./pulsar_test --kv-identity
 
+# L430: the generation path's host work against its earlier reading (pulsar_test --gen-host; host-only, no model): a
+# speculative round's look ahead -- which rows are a call's structure, where a single-call turn's chain ends -- on
+# thousands of random turns of every family, against the walks as they were (tests/gen_host_ref.h).
+.PHONY: gen-host-gate
+gen-host-gate: pulsar_test
+	./pulsar_test --gen-host
+
 # L427: grammar compile admission (src/lib/pulsar_grammar_admit.h): the slot queue, shared pending compiles and
 # per-request deadlines, with compiles the test blocks and releases.  Host only, seconds.  Two programs from one
 # source: the plain one adds the legs through the real xgrammar boundary; the ThreadSanitizer one is the admission
@@ -2903,7 +2910,7 @@ src/vendor/xgrammar/%.o: src/vendor/xgrammar/%.cc
 src/lib/pulsar_grammar.o: src/lib/pulsar_grammar.cpp src/lib/pulsar_grammar.h src/lib/pulsar_grammar_admit.h
 	$(CXX) $(GRAMMAR_CXXFLAGS) $(XGRAMMAR_INC) -c -o $@ $<
 
-tests/pulsar_test.o: tests/pulsar_test.cpp $(SERVER_SRCS) $(FAMILY_SERVERS_INC) $(SERVER_HDRS) src/pulsar.h $(LIB_HDRS) tests/sampler_host_ref.h
+tests/pulsar_test.o: tests/pulsar_test.cpp $(SERVER_SRCS) $(FAMILY_SERVERS_INC) $(SERVER_HDRS) src/pulsar.h $(LIB_HDRS) tests/sampler_host_ref.h tests/gen_host_ref.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Itests -c -o $@ tests/pulsar_test.cpp
 
 tests/pulsar_agent_test.o: tests/pulsar_agent_test.cpp $(AGENT_SRCS) src/agent/pulsar_agent_internal.h src/pulsar.h $(LIB_HDRS) src/vendor/linenoise.h
@@ -3431,6 +3438,16 @@ tests/grammar_bench.o: tests/grammar_bench.cpp $(SERVER_SRCS) $(FAMILY_SERVERS_I
 
 tests/grammar_bench: tests/grammar_bench.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS) $(GRAMMAR_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+# L430: what a speculative round's look ahead costs on the host, by the text generated so far: the walks before L430
+# (tests/gen_host_ref.h) against the live ones.  It prints; it does not grade.  No model, no GPU.
+tests/gen_host_bench.o: tests/gen_host_bench.cpp tests/gen_host_ref.h $(SERVER_SRCS) $(FAMILY_SERVERS_INC) $(SERVER_HDRS) src/pulsar.h $(LIB_HDRS)
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ tests/gen_host_bench.cpp
+tests/gen_host_bench: tests/gen_host_bench.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS) $(GRAMMAR_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+.PHONY: gen-host-bench
+gen-host-bench: tests/gen_host_bench
+	./tests/gen_host_bench
 
 .PHONY: api-golden-gate
 api-golden-gate: tests/api_golden

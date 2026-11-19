@@ -1883,8 +1883,8 @@ void gen_resolve_sampling_decode(const gen_state *g, float *temperature,
 
 
 
-/* The emit path's byte release -- gen_emit_token's, and (L296) the spec lane's per-position probe's on copies of the
- * same state: `text` (len bytes) just grew by `piece`, its last piece_len bytes.  The reasoning tracker and the stop
+/* The emit path's byte release -- gen_emit_token's, and (L296) the spec lane's per-position probe's on its look ahead
+ * over the same state (gen_walk): `text` (len bytes) just grew by `piece`, its last piece_len bytes.  The reasoning tracker and the stop
  * scan's resume point advance, and the return is how many bytes of `text` the stop-string scan releases (what the
  * client stream and the output parser are given).  A client stop sequence that matched sets *hit_stop, *stop_pos and
  * *stop_len. */
@@ -1932,59 +1932,97 @@ static bool gen_tool_override_varies(const gen_state *g) {
     return req->kind == REQ_CHAT && req->has_tools && g->parser_st && temperature > 0.0f;
 }
 
+namespace {
+
+/* L430: a speculative round's look ahead over the decode-time state, shared by the round's two walks
+ * (gen_spec_greedy_rows_text, gen_turn_draft_prefix_text).  It reads the round's tokens as the emit path will -- the
+ * emit path's own release rule (gen_release), the parser's own reading -- and leaves nothing behind.
+ *
+ * Before L430 each walk copied what it read ahead of: all of g->text, and the output parser with the turn's reported
+ * text and the open call's body.  A round then cost the bytes generated so far (829 us at 4 MB of a tool call's
+ * value), on the worker thread that launches every forward.  Now the round's tokens are appended to g->text ITSELF
+ * and cut off again, the reasoning tracker and the two offsets are the small copies they were, and the parser's
+ * probe borrows the open call's body (server_output_parser_ops::probe_new, out_parser::probe).  The cost is the
+ * round's bytes and the parser's bounded state.  The attempt is on the worker thread and no one else reads it, so
+ * nothing sees the borrowed state; the destructor puts back exactly what the constructor found. */
+/// One look ahead: construct, step() each token, read the probe, destroy.
+struct gen_walk {
+    gen_state *g;              ///< the attempt (its text is appended to, then cut back)
+    void *probe;               ///< the parser's probe (in_tool_call and turn_complete read it)
+    thinking_state thinking;   ///< the reasoning tracker's copy
+    size_t stop_scan_from;     ///< the stop scan's resume point, a copy
+    size_t plain_stream_pos;   ///< the streamed prefix, a copy
+    size_t len0;               ///< g->text's length before the walk
+    bool had_text;             ///< g->text held a buffer before the walk
+
+    /// @param gs  the attempt (with an output parser state)
+    explicit gen_walk(gen_state *gs)
+        : g(gs), probe(gs->parser->probe_new(gs->parser_st)), thinking(gs->thinking),
+          stop_scan_from(gs->stop_scan_from), plain_stream_pos(gs->plain_stream_pos), len0(gs->text.len),
+          had_text(gs->text.ptr != NULL) {}
+    gen_walk(const gen_walk &) = delete;
+    gen_walk &operator=(const gen_walk &) = delete;
+    ~gen_walk() {
+        g->parser->probe_free(probe);
+        if (!had_text) {
+            buf_free(&g->text);
+        } else {
+            g->text.len = len0;
+            g->text.ptr[len0] = '\0';
+        }
+    }
+    /// The next token of the round, as the emit path would take it.
+    /// @param piece  the token's text
+    /// @param n      its length
+    /// @return false when a stop string ends the stream at this token (the probe was fed nothing)
+    bool step(const char *piece, size_t n) {
+        buf_append(&g->text, piece, n);
+        size_t stop_pos = 0, stop_len = 0;
+        bool hit_stop = false;
+        const size_t upto = gen_release(&g->j->req.stops, g->text.ptr, g->text.len, piece, n, plain_stream_pos,
+                                        &thinking, &stop_scan_from, &hit_stop, &stop_pos, &stop_len);
+        if (hit_stop) return false;
+        if (gen_streams_plain(g) && upto > plain_stream_pos) plain_stream_pos = upto;
+        g->parser->probe_feed(probe, g, g->text.ptr, g->text.len, upto);
+        return true;
+    }
+};
+
+}  // namespace
+
 /* L296 toolsample: gen_resolve_sampling_decode's tool-call override at EVERY position of a speculative round, as the
  * plain lane evaluates it token by token (emit a token, resolve, draw the next).  pieces[0..n) are the texts of the
  * round's tokens the stream has not taken yet, in order -- the base unless it was streamed before the forward
  * (`base_emitted`), then the drafts; NULL = a stop token.  Bit i of the result = the token after the base and drafts
  * 0..i-1 (verify row i; row K is a full accept's carry) sits in a call's STRUCTURE, which the plain lane draws greedy.
  *
- * The positions are read off a SCRATCH copy of the decode-time state -- the output parser's tracking (its probe),
- * the reasoning tracker, the stop scan's resume point, the streamed prefix and the text -- advanced by the emit
- * path's own release rule (gen_release) and the parser's own reading, so each bit is what in_tool_call says once the
- * tokens before it are emitted.  Past a token that ends the stream (a stop token, a stop sequence) nothing is
- * emitted: those bits repeat the last, and the server never streams the rows they govern.  0 for a request the
- * override never touches (not a chat with tools) or that is greedy throughout. */
-uint32_t gen_spec_greedy_rows_text(const gen_state *g, const char *const *pieces, const size_t *piece_lens, int n,
+ * The positions are read off a look ahead over the decode-time state (gen_walk, L430) -- the output parser's
+ * tracking (its probe), the reasoning tracker, the stop scan's resume point, the streamed prefix and the text --
+ * advanced by the emit path's own release rule (gen_release) and the parser's own reading, so each bit is what
+ * in_tool_call says once the tokens before it are emitted.  Past a token that ends the stream (a stop token, a stop
+ * sequence) nothing is emitted: those bits repeat the last, and the server never streams the rows they govern.  0 for
+ * a request the override never touches (not a chat with tools) or that is greedy throughout. */
+uint32_t gen_spec_greedy_rows_text(gen_state *g, const char *const *pieces, const size_t *piece_lens, int n,
                                    bool base_emitted) {
     if (!gen_tool_override_varies(g)) return 0u;
-    const request *req = &g->j->req;
-    void *probe = g->parser->probe_new(g->parser_st);
-    buf text;
-    memset(&text, 0, sizeof text);
-    if (g->text.len) buf_append(&text, g->text.ptr, g->text.len);
-    thinking_state thinking = g->thinking;
-    size_t stop_scan_from = g->stop_scan_from;
-    size_t plain_stream_pos = g->plain_stream_pos;
-    bool greedy = g->parser->in_tool_call(probe, g);
+    gen_walk w(g);
+    bool greedy = g->parser->in_tool_call(w.probe, g);
     uint32_t bits = base_emitted && greedy ? 1u : 0u;   /* row 0 follows a streamed base: the state as it stands */
     int row = base_emitted ? 1 : 0;
     bool live = true;
     for (int i = 0; i < n && row < 32; i++, row++) {
         if (live && !pieces[i]) live = false;
         if (live) {
-            buf_append(&text, pieces[i], piece_lens[i]);
-            size_t stop_pos = 0, stop_len = 0;
-            bool hit_stop = false;
-            const size_t upto = gen_release(&req->stops, text.ptr, text.len, pieces[i], piece_lens[i],
-                                            plain_stream_pos, &thinking, &stop_scan_from, &hit_stop, &stop_pos,
-                                            &stop_len);
-            if (hit_stop) {
-                live = false;
-            } else {
-                if (gen_streams_plain(g) && upto > plain_stream_pos) plain_stream_pos = upto;
-                g->parser->probe_feed(probe, g, text.ptr, text.len, upto);
-                greedy = g->parser->in_tool_call(probe, g);
-            }
+            live = w.step(pieces[i], piece_lens[i]);
+            if (live) greedy = g->parser->in_tool_call(w.probe, g);
         }
         if (greedy) bits |= 1u << row;
     }
-    buf_free(&text);
-    g->parser->probe_free(probe);
     return bits;
 }
 
 /* gen_spec_greedy_rows_text over the round's token ids (the engine's texts and stop set). */
-uint32_t gen_spec_greedy_rows(server *s, const gen_state *g, const TokId *toks, int n, bool base_emitted) {
+uint32_t gen_spec_greedy_rows(server *s, gen_state *g, const TokId *toks, int n, bool base_emitted) {
     if (!gen_tool_override_varies(g)) return 0u;
     char *pieces[PULSAR_SPEC_LOGITS_ROWS + 1] = {};
     size_t lens[PULSAR_SPEC_LOGITS_ROWS + 1] = {};
@@ -1999,44 +2037,25 @@ uint32_t gen_spec_greedy_rows(server *s, const gen_state *g, const TokId *toks, 
 }
 
 /* L428: where a pending chain meets the end of a turn that may make one call.  The walk is gen_spec_greedy_rows_text's
- * -- a scratch copy of the decode-time state (the parser's probe, the reasoning tracker, the stop scan, the text)
- * advanced by the emit path's own release rule -- and it asks the probe what the emit path asks the parser after each
- * token (turn_complete).  The chain is cut after the token that says yes: the round then verifies nothing the server
- * would commit and not emit.  A stop token or a stop string ends the walk (the round clamps or the emit stops there
- * as before). */
-int gen_turn_draft_prefix_text(const gen_state *g, const char *const *pieces, const size_t *piece_lens, int n) {
+ * -- a look ahead over the decode-time state (gen_walk: the parser's probe, the reasoning tracker, the stop scan, the
+ * text) advanced by the emit path's own release rule -- and it asks the probe what the emit path asks the parser
+ * after each token (turn_complete).  The chain is cut after the token that says yes: the round then verifies nothing
+ * the server would commit and not emit.  A stop token or a stop string ends the walk (the round clamps or the emit
+ * stops there as before). */
+int gen_turn_draft_prefix_text(gen_state *g, const char *const *pieces, const size_t *piece_lens, int n) {
     const request *req = &g->j->req;
     if (n <= 0 || !req->single_tool_call || req->kind != REQ_CHAT || !req->has_tools || !g->parser_st) return n;
-    void *probe = g->parser->probe_new(g->parser_st);
-    buf text;
-    memset(&text, 0, sizeof text);
-    if (g->text.len) buf_append(&text, g->text.ptr, g->text.len);
-    thinking_state thinking = g->thinking;
-    size_t stop_scan_from = g->stop_scan_from;
-    size_t plain_stream_pos = g->plain_stream_pos;
-    int keep = n;
+    gen_walk w(g);
     for (int i = 0; i <= n; i++) {   /* pieces[0] is the base, pieces[i] draft i - 1 */
-        if (!pieces[i]) break;
-        buf_append(&text, pieces[i], piece_lens[i]);
-        size_t stop_pos = 0, stop_len = 0, end = 0;
-        bool hit_stop = false;
-        const size_t upto = gen_release(&req->stops, text.ptr, text.len, pieces[i], piece_lens[i], plain_stream_pos,
-                                        &thinking, &stop_scan_from, &hit_stop, &stop_pos, &stop_len);
-        if (hit_stop) break;
-        if (gen_streams_plain(g) && upto > plain_stream_pos) plain_stream_pos = upto;
-        g->parser->probe_feed(probe, g, text.ptr, text.len, upto);
-        if (g->parser->turn_complete(probe, g, &end)) {
-            keep = i;
-            break;
-        }
+        size_t end = 0;
+        if (!pieces[i] || !w.step(pieces[i], piece_lens[i])) break;
+        if (g->parser->turn_complete(w.probe, g, &end)) return i;
     }
-    buf_free(&text);
-    g->parser->probe_free(probe);
-    return keep;
+    return n;
 }
 
 /* gen_turn_draft_prefix_text over the chain's token ids (the engine's texts and stop set). */
-int gen_turn_draft_prefix(server *s, const gen_state *g, TokId base_id, const TokId *drafts, int n) {
+int gen_turn_draft_prefix(server *s, gen_state *g, TokId base_id, const TokId *drafts, int n) {
     const request *req = &g->j->req;
     if (n <= 0 || !req->single_tool_call || req->kind != REQ_CHAT || !req->has_tools || !g->parser_st) return n;
     char *pieces[PULSAR_SPEC_LOGITS_ROWS + 1] = {};

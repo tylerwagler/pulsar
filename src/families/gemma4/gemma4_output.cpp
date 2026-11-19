@@ -302,14 +302,16 @@ bool gemma4_call_body::close(const std::string &b, int index, std::vector<out_ev
 }
 
 bool gemma4_output_parser::init(bool reasoning, const char *tools_json, char *err, size_t errlen) {
-    body_.tools = pyjson_value();
+    body_.tools.reset();
     if (tools_json) {
         char jerr[160] = "not a JSON array";
-        if (!pyjson_parse(tools_json, strlen(tools_json), &body_.tools, jerr, sizeof jerr) ||
-            body_.tools.kind != pyjson_value::ARR) {
+        const std::shared_ptr<pyjson_value> tools = std::make_shared<pyjson_value>();   /* parsed once (L430) */
+        if (!pyjson_parse(tools_json, strlen(tools_json), tools.get(), jerr, sizeof jerr) ||
+            tools->kind != pyjson_value::ARR) {
             if (err && errlen) snprintf(err, errlen, "tools_not_array: %s", jerr);
             return false;
         }
+        body_.tools = tools;
     }
     out_parser::init(&gemma4_output_grammar(), &body_, reasoning ? OUT_REASONING : OUT_CONTENT);
     return true;

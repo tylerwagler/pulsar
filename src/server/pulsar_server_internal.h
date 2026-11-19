@@ -770,10 +770,13 @@ typedef struct server_output_parser_ops {
     /** The turn's final reading (repair, parse, ids, the family's own retry and memory).  false = a
      *  client write failed while finishing the stream. */
     bool (*finish)(void *st, server *s, struct session_slot *sl, struct gen_state *g, server_turn *out);
-    /** L296 toolsample: a SCRATCH copy of the decode-time tracking `in_tool_call` reads, so the spec lane can read
+    /** L296 toolsample: a SCRATCH reader of the decode-time tracking `in_tool_call` reads, so the spec lane can read
      *  the greedy region at every position of a round before any of it is emitted (gen_spec_greedy_rows).
-     *  `in_tool_call` reads a probe as it reads the state; nothing else does. */
-    void *(*probe_new)(const void *st);
+     *  `in_tool_call` and `turn_complete` read a probe as they read the state; nothing else does.  L430: a probe
+     *  costs the state's bounded part, not the turn so far, so it may BORROW from `st` what it would otherwise copy
+     *  (the kit: the open call's body): between probe_new and probe_free the state is not fed, finished or probed
+     *  again, and probe_free leaves it exactly as probe_new found it. */
+    void *(*probe_new)(void *st);
     /** Advance a probe as `feed` advances the state (no sink, no events kept): `text` (len bytes) is the
      *  generated text with the round's tokens so far appended, `upto` the bytes the stop-string scan released. */
     void (*probe_feed)(void *probe, const struct gen_state *g, const char *text, size_t len, size_t upto);
@@ -4550,6 +4553,9 @@ struct kit_gen {
      *  model wrote something else there. */
     bool cut = false;
     size_t cut_at = 0;               ///< where the turn's text ends in g->text; `parser` reads no further
+    /** L430: this kit_gen is a probe (parser_kit_probe_new): the state it was taken from, whose parsers lent it
+     *  their open call bodies (out_parser::probe).  NULL for an attempt's own state. */
+    kit_gen *lender = nullptr;
     ~kit_gen();                      ///< frees `calls` and the parsers (parser_kit.cpp)
 };
 /** The kit's server_output_parser_ops hooks (parser_kit.cpp): a family whose parser is a kit configuration
@@ -4575,7 +4581,7 @@ bool parser_kit_in_tool_call(const void *st, const struct gen_state *g);
 bool parser_kit_turn_complete(const void *st, const struct gen_state *g, size_t *end);
 void parser_kit_tool_progress(const void *st, bool *opened, bool *closed);
 bool parser_kit_finish(void *st, server *s, struct session_slot *sl, struct gen_state *g, server_turn *out);
-void *parser_kit_probe_new(const void *st);
+void *parser_kit_probe_new(void *st);
 /// server_output_parser_ops::probe_feed: feed the probe the text it has not read, up to `upto` (L428: and its
 /// read-ahead copy, in a turn that may make one call, up to `len`).
 /// @param probe  the probe (parser_kit_probe_new)
@@ -6153,23 +6159,25 @@ void gen_resolve_sampling_decode(const gen_state *g, float *temperature,
 void gen_resolve_sampling(const request *req, float *temperature,
                           int *top_k, float *top_p, float *min_p);
 /** L296: gen_resolve_sampling_decode's tool-call override at every position of a speculative round (bit i = verify
- *  row i draws greedy; pulsar_spec_step::greedy_rows), read off a scratch copy of the decode-time state.  `toks` (n)
- *  = the round's tokens not yet streamed: the base unless `base_emitted`, then the drafts. */
+ *  row i draws greedy; pulsar_spec_step::greedy_rows), read off a look ahead over the decode-time state.  `toks` (n)
+ *  = the round's tokens not yet streamed: the base unless `base_emitted`, then the drafts.  L430: the look ahead
+ *  costs the round's bytes, not the turn's -- it appends the tokens to g->text and cuts them off again, and the
+ *  parser's probe borrows the open call's body -- so `g` is not const; it is left exactly as it was. */
 /// @param s  the server
-/// @param g  the request's generation state
+/// @param g  the request's generation state (read ahead in place, then restored)
 /// @param toks  the round's tokens not yet streamed
 /// @param n  how many
 /// @param base_emitted  the base was already emitted
 /// @return the greedy-row bit set
-uint32_t gen_spec_greedy_rows(server *s, const gen_state *g, const TokId *toks, int n, bool base_emitted);
+uint32_t gen_spec_greedy_rows(server *s, gen_state *g, const TokId *toks, int n, bool base_emitted);
 /** The same over the tokens' texts (NULL = a stop token): the probe itself, engine-free (server tests). */
-/// @param g  the request's generation state
+/// @param g  the request's generation state (read ahead in place, then restored)
 /// @param pieces  each token's text (NULL = a stop token)
 /// @param piece_lens  their lengths, bytes
 /// @param n  how many
 /// @param base_emitted  the base was already emitted
 /// @return the greedy-row bit set
-uint32_t gen_spec_greedy_rows_text(const gen_state *g, const char *const *pieces, const size_t *piece_lens, int n,
+uint32_t gen_spec_greedy_rows_text(gen_state *g, const char *const *pieces, const size_t *piece_lens, int n,
                                    bool base_emitted);
 /** L428: the family's turn ended before its stop token (server_output_parser_ops::turn_complete -- DeepSeek's closed
  *  DSML block; the first call of a turn that may make one, request::single_tool_call): g->text is cut where the
@@ -6180,24 +6188,24 @@ bool gen_turn_complete(struct gen_state *g);
 /** L428: how many of a pending chain's `n` drafts (after the not yet emitted `base`) a turn that may make one call
  *  (request::single_tool_call) can use: the chain ends with the token that closes the turn's first call -- the emit
  *  path stops there (gen_turn_complete), so a draft past it would be verified, committed to the bank and then have
- *  to be rewound, or on a family whose state cannot rewind cost the bank its view.  Read off a scratch copy of the
- *  decode-time state, as gen_spec_greedy_rows reads its rows.  `n` for any other request, and for a chain that
- *  closes no call. */
+ *  to be rewound, or on a family whose state cannot rewind cost the bank its view.  Read off a look ahead over the
+ *  decode-time state, as gen_spec_greedy_rows reads its rows (L430: in place, `g` left as it was).  `n` for any
+ *  other request, and for a chain that closes no call. */
 /// @param s  the server
-/// @param g  the request's generation state
+/// @param g  the request's generation state (read ahead in place, then restored)
 /// @param base_id  the round's base token (not yet emitted)
 /// @param drafts  the pending drafts
 /// @param n  how many
 /// @return the usable prefix length, 0..n
-int gen_turn_draft_prefix(server *s, const gen_state *g, TokId base_id, const TokId *drafts, int n);
+int gen_turn_draft_prefix(server *s, gen_state *g, TokId base_id, const TokId *drafts, int n);
 /** The same over the tokens' texts (NULL = a stop token), pieces[0] the base: the probe itself, engine-free. */
-/// @param g  the request's generation state
+/// @param g  the request's generation state (read ahead in place, then restored)
 /// @param pieces  the base's text, then each draft's (NULL = a stop token)
 /// @param piece_lens  their lengths, bytes
 /// @param n  the drafts (pieces holds n + 1)
 /// @return the usable prefix length, 0..n
-int gen_turn_draft_prefix_text(const gen_state *g, const char *const *pieces, const size_t *piece_lens, int n);
-/** The emit path's byte release (gen_emit_token's; the probe's on copies): returns the bytes of `text` the
+int gen_turn_draft_prefix_text(gen_state *g, const char *const *pieces, const size_t *piece_lens, int n);
+/** The emit path's byte release (gen_emit_token's; the probe's on its look ahead): returns the bytes of `text` the
  *  stop-string scan releases after `text` grew by `piece`. */
 /// @param stops  the request's stop strings
 /// @param text  the generated text, `piece` already appended

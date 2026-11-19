@@ -5378,6 +5378,624 @@ static void test_l428_turn_ends_at_its_first_call(void) {
     l303_server_free(&srv);
 }
 
+/* ==== L430: a speculative round's look ahead against its reading before L430 ============================= */
+
+#include "gen_host_ref.h"
+
+/* L430: every speculative round reads ahead of the emit path twice -- which of the round's rows are a call's
+ * structure (gen_spec_greedy_rows_text: drawn greedy; a wrong bit changes the generated text) and where a pending
+ * chain meets the end of a single-call turn (gen_turn_draft_prefix_text).  Both used to copy the turn's text and the
+ * output parser every round; now they read ahead IN PLACE (gen_walk: the tokens appended to g->text and cut off, the
+ * parser's probe borrowing the open call's body) and must (a) answer what the copies answered, and (b) leave the
+ * attempt exactly as it was -- a round whose drafts are rejected is the test of that: the tokens emitted next are
+ * not the ones the walk read.
+ *
+ * So: thousands of random turns, each decoded twice through the production emit path (server::gen_emit_piece) -- side
+ * A with the live walks, side B with the walks as they were (tests/gen_host_ref.h), which never touch the attempt.
+ * A turn is random text in its family's own markup -- reasoning, content with Markdown code and UTF-8, tool calls
+ * well formed and broken, declared and not, values that spell the call's closers, or marker soup -- cut into random
+ * tokens (mid-marker, mid-UTF-8), for the kit's families (Qwen, Nemotron-H, Gemma 4, Inkling) and DeepSeek, with
+ * thinking on and off, a turn limited to one call or not, a forced call's seed, random stop strings, and the three
+ * stream shapes (none, the protocol's, raw).  It is decoded in random rounds: 1..31 tokens ahead, the base streamed
+ * before the forward or not, the drafts the turn's own next tokens or wrong ones (other markup, a stop token), a
+ * random number of them accepted.  At every round both walks' answers must be equal on the two sides and side A
+ * unchanged by its walks; after every emitted token the two sides' decode state must be equal; at the end the turns'
+ * readings and wire bytes.  The counters prove the generator reached the cases. */
+
+/// The test's generator: an LCG (a fixed seed, the same turns on every run).
+struct l430_rng {
+    uint64_t s;   ///< the state
+    /// @return the next 32 bits
+    uint32_t next() {
+        s = s * 6364136223846793005ull + 1442695040888963407ull;
+        return (uint32_t)(s >> 33);
+    }
+    /// @param n  a bound (> 0)
+    /// @return a value in [0, n)
+    uint32_t below(uint32_t n) { return next() % n; }
+    /// @param pct  a percentage
+    /// @return true `pct` times in a hundred
+    bool chance(uint32_t pct) { return below(100) < pct; }
+    /// @param v  a non-empty list
+    /// @return one of its items
+    template <class T> const T &pick(const std::vector<T> &v) { return v[below((uint32_t)v.size())]; }
+};
+
+/// One family's markup for the generator.
+struct l430_fam {
+    pulsar_chat_format fmt;            ///< the chat format
+    const char *name;                  ///< for a failure's line
+    const char *think_close;           ///< what closes its reasoning
+    std::vector<std::string> soup;     ///< its markers and pieces of them
+    /// @param r  the generator
+    /// @param f  this family
+    /// @return one call in its markup (well formed or not)
+    std::string (*call)(l430_rng *r, const l430_fam &f);
+    const char *between;               ///< what its template writes between two calls
+    const char *open, *close;          ///< the bytes around a block of calls (DeepSeek), else ""
+};
+
+/// Text any family's turn may hold: prose, whitespace, UTF-8, Markdown code, bytes that start markers and stops.
+static const std::vector<std::string> k_l430_text = {
+    "Checking the file.", "I will call the tool", " ", " ", "\n", "\n", "\n\n", "  \n", "\t", "\xc3\xa9", "S\xc3\xa3o",
+    "\xe6\x97\xa5\xe6\x9c\xac", "\xf0\x9f\x98\x80", "`", "``", "```\n", "```json\n", "~~~\n", "a", "b", "ab", "abc",
+    ".", "STOP", "TOP", "</", "<", ">", "<|", "|>", "\"", "\\", "{\"k\": 1}", "x = y < z", "{", "}", ":", ",", "1",
+    "true", "null", "call:", "thought\n", "<think>", "=", "value", "END"};
+
+/// @param r  the generator
+/// @param f  the family (its soup joins the text)
+/// @param n  how many fragments
+/// @param markup  percent of the fragments drawn from the family's soup
+/// @return `n` random fragments
+static std::string l430_frags(l430_rng *r, const l430_fam &f, uint32_t n, uint32_t markup) {
+    std::string t;
+    for (uint32_t i = 0; i < n; i++) t += r->chance(markup) ? r->pick(f.soup) : r->pick(k_l430_text);
+    return t;
+}
+
+/// @param r  the generator
+/// @param t  a text
+/// @return it, or (one time in four) broken: a slice deleted, or cut short
+static std::string l430_maybe_broken(l430_rng *r, std::string t) {
+    if (t.size() < 4 || !r->chance(25)) return t;
+    const size_t at = r->below((uint32_t)t.size());
+    if (r->chance(50)) t.erase(at, 1 + r->below(12));
+    else t.resize(at);
+    return t;
+}
+
+/// The XML call of Qwen's and Nemotron-H's templates.
+/// @param r  the generator
+/// @param f  the family
+/// @return "<tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>\n...</function>\n</tool_call>"
+static std::string l430_xml_call(l430_rng *r, const l430_fam &f) {
+    static const std::vector<std::string> fns = {"write", "write", "search", "now", "rm"};
+    static const std::vector<std::string> keys = {"path", "content", "content", "q", "n", "opts", "zz"};
+    static const std::vector<std::string> vals = {"3", "true", "True", "None", "{\"a\": \"b </parameter\"}", "[1, 2]",
+                                                  "\"quoted \\\" text\"", "src/table.cpp", "</tool_call>",
+                                                  "<parameter=x>", "</function>", ""};
+    std::string c = "<tool_call>\n<function=" + r->pick(fns) + ">\n";
+    for (uint32_t k = r->below(4); k > 0; k--) {
+        std::string v = r->chance(40) ? r->pick(vals) : l430_frags(r, f, r->chance(15) ? 40 + r->below(200) : r->below(8), 30);
+        const size_t e = v.find("</parameter>");   /* a value ends at its first closer: spelt whole, it is one */
+        if (e != std::string::npos && r->chance(80)) v.erase(e, 1);
+        c += "<parameter=" + r->pick(keys) + ">\n" + v + "\n</parameter>\n";
+    }
+    return l430_maybe_broken(r, c + "</function>\n</tool_call>");
+}
+
+/// Gemma 4's call.
+/// @param r  the generator
+/// @param f  the family
+/// @return "<|tool_call>call:NAME{KEY:VALUE,...}<tool_call|>"
+static std::string l430_gemma_call(l430_rng *r, const l430_fam &f) {
+    static const std::vector<std::string> fns = {"write", "search", "now", "rm"};
+    static const std::vector<std::string> keys = {"path", "content", "q", "n", "opts"};
+    std::string c = "<|tool_call>call:" + r->pick(fns) + "{";
+    for (uint32_t k = r->below(4), i = 0; i < k; i++) {
+        std::string v;
+        switch (r->below(5)) {
+        case 0: v = "3"; break;
+        case 1: v = "{a:<|\"|>b<|\"|>,c:[1,2]}"; break;
+        case 2: v = "true"; break;
+        default: v = "<|\"|>" + l430_frags(r, f, r->chance(15) ? 40 + r->below(200) : r->below(8), 10) + "<|\"|>"; break;
+        }
+        c += (i ? "," : "") + r->pick(keys) + ":" + v;
+    }
+    return l430_maybe_broken(r, c + "}<tool_call|>");
+}
+
+/// Inkling's call: a message headed by the tool's name, its body the shared JSON {"name", "args"}.
+/// @param r  the generator
+/// @param f  the family
+/// @return "NAME<|content_invoke_tool_json|>{...}<|end_message|>"
+static std::string l430_inkling_call(l430_rng *r, const l430_fam &f) {
+    static const std::vector<std::string> fns = {"write", "search", "now", "rm"};
+    static const std::vector<std::string> keys = {"path", "content", "q", "n"};
+    const std::string &fn = r->pick(fns);
+    std::string c = fn + "<|content_invoke_tool_json|>{\"name\":\"" + fn + "\",\"args\":{";
+    for (uint32_t k = r->below(3), i = 0; i < k; i++) {
+        std::string v = l430_frags(r, f, r->chance(15) ? 40 + r->below(200) : r->below(8), 10), esc;
+        for (char ch : v) {   /* a JSON string's text: quotes and backslashes escaped, control bytes dropped */
+            if (ch == '"' || ch == '\\') esc += '\\';
+            if ((unsigned char)ch >= 0x20) esc += ch;
+        }
+        c += std::string(i ? "," : "") + "\"" + r->pick(keys) + "\":" + (r->chance(25) ? "[1,{\"a\":2}]" : "\"" + esc + "\"");
+    }
+    return l430_maybe_broken(r, c + "}}<|end_message|>");
+}
+
+/// DeepSeek's invoke (inside a block the turn opens and closes).
+/// @param r  the generator
+/// @param f  the family
+/// @return one invoke with up to two parameters
+static std::string l430_ds_call(l430_rng *r, const l430_fam &f) {
+    static const std::vector<std::string> fns = {"write", "search", "now"};
+    std::string c = std::string(PULSAR_INVOKE_START) + " name=\"" + r->pick(fns) + "\">\n";
+    for (uint32_t k = r->below(3); k > 0; k--)
+        c += std::string(PULSAR_PARAM_START) + " name=\"q\" string=\"" + (r->chance(70) ? "true" : "false") + "\">" +
+             (r->chance(30) ? "3" : l430_frags(r, f, r->below(8), 5)) + PULSAR_PARAM_END + "\n";
+    return l430_maybe_broken(r, c + PULSAR_INVOKE_END + "\n");
+}
+
+/// @return the families the test decodes
+static const std::vector<l430_fam> &l430_fams(void) {
+    static const std::vector<std::string> xml = {"<tool_call>", "</tool_call>", "<function=", "</function>", "<parameter=",
+                                                 "</parameter>", "</think>", "<tool_call>\n<function=write>\n",
+                                                 "<parameter=content>\n", "\n</parameter>\n", "</function>\n</tool_call>",
+                                                 "</tool", "<tool_c", "</param", "write>", "content>", "<|im_end|>"};
+    static const std::vector<l430_fam> fams = {
+        {PULSAR_CHAT_QWEN, "qwen", "</think>\n\n", xml, l430_xml_call, "\n", "", ""},
+        {PULSAR_CHAT_NEMOTRON_H, "nemotron-h", "</think>", xml, l430_xml_call, "\n", "", ""},
+        {PULSAR_CHAT_GEMMA4, "gemma4", "<channel|>",
+         {"<|tool_call>", "<tool_call|>", "<|channel>", "<channel|>", "<|\"|>", "call:write{", "content:<|\"|>",
+          "<|\"|>}<tool_call|>", "<turn|>", "<|tool_response>", "<|tool", "<tool_c", "thought\n", "<|think|>", "{", "}"},
+         l430_gemma_call, "", "", ""},
+        {PULSAR_CHAT_INKLING, "inkling", "<|end_message|>",
+         {"<|content_invoke_tool_json|>", "<|end_message|>", "<|message_model|>", "<|content_text|>",
+          "<|content_thinking|>", "<|content_", "<|end_", "{\"name\":\"write\",\"args\":{\"content\":\"", "\"}}", "search"},
+         l430_inkling_call, "<|message_model|>", "", ""},
+        {PULSAR_CHAT_DS4_V41, "deepseek", "</think>",
+         {PULSAR_TOOL_CALLS_START, PULSAR_TOOL_CALLS_END, PULSAR_INVOKE_START, PULSAR_INVOKE_END, PULSAR_PARAM_START,
+          PULSAR_PARAM_END, "</think>", " name=\"q\" string=\"true\">", "<\xef\xbd\x9c"},
+         l430_ds_call, "", "\n\n" PULSAR_TOOL_CALLS_START "\n", PULSAR_TOOL_CALLS_END},
+    };
+    return fams;
+}
+
+/// @param r      the generator
+/// @param f      the family
+/// @param think  the turn starts in its reasoning
+/// @return one turn's text as a model might sample it
+static std::string l430_turn_text(l430_rng *r, const l430_fam &f, bool think) {
+    if (r->chance(12)) return l430_frags(r, f, 5 + r->below(40), 60);   /* marker soup */
+    std::string t;
+    if (r->chance(think ? 85 : 8)) t += l430_frags(r, f, r->below(10), 4) + f.think_close;
+    t += l430_frags(r, f, r->below(6), 6);
+    const uint32_t calls = r->chance(25) ? 0 : 1 + r->below(3);
+    if (calls) {
+        t += r->chance(70) ? "\n" : "";
+        t += f.open;
+        for (uint32_t i = 0; i < calls; i++) {
+            if (i) t += r->chance(80) ? std::string(f.between) : l430_frags(r, f, r->below(3), 20);
+            t += f.call(r, f);
+        }
+        t += f.close;
+    }
+    if (r->chance(30)) t += l430_frags(r, f, r->below(5), 15);
+    return t;
+}
+
+/// @param r  the generator
+/// @param t  a text
+/// @return it cut into tokens of 1..12 bytes, wherever the cuts fall
+static std::vector<std::string> l430_tokens(l430_rng *r, const std::string &t) {
+    std::vector<std::string> toks;
+    const uint32_t style = r->below(3);   /* short, mixed, long tokens */
+    for (size_t at = 0; at < t.size();) {
+        const size_t n = std::min<size_t>(t.size() - at, 1 + r->below(style == 0 ? 3 : style == 1 ? 7 : 12));
+        toks.push_back(t.substr(at, n));
+        at += n;
+    }
+    return toks;
+}
+
+/// The stop strings a turn may run under: none, one byte, several bytes, overlapping, a byte inside a UTF-8 sequence.
+static const std::vector<std::vector<std::string>> k_l430_stops = {
+    {}, {}, {}, {}, {}, {}, {"\n"}, {"\n", "."}, {"STOP"}, {"QQQQ"}, {"zzzzzzzz", "z"}, {"\n\n", "\n"}, {"ab", "abc", "b"},
+    {"STOP", "TOP", "S"}, {"</", "</tool_call>"}, {">", ">\n"}, {"\xc3\xa9"}, {"\xa9"}, {"\xe6\x9c\xac", "\xe6\x97\xa5\xe6\x9c\xac"},
+    {"}"}, {"END", "D"}, {"|>"}, {"\n</parameter>"}, {"\"}}"}, {"x = y < z", "y"}};
+
+/// One request shape of the test.
+struct l430_cfg {
+    const l430_fam *fam;   ///< the family
+    bool think;            ///< thinking on
+    bool single;           ///< the turn may make one call (L428)
+    bool forced;           ///< tool_choice "required": the turn starts with the family's seed
+};
+
+/// @param c  a request shape
+/// @return its OpenAI chat request
+static std::string l430_body(const l430_cfg &c) {
+    return std::string("{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"temperature\":0.7,\"tools\":["
+                       "{\"type\":\"function\",\"function\":{\"name\":\"write\",\"parameters\":{\"type\":\"object\","
+                       "\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"},"
+                       "\"n\":{\"type\":\"integer\"},\"opts\":{\"type\":\"object\"}}}}},"
+                       "{\"type\":\"function\",\"function\":{\"name\":\"search\",\"parameters\":{\"type\":\"object\","
+                       "\"properties\":{\"q\":{\"type\":\"string\"}}}}},"
+                       "{\"type\":\"function\",\"function\":{\"name\":\"now\",\"parameters\":{\"type\":\"object\","
+                       "\"properties\":{}}}}]") +
+           (c.single ? ",\"parallel_tool_calls\":false" : "") + (c.think ? "" : ",\"enable_thinking\":false") +
+           (c.forced ? ",\"tool_choice\":\"required\"" : "") + "}";
+}
+
+/// One side of a turn decoded twice: its own job, attempt and client socket.
+struct l430_side {
+    job j;                  ///< the job (its request)
+    gen_state *g = NULL;    ///< the decode attempt
+    int sv[2] = {-1, -1};   ///< the client's socket pair: the server writes sv[0]
+    std::string wire;       ///< what the client received
+    bool stopped = false;   ///< the emit path ended the turn
+};
+
+/// Start one side as gen_decode_init starts an attempt: the request rendered, the stream opened, the parser, a
+/// forced call's seed.
+/// @param s      the side
+/// @param srv    the server
+/// @param c      the request shape
+/// @param stops  the request's stop strings
+/// @param mode   0 = no stream, 1 = the protocol's stream (OpenAI chat chunks), 2 = a raw stream of the text
+/// @return false when the family refuses the request shape
+static bool l430_start(l430_side *s, server *srv, const l430_cfg &c, const std::vector<std::string> &stops, int mode) {
+    memset(&s->j, 0, sizeof s->j);
+    char err[300];
+    if (!l303_request(srv, c.fam->fmt, API_OPENAI, l430_body(c).c_str(), &s->j.req, err, sizeof err)) {
+        request_free(&s->j.req);
+        return false;
+    }
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, s->sv) == 0);
+    s->j.fd = s->sv[0];
+    request *r = &s->j.req;
+    for (const std::string &st : stops) stop_list_push(&r->stops, server_xstrdup(st.c_str()));
+    r->stream = mode != 0;
+    r->stream_include_usage = true;
+    gen_state *g = s->g = new gen_state();
+    g->j = &s->j;
+    snprintf(g->id, sizeof g->id, "id_l430");
+    g->finish = "length";
+    g->next_decode_log = 1 << 30;   /* no progress lines */
+    g->recovery_attempted = true;   /* no model-visible retry: it needs a live session */
+    g->thinking = thinking_state_from_prompt(r);
+    g->structured_stream = mode == 1 && request_uses_structured_stream(r);
+    if (g->structured_stream) {
+        openai_stream_start(r, &g->openai_live);
+        openai_sink_init(&g->sink, s->sv[0], NULL, r, g->id, &g->openai_live);
+    }
+    g->parser = r->family->output;
+    g->parser_st = g->parser->create(srv, g, err, sizeof err);
+    TEST_ASSERT(g->parser_st != NULL);
+    if (r->force_tool_call && r->family->forced_call_seed) {
+        r->family->forced_call_seed(r, &g->text);
+        if (g->parser->seed) g->parser->seed(g->parser_st, g);
+        g->plain_stream_pos = g->text.len;
+    }
+    return true;
+}
+
+/// Read what the server wrote so far into the side's wire.
+/// @param s  the side
+static void l430_drain(l430_side *s) {
+    char tmp[4096];
+    ssize_t n;
+    while ((n = recv(s->sv[1], tmp, sizeof tmp, MSG_DONTWAIT)) > 0) s->wire.append(tmp, (size_t)n);
+}
+
+/// What the two sides are compared on after a token: the decode-time state a later token or the finish reads.
+struct l430_state {
+    std::string text;            ///< gen_state::text
+    std::string finish;          ///< gen_state::finish
+    std::string think_tail;      ///< the reasoning tracker's tail
+    std::string content, reasoning;   ///< the kit parser's reported text so far
+    size_t plain_stream_pos = 0, fed = 0, cut_at = 0, end = 0, wire = 0;   ///< offsets
+    int completion = 0, calls = 0, errors = 0;                             ///< counts
+    /// flags
+    bool stopped = false, cut_short = false, thinking = false, in_tool_call = false, turn_complete = false,
+         cut = false, in_call = false, in_payload = false;
+    bool operator==(const l430_state &) const = default;   ///< every field
+};
+
+/// @param s  a side
+/// @return its state
+static l430_state l430_read(l430_side *s) {
+    gen_state *g = s->g;
+    l430_drain(s);
+    l430_state st;
+    st.text.assign(g->text.ptr ? g->text.ptr : "", g->text.len);
+    st.finish = g->finish;
+    st.think_tail.assign(g->thinking.tail, (size_t)g->thinking.tail_len);
+    st.plain_stream_pos = g->plain_stream_pos;
+    st.completion = g->completion;
+    st.stopped = s->stopped;
+    st.cut_short = g->turn_cut_short;
+    st.thinking = g->thinking.inside;
+    st.in_tool_call = g->parser->in_tool_call(g->parser_st, g);
+    st.turn_complete = g->parser->turn_complete(g->parser_st, g, &st.end);
+    st.wire = s->wire.size();
+    if (g->parser->probe_new == parser_kit_probe_new) {
+        const kit_gen *q = (const kit_gen *)g->parser_st;
+        st.fed = q->fed;
+        st.cut = q->cut;
+        st.cut_at = q->cut_at;
+        st.calls = q->calls.len;
+        st.errors = q->parser->errors();
+        st.in_call = q->parser->in_tool_call();
+        st.in_payload = q->parser->in_payload();
+        st.content = q->parser->content();
+        st.reasoning = q->parser->reasoning();
+    }
+    return st;
+}
+
+/// @param w  a client's wire bytes
+/// @return them with what differs between two servings of one turn masked: the calls' random ids, the clock
+static std::string l430_wire_norm(const std::string &w) {
+    std::string out = w;
+    for (size_t at = out.find("call_"); at != std::string::npos; at = out.find("call_", at + 5))
+        for (size_t i = at + 5; i < out.size() && isalnum((unsigned char)out[i]); i++) out[i] = 'X';
+    for (size_t at = out.find("\"created\":"); at != std::string::npos; at = out.find("\"created\":", at + 10))
+        for (size_t i = at + 10; i < out.size() && isdigit((unsigned char)out[i]); i++) out[i] = '0';
+    return out;
+}
+
+/// The turn's end on one side: the family's finish and the protocol's response, into the side's wire; the side freed.
+/// @param s     the side
+/// @param srv   the server
+/// @param out   receives the reading as text (content, reasoning, finish, each call's name and arguments, the
+///              calls' sampled bytes)
+static void l430_finish(l430_side *s, server *srv, std::string *out) {
+    gen_state *g = s->g;
+    request *r = &s->j.req;
+    if (!s->stopped) g->finish = "stop";   /* the model's own stop token ended the turn */
+    server_turn turn;
+    memset(&turn, 0, sizeof turn);
+    turn.finish = g->finish;
+    TEST_ASSERT(g->parser->finish(g->parser_st, srv, NULL, g, &turn) && !turn.retry);
+    *out = std::string("content=") + (turn.content ? turn.content : "(null)") + "\nreasoning=" +
+           (turn.reasoning ? turn.reasoning : "(null)") + "\nfinish=" + turn.finish + "\nparse_failed=" +
+           (turn.parse_failed ? "1" : "0") + "\nraw=" + (turn.calls.raw_calls ? turn.calls.raw_calls : "(null)") +
+           "\ntext=" + std::string(g->text.ptr ? g->text.ptr : "", g->text.len) + "\nstop=" +
+           (g->stop_sequence ? g->stop_sequence : "(null)");
+    for (int i = 0; i < turn.calls.len; i++)
+        *out += std::string("\ncall ") + turn.calls.v[i].name + " " +
+                (turn.calls.v[i].arguments ? turn.calls.v[i].arguments : "(null)");
+    r->timings.valid = true;
+    if (g->structured_stream) {
+        TEST_ASSERT(g->parser->feed(g->parser_st, srv, g, g->text.len, true));
+        TEST_ASSERT(openai_sse_finish(&g->sink, &turn.calls, turn.finish, 10, g->completion));
+    } else if (!r->stream) {
+        TEST_ASSERT(final_response(s->sv[0], r, g->id, turn.content, turn.reasoning, &turn.calls, turn.finish, 10,
+                                   g->completion, NULL));
+    }
+    l430_drain(s);
+    close(s->sv[0]);
+    close(s->sv[1]);
+    g->parser->destroy(g->parser_st);
+    free(turn.content);
+    free(turn.reasoning);
+    tool_calls_free(&turn.calls);
+    free(g->stop_sequence);
+    buf_free(&g->text);
+    delete g;
+    request_free(r);
+}
+
+/// What one run of the differential counted (proof the generator reached the cases).
+struct l430_counts {
+    long turns = 0, tokens = 0, rounds = 0;   ///< turns decoded, tokens emitted, rounds walked
+    long crossing = 0;       ///< rounds whose rows are part structure, part not
+    long rejected = 0;       ///< rounds with wrong drafts (none of them emitted)
+    long in_call = 0;        ///< rounds walked from inside an open call
+    long reopened = 0;       ///< of those, rounds whose tokens close the call and open another (the borrowed body set aside)
+    long prefix_cut = 0;     ///< single-call rounds whose chain was cut
+    long stop_token = 0;     ///< rounds with a stop token among the drafts
+    long stopped_stop = 0, stopped_call = 0;   ///< turns a stop string ended, turns the single-call rule ended
+    long with_calls = 0;     ///< turns whose reading returned a call
+    long refused = 0;        ///< request shapes a family refused (not decoded)
+    long by_fam[8] = {0};    ///< turns per family
+};
+
+/// Decode one random turn on both sides and compare them.
+/// @param srv   the server
+/// @param r     the generator
+/// @param c     the request shape
+/// @param n     the counters
+/// @param why   receives the first difference (left alone when there is none)
+/// @return false on a difference
+static bool l430_one_turn(server *srv, l430_rng *r, const l430_cfg &c, l430_counts *n, std::string *why) {
+    const std::vector<std::string> &stops = r->pick(k_l430_stops);
+    const int mode = (int)r->below(3);
+    l430_side a, b;
+    if (!l430_start(&a, srv, c, stops, mode)) {
+        n->refused++;
+        return true;
+    }
+    TEST_ASSERT(l430_start(&b, srv, c, stops, mode));
+    const l430_fam &f = *c.fam;
+    const std::string text = l430_turn_text(r, f, c.think);
+    const std::vector<std::string> toks = l430_tokens(r, text);
+    const int nt = (int)toks.size();
+    n->turns++;
+    n->by_fam[c.fam - l430_fams().data()]++;
+    char where[160];
+    auto differ = [&](const char *what, int at) {
+        snprintf(where, sizeof where, "%s%s%s%s mode %d, %zu stops, token %d of %d: %s", f.name, c.think ? " think" : "",
+                 c.single ? " single" : "", c.forced ? " forced" : "", mode, stops.size(), at, nt, what);
+        *why = std::string(where) + "\n--- the turn ---\n" + text + "\n---";
+        return false;
+    };
+    bool ok = true;
+    if (!(l430_read(&a) == l430_read(&b))) ok = differ("the two sides start apart", 0);
+    for (int pos = 0; ok && pos < nt && !a.stopped;) {
+        /* the round: its tokens not yet streamed -- the base unless it went out before the forward, then drafts */
+        const bool base_emitted = pos > 0 && r->chance(40);
+        const int ahead = 1 + (int)(r->chance(10) ? r->below(31) : r->below(9));
+        int wrong_from = r->chance(40) ? (int)r->below((uint32_t)ahead) : ahead;   /* the first wrong draft */
+        if (!base_emitted && wrong_from == 0) wrong_from = 1;                       /* the base is never a draft */
+        std::vector<std::string> owned;
+        const char *pieces[32];
+        size_t lens[32];
+        bool has_stop_token = false;
+        for (int i = 0; i < ahead; i++) {
+            if (i >= wrong_from || pos + i >= nt) {
+                if (r->chance(8)) {   /* a drafted stop token */
+                    owned.push_back("");
+                    pieces[i] = NULL;
+                    lens[i] = 0;
+                    has_stop_token = true;
+                    if (wrong_from > i) wrong_from = i;
+                    continue;
+                }
+                owned.push_back(r->chance(50) ? r->pick(f.soup) : r->chance(50) ? r->pick(k_l430_text)
+                                                                                : toks[r->below((uint32_t)nt)]);
+                if (wrong_from > i) wrong_from = i;
+            } else {
+                owned.push_back(toks[(size_t)(pos + i)]);
+            }
+            pieces[i] = owned.back().data();
+            lens[i] = owned.back().size();
+        }
+        for (int i = 0; i < ahead; i++)   /* owned may have moved while it grew */
+            if (pieces[i]) pieces[i] = owned[(size_t)i].data();
+        n->rounds++;
+        n->rejected += wrong_from < ahead;
+        n->stop_token += has_stop_token;
+        if (a.g->parser->probe_new == parser_kit_probe_new) {
+            const kit_gen *q = (const kit_gen *)a.g->parser_st;
+            if (q->parser->in_tool_call()) {
+                n->in_call++;
+                out_parser *look = q->parser->clone();   /* does the round close this call and open another? */
+                std::vector<out_event> ev;
+                bool left = false, back = false;
+                for (int i = 0; i < ahead && pieces[i]; i++) {
+                    look->feed(pieces[i], lens[i], &ev);
+                    left = left || !look->in_tool_call();
+                    back = back || (left && look->in_tool_call());
+                }
+                delete look;
+                n->reopened += back;
+            }
+        }
+        const l430_state before = l430_read(&a);
+        const uint32_t bits_ref = gen_spec_greedy_rows_text_ref(b.g, pieces, lens, ahead, base_emitted);
+        const uint32_t bits = gen_spec_greedy_rows_text(a.g, pieces, lens, ahead, base_emitted);
+        const int rows = ahead + (base_emitted ? 1 : 0);
+        const uint32_t all = rows >= 32 ? ~0u : (1u << rows) - 1u;
+        n->crossing += (bits & all) != 0 && (bits & all) != all;
+        if (bits != bits_ref) {
+            ok = differ("the round's greedy rows differ", pos);
+            break;
+        }
+        if (!(l430_read(&a) == before)) {
+            ok = differ("the greedy-rows walk changed the attempt", pos);
+            break;
+        }
+        if (!base_emitted && ahead >= 2) {   /* pieces[0] the base, then ahead - 1 drafts */
+            const int keep_ref = gen_turn_draft_prefix_text_ref(b.g, pieces, lens, ahead - 1);
+            const int keep = gen_turn_draft_prefix_text(a.g, pieces, lens, ahead - 1);
+            n->prefix_cut += keep < ahead - 1;
+            if (keep != keep_ref) {
+                ok = differ("the usable chain differs", pos);
+                break;
+            }
+            if (!(l430_read(&a) == before)) {
+                ok = differ("the chain walk changed the attempt", pos);
+                break;
+            }
+        }
+        /* the round's outcome: the base (if it was not streamed) and some of the right drafts are emitted */
+        const int right = std::min(wrong_from, nt - pos);
+        int take = right > 0 ? (int)r->below((uint32_t)right + 1) : 0;
+        if (take == 0) take = 1;   /* a round always commits its base; a streamed base's round, its first draft */
+        for (int k = 0; ok && k < take && pos < nt && !a.stopped; k++, pos++) {
+            const std::string &t = toks[(size_t)pos];
+            a.stopped = srv->gen_emit_piece(a.g, 0, t.data(), t.size());
+            b.stopped = srv->gen_emit_piece(b.g, 0, t.data(), t.size());
+            n->tokens++;
+            if (!(l430_read(&a) == l430_read(&b))) ok = differ("the two sides part after a token", pos);
+        }
+    }
+    if (a.stopped) {
+        n->stopped_stop += !strcmp(a.g->finish, "stop");
+        n->stopped_call += !strcmp(a.g->finish, "tool_calls");
+    }
+    std::string ra, rb;
+    l430_finish(&a, srv, &ra);
+    l430_finish(&b, srv, &rb);
+    n->with_calls += ra.find("\ncall ") != std::string::npos;
+    if (ok && ra != rb) ok = differ("the turns' readings differ", nt);
+    if (ok && l430_wire_norm(a.wire) != l430_wire_norm(b.wire)) ok = differ("the clients received different bytes", nt);
+    return ok;
+}
+
+/// Run `turns` random turns over every request shape.
+/// @param seed   the generator's seed
+/// @param turns  how many turns
+/// @param n      the counters
+/// @param why    receives the first difference
+/// @return false on a difference
+static bool l430_run(uint64_t seed, int turns, l430_counts *n, std::string *why) {
+    l303_vocab v;
+    server srv;
+    l303_server(&srv, v);
+    l430_rng r = {seed};
+    /* the turns log every broken call they generate: thousands of lines no one reads -- unless the run dies in
+     * them (the parser's own invariants abort), so they go to a file that is removed when the run comes back */
+    char log_path[] = "/tmp/pulsar_test_l430.XXXXXX";
+    const int log_fd = mkstemp(log_path);
+    TEST_ASSERT(log_fd >= 0);
+    fprintf(stderr, "  L430: the random turns' server log goes to %s while they run\n", log_path);
+    fflush(stderr);
+    const int saved = dup(2);
+    dup2(log_fd, 2);
+    close(log_fd);
+    bool ok = true;
+    for (int t = 0; ok && t < turns; t++) {
+        l430_cfg c;
+        c.fam = &l430_fams()[r.below((uint32_t)l430_fams().size())];
+        c.think = r.chance(50);
+        c.single = r.chance(45);
+        c.forced = r.chance(8);
+        ok = l430_one_turn(&srv, &r, c, n, why);
+    }
+    fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    unlink(log_path);
+    l303_server_free(&srv);
+    return ok;
+}
+
+static void test_l430_round_walks_match_reference(void) {
+    l430_counts n;
+    std::string why;
+    const bool ok = l430_run(0x4c343330ull, 6000, &n, &why);
+    if (!ok) fprintf(stderr, "L430: %s\n", why.c_str());
+    TEST_ASSERT(ok);
+    fprintf(stderr,
+            "  L430 round walks vs their pre-L430 reading: %ld turns (qwen %ld, nemotron-h %ld, gemma4 %ld, inkling %ld, "
+            "deepseek %ld; %ld shapes refused), %ld tokens, %ld rounds: %ld cross structure, %ld with wrong drafts, "
+            "%ld with a stop token, %ld from inside a call (%ld close it and open another), %ld chains cut; turns "
+            "ended by a stop string %ld, by the one-call rule %ld; %ld turns returned calls\n",
+            n.turns, n.by_fam[0], n.by_fam[1], n.by_fam[2], n.by_fam[3], n.by_fam[4], n.refused, n.tokens, n.rounds,
+            n.crossing, n.rejected, n.stop_token, n.in_call, n.reopened, n.prefix_cut, n.stopped_stop, n.stopped_call,
+            n.with_calls);
+    /* the generator reached the cases */
+    for (int i = 0; i < 5; i++) TEST_ASSERT(n.by_fam[i] > 300);
+    TEST_ASSERT(n.rounds > 50000 && n.crossing > 3000 && n.rejected > 10000 && n.in_call > 8000);
+    TEST_ASSERT(n.reopened > 100 && n.prefix_cut > 300 && n.stop_token > 1000);
+    TEST_ASSERT(n.stopped_stop > 300 && n.stopped_call > 300 && n.with_calls > 1000);
+}
+
 /// @param s  a text
 /// @return it as a JSON string literal
 static std::string l428_json(const std::string &s) {
@@ -19982,6 +20600,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l428_flag_parses_on_every_surface();
     test_l428_gate_admits_one_call();
     test_l428_turn_ends_at_its_first_call();
+    test_l430_round_walks_match_reference();
     test_l428_next_prompt_extends_the_cut_turn();
     test_l420_stop_inside_reasoning_answers_with_it();
     test_l420_other_endings_are_unchanged();

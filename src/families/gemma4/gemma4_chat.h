@@ -152,8 +152,8 @@ const out_grammar &gemma4_output_grammar(void);
 class gemma4_call_body : public out_call_body {
 public:
     /** The request's tools (a bare value whose top-level property is declared a string -- out_tool_param_type --
-     *  stays the raw text). */
-    pyjson_value tools;
+     *  stays the raw text); shared with the parser's copies (L430). */
+    out_tools tools;
     void open() override;
     void grow(const std::string &b, size_t held, bool closing, int index, std::vector<out_event> *ev) override;
     bool in_payload() const override { return in_str_; }

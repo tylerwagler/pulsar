@@ -126,18 +126,23 @@ bool parser_kit_in_tool_call(const void *st, const gen_state *) {
     return p.in_tool_call() && !p.in_payload();
 }
 
-/* L296 toolsample: the probe is a kit_gen around a copy of the parser's reading, at the same fed offset; it is fed
- * what parser_kit_feed would feed it and read only by parser_kit_in_tool_call (no sink, no calls, events dropped). */
+/* L296 toolsample: the probe is a kit_gen at the same fed offset, around a reader that reads on as the parser would;
+ * it is fed what parser_kit_feed would feed it and read only by parser_kit_in_tool_call and parser_kit_turn_complete
+ * (no sink, no calls, events dropped).  L430: that reader is the parser's probe() and not its clone(): one is taken
+ * every speculative round, and a clone copies the turn's reported text and the open call's body -- a megabyte a
+ * round inside a long value.  The probe borrows the body from the state it was taken from, which is therefore not
+ * fed until parser_kit_probe_free gives it back. */
 /// server_output_parser_ops::probe_new.
-/// @param st  the kit state (a kit_gen, from parser_kit_start)
+/// @param st  the kit state (a kit_gen, from parser_kit_start); lends its parsers' open call bodies to the probe
 /// @return a new probe (owned by the caller; parser_kit_probe_free)
-void *parser_kit_probe_new(const void *st) {
-    const kit_gen *q = (const kit_gen *)st;
+void *parser_kit_probe_new(void *st) {
+    kit_gen *q = (kit_gen *)st;
     kit_gen *p = new kit_gen();
-    p->parser = q->parser->clone();
+    p->lender = q;
+    p->parser = q->parser->probe();
     p->fed = q->fed;
     /* L428: the read-ahead with it, so the probe says where the turn ends as the state will (turn_complete) */
-    if (q->ahead) p->ahead = q->ahead->clone();
+    if (q->ahead) p->ahead = q->ahead->probe();
     p->ahead_fed = q->ahead_fed;
     p->call_closed = q->call_closed;
     p->call_end = q->call_end;
@@ -163,9 +168,19 @@ void parser_kit_probe_feed(void *probe, const gen_state *g, const char *text, si
     p->fed = upto;
 }
 
-/// server_output_parser_ops::probe_free.
+/// server_output_parser_ops::probe_free: the borrowed bodies go back to the state the probe was taken from.
 /// @param probe  the probe (parser_kit_probe_new)
-void parser_kit_probe_free(void *probe) { delete (kit_gen *)probe; }
+void parser_kit_probe_free(void *probe) {
+    kit_gen *p = (kit_gen *)probe;
+    kit_gen *q = p->lender;
+    q->parser->probe_end(p->parser);
+    p->parser = nullptr;
+    if (q->ahead) {   /* else the probe's read-ahead is a copy it took itself (kit_read_ahead), and its own */
+        q->ahead->probe_end(p->ahead);
+        p->ahead = nullptr;
+    }
+    delete p;
+}
 
 /// server_output_parser_ops::turn_complete: a kit turn ends at the stop token, or (L428) past the first call of a
 /// turn that may make one (kit_read_ahead).

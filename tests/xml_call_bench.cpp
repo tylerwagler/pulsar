@@ -9,8 +9,8 @@
  *   one string parameter of 10 KB .. 4 MB, in 4-byte and in 64-byte feeds
  *   a value that spells "</tool_call>" on every line (L410: each one asks holds_closer), in 64-byte feeds
  *   2,000 small parameters, in 4-byte and in 64-byte feeds
- *   what one speculative round's probe copies at that point of a call (out_parser::clone() + the turn's text, as
- *   gen_spec_greedy_rows_text does for a sampled chat with tools) -- not changed by L429, printed for scale
+ *
+ * (What a speculative round's look ahead costs at such a point of a call is tests/gen_host_bench.cpp's, L430.)
  *
  * It prints; it does not grade.  It does check, and die on, the one thing that would make the numbers meaningless:
  * the two bodies reading different calls.
@@ -129,29 +129,6 @@ std::string one_value_turn(const std::string &value) {
            "\n</parameter>\n</function>\n</tool_call>";
 }
 
-/// What one probe of a speculative round copies with `n` bytes of a value generated: the parser and the turn's text.
-/// @param n the value's bytes so far
-void probe_row(size_t n) {
-    const std::string turn = one_value_turn(file_text(n, false));
-    const std::string sofar = turn.substr(0, turn.size() - strlen("\n</parameter>\n</function>\n</tool_call>"));
-    call_body_parser<xml_call_body> p;
-    p.start(qwen_output_grammar(false), kTools, false, OUT_CONTENT);
-    std::vector<out_event> ev;
-    p.feed(sofar.data(), sofar.size(), &ev);
-    const int rounds = n >= (1u << 20) ? 200 : 2000;
-    size_t sink = 0;
-    const double t0 = cpu_s();
-    for (int i = 0; i < rounds; i++) {
-        out_parser *probe = p.clone();
-        std::string text(sofar);   /* gen_spec_greedy_rows_text's copy of g->text */
-        sink += text.size() + probe->in_payload();
-        delete probe;
-    }
-    const double s = cpu_s() - t0;
-    printf("%-34s %10.1f us a round   (%d rounds, %zu bytes copied)\n",
-           ("probe at " + std::to_string(n >> 10) + " KB of a value").c_str(), s / rounds * 1e6, rounds, sink / (size_t)rounds);
-}
-
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -174,7 +151,5 @@ int main(int argc, char **argv) {
                 "\n</parameter>\n";
     many += "</function>\n</tool_call>";
     for (size_t piece : {(size_t)4, (size_t)64}) row("2000 small parameters", many, piece, true);
-    printf("\nnot changed by L429 -- what a speculative round's probe copies (clone() + the turn's text):\n");
-    for (size_t n : {(size_t)10 << 10, (size_t)100 << 10, (size_t)1 << 20, (size_t)4 << 20}) probe_row(n);
     return 0;
 }

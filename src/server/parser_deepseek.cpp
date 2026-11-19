@@ -69,7 +69,7 @@ static bool ds_parser_in_tool_call(const void *st, const gen_state *) {
 /// server_output_parser_ops::probe_new.
 /// @param st  the parser state (a deepseek_parser, from ds_parser_create)
 /// @return a probe holding a copy of the decode tracker (owned by the caller; ds_parser_probe_free)
-static void *ds_parser_probe_new(const void *st) {
+static void *ds_parser_probe_new(void *st) {
     deepseek_parser *p = (deepseek_parser *)server_xmalloc(sizeof *p);
     memset(p, 0, sizeof *p);
     p->tracker = ((const deepseek_parser *)st)->tracker;

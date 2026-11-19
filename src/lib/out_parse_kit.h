@@ -34,6 +34,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -158,6 +159,18 @@ struct pyjson_value;
 /// @return "string", "other", or NULL (the tool or the property is not declared)
 const char *out_tool_param_type(const pyjson_value &tools, const std::string &fn, const std::string &key);
 
+/** L430: a request's tools as a call body holds them: parsed once, then shared -- never copied -- by the parser, its
+ *  clone()s and its probe()s (a tools array is tens of kilobytes of schema; a speculative round copies the parser).
+ *  Empty = the request declares no tools. */
+typedef std::shared_ptr<const pyjson_value> out_tools;
+
+/** out_tool_param_type over a body's shared tools. */
+/// @param tools the body's tools (empty: nothing is declared)
+/// @param fn    a function name
+/// @param key   one of its parameters
+/// @return "string", "other", or NULL (no tools, or the tool or the property is not declared)
+const char *out_tool_param_type(const out_tools &tools, const std::string &fn, const std::string &key);
+
 /** The reader of a call's body: the bytes between the marker that opened the call and the marker that
  * closes it.  The kit owns the call's index, the events' order and the call list; the reader owns the
  * body's syntax. */
@@ -251,10 +264,24 @@ public:
     out_parser() = default;
     virtual ~out_parser() = default;
     out_parser &operator=(const out_parser &) = delete;   ///< it points at its configuration's body
-    /** L296: a copy of the reading so far -- its own body in the same state, the same grammar -- for a scratch
-     *  probe that reads ahead without touching this one (the server's per-position tool-call override). */
+    /** L296: a copy of the reading so far -- its own body in the same state, the same grammar -- that reads on
+     *  without touching this one (L428: the kit's read-ahead copy, taken once at a turn's first feed).  It copies
+     *  everything the parser holds, so its cost grows with the turn: a reader taken every round is a probe(). */
     /// @return a new parser (caller owns it) with this one's reading and its own copy of the body
     virtual out_parser *clone() const = 0;
+    /** L430: a scratch reader for a look ahead that is thrown away (the server's per-round probes): clone()'s reading
+     *  of the bytes fed to it -- the same events from feed(), the same in_tool_call() / in_payload() after each --
+     *  at a cost that does not grow with the turn.  It copies none of the text reported so far (its reasoning(),
+     *  content() and calls() start empty, so it is never finish()ed and never asked for the turn's reading), and it
+     *  BORROWS the open call's body instead of copying it: until probe_end() this parser holds no body and is not
+     *  fed.  What it copies is the parser's bounded state: the held marker prefix, the section policies' held
+     *  whitespace, a header's text, the body reader's cursors. */
+    /// @return the probe (give it back with probe_end(), which deletes it)
+    out_parser *probe();
+    /** End a probe(): the open call's body comes back as it was lent -- the bytes the probe appended cut off, or the
+     *  body set aside when the probe read on into another call -- and the probe is deleted. */
+    /// @param probe the probe this parser's probe() returned
+    void probe_end(out_parser *probe);
     /** `g` and `body` outlive the parser; `initial` is the state the prompt left the turn in.  Resets every
      *  reading: one init per turn. */
     /// @param g       the family's grammar (not owned)
@@ -357,6 +384,8 @@ private:
     /// Close the open call: the body's verdict becomes TOOL_END (and calls_) or ERROR; index_ advances either way.
     /// @param ev receives the event
     void close_call(std::vector<out_event> *ev);
+    /// A call opens: its body starts empty.  A probe's borrowed body is set aside first (probe_end() returns it).
+    void new_block();
 
     /// The bound grammar (not owned).
     const out_grammar *g_ = nullptr;
@@ -387,6 +416,16 @@ private:
     *  The content text reported so far. */
     /// The well-formed calls read so far.
     std::vector<out_call> calls_;
+    /// L430: what a probe() holds of the parser it was taken from.
+    enum loan_t : uint8_t {
+        LOAN_NONE,    ///< not a probe (or a copy of one: it owns what it holds)
+        LOAN_HELD,    ///< block_ is the lender's open call body, with what this probe appended past loan_len_
+        LOAN_PARKED,  ///< the probe opened a call of its own: the lender's body waits in parked_
+    };
+    bool lent_out_ = false;     ///< L430: a probe() holds this parser's block_ until probe_end(); it is not fed meanwhile
+    loan_t loan_ = LOAN_NONE;   ///< L430: this parser is a probe()
+    size_t loan_len_ = 0;       ///< L430: the borrowed body's length when it was lent
+    std::string parked_;        ///< L430: the borrowed body, set aside (LOAN_PARKED)
 };
 
 /* ---- L295 F8 step 2: the output parser of a chat format, registered by the family's own frontend file ----------
