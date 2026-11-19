@@ -55,7 +55,8 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
         if (char *bad = agent_tool_arg_int(call, "job", 0, 0, INT_MAX, &job_id)) return bad;
         if (char *bad = agent_tool_arg_int(call, "pid", 0, 0, INT_MAX, &pid)) return bad;
         if (char *bad = agent_tool_arg_int(call, "refresh_sec", 60, 1, 3600, &refresh)) return bad;
-        agent_bash_job *job = agent_bash_find_job(w, job_id, pid);
+        /* (the argument is 0 .. INT_MAX: 0, no job named, enters as none() and the pid decides) */
+        agent_bash_job *job = agent_bash_find_job(w, AgentJobId{job_id}, pid);
         if (!job) {
             char msg[128];
             snprintf(msg, sizeof(msg), "Tool error: bash job not found: job=%d pid=%ld\n",
@@ -119,7 +120,7 @@ char *agent_bash_jobs_compaction_observation(agent_worker *w) {
         next = job->next;
         char *obs = job->observation(true);
         char hdr[64];
-        snprintf(hdr, sizeof(hdr), "\nJob %d:\n", job->id);
+        snprintf(hdr, sizeof(hdr), "\nJob %d:\n", job->id.raw());
         agent_buf_puts(&out, hdr);
         agent_buf_puts(&out, obs);
         free(obs);

@@ -405,7 +405,7 @@ struct sync_hooks {
  * the short suffix in place or reloads an older disk checkpoint before replay. */
 void server::canonicalize_tool_checkpoint(session_slot *sl,
                                          const job *j, const char *ctx,
-                                         uint64_t trace_id, const char *content,
+                                         TraceId trace_id, const char *content,
                                          const char *reasoning, const tool_calls *calls) {
     auto *s = this;
     if (!calls || calls->len == 0 || !j->req.prompt_text) return;

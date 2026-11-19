@@ -1227,7 +1227,7 @@ bool server_terminal_arms(bool wants, const terminal_evidence *ev, bool called);
  *  worker_evict_one, the pick in gen_begin_plan, the times and counts at its end (server::kv_req_log).  An int of
  *  -1 and an empty string are "absent" and print as `-`. */
 typedef struct {
-    uint64_t id;         ///< the job's number (job::seq, given at enqueue)
+    JobId id;            ///< the job's number (job::seq, given at enqueue)
     const char *ep;      ///< the endpoint: chat, completions, responses, messages
     const char *cls;     ///< the x-claude-code-request-class name ("" = no header)
     bool ro;             ///< X-Pulsar-KV: read-only
@@ -2026,7 +2026,7 @@ bool server_chain_ends_at_text_end(TextBytes chain_text_end, TextBytes text_len)
 /** A queued job's wait for another prompt's prefill (job::pw).  Worker-thread state only. */
 typedef struct {
     bool decided;           ///< the wait was decided for this job (it waits at most once)
-    uint64_t leader;        ///< the bound job it waits on (job::seq), 0 = not waiting
+    JobId leader;           ///< the bound job it waits on (job::seq), none() = not waiting
     SlotIdx slot;           ///< that job's slot
     PromptPos mark;         ///< the cut the leader's prefill is to stand at: an index into both prompts (shared by id)
     PromptToks have;        ///< the request's tokens served when it started waiting (the gain is mark - have)
@@ -3166,7 +3166,7 @@ struct server {
     pthread_cond_t stream_cv;
     job *head;                   ///< queue head; the next job to bind
     job *tail;                   ///< queue tail; where enqueue appends
-    uint64_t job_seq;            ///< L329 (a): the last job::seq enqueue gave (under mu)
+    JobId job_seq;               ///< L329 (a): the last job::seq enqueue gave (under mu)
     /** L329 (a): PULSAR_SERVER_PREFIX_WAIT_MS -- how long a queued request may wait for a cut another prompt's
      *  prefill is filling (0: never; set at startup, read by the worker only). */
     int prefix_wait_ms;
@@ -3370,7 +3370,7 @@ struct server {
     int m_queue_block_reason;  ///< provision_refusal + 1 of a stuck head; 0 = not blocked
     FILE *trace;               ///< trace sink, or NULL when tracing is off
     pthread_mutex_t trace_mu;  ///< serialises trace writes across threads
-    uint64_t trace_seq;        ///< monotonic trace event counter, for ordering
+    TraceId trace_seq;         ///< the last trace id trace_begin gave (monotonic, under trace_mu)
     FILE *capture;             ///< --capture-requests sink (append), or NULL
     pthread_mutex_t capture_mu;///< serialises capture writes across client threads
 
@@ -3794,7 +3794,7 @@ struct server {
     /// @param content    the turn's parsed content (may be NULL)
     /// @param reasoning  the turn's parsed reasoning (may be NULL)
     /// @param calls      the turn's calls (none: nothing to do)
-    void canonicalize_tool_checkpoint(session_slot *sl, const job *j, const char *ctx, uint64_t trace_id, const char *content, const char *reasoning, const tool_calls *calls);
+    void canonicalize_tool_checkpoint(session_slot *sl, const job *j, const char *ctx, TraceId trace_id, const char *content, const char *reasoning, const tool_calls *calls);
     /** The failure epilogue of a job that has no decode attempt yet -- both prefill phases (the old duplicated blocks
      * after each pulsar_session_sync failure), the restore, a bank that cannot be installed, a decode init that
      * could not start (L372): the client is answered and the job is GEN_DONE.  Token vectors and the disk path are
@@ -4116,11 +4116,11 @@ struct server {
     /// @param id     the request's trace id (0: ignored)
     /// @param piece  the bytes
     /// @param len    bytes at `piece`
-    void trace_piece(uint64_t id, const char *piece, size_t len);
+    void trace_piece(TraceId id, const char *piece, size_t len);
     /** Write a formatted event line into the trace for request `id`. */
     /// @param id   the request's trace id (0: ignored)
     /// @param fmt  printf format, then its arguments
-    void trace_event(uint64_t id, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+    void trace_event(TraceId id, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
     /** Record how the prompt was resolved: what the caches supplied, what the
      * tool replay matched, and which file was used. This is the record that
      * explains a cold prefill after the fact. */
@@ -4141,7 +4141,7 @@ struct server {
     /// @param disk_cached              the request's tokens a disk chain loaded
     /// @param disk_path                the loaded chain's segment key (may be NULL)
     /// @return 0 when tracing is off
-    uint64_t trace_begin(const job *j, PromptToks cached, PromptToks effective_prompt_tokens,
+    TraceId trace_begin(const job *j, PromptToks cached, PromptToks effective_prompt_tokens,
                          const trace_cache_diag *cache_diag, const char *cache_source, PromptToks disk_cached,
                          const char *disk_path);
     /** Close the trace: outcome, token counts, what the final parse produced. */
@@ -4155,7 +4155,7 @@ struct server {
     /// @param parsed_reasoning  the final parse's reasoning (may be NULL)
     /// @param parsed_calls      the final parse's calls (may be NULL)
     /// @param elapsed           the request's wall time, seconds
-    void trace_finish(uint64_t id, const request *r, const char *final_finish, int completion, bool saw_tool_start, bool saw_tool_end, const char *parsed_content, const char *parsed_reasoning, const tool_calls *parsed_calls, double elapsed);
+    void trace_finish(TraceId id, const request *r, const char *final_finish, int completion, bool saw_tool_start, bool saw_tool_end, const char *parsed_content, const char *parsed_reasoning, const tool_calls *parsed_calls, double elapsed);
     /** @} */
     /** Append `j` to the queue and wake the worker. Takes `mu`.
      * @return false when the server is stopping and the job was not queued. */
@@ -4707,7 +4707,7 @@ struct job {
     uint64_t route_logged;
     /** L329 (a): the job's number, given at enqueue from 1: a waiter names its leader by it (a later job at the
      *  freed address is not the leader). */
-    uint64_t seq;
+    JobId seq;
     prefix_wait pw;   ///< L329 (a): its wait for another prompt's prefill while queued
     kv_req_line kvr;  ///< L378: what its `kv req:` line will print, filled as it becomes known (worker thread)
     /** L249 D: the early stream.  A streaming request the worker has not started writing to gets its SSE head and
@@ -5053,7 +5053,7 @@ struct gen_state {
     TokPos sync_end;
     double t0;                        ///< wall time the request began, for latency accounting
     double first_token_t;  ///< wall time the first output token was produced (TTFT); 0 until set. Request-lifetime: survives decode_again so it reflects the genuinely first token emitted.
-    uint64_t trace_id;   ///< correlates every trace event for this request
+    TraceId trace_id;    ///< correlates every trace event for this request (none(): tracing off)
     char ctx_span[48];   ///< human-readable context span, for logs ("1234-5678")
     char req_flags[64];  ///< compact flag string describing the request, for logs
     server_prefill_progress progress;  ///< stable address: callback userdata

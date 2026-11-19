@@ -14041,7 +14041,7 @@ static void test_l378_token_hash_and_conversation_key(void) {
 static void test_l378_kv_req_line_format(void) {
     kv_req_line r;
     memset(&r, 0, sizeof r);
-    r.id = 4711;
+    r.id = JobId{4711};
     r.ep = "messages";
     r.cls = "subagent";
     r.ro = true;
@@ -14106,7 +14106,7 @@ static void test_l378_kv_req_line_format(void) {
     j.req.kind = REQ_COMPLETION;
     snprintf(j.req.hints.session, sizeof j.req.hints.session, "a-session-id-longer-than-sixteen-chars");
     s.kv_req_key(&j);
-    j.kvr.id = 9;
+    j.kvr.id = JobId{9};
     TEST_ASSERT(!strcmp(j.kvr.sess, "a-session-id-lon"));   /* as received, cut to 16 */
     j.kvr.finish = "gone-queued";
     kv_req_format(&j.kvr, line, sizeof line);
@@ -19391,7 +19391,7 @@ static void l329_fanout(const l329_req *rq, int n, int wait_ms, l329_out *o) {
         /* the bind pass (worker_try_bind's order) */
         for (int k = 0; k < n; k++) {
             prefix_wait *w = &r[k].pw;
-            if (!w->leader || r[k].bound || r[k].cancelled || rq[k].arrive > t) continue;
+            if (w->leader.is_none() || r[k].bound || r[k].cancelled || rq[k].arrive > t) continue;
             st *l = &r[w->slot.raw()];   /* the simulation's requests, by the leader's number */
             const bool live = l->bound && !l->finished && !l->cancelled;
             const prefix_wait_verdict v =
@@ -19401,12 +19401,12 @@ static void l329_fanout(const l329_req *rq, int n, int wait_ms, l329_out *o) {
                 continue;
             }
             o->outcomes[v]++;
-            w->leader = 0;
+            w->leader = JobId::none();
         }
         for (bool bound_one = true; bound_one;) {
             bound_one = false;
             for (int k = 0; k < n && !bound_one; k++) {
-                if (r[k].bound || r[k].cancelled || rq[k].arrive > t || r[k].pw.leader) continue;
+                if (r[k].bound || r[k].cancelled || rq[k].arrive > t || !r[k].pw.leader.is_none()) continue;
                 int have = 0, nl = 0, lead_of[L329_N];
                 unseamed_lead leads[L329_N];
                 for (int b = 0; b < n; b++) {
@@ -19425,7 +19425,7 @@ static void l329_fanout(const l329_req *rq, int n, int wait_ms, l329_out *o) {
                     const int pick = wait_ms > 0 ? unseamed_wait_pick(have, rq[k].len, grid, G, leads, nl, &mark)
                                                  : -1;
                     if (pick >= 0) {
-                        r[k].pw = {true, (uint64_t)lead_of[pick] + 1u, SlotIdx{(uint32_t)lead_of[pick]},
+                        r[k].pw = {true, JobId{lead_of[pick] + 1}, SlotIdx{(uint32_t)lead_of[pick]},
                                    PromptPos{mark}, PromptToks{have}, t};
                         st *l = &r[lead_of[pick]];
                         l->mark = unseamed_mark_merge(l->mark, mark, l->pos);
@@ -22685,8 +22685,8 @@ static_assert(std::is_same_v<decltype(&server_slot_match_is_trivial), bool (*)(T
                   std::is_same_v<decltype(&server_prefix_mark_merge), PromptPos (*)(PromptPos, PromptPos, TokPos)> &&
                   std::is_same_v<decltype(std::declval<server>().slot_common_prefix(nullptr, nullptr)), TokCount> &&
                   std::is_same_v<decltype(&server::trace_begin),
-                                 uint64_t (server::*)(const job *, PromptToks, PromptToks, const trace_cache_diag *,
-                                                      const char *, PromptToks, const char *)>,
+                                 TraceId (server::*)(const job *, PromptToks, PromptToks, const trace_cache_diag *,
+                                                     const char *, PromptToks, const char *)>,
               "the routing, scratch, anchor, prefix-wait and trace predicates take each count in its currency");
 /** Does the route's in-place rule take this type for where the resume starts? */
 template <class A> concept l439_route_takes = requires(A a) {
@@ -23310,6 +23310,15 @@ static_assert(!std::is_constructible_v<BankId, SlotIdx> && !std::is_constructibl
                   !std::is_constructible_v<BankCount, SlotIdx> && !std::is_constructible_v<BankCount, BankId>,
               "a slot becomes a bank through server::bank_of_slot alone; a count is neither");
 
+static_assert(std::is_same_v<decltype(job::seq), JobId> && std::is_same_v<decltype(server::job_seq), JobId> &&
+                  std::is_same_v<decltype(kv_req_line::id), JobId> && std::is_same_v<decltype(prefix_wait::leader), JobId> &&
+                  std::is_same_v<decltype(gen_state::trace_id), TraceId> &&
+                  std::is_same_v<decltype(server::trace_seq), TraceId> &&
+                  std::is_same_v<decltype(&server::trace_piece), void (server::*)(TraceId, const char *, size_t)> &&
+                  !std::is_constructible_v<JobId, TraceId> && !std::is_constructible_v<TraceId, JobId> &&
+                  !std::is_assignable_v<JobId &, uint64_t> && !std::is_assignable_v<TraceId &, int>,
+              "the server's job number and a trace's id are two id types, neither an integer (L441)");
+
 /* L441: the crossings and the count compute what the open-coded int expressions did: slot i holds bank i both ways,
  * a slot's index is its position, a count walks 0 .. n-1 (none for 0 or less), covers what `i < n` did, reaches a slot
  * with i + 1, names the bank past it, and a slot's bit is 1 << i; a broken identity is caught by name (a child). */
@@ -23343,6 +23352,18 @@ static void test_l441_pool_spaces(void) {
         if (n >= 0) TEST_ASSERT(c.bank_past() == BankId{n});
         if (n >= 0) TEST_ASSERT(BankCount::through(SlotIdx{(uint32_t)n}) == BankCount{n + 1});
     }
+    /* the ids: 0 is none(), the counter steps by one from it (enqueue's ++job_seq, trace_begin's ++trace_seq) */
+    JobId jid{};
+    TEST_ASSERT(jid.is_none() && jid == JobId::none() && jid.next() == JobId{1} && JobId{1}.next().raw() == 2u);
+    TraceId tid = TraceId::none();
+    tid = tid.next();
+    TEST_ASSERT(!tid.is_none() && tid.raw() == 1u);
+    kv_req_line kl;
+    memset(&kl, 0, sizeof kl);
+    kl.id = JobId{4711};
+    char kline[KV_REQ_LINE_MAX];
+    kv_req_format(&kl, kline, sizeof kline);
+    TEST_ASSERT(!strncmp(kline, "id=4711 ", 8));   /* printed as the integer it was */
     BankCount m{0};
     TEST_ASSERT((m++) == BankCount{0} && m == BankCount{1} && (++m) == BankCount{2} && m - BankCount{1} == BankCount{1});
     /* the identity broken (a slot's bank written by hand): both crossings refuse by name */

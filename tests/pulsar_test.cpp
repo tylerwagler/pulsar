@@ -4929,8 +4929,8 @@ static void test_batch_history(void) {
     memset(&dec_job, 0, sizeof dec_job);
     memset(&lead_job, 0, sizeof lead_job);
     dec_job.fd = lead_job.fd = -1;
-    dec_job.seq = 11;
-    lead_job.seq = 12;
+    dec_job.seq = JobId{11};
+    lead_job.seq = JobId{12};
     gen_state g, lg;
     memset(&g, 0, sizeof g);
     memset(&lg, 0, sizeof lg);
@@ -5008,7 +5008,7 @@ static void test_batch_history(void) {
         j.fd = -1;
         j.req.prompt = wait_t;
         TEST_ASSERT(s.slot_resume_at(&dec, &wait_t, NULL, 0).served == PromptToks{600});
-        TEST_ASSERT(!s.prefix_wait_decide(&j) && j.pw.decided && j.pw.leader == 0);
+        TEST_ASSERT(!s.prefix_wait_decide(&j) && j.pw.decided && j.pw.leader.is_none());
         s.head = &j;
         slot_flags protect = {};
         s.worker_protect_queued_warm_matches(protect);
@@ -5035,7 +5035,7 @@ static void test_batch_history(void) {
         memset(&j, 0, sizeof j);
         j.fd = -1;
         j.req.prompt = wait_t;
-        TEST_ASSERT(s.prefix_wait_decide(&j) && j.pw.leader == 12 && j.pw.mark == PromptPos{768} &&
+        TEST_ASSERT(s.prefix_wait_decide(&j) && j.pw.leader == JobId{12} && j.pw.mark == PromptPos{768} &&
                     j.pw.have == PromptToks{300});
         lg.share_mark = PromptPos{0};
     }

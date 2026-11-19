@@ -40,7 +40,8 @@ bool server::enqueue(job *j) {
         pthread_mutex_unlock(&s->mu);
         return false;
     }
-    j->seq = ++s->job_seq;
+    s->job_seq = s->job_seq.next();
+    j->seq = s->job_seq;
     j->kvr.id = j->seq;
     if (s->tail) s->tail->next = j; else s->head = j;
     s->tail = j;
@@ -1798,7 +1799,7 @@ void server::prefix_wait_release(job *const *queued, int n) {
     const double now = server_now_sec();
     for (int k = 0; k < n; k++) {
         prefix_wait *w = &queued[k]->pw;
-        if (!w->leader) continue;
+        if (w->leader.is_none()) continue;
         session_slot *ls = &s->slots[w->slot];
         const bool live = slot_prefilling(ls) && ls->active_job->seq == w->leader;
         const TokPos pos = live ? server_bank_pos(s->sess, ls->bank) : TokPos{0};
@@ -1819,7 +1820,7 @@ void server::prefix_wait_release(job *const *queued, int n) {
          * an unseamed leader's checkpoint there holds that many of them */
         if (v == PREFIX_WAIT_REACHED) s->m_prefix_wait_gain += (uint64_t)(w->mark.before() - w->have).raw();
         pthread_mutex_unlock(&s->mu);
-        w->leader = 0;
+        w->leader = JobId::none();
     }
 }
 
@@ -1923,7 +1924,7 @@ bool server::worker_try_bind() {
         pthread_mutex_lock(&q->mu);
         head_cancelled = q->cancelled;
         pthread_mutex_unlock(&q->mu);
-        if (head_cancelled || (!q->pw.leader && !s->prefix_wait_decide(q))) j = q;
+        if (head_cancelled || (q->pw.leader.is_none() && !s->prefix_wait_decide(q))) j = q;
     }
     if (!j) {
         pthread_mutex_lock(&s->mu);
@@ -2337,7 +2338,7 @@ void kv_id_cut(char dst[KV_REQ_ID_CHARS + 1], const char *id) {
 void kv_req_format(const kv_req_line *r, char *out, size_t cap) {
     kv_line l = {out, cap, 0};
     if (cap) out[0] = '\0';
-    kv_line_put(&l, "id", "%llu", (unsigned long long)r->id);
+    kv_line_put(&l, "id", "%llu", (unsigned long long)r->id.raw());
     kv_line_word(&l, "ep", r->ep);
     kv_line_word(&l, "class", r->cls);
     kv_line_put(&l, "ro", "%d", r->ro ? 1 : 0);
@@ -6044,7 +6045,7 @@ void *server_worker_main(void *arg) {
                 pulsar::ScopedLock lk(&s->mu);
                 /* L329 (a): the head a waiter is passed over for (pw is worker-thread state) */
                 const job *h = s->head;
-                while (h && h->pw.leader) h = h->next;
+                while (h && !h->pw.leader.is_none()) h = h->next;
                 kv_wait = h && h->refusal_counted == PROVISION_REFUSED_KV_TOUCHED;
             }
             if (!kv_wait && s->worker_readmit_preempted()) bound = true;

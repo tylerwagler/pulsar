@@ -187,7 +187,7 @@ static void trace_time(FILE *fp) {
 
 
 
-uint64_t server::trace_begin(
+TraceId server::trace_begin(
         const job *j,
         PromptToks cached,
         PromptToks effective_prompt_tokens,
@@ -196,11 +196,12 @@ uint64_t server::trace_begin(
         PromptToks disk_cached,
         const char *disk_path) {
     auto *s = this;
-    if (!s->trace) return 0;
+    if (!s->trace) return TraceId::none();
 
     pthread_mutex_lock(&s->trace_mu);
-    uint64_t id = ++s->trace_seq;
-    fprintf(s->trace, "\n===== request %llu ", (unsigned long long)id);
+    s->trace_seq = s->trace_seq.next();
+    const TraceId id = s->trace_seq;
+    fprintf(s->trace, "\n===== request %llu ", (unsigned long long)id.raw());
     trace_time(s->trace);
     fprintf(s->trace,
             " =====\nkind: %s\nmodel: %s\nstream: %d\ntools: %d\nthink_mode: %s\nprompt_tokens: %d\neffective_prompt_tokens: %d\ncached_tokens: %d\nmax_tokens: %d\ntemperature: %.3f\ntop_k: %d\ntop_p: %.3f\nmin_p: %.3f\nseed: %llu\n",
@@ -244,9 +245,9 @@ uint64_t server::trace_begin(
 
 
 
-void server::trace_piece(uint64_t id, const char *piece, size_t len) {
+void server::trace_piece(TraceId id, const char *piece, size_t len) {
     auto *s = this;
-    if (!s->trace || !id || !piece || !len) return;
+    if (!s->trace || id.is_none() || !piece || !len) return;
     pthread_mutex_lock(&s->trace_mu);
     fwrite(piece, 1, len, s->trace);
     fflush(s->trace);
@@ -255,9 +256,9 @@ void server::trace_piece(uint64_t id, const char *piece, size_t len) {
 
 
 
-void server::trace_event(uint64_t id, const char *fmt, ...) {
+void server::trace_event(TraceId id, const char *fmt, ...) {
     auto *s = this;
-    if (!s->trace || !id) return;
+    if (!s->trace || id.is_none()) return;
     pthread_mutex_lock(&s->trace_mu);
     fputs("\n\n--- trace: ", s->trace);
     va_list ap;
@@ -272,7 +273,7 @@ void server::trace_event(uint64_t id, const char *fmt, ...) {
 
 
 void server::trace_finish(
-        uint64_t id,
+        TraceId id,
         const request *r,
         const char *final_finish,
         int completion,
@@ -283,7 +284,7 @@ void server::trace_finish(
         const tool_calls *parsed_calls,
         double elapsed) {
     auto *s = this;
-    if (!s->trace || !id) return;
+    if (!s->trace || id.is_none()) return;
 
     pthread_mutex_lock(&s->trace_mu);
     fprintf(s->trace,
@@ -313,7 +314,7 @@ void server::trace_finish(
                     tc->arguments ? tc->arguments : "");
         }
     }
-    fprintf(s->trace, "\n===== end request %llu =====\n", (unsigned long long)id);
+    fprintf(s->trace, "\n===== end request %llu =====\n", (unsigned long long)id.raw());
     fflush(s->trace);
     pthread_mutex_unlock(&s->trace_mu);
 }
