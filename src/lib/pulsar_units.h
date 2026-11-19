@@ -579,7 +579,9 @@ static_assert(sizeof(TextBytes) == sizeof(uint64_t) && std::is_trivial<TextBytes
  * Left untyped, each inside one object and crossing no boundary as an offset: the parser's held bytes (hold_: offsets
  * local to out_parser::feed / find_marker, converted by out_parser::stream_at), an open call's body (out_call_body
  * readers), the Markdown scanner (run lengths only, no offset) and the grammar gate's trigger matchers (KMP states:
- * prefix lengths of a PATTERN).  Rendered-prompt offsets stay TextBytes / pulsar_text_span (L334 P7). */
+ * prefix lengths of a PATTERN).  Two readers of the turn's text take its offsets raw at their own door: the protocol
+ * sinks' release watermark (chat_sink::text, the logprob ledger's) and DeepSeek's DSML walk, a (text, length, offset)
+ * scanner.  Rendered-prompt offsets stay TextBytes / pulsar_text_span (L334 P7). */
 
 /** Tag of GenBytes (never instantiated). */
 struct pulsar_gen_bytes_tag;
