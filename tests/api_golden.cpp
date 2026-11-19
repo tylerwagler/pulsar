@@ -53,7 +53,7 @@ static void put_str(const char *key, const char *v) {
 
 static void put_spans(const char *key, const pulsar_text_span *v, uint32_t n) {
     printf("  %s: [", key);
-    for (uint32_t i = 0; i < n; i++) printf("%s%zu-%zu", i ? " " : "", (size_t)v[i].lo, (size_t)v[i].hi);
+    for (uint32_t i = 0; i < n; i++) printf("%s%zu-%zu", i ? " " : "", (size_t)v[i].lo.raw(), (size_t)v[i].hi.raw());
     printf("]\n");
 }
 

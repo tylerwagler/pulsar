@@ -12,14 +12,15 @@
 
 void chat_piece::client(const std::string &t) {
     if (t.empty()) return;
-    spans.push_back({(uint32_t)s.size(), (uint32_t)(s.size() + t.size())});
+    const PromptOff lo = prompt_end(s);
     s += t;
+    spans.push_back({lo, prompt_end(s)});
 }
 
 void chat_piece::add(const chat_piece &p) {
-    const uint32_t base = (uint32_t)s.size();
+    const PromptOff base = prompt_end(s);
     for (const pulsar_text_span &sp : p.spans) {
-        const pulsar_text_span v = {base + sp.lo, base + sp.hi};
+        const pulsar_text_span v = sp.placed(base);
         if (!spans.empty() && spans.back().hi == v.lo) spans.back().hi = v.hi;
         else spans.push_back(v);
     }
@@ -30,8 +31,8 @@ chat_piece chat_piece::sub(size_t lo, size_t hi) const {
     chat_piece out;
     out.s = s.substr(lo, hi - lo);
     for (const pulsar_text_span &sp : spans) {
-        const size_t a = sp.lo > lo ? sp.lo : lo, b = sp.hi < hi ? sp.hi : hi;
-        if (a < b) out.spans.push_back({(uint32_t)(a - lo), (uint32_t)(b - lo)});
+        pulsar_text_span v;
+        if (sp.slice(TextBytes{lo}, TextBytes{hi - lo}, &v)) out.spans.push_back(v);
     }
     return out;
 }
@@ -44,15 +45,15 @@ chat_piece chat_piece::trimmed() const {
 
 void chat_writer::client(const std::string &t) {
     if (t.empty()) return;
-    const uint32_t lo = (uint32_t)out->text.size();
+    const PromptOff lo = prompt_end(out->text);
     out->text += t;
-    out->spans.push_back({lo, (uint32_t)out->text.size()});
+    out->spans.push_back({lo, prompt_end(out->text)});
 }
 
 void chat_writer::add(const chat_piece &p) {
-    const uint32_t base = (uint32_t)out->text.size();
+    const PromptOff base = prompt_end(out->text);
     for (const pulsar_text_span &sp : p.spans) {
-        const pulsar_text_span v = {base + sp.lo, base + sp.hi};
+        const pulsar_text_span v = sp.placed(base);
         if (!out->spans.empty() && out->spans.back().hi == v.lo) out->spans.back().hi = v.hi;
         else out->spans.push_back(v);
     }

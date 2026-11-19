@@ -2065,8 +2065,7 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
     prompt = NULL;
     if (r->prompt_text[0]) {
         r->prompt_spans = (pulsar_text_span *)server_xmalloc(sizeof(pulsar_text_span));
-        r->prompt_spans[0].lo = 0;
-        r->prompt_spans[0].hi = (uint32_t)strlen(r->prompt_text);
+        r->prompt_spans[0] = {PromptOff{0}, PromptOff::after(TextBytes{strlen(r->prompt_text)})};
         r->prompt_n_spans = 1;
     }
     if (!request_tokenize_rendered(e, r, err, errlen)) goto bad;

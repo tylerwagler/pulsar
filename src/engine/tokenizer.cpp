@@ -987,9 +987,10 @@ void pulsar_vocab::tokenize_rendered_chat_spans_vocab(const char *text,
     uint32_t si = 0;
     while (*p) {
         const size_t off = (size_t)(p - base);
-        while (si < n_spans && (off >= spans[si].hi || spans[si].hi <= spans[si].lo)) si++;
-        if (si < n_spans && off >= spans[si].lo) {
-            const char *end = base + spans[si].hi;
+        /* L440: `off` is the byte cursor over the whole text (a size_t); a span's offsets meet it as raw indices */
+        while (si < n_spans && (off >= spans[si].hi.raw() || spans[si].empty())) si++;
+        if (si < n_spans && off >= spans[si].lo.raw()) {
+            const char *end = base + spans[si].hi.raw();
             if (end > end_of_text) end = end_of_text;   /* clamp to the string */
             vocab->tokenize_span(span, (size_t)(p - span), out);   /* flush the pending plain run */
             vocab->tokenize_span(p, (size_t)(end - p), out);       /* client text: BPE only */
@@ -1000,7 +1001,7 @@ void pulsar_vocab::tokenize_rendered_chat_spans_vocab(const char *text,
         int token = -1;
         size_t len = 0;
         /* spans[si], when there is one, is the next client range: off < its lo here */
-        if (vocab->special_token_at(p, &token, &len) && !(si < n_spans && off + len > spans[si].lo)) {
+        if (vocab->special_token_at(p, &token, &len) && !(si < n_spans && off + len > spans[si].lo.raw())) {
             vocab->tokenize_span(span, (size_t)(p - span), out);
             token_vec_push(out, TokId{token});
             p += len;
@@ -1034,21 +1035,11 @@ bool pulsar_tokenize_rendered_chat_spans(pulsar_engine *e, const char *text,
 pulsar_text_span *pulsar_text_spans_slice(const pulsar_text_span *spans, uint32_t n_spans,
                                           TextBytes skip_bytes, TextBytes len_bytes, uint32_t *n_out) {
     if (n_out) *n_out = 0;
-    const size_t skip = (size_t)skip_bytes.raw(), len = (size_t)len_bytes.raw();   /* a renderer span is raw bytes */
-    if (!spans || !n_spans || !len) return NULL;
+    if (!spans || !n_spans || len_bytes == TextBytes{0}) return NULL;
     pulsar_text_span *out = (pulsar_text_span *)xmalloc((size_t)n_spans * sizeof *out);
-    const size_t end = skip + len;
     uint32_t k = 0;
-    for (uint32_t i = 0; i < n_spans; i++) {
-        size_t lo = spans[i].lo, hi = spans[i].hi;
-        if (hi <= skip || lo >= end) continue;
-        if (lo < skip) lo = skip;
-        if (hi > end) hi = end;
-        if (hi <= lo) continue;
-        out[k].lo = (uint32_t)(lo - skip);
-        out[k].hi = (uint32_t)(hi - skip);
-        k++;
-    }
+    for (uint32_t i = 0; i < n_spans; i++)
+        if (spans[i].slice(skip_bytes, len_bytes, &out[k])) k++;
     if (!k) { free(out); return NULL; }
     if (n_out) *n_out = k;
     return out;

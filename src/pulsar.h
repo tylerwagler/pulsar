@@ -774,12 +774,9 @@ bool pulsar_tokenize_text(pulsar_engine *e, const char *text, pulsar_tokens *out
  *  @return false, `out` untouched, when the family has no tokenizer (said once) or its tokenizer refused the text
  *          (not UTF-8; said) */
 bool pulsar_tokenize_rendered_chat(pulsar_engine *e, const char *text, pulsar_tokens *out);
-/** A half-open [lo, hi) byte range of CLIENT-supplied text in a rendered prompt.
- * The renderer produces these; the tokeniser treats them as plain text. */
-typedef struct {
-    uint32_t lo;   ///< first byte
-    uint32_t hi;   ///< one past the last byte
-} pulsar_text_span;
+/* pulsar_text_span -- a half-open [lo, hi) byte range of CLIENT-supplied text in a rendered prompt, which the
+ * renderer produces and the tokeniser treats as plain text -- is defined with its offset type (PromptOff) in
+ * lib/pulsar_units.h (L440): the same {lo, hi} 32-bit pair, its layout asserted there. */
 
 /** As pulsar_tokenize_rendered_chat, but every byte inside one of the `n_spans`
  * half-open [lo, hi) ranges is tokenised as PLAIN TEXT: no special-token matching

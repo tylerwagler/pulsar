@@ -1977,8 +1977,8 @@ static void test_anthropic_count_tokens_parse(void) {
         std::string pre(plain.prompt_text, cut);
         std::vector<pulsar_text_span> spans;
         for (uint32_t i = 0; i < plain.prompt_n_spans; i++)
-            if (plain.prompt_spans[i].lo < cut)
-                spans.push_back({plain.prompt_spans[i].lo, std::min(plain.prompt_spans[i].hi, cut)});
+            if (plain.prompt_spans[i].lo.raw() < cut)
+                spans.push_back(pulsar_text_span::of(plain.prompt_spans[i].lo.raw(), std::min(plain.prompt_spans[i].hi.raw(), cut)));
         pulsar_tokens head = {0};
         pulsar_tokenize_rendered_chat_spans(engine, pre.c_str(), spans.data(), (uint32_t)spans.size(), &head, NULL, 0);
         TEST_ASSERT(at && head.len > 0 && cp <= head.len + 1);
@@ -2442,7 +2442,7 @@ static void test_l375_tokenizer_refusal_is_a_result(void) {
         e->family = &fam;
         e->family_state = state[c];
         const char *text = "hello world";
-        const pulsar_text_span good[2] = {{0u, 5u}, {6u, 11u}}, bad[2] = {{6u, 11u}, {0u, 5u}};
+        const pulsar_text_span good[2] = {pulsar_text_span::of(0u, 5u), pulsar_text_span::of(6u, 11u)}, bad[2] = {pulsar_text_span::of(6u, 11u), pulsar_text_span::of(0u, 5u)};
         pulsar_tokens out = {0};
         char err[128] = "";
         /* the rendered entry: ascending spans tokenize; the same spans out of order are refused, with the reason */
@@ -2496,8 +2496,8 @@ static void test_l375_refused_render_fails_the_request(void) {
     TEST_ASSERT(parse_refusal_get() == PARSE_REFUSED_REQUEST);
     r.prompt_text = server_xstrdup("hello world");
     r.prompt_spans = (pulsar_text_span *)server_xmalloc(2 * sizeof(pulsar_text_span));
-    r.prompt_spans[0] = {6u, 11u};   /* out of order: what only a renderer defect produces */
-    r.prompt_spans[1] = {0u, 5u};
+    r.prompt_spans[0] = pulsar_text_span::of(6u, 11u);   /* out of order: what only a renderer defect produces */
+    r.prompt_spans[1] = pulsar_text_span::of(0u, 5u);
     r.prompt_n_spans = 2;
     char err[160] = "";
     TEST_ASSERT(!request_tokenize_rendered(e, &r, err, sizeof err));
@@ -2521,8 +2521,8 @@ static void test_l375_refused_render_fails_the_request(void) {
     a = answer(true);
     TEST_ASSERT(a.find(" 500 ") != std::string::npos && a.find("api_error") != std::string::npos);
     /* the same request with its spans in order parses: the record is the failed parse's alone */
-    r.prompt_spans[0] = {0u, 5u};
-    r.prompt_spans[1] = {6u, 11u};
+    r.prompt_spans[0] = pulsar_text_span::of(0u, 5u);
+    r.prompt_spans[1] = pulsar_text_span::of(6u, 11u);
     TEST_ASSERT(request_tokenize_rendered(e, &r, err, sizeof err) && r.prompt.len > 0);
     request_free(&r);
     request_init(&r, REQ_CHAT, 16);   /* a new parse starts as the request's own */
@@ -2794,7 +2794,7 @@ static int test_tokens_count_ids(const pulsar_tokens *t, const pulsar_tokens *id
 static bool test_spans_cover(const pulsar_text_span *spans, uint32_t n_spans,
                              size_t lo, size_t hi) {
     for (uint32_t i = 0; i < n_spans; i++)
-        if (spans[i].lo <= lo && spans[i].hi >= hi) return true;
+        if (spans[i].lo.raw() <= lo && spans[i].hi.raw() >= hi) return true;
     return false;
 }
 
@@ -2805,7 +2805,7 @@ static int test_spans_control_ids(pulsar_engine *e, const char *text,
                                   const pulsar_tokens *control_ids) {
     int n = 0;
     for (uint32_t i = 0; i < n_spans; i++) {
-        char *seg = test_span_slice(text, spans[i].lo, spans[i].hi);
+        char *seg = test_span_slice(text, spans[i].lo.raw(), spans[i].hi.raw());
         pulsar_tokens t = {0};
         pulsar_tokenize_rendered_chat(e, seg, &t);
         n += test_tokens_count_ids(&t, control_ids);
@@ -2831,17 +2831,17 @@ static void test_control_token_span_edge(void) {
         token_vec_free(&out);
         return got;
     };
-    const pulsar_text_span tail = {4, 7};                  /* "<thi" | "nk>" : the client completes it */
+    const pulsar_text_span tail = pulsar_text_span::of(4, 7);                  /* "<thi" | "nk>" : the client completes it */
     TEST_ASSERT(run("<think>", &tail, 1) == 0);
-    const pulsar_text_span last = {6, 7};                  /* "<think" | ">" : one client byte completes it */
+    const pulsar_text_span last = pulsar_text_span::of(6, 7);                  /* "<think" | ">" : one client byte completes it */
     TEST_ASSERT(run("<think>", &last, 1) == 0);
-    const pulsar_text_span after = {7, 9};                 /* "<think>" | "hi" : ends where the range begins */
+    const pulsar_text_span after = pulsar_text_span::of(7, 9);                 /* "<think>" | "hi" : ends where the range begins */
     TEST_ASSERT(run("<think>hi", &after, 1) == 1);
-    const pulsar_text_span inside = {0, 7};                /* the whole spelling is client text (L223) */
+    const pulsar_text_span inside = pulsar_text_span::of(0, 7);                /* the whole spelling is client text (L223) */
     TEST_ASSERT(run("<think><think>", &inside, 1) == 1);   /* ... and the renderer's own after it is not */
-    const pulsar_text_span two[2] = {{0, 2}, {9, 12}};     /* "ab" "<think>" "nk>" : whole between two ranges */
+    const pulsar_text_span two[2] = {pulsar_text_span::of(0, 2), pulsar_text_span::of(9, 12)};     /* "ab" "<think>" "nk>" : whole between two ranges */
     TEST_ASSERT(run("ab<think>nk>", two, 2) == 1);
-    const pulsar_text_span past = {20, 30};                /* a range past the string: nothing to cross */
+    const pulsar_text_span past = pulsar_text_span::of(20, 30);                /* a range past the string: nothing to cross */
     TEST_ASSERT(run("<think>", &past, 1) == 1);
 }
 
@@ -2895,7 +2895,7 @@ static void test_control_token_spans(void) {
          * what the tokeniser's single forward pass relies on. */
         for (uint32_t i = 0; i < r.prompt_n_spans; i++) {
             TEST_ASSERT(r.prompt_spans[i].lo < r.prompt_spans[i].hi);
-            TEST_ASSERT(r.prompt_spans[i].hi <= tlen);
+            TEST_ASSERT(r.prompt_spans[i].hi.raw() <= tlen);
             if (i) TEST_ASSERT(r.prompt_spans[i].lo >= r.prompt_spans[i - 1].hi);
         }
     }
@@ -2936,7 +2936,7 @@ static void test_control_token_spans(void) {
         TEST_ASSERT(vcovered == vfound);
         for (uint32_t i = 0; i < vn; i++) {
             TEST_ASSERT(vspans[i].lo < vspans[i].hi);
-            TEST_ASSERT(vspans[i].hi <= vlen);
+            TEST_ASSERT(vspans[i].hi.raw() <= vlen);
             if (i) TEST_ASSERT(vspans[i].lo >= vspans[i - 1].hi);
         }
     }
@@ -2947,20 +2947,20 @@ static void test_control_token_spans(void) {
     /* The slice helper a continuation tail uses: rebase to the slice and clip
      * to it, drop what falls outside, and never leave a zero-width range. */
     {
-        const pulsar_text_span whole[2] = {{10, 20}, {30, 40}};
+        const pulsar_text_span whole[2] = {pulsar_text_span::of(10, 20), pulsar_text_span::of(30, 40)};
         uint32_t n = 0;
         pulsar_text_span *sl = pulsar_text_spans_slice(whole, 2, TextBytes{15}, TextBytes{20}, &n);   /* [15,35) */
         TEST_ASSERT(sl != NULL && n == 2);
         if (sl) {
-            TEST_ASSERT(sl[0].lo == 0 && sl[0].hi == 5);
-            TEST_ASSERT(sl[1].lo == 15 && sl[1].hi == 20);
+            TEST_ASSERT(sl[0].lo.raw() == 0 && sl[0].hi.raw() == 5);
+            TEST_ASSERT(sl[1].lo.raw() == 15 && sl[1].hi.raw() == 20);
         }
         free(sl);
         sl = pulsar_text_spans_slice(whole, 2, TextBytes{12}, TextBytes{100}, &n);                    /* clamped */
         TEST_ASSERT(sl != NULL && n == 2);
         if (sl) {
-            TEST_ASSERT(sl[0].lo == 0 && sl[0].hi == 8);
-            TEST_ASSERT(sl[1].lo == 18 && sl[1].hi == 28);
+            TEST_ASSERT(sl[0].lo.raw() == 0 && sl[0].hi.raw() == 8);
+            TEST_ASSERT(sl[1].lo.raw() == 18 && sl[1].hi.raw() == 28);
         }
         free(sl);
         sl = pulsar_text_spans_slice(whole, 2, TextBytes{21}, TextBytes{5},
@@ -2990,7 +2990,7 @@ static void test_marked_tokens_ok(pulsar_engine *e, const char *tag, const char 
         free(t);
         if (!test_tokens_contain_id(control_ids, marked->v[i])) continue;
         for (uint32_t k = 0; k < n_spans; k++)
-            if (lo < spans[k].hi && spans[k].lo < lo + n) touching++;
+            if (lo < spans[k].hi.raw() && spans[k].lo.raw() < lo + n) touching++;
     }
     const bool spells = spelled == text;
     TEST_ASSERT(spells);

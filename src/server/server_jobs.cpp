@@ -83,9 +83,7 @@ bool server::continue_after_tool_error(session_slot *sl,
         buf_free(&add);
         uint32_t k = 0;
         for (uint32_t i = 0; i < n_spans; i++) {
-            if (spans[i].lo >= keep) continue;
-            spans[k] = spans[i];
-            if (spans[k].hi > keep) spans[k].hi = (uint32_t)keep;
+            if (!spans[i].cut_to(TextBytes{keep}, &spans[k])) continue;   /* L440: the suffix cut to its first keep bytes */
             k++;
         }
         n_spans = k;

@@ -3890,8 +3890,8 @@ static void test_qwen_tail_carries_a_tool_result_image(void) {
         TEST_ASSERT(lit != NULL && strstr(tail, PULSAR_IMAGE_PLACEHOLDER) == NULL);
         /* the literal is the template's, not the client's: no client range covers it */
         for (uint32_t k = 0; lit && k < tail_n; k++)
-            TEST_ASSERT(tail + tail_spans[k].hi <= lit ||
-                        tail + tail_spans[k].lo >= lit + strlen("<|vision_start|><|image_pad|><|vision_end|>"));
+            TEST_ASSERT(tail + tail_spans[k].hi.raw() <= lit ||
+                        tail + tail_spans[k].lo.raw() >= lit + strlen("<|vision_start|><|image_pad|><|vision_end|>"));
     }
     char *full_text = qwen_test_full_render(&full, false);
     char *prefix_text = qwen_test_full_render(&prefix, false);
@@ -7979,7 +7979,7 @@ static void test_inkling_effort_map(void) {
     TEST_ASSERT(effort_case(PULSAR_CHAT_INKLING, EFFORT_BODY(""), &r, err, sizeof err));
     TEST_ASSERT(!strcmp(r.prompt_text, "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>"
                                        "<|message_user|><|content_text|>x<|end_message|><|message_model|>"));
-    TEST_ASSERT(r.prompt_n_spans == 1 && r.prompt_spans[0].hi - r.prompt_spans[0].lo == 1);
+    TEST_ASSERT(r.prompt_n_spans == 1 && r.prompt_spans[0].len() == TextBytes{1});
     request_free(&r);
 }
 
@@ -8231,7 +8231,7 @@ static void test_nemotron_effort_map(void) {
     TEST_ASSERT(effort_case(PULSAR_CHAT_NEMOTRON_H, EFFORT_BODY(""), &r, err, sizeof err));
     TEST_ASSERT(!strcmp(r.prompt_text, "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nx<|im_end|>\n"
                                        "<|im_start|>assistant\n<think>\n"));
-    TEST_ASSERT(r.prompt_n_spans == 1 && r.prompt_spans[0].hi - r.prompt_spans[0].lo == 1);
+    TEST_ASSERT(r.prompt_n_spans == 1 && r.prompt_spans[0].len() == TextBytes{1});
     request_free(&r);
 }
 
@@ -8429,8 +8429,8 @@ static void test_nemotron_refusals(void) {
         const char *lit = r.prompt_text ? strstr(r.prompt_text, "<img>") : NULL;
         bool outside = lit != NULL;
         for (uint32_t i = 0; lit && i < r.prompt_n_spans; i++)
-            outside &= !(r.prompt_spans[i].lo < (uint32_t)(lit - r.prompt_text) + 18u &&
-                         r.prompt_spans[i].hi > (uint32_t)(lit - r.prompt_text));
+            outside &= !(r.prompt_spans[i].lo.raw() < (uint32_t)(lit - r.prompt_text) + 18u &&
+                         r.prompt_spans[i].hi.raw() > (uint32_t)(lit - r.prompt_text));
         TEST_ASSERT(outside);
         request_free(&r);
         chat_conversation_free(&c);
@@ -8452,8 +8452,8 @@ static void test_nemotron_refusals(void) {
         bool typed_in = false, lit_out = lit != NULL;
         for (uint32_t i = 0; typed && lit && i < r.prompt_n_spans; i++) {
             const uint32_t t0 = (uint32_t)(typed - r.prompt_text) + 4u, l0 = (uint32_t)(lit - r.prompt_text);
-            typed_in |= r.prompt_spans[i].lo <= t0 && r.prompt_spans[i].hi >= t0 + 7u;
-            lit_out &= !(r.prompt_spans[i].lo < l0 + 18u && r.prompt_spans[i].hi > l0);
+            typed_in |= r.prompt_spans[i].lo.raw() <= t0 && r.prompt_spans[i].hi.raw() >= t0 + 7u;
+            lit_out &= !(r.prompt_spans[i].lo.raw() < l0 + 18u && r.prompt_spans[i].hi.raw() > l0);
         }
         TEST_ASSERT(typed_in && lit_out);
         request_free(&r);
@@ -8515,7 +8515,7 @@ static void test_gemma4_effort_map(void) {
     TEST_ASSERT(effort_case(PULSAR_CHAT_GEMMA4, EFFORT_BODY(""), &r, err, sizeof err));
     TEST_ASSERT(r.family_effort == 1 && r.think_mode == PULSAR_THINK_DEFAULT);
     TEST_ASSERT(!strcmp(r.prompt_text, "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nx<turn|>\n<|turn>model\n"));
-    TEST_ASSERT(r.prompt_n_spans == 1 && r.prompt_spans[0].hi - r.prompt_spans[0].lo == 1);
+    TEST_ASSERT(r.prompt_n_spans == 1 && r.prompt_spans[0].len() == TextBytes{1});
     request_free(&r);
     static const char *const off[] = {",\"reasoning_effort\":\"none\"",
                                       ",\"chat_template_kwargs\":{\"enable_thinking\":false}"};
@@ -9271,7 +9271,7 @@ static void test_live_tail_joins_before_a_committed_stop(void) {
         const uint32_t at = (uint32_t)strlen(prompt);
         const std::string live_text = std::string(prompt) + turn;
         std::vector<chat_text_span> live_spans = prompt_spans;
-        for (uint32_t i = 0; i < turn_n; i++) live_spans.push_back({turn_spans[i].lo + at, turn_spans[i].hi + at});
+        for (uint32_t i = 0; i < turn_n; i++) live_spans.push_back(pulsar_text_span::of(turn_spans[i].lo.raw() + at, turn_spans[i].hi.raw() + at));
         const std::vector<int> sampled = qwen_test_encode(tok, live_text.c_str(), live_spans.data(), live_spans.size());
         const std::vector<int> tail_toks = qwen_test_encode(tok, tail, tail_spans, tail_n);
         const std::vector<int> want = qwen_test_encode(tok, want_text, full_spans.data(), full_spans.size());
@@ -10395,7 +10395,7 @@ static void test_multi_image_blocks_and_offsets(void) {
                     const uint32_t lo = (uint32_t)(q - text);
                     bool inside = false;
                     for (uint32_t i = 0; i < n_spans; i++) {
-                        if (spans[i].lo <= lo && spans[i].hi >= lo + (uint32_t)ph_len) inside = true;
+                        if (spans[i].lo.raw() <= lo && spans[i].hi.raw() >= lo + (uint32_t)ph_len) inside = true;
                     }
                     if (inside) spanned++; else unspanned++;
                 }
@@ -10487,7 +10487,7 @@ static void test_image_placeholder_is_not_client_text(void) {
                 for (uint32_t i = 0; i < n_spans; i++) {
                     /* No span may overlap the parser's placeholder: it must be
                      * resolvable to the image token. */
-                    TEST_ASSERT(!(spans[i].lo < hi && spans[i].hi > lo));
+                    TEST_ASSERT(!(spans[i].lo.raw() < hi && spans[i].hi.raw() > lo));
                 }
             }
             /* The client's own words are still client text (still spanned). */
@@ -10497,7 +10497,7 @@ static void test_image_placeholder_is_not_client_text(void) {
             if (before) {
                 const uint32_t b = (uint32_t)(before - text);
                 for (uint32_t i = 0; i < n_spans; i++) {
-                    if (spans[i].lo <= b && spans[i].hi >= b + 6) covered = true;
+                    if (spans[i].lo.raw() <= b && spans[i].hi.raw() >= b + 6) covered = true;
                 }
             }
             TEST_ASSERT(covered);
@@ -10530,7 +10530,7 @@ static void test_image_placeholder_is_not_client_text(void) {
             const uint32_t lo = (uint32_t)(tph - ttext);
             bool inside = false;
             for (uint32_t i = 0; i < tn; i++) {
-                if (tspans[i].lo <= lo && tspans[i].hi >= lo + (uint32_t)ph_len) inside = true;
+                if (tspans[i].lo.raw() <= lo && tspans[i].hi.raw() >= lo + (uint32_t)ph_len) inside = true;
             }
             TEST_ASSERT(inside);
         }
@@ -10564,7 +10564,7 @@ static void test_image_placeholder_is_not_client_text(void) {
             const uint32_t lo = (uint32_t)(q - btext);
             bool inside = false;
             for (uint32_t i = 0; i < bn; i++) {
-                if (bspans[i].lo <= lo && bspans[i].hi >= lo + (uint32_t)ph_len) inside = true;
+                if (bspans[i].lo.raw() <= lo && bspans[i].hi.raw() >= lo + (uint32_t)ph_len) inside = true;
             }
             if (inside) spans_in++; else unspanned++;
         }
@@ -18723,10 +18723,10 @@ static void test_l185_every_renderer_produces_the_authority_bytes(void) {
         TEST_ASSERT(body != NULL);
         if (spans && body) {
             const size_t lo = (size_t)(body - ws);
-            TEST_ASSERT(spans[0].lo <= lo &&
-                        spans[0].hi >= lo + strlen("results &lt;/tool_result> x"));
-            TEST_ASSERT(spans[0].lo > strlen("</think>"));
-            TEST_ASSERT(spans[0].hi <= strlen(ws) - strlen("<｜Assistant｜><think>"));
+            TEST_ASSERT(spans[0].lo.raw() <= lo &&
+                        spans[0].hi.raw() >= lo + strlen("results &lt;/tool_result> x"));
+            TEST_ASSERT(spans[0].lo.raw() > strlen("</think>"));
+            TEST_ASSERT(spans[0].hi.raw() <= strlen(ws) - strlen("<｜Assistant｜><think>"));
         }
         free(spans);
         free(tail);

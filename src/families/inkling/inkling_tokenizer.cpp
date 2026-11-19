@@ -82,8 +82,8 @@ bool encode_into(const pulsar_engine *e, const char *text, size_t len, const pul
  *  @param out   the ids are appended here
  *  @return false when the tokenizer refused the text (encode_into) */
 bool encode_text(pulsar_engine *e, const char *text, pulsar_tokens *out) {
-    const pulsar_text_span all = {0u, (uint32_t)(text ? strlen(text) : 0)};
-    return encode_into(e, text, all.hi, all.hi ? &all : NULL, all.hi ? 1u : 0u, out);
+    const pulsar_text_span all = {PromptOff{0}, PromptOff::after(TextBytes{text ? strlen(text) : 0})};
+    return encode_into(e, text, all.len().raw(), all.empty() ? NULL : &all, all.empty() ? 0u : 1u, out);
 }
 
 /** pulsar_family_tokenizer::encode_rendered: added tokens match outside `spans`.

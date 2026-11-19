@@ -82,9 +82,8 @@ bool request_apply_forced_tool_prefill(request *r, char *err, size_t errlen) {
     if (r->prompt_spans) {
         uint32_t k = 0;
         for (uint32_t i = 0; i < r->prompt_n_spans; i++) {
-            pulsar_text_span sp = r->prompt_spans[i];
-            if (sp.lo >= blen) continue;
-            if (sp.hi > blen) sp.hi = (uint32_t)blen;
+            pulsar_text_span sp;
+            if (!r->prompt_spans[i].cut_to(TextBytes{blen}, &sp)) continue;   /* the prompt cut to its first blen bytes */
             r->prompt_spans[k++] = sp;
         }
         pt.spans = r->prompt_spans;

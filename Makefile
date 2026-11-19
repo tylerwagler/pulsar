@@ -1281,7 +1281,7 @@ QWEN_RENDER_CASES ?= $(call need_path,QWEN_RENDER_CASES)
 QWEN_CALIB ?= $(call need_path,QWEN_CALIB)
 QWEN_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/families/qwen/qwen_chat.cpp src/families/qwen/qwen_output.cpp src/lib/out_parse_kit.cpp
 tests/qwen_chat_gate: tests/qwen_chat_gate.cpp tests/bpe_gate_util.h $(QWEN_CHAT_SRCS) src/lib/bpe_tokenizer.h \
-                      src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/families/qwen/qwen_chat.h src/lib/out_parse_kit.h src/lib/md_code_scan.h src/lib/xml_call_body.h src/lib/pulsar_utf8.h src/lib/chat_refuse.h \
+                      src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/families/qwen/qwen_chat.h src/lib/chat_render_kit.h src/lib/out_parse_kit.h src/lib/md_code_scan.h src/lib/xml_call_body.h src/lib/pulsar_utf8.h src/lib/chat_refuse.h \
                       src/lib/sha1.hpp tests/xml_call_body_ref.h Makefile
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/lib -o $@ tests/qwen_chat_gate.cpp $(QWEN_CHAT_SRCS)
 .PHONY: qwen-chat-gate

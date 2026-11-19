@@ -49,7 +49,7 @@ static std::string qwen_sweep_context(const std::string &c) { return "x" + c + c
 struct conv {
     std::vector<qwen_msg_in> msgs;
     std::vector<std::vector<qwen_tool_call_in>> calls;
-    std::vector<std::vector<uint32_t>> image_at;   /* L268: per message, where its images sit in its content */
+    std::vector<std::vector<StrippedOff>> image_at;   /* L268: per message, where its images sit in its content */
     std::vector<std::string> store;   /* owned strings; reserved up front so c_str() stays put */
     std::string tools;
     bool has_tools = false;
@@ -84,7 +84,7 @@ static void build_conv(const pyjson_value &messages, const pyjson_value *tools, 
             for (const auto &part : content->a) {
                 const pyjson_value *type = part.get("type");
                 if (type && type->s == "image") {
-                    c->image_at[i].push_back((uint32_t)text.size());
+                    c->image_at[i].push_back(StrippedOff::after(TextBytes{text.size()}));
                 } else if (const pyjson_value *t = part.get("text")) {
                     text += t->s;
                 }
@@ -145,7 +145,7 @@ static std::string spans_text(const std::vector<pulsar_text_span> &spans) {
     std::string s;
     char b[32];
     for (size_t i = 0; i < spans.size(); i++) {
-        snprintf(b, sizeof b, "%s%u-%u", i ? "," : "", spans[i].lo, spans[i].hi);
+        snprintf(b, sizeof b, "%s%u-%u", i ? "," : "", spans[i].lo.raw(), spans[i].hi.raw());
         s += b;
     }
     return s;
