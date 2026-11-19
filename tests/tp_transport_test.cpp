@@ -75,8 +75,8 @@ static uint64_t agreed_digest(uint32_t slot) { return 0x9E3779B97F4A7C15ull * (s
 
 static float *slot_at(uint8_t *base, const pulsar_tp_slab *s, uint32_t layer,
                       uint32_t gate, uint64_t vec, int in) {
-    const uint64_t off = in ? pulsar_tp_slab_in_offset(s, layer, gate, vec)
-                            : pulsar_tp_slab_out_offset(s, layer, gate, vec);
+    const uint64_t off = in ? pulsar_tp_slab_in_offset(s, TpSlot{layer}, gate, vec)
+                            : pulsar_tp_slab_out_offset(s, TpSlot{layer}, gate, vec);
     return reinterpret_cast<float *>(base + off);
 }
 
@@ -94,7 +94,7 @@ static void gate_phase(pulsar_tp *tp, uint8_t *base, int rank, const pulsar_tp_s
                 for (uint32_t i = 0; i < n; i++) out[i] = pat(sender, (uint32_t)slot, i);
             else
                 std::memset(out, 0, vec);
-            if (!pulsar_tp_gate_exchange(tp, layer, gate, seq)) {
+            if (!pulsar_tp_gate_exchange(tp, TpSlot{layer}, gate, seq)) {
                 CHECK(0, "rank %d gate_exchange l=%u g=%u seq=%llu failed", rank,
                       layer, gate, (unsigned long long)seq);
                 return;
@@ -117,13 +117,13 @@ static void batch_phase(pulsar_tp *tp, uint8_t *base, int rank, const pulsar_tp_
                         uint32_t sender) {
     const uint64_t bytes = (uint64_t)rows * vec;
     const uint32_t n = (uint32_t)(bytes / sizeof(float));
-    float *out = reinterpret_cast<float *>(base + pulsar_tp_slab_batch_out_offset(s, layer, vec));
-    float *in = reinterpret_cast<float *>(base + pulsar_tp_slab_batch_in_offset(s, layer, vec));
+    float *out = reinterpret_cast<float *>(base + pulsar_tp_slab_batch_out_offset(s, TpSlot{layer}, vec));
+    float *in = reinterpret_cast<float *>(base + pulsar_tp_slab_batch_in_offset(s, TpSlot{layer}, vec));
     if (rank == (int)sender)
         for (uint32_t i = 0; i < n; i++) out[i] = pat(sender, layer, i);
     else
         std::memset(out, 0, bytes);
-    if (!pulsar_tp_batch_gate_exchange(tp, layer, rows, seq)) {
+    if (!pulsar_tp_batch_gate_exchange(tp, TpSlot{layer}, rows, seq)) {
         CHECK(0, "rank %d batch_gate_exchange l=%u rows=%u failed", rank, layer, rows);
         return;
     }
@@ -151,7 +151,7 @@ static void big_phase(pulsar_tp *tp, int rank, uint32_t layer, uint64_t seq,
     }
     if (rank == (int)sender)
         for (uint32_t i = 0; i < n; i++) out[i] = pat(sender, 999, i);
-    if (!pulsar_tp_big_gate_exchange(tp, layer, seq, out, in, bytes)) {
+    if (!pulsar_tp_big_gate_exchange(tp, TpSlot{layer}, seq, out, in, bytes)) {
         CHECK(0, "rank %d big_gate_exchange l=%u bytes=%llu failed", rank, layer,
               (unsigned long long)bytes);
     } else {

@@ -60,16 +60,16 @@ int main(int argc, char **argv) {
     bool plan_ok = p->n_layer == s->n_layer && s->n_layer > 0;
     uint32_t n_full = 0;
     for (uint32_t il = 0; plan_ok && il < p->n_layer; il++) {
-        const pulsar_layer_desc &d = p->desc[il];
-        const bool full = pulsar_gemma4_is_full(s, il);
-        plan_ok = p->kind[il] == PULSAR_LAYER_BLOCKS &&
+        const pulsar_layer_desc &d = p->desc[TrunkLayer{il}];
+        const bool full = pulsar_gemma4_is_full(s, TrunkLayer{il});
+        plan_ok = p->kind[TrunkLayer{il}] == PULSAR_LAYER_BLOCKS &&
                   d.mixer == (full ? PULSAR_MIXER_ATTN_FULL : PULSAR_MIXER_ATTN_WINDOW) &&
                   d.window == (full ? 0u : s->window) && d.ffn == PULSAR_FFN_DENSE_MOE;
         n_full += full;
     }
     check(plan_ok, "plan: %u layers (%s), %u window (%u keys) + %u full, every layer dense MLP + MoE, from layer_types",
-          p->n_layer, pulsar_layer_kind_name(p->kind[0]), p->n_layer - n_full, s->window, n_full);
-    uint32_t at = 0;
+          p->n_layer, pulsar_layer_kind_name(p->kind[TrunkLayer{0}]), p->n_layer - n_full, s->window, n_full);
+    TrunkLayer at{0u};
     check(pulsar_layer_plan_check(p, &at) == NULL, "the plan's invariants hold (PULSAR_FFN_DENSE_MOE admitted)");
 
     /* every tensor bound, every byte priced, the price is what is staged and charged */
@@ -91,11 +91,11 @@ int main(int argc, char **argv) {
 
     /* every slot the plan declares is bound; the stored widths */
     bool slots = w->embed && w->output_norm && w->head;
-    for (uint32_t il = 0; slots && il < s->n_layer; il++) slots = layer_bound(w->layer[il], pulsar_gemma4_is_full(s, il));
+    for (uint32_t il = 0; slots && il < s->n_layer; il++) slots = layer_bound(w->layer[TrunkLayer{il}], pulsar_gemma4_is_full(s, TrunkLayer{il}));
     check(slots, "every slot bound: embed, output_norm, head (the pack's EXL3), and each layer's (no attn_v on a global "
                  "layer)");
     check(exl3_type_k2(w->head->type) > 0, "the head is EXL3 (rate K%d: the Turing build's head)", exl3_type_k2(w->head->type) / 2);
-    const pulsar_gemma4_block &L0 = w->layer[0];
+    const pulsar_gemma4_block &L0 = w->layer[TrunkLayer{0}];
     check(pulsar_gemma4_ff_stored(s) == 2176 && pulsar_gemma4_ff_exp_stored(s) == 768 &&
               L0.ffn_down->dim[0] == 2176 && L0.exp_down->dim[0] == 768 && L0.exp_gate->dim[1] == 768 &&
               L0.exp_gate->dim[2] == s->n_expert,
@@ -116,7 +116,7 @@ int main(int argc, char **argv) {
     if (gw->block_written) {
         bool taps_ok = bd && bd->n_taps > 0;
         for (uint32_t j = 0; taps_ok && j < bd->n_taps; j++)
-            taps_ok = bd->tap_layer[j] == bd->tap_block[j] && bd->tap_sub[j] == PULSAR_BLOCK_TAP_FFN;
+            taps_ok = bd->tap_layer[j] == pulsar_gemma4_block_layer(bd->tap_block[j]) && bd->tap_sub[j] == PULSAR_BLOCK_TAP_FFN;
         check(pulsar_engine_drafter(e) == PULSAR_DRAFTER_BLOCK && bd && bd->head_kind == PULSAR_BLOCK_HEAD_PLAIN &&
                   bd->conv_taps == 0 && bd->head == gw->head && bd->embed == gw->embed && bd->embed_scale == 53.0f &&
                   bd->softcap == 30.0f && bd->full_layers != 0 && taps_ok && e->drafter_ops == &bd->ops,
@@ -141,7 +141,7 @@ int main(int argc, char **argv) {
     pulsar_tokens_free(&hello);
     int k2 = 0;
     for (uint32_t il = 0; il < s->n_layer; il++) {
-        const int g = exl3_type_k2(w->layer[il].exp_gate->type);
+        const int g = exl3_type_k2(w->layer[TrunkLayer{il}].exp_gate->type);
         if (g > k2) k2 = g;
     }
     check(k2 > 0 && e->routed_quant_bits() == 20 + k2, "routed quant tier %d (EXL3: 20 + the highest half-bit rate)",
@@ -150,7 +150,7 @@ int main(int argc, char **argv) {
     /* the session side as declared (E4): the driver's table covers the plan; the state is a window layer's K|V ring
      * (RING over the 1024-key window, 8 kv x 256 BF16) and a global layer's K|V pool (POOL, one token a row, 2 kv x
      * 512 BF16); the session ops are the core driver's over the declared banks */
-    uint32_t miss_at = 0;
+    TrunkLayer miss_at{0u};
     const char *miss = pulsar_driver_first_missing(e->family->driver, p, &miss_at);
     check(e->family->driver == &PULSAR_GEMMA4_DRIVER && !miss, "the core driver's table covers the plan (%s)",
           miss ? miss : "nothing missing");
@@ -164,10 +164,10 @@ int main(int argc, char **argv) {
                     full.bytes == 2ull * s->n_head_kv * s->head_dim * 2u &&
                     sp->n_trunk == s->n_layer && sp->n_slots == s->n_layer + dl;
     for (uint32_t il = 0; state_ok && il < s->n_layer; il++)
-        state_ok = sp->slot[il] == 1u << (pulsar_gemma4_is_full(s, il) ? PULSAR_GEMMA4_STATE_KV_FULL
+        state_ok = sp->slot[LayerSlot{il}] == 1u << (pulsar_gemma4_is_full(s, TrunkLayer{il}) ? PULSAR_GEMMA4_STATE_KV_FULL
                                                                         : PULSAR_GEMMA4_STATE_KV_WIN);
     for (uint32_t l = 0; state_ok && bd && l < bd->n_layer; l++)
-        state_ok = sp->slot[s->n_layer + l] == 1u << (((bd->full_layers >> l) & 1u) ? bd->decl_kv_full : bd->decl_kv);
+        state_ok = sp->slot[LayerSlot{s->n_layer + l}] == 1u << (((bd->full_layers >> l) & 1u) ? bd->decl_kv_full : bd->decl_kv);
     check(state_ok, "the declared state: kv_win RING %u keys x %llu B a window layer, kv_full POOL %llu B a token a "
           "global layer%s", win.tokens, (unsigned long long)win.bytes, (unsigned long long)full.bytes,
           bd ? "; the drafter's draft_kv RING (+ draft_kv_full for its full layer) a drafter layer" : "");

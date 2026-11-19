@@ -97,15 +97,16 @@ typedef struct {
 /** Optional per-block hooks (the caller's GPU phases, its stage dumps): before block il, after it.  NULL = none. */
 typedef struct {
     /// called before block il runs (NULL = none)
-    void (*before_block)(void *ud, uint32_t il);
+    void (*before_block)(void *ud, VisLayer il);
     /// called after block il ran (NULL = none)
-    void (*after_block)(void *ud, uint32_t il);
+    void (*after_block)(void *ud, VisLayer il);
     /// the hooks' first argument
     void *ud;
 } pulsar_vit_hooks;
 
 /** The blocks over the n seeded rows of res: LN1 of block 0, then `depth` blocks.  false + `err` (said) on a refusal. */
-bool pulsar_vit_encode(const pulsar_model *m, const pulsar_vit_dims &d, const pulsar_vit_block *blocks,
+bool pulsar_vit_encode(const pulsar_model *m, const pulsar_vit_dims &d,
+                       pulsar_indexed_view<const pulsar_vit_block, VisLayer> blocks,
                        pulsar_rows_out fmt, const pulsar_vit_bufs &b, uint32_t n, const pulsar_vit_hooks *hooks,
                        char *err, size_t errlen);
 

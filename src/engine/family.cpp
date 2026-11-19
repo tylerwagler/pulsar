@@ -18,15 +18,15 @@ const char *pulsar_layer_kind_name(pulsar_layer_kind k) {
 
 uint32_t pulsar_layer_plan_count(const pulsar_layer_plan *p, pulsar_layer_kind k) {
     uint32_t n = 0;
-    for (uint32_t il = 0; il < p->n_layer; il++) n += p->kind[il] == k;
+    for (TrunkLayer il{0u}; il.below(p->n_layer); ++il) n += p->kind[il] == k;
     return n;
 }
 
-const char *pulsar_layer_plan_check(const pulsar_layer_plan *p, uint32_t *at_layer) {
-    *at_layer = UINT32_MAX;
+const char *pulsar_layer_plan_check(const pulsar_layer_plan *p, TrunkLayer *at_layer) {
+    *at_layer = TrunkLayer::none();
     if (p->n_layer == 0 || p->n_layer > PULSAR_FAMILY_MAX_LAYER) return "a layer count outside 1 .. PULSAR_FAMILY_MAX_LAYER";
     static const pulsar_layer_desc zero = {};
-    for (uint32_t il = 0; il < p->n_layer; il++) {
+    for (TrunkLayer il{0u}; il.below(p->n_layer); ++il) {
         *at_layer = il;
         const pulsar_layer_kind k = p->kind[il];
         const pulsar_layer_desc &d = p->desc[il];
@@ -42,7 +42,7 @@ const char *pulsar_layer_plan_check(const pulsar_layer_plan *p, uint32_t *at_lay
             return "a blocks layer with an unknown FFN";
         if ((d.window != 0) != (d.mixer == PULSAR_MIXER_ATTN_WINDOW)) return "a window on a full-attention layer, or none on a window layer";
     }
-    *at_layer = UINT32_MAX;
+    *at_layer = TrunkLayer::none();
     return NULL;
 }
 

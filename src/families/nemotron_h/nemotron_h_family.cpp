@@ -91,13 +91,13 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
             if (!pulsar_block_drafter_read(&e->model, d)) return false;
             /* the taps: the residual after target block tap_block[j], at its place in the plan */
             for (uint32_t j = 0; j < d->n_taps; j++) {
-                if (d->tap_block[j] >= s.n_blocks) {
+                if (!d->tap_block[j].below(s.n_blocks)) {
                     fprintf(stderr, "pulsar: %s: the drafter taps block %u of a %u-block target -- refusing\n", ARCH,
-                            d->tap_block[j], s.n_blocks);
+                            d->tap_block[j].raw(), s.n_blocks);
                     return false;
                 }
-                d->tap_layer[j] = s.block_layer[d->tap_block[j]];
-                d->tap_sub[j] = s.block_sub[d->tap_block[j]];
+                d->tap_layer[j] = pulsar_nemotron_h_block_layer(&s, d->tap_block[j]);
+                d->tap_sub[j] = pulsar_nemotron_h_block_sub(&s, d->tap_block[j]);
             }
             if (d->hidden != s.n_embd || d->vocab != s.n_vocab) {
                 fprintf(stderr, "pulsar: %s: the drafter's hidden %u / vocabulary %u are not the target's %u / %u -- "
@@ -151,7 +151,7 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
     }
     const pulsar_nemotron_h_shape *s = &w->shape;
     uint32_t n_mamba = 0, n_moe = 0;
-    for (uint32_t il = 0; il < e->plan.n_layer; il++) {
+    for (TrunkLayer il{0u}; il.below(e->plan.n_layer); ++il) {
         n_mamba += e->plan.desc[il].mixer == PULSAR_MIXER_MAMBA2;
         n_moe += e->plan.desc[il].ffn == PULSAR_FFN_MOE;
     }
@@ -179,7 +179,7 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
 bool after_gpu(pulsar_engine *e) {
     if (!pulsar_nemotron_h_vision_run_create(&e->model, &((pulsar_nemotron_h_model *)e->family_state)->vision))
         return false;
-    uint32_t at = 0;
+    TrunkLayer at{0u};
     const char *miss = pulsar_driver_first_missing(e->family->driver, &e->plan, &at);
     const pulsar_state_plan *sp = &e->state_plan;
     fprintf(stderr, "pulsar: %s: the core step driver over %u layers of shared blocks (N2 Mamba-2, F1 GQA, F2 router "
@@ -239,7 +239,7 @@ pulsar_drafter_kind drafter(pulsar_engine *e) {
 int quant_bits(pulsar_engine *e) {
     const pulsar_nemotron_h_model *w = model_of(e);
     int bits = 0;
-    for (uint32_t il = 0; il < w->shape.n_layer; il++)
+    for (TrunkLayer il{0u}; il.below(w->shape.n_layer); ++il)
         for (const pulsar_tensor *t : {w->layer[il].exp_up, w->layer[il].exp_down}) {
             const int k2 = t ? exl3_type_k2(t->type) : 0;
             if (k2 && 20 + k2 > bits) bits = 20 + k2;

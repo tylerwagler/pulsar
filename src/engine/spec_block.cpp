@@ -117,7 +117,7 @@ bool want_native_rope(const pulsar_model *m, const char *key) {
 /// @param cap the most entries accepted
 /// @param n receives the entry count (1 .. cap)
 /// @return false = refused (counted)
-bool get_ids(const pulsar_model *m, const char *key, uint32_t *out, uint32_t cap, uint32_t *n) {
+bool get_ids(const pulsar_model *m, const char *key, SrcBlock *out, uint32_t cap, uint32_t *n) {
     pulsar_array_ref arr;
     if (!model_get_array(m, key, &arr) ||
         (arr.type != PULSAR_META_UINT32 && arr.type != PULSAR_META_INT32 && arr.type != PULSAR_META_UINT64 &&
@@ -137,7 +137,7 @@ bool get_ids(const pulsar_model *m, const char *key, uint32_t *out, uint32_t cap
             v = arr.type == PULSAR_META_INT32 ? (int64_t)(int32_t)u : (int64_t)u;
         }
         if (!ok || v < 0 || v > 0xffff) return refuse("%s holds an entry that is not a block id%s", key);
-        out[i] = (uint32_t)v;
+        out[i] = SrcBlock{(uint32_t)v};
     }
     *n = (uint32_t)arr.len;
     return true;
@@ -156,10 +156,10 @@ bool get_layer_types(const pulsar_model *m, const char *key, uint32_t n, uint32_
     if (!model_get_array(m, key, &arr) || arr.type != PULSAR_META_STRING || arr.len != n || n > 32u)
         return refuse("%s is missing or not one string per drafter layer%s", key);
     pulsar_cursor c = cursor_at(m, arr.data_pos);
-    for (uint32_t l = 0; l < n; l++) {
+    for (DraftLayer l{0u}; l.below(n); ++l) {
         pulsar_str t = {NULL, 0};
         if (!cursor_string(&c, &t)) return refuse("%s is unreadable%s", key);
-        if (pulsar_streq(t, "full_attention")) *mask |= 1u << l;
+        if (pulsar_streq(t, "full_attention")) *mask |= 1u << l.raw();
         else if (!pulsar_streq(t, "sliding_attention")) return refuse("%s: sliding_attention or full_attention%s", key);
     }
     return true;
@@ -416,9 +416,9 @@ bool pulsar_block_drafter_bind(pulsar_role_binder *b, pulsar_block_drafter *d) {
     }
     /* PLAIN (L338): the head is the TARGET's, as the target holds it -- the family sets it (pulsar_block_drafter::head) */
     if (d->head_kind != PULSAR_BLOCK_HEAD_PLAIN) d->head = pulsar_role_bind(b, top("head"), A_LINEAR, 2, E, d->head_rows);
-    for (uint32_t l = 0; l < d->n_layer; l++) {
+    for (DraftLayer l{0u}; l.below(d->n_layer); ++l) {
         pulsar_block_layer &L = d->layer[l];
-        auto k = [&](const char *role) { return pulsar_role_in(role, BLOCK, (int32_t)l); };
+        auto k = [&](const char *role) { return pulsar_role_in(role, BLOCK, (int32_t)l.raw()); };
         L.in_norm = pulsar_role_bind(b, k("in_norm"), A_BF16, 1, E);
         L.post_norm = pulsar_role_bind(b, k("post_norm"), A_BF16, 1, E);
         L.q = pulsar_role_bind(b, k("attn_q"), A_LINEAR, 2, E, Q);
@@ -505,12 +505,12 @@ namespace {
  * q / k RMSNorm with the layer's weights, the NeoX rope; `block` for the query block (bidirectional, never stored), 0
  * for the context store */
 /// @param d the drafter
-/// @param li the drafter layer (its window or the full ring's: L338), UINT32_MAX = the widest
+/// @param li the drafter layer (its window or the full ring's: L338), none() = the widest
 /// @param qn device q_norm weight of the layer (NULL when only sizing)
 /// @param kn device k_norm weight of the layer (NULL when only sizing)
 /// @param block true: the query block (bidirectional, not stored); false: the context store
 /// @return the GQA layer declaration (E4M3 K / V rows, windowed)
-pulsar_gqa_layer gqa_decl(const pulsar_block_drafter *d, uint32_t li, const uint16_t *qn, const uint16_t *kn, bool block) {
+pulsar_gqa_layer gqa_decl(const pulsar_block_drafter *d, DraftLayer li, const uint16_t *qn, const uint16_t *kn, bool block) {
     pulsar_gqa_layer L{};
     L.n_q = d->n_head;
     L.n_kv = d->n_kv;
@@ -523,7 +523,7 @@ pulsar_gqa_layer gqa_decl(const pulsar_block_drafter *d, uint32_t li, const uint
     L.kv_fmt = PULSAR_GQA_KV_E4M3;
     L.span = PULSAR_GQA_WINDOW;
     /* L338: a full layer is a PULSAR_BLOCK_FULL_KEYS window (spec_block.h); li past the layers = the widest */
-    const bool full = li < d->n_layer ? ((d->full_layers >> li) & 1u) != 0 : d->full_layers != 0;
+    const bool full = li.below(d->n_layer) ? ((d->full_layers >> li.raw()) & 1u) != 0 : d->full_layers != 0;
     L.window = full ? std::max(d->window, PULSAR_BLOCK_FULL_KEYS) : d->window;
     L.scale = (float)(1.0 / sqrt((double)d->head_dim));
     L.qk_norm = 1;
@@ -539,7 +539,10 @@ pulsar_gqa_layer gqa_decl(const pulsar_block_drafter *d, uint32_t li, const uint
 
 void pulsar_block_drafter_plan(pulsar_engine *e, pulsar_state_plan *p) {
     pulsar_block_drafter *d = e->block_drafter;
-    const pulsar_gqa_layer g = gqa_decl(d, 0, NULL, NULL, false);
+    /* L436: the rings and the anchor are read at pulsar_drafter_slot(plan, l) -- the slots right after the trunk's.  A
+     * plan that already holds another drafter's slots (an MTP layer's) is refused, nothing declared */
+    if (!pulsar_state_plan_drafter_first(p, "the block drafter")) return;
+    const pulsar_gqa_layer g = gqa_decl(d, DraftLayer{0u}, NULL, NULL, false);
     pulsar_state_decl kv{"draft_kv", PULSAR_STATE_RING, PULSAR_STATE_CAPTURE_NONE, false, false, d->window,
                          pulsar_gqa_kv_token_bytes(&g), 0, 0, NULL, NULL, NULL};
     d->decl_kv = pulsar_state_plan_add(p, kv);
@@ -553,14 +556,14 @@ void pulsar_block_drafter_plan(pulsar_engine *e, pulsar_state_plan *p) {
     /* L375 O48: each layer's slot through the plan's bounded append -- a trunk that leaves too few slots writes none
      * past the table and the family's load refuses the model (pulsar_state_plan_slots_fit) */
     const uint32_t first = p->n_slots;
-    for (uint32_t l = 0; l < d->n_layer; l++)
-        (void)pulsar_state_plan_add_slot(p, 1u << (((d->full_layers >> l) & 1u) ? d->decl_kv_full : d->decl_kv));
+    for (DraftLayer l{0u}; l.below(d->n_layer); ++l)
+        (void)pulsar_state_plan_add_slot(p, 1u << (((d->full_layers >> l.raw()) & 1u) ? d->decl_kv_full : d->decl_kv));
     d->decl_anchor = UINT32_MAX;
     if (d->head_kind == PULSAR_BLOCK_HEAD_LILICORR) {   /* the candidate head reads cn of the last committed row */
         pulsar_state_decl anchor{"draft_anchor", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_NONE, false, false, 0,
                                  (uint64_t)d->hidden * 2u, 0, 0, NULL, NULL, NULL};
         d->decl_anchor = pulsar_state_plan_add(p, anchor);
-        if (p->n_slots > first) p->slot[first] |= 1u << d->decl_anchor;   /* on the drafter's first layer slot */
+        if (p->n_slots > first) p->slot[LayerSlot{first}] |= 1u << d->decl_anchor;   /* on the drafter's first layer slot */
     }
     /* no lane counters to keep with the walk: the ring and the anchor ARE the drafter's state at the bank's frontier
      * (a draft writes neither) */
@@ -582,7 +585,7 @@ void pulsar_block_drafter_describe(const pulsar_block_drafter *d, char *out, siz
                      d->head_kind == PULSAR_BLOCK_HEAD_PLAIN ? " (the target's)" : "", (double)d->softcap,
                      (double)d->embed_scale, headw);
     for (uint32_t j = 0; j < d->n_taps && n > 0 && (size_t)n < cap; j++)
-        n += snprintf(out + n, cap - (size_t)n, " %u@L%u%s", d->tap_block[j], d->tap_layer[j],
+        n += snprintf(out + n, cap - (size_t)n, " %u@L%u%s", d->tap_block[j].raw(), d->tap_layer[j].raw(),
                       d->tap_sub[j] == PULSAR_BLOCK_TAP_MIXER ? "m" : "f");
 }
 
@@ -736,7 +739,7 @@ absorb_layout absorb_of(const pulsar_block_drafter *d) {
     const int fo[1] = {(int)E}, kvo[2] = {(int)KV, (int)KV};
     L.ws = o; L.ws_bytes = std::max(multi_ws((int)(d->n_taps * E), fo, 1, R), multi_ws((int)E, kvo, 2, R));
     o += L.ws_bytes;
-    const pulsar_gqa_layer g = gqa_decl(d, UINT32_MAX, NULL, NULL, false);
+    const pulsar_gqa_layer g = gqa_decl(d, DraftLayer::none(), NULL, NULL, false);
     L.gqa = o; L.gqa_bytes = a256(pulsar_gqa_store_workspace_bytes(&g, (uint32_t)R)); o += L.gqa_bytes;
     L.total = o;
     return L;
@@ -781,7 +784,7 @@ draft_layout draft_of(const pulsar_block_drafter *d) {
         L.ws_bytes = std::max(L.ws_bytes, std::max(multi_ws((int)E, hr, 1, R), multi_ws((int)E, sr, 1, R)));
     }
     o += L.ws_bytes;
-    const pulsar_gqa_layer g = gqa_decl(d, UINT32_MAX, NULL, NULL, true);
+    const pulsar_gqa_layer g = gqa_decl(d, DraftLayer::none(), NULL, NULL, true);
     /* sized for any bound: the (widest) window's chunks cap a row's partials whatever the context */
     L.gqa = o; L.gqa_bytes = a256(pulsar_gqa_workspace_bytes(&g, (uint32_t)R, 2u * g.window + 1024u));
     o += L.gqa_bytes;
@@ -915,7 +918,7 @@ struct pulsar_block_lane {
     /// Pinned [n_layer][desc_stride]: the attention descriptors, staged for upload.
     uint8_t *h_desc;
     /// Each layer's planned attention call (pulsar_gqa_plan).
-    pulsar_gqa_call call[PULSAR_BLOCK_MAX_LAYERS];
+    pulsar_indexed<pulsar_gqa_call, DraftLayer, PULSAR_BLOCK_MAX_LAYERS> call;
     /// The draft pass's rule-5 line was printed.
     bool announced;
 };
@@ -970,7 +973,7 @@ void pulsar_block_lane_free(pulsar_block_lane *l) {
     delete l;
 }
 
-uint16_t *pulsar_block_tap_dst(pulsar_driver_state *ds, uint32_t il, uint32_t sub, uint32_t n, uint32_t *j,
+uint16_t *pulsar_block_tap_dst(pulsar_driver_state *ds, TrunkLayer il, uint32_t sub, uint32_t n, uint32_t *j,
                                uint64_t *ld_dst, bool *refused) {
     pulsar_block_lane *l = ds ? ds->block : NULL;
     if (!l) return NULL;
@@ -987,7 +990,7 @@ uint16_t *pulsar_block_tap_dst(pulsar_driver_state *ds, uint32_t il, uint32_t su
     return NULL;
 }
 
-bool pulsar_block_tap(pulsar_driver_state *ds, uint32_t il, uint32_t sub, const uint16_t *h, uint64_t ld, uint32_t n) {
+bool pulsar_block_tap(pulsar_driver_state *ds, TrunkLayer il, uint32_t sub, const uint16_t *h, uint64_t ld, uint32_t n) {
     const uint32_t E = ds && ds->block ? ds->block->d->hidden : 0u;
     return pulsar_block_tap_rows(ds, il, sub, n, [&](uint16_t *dst, uint64_t ld_dst) {
         return pulsar_blockdraft_rows_copy_launch(h, ld, n, E, dst, ld_dst, 0) == 0 || fail("the tap copy refused");
@@ -1096,10 +1099,10 @@ bool linears(pulsar_session *s, int n, const pulsar_tensor *const *t, int in, co
 /// @param l drafter layer
 /// @param b bank
 /// @return the ring (zeroed when its state tensor is missing)
-pulsar_gqa_seq ring_of(const pulsar_session *s, const pulsar_block_drafter *d, uint32_t l, uint32_t b) {
+pulsar_gqa_seq ring_of(const pulsar_session *s, const pulsar_block_drafter *d, DraftLayer l, uint32_t b) {
     const pulsar_state_set *ss = s->states;
-    const uint32_t dc = ((d->full_layers >> l) & 1u) ? d->decl_kv_full : d->decl_kv;   /* L338: a full layer's ring */
-    pulsar_gpu_tensor *t = pulsar_state_tensor(ss, ss->plan->n_trunk + l, dc);
+    const uint32_t dc = ((d->full_layers >> l.raw()) & 1u) ? d->decl_kv_full : d->decl_kv;   /* L338: a full layer's ring */
+    pulsar_gpu_tensor *t = pulsar_state_tensor(ss, pulsar_drafter_slot(ss->plan, l), dc);
     const pulsar_state_decl &dk = ss->plan->decl[dc];
     const uint64_t bb = pulsar_state_decl_bank_bytes(&dk);
     pulsar_gqa_seq q{};
@@ -1135,7 +1138,8 @@ bool absorb_rows(pulsar_session *s, uint32_t row0, const int32_t *pos, const Ban
     float *stage = (float *)(base + A.stage);
     const uint16_t *hn = (const uint16_t *)wp(s, d->hidden_norm, "drafter hidden_norm");
     pulsar_gpu_tensor *anchor =
-        d->decl_anchor != UINT32_MAX ? pulsar_state_tensor(ss, ss->plan->n_trunk, d->decl_anchor) : NULL;
+        d->decl_anchor != UINT32_MAX ? pulsar_state_tensor(ss, pulsar_drafter_slot(ss->plan, DraftLayer{0u}), d->decl_anchor)
+                                     : NULL;
     if (!hn || (d->decl_anchor != UINT32_MAX && !anchor)) return fail("the drafter's context norm or anchor state is missing");
     dump_ctx(l, row0, pos, bank, n);
     for (uint32_t p0 = 0; p0 < n; p0 += kAbsorbRows) {
@@ -1160,7 +1164,7 @@ bool absorb_rows(pulsar_session *s, uint32_t row0, const int32_t *pos, const Ban
             l->row_seq[i] = ns - 1u;
             l->row_pos[i] = (uint32_t)pos[r];
         }
-        for (uint32_t li = 0; li < d->n_layer; li++) {
+        for (DraftLayer li{0u}; li.below(d->n_layer); ++li) {
             const pulsar_block_layer &L = d->layer[li];
             const pulsar_tensor *t[2] = {L.k, L.v};
             const int out[2] = {(int)KV, (int)KV};
@@ -1246,7 +1250,7 @@ bool draft_pass(pulsar_session *s, const BankId *banks, const uint32_t *pos, con
     ok = ok && pulsar_gpu_tensor_write_async(l->arena, TensorBytes{D.nf}, &nf_clear,
                                              TensorBytes{sizeof(nf_clear)}) != 0;
     if (lili) {   /* the candidate head's anchor rows (cn of each bank's last committed row) and their validity */
-        pulsar_gpu_tensor *anchor = pulsar_state_tensor(ss, ss->plan->n_trunk, d->decl_anchor);
+        pulsar_gpu_tensor *anchor = pulsar_state_tensor(ss, pulsar_drafter_slot(ss->plan, DraftLayer{0u}), d->decl_anchor);
         ok = ok && anchor && pulsar_gpu_tensor_write_async(l->arena, TensorBytes{D.valid}, l->h_valid,
                                                            bytes_of<uint8_t>(nb)) != 0;
         for (uint32_t i = 0; ok && i < nb; i++)
@@ -1257,15 +1261,16 @@ bool draft_pass(pulsar_session *s, const BankId *banks, const uint32_t *pos, con
         ok = ok && pulsar_gpu_tensor_write_async(l->arena, TensorBytes{D.anchor_ids}, l->h_anchor,
                                                  bytes_of<int32_t>(nb)) != 0;
     }
-    std::vector<pulsar_gqa_layer> G(d->n_layer);
-    for (uint32_t li = 0; ok && li < d->n_layer; li++) {
+    std::vector<pulsar_gqa_layer> Gv(d->n_layer);
+    const pulsar_indexed_view<pulsar_gqa_layer, DraftLayer> G{Gv.data(), d->n_layer};   /* by the drafter's layer */
+    for (DraftLayer li{0u}; ok && li.below(d->n_layer); ++li) {
         const pulsar_block_layer &L = d->layer[li];
         G[li] = gqa_decl(d, li, (const uint16_t *)wp(s, L.q_norm, "drafter q_norm"),
                          (const uint16_t *)wp(s, L.k_norm, "drafter k_norm"), true);
         for (uint32_t i = 0; i < nb; i++) l->seqs[i] = ring_of(s, d, li, pulsar_bank_index(banks[i]));
         ok = G[li].q_norm_w && G[li].k_norm_w &&
              pulsar_gqa_plan(&G[li], l->seqs.data(), nb, l->row_seq.data(), l->row_pos.data(), R, bound,
-                             l->h_desc + (uint64_t)li * D.desc_stride, D.desc_stride, &l->call[li]) == 0;
+                             l->h_desc + (uint64_t)li.raw() * D.desc_stride, D.desc_stride, &l->call[li]) == 0;
     }
     ok = ok && pulsar_gpu_tensor_write_async(l->arena, TensorBytes{D.desc}, l->h_desc,
                                              TensorBytes{D.desc_stride}.times(d->n_layer)) != 0;
@@ -1296,7 +1301,7 @@ bool draft_pass(pulsar_session *s, const BankId *banks, const uint32_t *pos, con
         if (pulsar_head_embed_launch(&hd, table, V, (const int32_t *)(base + D.ids), R, h, E, 0) != 0)
             return fail("the block's embedding refused");
         const uint16_t *res = t;   /* the last sublayer's output (conv: its finish t; L338 plain: the Linear's ob) */
-        for (uint32_t li = 0; li < d->n_layer; li++) {
+        for (DraftLayer li{0u}; li.below(d->n_layer); ++li) {
             const pulsar_block_layer &L = d->layer[li];
             const uint16_t *in_n = (const uint16_t *)wp(s, L.in_norm, "drafter in_norm");
             const uint16_t *post_n = (const uint16_t *)wp(s, L.post_norm, "drafter post_norm");
@@ -1304,7 +1309,7 @@ bool draft_pass(pulsar_session *s, const BankId *banks, const uint32_t *pos, con
             const uint16_t *mb = conv ? (const uint16_t *)wp(s, L.mc_base, "drafter mlp conv base") : NULL;
             if (!in_n || !post_n || (conv && (!ab || !mb))) return false;
             /* x = rmsnorm(h) (layer 0), else h += the previous layer's output and x its norm */
-            if ((li == 0 ? pulsar_rows_rmsnorm_launch(h, E, R, E, in_n, d->eps, x, E, 0)
+            if ((li == DraftLayer{0u} ? pulsar_rows_rmsnorm_launch(h, E, R, E, in_n, d->eps, x, E, 0)
                          : pulsar_rows_add_launch(h, E, res, E, R, E, in_n, d->eps, x, E, 0)) != 0)
                 return fail("the input norm refused");
             /* the attention conv's taps, its prepare; q / k / v; the block attention; o; the conv's finish (side 1) */
@@ -1334,8 +1339,8 @@ bool draft_pass(pulsar_session *s, const BankId *banks, const uint32_t *pos, con
             io.workspace = base + D.gqa;
             io.workspace_bytes = D.gqa_bytes;
             io.nf_flag = (uint32_t *)(base + D.nf);   /* O59: read back after the pass, on a widening build */
-            io.nf_code = 0x42000000u | li;
-            if (pulsar_gqa_launch(&G[li], &l->call[li], base + D.desc + (uint64_t)li * D.desc_stride, &io, 0) != 0)
+            io.nf_code = 0x42000000u | li.raw();
+            if (pulsar_gqa_launch(&G[li], &l->call[li], base + D.desc + (uint64_t)li.raw() * D.desc_stride, &io, 0) != 0)
                 return fail("the block attention refused");
             {
                 const pulsar_tensor *w[1] = {L.o};

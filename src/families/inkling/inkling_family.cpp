@@ -82,7 +82,7 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
     if (!pulsar_inkling_load_tokenizer(w, opt->model_path)) return false;
     const pulsar_inkling_shape *s = &w->shape;
     uint32_t n_window = 0, n_dense = 0;
-    for (uint32_t il = 0; il < e->plan.n_layer; il++) {
+    for (TrunkLayer il{0u}; il.below(e->plan.n_layer); ++il) {
         n_window += e->plan.desc[il].mixer == PULSAR_MIXER_ATTN_WINDOW;
         n_dense += e->plan.desc[il].ffn == PULSAR_FFN_DENSE;
     }
@@ -143,7 +143,7 @@ pulsar_drafter_kind drafter(pulsar_engine *) { return PULSAR_DRAFTER_NONE; }
 int quant_bits(pulsar_engine *e) {
     const pulsar_inkling_model *w = model_of(e);
     int bits = 0;
-    for (uint32_t il = 0; il < w->shape.n_layer; il++)
+    for (TrunkLayer il{0u}; il.below(w->shape.n_layer); ++il)
         for (const pulsar_tensor *t : {w->layer[il].exp_gate, w->layer[il].exp_up, w->layer[il].exp_down}) {
             const int k2 = t ? exl3_type_k2(t->type) : 0;
             if (k2 && 20 + k2 > bits) bits = 20 + k2;

@@ -44,6 +44,7 @@
 #define PULSAR_QWEN_NGRAM_H
 
 #include <stdint.h>
+#include "lib/pulsar_units.h"   /* TrunkLayer (L436) */
 
 #define PULSAR_QWEN_NGRAM_ORDER    3u    /**< ngram_size: bigrams and trigrams */
 #define PULSAR_QWEN_NGRAM_HEADS    8u    /**< heads_per_ngram */
@@ -88,7 +89,7 @@ struct pulsar_engram_table;
 /// @param layer the PLE layer
 /// @param L the layout
 /// @return 1 or 0
-int  pulsar_qwen_ngram_table_open(struct pulsar_engram_table *t, const char *path, uint32_t layer,
+int  pulsar_qwen_ngram_table_open(struct pulsar_engram_table *t, const char *path, TrunkLayer layer,
                                   const pulsar_qwen_ngram_layout *L);
 
 /** A new sequence: EOS, EOS. */

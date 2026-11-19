@@ -15,7 +15,7 @@
 /** Snapshot of every layer's compressed-row frontier, taken before a
  * speculative block so a rejected draft can be rolled back exactly. */
 typedef struct {
-    uint32_t n_comp[PULSAR_MAX_LAYER];        ///< compressed rows per kv source
+    pulsar_indexed<uint32_t, TrunkLayer, PULSAR_MAX_LAYER> n_comp;        ///< compressed rows per kv source
 } pulsar_spec_frontier;
 
 /* PULSAR_DSPARK_DUMP set: the offline dump wants the refined ids on the host
@@ -156,7 +156,7 @@ static bool spec_frontier_copy_tables_init(pulsar_gpu_graph *g) {
      * exactly where the profile says so (s119 found this copy set missing it;
      * a rejected round then rolled the attention lane back and left the
      * indexer's carry where the rejected draft had put it). */
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         if (!gpu_graph_layer_has_comp_state(il)) continue;
         const TensorBytes ab = pulsar_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
         dst[n] = g->spec_attn_state_kv[il];    src[n] = g->layer_attn_state_kv[il];    bytes[n++] = ab;
@@ -210,7 +210,7 @@ static bool spec_frontier_snapshot(pulsar_spec_frontier *f, pulsar_session *s) {
     if (!spec_frontier_copy_tables_init(g)) return false;
 
     bool ok = pulsar_gpu_begin_commands() != 0;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         /* the snapshot's raw copy */
         f->n_comp[il] = (uint32_t)gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il).raw();
     }
@@ -239,7 +239,7 @@ static bool spec_frontier_restore(pulsar_spec_frontier *f, pulsar_session *s) {
      * WAS the fallback. */
     if (!spec_frontier_copy_tables_init(g)) return false;
     bool ok = pulsar_gpu_begin_commands() != 0;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         gpu_graph_set_n_comp(g, gpu_graph_cur_bank(g), il, CompRows{(int)f->n_comp[il]});
     }
     if (ok && g->spec_frontier_copy_n)
@@ -337,7 +337,7 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
     /* rows */
     TokId draft_ids[PULSAR_DSPARK_DRAFT_ROWS_MAX];
     uint32_t row_bank[PULSAR_DSPARK_DRAFT_ROWS_MAX];
-    uint32_t bank_n_raw[PULSAR_MSEQ_MAX][3];
+    pulsar_indexed<uint32_t, DraftLayer, 3> bank_n_raw[PULSAR_MSEQ_MAX];
     uint32_t bank_n_draft[PULSAR_MSEQ_MAX];
     int32_t base_row[PULSAR_DSPARK_BANKS_MAX] = {0};
     uint32_t n_rows = 0, max_draft_g = 0, max_draft_s = 0;
@@ -350,7 +350,7 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
         base_row[j] = (int32_t)n_rows;
         if (banks) {
             const uint32_t b = pulsar_bank_index(banks[j]);   /* in the pool: checked above */
-            for (uint32_t li = 0; li < 3; li++) bank_n_raw[b][li] = g->ms_dspark_n_raw[b][li];
+            for (DraftLayer li{0u}; li.below(3); ++li) bank_n_raw[b][li] = g->ms_dspark_n_raw[b][li];
             bank_n_draft[b] = q->n_draft;
         }
         for (uint32_t k = 0; k < q->n_draft; k++) {
@@ -686,7 +686,7 @@ static int dspark_prime(pulsar_session *s, char *err, size_t errlen) {
     const pulsar_dspark_weights *w = &e->dspark_weights;
     static int dspark_stats_env = -1;
     const int dspark_stats = gpu_graph_env_flag("PULSAR_DSPARK_STATS", &dspark_stats_env);
-    if (!(g->dspark_n_raw[0] == 0 && g->dspark_prompt_n > 0 && g->dspark_prompt_h[0])) return 0;
+    if (!(g->dspark_n_raw[DraftLayer{0}] == 0 && g->dspark_prompt_n > 0 && g->dspark_prompt_h[0])) return 0;
     const uint32_t win = PULSAR_DSPARK_DRAFT_WINDOW;
     uint32_t avail = g->dspark_prompt_n - g->dspark_prompt_lo;
     const uint32_t take = avail < win ? avail : win;

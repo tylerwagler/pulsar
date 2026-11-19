@@ -1003,12 +1003,12 @@ static std::vector<uint8_t> declared_bank_state(pulsar_session *s, uint32_t b, i
     for (uint32_t k = 0; ok && k < p->n_trunk; k++) {
         for (uint32_t id = 0; id < p->n_decl; id++) {
             const pulsar_state_decl *d = &p->decl[id];
-            if (!(p->slot[k] >> id & 1u)) continue;
+            if (!(p->slot[LayerSlot{k}] >> id & 1u)) continue;
             if (d->kind != PULSAR_STATE_POOL) {
                 const uint64_t bb = pulsar_state_decl_bank_bytes(d);
-                grab(pulsar_state_tensor(ss, k, id), b * bb, bb);
+                grab(pulsar_state_tensor(ss, LayerSlot{k}, id), b * bb, bb);
             } else if (d->tokens == 1u) {   /* the row the token at pos wrote (a one-token pool: the KV) */
-                grab(pulsar_state_pool(ss, k, id, BankId{b}), (uint64_t)pos / d->tokens * d->bytes, d->bytes);
+                grab(pulsar_state_pool(ss, LayerSlot{k}, id, BankId{b}), (uint64_t)pos / d->tokens * d->bytes, d->bytes);
             }
         }
     }

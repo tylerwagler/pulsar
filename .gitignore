@@ -212,6 +212,7 @@ tests/sse-golden/out.txt
 /tests/lora_rows_gate
 /tests/mma_k8_split_gate
 /tests/nemotron_family_gate
+/tests/layer_index_gate
 /tests/nemotron_fwd_gate
 /tests/nemotron_enc_gate
 /tests/nemotron_parse_gate

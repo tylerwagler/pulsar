@@ -92,8 +92,8 @@ bool fail(const char *what) {
  *  @param what  the reason
  *  @param il    the layer
  *  @return always false */
-bool failf(const char *what, uint32_t il) {
-    fprintf(stderr, "pulsar: %s: %s (layer %u) -- refusing the step\n", ARCH, what, il);
+bool failf(const char *what, TrunkLayer il) {
+    fprintf(stderr, "pulsar: %s: %s (layer %u) -- refusing the step\n", ARCH, what, il.raw());
     return false;
 }
 
@@ -512,12 +512,12 @@ bool constants(const pulsar_engine *e, g4_state *st) {
     for (uint32_t p = 0; p < live; p++) tab[p] = (float)(1.0 / pow((double)s.rope_theta, (double)(2u * p) / (double)s.head_dim));
     std::vector<uint16_t> ones(s.head_dim, (uint16_t)0x3f80u);
     std::vector<float> es((size_t)s.n_layer * s.n_expert);
-    for (uint32_t il = 0; il < s.n_layer; il++) {
+    for (TrunkLayer il{0u}; il.below(s.n_layer); ++il) {
         const uint16_t *src = (const uint16_t *)tensor_data(&e->model, w->layer[il].router_expert_scale);
         if (!src) return false;
         for (uint32_t x = 0; x < s.n_expert; x++) {
             const uint32_t u = (uint32_t)src[x] << 16;
-            memcpy(&es[(size_t)il * s.n_expert + x], &u, 4);
+            memcpy(&es[(size_t)il.raw() * s.n_expert + x], &u, 4);
         }
     }
     return pulsar_gpu_tensor_write(st->rope_tab, TensorBytes{0}, tab.data(), bytes_of<float>(P)) &&
@@ -731,13 +731,20 @@ uint32_t attn_bound(const g4_step *st) {
 
 /* layer il's F1 call planned: the step's sequences on the layer's ring (a window layer: bank b's slots of the decl's
  * bank-major tensor) or pool (a global layer), its descriptors staged at off */
+/* L436: a layer's two attention calls -- its decode rows' and its prompt rows' -- sit side by side in the call table:
+ * call 2 il is layer il's decode arm, 2 il + 1 its prompt arm.  The one way to a call's index. */
+/** @param il      a trunk layer
+ *  @param prompt  the prompt rows' call (else the decode rows')
+ *  @return the call's index in attn_call / attn_off */
+uint32_t attn_call_of(TrunkLayer il, bool prompt) { return 2u * il.raw() + (prompt ? 1u : 0u); }
+
 /** @param st      the step
  *  @param il      the layer
  *  @param bound   the attention bound in tokens
  *  @param off     the layer's descriptors' byte offset in attn_desc_host (two calls' worth)
  *  @param stride  one call's descriptor bytes
  *  @return true = both row kinds' calls planned; false = a pool is evicted or a plan refused (said) */
-bool plan_call(const g4_step *st, uint32_t il, uint32_t bound, uint64_t off, uint64_t stride) {
+bool plan_call(const g4_step *st, TrunkLayer il, uint32_t bound, uint64_t off, uint64_t stride) {
     g4_state *q = st->st;
     const bool full = pulsar_gemma4_is_full(&st->w->shape, il);
     const pulsar_gemma4_block &L = st->w->layer[il];
@@ -745,14 +752,14 @@ bool plan_call(const g4_step *st, uint32_t il, uint32_t bound, uint64_t off, uin
                                          (const uint16_t *)wp(st, L.attn_k_norm, "gemma4 k_norm"),
                                          (const float *)dptr(q->rope_tab));
     const uint64_t tb = pulsar_gqa_kv_token_bytes(&G1);
-    pulsar_gpu_tensor *ring = full ? NULL : pulsar_state_tensor(st->states, il, PULSAR_GEMMA4_STATE_KV_WIN);
+    pulsar_gpu_tensor *ring = full ? NULL : pulsar_state_tensor(st->states, pulsar_layer_slot_of(il), PULSAR_GEMMA4_STATE_KV_WIN);
     const uint64_t ring_bank = full ? 0 : pulsar_state_decl_bank_bytes(&st->states->plan->decl[PULSAR_GEMMA4_STATE_KV_WIN]);
     if (!full && !ring) return failf("a window layer's ring is missing", il);
     for (uint32_t j = 0; j < q->n_seq; j++) {
         pulsar_gqa_seq &sq = q->seqs[j];
         const uint32_t bank = pulsar_bank_index(q->seq_bank[j]);   /* in the pool: the driver's forward checked */
         if (full) {
-            pulsar_gpu_tensor *pool = pulsar_state_pool(st->states, il, PULSAR_GEMMA4_STATE_KV_FULL, q->seq_bank[j]);
+            pulsar_gpu_tensor *pool = pulsar_state_pool(st->states, pulsar_layer_slot_of(il), PULSAR_GEMMA4_STATE_KV_FULL, q->seq_bank[j]);
             if (!pool) return failf("a global layer's pool is evicted", il);
             sq.kv = dptr(pool);
             sq.bytes = pulsar_gpu_tensor_bytes(pool).raw();
@@ -763,9 +770,9 @@ bool plan_call(const g4_step *st, uint32_t il, uint32_t bound, uint64_t off, uin
         sq.cap = (uint32_t)(sq.bytes / tb);
     }
     /* L370: one call a row kind -- a row's attention arm is its kind's, whatever rides in the step with it */
-    q->attn_call[2u * il] = q->attn_call[2u * il + 1u] = pulsar_gqa_call{};
+    q->attn_call[attn_call_of(il, false)] = q->attn_call[attn_call_of(il, true)] = pulsar_gqa_call{};
     return arm_segments(st, 0, st->n_rows, [&](bool prompt, uint32_t r0, uint32_t m) {
-        const uint32_t c = 2u * il + (prompt ? 1u : 0u);
+        const uint32_t c = attn_call_of(il, prompt);
         q->attn_off[c] = off + (prompt ? stride : 0u);
         return pulsar_gqa_plan(&G1, q->seqs, q->n_seq, q->row_seq + r0, q->row_pos + r0, m, bound,
                                q->attn_desc_host + q->attn_off[c], stride, &q->attn_call[c]) == 0 ||
@@ -787,8 +794,8 @@ bool stage(const pulsar_driver_step *st0, uint64_t *graph_key) {
     if (!build_tables(st)) return false;
     const uint32_t bound = attn_bound(st);
     const uint64_t stride = a256(pulsar_gqa_desc_bytes(st->n_rows));
-    for (uint32_t il = 0; il < st->plan->n_layer; il++)
-        if (!plan_call(st, il, bound, (uint64_t)il * 2u * stride, stride)) return false;
+    for (TrunkLayer il{0u}; il.below(st->plan->n_layer); ++il)
+        if (!plan_call(st, il, bound, (uint64_t)il.raw() * 2u * stride, stride)) return false;
     if (pulsar_gpu_tensor_write_async(q->attn_desc, TensorBytes{0}, q->attn_desc_host,
                                       TensorBytes{stride}.times((uint64_t)st->plan->n_layer * 2u)) == 0)
         return fail("could not upload the attention descriptors");
@@ -867,7 +874,7 @@ bool lora_rows(const g4_step *st, const pulsar_gemma4_lora &l, const uint16_t *x
  *  @param base  the MIX arena's device base
  *  @param M     the MIX arena's layout
  *  @return true = launched (o_proj's bf16 rows in M.db); false = refused (said) */
-bool attention(const g4_step *st, uint32_t il, uint8_t *base, const mix_scratch &M) {
+bool attention(const g4_step *st, TrunkLayer il, uint8_t *base, const mix_scratch &M) {
     g4_state *q = st->st;
     const pulsar_gemma4_shape &s = st->w->shape;
     const pulsar_gemma4_block &L = st->w->layer[il];
@@ -903,12 +910,12 @@ bool attention(const g4_step *st, uint32_t il, uint8_t *base, const mix_scratch 
     const pulsar_gqa_layer G1 = gqa_decl(s, full, (const uint16_t *)wp(st, L.attn_q_norm, "gemma4 q_norm"),
                                          (const uint16_t *)wp(st, L.attn_k_norm, "gemma4 k_norm"),
                                          (const float *)dptr(q->rope_tab));
-    if (q->attn_call[2u * il].n_rows + q->attn_call[2u * il + 1u].n_rows != n)
+    if (q->attn_call[attn_call_of(il, false)].n_rows + q->attn_call[attn_call_of(il, true)].n_rows != n)
         return failf("an attention layer the step did not plan", il);
     /* L370: the decode rows' call, then the prompt rows' (stage planned each).  Stream order makes the one workspace
      * serve both; the calls' sequences are different banks' */
     if (!arm_segments(st, 0, n, [&](bool prompt, uint32_t r0, uint32_t m) {
-            const uint32_t c = 2u * il + (prompt ? 1u : 0u);
+            const uint32_t c = attn_call_of(il, prompt);
             if (q->attn_call[c].n_rows != m) return false;
             pulsar_gqa_io io{};
             io.q = {qb + (uint64_t)r0 * Q, Q, hd};
@@ -923,7 +930,7 @@ bool attention(const g4_step *st, uint32_t il, uint8_t *base, const mix_scratch 
                                                      * a group of 4; a decode step's rows are sequences of their own */
             /* O59: the step's non-finite flag (step_end reads it); bit 23 marks an attention operand */
             io.nf_flag = (uint32_t *)((uint8_t *)dptr(st->st->scratch[ARENA_ROWS]) + rows_layout(st->st->max_rows).nf);
-            io.nf_code = 0x47800000u | il;
+            io.nf_code = 0x47800000u | il.raw();
             return pulsar_gqa_launch(&G1, &q->attn_call[c], (const uint8_t *)dptr(q->attn_desc) + q->attn_off[c], &io,
                                      0) == 0;
         }))
@@ -945,9 +952,9 @@ bool attention(const g4_step *st, uint32_t il, uint8_t *base, const mix_scratch 
 /** @param st  the step
  *  @param il  a layer
  *  @return the device weight, or NULL */
-const uint16_t *next_norm(const g4_step *st, uint32_t il) {
-    if (il + 1u < st->plan->n_layer)
-        return (const uint16_t *)wp(st, st->w->layer[il + 1u].attn_norm, "gemma4 input_layernorm");
+const uint16_t *next_norm(const g4_step *st, TrunkLayer il) {
+    if (il.next().below(st->plan->n_layer))
+        return (const uint16_t *)wp(st, st->w->layer[il.next()].attn_norm, "gemma4 input_layernorm");
     return (const uint16_t *)wp(st, st->w->output_norm, "gemma4 norm");
 }
 
@@ -961,7 +968,7 @@ const uint16_t *next_norm(const g4_step *st, uint32_t il) {
  *  @param base  the FFN arena's device base
  *  @param F     the FFN arena's layout
  *  @return true = launched (h updated, the next reader's norm of it in xa); false = refused (said) */
-bool ffn(const g4_step *st, uint32_t il, uint8_t *base, const ffn_scratch &F) {
+bool ffn(const g4_step *st, TrunkLayer il, uint8_t *base, const ffn_scratch &F) {
     const pulsar_gemma4_shape &s = st->w->shape;
     const pulsar_gemma4_block &L = st->w->layer[il];
     const uint32_t n = st->n_rows, E = s.n_embd, K = s.n_expert_used;
@@ -1017,7 +1024,7 @@ bool ffn(const g4_step *st, uint32_t il, uint8_t *base, const ffn_scratch &F) {
     /* the router: bf16 logits of xr (x hidden^-1/2), softmax, top-8, renormalised, x per_expert_scale */
     const pulsar_router_cfg rc = router_cfg(s);
     pulsar_router_layer rl{};
-    rl.expert_scale = (const float *)dptr(st->st->escale) + (size_t)il * s.n_expert;
+    rl.expert_scale = (const float *)dptr(st->st->escale) + (size_t)il.raw() * s.n_expert;
     const uint16_t *rw = (const uint16_t *)wp(st, L.router, "gemma4 router");
     /* L336: the logits take the row-kind segments (a prompt chunk's on the tensor cores, where the device has bf16
      * ones); the select stays whole */
@@ -1040,7 +1047,7 @@ bool ffn(const g4_step *st, uint32_t il, uint8_t *base, const ffn_scratch &F) {
     c.ws = parts.routed;
     c.ws_bytes = parts.routed_bytes;
     c.nf_flag = (uint32_t *)((uint8_t *)dptr(st->st->scratch[ARENA_ROWS]) + R.nf);
-    c.nf_code = 0x47000000u | il;
+    c.nf_code = 0x47000000u | il.raw();
     if (!arm_segments(st, 0, n, [&](bool prompt, uint32_t r0, uint32_t rows) {
             c.selected = parts.sel + (size_t)r0 * K;
             c.weights = parts.wts + (size_t)r0 * K;
@@ -1071,7 +1078,7 @@ bool ffn(const g4_step *st, uint32_t il, uint8_t *base, const ffn_scratch &F) {
  *  @param st0  the trunk's step
  *  @param il   the layer
  *  @return true = launched; false = refused (said) */
-bool block(const pulsar_driver_step *st0, uint32_t il) {
+bool block(const pulsar_driver_step *st0, TrunkLayer il) {
     const g4_step *st = S(st0);
     g4_state *q = st->st;
     const pulsar_layer_desc &d = st0->plan->desc[il];
@@ -1081,7 +1088,7 @@ bool block(const pulsar_driver_step *st0, uint32_t il) {
     const pulsar_gemma4_block &L = st->w->layer[il];
     const uint32_t n = st->n_rows, E = s.n_embd;
     uint16_t *h = (uint16_t *)dptr(q->h), *xa = (uint16_t *)dptr(q->xa);
-    if (il == 0 && !norm(h, (const uint16_t *)wp(st, L.attn_norm, "gemma4 input_layernorm"), xa, n, E))
+    if (il == TrunkLayer{0u} && !norm(h, (const uint16_t *)wp(st, L.attn_norm, "gemma4 input_layernorm"), xa, n, E))
         return failf("the input norm refused", il);
     const mix_scratch M = mix_layout(q->max_rows, st->states->ctx);
     uint8_t *mbase = (uint8_t *)dptr(q->scratch[ARENA_MIX]);
@@ -1194,9 +1201,9 @@ bool step_end(const pulsar_driver_step *st0, bool ok) {
  *  parity grade reads against the reference's hidden_states.
  *  @param st0  the step
  *  @param il   the layer just run */
-void dump(const pulsar_driver_step *st0, uint32_t il) {
+void dump(const pulsar_driver_step *st0, TrunkLayer il) {
     const g4_step *st = S(st0);
-    gpu_graph_debug_dump_hc_tensor("gemma4", st->st->h, (uint64_t)st->n_rows * st->w->shape.n_embd, il,
+    gpu_graph_debug_dump_hc_tensor("gemma4", st->st->h, (uint64_t)st->n_rows * st->w->shape.n_embd, il.raw(),
                                    (uint32_t)st->pos[st->n_rows - 1]);
 }
 
@@ -1221,8 +1228,8 @@ void pulsar_gemma4_state_plan(pulsar_engine *e) {
     d[PULSAR_GEMMA4_STATE_KV_FULL] = {"kv_full", PULSAR_STATE_POOL, PULSAR_STATE_CAPTURE_NONE, false, false, 1u,
                                       pulsar_gqa_kv_token_bytes(&gf), 0, 0, NULL, NULL, NULL};
     for (uint32_t id = 0; id < PULSAR_GEMMA4_STATE_COUNT; id++) (void)pulsar_state_plan_add(p, d[id]);
-    for (uint32_t il = 0; il < lp->n_layer; il++)
-        p->slot[il] = 1u << (pulsar_gemma4_is_full(s, il) ? PULSAR_GEMMA4_STATE_KV_FULL : PULSAR_GEMMA4_STATE_KV_WIN);
+    for (TrunkLayer il{0u}; il.below(lp->n_layer); ++il)
+        p->slot[pulsar_layer_slot_of(il)] = 1u << (pulsar_gemma4_is_full(s, il) ? PULSAR_GEMMA4_STATE_KV_FULL : PULSAR_GEMMA4_STATE_KV_WIN);
     p->n_trunk = lp->n_layer;
     p->n_slots = lp->n_layer;
     p->session = 0;

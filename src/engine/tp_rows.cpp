@@ -12,7 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-bool pulsar_tp_allreduce_rows(const pulsar_tp_rows *g, uint32_t il, uint32_t n_tokens,
+bool pulsar_tp_allreduce_rows(const pulsar_tp_rows *g, TpSlot slot, uint32_t n_tokens,
                               pulsar_gpu_tensor *t, pulsar_gpu_tensor *addend,
                               const char *what) {
     if (!g->tp) return 1;
@@ -40,7 +40,7 @@ bool pulsar_tp_allreduce_rows(const pulsar_tp_rows *g, uint32_t il, uint32_t n_t
         if (ok) ok = pulsar_gpu_tp_combine_sum(t, slab, L.in_off, L.vec_bytes,
                                                first, L.n_slots, n_tokens, slab + L.done_off,
                                                exch, slab + L.err_off) != 0;
-        if (!ok) fprintf(stderr, "pulsar: tp row lane: layer %u %s exchange refused (%u rows)\n", il, what, n_tokens);
+        if (!ok) fprintf(stderr, "pulsar: tp row lane: layer %u %s exchange refused (%u rows)\n", slot.raw(), what, n_tokens);
         return ok;
     }
     /* Prefill-sized exchanges on a pair ride the BULK LANE (v14): the same
@@ -79,7 +79,7 @@ bool pulsar_tp_allreduce_rows(const pulsar_tp_rows *g, uint32_t il, uint32_t n_t
                                                 exch, slab + L.err_off) != 0;
         }
         if (!ok) fprintf(stderr, "pulsar: tp bulk lane: layer %u %s exchange refused (%u rows)\n",
-                         il, what, n_tokens);
+                         slot.raw(), what, n_tokens);
         return ok;
     }
     /* Two staging shapes, chosen by ROW COUNT because that is the slab's sizing
@@ -98,18 +98,18 @@ bool pulsar_tp_allreduce_rows(const pulsar_tp_rows *g, uint32_t il, uint32_t n_t
     if (addend &&
         (pulsar_gpu_add_tensor(t, t, addend, (uint32_t)nelt) == 0 ||
          pulsar_gpu_tensor_fill_f32(addend, 0.0f, nelt) == 0)) {
-        fprintf(stderr, "pulsar: tp: layer %u %s addend fold refused (%u rows)\n", il, what, n_tokens);
+        fprintf(stderr, "pulsar: tp: layer %u %s addend fold refused (%u rows)\n", slot.raw(), what, n_tokens);
         return false;
     }
     float *out = NULL;
     float *in = NULL;
     bool heap = false;
     if (n_tokens <= PULSAR_TP_BATCH_MAX_ROWS) {
-        out = (float *)pulsar_tp_slab_batch_out(g->tp, il);
-        in  = (float *)pulsar_tp_slab_batch_in(g->tp, il);
+        out = (float *)pulsar_tp_slab_batch_out(g->tp, slot);
+        in  = (float *)pulsar_tp_slab_batch_in(g->tp, slot);
         if (!out || !in) {
             fprintf(stderr, "pulsar: tp gate: no slab batch region for layer %u "
-                            "(%u rows) -- refusing\n", il, n_tokens);
+                            "(%u rows) -- refusing\n", slot.raw(), n_tokens);
             return false;
         }
     } else {
@@ -127,7 +127,7 @@ bool pulsar_tp_allreduce_rows(const pulsar_tp_rows *g, uint32_t il, uint32_t n_t
     bool ok = pulsar_gpu_tensor_read(t, TensorBytes{0}, out, TensorBytes{bytes}) != 0 &&
               pulsar_tp_row_lane_check(g->tp) != 0;   /* stream drained: every row-lane exchange done */
     if (ok) {
-        ok = pulsar_tp_allreduce_sum(g->tp, il, ++*g->seq,
+        ok = pulsar_tp_allreduce_sum(g->tp, slot, ++*g->seq,
                                      out, in, bytes) != 0;
     }
     if (ok) {
@@ -247,7 +247,7 @@ bool pulsar_tp_vocab_gather(const pulsar_tp_vocab *g, uint32_t n_rows, const pul
         }
     }
     if (ok) {
-        ok = pulsar_tp_allgather_rows(g->tp, PULSAR_TP_NON_LAYER_TAG,
+        ok = pulsar_tp_allgather_rows(g->tp, PULSAR_TP_NON_LAYER_SLOT,
                                        ++*g->seq, full, own, scratch,
                                        n_rows, n_vocab, 1u) != 0;
     }

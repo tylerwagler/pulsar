@@ -80,7 +80,7 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
     pulsar_gpu_tensor_free(g->dspark_main_x);
     for (int i = 0; i < 3; i++) {
         pulsar_gpu_tensor_free(g->dspark_target_h[i]);
-        pulsar_gpu_tensor_free(g->dspark_raw_cache[i]);
+        pulsar_gpu_tensor_free(g->dspark_raw_cache[DraftLayer{i}]);
         pulsar_gpu_tensor_free(g->dspark_bulk_h[i]);
         if (i == 0) {
             pulsar_gpu_tensor_free(g->distill_top_ids);
@@ -91,7 +91,7 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
         pulsar_gpu_tensor_free(g->dspark_prompt_h[i]);
         pulsar_gpu_tensor_free(g->dspark_target_h_batch[i]);
     }
-    for (uint32_t il = 0; il < PULSAR_MAX_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_MAX_LAYER); ++il) {
         pulsar_gpu_tensor_free(g->spec_comp_kv_save[il]);
         pulsar_gpu_tensor_free(g->spec_comp_sc_save[il]);
         pulsar_gpu_tensor_free(g->spec_icomp_kv_save[il]);
@@ -119,26 +119,26 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
     pulsar_gpu_tensor_free(g->cand_mask);
     pulsar_gpu_tensor_free(g->cand_bscore);
     pulsar_gpu_tensor_free(g->indexer_scores);
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         pulsar_gpu_tensor_free(g->layer_raw_cache[il]);
     }
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         pulsar_gpu_tensor_free(g->layer_attn_comp_cache[il]);
     }
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         pulsar_gpu_tensor_free(g->layer_attn_state_kv[il]);
     }
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         pulsar_gpu_tensor_free(g->layer_attn_state_score[il]);
     }
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         pulsar_gpu_tensor_free(g->layer_index_comp_cache[il]);
     }
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         pulsar_gpu_tensor_free(g->layer_index_state_kv[il]);
         pulsar_gpu_tensor_free(g->layer_index_state_score[il]);
     }
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         pulsar_gpu_tensor_free(g->spec_attn_state_kv[il]);
         pulsar_gpu_tensor_free(g->spec_attn_state_score[il]);
         pulsar_gpu_tensor_free(g->spec_index_state_kv[il]);
@@ -146,7 +146,7 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
     }
     /* Bank-pool slabs (the layer_* pointers freed above were views into
      * these when the pool was enabled; view frees release no memory). */
-    for (uint32_t il = 0; il < PULSAR_MAX_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_MAX_LAYER); ++il) {
         pulsar_gpu_tensor_free(g->banks.raw[il]);
         /* Per-bank split comp/index allocations (increment 2a): each bank is its
          * own cudaMallocManaged so the eviction guard can cudaFree it directly. */
@@ -168,7 +168,7 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
     /* Option F per-bank drafter-ring slabs (dspark_raw_cache[i]/dspark_prompt_h[i]
      * freed above were bank views into these). */
     for (int i = 0; i < 3; i++) {
-        pulsar_gpu_tensor_free(g->banks.dspark_raw[i]);
+        pulsar_gpu_tensor_free(g->banks.dspark_raw[DraftLayer{i}]);
         pulsar_gpu_tensor_free(g->banks.dspark_prompt[i]);
     }
     /* plan-33 inc C boundary-row stash (one pair for the whole pool, so outside

@@ -86,9 +86,9 @@ int main(int argc, char **argv) {
     uint32_t n_mamba = 0, n_moe = 0;
     std::string kinds;
     for (uint32_t il = 0; plan_ok && il < p->n_layer; il++) {
-        const pulsar_layer_desc &d = p->desc[il];
+        const pulsar_layer_desc &d = p->desc[TrunkLayer{il}];
         const bool mamba = s->mamba_layers >> il & 1u, moe = s->moe_layers >> il & 1u;
-        plan_ok = p->kind[il] == PULSAR_LAYER_BLOCKS && d.mixer == (mamba ? PULSAR_MIXER_MAMBA2 : PULSAR_MIXER_ATTN_FULL) &&
+        plan_ok = p->kind[TrunkLayer{il}] == PULSAR_LAYER_BLOCKS && d.mixer == (mamba ? PULSAR_MIXER_MAMBA2 : PULSAR_MIXER_ATTN_FULL) &&
                   d.ffn == (moe ? PULSAR_FFN_MOE : PULSAR_FFN_NONE) && d.window == 0;
         n_mamba += mamba;
         n_moe += moe;
@@ -98,7 +98,7 @@ int main(int argc, char **argv) {
     check(plan_ok && n_mamba + n_moe + (s->n_layer - n_mamba) == s->n_blocks,
           "plan: %u blocks -> %u layers [%s]: %u Mamba-2 + %u attention, %u MoE + %u mixer-only", s->n_blocks,
           p->n_layer, kinds.c_str(), n_mamba, p->n_layer - n_mamba, n_moe, p->n_layer - n_moe);
-    uint32_t at = 0;
+    TrunkLayer at{0u};
     check(pulsar_layer_plan_check(p, &at) == NULL, "the plan passes the one layer-description check");
 
     /* every tensor bound, every byte priced, the price is what is staged and charged */
@@ -119,7 +119,7 @@ int main(int argc, char **argv) {
 
     /* every slot the plan declares is bound, and only those */
     bool slots = w->embed && w->output_norm && w->head;
-    for (uint32_t il = 0; slots && il < s->n_layer; il++) slots = block_bound(w->layer[il], p->desc[il]);
+    for (uint32_t il = 0; slots && il < s->n_layer; il++) slots = block_bound(w->layer[TrunkLayer{il}], p->desc[TrunkLayer{il}]);
     check(slots, "every slot bound: embed, output_norm, head, and each layer's mixer / MoE slots (none of the other kind)");
     if (s->mtp_written) {
         const pulsar_layer_desc attn_moe = {PULSAR_MIXER_ATTN_FULL, PULSAR_FFN_MOE, 0};
@@ -192,8 +192,8 @@ int main(int argc, char **argv) {
           "the drafter: %s (N9)", s->mtp_written ? "the MTP module, on the chained-MTP lane" : "none (no MTP module)");
     int k2 = 0;
     for (uint32_t il = 0; il < s->n_layer; il++)
-        if (w->layer[il].exp_up) {
-            const int g = exl3_type_k2(w->layer[il].exp_up->type);
+        if (w->layer[TrunkLayer{il}].exp_up) {
+            const int g = exl3_type_k2(w->layer[TrunkLayer{il}].exp_up->type);
             if (g > k2) k2 = g;
         }
     check(e->routed_quant_bits() == (k2 ? 20 + k2 : 0), "routed quant tier %d (EXL3: 20 + the highest half-bit rate; "
@@ -202,7 +202,7 @@ int main(int argc, char **argv) {
     /* the session side as declared (N3 / N7): the driver's table covers the plan; the state is the Mamba-2 layers'
      * SSM (FIXED, DELTA with its commit) + conv tail (FIXED, SNAPSHOT), the attention layers' K|V pool, the drafter's
      * slot's K|V pool when the container holds the MTP module */
-    uint32_t miss_at = 0;
+    TrunkLayer miss_at{0u};
     const char *miss = pulsar_driver_first_missing(e->family->driver, p, &miss_at);
     check(e->family->driver && !miss, "the core driver's table covers the plan (%s)", miss ? miss : "nothing missing");
     const pulsar_state_plan *sp = &e->state_plan;
@@ -224,11 +224,11 @@ int main(int argc, char **argv) {
     state_ok = state_ok && pend.kind == PULSAR_STATE_FIXED && pend.capture == PULSAR_STATE_CAPTURE_NONE && !pend.host &&
                pend.bytes == (uint64_t)s->n_embd * 2u;
     for (uint32_t il = 0; state_ok && il < s->n_layer; il++)
-        state_ok = sp->slot[il] == (p->desc[il].mixer == PULSAR_MIXER_MAMBA2
+        state_ok = sp->slot[LayerSlot{il}] == (p->desc[TrunkLayer{il}].mixer == PULSAR_MIXER_MAMBA2
                                         ? (1u << PULSAR_NEMOTRON_H_STATE_SSM | 1u << PULSAR_NEMOTRON_H_STATE_CONV)
                                         : 1u << PULSAR_NEMOTRON_H_STATE_KV);
     if (state_ok && s->mtp_written)
-        state_ok = sp->slot[s->n_layer] == (1u << PULSAR_NEMOTRON_H_STATE_KV | 1u << PULSAR_NEMOTRON_H_STATE_MTP_PEND) &&
+        state_ok = sp->slot[LayerSlot{s->n_layer}] == (1u << PULSAR_NEMOTRON_H_STATE_KV | 1u << PULSAR_NEMOTRON_H_STATE_MTP_PEND) &&
                    sp->drafter_at == pulsar_mtp_drafter_at && sp->drafter_frontier == pulsar_mtp_drafter_frontier;
     check(state_ok, "the declared state: ssm FIXED DELTA %llu B (+ %llu B a verify row), ssm_conv FIXED SNAPSHOT %llu B "
           "a Mamba-2 layer; kv POOL %llu B a token an attention layer%s", (unsigned long long)ssm.bytes,

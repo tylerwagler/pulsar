@@ -59,8 +59,8 @@ void imatrix_collector_free(pulsar_imatrix_collector *c) {
 /// @param il the layer
 /// @param expert the expert
 /// @return its gate / up input sum of squares, [PULSAR_N_EMBD] floats
-static float *imatrix_gate_up_ptr(pulsar_imatrix_collector *c, uint32_t il, uint32_t expert) {
-    return c->gate_up_sum2 + ((size_t)il * PULSAR_N_EXPERT + expert) * PULSAR_N_EMBD;
+static float *imatrix_gate_up_ptr(pulsar_imatrix_collector *c, TrunkLayer il, uint32_t expert) {
+    return c->gate_up_sum2 + ((size_t)il.raw() * PULSAR_N_EXPERT + expert) * PULSAR_N_EMBD;
 }
 
 
@@ -69,8 +69,8 @@ static float *imatrix_gate_up_ptr(pulsar_imatrix_collector *c, uint32_t il, uint
 /// @param il the layer
 /// @param expert the expert
 /// @return its down input sum of squares, [PULSAR_N_FF_EXP] floats
-static float *imatrix_down_ptr(pulsar_imatrix_collector *c, uint32_t il, uint32_t expert) {
-    return c->down_sum2 + ((size_t)il * PULSAR_N_EXPERT + expert) * PULSAR_N_FF_EXP;
+static float *imatrix_down_ptr(pulsar_imatrix_collector *c, TrunkLayer il, uint32_t expert) {
+    return c->down_sum2 + ((size_t)il.raw() * PULSAR_N_EXPERT + expert) * PULSAR_N_FF_EXP;
 }
 
 
@@ -84,7 +84,7 @@ static float *imatrix_down_ptr(pulsar_imatrix_collector *c, uint32_t il, uint32_
 static bool imatrix_collect_layer_batch(
         pulsar_imatrix_collector *c,
         pulsar_gpu_graph         *g,
-        uint32_t               il,
+        TrunkLayer               il,
         uint32_t               n_tokens) {
     if (!c || n_tokens == 0) return true;
     if (n_tokens > c->cap_tokens) return false;
@@ -229,24 +229,24 @@ bool imatrix_collector_save(
         const char                  *path) {
     FILE *fp = imatrix_dat_open(path, (int32_t)(PULSAR_N_LAYER * 3));
     if (!fp) return false;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         const pulsar_layer_weights *layer = &weights->layer[il];
         char name[256];
         snprintf(name, sizeof(name), "%.*s", (int)layer->ffn_gate_exps->name.len, layer->ffn_gate_exps->name.ptr);
         imatrix_write_entry(fp, name,
-                            c->gate_up_sum2 + (size_t)il * PULSAR_N_EXPERT * PULSAR_N_EMBD,
+                            c->gate_up_sum2 + (size_t)il.raw() * PULSAR_N_EXPERT * PULSAR_N_EMBD,
                             c->gate_up_count[il],
                             PULSAR_N_EXPERT,
                             PULSAR_N_EMBD);
         snprintf(name, sizeof(name), "%.*s", (int)layer->ffn_up_exps->name.len, layer->ffn_up_exps->name.ptr);
         imatrix_write_entry(fp, name,
-                            c->gate_up_sum2 + (size_t)il * PULSAR_N_EXPERT * PULSAR_N_EMBD,
+                            c->gate_up_sum2 + (size_t)il.raw() * PULSAR_N_EXPERT * PULSAR_N_EMBD,
                             c->gate_up_count[il],
                             PULSAR_N_EXPERT,
                             PULSAR_N_EMBD);
         snprintf(name, sizeof(name), "%.*s", (int)layer->ffn_down_exps->name.len, layer->ffn_down_exps->name.ptr);
         imatrix_write_entry(fp, name,
-                            c->down_sum2 + (size_t)il * PULSAR_N_EXPERT * PULSAR_N_FF_EXP,
+                            c->down_sum2 + (size_t)il.raw() * PULSAR_N_EXPERT * PULSAR_N_FF_EXP,
                             c->down_count[il],
                             PULSAR_N_EXPERT,
                             PULSAR_N_FF_EXP);
@@ -269,7 +269,7 @@ bool gpu_graph_reset_prefill_state(pulsar_gpu_graph *g) {
     {
         const BankId bank = gpu_graph_cur_bank(g);
         const uint32_t b = pulsar_bank_index(bank);
-        memset(g->ms_n_comp[b], 0, sizeof(g->ms_n_comp[b]));
+        memset(g->ms_n_comp[b].data(), 0, sizeof(g->ms_n_comp[b]));
         pulsar_ckpt_drop_bank(&g->ckpt, bank);   /* L264: the zeroing bypasses the frontier writer */
     }
     const uint32_t cur = pulsar_bank_index(gpu_graph_cur_bank(g));
@@ -361,11 +361,11 @@ static void dspark_bulk_drain_runs(pulsar_gpu_graph *g, const int32_t *pos, cons
         }
         if (start == 0 || start != g->ms_dspark_prompt_n[b]) g->ms_dspark_prompt_lo[b] = start;
         g->ms_dspark_prompt_n[b] = start + n;
-        for (int i2 = 0; i2 < 3; i2++) g->ms_dspark_n_raw[b][i2] = 0;
+        for (int i2 = 0; i2 < 3; i2++) g->ms_dspark_n_raw[b][DraftLayer{i2}] = 0;
         if (b == cur) {
             g->dspark_prompt_lo = g->ms_dspark_prompt_lo[b];
             g->dspark_prompt_n = g->ms_dspark_prompt_n[b];
-            for (int i2 = 0; i2 < 3; i2++) g->dspark_n_raw[i2] = 0;
+            for (int i2 = 0; i2 < 3; i2++) g->dspark_n_raw[DraftLayer{i2}] = 0;
         }
         r0 = r1;
     }
@@ -415,7 +415,7 @@ static void dspark_bulk_drain(pulsar_gpu_graph *g, const token_vec *prompt,
          * next generation start reseed from the prompt ring. (The server's
          * between-request reset does not go through invalidate/rewind, so
          * this is the invariant that catches every new prompt.) */
-        for (int i2 = 0; i2 < 3; i2++) g->dspark_n_raw[i2] = 0;
+        for (int i2 = 0; i2 < 3; i2++) g->dspark_n_raw[DraftLayer{i2}] = 0;
     }
     const char *path = getenv("PULSAR_DSPARK_PREFILL_DUMP");
     if (!path || !path[0] || !g->dspark_bulk_h[0]) return;
@@ -638,7 +638,7 @@ static bool gpu_graph_prefill_layer_major_inner(
     if (!split_commands) {
         ok = gpu_graph_seed_chunk_hc(g, model, weights, prompt, start, n_tokens);
         if (ok) ok = pulsar_gpu_begin_commands() != 0;
-        for (uint32_t il = 0; ok && il < PULSAR_N_LAYER; il++) {
+        for (TrunkLayer il{0u}; ok && il.below(PULSAR_N_LAYER); ++il) {
             ok = gpu_graph_encode_layer_batch(g,
                                                 model,
                                                 &weights->layer[il],
@@ -646,10 +646,10 @@ static bool gpu_graph_prefill_layer_major_inner(
                                                 start,
                                                 n_tokens);
             if (!ok) {
-                fprintf(stderr, "pulsar: gpu whole-prefill layer %u encode failed\n", il);
+                fprintf(stderr, "pulsar: gpu whole-prefill layer %u encode failed\n", il.raw());
             }
             if (show_progress) {
-                fprintf(stderr, "pulsar: gpu prefill layer %u/%u\r", il + 1, (uint32_t)PULSAR_N_LAYER);
+                fprintf(stderr, "pulsar: gpu prefill layer %u/%u\r", il.raw() + 1, (uint32_t)PULSAR_N_LAYER);
                 fflush(stderr);
             }
         }
@@ -688,10 +688,10 @@ static bool gpu_graph_prefill_layer_major_inner(
      * the layer's marker (-1 = the branch drained the stream itself, so the
      * layer is complete by construction); layers_reported walks them in order
      * and fires the progress callbacks when a layer has actually finished. */
-    int layer_marker[PULSAR_MAX_LAYER];
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) layer_marker[il] = -1;
+    pulsar_indexed<int, TrunkLayer, PULSAR_MAX_LAYER> layer_marker;
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) layer_marker[il] = -1;
     uint32_t layers_reported = 0;
-    for (uint32_t il = 0; ok && il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; ok && il.below(PULSAR_N_LAYER); ++il) {
         {
             ok = pulsar_gpu_begin_commands() != 0;
             if (ok) ok = gpu_graph_encode_layer_batch(g,
@@ -701,7 +701,7 @@ static bool gpu_graph_prefill_layer_major_inner(
                                                         start,
                                                         n_tokens);
             if (!ok) {
-                fprintf(stderr, "pulsar: gpu layer-major prefill layer %u encode failed\n", il);
+                fprintf(stderr, "pulsar: gpu layer-major prefill layer %u encode failed\n", il.raw());
             }
             /* L142: the layer's only host-side consumers are the imatrix
              * collector (reads the layer's activations) and the profile timers.
@@ -724,8 +724,8 @@ static bool gpu_graph_prefill_layer_major_inner(
          * GPU by however far the host has run ahead, and the chunk driver's
          * end-of-chunk report covers whatever is still in flight when the loop
          * ends -- so a client sees true progress and the GPU never waits for it. */
-        while (layers_reported <= il &&
-               pulsar_gpu_marker_done(layer_marker[layers_reported])) {
+        while (layers_reported <= il.raw() &&
+               pulsar_gpu_marker_done(layer_marker[TrunkLayer{layers_reported}])) {
             layers_reported++;
             gpu_graph_report_prefill_display_progress(display_progress,
                                                       display_progress_ud,
@@ -792,7 +792,7 @@ pulsar_prefill_shape gpu_graph_prefill_shape(const pulsar_gpu_graph *g) {
      * makes every later chunk's start unaligned, and each of those takes the per-token compressor path instead of
      * the batched aligned one for the rest of the prompt */
     uint32_t align = 1;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         const uint32_t r = pulsar_layer_compress_ratio(il);
         if (r > 1 && align % r != 0) align *= r / gcd_u32(align, r);
     }
@@ -902,7 +902,7 @@ bool gpu_graph_verify_suffix(
     if (!ok) return false;
 
     ok = pulsar_gpu_begin_commands() != 0;
-    for (uint32_t il = 0; ok && il < PULSAR_N_LAYER; il++)
+    for (TrunkLayer il{0u}; ok && il.below(PULSAR_N_LAYER); ++il)
         ok = gpu_graph_encode_layer_batch(g, model, &weights->layer[il], il, start, n_tokens);
     if (ok) ok = gpu_graph_encode_output_head_batch_tp(g, model, weights, 0u, n_tokens, g->spec_logits);
     if (ok) ok = pulsar_gpu_end_commands() != 0;
@@ -1119,7 +1119,7 @@ int gpu_graph_decode_multiseq_batch(
             if ((uint32_t)last_idx[r] != r) { head_single_block = false; break; }
 
     bool ok = pulsar_gpu_begin_commands() != 0;
-    for (uint32_t il = 0; ok && il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; ok && il.below(PULSAR_N_LAYER); ++il) {
         ok = gpu_graph_encode_layer_batch(g, model, &weights->layer[il], il,
                                           (uint32_t)pos[0], n_active);
     }
@@ -1293,7 +1293,7 @@ static void *ds4_imatrix_begin(pulsar_engine *e, const char *dataset_path, int c
     const uint32_t raw_cap = gpu_graph_raw_cap_for_context(ctx_size, prefill_cap);
     ds4_imatrix_run *r = new ds4_imatrix_run;
     r->prefill_cap = prefill_cap;
-    if (!gpu_graph_alloc_raw_cap(&r->g, &e->weights, &e->weights.layer[0], raw_cap, (uint32_t)ctx_size, prefill_cap,
+    if (!gpu_graph_alloc_raw_cap(&r->g, &e->weights, &e->weights.layer[TrunkLayer{0}], raw_cap, (uint32_t)ctx_size, prefill_cap,
                                  gpu_graph_bank_pool_n(), false)) {
         fprintf(stderr, "pulsar: failed to allocate imatrix GPU graph runtime\n");
         delete r;

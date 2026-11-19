@@ -3643,30 +3643,30 @@ static void release_profile_attn_layout(void) {
 static void test_attn_layout_table(void) {
     install_profile_attn_layout();
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const pulsar_layer_attn *a = pulsar_layer_attn_layout(il);
-        TEST_ASSERT(a->ratio == pulsar_layer_compress_ratio(il));
+        const pulsar_layer_attn *a = pulsar_layer_attn_layout(TrunkLayer{il});
+        TEST_ASSERT(a->ratio == pulsar_layer_compress_ratio(TrunkLayer{il}));
         if (il < 2) {
             TEST_ASSERT(a->mode == PULSAR_ATTN_WINDOW && a->ratio == 0);
-            TEST_ASSERT(a->kv_source == PULSAR_NO_LAYER && a->index_source == PULSAR_NO_LAYER);
+            TEST_ASSERT(a->kv_source.is_none() && a->index_source.is_none());
             TEST_ASSERT(!a->candidate_source && !a->uses_candidates);
             continue;
         }
         const uint32_t kv_src = il < 8 ? 2u : il < 14 ? 8u : il < 20 ? 14u : 20u;
         const uint32_t idx_src = il < 20 ? kv_src : il < 24 ? 20u : il < 28 ? 24u : il < 32 ? 28u : il < 36 ? 32u : 36u;
         TEST_ASSERT(a->ratio == (il < 20 ? 2u : 1u));
-        TEST_ASSERT(a->kv_source == kv_src);
-        TEST_ASSERT(a->index_source == idx_src);
+        TEST_ASSERT(a->kv_source == TrunkLayer{kv_src});
+        TEST_ASSERT(a->index_source == TrunkLayer{idx_src});
         const pulsar_attn_mode want = kv_src == il ? PULSAR_ATTN_FULL : idx_src == il ? PULSAR_ATTN_REINDEX : PULSAR_ATTN_REUSE;
         TEST_ASSERT(a->mode == want);
         TEST_ASSERT(a->candidate_source == (il == 20));
         TEST_ASSERT(a->uses_candidates == (il > 20 && idx_src == il));
         /* a member never precedes its source, and a source's ratio is its own */
-        TEST_ASSERT(a->kv_source <= il && a->index_source <= il);
+        TEST_ASSERT(a->kv_source <= TrunkLayer{il} && a->index_source <= TrunkLayer{il});
         TEST_ASSERT(pulsar_layer_compress_ratio(a->kv_source) == a->ratio);
     }
     /* the four modes are all present: 4 FULL, 4 REINDEX, 30 REUSE, 2 WINDOW */
     uint32_t n[4] = {0, 0, 0, 0};
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) n[pulsar_layer_attn_layout(il)->mode]++;
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) n[pulsar_layer_attn_layout(TrunkLayer{il})->mode]++;
     TEST_ASSERT(n[PULSAR_ATTN_WINDOW] == 2 && n[PULSAR_ATTN_FULL] == 4 &&
                 n[PULSAR_ATTN_REINDEX] == 4 && n[PULSAR_ATTN_REUSE] == 30);
     release_profile_attn_layout();
@@ -5496,7 +5496,7 @@ static void test_state_plan_overflow(void) {
     for (uint32_t i = 0; i < PULSAR_STATE_DECLS_MAX; i++) {
         const uint32_t id = pulsar_state_plan_add(&p, d);
         TEST_ASSERT(id == i);
-        p.slot[0] |= 1u << id;
+        p.slot[LayerSlot{0}] |= 1u << id;
     }
     TEST_ASSERT(p.n_decl == PULSAR_STATE_DECLS_MAX && p.n_overflow == 0u);
     for (uint32_t i = 0; i < 2u; i++) {
@@ -5515,12 +5515,12 @@ static void test_state_plan_overflow(void) {
     q.ckpt_slots = 1u;
     const uint32_t id = pulsar_state_plan_add(&q, d);
     q.n_trunk = q.n_slots = PULSAR_STATE_SLOTS_MAX - 2u;
-    for (uint32_t k = 0; k < q.n_trunk; k++) q.slot[k] = 1u << id;
+    for (uint32_t k = 0; k < q.n_trunk; k++) q.slot[LayerSlot{k}] = 1u << id;
     q.session = 0xA5A5A5A5u;   /* the word after slot[]: a write past the table would land here */
-    TEST_ASSERT(pulsar_state_plan_add_slot(&q, 1u << id) == PULSAR_STATE_SLOTS_MAX - 2u);
-    TEST_ASSERT(pulsar_state_plan_add_slot(&q, 1u << id) == PULSAR_STATE_SLOTS_MAX - 1u);
+    TEST_ASSERT(pulsar_state_plan_add_slot(&q, 1u << id) == LayerSlot{PULSAR_STATE_SLOTS_MAX - 2u});
+    TEST_ASSERT(pulsar_state_plan_add_slot(&q, 1u << id) == LayerSlot{PULSAR_STATE_SLOTS_MAX - 1u});
     TEST_ASSERT(q.n_slots == PULSAR_STATE_SLOTS_MAX && q.slot_overflow == 0u && pulsar_state_plan_slots_fit(&q, "test"));
-    for (uint32_t i = 0; i < 3u; i++) TEST_ASSERT(pulsar_state_plan_add_slot(&q, 1u << id) == PULSAR_STATE_SLOTS_MAX);
+    for (uint32_t i = 0; i < 3u; i++) TEST_ASSERT(pulsar_state_plan_add_slot(&q, 1u << id) == LayerSlot{PULSAR_STATE_SLOTS_MAX});
     TEST_ASSERT(q.n_slots == PULSAR_STATE_SLOTS_MAX && q.slot_overflow == 3u && q.session == 0xA5A5A5A5u);
     TEST_ASSERT(!pulsar_state_plan_slots_fit(&q, "test"));
     q.session = 0u;
@@ -6758,9 +6758,9 @@ static void test_context_memory_shape(void) {
      * each a comp row AND an index-K row per compressed position. */
     uint64_t comp_index = 0; uint32_t n_src = 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        if (pulsar_layer_attn_layout(il)->mode != PULSAR_ATTN_FULL) continue;
+        if (pulsar_layer_attn_layout(TrunkLayer{il})->mode != PULSAR_ATTN_FULL) continue;
         n_src++;
-        const uint64_t rows = gpu_graph_comp_cap((uint32_t)ctx, pulsar_layer_compress_ratio(il));
+        const uint64_t rows = gpu_graph_comp_cap((uint32_t)ctx, pulsar_layer_compress_ratio(TrunkLayer{il}));
         comp_index += rows * (PULSAR_ENGINE_MAINKV_ROWBYTES + PULSAR_ENGINE_IDXFP4_ROWBYTES);
     }
     TEST_ASSERT(n_src == 4 && comp_index > 0 && m.comp_index_bytes == comp_index);

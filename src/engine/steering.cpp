@@ -30,13 +30,13 @@ bool gpu_graph_directional_steering_ffn_enabled(const pulsar_gpu_graph *g) {
 static bool gpu_graph_apply_directional_steering(
         pulsar_gpu_graph  *g,
         pulsar_gpu_tensor *x,
-        uint32_t          il,
+        TrunkLayer          il,
         uint32_t          rows,
         float             scale) {
     if (!g || !g->directional_steering_dirs || scale == 0.0f) return true;
     return pulsar_gpu_directional_steering_project_tensor(x,
                                             g->directional_steering_dirs,
-                                            il,
+                                            il.raw(),   /* the launch: the direction table's row */
                                             PULSAR_N_EMBD,
                                             rows,
                                             scale) != 0;
@@ -53,7 +53,7 @@ static bool gpu_graph_apply_directional_steering(
 bool gpu_graph_apply_directional_steering_attn(
         pulsar_gpu_graph  *g,
         pulsar_gpu_tensor *x,
-        uint32_t          il,
+        TrunkLayer          il,
         uint32_t          rows) {
     return gpu_graph_apply_directional_steering(g, x, il, rows, g ? g->directional_steering_attn_scale : 0.0f);
 }
@@ -69,7 +69,7 @@ bool gpu_graph_apply_directional_steering_attn(
 bool gpu_graph_apply_directional_steering_ffn(
         pulsar_gpu_graph  *g,
         pulsar_gpu_tensor *x,
-        uint32_t          il,
+        TrunkLayer          il,
         uint32_t          rows) {
     return gpu_graph_apply_directional_steering(g, x, il, rows, g ? g->directional_steering_ffn_scale : 0.0f);
 }
@@ -91,7 +91,7 @@ uint64_t gpu_graph_comp_index_bytes_for_context(uint32_t ctx_size) {
      * publish none, so pricing one for them would overshoot the real allocation
      * (and the accounting gate reads the allocation, not this formula).  The
      * member layers read the pools and own nothing. */
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const uint64_t comp_cap = gpu_graph_comp_cap(ctx_size, pulsar_layer_compress_ratio(il));
         bytes += comp_cap * attn_row;
@@ -110,7 +110,7 @@ uint64_t gpu_graph_raw_ring_bytes_for_context(uint32_t raw_cap) {
 
 uint32_t gpu_graph_comp_cap_max(uint32_t ctx_size) {
     uint32_t min_ratio = UINT32_MAX;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio != 0 && ratio < min_ratio) min_ratio = ratio;
     }

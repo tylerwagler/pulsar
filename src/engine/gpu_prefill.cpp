@@ -146,7 +146,7 @@ static bool gpu_graph_csa2_emit_rows(
         pulsar_gpu_graph           *g,
         const pulsar_model         *model,
         const pulsar_layer_weights *layer,
-        uint32_t                    il,
+        TrunkLayer                    il,
         bool                        banked,
         uint32_t                    bank,
         CompRows                    n_rows_c,       /* compressed rows emitted */
@@ -160,12 +160,12 @@ static bool gpu_graph_csa2_emit_rows(
     if (n_rows == 0) return true;
     if (cache_row0 > g->layer_comp_cap[il] || n_rows > g->layer_comp_cap[il] - cache_row0) {
         fprintf(stderr, "pulsar: kv source %u: compressed rows %u+%u exceed the pool cap %u -- refusing\n",
-                il, cache_row0, n_rows, g->layer_comp_cap[il]);
+                il.raw(), cache_row0, n_rows, g->layer_comp_cap[il]);
         return false;
     }
     if (n_rows > g->attn_comp_stage_cap || n_rows > g->comp_cap) {
         fprintf(stderr, "pulsar: kv source %u: %u latent rows exceed the staging cap %u -- refusing\n",
-                il, n_rows, g->attn_comp_stage_cap);
+                il.raw(), n_rows, g->attn_comp_stage_cap);
         return false;
     }
     const float freq_base = layer_rope_freq_base(il);
@@ -285,7 +285,7 @@ static bool gpu_graph_index_comp_prefill(
         pulsar_gpu_graph           *g,
         const pulsar_model         *model,
         const pulsar_layer_weights *layer,
-        uint32_t                    il,
+        TrunkLayer                    il,
         bool                        banked,
         uint32_t                    bank,
         uint32_t                    row0,      /* the run's first BATCH ROW */
@@ -319,7 +319,7 @@ static bool gpu_graph_index_comp_prefill(
     if (!lanes) {
         fprintf(stderr, "pulsar: index source %u: %s index lane missing for bank %u "
                         "(batch %s/%s, pool %s, state %s/%s) -- refusing\n",
-                il, banked ? "banked" : "classic", bank,
+                il.raw(), banked ? "banked" : "classic", bank,
                 kv ? "ok" : "MISSING", sc ? "ok" : "MISSING",
                 comp ? "ok" : "MISSING", st_kv ? "ok" : "MISSING", st_sc ? "ok" : "MISSING");
     }
@@ -373,7 +373,7 @@ static bool gpu_graph_index_comp_update(
         pulsar_gpu_graph           *g,
         const pulsar_model         *model,
         const pulsar_layer_weights *layer,
-        uint32_t                    il,
+        TrunkLayer                    il,
         bool                        banked,
         uint32_t                    bank,        /* which BANK this row belongs to */
         StepRow                     row_at,      /* which BATCH ROW to read */
@@ -406,7 +406,7 @@ static bool gpu_graph_index_comp_update(
     if (!lanes) {
         fprintf(stderr, "pulsar: index source %u: %s index lane missing for bank %u "
                         "(row %u, pool %s, state %s/%s) -- refusing\n",
-                il, banked ? "banked" : "classic", bank, row,
+                il.raw(), banked ? "banked" : "classic", bank, row,
                 comp ? "ok" : "MISSING", st_kv ? "ok" : "MISSING", st_sc ? "ok" : "MISSING");
     }
     const bool ok = lanes &&
@@ -510,7 +510,7 @@ static bool gpu_graph_csa2_produce(
         pulsar_gpu_graph           *g,
         const pulsar_model         *model,
         const pulsar_layer_weights *layer,
-        uint32_t                    il,
+        TrunkLayer                    il,
         uint32_t                    pos0,
         uint32_t                    n_tokens,
         bool                        mseq,
@@ -590,17 +590,17 @@ static bool gpu_graph_csa2_produce(
         const uint32_t n_groups = n / ratio;
         if (ok && g->ms_comp_state_stale[run_bank]) {
             fprintf(stderr, "pulsar: kv source %u bank %u: store at %u on a bank whose state is stale "
-                            "(rewound off its grid checkpoints) -- refusing\n", il, run_bank, rpos0);
+                            "(rewound off its grid checkpoints) -- refusing\n", il.raw(), run_bank, rpos0);
             ok = false;
         }
         if (ok && before != rpos0 / ratio) {
             fprintf(stderr, "pulsar: kv source %u bank %u: frontier %u is not position-true at %u (ratio %u) -- refusing\n",
-                    il, run_bank, before, rpos0, ratio);
+                    il.raw(), run_bank, before, rpos0, ratio);
             ok = false;
         }
         if (ok && n_groups > g->attn_comp_stage_cap) {
             fprintf(stderr, "pulsar: kv source %u: %u groups exceed the staging cap %u -- refusing\n",
-                    il, n_groups, g->attn_comp_stage_cap);
+                    il.raw(), n_groups, g->attn_comp_stage_cap);
             ok = false;
         }
         const TensorBytes row_bytes = bytes_of<float>(comp_width);
@@ -608,7 +608,7 @@ static bool gpu_graph_csa2_produce(
         pulsar_gpu_tensor *sc = pulsar_gpu_tensor_view(g->batch_comp_sc, row_bytes.times(row0), row_bytes.times(n));
         if (ok && (!kv || !sc)) {
             fprintf(stderr, "pulsar: kv source %u: batch rows %u+%u are outside the projection batch -- refusing\n",
-                    il, row0, n);
+                    il.raw(), row0, n);
             ok = false;
         }
         if (ok) ok = gpu_graph_comp_ape_fold(model, layer, sc, comp_width, ratio, rpos0, n);
@@ -672,7 +672,7 @@ static bool gpu_graph_csa2_produce(
             int emitted = 0;
             if (g->ms_comp_state_stale[bank]) {
                 fprintf(stderr, "pulsar: kv source %u bank %u: store at %u on a bank whose state is stale "
-                                "(rewound off its grid checkpoints) -- refusing\n", il, bank, pos);
+                                "(rewound off its grid checkpoints) -- refusing\n", il.raw(), bank, pos);
                 ok = false;
             }
             if (ok) ok = gpu_graph_comp_ape_fold(model, layer, sc_view, comp_width, ratio, pos, 1u);
@@ -700,14 +700,14 @@ static bool gpu_graph_csa2_produce(
                                                                   &idx_emitted);
             if (ok && own_index && (idx_emitted != 0) != (emitted != 0)) {
                 fprintf(stderr, "pulsar: index source %u: the indexer's compressor and the attention's "
-                                "disagree about the group boundary at %u (ratio %u) -- refusing\n", il, pos, ratio);
+                                "disagree about the group boundary at %u (ratio %u) -- refusing\n", il.raw(), pos, ratio);
                 ok = false;
             }
             if (ok && emitted) {
                 const uint32_t row = *n_comp_slot;
                 if (CompRow{(int)row} != pulsar_comp_row_of(pulsar_ckpt_pos(pos), TokPerRow{ratio})) {
                     fprintf(stderr, "pulsar: kv source %u bank %u: frontier %u is not position-true at %u (ratio %u) -- refusing\n",
-                            il, bank, row, pos, ratio);
+                            il.raw(), bank, row, pos, ratio);
                     ok = false;
                 }
                 /* the closed group's first position: pos + 1 - ratio (the group ends at pos) */
@@ -954,7 +954,7 @@ bool gpu_graph_warmup_prefill_kernels(
                                                       (uint32_t)hc_dim, n_tokens, PULSAR_RMS_EPS, 0) != 0;
     if (ok) pulsar_gpu_bf16_act_note(g->batch_flat_hc, n_tokens, hc_dim);
     if (ok) {
-        ok = pulsar_linear_slot(g->batch_hc_mix, model, weights->layer[0].hc_attn_fn, hc_dim, 0, mix_hc, g->batch_flat_hc, n_tokens);
+        ok = pulsar_linear_slot(g->batch_hc_mix, model, weights->layer[TrunkLayer{0}].hc_attn_fn, hc_dim, 0, mix_hc, g->batch_flat_hc, n_tokens);
     }
     if (ok) ok = pulsar_gpu_end_commands() != 0;
     if (!ok) {
@@ -996,7 +996,7 @@ bool gpu_graph_warmup_prefill_kernels(
 /// @param pos0 the first row's position (no positions)
 /// @param positions per-row positions (mseq), or NULL
 /// @return true when the layer neither publishes nor reads candidates; false = failed
-static bool gpu_graph_csa2_candidates(pulsar_gpu_graph *g, const pulsar_layer_attn *attn, uint32_t il,
+static bool gpu_graph_csa2_candidates(pulsar_gpu_graph *g, const pulsar_layer_attn *attn, TrunkLayer il,
                                       uint32_t row0, uint32_t n, uint32_t n_comp, uint32_t ratio,
                                       uint32_t pos0, const pulsar_gpu_tensor *positions) {
     if (!attn->candidate_source && !attn->uses_candidates) return true;
@@ -1078,7 +1078,7 @@ static bool gpu_graph_indexed_attention_span(
         pulsar_gpu_graph           *g,
         const pulsar_model         *model,
         const pulsar_layer_weights *layer,
-        uint32_t                    il,
+        TrunkLayer                    il,
         const pulsar_layer_attn    *attn,
         uint32_t                    s0,
         uint32_t                    sn,
@@ -1169,7 +1169,7 @@ static bool gpu_graph_indexed_attention_span(
     }
     if (ok && !span_runs_conform) {
         fprintf(stderr, "pulsar: indexer span at layer %u: a bank's %u rows are not consecutive "
-                        "positions (step_begin admits no such batch) -- refusing\n", il, sn);
+                        "positions (step_begin admits no such batch) -- refusing\n", il.raw(), sn);
         ok = false;
     }
     /* Every banked span, one-row spans included, scores each bank run through
@@ -1256,7 +1256,7 @@ static bool gpu_graph_indexed_attention_span(
      * the last span's 0 -- its verify rows on the prefill arms from there. */
     if (ok && span_dec != (uint32_t)(step_dec > 0 ? step_dec : 0) &&
         !pulsar_gpu_matmul_set_batch_decode_rows_capped((int)span_dec, (int)PULSAR_DSPARK_DRAFT_ROWS_MAX)) {
-        fprintf(stderr, "pulsar: indexed span at layer %u: decode-row count %u refused -- refusing\n", il, span_dec);
+        fprintf(stderr, "pulsar: indexed span at layer %u: decode-row count %u refused -- refusing\n", il.raw(), span_dec);
         ok = false;
     }
     if (ok) {
@@ -1339,7 +1339,7 @@ static bool gpu_graph_indexed_attention_span(
 /// @param attn its attention layout
 /// @return false = refused (said) or failed
 static bool tp_attn_input_split(pulsar_gpu_graph *g, const pulsar_model *model,
-                                const pulsar_layer_weights *layer, uint32_t il, uint32_t n_tokens, uint64_t q_rank, uint32_t ratio,
+                                const pulsar_layer_weights *layer, TrunkLayer il, uint32_t n_tokens, uint64_t q_rank, uint32_t ratio,
                                 const pulsar_layer_attn *attn) {
     struct item { const pulsar_tensor *w; uint64_t out_full; pulsar_gpu_tensor *dst; const char *name; };
     item it[PULSAR_TP_GATHER_BLOCKS_MAX];
@@ -1381,7 +1381,7 @@ static bool tp_attn_input_split(pulsar_gpu_graph *g, const pulsar_model *model,
              hi - lo == phi - plo && hi > lo;
         if (!ok) {
             fprintf(stderr, "pulsar: layer %u: %s cannot be row-split for the pair (dims %llu x %llu, "
-                            "want %u x %llu) -- refusing\n", il, it[k].name,
+                            "want %u x %llu) -- refusing\n", il.raw(), it[k].name,
                     w ? (unsigned long long)w->dim[0] : 0ull, w ? (unsigned long long)w->dim[1] : 0ull,
                     (unsigned)PULSAR_N_EMBD, (unsigned long long)it[k].out_full);
             break;
@@ -1404,7 +1404,7 @@ static bool tp_attn_input_split(pulsar_gpu_graph *g, const pulsar_model *model,
     const uint32_t msgs = (uint32_t)((elem0 + vf - 1u) / vf);
     if (ok && (msgs == 0 || msgs > PULSAR_TP_BATCH_MAX_ROWS)) {
         fprintf(stderr, "pulsar: layer %u: attention-input gather of %llu floats needs %u row-lane messages "
-                        "(max %u) -- refusing\n", il, (unsigned long long)elem0, msgs,
+                        "(max %u) -- refusing\n", il.raw(), (unsigned long long)elem0, msgs,
                 (unsigned)PULSAR_TP_BATCH_MAX_ROWS);
         ok = false;
     }
@@ -1420,7 +1420,7 @@ static bool tp_attn_input_split(pulsar_gpu_graph *g, const pulsar_model *model,
                                                      slab + L.err_off) != 0;
     pulsar_gpu_tensor_free(payload);
     if (!ok) fprintf(stderr, "pulsar: layer %u: attention-input row split refused (%u rows, %u blocks)\n",
-                     il, n_tokens, n);
+                     il.raw(), n_tokens, n);
     static int said = 0;
     if (ok && !said) {
         said = 1;
@@ -1443,7 +1443,7 @@ bool gpu_graph_encode_layer_attention_batch(
         pulsar_gpu_graph  *g,
         const pulsar_model        *model,
         const pulsar_layer_weights *layer,
-        uint32_t                il,
+        TrunkLayer                il,
         uint32_t                pos0,
         uint32_t                n_tokens) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
@@ -1469,7 +1469,7 @@ bool gpu_graph_encode_layer_attention_batch(
     const uint32_t g_lo = g->tp_group_lo, g_hi = g->tp_group_hi;
     if (g_hi <= g_lo || g_hi > n_groups_total) {
         fprintf(stderr, "pulsar: layer %u attention: this graph owns output groups [%u,%u) of %u "
-                        "-- refusing\n", il, g_lo, g_hi, n_groups_total);
+                        "-- refusing\n", il.raw(), g_lo, g_hi, n_groups_total);
         return false;
     }
     const uint32_t n_groups = g_hi - g_lo;
@@ -1481,7 +1481,7 @@ bool gpu_graph_encode_layer_attention_batch(
     const bool compressed = ratio != 0;
     /* CSA2 (L218): the pools this layer attends over live at its kv source. */
     const pulsar_layer_attn *attn = pulsar_layer_attn_layout(il);
-    const uint32_t src = compressed ? attn->kv_source : il;
+    const TrunkLayer src = compressed ? attn->kv_source : il;
     /* Grouped E4M3 for the attn-output "a" projection, emitted by the fp16
      * attention epilogue (head dims [0, n_nope)) and rope_tail (the rest).
      * Declared here because the two producers sit in different scopes below
@@ -2064,7 +2064,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                             layer->indexer_compressor_norm && layer->indexer_compressor_ape)
                                          : (layer->indexer_k && layer->indexer_k_norm)));
             if (!have_comp) {
-                fprintf(stderr, "pulsar: kv source %u is missing its %s weights -- refusing\n", il,
+                fprintf(stderr, "pulsar: kv source %u is missing its %s weights -- refusing\n", il.raw(),
                         !indexed ? "compressor"
                                  : own ? "compressor / indexer-compressor" : "compressor / index-key");
                 ok = false;
@@ -2105,7 +2105,7 @@ bool gpu_graph_encode_layer_attention_batch(
          * not carry. */
         if (ok && pulsar_attn_runs_indexer(attn->mode)) {
             if (!layer->indexer_attn_q_b || !layer->indexer_proj) {
-                fprintf(stderr, "pulsar: index source %u is missing indexer query weights -- refusing\n", il);
+                fprintf(stderr, "pulsar: index source %u is missing indexer query weights -- refusing\n", il.raw());
                 ok = false;
             }
             if (ok) ok = pulsar_linear_slot(g->batch_indexer_q, model, layer->indexer_attn_q_b, q_rank, 0, (uint64_t)PULSAR_N_INDEXER_HEAD * PULSAR_N_INDEXER_HEAD_DIM, g->batch_qr_norm, n_tokens);
@@ -2168,7 +2168,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                   &gact_data, &gact_scale, &gact_kbp, &gact_slab)) {
                 fprintf(stderr, "pulsar: layer %u: grouped E4M3 activation slot for %u x %u x %u heads "
                                 "unavailable -- refusing (no quantize-pass fallback)\n",
-                        il, n_tokens, n_groups, group_dim);
+                        il.raw(), n_tokens, n_groups, group_dim);
                 ok = false;
             }
             /* The top-k path needs a top-k.  A FULL_UNINDEXED source never has
@@ -2316,7 +2316,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                             &gact_data, &gact_scale, &gact_kbp, &gact_slab)) {
                 fprintf(stderr, "pulsar: layer %u: grouped E4M3 activation slot for %u x %u x %u heads "
                                 "unavailable -- refusing (no quantize-pass fallback)\n",
-                        il, n_tokens, n_groups, group_dim);
+                        il.raw(), n_tokens, n_groups, group_dim);
                 ok = false;
             }
             if (ok) ok = pulsar_gpu_attention_prefill_static_mixed_heads_tensor(g->batch_heads,
@@ -2358,7 +2358,7 @@ bool gpu_graph_encode_layer_attention_batch(
          * spans).  Reaching it banked would silently compute the wrong rows. */
         fprintf(stderr, "pulsar: multiseq layer batch rejected: unsupported shape "
                         "(layer %u n_tokens=%u raw_cap=%u)\n",
-                il, n_tokens, g->raw_cap);
+                il.raw(), n_tokens, g->raw_cap);
         ok = false;
     }
     if (ok && !raw_batch_attention && !batch_attention_done) {
@@ -2406,7 +2406,7 @@ bool gpu_graph_encode_layer_attention_batch(
             /* L283: one row at a time cannot reach FORWARD into the rest of an image span -- refuse, never run the
              * block causally (no sync reaches this: a chunk past 0 fits the raw ring, the batched arms above) */
             fprintf(stderr, "pulsar: layer %u: an image span in a %u-row chunk at %u would take the per-token arm, "
-                            "which has no span visibility -- refusing\n", il, n_tokens, pos0);
+                            "which has no span visibility -- refusing\n", il.raw(), n_tokens, pos0);
             ok = false;
         }
         if (raw_prefix_tokens < n_tokens) {
@@ -2661,8 +2661,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                   g->batch_attn_low,
                                                   n_tokens) != 0;
         if (!ok) fprintf(stderr, "pulsar: layer %u attention: row-parallel stage 'b' refused (owned groups "
-                                 "[%u,%u) of %u)\n", il, g_lo, g_hi, n_groups_total);
-        if (ok) ok = gpu_graph_tp_allreduce_rows(g, il, n_tokens, g->batch_attn_out, NULL, "attention");
+                                 "[%u,%u) of %u)\n", il.raw(), g_lo, g_hi, n_groups_total);
+        if (ok) ok = gpu_graph_tp_allreduce_rows(g, gpu_graph_tp_slot(il), n_tokens, g->batch_attn_out, NULL, "attention");
     } else if (ok) {
         ok = pulsar_gpu_attention_output_b_tensor(g->batch_attn_out,
                                                   tensor_map_base(model, layer->attn_output_a),
@@ -2728,19 +2728,19 @@ bool gpu_graph_encode_layer_attention_batch(
  * failure.  Host staging is a transient cost on this first wiring; the D2H/H2D
  * can move onto the registerable GB10 slab later. */
 /// @param g the graph (its TP group)
-/// @param il the layer
+/// @param slot the exchange slot (gpu_graph_tp_slot / gpu_graph_drafter_tp_slot)
 /// @param n_tokens rows
 /// @param t the rows, summed in place
 /// @param addend added to the sum (NULL = none)
 /// @param what the call's name, for refusal lines
 /// @return false = failed (said)
-bool gpu_graph_tp_allreduce_rows(pulsar_gpu_graph *g, uint32_t il, uint32_t n_tokens,
+bool gpu_graph_tp_allreduce_rows(pulsar_gpu_graph *g, TpSlot slot, uint32_t n_tokens,
                               pulsar_gpu_tensor *t, pulsar_gpu_tensor *addend,
                               const char *what) {
     /* L266: the lanes are the engine's (tp_rows.cpp); the graph lends its transport, slab, ticket and seq */
     const pulsar_tp_rows x = {g->tp, g->tp_slab_dev, g->tp_bulk_dev, g->tp_stage_ticket, &g->tp_prefill_seq,
                               (uint32_t)PULSAR_N_EMBD};
-    return pulsar_tp_allreduce_rows(&x, il, n_tokens, t, addend, what);
+    return pulsar_tp_allreduce_rows(&x, slot, n_tokens, t, addend, what);
 }
 
 /** @def PULSAR_CUDA_ENCODE_PREFILL_SHARED_EXPERT
@@ -2759,7 +2759,7 @@ bool gpu_graph_encode_layer_ffn_batch(
         pulsar_gpu_graph  *g,
         const pulsar_model        *model,
         const pulsar_layer_weights *layer,
-        uint32_t                il,
+        TrunkLayer                il,
         uint32_t                pos0,
         uint32_t                n_tokens) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
@@ -2943,7 +2943,7 @@ bool gpu_graph_encode_layer_ffn_batch(
     if (ok && g->tp &&
         !pulsar_tp_owned_range(pulsar_tp_rank(g->tp), pulsar_tp_n_ranks(g->tp),
                                (uint32_t)shared_dim, &shx_lo, &shx_hi)) {
-        fprintf(stderr, "pulsar: tp owned shared-expert range refused (layer %u)\n", il);
+        fprintf(stderr, "pulsar: tp owned shared-expert range refused (layer %u)\n", il.raw());
         ok = false;
     }
     const uint64_t shared_own = (uint64_t)(shx_hi - shx_lo);
@@ -3044,7 +3044,7 @@ bool gpu_graph_encode_layer_ffn_batch(
         mc.n_expert_used = layer->n_expert_used;
         mc.clamp = PULSAR_SWIGLU_CLAMP_EXP;
         mc.x = g->batch_ffn_norm;
-        mc.layer = il;
+        mc.layer = il.raw();   /* the kernel call's layer label (its non-finite code) */
         mc.n_tokens = n_tokens;
         ok = pulsar_moe_routed_slot(&mc);
     }
@@ -3060,7 +3060,7 @@ bool gpu_graph_encode_layer_ffn_batch(
         if (!pulsar_gpu_mxfp8_act_cache_decode_f32(g->batch_routed_mid,
                                                    (uint64_t)n_tokens * layer->n_expert_used,
                                                    down_in_dim, g->batch_routed_mid)) {
-            fprintf(stderr, "pulsar: imatrix: the routed leaf's E4M3 slot could not be decoded at layer %u\n", il);
+            fprintf(stderr, "pulsar: imatrix: the routed leaf's E4M3 slot could not be decoded at layer %u\n", il.raw());
             ok = false;
         }
     }
@@ -3116,7 +3116,7 @@ bool gpu_graph_encode_layer_ffn_batch(
          * on the decode row lane inside its stage kernel, no launch of its
          * own.  Every consumer below (hc expand-add, ffn_out) then reads the
          * full sum from routed_out and +0.0f from shared_out, as before. */
-        ok = gpu_graph_tp_allreduce_rows(g, il, n_tokens, g->batch_routed_out, g->batch_shared_out, "FFN");
+        ok = gpu_graph_tp_allreduce_rows(g, gpu_graph_tp_slot(il), n_tokens, g->batch_routed_out, g->batch_shared_out, "FFN");
         if (ok && keep_ffn_out) {
             ok = gpu_graph_ensure_batch_ffn_out(g) &&
                  pulsar_gpu_add_tensor(g->batch_ffn_out,
@@ -3184,7 +3184,7 @@ bool gpu_graph_encode_layer_ffn_batch(
 /// @param il the layer
 /// @param n_tokens the step's rows
 /// @return false = an armed capture failed
-static bool dspark_capture_anchors(pulsar_gpu_graph *g, uint32_t il, uint32_t n_tokens) {
+static bool dspark_capture_anchors(pulsar_gpu_graph *g, TrunkLayer il, uint32_t n_tokens) {
     /* row0: the anchor capture reads the step's leading (verify) rows; the bulk
      * capture reads from dspark_bulk_row0 -- 0 for a classic chunk, the decode-row
      * count for a fused step whose prefill rows follow them (L260). */
@@ -3198,7 +3198,7 @@ static bool dspark_capture_anchors(pulsar_gpu_graph *g, uint32_t il, uint32_t n_
             if (il != g->dspark_target_layer_ids[slot]) continue;
             if (!cap[c].dst[slot]) {
                 fprintf(stderr, "pulsar: drafter %s capture: layer %u is anchor slot %d but "
-                                "its buffer is not allocated -- refusing\n", cap[c].what, il, slot);
+                                "its buffer is not allocated -- refusing\n", cap[c].what, il.raw(), slot);
                 return false;
             }
             if (cap[c].row0 >= n_tokens) {
@@ -3239,7 +3239,7 @@ bool gpu_graph_encode_layer_batch(
         pulsar_gpu_graph  *g,
         const pulsar_model        *model,
         const pulsar_layer_weights *layer,
-        uint32_t                il,
+        TrunkLayer                il,
         uint32_t                pos0,
         uint32_t                n_tokens) {
     /* ENGRAM (V4.1 blocks 1 and 14, L242 slice 5): the reference adds the
@@ -3264,12 +3264,12 @@ bool gpu_graph_encode_layer_batch(
     if (ok && !g_pulsar_shape.dspark_anchor_after) ok = dspark_capture_anchors(g, il, n_tokens);
     if (ok) ok = gpu_graph_encode_layer_attention_batch(g, model, layer, il, pos0, n_tokens);
     if (!ok) {
-        fprintf(stderr, "pulsar: gpu layer %u attention batch encode failed\n", il);
+        fprintf(stderr, "pulsar: gpu layer %u attention batch encode failed\n", il.raw());
     }
     if (ok) {
         ok = gpu_graph_encode_layer_ffn_batch(g, model, layer, il, pos0, n_tokens);
         if (!ok) {
-            fprintf(stderr, "pulsar: gpu layer %u ffn batch encode failed\n", il);
+            fprintf(stderr, "pulsar: gpu layer %u ffn batch encode failed\n", il.raw());
         }
     }
     if (ok) {
@@ -3312,14 +3312,14 @@ bool gpu_graph_encode_layer_batch(
 /// @param pos the position
 /// @param what the kernel
 /// @return false, always
-static bool rollforward_fail(uint32_t il, uint32_t pos, const char *what) {
+static bool rollforward_fail(TrunkLayer il, uint32_t pos, const char *what) {
     char done[48];
-    if (il == 0u) snprintf(done, sizeof done, "no layer is");
-    else snprintf(done, sizeof done, "layers 0..%u are", il - 1u);
+    if (il == TrunkLayer{0u}) snprintf(done, sizeof done, "no layer is");
+    else snprintf(done, sizeof done, "layers 0..%u are", il.raw() - 1u);
     fprintf(stderr, "pulsar: compressor rollforward FAILED at layer %u pos %u (%s) -- %s "
                     "advanced to the committed frontier, layers %u.. are not: the pool state is "
                     "half-advanced and the caller must invalidate the checkpoint (it does)\n",
-            il, pos, what, done, il);
+            il.raw(), pos, what, done, il.raw());
     return false;
 }
 
@@ -3357,7 +3357,7 @@ bool gpu_graph_dspark_compressor_rollforward(
                 save_row0, n_positions, (unsigned)PULSAR_SPEC_LOGITS_ROWS + 1u);
         return false;
     }
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio > 1u) {

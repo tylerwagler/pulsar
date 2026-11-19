@@ -141,7 +141,7 @@ pulsar_drafter_kind drafter(pulsar_engine *) { return PULSAR_DRAFTER_NONE; }
 int quant_bits(pulsar_engine *e) {
     const pulsar_nemotron_enc_model *w = model_of(e);
     int bits = 0;
-    for (uint32_t il = 0; il < w->shape.n_layer; il++) {
+    for (TrunkLayer il{0u}; il.below(w->shape.n_layer); ++il) {
         const pulsar_nemotron_enc_layer &L = w->layer[il];
         for (const pulsar_tensor *t : {L.attn_q, L.attn_k, L.attn_v, L.attn_o, L.ffn_gate, L.ffn_up, L.ffn_down}) {
             const int k2 = t ? exl3_type_k2(t->type) : 0;

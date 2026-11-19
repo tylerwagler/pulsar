@@ -105,10 +105,27 @@ typedef struct {
     bool block_written;        ///< L298 pulsar.drafter = "lilicorr": the container holds the LiLiCorr block drafter
     /** L298: HF block b's place in the plan -- pulsar layer block_layer[b], its mixer (PULSAR_BLOCK_TAP_MIXER) or its
      *  MoE (PULSAR_BLOCK_TAP_FFN): where a block drafter's tap after block b reads the residual */
-    uint8_t block_layer[PULSAR_NEMOTRON_H_MAX_BLOCKS];
+    pulsar_indexed<uint8_t, SrcBlock, PULSAR_NEMOTRON_H_MAX_BLOCKS> block_layer;
     /// L298: HF block b's half of its layer: PULSAR_BLOCK_TAP_MIXER or PULSAR_BLOCK_TAP_FFN (pairs with block_layer)
-    uint8_t block_sub[PULSAR_NEMOTRON_H_MAX_BLOCKS];
+    pulsar_indexed<uint8_t, SrcBlock, PULSAR_NEMOTRON_H_MAX_BLOCKS> block_sub;
 } pulsar_nemotron_h_shape;
+
+/** L436: the trunk layer HF block `b` belongs to -- the plan groups a mixer block and the MoE block after it into ONE
+ *  layer, so a block's number is NOT its layer's.  The shape's table
+ *  (pulsar_nemotron_h_read_shape's grouping) is the one crossing.
+ *  @param s the shape
+ *  @param b an HF block, below s->n_blocks */
+/// @return the trunk layer holding the block
+static inline TrunkLayer pulsar_nemotron_h_block_layer(const pulsar_nemotron_h_shape *s, SrcBlock b) {
+    return TrunkLayer{s->block_layer[b]};
+}
+/** L436: which half of its layer HF block `b` is: PULSAR_BLOCK_TAP_MIXER or PULSAR_BLOCK_TAP_FFN.
+ *  @param s the shape
+ *  @param b an HF block, below s->n_blocks */
+/// @return the block's sublayer
+static inline uint32_t pulsar_nemotron_h_block_sub(const pulsar_nemotron_h_shape *s, SrcBlock b) {
+    return s->block_sub[b];
+}
 
 /// The one profile (Nemotron-3.5 Super): the geometry every container must equal.
 extern const pulsar_nemotron_h_shape PULSAR_NEMOTRON_H_SHAPE_SUPER;
@@ -244,7 +261,7 @@ typedef struct {
      *  @var pulsar_nemotron_h_vision::pos
      *  vit_pos: the CPE position table, BF16 [pos_grid * pos_grid][width] */
     pulsar_tensor *patch, *cls, *pos;
-    pulsar_vit_block vit[PULSAR_NEMOTRON_H_VIT_DEPTH];   ///< the ViT blocks (block `vit`, layer il)
+    pulsar_indexed<pulsar_vit_block, VisLayer, PULSAR_NEMOTRON_H_VIT_DEPTH> vit;   ///< the ViT blocks (block `vit`, layer il)
     /** @var pulsar_nemotron_h_vision::final_norm
      *  vit_final_norm: vision_final_layernorm's weight, f32 [width]
      *  @var pulsar_nemotron_h_vision::final_norm_b
@@ -363,7 +380,7 @@ typedef struct {
     pulsar_tensor *output_norm;      ///< output_norm [n_embd] (norm_f)
     pulsar_tensor *head;             ///< head [n_embd -> n_vocab] (untied)
     /// The trunk layers (grouped from the HF blocks); entries [0, shape.n_layer) are bound.
-    pulsar_nemotron_h_block layer[PULSAR_FAMILY_MAX_LAYER];
+    pulsar_indexed<pulsar_nemotron_h_block, TrunkLayer, PULSAR_FAMILY_MAX_LAYER> layer;
     /// The MTP module; bound only when the container holds it and the open selected it (drafting), else all NULL.
     pulsar_nemotron_h_draft mtp;
     /** L331: the vision tower (present when the container holds it; else images are refused by name). */

@@ -99,7 +99,12 @@ static inline uint32_t pulsar_gemma4_ff_exp_stored(const pulsar_gemma4_shape *s)
 /// @param s   the shape
 /// @param il  the layer
 /// @return true for a global layer
-static inline bool pulsar_gemma4_is_full(const pulsar_gemma4_shape *s, uint32_t il) { return s->full_layers >> il & 1u; }
+static inline bool pulsar_gemma4_is_full(const pulsar_gemma4_shape *s, TrunkLayer il) { return s->full_layers >> il.raw() & 1u; }
+/** L436: the trunk layer of a block in the source checkpoint's numbering (a block drafter's tap ids): HF decoder
+ *  layer i is the trunk's layer i.
+ *  @param b the checkpoint's layer */
+/// @return the trunk layer
+static inline TrunkLayer pulsar_gemma4_block_layer(SrcBlock b) { return TrunkLayer{b.raw()}; }
 
 /** Read the shape from the container's keys and check it (gemma4_shape.cpp).  Every refusal is said and counted
  *  (pulsar_load_refuse); false = at least one. */
@@ -166,7 +171,7 @@ typedef struct {
     pulsar_tensor *output_norm;         ///< output_norm [n_embd]
     pulsar_tensor *head;                ///< head [n_embd -> n_vocab]: the pack's EXL3 head (quantized from the tied embedding)
     /// The layers; entries [0, shape.n_layer) are bound, the rest stay zero.
-    pulsar_gemma4_block layer[PULSAR_FAMILY_MAX_LAYER];
+    pulsar_indexed<pulsar_gemma4_block, TrunkLayer, PULSAR_FAMILY_MAX_LAYER> layer;
     /** What the binding priced (role_bind.h): every byte the core stages, by role. */
     pulsar_role_census census;
     /** The digest a session's disk segments are keyed by: the directory's names, types and sizes (FNV-1a). */

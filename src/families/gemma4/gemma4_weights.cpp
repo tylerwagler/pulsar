@@ -41,13 +41,13 @@ const pulsar_role_admit A_F16 = {PULSAR_ROLE_PLAIN(PULSAR_TENSOR_F16), false, PU
  *  @param in     the projection's logical input width
  *  @param out    its logical output width
  *  @param L      receives the pair */
-void bind_lora(pulsar_role_binder *b, const char *target, int32_t il, uint64_t r, uint64_t in, uint64_t out,
+void bind_lora(pulsar_role_binder *b, const char *target, TrunkLayer il, uint64_t r, uint64_t in, uint64_t out,
                pulsar_gemma4_lora *L) {
     char ra[48], rb[48];
     snprintf(ra, sizeof(ra), "%s_lora_a", target);
     snprintf(rb, sizeof(rb), "%s_lora_b", target);
-    L->a = pulsar_role_bind(b, pulsar_role_in(ra, LAYERS, il), A_F16, 2, in, r);
-    L->b = pulsar_role_bind(b, pulsar_role_in(rb, LAYERS, il), A_F16, 2, r, out);
+    L->a = pulsar_role_bind(b, pulsar_role_in(ra, LAYERS, (int32_t)il.raw()), A_F16, 2, in, r);
+    L->b = pulsar_role_bind(b, pulsar_role_in(rb, LAYERS, (int32_t)il.raw()), A_F16, 2, r, out);
 }
 
 /** L338 P2: the adapter, when the container carries one (pulsar.adapter): its rank and scale from the kv, every
@@ -73,17 +73,17 @@ void bind_adapter(const pulsar_model *m, pulsar_role_binder *b, pulsar_gemma4_mo
     w->adapter = true;
     w->lora_scale = alpha / (float)w->lora_r;
     const uint64_t r = w->lora_r, E = s->n_embd, nq = s->n_head;
-    for (uint32_t il = 0; il < s->n_layer; il++) {
+    for (TrunkLayer il{0u}; il.below(s->n_layer); ++il) {
         pulsar_gemma4_block *L = &w->layer[il];
         const bool full = pulsar_gemma4_is_full(s, il);
         const uint64_t nkv = full ? s->n_head_kv : s->swa_n_head_kv, hd = full ? s->head_dim : s->swa_head_dim;
-        bind_lora(b, "attn_q", (int32_t)il, r, E, nq * hd, &L->lora_q);
-        bind_lora(b, "attn_k", (int32_t)il, r, E, nkv * hd, &L->lora_k);
-        if (!full) bind_lora(b, "attn_v", (int32_t)il, r, E, nkv * hd, &L->lora_v);
-        bind_lora(b, "attn_o", (int32_t)il, r, nq * hd, E, &L->lora_o);
-        bind_lora(b, "ffn_gate", (int32_t)il, r, E, s->n_ff, &L->lora_gate);
-        bind_lora(b, "ffn_up", (int32_t)il, r, E, s->n_ff, &L->lora_up);
-        bind_lora(b, "ffn_down", (int32_t)il, r, s->n_ff, E, &L->lora_down);
+        bind_lora(b, "attn_q", il, r, E, nq * hd, &L->lora_q);
+        bind_lora(b, "attn_k", il, r, E, nkv * hd, &L->lora_k);
+        if (!full) bind_lora(b, "attn_v", il, r, E, nkv * hd, &L->lora_v);
+        bind_lora(b, "attn_o", il, r, nq * hd, E, &L->lora_o);
+        bind_lora(b, "ffn_gate", il, r, E, s->n_ff, &L->lora_gate);
+        bind_lora(b, "ffn_up", il, r, E, s->n_ff, &L->lora_up);
+        bind_lora(b, "ffn_down", il, r, s->n_ff, E, &L->lora_down);
     }
     const pulsar_tensor *h = pulsar_role_binder_find(b, pulsar_role_top("decision_head"));
     w->decision_slots = h && h->ndim == 2 ? (uint32_t)h->dim[1] : 0;
@@ -101,11 +101,11 @@ void bind_adapter(const pulsar_model *m, pulsar_role_binder *b, pulsar_gemma4_mo
  *  @param s   the shape (widths)
  *  @param il  the layer
  *  @param L   receives the layer's tensors */
-void bind_layer(pulsar_role_binder *b, const pulsar_gemma4_shape *s, int32_t il, pulsar_gemma4_block *L) {
-    const bool full = pulsar_gemma4_is_full(s, (uint32_t)il);
+void bind_layer(pulsar_role_binder *b, const pulsar_gemma4_shape *s, TrunkLayer il, pulsar_gemma4_block *L) {
+    const bool full = pulsar_gemma4_is_full(s, il);
     const uint64_t E = s->n_embd, nq = s->n_head;
     const uint64_t nkv = full ? s->n_head_kv : s->swa_n_head_kv, hd = full ? s->head_dim : s->swa_head_dim;
-    auto k = [&](const char *role) { return pulsar_role_in(role, LAYERS, il); };
+    auto k = [&](const char *role) { return pulsar_role_in(role, LAYERS, (int32_t)il.raw()); };   /* the name's number */
     L->attn_norm = pulsar_role_bind(b, k("attn_norm"), A_BF16, 1, E);
     L->attn_q = pulsar_role_bind(b, k("attn_q"), A_LINEAR, 2, E, nq * hd);
     L->attn_k = pulsar_role_bind(b, k("attn_k"), A_LINEAR, 2, E, nkv * hd);
@@ -149,7 +149,7 @@ bool pulsar_gemma4_bind(const pulsar_model *m, pulsar_gemma4_model *w) {
     w->embed = pulsar_role_bind(b, pulsar_role_top("embed"), A_BF16, 2, s->n_embd, s->n_vocab);
     w->output_norm = pulsar_role_bind(b, pulsar_role_top("output_norm"), A_BF16, 1, s->n_embd);
     w->head = pulsar_role_bind(b, pulsar_role_top("head"), A_LINEAR, 2, s->n_embd, s->n_vocab);
-    for (uint32_t il = 0; il < s->n_layer; il++) bind_layer(b, s, (int32_t)il, &w->layer[il]);
+    for (TrunkLayer il{0u}; il.below(s->n_layer); ++il) bind_layer(b, s, il, &w->layer[il]);
     bind_adapter(m, b, w);
     /* L338 P3: the block drafter (block `drafter`) when the open loaded it, else unloaded */
     if (w->block) {

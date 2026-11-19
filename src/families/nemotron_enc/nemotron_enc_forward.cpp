@@ -200,7 +200,7 @@ bool forward(pulsar_engine *e, const pulsar_tokens *in, uint32_t n, uint32_t row
     const uint16_t *table = wp(w->embed, "nemotron_enc embed");
     if (!table || pulsar_head_embed_launch(&hd, table, s.n_vocab, dp<int32_t>(r->sc->t[B_IDS]), rows, h, E, 0) != 0)
         return fail(err, errlen, "the embedding refused");
-    if (pulsar_rows_rmsnorm_launch(h, E, rows, E, wp(w->layer[0].attn_norm, "nemotron_enc attn_norm"), s.rms_eps, xn,
+    if (pulsar_rows_rmsnorm_launch(h, E, rows, E, wp(w->layer[TrunkLayer{0}].attn_norm, "nemotron_enc attn_norm"), s.rms_eps, xn,
                                    E, 0) != 0)
         return fail(err, errlen, "layer 0's attention norm refused");
     pulsar_gqa_io io = {};
@@ -211,9 +211,9 @@ bool forward(pulsar_engine *e, const pulsar_tokens *in, uint32_t n, uint32_t row
     io.ld_out = Q;
     io.workspace = dp(r->sc->t[B_AWS]);
     io.workspace_bytes = r->sc->bytes[B_AWS];
-    for (uint32_t il = 0; il < s.n_layer; il++) {
+    for (TrunkLayer il{0u}; il.below(s.n_layer); ++il) {
         const pulsar_nemotron_enc_layer &L = w->layer[il];
-        const uint16_t *next = il + 1 < s.n_layer ? wp(w->layer[il + 1].attn_norm, "nemotron_enc attn_norm")
+        const uint16_t *next = il.next().below(s.n_layer) ? wp(w->layer[il.next()].attn_norm, "nemotron_enc attn_norm")
                                                   : wp(w->output_norm, "nemotron_enc output_norm");
         const uint16_t *fnorm = wp(L.ffn_norm, "nemotron_enc ffn_norm");
         if (!next || !fnorm) return fail(err, errlen, "a norm has no device copy");
@@ -428,7 +428,7 @@ bool pulsar_nemotron_enc_run_create(pulsar_engine *e) {
     A.rope_inv_freq = dp<float>(r->rope);
     /* the linears' workspace: the most any of the layer's launches takes at a chunk */
     uint64_t lws = 0;
-    for (uint32_t il = 0; il < s.n_layer; il++) {
+    for (TrunkLayer il{0u}; il.below(s.n_layer); ++il) {
         const pulsar_nemotron_enc_layer &L = w->layer[il];
         struct { int n; const pulsar_tensor *t[3]; int in; int out[3]; } groups[] = {
             {3, {L.attn_q, L.attn_k, L.attn_v}, (int)E, {(int)Q, (int)KV, (int)KV}},

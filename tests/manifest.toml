@@ -252,6 +252,12 @@ overlap = true
 budget = 90
 
 [[test]]
+name = "layer-index-gate"
+tier = "check"
+overlap = true
+budget = 120   # L436: seven inspect-only opens of the published containers (headers), seconds each
+
+[[test]]
 name = "kv-identity-gate"
 tier = "check"
 overlap = true
