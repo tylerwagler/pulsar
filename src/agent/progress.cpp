@@ -33,7 +33,7 @@ void worker_progress_cb(void *ud, const char *event, TokPos current, TokCount to
     if (done < 0) done = 0;
     if (done > w->status.prefill_total) done = w->status.prefill_total;
     w->status.prefill_done = done;
-    double elapsed = agent_now_sec() - w->progress_started_at;
+    double elapsed = pulsar_mono_sec() - w->progress_started_at;
     w->status.prefill_tps =
         done > 0 && elapsed > 0.0 ? (double)done / elapsed : 0.0;
     agent_wake_locked(w);

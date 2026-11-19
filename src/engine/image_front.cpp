@@ -18,13 +18,6 @@
 
 #include <time.h>
 
-/// @return CLOCK_MONOTONIC, in seconds
-static double front_now_s(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-}
-
 /// @param e the engine, or NULL
 /// @return its family's image front, or NULL
 static const pulsar_family_vision *front_of(const pulsar_engine *e) {
@@ -181,12 +174,12 @@ bool pulsar_image_merge_chunk(const pulsar_engine *e, const TokId *ids, int n_id
         if (!rows) return false;
         char err[256] = "";
         bool hit = false;
-        const double t0 = front_now_s();
+        const double t0 = pulsar_mono_sec();
         const bool ok = pulsar_image_block_rows(e, img, ids + s0, block_len, rows, &hit, err, sizeof err) &&
                         write(ud, rows, (uint32_t)block_len, s0 - pos0, n_tokens);
         free(rows);
         fprintf(stderr, "pulsar: image %d: %s %.1f ms (%d block rows)\n", i,
-                hit ? "CACHED tower (encode skipped)" : "tower encode+assemble", (front_now_s() - t0) * 1000.0,
+                hit ? "CACHED tower (encode skipped)" : "tower encode+assemble", pulsar_ms_of_sec(pulsar_mono_sec() - t0),
                 block_len);
         if (!ok) {
             fprintf(stderr, "pulsar: image %d at token %d failed to merge (block %d rows)%s%s\n", i, img->start_pos,

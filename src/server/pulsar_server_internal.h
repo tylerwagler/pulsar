@@ -1743,8 +1743,8 @@ typedef struct {
  *  typically over 100 ms and a two-chunk checkpoint about 300 ms, so a follow-up arriving inside the grace finds the
  *  bank free and absorbs the reply's rows in its own sync (about 1 ms a token). */
 #define PULSAR_SERVER_TERMINAL_GRACE_MS 300
-/// @param now_sec       server_now_sec() now
-/// @param turn_ended_at server_now_sec() when the slot's turn ended (session_slot::turn_ended_at)
+/// @param now_sec       pulsar_mono_sec() now
+/// @param turn_ended_at pulsar_mono_sec() when the slot's turn ended (session_slot::turn_ended_at)
 /// @return seconds of the idle grace (PULSAR_SERVER_TERMINAL_GRACE_MS) still to pass before the turn's terminal
 ///         checkpoint may start; 0 once it may
 double server_terminal_grace_left_s(double now_sec, double turn_ended_at);
@@ -1921,7 +1921,7 @@ typedef struct {
     bool cached_seen;                ///< L353 no. 17: a load with cached bytes has set best_cached_ms_per_gib
     double best_cold_ms_per_gib;     ///< L342: the lowest cold_ms_per_gib has been (the relaxation's floor)
     double best_cached_ms_per_gib;   ///< L342: the lowest cached_ms_per_gib has been (the relaxation's floor)
-    /// L342: server_now_sec() of the last load's start, slice or finish; 0 = never
+    /// L342: pulsar_mono_sec() of the last load's start, slice or finish; 0 = never
     double last_sec;
 } kv_read_cost;
 /** @var kv_read_cost::scc
@@ -1945,7 +1945,7 @@ typedef struct {
 void kv_read_cost_observe(kv_read_cost *c, uint64_t bytes, uint64_t cached, double ms, double now_sec);
 /** L342: a load started or progressed at `now_sec` -- holds the relaxation (kv_read_cost::last_sec). */
 /// @param c        the fit (caller holds server::mu)
-/// @param now_sec  server_now_sec() now; an earlier reading is ignored
+/// @param now_sec  pulsar_mono_sec() now; an earlier reading is ignored
 void kv_read_cost_touch(kv_read_cost *c, double now_sec);
 /** L353 no. 16: how many times a restore read its chain.
  *  @param verify it was checked before the load
@@ -1957,7 +1957,7 @@ uint64_t kv_restore_reads(bool verify, bool retained);
 /// @param c        the fit
 /// @param bytes    bytes to read
 /// @param cached   of which in the RAM tier
-/// @param now_sec  server_now_sec() now (the relaxation's clock)
+/// @param now_sec  pulsar_mono_sec() now (the relaxation's clock)
 /// @param ms       receives the estimate, ms
 /// @return false before the first load
 bool kv_read_cost_ms(const kv_read_cost *c, uint64_t bytes, uint64_t cached, double now_sec, double *ms);
@@ -2031,7 +2031,7 @@ typedef struct {
     int slot;               ///< that job's slot (server::slots index)
     PromptPos mark;         ///< the cut the leader's prefill is to stand at: an index into both prompts (shared by id)
     PromptToks have;        ///< the request's tokens served when it started waiting (the gain is mark - have)
-    double since;           ///< server_now_sec() when it started waiting
+    double since;           ///< pulsar_mono_sec() when it started waiting
 } prefix_wait;
 
 /** One bound prefill a queued request could wait on. */
@@ -2661,7 +2661,7 @@ typedef struct session_slot {
      *  history is prefilled again to its consumed end (server::terminal_checkpoint_step), so the next turn resumes
      *  there instead of re-prefilling the reply first.  Cleared by the next job's bind. */
     bool         terminal_pending;
-    /** L380: server_now_sec() when the turn that armed terminal_pending ended: its checkpoint starts no sooner than
+    /** L380: pulsar_mono_sec() when the turn that armed terminal_pending ended: its checkpoint starts no sooner than
      *  PULSAR_SERVER_TERMINAL_GRACE_MS after it (server_terminal_grace_left_s). */
     double       turn_ended_at;
     /** L380: the turn of a terminal checkpoint that YIELDED to a queued request (len > 0 only with terminal_pending):
@@ -3053,7 +3053,7 @@ struct server {
     /** L338: the KV is a discrete card's: its readings are the device's.  L391: set whether or not the guard runs
      *  -- every headroom check reads the memory the bytes occupy through it (server::mem_reading). */
     bool         guard_discrete;
-    double       guard_avail_at;         ///< when it was read (server_now_sec); re-read at most every 0.25 s
+    double       guard_avail_at;         ///< when it was read (pulsar_mono_sec); re-read at most every 0.25 s
     KvBytes      guard_budget_said;      ///< the live budget last logged (a move of 0.5 GiB or more is said)
     /** L357: the ledger budget set at run time by the test route POST /test/guard-budget (0 = none: guard_kv_budget
      *  stands).  The run-time twin of PULSAR_SERVER_KV_BUDGET_OVERRIDE, so the live legs that lower the budget share
@@ -3067,7 +3067,7 @@ struct server {
     void set_test_guard_budget(KvBytes b) { __atomic_store_n(&guard_test_budget_raw, b.raw(), __ATOMIC_RELAXED); }
     /** L357: PULSAR_SERVER_TEST_ROUTES=1 at startup -- the /test/ routes answer; otherwise they are unknown paths. */
     bool         test_routes;
-    /** L362: when spill_bank last said "nowhere to park the pool" for each bank (server_now_sec; once per 10 s) */
+    /** L362: when spill_bank last said "nowhere to park the pool" for each bank (pulsar_mono_sec; once per 10 s) */
     double       park_refused_said[PULSAR_SESSION_POOL_CAP];
     /** The stall watchdog (watchdog.cpp).  `stall_s` is written by the watchdog and read by /health (__atomic);
      *  For the dump, `worker_tid` is set by server_worker_main and `worker_thread` by cli_main after pthread_create. */
@@ -3903,12 +3903,12 @@ struct server {
      *  has passed, and the sync yields at a chunk end to a request queued meanwhile (server_request_queued, after
      *  at least one chunk landed): the bank then stands at a valid prefix, nothing is persisted, and the slot stays
      *  pending with its turn kept (session_slot::terminal_turn) for the next idle moment. */
-    /// @param now_sec       server_now_sec() now
+    /// @param now_sec       pulsar_mono_sec() now
     /// @param grace_waived  true to pick a turn still inside its grace (shutdown: every pending checkpoint runs)
     /// @return true when it ran one (to its end or to a yield) or dropped one that no longer applies, false when none
     ///         is pending and due
     bool terminal_checkpoint_step(double now_sec, bool grace_waived);
-    /// @param now_sec server_now_sec() now
+    /// @param now_sec pulsar_mono_sec() now
     /// @return seconds until the earliest pending terminal checkpoint is due (0: one is due now), < 0 when none is
     ///         pending -- the idle worker's wait (L380)
     double terminal_wait_s(double now_sec) const;
@@ -4656,16 +4656,16 @@ struct job {
      *  a prefill it shares): a gateway in front (Cloudflare's ~100 s origin timeout) sees bytes from then on, not at
      *  the first prefill chunk.  The worker claims the socket (job_claim_writes) before its first write; after that
      *  the client thread writes nothing.  All under mu. */
-    double accepted_at;   ///< server_now_sec when the client thread enqueued it
+    double accepted_at;   ///< pulsar_mono_sec when the client thread enqueued it
     bool worker_writes;   ///< the worker owns the socket's writes
     bool sse_early;       ///< the client thread sent the SSE head (the stream is open)
     bool sse_early_dead;  ///< an early write failed: the stream is dead
-    double early_last;    ///< server_now_sec of the last early write
+    double early_last;    ///< pulsar_mono_sec of the last early write
 };
 /** Client thread, mu held, while the job waits: open the stream / send a keepalive when one is due (a streaming
  *  request the worker has not claimed).  A write that does not go out whole marks the stream dead. */
 /// @param j    the job
-/// @param now  server_now_sec
+/// @param now  pulsar_mono_sec
 void job_early_keepalive(job *j, double now);
 /** Worker: take the socket's writes from the client thread (before the job's first write).  Returns whether the
  *  stream is already open; `*dead` = an early write failed (nothing more can be written). */
@@ -5128,10 +5128,10 @@ struct gen_state {
     fuse_witness fuse;
     /** L312: the fused lane's round selection (sched_value.cpp) -- this request's token service price over f
      *  (ms per token, Flare's ServicePrice; kept from prefill into decode; <= 0 until first priced), when it last
-     *  delivered output (the decode-age clock, server_now_sec; 0: never), and the round it last rode as a prompt
+     *  delivered output (the decode-age clock, pulsar_mono_sec; 0: never), and the round it last rode as a prompt
      *  (the unpriced rule's order). */
     double sched_inv_ms;
-    /// when it last delivered output (server_now_sec; 0: never)
+    /// when it last delivered output (pulsar_mono_sec; 0: never)
     double sched_out_t;
     /// the round it last rode as a prompt (server::w_sched_rounds; 0: never)
     uint64_t sched_last_ride;
@@ -6128,7 +6128,6 @@ bool anthropic_final_response(int fd,
                                      int prompt_tokens, int completion_tokens);
 bool anthropic_sse_start_live(int fd, const request *r, const char *id,
                                      int prompt_tokens, anthropic_stream *st);
-double server_now_sec(void);
 void server_log(pulsar_log_type type, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 int tool_memory_max_entries(const tool_memory *m);

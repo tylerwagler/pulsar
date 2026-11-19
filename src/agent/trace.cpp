@@ -12,13 +12,12 @@
 /** @brief Print the local wall-clock time, millisecond resolution, as a trace line's timestamp.
  *  @param fp the trace file */
 static void agent_trace_time(FILE *fp) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
+    const struct timespec ts = pulsar_wall_ts();
     struct tm tm;
     localtime_r(&ts.tv_sec, &tm);
     fprintf(fp, "%04d-%02d-%02d %02d:%02d:%02d.%03ld",
             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-            tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec / 1000000);
+            tm.tm_hour, tm.tm_min, tm.tm_sec, pulsar_ms_of_ns(ts.tv_nsec));
 }
 
 

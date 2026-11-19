@@ -1157,7 +1157,7 @@ static void editor_redraw_visible_prompt(agent_editor *ed) {
     editor_move_to_prompt_row(ed);
     write_all(STDOUT_FILENO, "\x1b[0m", 4);
     linenoiseShow(&ed->edit);
-    ed->last_prompt_redraw_time = agent_now_sec();
+    ed->last_prompt_redraw_time = pulsar_mono_sec();
 }
 
 
@@ -1166,7 +1166,7 @@ static void editor_redraw_visible_prompt(agent_editor *ed) {
  *  @param ed the editor
  *  @return true when a repaint is due */
 static bool editor_prompt_redraw_due(agent_editor *ed) {
-    double now = agent_now_sec();
+    double now = pulsar_mono_sec();
     if (ed->last_prompt_redraw_time <= 0.0 ||
         now - ed->last_prompt_redraw_time >= AGENT_STATUS_REDRAW_INTERVAL_SEC)
     {
@@ -1434,26 +1434,26 @@ bool agent_prompt_yes_no_ex(const char *prompt,
     agent_yes_no_auto auto_answer = opts ?
         opts->timeout_answer : AGENT_YES_NO_AUTO_NONE;
     bool use_timeout = timeout_sec > 0 && auto_answer != AGENT_YES_NO_AUTO_NONE;
-    double deadline = use_timeout ? agent_now_sec() + timeout_sec : 0.0;
+    double deadline = use_timeout ? pulsar_mono_sec() + timeout_sec : 0.0;
 
     if (timed_out) *timed_out = false;
     for (;;) {
         printf("%s", prompt);
         if (use_timeout) {
-            int rem = (int)(deadline - agent_now_sec() + 0.999);
+            int rem = (int)(deadline - pulsar_mono_sec() + 0.999);
             if (rem < 0) rem = 0;
             printf("[auto-%s in %ds] ", agent_yes_no_auto_name(auto_answer), rem);
         }
         fflush(stdout);
         if (use_timeout) {
-            double rem_sec = deadline - agent_now_sec();
+            double rem_sec = deadline - pulsar_mono_sec();
             if (rem_sec <= 0.0) {
                 if (timed_out) *timed_out = true;
                 printf("\n");
                 return auto_answer == AGENT_YES_NO_AUTO_YES;
             }
             struct pollfd pfd = {.fd = STDIN_FILENO, .events = POLLIN};
-            int timeout_ms = (int)(rem_sec * 1000.0) + 1;
+            int timeout_ms = (int)pulsar_ms_of_sec(rem_sec) + 1;
             int rc;
             do {
                 rc = poll(&pfd, 1, timeout_ms);

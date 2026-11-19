@@ -29,7 +29,7 @@ bool server_stall_limit_parse(const char *v, int *limit_s, char *err, size_t err
 
 int64_t server_stall_seconds(int64_t now_ms, int64_t beat_ms, bool busy, int limit_s) {
     if (limit_s <= 0 || !busy || now_ms < beat_ms) return 0;
-    const int64_t s = (now_ms - beat_ms) / 1000;
+    const int64_t s = pulsar_sec_of_ms(now_ms - beat_ms);
     return s >= limit_s ? s : 0;
 }
 
@@ -121,15 +121,15 @@ const char *phase_name(int ph) {
 void *watchdog_main(void *arg) {
     server *s = (server *)arg;
     uint64_t seen = g_pulsar_stall.beats.load(std::memory_order_relaxed);
-    int64_t beat_ms = pulsar_stall_now_ms();
+    int64_t beat_ms = pulsar_mono_ms();
     bool dumped = false, busy = false;
-    int64_t ledger_s = beat_ms / 1000;   /* L378: when the last hourly `kv ledger:` line was written (the start) */
+    int64_t ledger_s = pulsar_sec_of_ms(beat_ms);   /* L378: when the last hourly `kv ledger:` line was written (the start) */
     while (!__atomic_load_n(&s->watchdog_quit, __ATOMIC_RELAXED)) {
-        usleep(1000000);
-        const int64_t now = pulsar_stall_now_ms();
+        usleep(pulsar_us_of_sec(1u));
+        const int64_t now = pulsar_mono_ms();
         /* L378: the hourly ledger line, from the variables /metrics reads (under mu, tried once: a held mu leaves it
          * due for the next second) */
-        if (kv_ledger_due(now / 1000, ledger_s) && s->kv_ledger_log(false)) ledger_s = now / 1000;
+        if (kv_ledger_due(pulsar_sec_of_ms(now), ledger_s) && s->kv_ledger_log(false)) ledger_s = pulsar_sec_of_ms(now);
         const uint64_t beats = g_pulsar_stall.beats.load(std::memory_order_relaxed);
         if (beats != seen) {
             seen = beats;
@@ -194,7 +194,7 @@ void server::watchdog_dump(int64_t stalled_s) {
     auto *s = this;
     const char *where = g_pulsar_stall.where.load(std::memory_order_relaxed);
     const int64_t where_ms = g_pulsar_stall.where_ms.load(std::memory_order_relaxed);
-    const double where_age = where_ms ? (double)(pulsar_stall_now_ms() - where_ms) / 1000.0 : 0.0;
+    const double where_age = where_ms ? pulsar_sec_of_ms((double)(pulsar_mono_ms() - where_ms)) : 0.0;
     server_log(PULSAR_LOG_DEFAULT,
                "pulsar-server: STALL: the worker has made no progress for %lld s (limit %d s, PULSAR_STALL_WATCHDOG_S): "
                "last section entered \"%s\" %.1f s ago, %llu marks so far",

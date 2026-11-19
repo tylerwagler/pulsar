@@ -192,7 +192,7 @@ static void server_progress_cb(void *ud, const char *event, TokPos current, TokC
     const bool is_display = strcmp(event, "prefill_display") == 0;
     if (!is_chunk && !is_display) return;
 
-    double now = server_now_sec();
+    double now = pulsar_mono_sec();
     /* Keep the HTTP/SSE connection alive while prefill runs.  We write the SSE
      * response headers the first time the callback fires and then emit a
      * comment line (`:` prefix, ignored by SSE clients) every few seconds.
@@ -303,7 +303,7 @@ static bool job_early_send(int fd, const char *p) {
 
 void job_early_keepalive(job *j, double now) {
     if (!j->req.stream || j->done || j->worker_writes || j->sse_early_dead) return;
-    const double interval = PULSAR_SERVER_HEARTBEAT_MS / 1000.0;
+    const double interval = pulsar_sec_of_ms((double)PULSAR_SERVER_HEARTBEAT_MS);
     if (now - (j->sse_early ? j->early_last : j->accepted_at) < interval) return;
     bool ok = true;
     if (!j->sse_early) {
@@ -504,7 +504,7 @@ void server::canonicalize_tool_checkpoint(session_slot *sl,
             .cached_tokens = loaded ? loaded_at : own.at,   /* L334: where the computed rows start */
             .phase = "tool checkpoint canonicalization",
             .has_tools = j->req.has_tools,
-            .t0 = server_now_sec(),
+            .t0 = pulsar_mono_sec(),
             .fd = j->fd,
             .stream = j->req.stream,
             /* this runs after the response stream is in flight, so the SSE headers were sent long ago:
@@ -521,7 +521,7 @@ void server::canonicalize_tool_checkpoint(session_slot *sl,
         if (rc == 0) {
             server_log(PULSAR_LOG_KVCACHE,
                        "pulsar-server: tool checkpoint canonicalized ctx=%s source=%s cached=%d target=%d %.3fs",
-                       ctx, source, cached, target, server_now_sec() - progress.t0);
+                       ctx, source, cached, target, pulsar_mono_sec() - progress.t0);
             s->trace_event(trace_id, "tool checkpoint canonicalized: source=%s common=%d live=%d canonical=%d cached=%d",
                            source, common, live_len, canonical.len, cached);
         } else {
@@ -990,7 +990,7 @@ bool server::gen_resume_adopt(session_slot *sl, int src, gen_resolution *res) {
     gen_state *g = sl->gen;
     job *j = g->j;
     char aerr[192] = "";
-    const double t_a = server_now_sec();
+    const double t_a = pulsar_mono_sec();
     g->bank_written = true;   /* adopted or, refused, invalidated: either way no longer the history it held */
     const pulsar_bank_adopt_result ad =
         pulsar_session_bank_adopt(s->sess, BankId{src}, &j->req.prompt, aerr, sizeof(aerr));
@@ -1002,7 +1002,7 @@ bool server::gen_resume_adopt(session_slot *sl, int src, gen_resolution *res) {
         res->cache_source = "bank-adopt";
         j->kvr.from = BankId{src};   /* L378 */
         server_log(PULSAR_LOG_KVCACHE, "pulsar-server: bank %d adopted bank %d's state at %d of %d (%.1f ms)",
-                   sl->bank.raw(), src, ad.at.raw(), request_prompt_toks(&j->req).raw(), (server_now_sec() - t_a) * 1e3);
+                   sl->bank.raw(), src, ad.at.raw(), request_prompt_toks(&j->req).raw(), pulsar_ms_of_sec(pulsar_mono_sec() - t_a));
         return true;
     }
     if (ad.status == PULSAR_ADOPT_REFUSED) {
@@ -1534,7 +1534,7 @@ void server::gen_begin_plan(session_slot *sl, gen_resolution *r) {
     pthread_mutex_unlock(&s->mu);
 
     g->prompt_tokens = usage.prompt;
-    g->t0 = server_now_sec();
+    g->t0 = pulsar_mono_sec();
     g->prefill_end = TokPos{0};   /* set when the main prefill completes (gen_stream_begin) */
     g->trace_id = s->trace_begin(j, usage.cached, prompt_for_sync.len(), &r->cache_diag,
                               cache_source, disk_cached, g->disk_cache_path);
@@ -1554,7 +1554,7 @@ void server::gen_begin_plan(session_slot *sl, gen_resolution *r) {
         .stream = j->req.stream,
         .headers_sent = headers_sent,
         .stream_failed = stream_failed,
-        .last_keepalive = headers_sent ? server_now_sec() : 0.0,
+        .last_keepalive = headers_sent ? pulsar_mono_sec() : 0.0,
     };
     snprintf(g->progress.ctx, sizeof(g->progress.ctx), "%s", g->ctx_span);
     log_flags(g->req_flags, sizeof(g->req_flags), responses_protocol,
@@ -1827,7 +1827,7 @@ void server::gen_stream_begin(session_slot *sl) {
                g->ctx_span,
                g->req_flags[0] ? " " : "",
                g->req_flags,
-               server_now_sec() - g->t0);
+               pulsar_mono_sec() - g->t0);
     /* Random ids, like the tool-call and Responses ids (L192 item 7): a
      * counter leaked request ordering and made the unseeded sampler seed
      * below guessable. */
@@ -1946,7 +1946,7 @@ void server::gen_decode_init(session_slot *sl) {
     if (g->max_tokens < 0) g->max_tokens = 0;
     if (g->max_tokens > room) g->max_tokens = room;
     s->trace_event(g->trace_id, "prefill done; decode_max=%d ctx_room=%d", g->max_tokens, room);
-    g->decode_t0 = server_now_sec();
+    g->decode_t0 = pulsar_mono_sec();
     /* L119: reset the request-scoped DSpark accumulators (decode_again also
      * lands here, keeping them consistent with the reset completion/decode_t0
      * for the attempt that actually finishes). The spec-batched lane fills
@@ -2521,7 +2521,7 @@ void server::gen_step_finish(session_slot *sl) {
      * worker already kept. Pure metadata assembled once at finish, off any hot
      * path; the emitter derives the rates. */
     {
-        const double finish_t = server_now_sec();
+        const double finish_t = pulsar_mono_sec();
         req_timings *t = &j->req.timings;
         t->ttft_s = g->first_token_t > 0.0 ? g->first_token_t - g->t0 : 0.0;
         t->prefill_s = g->decode_t0 > g->t0 ? g->decode_t0 - g->t0 : 0.0;
@@ -2552,7 +2552,7 @@ void server::gen_step_finish(session_slot *sl) {
     s->trace_finish(g->trace_id, &j->req, said_finish, g->completion,
                  tool_open, tool_closed,
                  parsed_content ? parsed_content : (g->text.ptr ? g->text.ptr : ""),
-                 parsed_reasoning, &parsed_calls, server_now_sec() - g->t0);
+                 parsed_reasoning, &parsed_calls, pulsar_mono_sec() - g->t0);
 
     if (j->req.api == API_RESPONSES) {
         /* the visible suffix is the family's sampled-turn render; a family without one keeps no
@@ -2714,7 +2714,7 @@ void server::gen_step_finish(session_slot *sl) {
                        said_finish,
                        answer_note,
                        g->err,
-                       server_now_sec() - g->t0);
+                       pulsar_mono_sec() - g->t0);
         } else {
             server_log(PULSAR_LOG_GENERATION,
                        "pulsar-server: chat ctx=%s gen=%d%s%s finish=%s%s %.3fs",
@@ -2724,7 +2724,7 @@ void server::gen_step_finish(session_slot *sl) {
                        flags,
                        said_finish,
                        answer_note,
-                       server_now_sec() - g->t0);
+                       pulsar_mono_sec() - g->t0);
         }
     } else {
         char flags[80];
@@ -2745,7 +2745,7 @@ void server::gen_step_finish(session_slot *sl) {
                        said_finish,
                        answer_note,
                        g->err,
-                       server_now_sec() - g->t0);
+                       pulsar_mono_sec() - g->t0);
         } else {
             server_log(PULSAR_LOG_GENERATION,
                        "pulsar-server: %s ctx=%s gen=%d%s%s finish=%s%s %.3fs",
@@ -2756,7 +2756,7 @@ void server::gen_step_finish(session_slot *sl) {
                        flags,
                        said_finish,
                        answer_note,
-                       server_now_sec() - g->t0);
+                       pulsar_mono_sec() - g->t0);
         }
     }
     const bool called = parsed_calls.len > 0;
@@ -2768,13 +2768,13 @@ void server::gen_step_finish(session_slot *sl) {
     /* L380: nor when this conversation's requests leave replies of this kind behind (slot_turn_reply) */
     sl->terminal_pending = s->slot_turn_reply(
         sl, gen_turn_wants_terminal(g->abandoned, final_finish, g->completion_total + g->completion), called);
-    sl->turn_ended_at = server_now_sec();   /* L380: the checkpoint's idle grace runs from here */
+    sl->turn_ended_at = pulsar_mono_sec();   /* L380: the checkpoint's idle grace runs from here */
     gen_kv_finish(g, said_finish);   /* L378 */
     g->phase = GEN_DONE;
 }
 
 double server_terminal_grace_left_s(double now_sec, double turn_ended_at) {
-    const double left = turn_ended_at + PULSAR_SERVER_TERMINAL_GRACE_MS / 1000.0 - now_sec;
+    const double left = turn_ended_at + pulsar_sec_of_ms((double)PULSAR_SERVER_TERMINAL_GRACE_MS) - now_sec;
     return left > 0.0 ? left : 0.0;
 }
 
@@ -2933,7 +2933,7 @@ bool server::terminal_checkpoint_step(double now_sec, bool grace_waived) {
     if (pulsar_session_image_hashes(s->sess, NULL, 0) > 0) return true;
     if (!resumed) tokens_copy_prefix(&target, pulsar_session_tokens(s->sess), TokCount{C});
     const int old_len = pulsar_session_pos(s->sess).raw();
-    const double t0 = server_now_sec();
+    const double t0 = pulsar_mono_sec();
     char err[192] = "";
     /* the view IS the target when no stop trails it, and a sync of the same prompt is a no-op: the history short of
      * its last token first (that sync resumes below the decode rows), then the token.  A resumed checkpoint runs the
@@ -2972,14 +2972,14 @@ bool server::terminal_checkpoint_step(double now_sec, bool grace_waived) {
         server_log(PULSAR_LOG_KVCACHE,
                    "pulsar-server: terminal checkpoint: bank %d prefilled [%d, %d) of its turn to %d (prefill frontier "
                    "was %d) in %.1f ms -- yielded to a queued request, the rest when idle",
-                   pick->bank.raw(), origin.raw(), pick->committed_pos.raw(), C, pf, (server_now_sec() - t0) * 1e3);
+                   pick->bank.raw(), origin.raw(), pick->committed_pos.raw(), C, pf, pulsar_ms_of_sec(pulsar_mono_sec() - t0));
         s->slot_terminal_rearm(pick, &target, in_short);
         return true;
     }
     server_log(PULSAR_LOG_KVCACHE,
                "pulsar-server: terminal checkpoint: bank %d prefilled [%d, %d) of its turn (prefill frontier was %d) "
                "in %.1f ms%s%s",
-               pick->bank.raw(), origin.raw(), C, pf, (server_now_sec() - t0) * 1e3, rc == 0 ? "" : " -- FAILED: ",
+               pick->bank.raw(), origin.raw(), C, pf, pulsar_ms_of_sec(pulsar_mono_sec() - t0), rc == 0 ? "" : " -- FAILED: ",
                err);
     if (out.persist) s->kv_cache_persist(pick, KV_PERSIST_TERMINAL);
     else pulsar_session_invalidate(s->sess);   /* the bank's state is no position's; its next turn rebuilds it */
@@ -3040,7 +3040,7 @@ void server::generate_job_begin(session_slot *sl, job *j) {
         slot_writer_mark_written(&g->writer);
     }
     g->progress.stream_failed = dead;
-    j->kvr.qwait_ms = (server_now_sec() - j->accepted_at) * 1e3;   /* L378: acceptance to bind */
+    j->kvr.qwait_ms = pulsar_ms_of_sec(pulsar_mono_sec() - j->accepted_at);   /* L378: acceptance to bind */
     s->gen_begin(sl);
 }
 
@@ -3145,6 +3145,6 @@ void server::generate_job_end(session_slot *sl) {
     s->gen_state_free(sl);
     sl->active_job = NULL;
     sl->state = SLOT_IDLE;
-    sl->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
+    sl->last_serviced_us = (uint64_t)pulsar_us_of_sec(pulsar_mono_sec());
 }
 

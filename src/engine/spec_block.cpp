@@ -1584,7 +1584,7 @@ bool draft_chains(pulsar_session *s, const BankId *banks, uint64_t *const *rngs,
         }
         i0 = i;
         if (nb == 0) continue;
-        const double t0 = now_sec();
+        const double t0 = pulsar_mono_sec();
         if (!draft_pass(s, pb, pp, pc, nb)) {
             snprintf(err, errlen, "the block draft failed (see the log)");
             return false;
@@ -1595,10 +1595,10 @@ bool draft_chains(pulsar_session *s, const BankId *banks, uint64_t *const *rngs,
         if (timing) {
             static double sum = 0;
             static uint32_t cnt = 0;
-            sum += now_sec() - t0;
+            sum += pulsar_mono_sec() - t0;
             if (++cnt == 64) {
                 fprintf(stderr, "pulsar: block drafter: draft pass %.3f ms mean over 64 (%u bank(s) last)\n",
-                        sum / cnt * 1e3, nb);
+                        pulsar_ms_of_sec(sum / cnt), nb);
                 sum = 0;
                 cnt = 0;
             }
@@ -1828,7 +1828,7 @@ int block_warm(pulsar_session *s, char *err, size_t errlen) {
     while (top <= last_max) top *= 2u;
     pulsar_gpu_seg_stats a, b;
     pulsar_gpu_seg_stats_get(&a);
-    const double t0 = now_sec();
+    const double t0 = pulsar_mono_sec();
     BankId banks[kDraftRows];
     uint32_t pos[kDraftRows], shapes = 0, n_bounds = 0;
     int32_t carry[kDraftRows];
@@ -1853,7 +1853,7 @@ int block_warm(pulsar_session *s, char *err, size_t errlen) {
     fprintf(stderr, "pulsar: block drafter: L306 warmup: the draft pass at %u bank count(s) x %u attention bounds "
                     "(256 .. %u) = %u shapes, %llu graphs captured (%.1f MiB) in %.2f s\n",
             per, n_bounds, top, shapes, (unsigned long long)(b.captures - a.captures),
-            (double)(b.graph_bytes > a.graph_bytes ? b.graph_bytes - a.graph_bytes : 0u) / 1048576.0, now_sec() - t0);
+            (double)(b.graph_bytes > a.graph_bytes ? b.graph_bytes - a.graph_bytes : 0u) / 1048576.0, pulsar_mono_sec() - t0);
     return 0;
 }
 

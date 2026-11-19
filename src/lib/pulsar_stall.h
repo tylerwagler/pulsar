@@ -18,6 +18,8 @@
 #include <stdint.h>
 #include <time.h>
 
+#include "lib/pulsar_clock.h"
+
 /** The process-global progress marks (one instance, g_pulsar_stall); written by pulsar_stall_mark, read by the watchdog. */
 struct pulsar_stall_marks {
     std::atomic<uint64_t> beats{0};            ///< every mark bumps it: the heartbeat
@@ -28,18 +30,10 @@ struct pulsar_stall_marks {
 /// The process's one set of marks (C++17 inline variable: one instance across every TU).
 inline pulsar_stall_marks g_pulsar_stall;
 
-/** The CLOCK_MONOTONIC time in milliseconds, the clock the marks are stamped with.
- *  @return milliseconds since an arbitrary fixed point */
-static inline int64_t pulsar_stall_now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
 /** Enter a section: publish its name and the time, and beat. */
 /// @param where the section's name; must be a string literal (its pointer is published)
 static inline void pulsar_stall_mark(const char *where) {
     g_pulsar_stall.where.store(where, std::memory_order_relaxed);
-    g_pulsar_stall.where_ms.store(pulsar_stall_now_ms(), std::memory_order_relaxed);
+    g_pulsar_stall.where_ms.store(pulsar_mono_ms(), std::memory_order_relaxed);
     g_pulsar_stall.beats.fetch_add(1, std::memory_order_relaxed);
 }

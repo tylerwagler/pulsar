@@ -345,7 +345,7 @@ static void kv_seg_log(void *ud, const char *msg) {
 /** One copied-out file: the reserved job (its image is the file). */
 struct kv_write_item {
     pulsar_segstore_job *job;   ///< the reserved, filled job; committed on the store's thread
-    double staged_at;           ///< server_now_sec at submit
+    double staged_at;           ///< pulsar_mono_sec at submit
     double written_ms;          ///< the file write's wall time (the seal included)
     bool ok;                    ///< the file write succeeded
     char err[256];              ///< why it did not
@@ -376,9 +376,9 @@ void *kv_writer_main(void *arg) {
         w->queue.pop_front();
         w->busy = true;
         pthread_mutex_unlock(&w->mu);
-        const double t0 = server_now_sec();
+        const double t0 = pulsar_mono_sec();
         it.ok = pulsar_segstore_job_write(it.job, it.err, sizeof it.err);
-        it.written_ms = (server_now_sec() - t0) * 1000.0;
+        it.written_ms = pulsar_ms_of_sec(pulsar_mono_sec() - t0);
         const uint64_t bytes = pulsar_segstore_job_image_bytes(it.job);
         pthread_mutex_lock(&w->mu);
         w->staged -= bytes;
@@ -409,7 +409,7 @@ void kv_writer_submit(void *ud, pulsar_segstore_job *job) {
     kv_write_item it;
     memset(&it, 0, sizeof it);
     it.job = job;
-    it.staged_at = server_now_sec();
+    it.staged_at = pulsar_mono_sec();
     pulsar::ScopedLock lk(&w->mu);
     w->staged += pulsar_segstore_job_image_bytes(job);
     w->queue.push_back(it);
@@ -426,7 +426,7 @@ int kv_cache_commit_written(kv_disk_cache *kc) {
         done.swap(w->done);
     }
     int n = 0;
-    const double now = server_now_sec();
+    const double now = pulsar_mono_sec();
     for (kv_write_item &it : done) {
         char key[41];
         memcpy(key, pulsar_segstore_job_key(it.job), 41);
@@ -442,8 +442,8 @@ int kv_cache_commit_written(kv_disk_cache *kc) {
             server_log(PULSAR_LOG_KVCACHE,
                        "pulsar-server: kv cache %s %.12s %.1f MiB written in %.0f ms (%.2f GB/s), indexed %.0f ms "
                        "after its copy-out", rp ? "restore point" : "segment", key, (double)bytes / PULSAR_MIB,
-                       it.written_ms, it.written_ms > 0.0 ? (double)bytes / (it.written_ms * 1e6) : 0.0,
-                       (now - it.staged_at) * 1000.0);
+                       it.written_ms, it.written_ms > 0.0 ? (double)bytes / pulsar_ns_of_ms(it.written_ms) : 0.0,
+                       pulsar_ms_of_sec(now - it.staged_at));
         }
     }
     return n;
@@ -884,7 +884,7 @@ bool server::kv_rp_writes_for_end(kv_persist_trigger why, unsigned kv_flags, uns
     const uint64_t rows = gain ? pulsar_session_segment_bytes(s->sess, D, E, &state) : 0u;
     double read_ms = 0.0, prefill_ms = 0.0;
     pthread_mutex_lock(&s->mu);
-    const bool measured = kv_read_cost_ms(&s->kv.meter.read, rp + rows, 0, server_now_sec(), &read_ms);
+    const bool measured = kv_read_cost_ms(&s->kv.meter.read, rp + rows, 0, pulsar_mono_sec(), &read_ms);
     pthread_mutex_unlock(&s->mu);
     const int cap = pulsar_session_prefill_cap(s->sess).raw();
     const bool priced = gain && pulsar_engine_prefill_ms(s->engine, gain, (uint32_t)D.raw(),
@@ -951,7 +951,7 @@ int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chai
         if (!server_headroom_admits(avail, need, server_mem_floor())) {
             s->count_metric(&s->m_persist_skipped);
             unsigned skipped = 0;
-            if (warn_limiter_due(&s->persist_skip_warn, server_now_sec(), PULSAR_SERVER_MEM_FLOOR_WARN_SEC, &skipped)) {
+            if (warn_limiter_due(&s->persist_skip_warn, pulsar_mono_sec(), PULSAR_SERVER_MEM_FLOOR_WARN_SEC, &skipped)) {
                 server_log(PULSAR_LOG_WARNING,
                            "pulsar-server: kv cache persist SKIPPED reason=%s: MemAvailable %.2f GiB does not cover "
                            "the %.2f GiB it may take over the %.2f GiB floor%s (%u more skipped since the last line)",
@@ -964,7 +964,7 @@ int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chai
         }
     }
     pulsar_stall_mark("kv cache persist");
-    const double t0 = server_now_sec();
+    const double t0 = pulsar_mono_sec();
     (void)kv_cache_commit_written(&s->kv);   /* L338: the chain this persist extends may have just been written */
     const pulsar_kvchain_trailer tool_maps = { s, seg_trailer_size, seg_trailer_write };
     const pulsar_kvchain_writer writer = { s->kv.writer, kv_writer_wait_room, kv_writer_submit };
@@ -981,7 +981,7 @@ int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chai
                    "pulsar-server: kv cache persisted reason=%s chain to %d (%d new segments, %.1f MiB; %d restore "
                    "points, %.1f MiB; copied out, written behind) in %.1f ms bank=%d id=%llu",
                    reason, r.end.raw(), r.written, (double)r.bytes / PULSAR_MIB, r.rp_written,
-                   (double)r.rp_bytes / PULSAR_MIB, (server_now_sec() - t0) * 1000.0,
+                   (double)r.rp_bytes / PULSAR_MIB, pulsar_ms_of_sec(pulsar_mono_sec() - t0),
                    /* L415: whose history it is -- the bank, and the request bound to it (0: none, e.g. a spill) */
                    sl ? sl->bank.raw() : -1, (unsigned long long)(sl && sl->active_job ? sl->active_job->seq : 0u));
     if (r.no_room) {
@@ -1025,7 +1025,7 @@ kv_restore_verdict kv_restore_decide(uint32_t gained, bool measured, double tran
 /// @param bytes   bytes the load read (0: ignored)
 /// @param cached  of which in the RAM tier (clamped to `bytes`; L347 I3a, was the page cache)
 /// @param ms      the load's wall time, ms (<= 0: ignored)
-/// @param now_sec server_now_sec() at the load's end (stamps the relaxation clock, L342)
+/// @param now_sec pulsar_mono_sec() at the load's end (stamps the relaxation clock, L342)
 void kv_read_cost_observe(kv_read_cost *c, uint64_t bytes, uint64_t cached, double ms, double now_sec) {
     kv_read_cost_touch(c, now_sec);
     if (!(ms > 0.0) || bytes == 0u) return;
@@ -1179,7 +1179,7 @@ kv_restore_verdict server::kv_cache_price(const kv_chain_hit *hit, PromptToks ga
     const bool priced = pulsar_engine_prefill_ms(s->engine, gained, (uint32_t)base.raw(), cap > 0 ? (uint32_t)cap : 0u,
                                                  &prefill_ms);
     pthread_mutex_lock(&s->mu);
-    const bool measured = kv_read_cost_ms(&s->kv.meter.read, bytes, hit->cached, server_now_sec(), &transfer_ms);
+    const bool measured = kv_read_cost_ms(&s->kv.meter.read, bytes, hit->cached, pulsar_mono_sec(), &transfer_ms);
     pthread_mutex_unlock(&s->mu);
     const kv_restore_verdict v = kv_restore_decide(gained, measured, transfer_ms, priced, prefill_ms);
     pthread_mutex_lock(&s->mu);
@@ -1258,7 +1258,7 @@ void server::kv_restore_begin(kv_restore *r, const kv_chain_hit *hit, PromptToks
     pulsar_kvchain_pin(s->kv.st, hit->chain, hit->n, true);
     r->pinned = true;
     pthread_mutex_lock(&s->mu);
-    kv_read_cost_touch(&s->kv.meter.read, server_now_sec());   /* L342: a load is running: hold the relaxation */
+    kv_read_cost_touch(&s->kv.meter.read, pulsar_mono_sec());   /* L342: a load is running: hold the relaxation */
     s->kv.meter.restores[0]++;   /* L378: begun */
     pthread_mutex_unlock(&s->mu);
     if (!sliced) return;
@@ -1269,7 +1269,7 @@ void server::kv_restore_begin(kv_restore *r, const kv_chain_hit *hit, PromptToks
         const uint64_t cached = pulsar_segstore_resident_bytes(s->kv.st, g->key, true, i == hit->n - 1);
         double ms = 0.0;
         pthread_mutex_lock(&s->mu);
-        const bool measured = kv_read_cost_ms(&s->kv.meter.read, bytes, cached, server_now_sec(), &ms);
+        const bool measured = kv_read_cost_ms(&s->kv.meter.read, bytes, cached, pulsar_mono_sec(), &ms);
         pthread_mutex_unlock(&s->mu);
         r->pred_ms[i] = measured ? ms : -1.0;
     }
@@ -1292,7 +1292,7 @@ static int kv_restore_at(const kv_restore *r) {
 
 int server::kv_restore_slice(kv_restore *r, int k) {
     auto *s = this;
-    const double t0 = server_now_sec();
+    const double t0 = pulsar_mono_sec();
     char err[384];
     const bool checking = r->verify && r->verified < r->hit->n;
     if (!checking) r->touched = true;   /* the load writes the bank from its first segment on */
@@ -1307,12 +1307,12 @@ int server::kv_restore_slice(kv_restore *r, int k) {
     (void)kv_cache_commit_written(&s->kv);
     int rc = slice();
     if (rc == 2 && kv_cache_wait_written(&s->kv) > 0) rc = slice();
-    const double ms = (server_now_sec() - t0) * 1000.0;
+    const double ms = pulsar_ms_of_sec(pulsar_mono_sec() - t0);
     r->read_ms += ms;
     r->slices++;
     if (ms > r->slice_max_ms) r->slice_max_ms = ms;
     pthread_mutex_lock(&s->mu);
-    kv_read_cost_touch(&s->kv.meter.read, server_now_sec());   /* L342 */
+    kv_read_cost_touch(&s->kv.meter.read, pulsar_mono_sec());   /* L342 */
     s->m_restore_slices++;
     if (ms > s->m_restore_stall_max_ms) s->m_restore_stall_max_ms = ms;
     pthread_mutex_unlock(&s->mu);
@@ -1368,7 +1368,7 @@ TokPos server::kv_restore_finish(kv_restore *r, const char *text, const pulsar_t
     pthread_mutex_lock(&s->mu);
     /* L353 no. 16: a checked restore read the chain twice unless the check's read stayed as the RAM copy; the time is both */
     const uint64_t reads = kv_restore_reads(r->verify, pulsar_segstore_retains(s->kv.st));
-    kv_read_cost_observe(&s->kv.meter.read, r->hit->bytes * reads, r->hit->cached * reads, r->read_ms, server_now_sec());
+    kv_read_cost_observe(&s->kv.meter.read, r->hit->bytes * reads, r->hit->cached * reads, r->read_ms, pulsar_mono_sec());
     s->kv.meter.restored_tokens += (uint64_t)r->gained.raw();   /* L434: the tokens the verdict priced */
     pthread_mutex_unlock(&s->mu);
     const pulsar_tokens *loaded = pulsar_session_tokens(s->sess);

@@ -1,6 +1,7 @@
 /** @file
  *  pulsar: the command-line client -- one-shot prompts and an interactive chat REPL. */
 #include "pulsar.h"
+#include "lib/pulsar_clock.h"   /* L442: the clocks and the time-unit conversions */
 #include "pulsar_help.h"
 #include "pulsar_ctxmem.h"
 #include "pulsar_argparse.h"
@@ -110,14 +111,6 @@ static void usage(FILE *fp, const char *topic) {
  *  @return PULSAR_BACKEND_CUDA */
 static pulsar_backend default_backend(void) {
     return PULSAR_BACKEND_CUDA;
-}
-
-/** @brief Monotonic wall clock.
- *  @return seconds since an arbitrary epoch (CLOCK_MONOTONIC) */
-static double cli_now_sec(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
 static char *read_prompt_file(const char *path, bool fatal);
@@ -344,7 +337,7 @@ static int run_session_generation(pulsar_engine *engine, const cli_config *cfg, 
         .use_color = pulsar_log_is_tty(stderr),
     };
 
-    const double t_prefill0 = cli_now_sec();
+    const double t_prefill0 = pulsar_mono_sec();
     pulsar_session_set_progress(session, cli_prefill_progress_cb, &progress);
     pulsar_session_set_display_progress(session,
                                      progress.use_color ? cli_prefill_progress_cb : NULL,
@@ -359,7 +352,7 @@ static int run_session_generation(pulsar_engine *engine, const cli_config *cfg, 
     }
     pulsar_session_set_progress(session, NULL, NULL);
     pulsar_session_set_display_progress(session, NULL, NULL);
-    const double t_prefill1 = cli_now_sec();
+    const double t_prefill1 = pulsar_mono_sec();
 
     int max_tokens = cfg->gen.n_predict;
     int room = (pulsar_session_ctx(session) - pulsar_session_pos(session).before()).raw();
@@ -369,7 +362,7 @@ static int run_session_generation(pulsar_engine *engine, const cli_config *cfg, 
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
     int generated = 0;
-    const double t_decode0 = cli_now_sec();
+    const double t_decode0 = pulsar_mono_sec();
     while (generated < max_tokens && !cli_interrupt_requested()) {
         TokId toks[17];
         int ntok = 0;
@@ -432,7 +425,7 @@ static int run_session_generation(pulsar_engine *engine, const cli_config *cfg, 
         pulsar_session_free(session);
         return 1;
     }
-    const double t_decode1 = cli_now_sec();
+    const double t_decode1 = pulsar_mono_sec();
     generation_done(&printer);
     if (cli_interrupt_requested()) cli_interrupt_clear();
 
@@ -1324,7 +1317,7 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
         .input_tokens = suffix,
         .use_color = pulsar_log_is_tty(stderr),
     };
-    const double t_prefill0 = cli_now_sec();
+    const double t_prefill0 = pulsar_mono_sec();
     pulsar_session_set_progress(chat->session, cli_prefill_progress_cb, &progress);
     pulsar_session_set_display_progress(chat->session,
                                      progress.use_color ? cli_prefill_progress_cb : NULL,
@@ -1339,7 +1332,7 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
     }
     pulsar_session_set_progress(chat->session, NULL, NULL);
     pulsar_session_set_display_progress(chat->session, NULL, NULL);
-    const double t_prefill1 = cli_now_sec();
+    const double t_prefill1 = pulsar_mono_sec();
 
     token_printer printer = {
         .engine = engine,
@@ -1358,7 +1351,7 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
     int generated = 0;
-    const double t_decode0 = cli_now_sec();
+    const double t_decode0 = pulsar_mono_sec();
     while (generated < max_tokens && !cli_interrupt_requested()) {
         TokId toks[17];
         int ntok = 0;
@@ -1414,7 +1407,7 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
         }
         if (stop) break;
     }
-    const double t_decode1 = cli_now_sec();
+    const double t_decode1 = pulsar_mono_sec();
     generation_done(&printer);
 
     const bool interrupted = cli_interrupt_requested();

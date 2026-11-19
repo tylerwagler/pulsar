@@ -371,7 +371,7 @@ void log_flags(char *buf, size_t len, bool responses_protocol,
 /// @param thinking            thinking is on
 /// @param tool_start          a tool-call block opened
 /// @param tool_end            a tool-call block closed
-/// @param decode_t0           when decoding started (server_now_sec)
+/// @param decode_t0           when decoding started (pulsar_mono_sec)
 /// @param last_t              in: the last line's time; out: now
 /// @param last_completion     in: the last line's count; out: `completion`
 void log_decode_progress(req_kind kind, int prompt_tokens, int completion,
@@ -380,7 +380,7 @@ void log_decode_progress(req_kind kind, int prompt_tokens, int completion,
                                 bool tool_start, bool tool_end,
                                 double decode_t0,
                                 double *last_t, int *last_completion) {
-    const double now = server_now_sec();
+    const double now = pulsar_mono_sec();
     const double elapsed = now - decode_t0;
     const double interval_s = now - *last_t;
     const int interval_tokens = completion - *last_completion;

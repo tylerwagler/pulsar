@@ -16836,7 +16836,7 @@ static std::string early_drain(int fd) {
 
 static void test_early_stream_keepalive(void) {
     signal(SIGPIPE, SIG_IGN);
-    const double iv = PULSAR_SERVER_HEARTBEAT_MS / 1000.0;
+    const double iv = pulsar_sec_of_ms((double)PULSAR_SERVER_HEARTBEAT_MS);
     for (api_style api : {API_ANTHROPIC, API_OPENAI}) {
         int sv[2];
         TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -16906,7 +16906,7 @@ static void test_early_stream_keepalive(void) {
         j.fd = sv[0];
         j.req.api = API_ANTHROPIC;
         j.req.stream = true;
-        j.accepted_at = server_now_sec();
+        j.accepted_at = pulsar_mono_sec();
         gen_state *g = (gen_state *)calloc(1, sizeof(gen_state));
         g->j = &j;
         slot_writer_init(&g->writer, sv[0]);
@@ -17922,7 +17922,7 @@ static void test_l442_mem_split_values_unchanged(void) {
         g.guard_eager_bytes = kvb(31ull * GiB);
         g.guard_touched_ceiling = kvb(5ull * GiB);
         g.guard_budget_said = kvb(5ull * GiB);
-        g.guard_avail_at = server_now_sec();
+        g.guard_avail_at = pulsar_mono_sec();
         for (uint64_t a : avails) {
             g.guard_avail = devb(a);
             const uint64_t live = l442_old_touched_budget(g.guard_kv_budget.raw(), 31ull * GiB, 0, a,
@@ -18350,7 +18350,7 @@ static void test_l289_lane_reprobe_evidence(void) {
  * functions (the step itself needs a session): the grace and the worker's wait, the cancel predicate, what a sync's
  * result does to the slot, and where a yielded slot's live binding matches. */
 static void test_l380_terminal_grace_and_yield(void) {
-    const double G = PULSAR_SERVER_TERMINAL_GRACE_MS / 1000.0;
+    const double G = pulsar_sec_of_ms((double)PULSAR_SERVER_TERMINAL_GRACE_MS);
     /* the grace: not before it has passed since the turn ended, yes from then on */
     TEST_ASSERT(fabs(server_terminal_grace_left_s(100.0, 100.0) - G) < 1e-9);
     TEST_ASSERT(server_terminal_grace_left_s(100.0 + G / 2, 100.0) > 0.0);
@@ -19575,7 +19575,7 @@ static void l329_fanout(const l329_req *rq, int n, int wait_ms, l329_out *o) {
             st *l = &r[w->slot];
             const bool live = l->bound && !l->finished && !l->cancelled;
             const prefix_wait_verdict v =
-                unseamed_wait_check(live, l->pos, w->mark.raw(), (t - w->since) * 1e3, wait_ms);
+                unseamed_wait_check(live, l->pos, w->mark.raw(), pulsar_ms_of_sec(t - w->since), wait_ms);
             if (v == PREFIX_WAIT_HOLD) {
                 l->mark = unseamed_mark_merge(l->mark, w->mark.raw(), l->pos);
                 continue;
@@ -20390,7 +20390,7 @@ static void test_l281_prefill_chunk_publishes_the_slot_gauges(void) {
     g.phase = GEN_PREFILL_MAIN;
     g.prefill_last_current = -1;
     g.progress.srv = &s;
-    g.progress.t0 = server_now_sec();
+    g.progress.t0 = pulsar_mono_sec();
     g.progress.fd = -1;
     s.slots[0].provisioned = true;
     s.slots[0].active_job = &j;
@@ -20699,14 +20699,14 @@ static void test_metrics_stream_refreshes_when_quiet(void) {
 
     for (int i = 0; i < 2; i++) {
         struct timespec t0, t1;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
+        t0 = pulsar_mono_ts();
         int n = stream_read_within(fds[1], buf, sizeof buf, 2000);
-        clock_gettime(CLOCK_MONOTONIC, &t1);
+        t1 = pulsar_mono_ts();
         TEST_ASSERT(n > 0);
         TEST_ASSERT(strncmp(buf, "event: metrics\ndata: {\"generation\":5,", 37) == 0);
         TEST_ASSERT(strstr(buf, ": keepalive") == NULL);
         /* not before its time: a refresh that came early would be a frame storm on an idle server */
-        TEST_ASSERT((t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6 > 100.0);
+        TEST_ASSERT(pulsar_ms_between(t0, t1) > 100.0);
     }
 
     stream_stop(&f);
@@ -20730,13 +20730,13 @@ static void test_metrics_stream_frames_a_mark_nobody_broadcast(void) {
     TEST_ASSERT(stream_last_generation(buf) == 0 && stream_count_frames(buf) == 1);
 
     struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    t0 = pulsar_mono_ts();
     pulsar_metrics_feed_mark(&f.generation);   /* no lock, no broadcast */
     TEST_ASSERT(stream_read_within(fds[1], buf, sizeof buf, 2000) > 0);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
+    t1 = pulsar_mono_ts();
     TEST_ASSERT(stream_last_generation(buf) == 1);
     /* the bound is the window (100 ms); the margin is the machine's, for a loaded check run */
-    TEST_ASSERT((t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6 < 100.0 + 400.0);
+    TEST_ASSERT(pulsar_ms_between(t0, t1) < 100.0 + 400.0);
 
     stream_stop(&f);
     pthread_join(th, NULL);
@@ -20762,7 +20762,7 @@ static void test_metrics_stream_coalesces_a_burst_and_ends_on_the_last_state(voi
         used = strlen(all);
 
         struct timespec t0, t1;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
+        t0 = pulsar_mono_ts();
         for (int i = 0; i < 1000; i++) {
             if (wake) {
                 pthread_mutex_lock(&f.mu);
@@ -20782,11 +20782,11 @@ static void test_metrics_stream_coalesces_a_burst_and_ends_on_the_last_state(voi
             int n = stream_read_within(fds[1], all + used, sizeof all - used, 100);
             if (n > 0) used += (size_t)n;
         }
-        clock_gettime(CLOCK_MONOTONIC, &t1);
+        t1 = pulsar_mono_ts();
         TEST_ASSERT(stream_last_generation(all) == 1000);
         TEST_ASSERT(stream_read_within(fds[1], all + used, sizeof all - used, 250) < 0);
         /* the bound: one frame a window, so 1 (the first) + elapsed / window + 1 at the very most */
-        const double elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        const double elapsed_ms = pulsar_ms_between(t0, t1);
         const int frames = stream_count_frames(all);
         TEST_ASSERT(frames >= 2);
         TEST_ASSERT(frames <= 2 + (int)(elapsed_ms / 100.0));
@@ -20816,13 +20816,12 @@ static void test_metrics_stream_exits_promptly_on_shutdown(void) {
     TEST_ASSERT(stream_read_within(fds[1], buf, sizeof buf, 2000) > 0);
 
     struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    t0 = pulsar_mono_ts();
     stream_stop(&f);
     pthread_join(th, NULL);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
+    t1 = pulsar_mono_ts();
 
-    const double elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
-                            + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    const double elapsed_ms = pulsar_ms_between(t0, t1);
     TEST_ASSERT(elapsed_ms < 1000.0);
     TEST_ASSERT(f.result == true);   /* a shutdown exit is not a failure */
 
@@ -20925,12 +20924,11 @@ static void test_metrics_stream_write_does_not_hold_the_metrics_lock(void) {
 
     /* The lock must still be free: the pump is inside send_all right now. */
     struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    t0 = pulsar_mono_ts();
     pthread_mutex_lock(&f.mu);
     pthread_mutex_unlock(&f.mu);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    const double held_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
-                         + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    t1 = pulsar_mono_ts();
+    const double held_ms = pulsar_ms_between(t0, t1);
     TEST_ASSERT(held_ms < 500.0);
 
     /* Teardown: draining unblocks the write, then shutdown wakes the wait.
@@ -20972,12 +20970,11 @@ static void test_send_all_gives_up_on_a_wedged_socket(void) {
     char big[64 * 1024];
     memset(big, 'y', sizeof big);
     struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    t0 = pulsar_mono_ts();
     const bool ok = send_all(fds[0], big, sizeof big);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
+    t1 = pulsar_mono_ts();
 
-    const double took_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
-                         + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    const double took_ms = pulsar_ms_between(t0, t1);
     TEST_ASSERT(ok == false);
     /* Deadline is PULSAR_SERVER_SEND_STALL_TIMEOUT_MS; allow a wide margin for
      * scheduler noise but nothing like the unbounded case. */
@@ -21146,12 +21143,12 @@ static void stream_server_expect_frame(stream_server_fixture *x, const struct ti
     char buf[1024];
     const int n = stream_read_within(x->fds[1], buf, sizeof buf, 3000);
     struct timespec t1;
-    clock_gettime(CLOCK_MONOTONIC, &t1);
+    t1 = pulsar_mono_ts();
     TEST_ASSERT(n > 0);
     if (n <= 0) return;
     TEST_ASSERT(stream_count_frames(buf) == 1);
     TEST_ASSERT(stream_last_generation(buf) == x->s.metrics_generation);
-    TEST_ASSERT((t1.tv_sec - t0->tv_sec) * 1000.0 + (t1.tv_nsec - t0->tv_nsec) / 1e6 <
+    TEST_ASSERT(pulsar_ms_between(*t0, t1) <
                 PULSAR_METRICS_STREAM_MIN_INTERVAL_MS + 400.0);
 }
 
@@ -21184,7 +21181,7 @@ static void test_l432_a_systemone_request_reaches_the_stream(void) {
     TEST_ASSERT(jb.done);
     TEST_ASSERT(pulsar_metrics_feed_read(&x.s.metrics_generation) == gen0 + 1);
     struct timespec t0;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    t0 = pulsar_mono_ts();
     stream_server_expect_frame(&x, &t0);
 
     /* a step with no request waiting is no step: nothing published, no frame owed */
@@ -21193,7 +21190,7 @@ static void test_l432_a_systemone_request_reaches_the_stream(void) {
 
     /* the request's thread counts its 503 */
     x.s.count_503(SERVER_503_SYSTEMONE);
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    t0 = pulsar_mono_ts();
     TEST_ASSERT(x.s.m_kvl.refused[SERVER_503_SYSTEMONE] == 1);
     stream_server_expect_frame(&x, &t0);
 
@@ -21246,7 +21243,7 @@ static void test_l433_systemone_requests_are_counted(void) {
     /* no judge: 404, counted invalid; /metrics has no systemone series */
     TEST_ASSERT(ask("{}").find(" 404 ") != std::string::npos);
     TEST_ASSERT(x.s.m_systemone_requests[SERVER_SYSTEMONE_INVALID] == 1);
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    t0 = pulsar_mono_ts();
     stream_server_expect_frame(&x, &t0);
     TEST_ASSERT(metrics().find("pulsar:systemone_requests_total") == std::string::npos);
 
@@ -21258,7 +21255,7 @@ static void test_l433_systemone_requests_are_counted(void) {
     TEST_ASSERT(x.s.m_systemone_requests[SERVER_SYSTEMONE_INVALID] == 2);
     TEST_ASSERT(x.s.m_systemone_requests[SERVER_SYSTEMONE_OK] == 0 && x.s.m_systemone_requests[SERVER_SYSTEMONE_BUSY] == 0 &&
                 x.s.m_systemone_requests[SERVER_SYSTEMONE_FAILED] == 0 && x.s.m_systemone_questions == 0);
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    t0 = pulsar_mono_ts();
     stream_server_expect_frame(&x, &t0);
 
     const std::string m = metrics();
@@ -21284,18 +21281,18 @@ static void test_l432_refusals_and_counters_reach_the_stream(void) {
 
     for (int cause = 0; cause < SERVER_503_CAUSES; cause++) {
         x.s.count_503((server_503_cause)cause);
-        clock_gettime(CLOCK_MONOTONIC, &t0);
+        t0 = pulsar_mono_ts();
         stream_server_expect_frame(&x, &t0);
     }
 
     x.s.count_metric(&x.s.m_req_class[0]);
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    t0 = pulsar_mono_ts();
     stream_server_expect_frame(&x, &t0);
 
     job j;
     memset(&j, 0, sizeof j);
     x.s.note_provision_refusal(&j, PROVISION_REFUSED_KV_TOUCHED);
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    t0 = pulsar_mono_ts();
     TEST_ASSERT(x.s.m_refusals[PROVISION_REFUSED_KV_TOUCHED] == 1);
     stream_server_expect_frame(&x, &t0);
     /* the worker retries that head a hundred times a second: the retries change nothing and mark nothing */
@@ -21325,7 +21322,7 @@ static void test_l432_a_mark_from_any_thread_reaches_the_stream(void) {
         TEST_ASSERT(pthread_create(&th, NULL, l432_mark_thread, &x.s) == 0);
         pthread_join(th, NULL);
         struct timespec t0;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
+        t0 = pulsar_mono_ts();
         stream_server_expect_frame(&x, &t0);
     }
     stream_server_stop(&x);
@@ -21345,10 +21342,10 @@ static void test_l432_an_idle_server_sends_only_the_refresh(void) {
     char all[4096] = {0};
     size_t used = 0;
     struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    t0 = pulsar_mono_ts();
     for (;;) {
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        const double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        t1 = pulsar_mono_ts();
+        const double ms = pulsar_ms_between(t0, t1);
         if (ms >= 1000.0) break;
         int n = stream_read_within(fds[1], all + used, sizeof all - used, (int)(1000.0 - ms) + 1);
         if (n > 0) used += (size_t)n;
@@ -21494,7 +21491,7 @@ static void test_guard_budget_reads_live_memavailable(void) {
     s.guard_eager_bytes = kvb(31 * GiB);
     s.guard_touched_ceiling = kvb(5 * GiB);     /* cut at warmup: MemAvailable was floor + 5 GiB */
     s.guard_budget_said = kvb(5 * GiB);         /* no line for the cases below that stay put */
-    s.guard_avail_at = server_now_sec();        /* the reading below is fresh: no /proc read in this test */
+    s.guard_avail_at = pulsar_mono_sec();        /* the reading below is fresh: no /proc read in this test */
     s.guard_floor = server_guard_floor(false);
     s.guard_avail = devb(F + 2 * GiB);           /* 3 GiB went to something no ledger counts */
     TEST_ASSERT(s.guard_budget() == kvb(2 * GiB));   /* the live headroom binds */
@@ -21544,7 +21541,7 @@ static void test_guard_discrete_reads_the_device(void) {
     s.guard_eager_bytes = kvb(eager);
     s.guard_touched_ceiling = c;
     s.guard_budget_said = c;
-    s.guard_avail_at = server_now_sec();
+    s.guard_avail_at = pulsar_mono_sec();
     s.guard_avail = devb(floor.raw() + 1 * GiB);   /* 1.2 GiB went to something else: the live reading binds */
     TEST_ASSERT(s.guard_budget() == kvb(1 * GiB));
 }

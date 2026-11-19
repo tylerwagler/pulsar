@@ -306,11 +306,11 @@ static bool prefill_loop_chunk(void *ud, uint32_t pos0, uint32_t rows, bool last
      * at its embed, goes ahead of them) -- for a SERVED prompt only: the one a server named for this sync
      * (pulsar_session_set_prefill_ahead); a sync nobody licensed (a gate, the CLI, imatrix) passes NULL, reads nothing */
     (void)pulsar_session_read_ahead(c->s, pulsar_bank_index(c->bank), c->s->prefill_ahead, pos0 + rows);
-    const double t0 = now_sec();
+    const double t0 = pulsar_mono_sec();
     pulsar_stall_mark("prefill chunk");
     if (!c->chunk(c->s, c->prompt, pos0, rows, last, c->ud) || pulsar_gpu_end_commands() == 0) return false;
     if (c->s->sync_n_images == 0)
-        pulsar_engine_prefill_chunk_observe(c->s->engine, rows, pos0, (now_sec() - t0) * 1e3);
+        pulsar_engine_prefill_chunk_observe(c->s->engine, rows, pos0, pulsar_ms_of_sec(pulsar_mono_sec() - t0));
     return true;
 }
 

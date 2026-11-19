@@ -22,6 +22,7 @@
  */
 
 #include "tp/pulsar_tp.h"
+#include "lib/pulsar_clock.h"   /* L442: the clocks and the time-unit conversions */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -804,14 +805,6 @@ struct pulsar_tp {
  * Small socket helpers (same conventions as upstream ds4_tp.c).
  * --------------------------------------------------------------------- */
 
-/// Monotonic clock in seconds.
-/// @return CLOCK_MONOTONIC as seconds
-static double tp_now_sec(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
-}
-
 /// printf into (err, errlen) when err is non-NULL.
 /// @param err    the buffer (may be NULL)
 /// @param errlen size of `err`
@@ -942,7 +935,7 @@ static int tp_listen(const char *host, int port, int backlog, char *err, size_t 
 static int tp_dial(const char *host, int port, double timeout_sec, char *err, size_t errlen) {
     char portbuf[16];
     snprintf(portbuf, sizeof(portbuf), "%d", port);
-    double deadline = tp_now_sec() + timeout_sec;
+    double deadline = pulsar_mono_sec() + timeout_sec;
     int last_errno = 0;
     uint32_t attempts = 0;
     do {
@@ -970,8 +963,8 @@ static int tp_dial(const char *host, int port, double timeout_sec, char *err, si
                     gai != 0 ? gai_strerror(gai) :
                     last_errno ? strerror(last_errno) : "no address worked");
         }
-        usleep(200 * 1000);
-    } while (tp_now_sec() < deadline);
+        usleep(pulsar_us_of_ms(200u));
+    } while (pulsar_mono_sec() < deadline);
     tp_set_err(err, errlen, "tp connect %s:%d: %s", host, port,
                last_errno ? strerror(last_errno) : "unreachable");
     return -1;
@@ -997,17 +990,17 @@ static int tp_send_frame(int fd, uint32_t type, const void *payload, uint32_t by
  * the tests wrap themselves in `timeout`.  A deadline turns that hang into the
  * refusal it should always have been. */
 /// @param fd       the socket
-/// @param deadline absolute tp_now_sec() deadline
+/// @param deadline absolute pulsar_mono_sec() deadline
 /// @return 1 readable, 0 on timeout or poll error
 static int tp_wait_readable(int fd, double deadline) {
     for (;;) {
-        const double remaining = deadline - tp_now_sec();
+        const double remaining = deadline - pulsar_mono_sec();
         if (remaining <= 0.0) return 0;
         struct pollfd pfd;
         pfd.fd = fd;
         pfd.events = POLLIN;
         pfd.revents = 0;
-        int ms = (int)(remaining * 1000.0);
+        int ms = (int)pulsar_ms_of_sec(remaining);
         if (ms < 1) ms = 1;
         const int rc = poll(&pfd, 1, ms);
         if (rc > 0) return 1;
@@ -1022,7 +1015,7 @@ static int tp_wait_readable(int fd, double deadline) {
 /// @param tp the transport
 /// @return the absolute deadline, or 0 for none
 static double tp_control_deadline(const pulsar_tp *tp) {
-    return tp->timeout_sec ? tp_now_sec() + (double)tp->timeout_sec : 0.0;
+    return tp->timeout_sec ? pulsar_mono_sec() + (double)tp->timeout_sec : 0.0;
 }
 
 /// Read and check one control frame header.
@@ -1852,8 +1845,8 @@ static int tp_rdma_gate_exchange(pulsar_tp *tp, TpSlot layer, uint32_t gate,
             fprintf(stderr, "pulsar-tp: peer disconnected during rdma gate\n");
             ok = 0;
         }
-        if (deadline == 0.0) deadline = tp_now_sec() + (double)tp->timeout_sec;
-        else if (tp_now_sec() > deadline) {
+        if (deadline == 0.0) deadline = pulsar_mono_sec() + (double)tp->timeout_sec;
+        else if (pulsar_mono_sec() > deadline) {
             fprintf(stderr, "pulsar-tp: timeout waiting gate seq %llu (recv_done %llu)\n",
                     (unsigned long long)seq, (unsigned long long)r->recv_done);
             ok = 0;
@@ -2089,20 +2082,20 @@ static int tp_row_proxy_exchange(pulsar_tp *tp, uint64_t first, uint32_t rows) {
     if (!ok) fprintf(stderr, "pulsar-tp: row lane proxy: exchange published with no armed window\n");
     for (uint32_t k = 0; ok && k < rows; k++)
         ok = tp_rdma_post_gate_send(tp, first + k, tp_row_slot(tp, first + k));
-    const double t_posted = tp_now_sec();
+    const double t_posted = pulsar_mono_sec();
     const double deadline = t_posted + (double)tp->timeout_sec;
-    double next_abort_check = t_posted + 1e-3;
+    double next_abort_check = t_posted + pulsar_sec_of_ms(1.0);
     while (ok && (r->recv_done < last || r->send_outstanding > 0)) {
         ok = tp_rdma_drain_cq(tp);
-        if (ok && tp_now_sec() > next_abort_check) {
-            next_abort_check = tp_now_sec() + 1e-3;
+        if (ok && pulsar_mono_sec() > next_abort_check) {
+            next_abort_check = pulsar_mono_sec() + pulsar_sec_of_ms(1.0);
             if (tp_peer_lost(tp)) {
                 tp_row_err_latch(tp, 2u);
                 pulsar_tp_mark_failed(tp);
                 ok = 0;
             }
         }
-        if (ok && tp_now_sec() > deadline) {
+        if (ok && pulsar_mono_sec() > deadline) {
             fprintf(stderr, "pulsar-tp: row lane: timeout at seq %llu (recv_done %llu, "
                             "%u sends outstanding)\n", (unsigned long long)last,
                     (unsigned long long)r->recv_done, r->send_outstanding);
@@ -2232,20 +2225,20 @@ static int tp_bulk_proxy_exchange(pulsar_tp *tp, uint64_t e, uint64_t bytes, uin
     if (two && !tp_bulk_post_rail(&tp->rail2, r->bulk_qp2, tp->peer_bulk2_rkey, tp->bulk, remote,
                                   front, bytes - front, e))
         return 0;
-    const double t_posted = tp_now_sec();
+    const double t_posted = pulsar_mono_sec();
     /* The peer's k-th bulk exchange is our k-th imm arrival, on every rail. */
     const uint64_t want = pulsar_tp_bulk_arrival_next(&r->bulk_arr);
     const uint64_t want2 = two ? pulsar_tp_bulk_arrival_next(&r->bulk_arr2) : 0;
     bool sent = false, sent2 = !two;
     const double deadline = t_posted + (double)tp->timeout_sec;
-    double next_abort_check = t_posted + 1e-3;
+    double next_abort_check = t_posted + pulsar_sec_of_ms(1.0);
     while (!sent || !sent2 || !pulsar_tp_bulk_arrival_ready(&r->bulk_arr, want) ||
            (two && !pulsar_tp_bulk_arrival_ready(&r->bulk_arr2, want2))) {
         if (!tp_bulk_reap_rail(&tp->rdma, &r->bulk_arr, &sent, e)) return 0;
         if (two && !tp_bulk_reap_rail(&tp->rail2, &r->bulk_arr2, &sent2, e)) return 0;
-        const double now = tp_now_sec();
+        const double now = pulsar_mono_sec();
         if (now > next_abort_check) {
-            next_abort_check = now + 1e-3;
+            next_abort_check = now + pulsar_sec_of_ms(1.0);
             if (tp_peer_lost(tp)) {
                 tp_row_err_latch(tp, 2u);
                 pulsar_tp_mark_failed(tp);
@@ -2288,7 +2281,7 @@ static void *tp_row_proxy_main(void *arg) {
     pulsar_tp *tp = static_cast<pulsar_tp *>(arg);
     volatile uint64_t *desc = tp_row_desc(tp);
     uint64_t last_exch = 0, next_msg = 1;
-    double idle_since = tp_now_sec();
+    double idle_since = pulsar_mono_sec();
     /* How long to keep busy-polling after the last exchange before backing off.
      * Decode exchanges come microseconds apart, so 2 ms covers them.  A prefill
      * chunk's BULK exchanges come one per half-layer, ~15 ms apart on the pair
@@ -2302,7 +2295,7 @@ static void *tp_row_proxy_main(void *arg) {
         const uint64_t e = __atomic_load_n(&desc[0], __ATOMIC_ACQUIRE);
         if (e == last_exch) {
             /* busy-poll while exchanges are coming; back off once idle */
-            if (tp_now_sec() - idle_since > busy_window) usleep(50);
+            if (pulsar_mono_sec() - idle_since > busy_window) usleep(50);
             continue;
         }
         if (desc[2] & PULSAR_TP_DESC_BULK_FLAG) {
@@ -2324,7 +2317,7 @@ static void *tp_row_proxy_main(void *arg) {
             }
             last_exch = e;
             tp_row_done_publish(tp, e);
-            idle_since = tp_now_sec();
+            idle_since = pulsar_mono_sec();
             busy_window = 0.050;
             continue;
         }
@@ -2346,7 +2339,7 @@ static void *tp_row_proxy_main(void *arg) {
         last_exch = e;
         next_msg = first + rows;
         tp_row_done_publish(tp, e);
-        idle_since = tp_now_sec();
+        idle_since = pulsar_mono_sec();
     }
     return NULL;
 }
@@ -2430,7 +2423,7 @@ static int tp_rdma_drain_decode_window(pulsar_tp *tp) {
 
     uint32_t recv_done = 0;
     int send_done = 0;
-    const double deadline = tp_now_sec() + (double)tp->timeout_sec;
+    const double deadline = pulsar_mono_sec() + (double)tp->timeout_sec;
     uint32_t peer_poll = 0;
     while (recv_done < nwr || !send_done) {
         struct tp_ibv_wc wc[PULSAR_TP_RDMA_RECV_WINDOW * 2u + 1u];
@@ -2461,7 +2454,7 @@ static int tp_rdma_drain_decode_window(pulsar_tp *tp) {
             pthread_mutex_unlock(&r->post_lock);
             return 0;
         }
-        if (tp_now_sec() > deadline) {
+        if (pulsar_mono_sec() > deadline) {
             fprintf(stderr,
                     "pulsar-tp: timeout draining rdma receive window (%u/%u)\n",
                     recv_done, nwr);
@@ -2582,7 +2575,7 @@ static int tp_rdma_big_gate_exchange(pulsar_tp *tp, pulsar_tp_rdma_link *link, i
 
         uint32_t recv_done = 0;
         int send_done = 0;
-        const double deadline = tp_now_sec() + (double)tp->timeout_sec;
+        const double deadline = pulsar_mono_sec() + (double)tp->timeout_sec;
         uint32_t peer_poll = 0;
         while (recv_done < chunks || !send_done) {
             struct tp_ibv_wc wc[PULSAR_TP_RDMA_BULK_SLOTS + 1u];
@@ -2615,7 +2608,7 @@ static int tp_rdma_big_gate_exchange(pulsar_tp *tp, pulsar_tp_rdma_link *link, i
                         "pulsar-tp: peer disconnected during bulk rdma gate\n");
                 return 0;
             }
-            if (tp_now_sec() > deadline) {
+            if (pulsar_mono_sec() > deadline) {
                 fprintf(stderr,
                         "pulsar-tp: timeout waiting for bulk rdma round "
                         "(%u/%u recvs, send=%d)\n",
@@ -4848,7 +4841,7 @@ void pulsar_tp_own_step_failed(pulsar_tp *tp, const char *operation) {
                 operation ? operation : "step", why);
     for (int i = 0; tp && i < tp->n_peers; i++) {
         const int pfd = tp->peers[i].control_fd;
-        if (pfd >= 0 && !tp_wait_readable(pfd, tp_now_sec() + 5.0)) {
+        if (pfd >= 0 && !tp_wait_readable(pfd, pulsar_mono_sec() + 5.0)) {
             char why[160];
             snprintf(why, sizeof(why), "this rank's %s failed and the peer did not answer within 5 s "
                                        "(it is still running the step)", operation ? operation : "step");

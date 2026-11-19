@@ -8,6 +8,7 @@
 #define PULSAR_AGENT_INTERNAL_H
 
 #include "pulsar.h"
+#include "lib/pulsar_clock.h"   /* L442: the clocks and the time-unit conversions */
 #include "pulsar_help.h"
 #include "pulsar_kvtext.h"
 #include "pulsar_segstore.h"
@@ -1022,9 +1023,6 @@ void agent_input_buf_free(agent_input_buf *b);
  *  @param cmd the typed line
  *  @return true for a known command */
 bool agent_slash_command_known(const char *cmd);
-/** Monotonic clock (CLOCK_MONOTONIC).
- *  @return seconds, with nanosecond resolution */
-double agent_now_sec(void);
 /** Parse pulsar-agent's command line over the agent's defaults (the merged drafter disabled, 100000-token
  *  context, 50000-token turn cap); exits with usage on a bad option.
  *  @param argc argument count
@@ -1877,7 +1875,7 @@ bool agent_worker_compact_if_needed(agent_worker *w, const char *reason,
  *  @param w         the worker
  *  @param token     the token
  *  @param generated the turn's token count, incremented
- *  @param t0        the turn's start (agent_now_sec), for tokens/s
+ *  @param t0        the turn's start (pulsar_mono_sec), for tokens/s
  *  @param stream    the display stream
  *  @param err       receives the reason on failure
  *  @param err_len   its capacity
@@ -1894,7 +1892,7 @@ int worker_accept_generated_token(agent_worker *w,
  *  @param text       the text to force
  *  @param max_tokens the turn's token cap
  *  @param generated  the turn's token count, incremented
- *  @param t0         the turn's start (agent_now_sec)
+ *  @param t0         the turn's start (pulsar_mono_sec)
  *  @param stream     the display stream
  *  @param err        receives the reason on failure
  *  @param err_len    its capacity

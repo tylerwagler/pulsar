@@ -6,14 +6,6 @@
 
 
 
-/// @brief The wall clock (gettimeofday), in milliseconds; the writer's stall and idle clock.
-/// @return milliseconds since the epoch
-static long long wall_ms(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
-}
-
 
 
 /* Thread-local: only the GPU worker installs a writer (around a job), so
@@ -63,7 +55,7 @@ bool slot_writer_flush(slot_writer *w) {
         ssize_t r = send(w->fd, w->pending.ptr + w->off, w->pending.len - w->off, 0);
         if (r > 0) {
             w->off += (size_t)r;
-            w->stall_deadline_ms = wall_ms() + PULSAR_SERVER_SEND_STALL_TIMEOUT_MS;
+            w->stall_deadline_ms = pulsar_wall_ms() + PULSAR_SERVER_SEND_STALL_TIMEOUT_MS;
             continue;
         }
         if (r < 0 && errno == EINTR) continue;
@@ -84,7 +76,7 @@ bool slot_writer_flush(slot_writer *w) {
         w->pending.len -= w->off;
         w->off = 0;
     }
-    if (wall_ms() >= w->stall_deadline_ms) {
+    if (pulsar_wall_ms() >= w->stall_deadline_ms) {
         w->failed = true;
         return false;
     }
@@ -110,7 +102,7 @@ static bool slot_writer_send(slot_writer *w, const void *p, size_t n) {
     /* Stamp BEFORE the fast path below, which can return early once the bytes
      * go straight to the wire — stamping at the buf_append would miss exactly
      * the case where the client is keeping up (the common one). */
-    w->last_write_ms = wall_ms();
+    w->last_write_ms = pulsar_wall_ms();
     const char *s = (const char *)p;
     if (w->off == w->pending.len) {
         /* Nothing queued: try the wire directly so hard errors (EPIPE from a
@@ -137,7 +129,7 @@ static bool slot_writer_send(slot_writer *w, const void *p, size_t n) {
         return false;
     }
     if (!w->stall_deadline_ms) {
-        w->stall_deadline_ms = wall_ms() + PULSAR_SERVER_SEND_STALL_TIMEOUT_MS;
+        w->stall_deadline_ms = pulsar_wall_ms() + PULSAR_SERVER_SEND_STALL_TIMEOUT_MS;
     }
     return slot_writer_flush(w);
 }
@@ -148,7 +140,7 @@ static bool slot_writer_send(slot_writer *w, const void *p, size_t n) {
 ///        stream, written by the client thread).
 /// @param w  the writer
 void slot_writer_mark_written(slot_writer *w) {
-    w->last_write_ms = wall_ms();
+    w->last_write_ms = pulsar_wall_ms();
 }
 
 
@@ -191,12 +183,12 @@ bool gen_stream_heartbeat(gen_state *g) {
         /* L249 D: bound, but nothing written yet (a restore, an admission wait, a long first chunk): the stream
          * opens once the request has waited a beat since it was accepted, the SSE head and a beat at once -- the
          * pre-bind wait has the client thread's early stream (job_early_keepalive) */
-        if (server_now_sec() - g->j->accepted_at < PULSAR_SERVER_HEARTBEAT_MS / 1000.0) return false;
+        if (pulsar_mono_sec() - g->j->accepted_at < pulsar_sec_of_ms((double)PULSAR_SERVER_HEARTBEAT_MS)) return false;
         g->progress.headers_sent = true;
         return slot_writer_send(&g->writer, k_sse_head, strlen(k_sse_head)) &&
                slot_writer_send(&g->writer, beat, strlen(beat));
     }
-    if (!slot_writer_idle_for(&g->writer, wall_ms(), PULSAR_SERVER_HEARTBEAT_MS)) return false;
+    if (!slot_writer_idle_for(&g->writer, pulsar_wall_ms(), PULSAR_SERVER_HEARTBEAT_MS)) return false;
 
     /* Write through the slot's OWN writer, not send_all: send_all only becomes
      * non-blocking when that writer is INSTALLED thread-locally, which it is
@@ -220,7 +212,7 @@ bool slot_writer_drain(slot_writer *w) {
         }
         if (!slot_writer_flush(w)) break;
         if (w->off >= w->pending.len) break;
-        long long remaining = w->stall_deadline_ms - wall_ms();
+        long long remaining = w->stall_deadline_ms - pulsar_wall_ms();
         if (remaining <= 0) {
             w->failed = true;
             break;
@@ -252,13 +244,13 @@ bool send_all(int fd, const void *p, size_t n) {
         return slot_writer_send(g_slot_writer, p, n);
     }
     const char *s = (const char *)p;
-    long long deadline = wall_ms() + PULSAR_SERVER_SEND_STALL_TIMEOUT_MS;
+    long long deadline = pulsar_wall_ms() + PULSAR_SERVER_SEND_STALL_TIMEOUT_MS;
     while (n) {
         if (g_stop_requested) return false;
         ssize_t w = send(fd, s, n, 0);
         if (w < 0 && errno == EINTR) continue;
         if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            long long remaining = deadline - wall_ms();
+            long long remaining = deadline - pulsar_wall_ms();
             if (remaining <= 0) return false;
             struct pollfd pfd = {.fd = fd, .events = POLLOUT};
             int timeout = remaining > 50 ? 50 : (int)remaining;
@@ -272,7 +264,7 @@ bool send_all(int fd, const void *p, size_t n) {
         if (w <= 0) return false;
         s += w;
         n -= (size_t)w;
-        deadline = wall_ms() + PULSAR_SERVER_SEND_STALL_TIMEOUT_MS;
+        deadline = pulsar_wall_ms() + PULSAR_SERVER_SEND_STALL_TIMEOUT_MS;
     }
     return true;
 }

@@ -217,7 +217,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             w->status.prefill_label : agent_next_prefill_label();
         w->status.state = AGENT_WORKER_PREFILL;
         w->progress_base = cached;
-        w->progress_started_at = agent_now_sec();
+        w->progress_started_at = pulsar_mono_sec();
         w->status.prefill_done = 0;
         w->status.prefill_total = suffix;
         w->status.prefill_label = prefill_label;
@@ -294,7 +294,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         bool malformed_tool = false;
         bool early_tool_error = false;
         int generated = 0;
-        double t0 = agent_now_sec();
+        double t0 = pulsar_mono_sec();
 
         pthread_mutex_lock(&w->mu);
         w->status.state = AGENT_WORKER_GENERATING;
@@ -604,9 +604,7 @@ void *worker_main(void *arg) {
                 continue;
             }
             /* L373: an idle worker with a bash job running wakes once a second to drain it and apply its timeout */
-            struct timespec until;
-            clock_gettime(CLOCK_REALTIME, &until);
-            until.tv_sec += 1;
+            const struct timespec until = pulsar_wall_deadline_after(1.0);
             if (pthread_cond_timedwait(&w->cond, &w->mu, &until) != ETIMEDOUT) continue;
             pthread_mutex_unlock(&w->mu);   /* a job that ends takes w->mu itself */
             jobs_running = agent_bash_jobs_poll(w);

@@ -14,6 +14,7 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_bf16.h>
+#include "lib/pulsar_clock.h"   /* L442: the clocks and the time-unit conversions */
 #include <mma.h>
 #include <cublas_v2.h>
 #include <cublasLt.h>

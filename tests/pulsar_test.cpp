@@ -5449,12 +5449,6 @@ static bool bpe_merge_same(const pulsar_vocab *v, const char *what, const std::s
     return same;
 }
 
-static double bpe_test_seconds(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
-}
-
 /* Host: the DeepSeek container's vocabulary and merge table (PULSAR_TEST_DS4_TOKENIZER, the container the engine
  * would load -- only its metadata is read). */
 static void test_bpe_merge(void) {
@@ -5592,9 +5586,9 @@ static void test_bpe_merge(void) {
      * under a second; the old loop's cost at a tenth of that, for the log */
     const std::string run(200000u, 'a');
     token_vec out = {0};
-    double t0 = bpe_test_seconds();
+    double t0 = pulsar_mono_sec();
     v.bpe_tokenize_text(run.c_str(), &out);
-    const double run_s = bpe_test_seconds() - t0;
+    const double run_s = pulsar_mono_sec() - t0;
     TEST_ASSERT(out.len > 0 && run_s < 0.5);
     size_t back = 0;
     for (int i = 0; i < out.len; i++) {
@@ -5606,14 +5600,14 @@ static void test_bpe_merge(void) {
     std::string mixed;
     for (uint32_t i = 0; i < 200000u; i++) mixed += (char)('a' + next() % 26u);
     token_vec out_mixed = {0};
-    t0 = bpe_test_seconds();
+    t0 = pulsar_mono_sec();
     v.bpe_tokenize_text(mixed.c_str(), &out_mixed);
-    const double mixed_s = bpe_test_seconds() - t0;
+    const double mixed_s = pulsar_mono_sec() - t0;
     TEST_ASSERT(out_mixed.len > 0 && mixed_s < 0.5);
     token_vec ref = {0};
-    t0 = bpe_test_seconds();
+    t0 = pulsar_mono_sec();
     bpe_ref_emit_piece(&v, { run.data(), 20000u }, &ref);
-    const double ref_s = bpe_test_seconds() - t0;
+    const double ref_s = pulsar_mono_sec() - t0;
     printf("bpe-merge: %" PRIu64 " corpus pieces, %u randomized (the longest %u bytes), %u repeat lengths: "
            "%" PRIu64 " ids identical to the old merge loop's; a 200000-character run %.3f s (%d ids), 200000 random "
            "letters %.3f s (%d ids); the old loop on a 20000-character run %.3f s\n",

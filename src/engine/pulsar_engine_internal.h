@@ -23,6 +23,7 @@
  */
 
 #include "tp/pulsar_tp.h"
+#include "lib/pulsar_clock.h"   /* L442: the clocks and the time-unit conversions */
 #include <errno.h>
 #include <fcntl.h>
 #include <float.h>
@@ -3897,8 +3898,6 @@ char *pulsar_strdup(const char *s);
 /// @param size  the new size, bytes
 /// @return the reallocated block.
 void *xrealloc(void *ptr, size_t size);
-/// @return CLOCK_MONOTONIC time, in seconds.
-double now_sec(void);
 
 /// Fold one step into a lane's exponentially weighted cost fit and refit.
 /// @param f     the fit (NULL is a no-op)

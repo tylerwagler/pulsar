@@ -2062,8 +2062,8 @@ void pulsar_engine_lane_cost_observe(pulsar_engine *e, pulsar_decode_lane lane, 
         f->ann_row_us = f->row_us;
         f->ann_n = f->n;
         fprintf(stderr, "pulsar: %s lane cost measured: step = %.1f + %.2f x rows ms (%u steps%s)\n",
-                lane == PULSAR_LANE_SPEC ? "spec" : "plain", (double)f->flat_us / 1000.0,
-                (double)f->row_us / 1000.0, f->n, first ? "" : ", moved");
+                lane == PULSAR_LANE_SPEC ? "spec" : "plain", pulsar_ms_of_us((double)f->flat_us),
+                pulsar_ms_of_us((double)f->row_us), f->n, first ? "" : ", moved");
     }
 }
 pulsar_lane_cost pulsar_engine_lane_cost(const pulsar_engine *e, pulsar_decode_lane lane) {

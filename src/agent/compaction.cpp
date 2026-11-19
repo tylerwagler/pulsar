@@ -163,7 +163,7 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
 
     pthread_mutex_lock(&w->mu);
     w->status.state = AGENT_WORKER_COMPACTING;
-    w->progress_started_at = agent_now_sec();
+    w->progress_started_at = pulsar_mono_sec();
     w->status.prefill_done = 0;
     w->status.prefill_total = 0;
     w->status.prefill_tps = 0.0;
@@ -218,7 +218,7 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
     char eval_err[160] = {0};
     TokId think_end_id = pulsar_token_think_close(w->engine);
     TokId dsml_id = agent_special_token_id(w->engine, "｜DSML｜");
-    double t0 = agent_now_sec();
+    double t0 = pulsar_mono_sec();
     for (int i = 0; i < summary_max; i++) {
         if (worker_should_interrupt(w)) {
             snprintf(err, err_len, "interrupted");
@@ -259,7 +259,7 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
         agent_publish_untrusted(w, text, text_len);
         free(text);
 
-        double dt = agent_now_sec() - t0;
+        double dt = pulsar_mono_sec() - t0;
         pthread_mutex_lock(&w->mu);
         w->status.generated = i + 1;
         w->status.gen_tps = dt > 0.0 ? (double)(i + 1) / dt : 0.0;
@@ -369,7 +369,7 @@ int worker_accept_generated_token(agent_worker *w,
     free(text);
     (*generated)++;
 
-    double dt = agent_now_sec() - t0;
+    double dt = pulsar_mono_sec() - t0;
     pthread_mutex_lock(&w->mu);
     w->status.generated = *generated;
     w->status.gen_tps = dt > 0.0 ? (double)*generated / dt : 0.0;

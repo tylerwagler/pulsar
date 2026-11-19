@@ -58,7 +58,7 @@
 /// @return false when a declared shape's capture failed: the server refuses to start
 static bool server_warmup_generation(pulsar_engine *engine, pulsar_session *session,
                                      int ctx_size) {
-    const double t0 = server_now_sec();
+    const double t0 = pulsar_mono_sec();
     pulsar_gpu_seg_catalog_open();
     const HostBytes avail_before = pulsar_mem_available();
     /* One full prefill-cap chunk plus a tail: exercises the widened chunk
@@ -163,7 +163,7 @@ static bool server_warmup_generation(pulsar_engine *engine, pulsar_session *sess
                    "pulsar-server: warmup generation: %d prompt + %d decode tokens "
                    "in %.1f s; MemAvailable %.2f -> %.2f GiB "
                    "(first-generation working set %.2f GiB materialized)",
-                   want, emitted, server_now_sec() - t0,
+                   want, emitted, pulsar_mono_sec() - t0,
                    pulsar_gib(avail_before),
                    pulsar_gib(avail_after),
                    pulsar_gib(avail_before > avail_after

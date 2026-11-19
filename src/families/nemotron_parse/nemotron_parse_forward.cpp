@@ -60,13 +60,6 @@ constexpr uint32_t NP_PROMPT_MAX = 64;
 /// The f16 operand rows every Linear but the decoder's Wo reads.
 constexpr pulsar_rows_out F16 = PULSAR_ROWS_OUT_F16;
 
-/** @return CLOCK_MONOTONIC in milliseconds (the stats' stage timings) */
-double now_ms(void) {
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return 1e3 * (double)t.tv_sec + 1e-6 * (double)t.tv_nsec;
-}
-
 /** The run's device buffers, an index into pulsar_nemotron_parse_run::t / ::bytes (sizes in run_create); B_COUNT
  *  counts them. */
 enum np_buf {
@@ -474,7 +467,7 @@ int parse(pulsar_engine *e, const uint8_t *image, size_t len, const pulsar_parse
         if (err) snprintf(err, errlen, "%s: a prompt of %zu tokens (at most %u)", ARCH, prompt.size(), NP_PROMPT_MAX);
         return -2;
     }
-    const double t0 = now_ms();
+    const double t0 = pulsar_mono_ms_f();
     pulsar_nemotron_parse_page pg;
     vision_decode_busy_reset();
     if (!pulsar_nemotron_parse_page_prepare(&s, image, len, &pg, err, errlen)) return vision_decode_busy_seen() ? -3 : -2;
@@ -491,7 +484,7 @@ int parse(pulsar_engine *e, const uint8_t *image, size_t len, const pulsar_parse
         pulsar_group_gpu_phase ph;
         ok = ok && neck(c, n_patch, &n_prefix);
     }
-    const double t1 = now_ms();
+    const double t1 = pulsar_mono_ms_f();
     std::vector<int> seq = prompt;
     std::vector<float> logits(s.vocab);
     std::vector<uint8_t> seen(s.vocab, 0);
@@ -503,7 +496,7 @@ int parse(pulsar_engine *e, const uint8_t *image, size_t len, const pulsar_parse
               fail(err, errlen, "the logits' read failed"));
         if (ok) c.put("logits0", r->t[B_LOGITS], 1, s.vocab);
     }
-    const double t2 = now_ms();
+    const double t2 = pulsar_mono_ms_f();
     const uint32_t max_new = opt && opt->max_new_tokens ? opt->max_new_tokens : s.max_new;
     uint32_t n_new = 0;
     while (ok) {
@@ -522,7 +515,7 @@ int parse(pulsar_engine *e, const uint8_t *image, size_t len, const pulsar_parse
               fail(err, errlen, "the logits' read failed"));
     }
     pthread_mutex_unlock(&r->mu);
-    const double t3 = now_ms();
+    const double t3 = pulsar_mono_ms_f();
     if (!ok) return -1;
     for (int id : seq) pulsar_tokens_push(ids_out, TokId{id});
     const std::string t = pulsar_nemotron_parse_decode(w->vocab, seq.data(), seq.size());

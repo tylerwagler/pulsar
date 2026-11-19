@@ -608,7 +608,7 @@ static bool accelerator_prepare_model_tensor_spans(const pulsar_model *m,
     const int tty = pulsar_log_is_tty(stderr);
     const uint64_t progress_step = (tty ? 2ull : 16ull) * 1073741824ull;
     uint64_t next_progress = progress_step;
-    double last_progress = now_sec();
+    double last_progress = pulsar_mono_sec();
     uint64_t prepared = 0;
     uint64_t merged = 0;
 
@@ -652,7 +652,7 @@ static bool accelerator_prepare_model_tensor_spans(const pulsar_model *m,
         prepared += (end - off).raw();
         merged++;
 
-        const double now = now_sec();
+        const double now = pulsar_mono_sec();
         if (prepared >= next_progress || now - last_progress >= (tty ? 2.0 : 10.0)) {
             if (tty) {
                 fprintf(stderr, "\r\033[Kpulsar: %s preparing model tensor mappings: %.2f GiB",
@@ -725,12 +725,12 @@ bool accelerator_cache_model_tensors(pulsar_backend backend,
     /* n_fp8 == n_fp8_lt by construction now -- a plain one dies above. The line
      * still prints both because a future divergence should be visible, and
      * because 369/390 is exactly how the double-store was spotted. */
-    const double t0 = now_sec();
+    const double t0 = pulsar_mono_sec();
     uint64_t prepared = 0;
     if (!accelerator_prepare_model_tensor_spans(m, span_offsets, span_sizes, span_count, skip_prefix, &prepared)) {
         return false;
     }
-    const double t1 = now_sec();
+    const double t1 = pulsar_mono_sec();
     const char *accelerator_name = "CUDA";
     fprintf(stderr,
             "pulsar: %s startup model preparation covered %.2f GiB of tensor spans in %.3fs\n",

@@ -672,11 +672,11 @@ void *client(void *arg) {
         } else if (!(c = route(srv, kind, o, &why))) {
             http_error(fd, 400, why.c_str());
         } else {
-            const double t0 = server_now_sec();
+            const double t0 = pulsar_mono_sec();
             if (kind == K_EMBED) embeddings(c, fd, o);
             else if (kind == K_RERANK) rerank(c, fd, o);
             else parse(c, fd, o);
-            server_log(PULSAR_LOG_DEFAULT, "pulsar-server: %s %s %.0f ms", hr.path, c->id, (server_now_sec() - t0) * 1e3);
+            server_log(PULSAR_LOG_DEFAULT, "pulsar-server: %s %s %.0f ms", hr.path, c->id, pulsar_ms_of_sec(pulsar_mono_sec() - t0));
         }
     } else {
         std::string eps;

@@ -640,7 +640,7 @@ bool server::send_metrics(int fd) {
     const unsigned long long restores = (unsigned long long)s->m_restores;
     const unsigned long long restore_failures = (unsigned long long)s->m_restore_failures;
     const unsigned long long restore_slices = (unsigned long long)s->m_restore_slices;    /* L330 */
-    const double restore_stall_max_s = s->m_restore_stall_max_ms / 1000.0;
+    const double restore_stall_max_s = pulsar_sec_of_ms((double)s->m_restore_stall_max_ms);
     const unsigned long long kv_touched = (unsigned long long)s->m_kv_touched.raw();      /* L328 */
     const unsigned long long kv_reserved = (unsigned long long)s->m_kv_reserved.raw();
     const unsigned long long kv_budget_live = (unsigned long long)s->m_kv_budget.raw();   /* 2026-10-29 */
@@ -1078,7 +1078,7 @@ bool server::send_metrics(int fd) {
         const char *from[2] = {"disk", "ram"};   /* L347 I3a: the RAM tier (was page_cache) */
         for (int i = 0; i < 2; i++)
             buf_printf(&b, "pulsar:kv_disk_read_bytes_per_second{from=\"%s\"} %.0f\n", from[i],
-                       per_gib[i] > 0.0 ? PULSAR_GIB * 1000.0 / per_gib[i] : 0.0);
+                       per_gib[i] > 0.0 ? pulsar_per_sec(PULSAR_GIB, per_gib[i]) : 0.0);
     }
     buf_puts(&b, "# HELP pulsar:kv_disk_last_transfer_ms The last disk hit's estimated chain read time.\n");
     buf_puts(&b, "# TYPE pulsar:kv_disk_last_transfer_ms gauge\n");
@@ -1200,7 +1200,7 @@ bool server::send_metrics(int fd) {
         buf_printf(&b, "pulsar:ple_read_ahead_bytes_total %llu\n", (unsigned long long)ra.bytes_read);
         buf_puts(&b, "# HELP pulsar:ple_read_ahead_seconds_total Reader time on read-ahead rows, summed over the readers.\n");
         buf_puts(&b, "# TYPE pulsar:ple_read_ahead_seconds_total counter\n");
-        buf_printf(&b, "pulsar:ple_read_ahead_seconds_total %.6f\n", (double)ra.read_ns * 1e-9);
+        buf_printf(&b, "pulsar:ple_read_ahead_seconds_total %.6f\n", pulsar_sec_of_ns((double)ra.read_ns));
         buf_puts(&b, "# HELP pulsar:ple_read_ahead_issued_total Read-aheads queued (one per prompt chunk ahead).\n");
         buf_puts(&b, "# TYPE pulsar:ple_read_ahead_issued_total counter\n");
         buf_printf(&b, "pulsar:ple_read_ahead_issued_total %llu\n", (unsigned long long)ra.issued);
@@ -1490,12 +1490,11 @@ bool metrics_stream_pump(int fd, pthread_mutex_t *mu, pthread_cond_t *cv,
          * never queues behind a slow client. A change and a refresh are the
          * same frame: the refresh repeats the generation with a new `t`. */
         buf b = {0};
-        struct timespec now;
-        clock_gettime(CLOCK_REALTIME, &now);
+        const struct timespec now = pulsar_wall_ts();
         buf_puts(&b, "event: metrics\ndata: {\"generation\":");
         buf_printf(&b, "%llu", gen);
         buf_puts(&b, ",\"t\":");
-        buf_printf(&b, "%.3f", (double)now.tv_sec + (double)now.tv_nsec / 1e9);
+        buf_printf(&b, "%.3f", pulsar_ts_sec(now));
         buf_puts(&b, "}\n\n");
         bool ok = send_all(fd, b.ptr, b.len);
         buf_free(&b);
@@ -1784,7 +1783,7 @@ void *client_main(void *arg) {
     memset(&j, 0, sizeof(j));
     j.fd = fd;
     j.req = req;
-    j.accepted_at = server_now_sec();
+    j.accepted_at = pulsar_mono_sec();
     pthread_mutex_init(&j.mu, NULL);
     pthread_cond_init(&j.cv, NULL);
 
@@ -1804,15 +1803,12 @@ void *client_main(void *arg) {
              * so the worker-only pop invariant holds (upstream ds4 e9ded97,
              * reshaped for our stack-owned jobs). */
             while (!j.done) {
-                struct timespec ts;
-                clock_gettime(CLOCK_REALTIME, &ts);
-                ts.tv_nsec += 250 * 1000000L;
-                if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+                const struct timespec ts = pulsar_wall_deadline_after(0.25);
                 pthread_cond_timedwait(&j.cv, &j.mu, &ts);
                 if (!j.done && !j.cancelled && gen_client_disconnected(j.fd))
                     j.cancelled = true;
                 /* L249 D: a streaming job still waiting for the worker gets its stream opened and kept alive */
-                if (!j.done && !j.cancelled) job_early_keepalive(&j, server_now_sec());
+                if (!j.done && !j.cancelled) job_early_keepalive(&j, pulsar_mono_sec());
             }
         }
     }

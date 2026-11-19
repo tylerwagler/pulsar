@@ -213,12 +213,6 @@ static pulsar_backend default_backend(void) {
 
 
 
-double agent_now_sec(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
-}
-
 
 
 /// @brief Print pulsar-agent's help (PULSAR_HELP_AGENT), or one topic of it.

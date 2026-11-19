@@ -480,7 +480,7 @@ int agent_worker_sync_tokens(agent_worker *w, const pulsar_tokens *tokens,
             w->status.prefill_label : agent_next_prefill_label();
         w->status.state = AGENT_WORKER_PREFILL;
         w->progress_base = cached;
-        w->progress_started_at = agent_now_sec();
+        w->progress_started_at = pulsar_mono_sec();
         w->status.prefill_done = 0;
         w->status.prefill_total = suffix;
         w->status.prefill_label = prefill_label;

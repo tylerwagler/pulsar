@@ -94,7 +94,7 @@ bool request_prepare_images(pulsar_engine *e, const chat_msgs *msgs,
      * decodes and preprocesses every image to learn its span geometry, and that
      * happens again on every turn even when the KV rows are reused.  Timed here
      * because it is the thing a prepared-span cache would remove (L226). */
-    const double vp_t0 = server_now_sec();
+    const double vp_t0 = pulsar_mono_sec();
     const int placed = pulsar_expand_image_placeholders(e, &r->prompt, 0, r->images, r->n_images, &expanded, err,
                                                         errlen);
     if (placed != 1) {
@@ -104,7 +104,7 @@ bool request_prepare_images(pulsar_engine *e, const chat_msgs *msgs,
         return false;
     }
     server_log(PULSAR_LOG_PREFILL, "pulsar-server: image prepare: %d image(s) decoded+preprocessed in %.1f ms",
-               r->n_images, (server_now_sec() - vp_t0) * 1000.0);
+               r->n_images, pulsar_ms_of_sec(pulsar_mono_sec() - vp_t0));
     pulsar_tokens_free(&r->prompt);
     r->prompt = expanded;
     return true;

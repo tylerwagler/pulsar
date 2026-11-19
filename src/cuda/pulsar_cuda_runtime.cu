@@ -608,13 +608,6 @@ int cuda_ok(cudaError_t err, const char *what) {
 
 
 
-/// @return CLOCK_MONOTONIC time in seconds
-static double cuda_wall_sec(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
-}
-
 
 
 
@@ -646,7 +639,7 @@ static void cuda_model_load_progress_finish(void) {
 /// Prints a load-progress line when due (every 2 GiB / 2 s on a tty, 16 GiB / 10 s otherwise).
 /// @param cached_bytes bytes cached on the device so far
 static void cuda_model_load_progress_note(uint64_t cached_bytes) {
-    const double now = cuda_wall_sec();
+    const double now = pulsar_mono_sec();
     const int tty = isatty(STDERR_FILENO) != 0;
     const uint64_t step = (tty ? 2ull : 16ull) *
                           1024ull * 1024ull * 1024ull;
@@ -2272,18 +2265,11 @@ bool g_seg_full_reset_pending = false;
 bool g_seg_catalog_on = false;               ///< the warmup's declaration window is open
 bool g_seg_catalog_done = false;             ///< a warmup declared a catalog and closed (a regrow after it is news)
 bool g_seg_off = false;                      ///< L296 perf: an instrument's eager reference (never the engine)
-/// seg_now() at the warmup's catalog window opening, for its closing line's elapsed seconds.
+/// pulsar_mono_sec() at the warmup's catalog window opening, for its closing line's elapsed seconds.
 double g_seg_catalog_t0 = 0.0;
 uint64_t g_seg_catalog_refused = 0;          ///< bodies that refused under a capture inside the window
 /// The segment graphs' running counters (pulsar_gpu_seg_stats).
 pulsar_gpu_seg_stats g_seg_st;
-
-/// @return CLOCK_MONOTONIC time in seconds
-double seg_now(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
-}
 
 /// @return the device's free memory in bytes (cudaMemGetInfo), or 0 when the query fails
 uint64_t seg_free_bytes(void) {
@@ -2585,7 +2571,7 @@ void pulsar_gpu_seg_stats_get(pulsar_gpu_seg_stats *out) { *out = g_seg_st; }
 void pulsar_gpu_seg_catalog_open(void) {
     g_seg_catalog_on = true;
     g_seg_catalog_refused = 0;
-    g_seg_catalog_t0 = seg_now();
+    g_seg_catalog_t0 = pulsar_mono_sec();
 }
 
 /// Closes the warmup's window and prints the catalog line.
@@ -2607,7 +2593,7 @@ uint64_t pulsar_gpu_seg_catalog_close(void) {
                     "%llu used once (captured on their next use), %llu FAILED, %llu refused under capture; window %.2f s\n",
             (unsigned long long)declared, (unsigned long long)captured, (double)bytes / 1048576.0,
             (unsigned long long)(declared - captured - dead), (unsigned long long)dead,
-            (unsigned long long)g_seg_catalog_refused, seg_now() - g_seg_catalog_t0);
+            (unsigned long long)g_seg_catalog_refused, pulsar_mono_sec() - g_seg_catalog_t0);
     return dead + g_seg_catalog_refused;
 }
 
