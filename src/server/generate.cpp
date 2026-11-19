@@ -95,7 +95,7 @@ void logprob_capture_session(logprob_ledger *lg, pulsar_session *sess, int token
 /// @param sess the pool session
 /// @param row the step's headed row the draw read
 /// @param token the drawn token
-void logprob_capture_row(logprob_ledger *lg, pulsar_session *sess, uint32_t row, int token) {
+void logprob_capture_row(logprob_ledger *lg, pulsar_session *sess, HeadRow row, int token) {
     if (!lg || !lg->enabled) return;
     pulsar_token_score chosen;
     int have = 0, n_top = 0;

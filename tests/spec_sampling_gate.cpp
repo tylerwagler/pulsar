@@ -195,11 +195,11 @@ static int sampled_plain_batch(pulsar_session *s, const start_state *snap,
             return -1;
         }
         /* every bank's row drawn in one device launch, each at its own stream's key (L302) */
-        uint32_t qrow[SAMPLED_BANKS_PLAIN];
+        HeadRow qrow[SAMPLED_BANKS_PLAIN];   /* one row a bank, all headed (max_head_runs 0): head row q */
         pulsar_row_draw d[SAMPLED_BANKS_PLAIN];
         TokId drawn[SAMPLED_BANKS_PLAIN];
         for (uint32_t q = 0; q < m; q++) {
-            qrow[q] = q;
+            qrow[q] = HeadRow{q};
             d[q] = pulsar_row_draw{temp, 0, top_p, min_p, &rng[who[q]], false, NULL};
         }
         if (pulsar_session_draw_rows(s, qrow, d, m, drawn) != 0) {

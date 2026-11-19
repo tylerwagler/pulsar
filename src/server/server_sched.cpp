@@ -4305,6 +4305,41 @@ static void lane_abandon(gen_state *g, bool drop_feed) {
     g->phase = GEN_FINISH;
 }
 
+/* L443: the plain and mixed lanes' row map, owned here where they build their steps.  A lane lays its m decode
+ * requests first (reqs[0 .. m)), one row a bank -- each its own run -- and heads every decode run: the plain lane
+ * heads all runs, the mixed lane caps its heads at the decode runs or heads all (mixed_head_cap).  So decode request
+ * q is step row q AND head row q, and a prefill run after them (the mixed lane's) has its one headed row right after
+ * the decode heads: head row m, though its step row is m + k - 1.  These two are the only ways from a lane's request
+ * ordinals to the rows the engine's row API takes; each is fatal outside the layout it relies on. */
+/// @brief Decode request q's head row (= its step row) in a lane step that heads its decode runs.
+/// @param q the request's ordinal among the step's decode requests
+/// @param n_dec the step's decode requests (rows [0, n_dec) of the step)
+/// @param max_head_runs the step's head cap as passed to pulsar_session_decode_mixed (0 or
+///        PULSAR_MSEQ_HEAD_ALL_ROWS = every run; else the runs headed, which must cover the decode runs)
+/// @return head row q
+static HeadRow lane_decode_head_row(int q, int n_dec, uint32_t max_head_runs) {
+    if (q < 0 || q >= n_dec || (max_head_runs != 0u && max_head_runs < (uint32_t)n_dec)) {
+        char msg[160];
+        snprintf(msg, sizeof msg, "lane row map: decode request %d of %d with %u runs headed is no head row", q, n_dec,
+                 max_head_runs);
+        pulsar_die(msg);
+    }
+    return HeadRow{q};
+}
+/// @brief The mixed lane's prefill run's head row: the next after the n_dec decode heads.
+/// @param n_dec the step's decode requests (each one headed run, ahead of the prefill run)
+/// @param n_heads the runs the step headed (pulsar_session_decode_mixed's *out_n_rows)
+/// @return head row n_dec
+static HeadRow lane_prefill_head_row(int n_dec, uint32_t n_heads) {
+    if (n_dec < 0 || n_heads != (uint32_t)n_dec + 1u) {
+        char msg[160];
+        snprintf(msg, sizeof msg, "lane row map: a prefill run after %d decode runs, but the step headed %u runs", n_dec,
+                 n_heads);
+        pulsar_die(msg);
+    }
+    return HeadRow{n_dec};
+}
+
 /* The plain and mixed batched lanes' step epilogue: every decode row's committed token emitted, then the rows of
  * the slots that go on drawn in ONE device launch (THE sampler over the step's headed rows: row q is dec[live_idx[q]]'s,
  * each at its own stream's key, a live grammar region through its mask -- L302, L303), and each draw's logprobs captured
@@ -4313,9 +4348,11 @@ static void lane_abandon(gen_state *g, bool drop_feed) {
 /// @param dec the quantum's decoders
 /// @param live_idx the decoders this step stepped, as indexes into `dec`; row q of the step is dec[live_idx[q]]'s
 /// @param m how many
+/// @param max_head_runs the step's head cap (lane_decode_head_row)
 /// @param pool the pool session
-static void lane_emit_and_draw(server *s, session_slot **dec, const int *live_idx, int m, pulsar_session *pool) {
-    uint32_t rows[PULSAR_SESSION_POOL_CAP];
+static void lane_emit_and_draw(server *s, session_slot **dec, const int *live_idx, int m, uint32_t max_head_runs,
+                               pulsar_session *pool) {
+    HeadRow rows[PULSAR_SESSION_POOL_CAP];
     pulsar_row_draw d[PULSAR_SESSION_POOL_CAP];
     std::vector<uint32_t> masks[PULSAR_SESSION_POOL_CAP];
     gen_state *who[PULSAR_SESSION_POOL_CAP];
@@ -4343,7 +4380,7 @@ static void lane_emit_and_draw(server *s, session_slot **dec, const int *live_id
             g->finish = "error"; g->batch_feed_valid = false; g->phase = GEN_FINISH;
             continue;
         }
-        rows[nd] = (uint32_t)q;
+        rows[nd] = lane_decode_head_row(q, m, max_head_runs);
         who[nd++] = g;
     }
     if (nd == 0) return;
@@ -4474,7 +4511,7 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n, int quantu
             break;
         }
 
-        lane_emit_and_draw(s, dec, live_idx, m, pool);
+        lane_emit_and_draw(s, dec, live_idx, m, 0u /* every run headed: the decode_mixed call above */, pool);
         /* L284: the plain lane's step cost, measured as the spec lane's round is -- the rows the forward
          * carried against the step's wall, sampling and emission included -- into the same fit structure
          * (pulsar_engine_lane_cost), so the lane choice weighs one clock against the other */
@@ -4710,8 +4747,8 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
 
     pulsar_spec_round *rounds[PULSAR_SESSION_POOL_CAP] = {0};
     int first_tok[PULSAR_SESSION_POOL_CAP];
-    uint32_t row0s[PULSAR_SESSION_POOL_CAP];
-    int row_nb[PULSAR_SESSION_POOL_CAP];   /* rows this bank contributed (base+K) */
+    StepRow row0s[PULSAR_SESSION_POOL_CAP];    /* each round's first step row (the engine's assemble laid them) */
+    StepRows row_nb[PULSAR_SESSION_POOL_CAP];  /* rows this bank contributed (base+K) */
     int live_idx[PULSAR_SESSION_POOL_CAP];
     pulsar_multiseq_req reqs[PULSAR_SPEC_LOGITS_ROWS];
     /* L260: one step per bank per phase; each bank keeps its own accepted[]
@@ -5037,7 +5074,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             switch (st->status) {
             case PULSAR_SPEC_STEP_OK:
                 row0s[m] = st->row0;
-                row_nb[m] = (int)st->n_rows;
+                row_nb[m] = st->n_rows;
                 first_tok[m] = st->first_token.raw();
                 live_idx[m] = i;
                 m++;
@@ -5243,7 +5280,8 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             {
                 TokId toks[PULSAR_SPEC_LOGITS_ROWS];
                 int nt = 0;
-                for (int i = base_sent[q] ? 1 : 0; i < row_nb[q]; i++) toks[nt++] = reqs[row0s[q] + (uint32_t)i].token;
+                for (int i = base_sent[q] ? 1 : 0; i < row_nb[q].raw(); i++)
+                    toks[nt++] = reqs[(row0s[q] + StepRows{i}).raw()].token;   /* reqs is indexed by step row */
                 st->greedy_rows = gen_spec_greedy_rows(s, g, toks, nt, base_sent[q]);
                 /* L303: each verify row's mask -- the gate walked through the round's tokens and back */
                 const int mr = gen_constrain_round(s, g, toks, nt, base_sent[q], &st->masks);
@@ -5368,7 +5406,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
              * accumulated here where it is unambiguous (row_nb = base+K rows
              * this bank contributed; na = base + accepted drafts). */
             g->req_spec_rounds++;
-            if (row_nb[q] > 1) g->req_spec_draft += (uint64_t)(row_nb[q] - 1);
+            if (row_nb[q] > StepRows{1}) g->req_spec_draft += (uint64_t)(row_nb[q] - StepRows{1}).raw();
             if (na > 1) g->req_spec_accepted += (uint64_t)(na - 1);
             g->req_spec_gen += (uint64_t)done;
             emitted_total += done;
@@ -5815,7 +5853,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
         char err[96];
         uint32_t n_runs = 0;
         /* LEVER 1: the head cap is mixed_head_cap's (see it). */
-        const uint32_t head_cap = mixed_head_cap(kthis, m, pos_now, len);
+        uint32_t head_cap = mixed_head_cap(kthis, m, pos_now, len);
         int rc = pulsar_session_decode_mixed(pool, reqs, (uint32_t)nrows, NULL, 0, &n_runs, head_cap, err,
                                              sizeof err);
         const int verdict = mixed_prefill_giveup(rc, kthis, m);
@@ -5828,7 +5866,8 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
                        "pulsar-server: fused prefill rejected (%s): this prefill runs classic "
                        "from now on; the %d decode bank(s) retry this step alone", err, m);
             if (verdict == MIXED_GIVEUP_RETRY_DECODE) {
-                rc = pulsar_session_decode_mixed(pool, reqs, (uint32_t)m, NULL, 0, &n_runs, 0u, err, sizeof err);
+                head_cap = 0u;   /* L443: the retry heads every run (the row map lane_emit_and_draw reads) */
+                rc = pulsar_session_decode_mixed(pool, reqs, (uint32_t)m, NULL, 0, &n_runs, head_cap, err, sizeof err);
             } else { s->live_bank = BankId::none(); break; }   /* only prefill this step: just stop */
             kthis = 0;                              /* prefill did not advance */
         }
@@ -5856,20 +5895,20 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
         if (kthis > 0 && pos_now + kthis == len) {
             /* final prefill sub-chunk: the len-1 row (the prefill run's, headed row m, last-of-run) becomes the
              * prefill bank's next-token row -- the decode seed for the handoff, on the device (L302) */
-            if (pulsar_session_step_row_to_bank(pool, (uint32_t)m, pf->bank) != 0) {
+            if (pulsar_session_step_row_to_bank(pool, lane_prefill_head_row(m, n_runs), pf->bank) != 0) {
                 snprintf(pg->err, sizeof pg->err, "prefill bank %d: its last row could not be kept", pf->bank.raw());
                 /* L372: the step is committed for the decode banks whatever became of the prefill's row -- their
                  * tokens are emitted and their next drawn before the quantum stops.  The break alone dropped the step:
                  * each bank's KV had advanced a row its slot never counted or emitted, and the next quantum fed the
                  * same token at the same position again.  Before the prefill's epilogue, which installs its bank. */
-                lane_emit_and_draw(s, dec, live_idx, m, pool);
+                lane_emit_and_draw(s, dec, live_idx, m, head_cap, pool);
                 s->gen_prefill_fail(pf);   /* L372: as the bank install above */
                 break;
             }
             reached_end = true;
         }
 
-        lane_emit_and_draw(s, dec, live_idx, m, pool);
+        lane_emit_and_draw(s, dec, live_idx, m, head_cap, pool);
     }
     free(reqs);
 

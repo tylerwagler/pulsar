@@ -791,7 +791,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
                 st->k_alloc = r->i1;
                 st->accepted_cap = r->i2;
                 st->accepted = acc + off;
-                st->row0 = (uint32_t)r->i3;
+                st->row0 = StepRow{r->i3};   /* the wire's int32, as the uint32 field held it */
                 st->greedy_rows = r->greedy_rows;
                 off += r->i2 > 0 ? r->i2 : 0;
                 if (!st->round) ok = 0;

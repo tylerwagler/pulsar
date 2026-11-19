@@ -1430,14 +1430,14 @@ TokId pulsar_session_draw(pulsar_session *s, const pulsar_row_draw *d);
  *  @param d n draws' knobs, d[k] for rows[k]
  *  @param n the count
  *  @param tokens receives n tokens */
-int pulsar_session_draw_rows(pulsar_session *s, const uint32_t *rows, const pulsar_row_draw *d, uint32_t n,
+int pulsar_session_draw_rows(pulsar_session *s, const HeadRow *rows, const pulsar_row_draw *d, uint32_t n,
                              TokId *tokens);
 /** The last batched step's headed row `row` becomes `bank`'s next-token row (a mixed step's finished prompt run: the
  * bank's restore installs it).  On the device.  @return 0, or 1. */
 /** @param s the session
  *  @param row the headed row
  *  @param bank the bank it becomes the next-token row of */
-int pulsar_session_step_row_to_bank(pulsar_session *s, uint32_t row, BankId bank);
+int pulsar_session_step_row_to_bank(pulsar_session *s, HeadRow row, BankId bank);
 /** pulsar_session_draw with no mask and no greedy override. @return the token, or -1. */
 /** @param s the session
  *  @param temperature as pulsar_row_draw
@@ -1479,7 +1479,7 @@ int pulsar_session_token_logprob(pulsar_session *s, TokId token, pulsar_token_sc
  *  @param top receives k entries
  *  @param k entries wanted
  *  @param n_top receives the real entries */
-int pulsar_session_step_row_logprobs(pulsar_session *s, uint32_t row, TokId token, pulsar_token_score *chosen,
+int pulsar_session_step_row_logprobs(pulsar_session *s, HeadRow row, TokId token, pulsar_token_score *chosen,
                                      int *have_chosen, pulsar_token_score *top, int k, int *n_top);
 /** Copy the live logits row to the host.
  *  @param s the session
@@ -1987,10 +1987,11 @@ typedef struct {
     /* assemble out, round_end in */
     /** The round's base token, drawn by assemble; none() when the step drew none (L334 P3: was -1). */
     TokId first_token;
-    /** The bank's first row in the shared forward. */
-    uint32_t row0;           /* the bank's first row in the shared forward */
+    /** The bank's first row in the shared forward: a STEP row (reqs[row0 ..)); the forward heads every row of a
+     *  verify, so the walk reads its logits at the same index (L443). */
+    StepRow row0;
     /** Rows the bank contributed to the shared forward (base + drafts). */
-    uint32_t n_rows;         /* base + drafts it contributed */
+    StepRows n_rows;
     /* out */
     /** The step's outcome, a pulsar_spec_step_status. */
     int status;              /* pulsar_spec_step_status */

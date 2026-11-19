@@ -1496,8 +1496,8 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
     if (spec_steps_no_drafter(s, steps, n, "spec assemble batch")) {
         for (int i = 0; i < n; i++) {   /* the phase's outputs, as a step that drew nothing leaves them */
             steps[i].first_token = TokId::none();
-            steps[i].row0 = 0;
-            steps[i].n_rows = 0;
+            steps[i].row0 = StepRow{0};
+            steps[i].n_rows = StepRows{0};
         }
         return;
     }
@@ -1505,8 +1505,8 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
         pulsar_spec_step *st = &steps[i];
         spec_step_reset(st);
         st->first_token = TokId::none();
-        st->row0 = 0;
-        st->n_rows = 0;
+        st->row0 = StepRow{0};
+        st->n_rows = StepRows{0};
         if (!spec_bank_restore(s, st->bank)) {
             st->status = PULSAR_SPEC_STEP_RESTORE_FAILED;
             continue;
@@ -1540,10 +1540,12 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
                 st->status = PULSAR_SPEC_STEP_FAILED;
             } else {
                 /* The worker has no reqs: its rows ride the mixed-batch frame. */
-                st->n_rows = reqs ? pulsar_spec_round_fill_reqs(st->round, st->bank, reqs + rows)
-                                  : pulsar_spec_round_n_rows(st->round);
-                st->row0 = rows;
-                rows += st->n_rows;
+                /* L443: the step's rows are laid here, each round's contiguous from `rows` (the builder's row map) */
+                const uint32_t nr = reqs ? pulsar_spec_round_fill_reqs(st->round, st->bank, reqs + rows)
+                                         : pulsar_spec_round_n_rows(st->round);
+                st->n_rows = StepRows{nr};
+                st->row0 = StepRow{rows};
+                rows += nr;
             }
         }
         spec_bank_save(s, st->bank);
@@ -1598,7 +1600,7 @@ void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_st
         widx[i] = -1;
         if (!st->round || st->round->n_batch == 0 || nw == PULSAR_GPU_SAMPLE_ROWS_MAX) continue;
         if (st->temperature > 0.0f && !st->rng) continue;   /* its round_end refuses below */
-        w[nw] = {st->round, st->row0, st->temperature, st->top_k, st->top_p, st->min_p, st->greedy_rows,
+        w[nw] = {st->round, pulsar_row_index(st->row0), st->temperature, st->top_k, st->top_p, st->min_p, st->greedy_rows,
                  st->rng ? *st->rng : 0u, st->masks, st->mask_rows};
         widx[i] = (int)nw++;
     }
@@ -1630,7 +1632,7 @@ void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_st
         } else
             na = spec_round_end_walked(s, st->round, st->first_token.raw(), st->temperature, st->top_k, st->top_p,
                                        st->min_p, st->greedy_rows, st->masks, st->mask_rows, st->rng,
-                                       &wv[widx[i]], st->row0, n /* L263: the step's flat cost is shared n ways */,
+                                       &wv[widx[i]], pulsar_row_index(st->row0), n /* L263: the step's flat cost is shared n ways */,
                                        NULL, st->accepted, st->accepted_cap, st->err, sizeof st->err);
         if (na < 0) st->status = PULSAR_SPEC_STEP_FAILED;
         else st->n_accepted = na;
@@ -1676,8 +1678,8 @@ int pulsar_spec_steps_verdict(pulsar_spec_phase phase, const pulsar_spec_step *s
         h = spec_fp(h, (uint32_t)st->status);
         if (phase == PULSAR_SPEC_PHASE_ASSEMBLE) {
             h = spec_fp(h, (uint32_t)st->first_token.raw());
-            h = spec_fp(h, st->row0);
-            h = spec_fp(h, st->n_rows);
+            h = spec_fp(h, (uint32_t)st->row0.raw());   /* the digest's bytes, as the uint32 fields were */
+            h = spec_fp(h, (uint32_t)st->n_rows.raw());
         } else if (phase == PULSAR_SPEC_PHASE_ROUND_END) {
             h = spec_fp(h, (uint32_t)st->pos_after.raw());
             h = spec_fp(h, (uint32_t)st->n_accepted);

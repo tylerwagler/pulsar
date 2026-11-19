@@ -293,14 +293,18 @@ int pulsar_session::argmax_excluding(int excluded_id) {
     return draw(&d);
 }
 
-int pulsar_session::draw_step_rows(const uint32_t *rows, const pulsar_row_draw *d, uint32_t n, TokId *tokens) {
+int pulsar_session::draw_step_rows(const HeadRow *rows, const pulsar_row_draw *d, uint32_t n, TokId *tokens) {
+    /* L443: the head rows as the logits-row indices the launch takes (raw: none() is past every step's rows) */
+    uint32_t idx[PULSAR_GPU_SAMPLE_ROWS_MAX];
     for (uint32_t k = 0; k < n; k++)
-        if (!dev.step_rows || rows[k] >= dev.step_n) {
-            fprintf(stderr, "pulsar: session: a draw of row %u of a step that headed %u -- refusing\n", rows[k],
-                    dev.step_rows ? dev.step_n : 0u);
+        if (!dev.step_rows || (uint32_t)rows[k].raw() >= dev.step_n) {
+            fprintf(stderr, "pulsar: session: a draw of row %u of a step that headed %u -- refusing\n",
+                    (uint32_t)rows[k].raw(), dev.step_rows ? dev.step_n : 0u);
             return 1;
         }
-    return session_draw(this, dev.step_rows, rows, d, n, tokens);
+    if (n > PULSAR_GPU_SAMPLE_ROWS_MAX) return 1;   /* session_draw's own refusal, before the copy */
+    for (uint32_t k = 0; k < n; k++) idx[k] = (uint32_t)rows[k].raw();
+    return session_draw(this, dev.step_rows, idx, d, n, tokens);
 }
 
 /* ---- logprobs ----------------------------------------------------------------------------------------------- */

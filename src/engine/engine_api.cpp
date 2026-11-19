@@ -1111,18 +1111,20 @@ TokId pulsar_session_sample(pulsar_session *s, float temperature, int top_k, flo
 TokId pulsar_session_draw(pulsar_session *s, const pulsar_row_draw *d) {
     return s && d ? TokId{s->draw(d)} : TokId::none();
 }
-int pulsar_session_draw_rows(pulsar_session *s, const uint32_t *rows, const pulsar_row_draw *d, uint32_t n,
+int pulsar_session_draw_rows(pulsar_session *s, const HeadRow *rows, const pulsar_row_draw *d, uint32_t n,
                              TokId *tokens) {
     return s && rows && d && tokens && n ? s->draw_step_rows(rows, d, n, tokens) : 1;
 }
-int pulsar_session_step_row_to_bank(pulsar_session *s, uint32_t row, BankId bank_id) {
+int pulsar_session_step_row_to_bank(pulsar_session *s, HeadRow row, BankId bank_id) {
     const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */
-    return s && s->step_row_to_bank(row, bank) ? 0 : 1;
+    /* L443: the head row raw inside, as the uint32 it was (none() is past every step's rows: refused there) */
+    return s && s->step_row_to_bank((uint32_t)row.raw(), bank) ? 0 : 1;
 }
-int pulsar_session_step_row_logprobs(pulsar_session *s, uint32_t row, TokId token, pulsar_token_score *chosen,
+int pulsar_session_step_row_logprobs(pulsar_session *s, HeadRow row, TokId token, pulsar_token_score *chosen,
                                      int *have_chosen, pulsar_token_score *top, int k, int *n_top) {
+    /* L443: the head row raw inside, as the uint32 it was (none() is past every step's rows: refused there) */
     return s && chosen && have_chosen && n_top && (top || k == 0)
-               ? s->step_row_logprobs(row, token.raw(), chosen, have_chosen, top, k, n_top) : 1;
+               ? s->step_row_logprobs((uint32_t)row.raw(), token.raw(), chosen, have_chosen, top, k, n_top) : 1;
 }
 int pulsar_session_top_logprobs(pulsar_session *s, pulsar_token_score *out, int k) { return s && tp_mirror_settle(s, NULL, 0) ? s->top_logprobs(out, k) : 0; }
 int pulsar_session_token_logprob(pulsar_session *s, TokId token, pulsar_token_score *out) {
@@ -1903,7 +1905,7 @@ static int tp_spec_steps_mirror(pulsar_session *s, pulsar_tp *tp, uint32_t frame
         r->i0 = frame_type == PULSAR_TP_FRAME_SPEC_ASSEMBLE_BATCH ? st->max_tokens : st->first_token.raw();
         r->i1 = st->k_alloc;
         r->i2 = st->accepted_cap;
-        r->i3 = (int32_t)st->row0;
+        r->i3 = (int32_t)st->row0.raw();   /* the wire's int32 */
         r->greedy_rows = st->greedy_rows;
     }
     return tp_mirror_sent(tp, operation, pulsar_tp_send_spec_steps(tp, frame_type, &c, recs), NULL, 0);

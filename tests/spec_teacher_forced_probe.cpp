@@ -178,7 +178,7 @@ int GATE_ENTRY(int argc, char **argv) {
             if (have_q) {
                 uint64_t at = rng;
                 pulsar_sample_advance(&at, 1u);
-                const uint32_t row0 = 0;
+                const HeadRow row0{0};
                 const pulsar_row_draw dp = {temperature, top_k, top_p, min_p, &at, false, NULL};
                 const pulsar_row_draw dm = {temperature, top_k, top_p, min_p, NULL, true, NULL};
                 TokId tp_id = TokId::none(), tm_id = TokId::none();

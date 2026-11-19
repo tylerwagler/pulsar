@@ -3364,12 +3364,12 @@ struct pulsar_session {
     /// @return the token, or PULSAR_SAMPLE_REFUSED.
     int draw(const pulsar_row_draw *d);
     /** Draws from rows of the last batched step (pulsar_session_draw_rows). */
-    /// @param rows    n headed-row indices of the last batched step, each < dev.step_n
+    /// @param rows    n headed rows of the last batched step, each < dev.step_n
     /// @param d       n draws, one per row
     /// @param n       draws, 1 .. PULSAR_GPU_SAMPLE_ROWS_MAX
     /// @param tokens  receives n tokens (PULSAR_SAMPLE_REFUSED for a degenerate row)
     /// @return 0, or 1 when nothing was drawn.
-    int draw_step_rows(const uint32_t *rows, const pulsar_row_draw *d, uint32_t n, TokId *tokens);
+    int draw_step_rows(const HeadRow *rows, const pulsar_row_draw *d, uint32_t n, TokId *tokens);
     /** Logprobs of a row of the last batched step (pulsar_session_step_row_logprobs). */
     /// @param row          headed row of the last batched step, < dev.step_n
     /// @param token        the token to score (< 0: none)

@@ -6749,7 +6749,7 @@ bool gen_streams_plain(const gen_state *g);
 void logprob_ledger_reset(logprob_ledger *lg);
 void logprob_ledger_free(logprob_ledger *lg);
 void logprob_capture_session(logprob_ledger *lg, pulsar_session *sess, int token);
-void logprob_capture_row(logprob_ledger *lg, pulsar_session *sess, uint32_t row, int token);
+void logprob_capture_row(logprob_ledger *lg, pulsar_session *sess, HeadRow row, int token);
 bool logprob_commit(logprob_ledger *lg, pulsar_engine *engine, int token,
                     const char *piece, size_t piece_len, GenOff end_off);
 int  logprob_stream_ready(const logprob_ledger *lg, GenOff upto);

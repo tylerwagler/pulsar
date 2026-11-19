@@ -20289,6 +20289,21 @@ static void test_l179_mixed_head_cap_drops_only_intermediate_prefill_head(void) 
     TEST_ASSERT(mixed_head_cap(1, 1, 1, 1000) == 1u);
 }
 
+/* L443: the plain and mixed lanes' row map (lane_decode_head_row / lane_prefill_head_row): decode request q is head
+ * row q under every head cap the lanes pass (0 = all runs, mixed_head_cap's m, the spec-verify ALL_ROWS); the mixed
+ * lane's finishing prefill run is head row m -- the run after the decode heads -- not step row m + k - 1.  Outside
+ * those layouts the crossings are fatal (not tested here: they abort). */
+static void test_l443_lane_row_map(void) {
+    TEST_ASSERT(lane_decode_head_row(0, 1, 0u) == HeadRow{0});
+    TEST_ASSERT(lane_decode_head_row(2, 3, 0u) == HeadRow{2});
+    TEST_ASSERT(lane_decode_head_row(2, 3, mixed_head_cap(16, 3, 100, 1000)) == HeadRow{2});   /* cap = the decode runs */
+    TEST_ASSERT(lane_decode_head_row(2, 3, mixed_head_cap(16, 3, 984, 1000)) == HeadRow{2});   /* final chunk: all */
+    TEST_ASSERT(lane_decode_head_row(1, 3, PULSAR_MSEQ_HEAD_ALL_ROWS) == HeadRow{1});
+    /* 3 decode runs + the finishing prompt run (all headed): its head is the 4th, row 3 */
+    TEST_ASSERT(lane_prefill_head_row(3, 4u) == HeadRow{3});
+    TEST_ASSERT(lane_prefill_head_row(0, 1u) == HeadRow{0});   /* a prefill-only step */
+}
+
 /* L179 branch 10 -- the fused step's give-up verdict (mixed_prefill_giveup).
  * Invariant: only the engine's RECOVERABLE reject (rc == 1) on a step that
  * folded prefill rows (kthis > 0) gives the prefill up; with decode banks in
@@ -22128,6 +22143,23 @@ static_assert(std::is_same_v<decltype(pulsar_comp_row_of(TokPos{}, TokPerRow{}))
                   std::is_same_v<decltype(pulsar_step_run{}.row_of(TokPos{})), StepRow>,
               "the crossings' types");
 
+/* L443: the public row API takes the rows' types -- a draw, a logprobs read and a bank's row name HEAD rows of the
+ * last step, the spec step's span is STEP rows; no request ordinal (int / uint32) and no other space passes. */
+static_assert(std::is_same_v<decltype(&pulsar_session_draw_rows),
+                             int (*)(pulsar_session *, const HeadRow *, const pulsar_row_draw *, uint32_t, TokId *)> &&
+                  std::is_same_v<decltype(&pulsar_session_step_row_to_bank), int (*)(pulsar_session *, HeadRow, BankId)> &&
+                  std::is_same_v<decltype(&pulsar_session_step_row_logprobs),
+                                 int (*)(pulsar_session *, HeadRow, TokId, pulsar_token_score *, int *,
+                                         pulsar_token_score *, int, int *)>,
+              "the row API takes head rows");
+static_assert(!l334_passes<uint32_t, HeadRow> && !l334_passes<int, HeadRow> && !l334_passes<StepRow, HeadRow> &&
+                  !std::is_constructible_v<HeadRow, StepRow>,
+              "an ordinal or a step row is no head row without the lane's row map");
+static_assert(std::is_same_v<decltype(pulsar_spec_step{}.row0), StepRow> &&
+                  std::is_same_v<decltype(pulsar_spec_step{}.n_rows), StepRows> &&
+                  !l334_passes<uint32_t, StepRow> && !l334_passes<HeadRow, StepRow>,
+              "the spec step's span is in step rows");
+
 /* L334 P3: a token id is an identity -- the compile-fail checks.  No arithmetic, no ordering, no position / count /
  * row passes for it or it for them, and no int enters it implicitly (L251's eval(sess, 1, ..) count). */
 template <class A> concept l334_steps = requires(A a) { ++a; };
@@ -23622,6 +23654,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l281_prefill_chunk_publishes_the_slot_gauges();
     test_l179_evict_reset_leaves_a_reusable_hole();
     test_l179_mixed_head_cap_drops_only_intermediate_prefill_head();
+    test_l443_lane_row_map();
     test_l179_mixed_giveup_only_on_recoverable_prefill_reject();
 
     test_metrics_stream_sends_the_current_generation_first();
