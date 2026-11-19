@@ -733,7 +733,7 @@ static bool responses_emit_text(int fd, responses_stream *st, const char *text, 
 /// @param text       the bytes
 /// @param len        bytes at `text` (0, or an inactive stream: nothing sent)
 /// @return false when a write failed
-static bool responses_sink_text_cb(chat_sink *k, bool reasoning, const char *text, size_t len, size_t) {
+static bool responses_sink_text_cb(chat_sink *k, bool reasoning, const char *text, size_t len, GenOff) {
     responses_stream *st = (responses_stream *)k->st;
     if (!st->active || len == 0) return true;
     if (reasoning) return !k->r->reasoning_summary_emit || responses_emit_reasoning(k->fd, st, text, len);

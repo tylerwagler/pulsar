@@ -90,7 +90,7 @@ bool deepseek_stream_update(deepseek_stream_walk *w, chat_sink *k, const char *r
         }
 
         if (limit > w->emit_pos) {
-            if (!k->text(k, true, raw + w->emit_pos, limit - w->emit_pos, limit)) return false;
+            if (!k->text(k, true, raw + w->emit_pos, limit - w->emit_pos, GenOff{limit})) return false;
             w->emit_pos = limit;
         }
 
@@ -125,7 +125,7 @@ bool deepseek_stream_update(deepseek_stream_walk *w, chat_sink *k, const char *r
             if (close && (!tool2 || close < tool2)) {
                 const size_t limit = (size_t)(close - raw);
                 if (limit > w->emit_pos &&
-                    !k->text(k, true, raw + w->emit_pos, limit - w->emit_pos, limit)) return false;
+                    !k->text(k, true, raw + w->emit_pos, limit - w->emit_pos, GenOff{limit})) return false;
                 if (!k->end(k, false)) return false;
                 w->emit_pos = limit + strlen("</think>");
                 w->guard_second_reasoning = false;
@@ -141,7 +141,7 @@ bool deepseek_stream_update(deepseek_stream_walk *w, chat_sink *k, const char *r
                                               r->has_tools, final);
 
         if (limit > w->emit_pos) {
-            if (!k->text(k, false, raw + w->emit_pos, limit - w->emit_pos, limit)) return false;
+            if (!k->text(k, false, raw + w->emit_pos, limit - w->emit_pos, GenOff{limit})) return false;
             w->emit_pos = limit;
         }
 

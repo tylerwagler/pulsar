@@ -692,10 +692,10 @@ static void test_context_length_error_uses_protocol_standard_shape(void) {
  * double-emits or drops a token's logprobs across a chunk boundary. */
 static void test_logprob_stream_ready_watermark(void) {
     logprob_entry v[4] = {0};
-    v[0].end_off = 3;
-    v[1].end_off = 7;
-    v[2].end_off = 7;   /* two entries share a watermark (a multi-token piece) */
-    v[3].end_off = 12;
+    v[0].end_off = GenOff{3};
+    v[1].end_off = GenOff{7};
+    v[2].end_off = GenOff{7};   /* two entries share a watermark (a multi-token piece) */
+    v[3].end_off = GenOff{12};
     logprob_ledger lg = {0};
     lg.enabled = true;
     lg.v = v;
@@ -704,28 +704,28 @@ static void test_logprob_stream_ready_watermark(void) {
 
     /* disabled ledger releases nothing */
     lg.enabled = false;
-    TEST_ASSERT(logprob_stream_ready(&lg, SIZE_MAX) == 0);
+    TEST_ASSERT(logprob_stream_all(&lg) == 0);
     lg.enabled = true;
 
     /* watermark below the first entry: nothing ready */
-    TEST_ASSERT(logprob_stream_ready(&lg, 2) == 0);
+    TEST_ASSERT(logprob_stream_ready(&lg, GenOff{2}) == 0);
     /* exactly at an end_off releases that entry (<=, not <) */
-    TEST_ASSERT(logprob_stream_ready(&lg, 3) == 1);
+    TEST_ASSERT(logprob_stream_ready(&lg, GenOff{3}) == 1);
     /* between entries: only those fully covered */
-    TEST_ASSERT(logprob_stream_ready(&lg, 6) == 1);
+    TEST_ASSERT(logprob_stream_ready(&lg, GenOff{6}) == 1);
     /* both entries sharing end_off=7 release together, never split */
-    TEST_ASSERT(logprob_stream_ready(&lg, 7) == 3);
-    TEST_ASSERT(logprob_stream_ready(&lg, 11) == 3);
-    /* the terminal SIZE_MAX chunk releases the remainder */
-    TEST_ASSERT(logprob_stream_ready(&lg, SIZE_MAX) == 4);
+    TEST_ASSERT(logprob_stream_ready(&lg, GenOff{7}) == 3);
+    TEST_ASSERT(logprob_stream_ready(&lg, GenOff{11}) == 3);
+    /* the terminal chunk releases the remainder (L437: logprob_stream_all, once SIZE_MAX for the watermark) */
+    TEST_ASSERT(logprob_stream_all(&lg) == 4);
 
     /* advancing streamed makes it resume, not re-release: entries [0,streamed)
      * are already on the wire and must not appear again. */
     lg.streamed = 3;
-    TEST_ASSERT(logprob_stream_ready(&lg, 7) == 3);      /* nothing new at 7 */
-    TEST_ASSERT(logprob_stream_ready(&lg, SIZE_MAX) == 4);
+    TEST_ASSERT(logprob_stream_ready(&lg, GenOff{7}) == 3);      /* nothing new at 7 */
+    TEST_ASSERT(logprob_stream_all(&lg) == 4);
     lg.streamed = 4;
-    TEST_ASSERT(logprob_stream_ready(&lg, SIZE_MAX) == 4); /* all streamed, none left */
+    TEST_ASSERT(logprob_stream_all(&lg) == 4); /* all streamed, none left */
 }
 
 

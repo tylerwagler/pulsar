@@ -556,7 +556,7 @@ typedef struct {
  * response, and the alternatives considered at that position. */
 typedef struct {
     logprob_token tok;  ///< the token that was actually emitted
-    size_t end_off;  ///< byte watermark: where this token's text ends in the response
+    GenOff end_off;  ///< byte watermark: where this token's text ends in the response
     int    n_top;    ///< alternatives recorded in `top`
     logprob_token *top;  ///< owned; n_top alternatives, descending
 } logprob_entry;
@@ -1441,7 +1441,7 @@ struct chat_sink {
     void *st;              ///< the protocol's stream state
     /** Reasoning or answer text; `release_upto` is the byte offset in the generation the text ends at
      * (OpenAI's logprob entries ride with the delta that releases their bytes). */
-    bool (*text)(chat_sink *k, bool reasoning, const char *text, size_t len, size_t release_upto);
+    bool (*text)(chat_sink *k, bool reasoning, const char *text, size_t len, GenOff release_upto);
     /** The current section ended; `think_closed`: at the model's own \</think\>. */
     bool (*end)(chat_sink *k, bool think_closed);
     /** Live tool-call events; NULL: calls go out with the finish. */
@@ -6292,8 +6292,9 @@ void logprob_ledger_free(logprob_ledger *lg);
 void logprob_capture_session(logprob_ledger *lg, pulsar_session *sess, int token);
 void logprob_capture_row(logprob_ledger *lg, pulsar_session *sess, uint32_t row, int token);
 bool logprob_commit(logprob_ledger *lg, pulsar_engine *engine, int token,
-                    const char *piece, size_t piece_len, size_t end_off);
-int  logprob_stream_ready(const logprob_ledger *lg, size_t upto);
+                    const char *piece, size_t piece_len, GenOff end_off);
+int  logprob_stream_ready(const logprob_ledger *lg, GenOff upto);
+int  logprob_stream_all(const logprob_ledger *lg);
 /* The OpenAI logprobs object for ledger entries [from, to), leading comma
  * included (append_openai_timings_json's convention); nothing when the client
  * did not ask for logprobs. */

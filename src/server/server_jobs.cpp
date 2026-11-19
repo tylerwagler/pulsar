@@ -2128,7 +2128,7 @@ bool server::gen_emit_piece(gen_state *g, int token, const char *piece, size_t p
 
     s->trace_piece(g->trace_id, piece, piece_len);
     buf_append(&g->text, piece, piece_len);
-    if (!logprob_commit(&g->logprobs, s->engine, token, piece, piece_len, g->text.len)) {
+    if (!logprob_commit(&g->logprobs, s->engine, token, piece, piece_len, gen_text_end(g->text.len))) {
         server_log(PULSAR_LOG_WARNING,
                    "pulsar-server: chat ctx=%s emitted a token with no captured "
                    "distribution after %d tokens; logprobs dropped for this request",
