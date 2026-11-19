@@ -805,7 +805,8 @@ bool stage(const pulsar_driver_step *st0, uint64_t *graph_key) {
     if (pulsar_gpu_tensor_write_async(q->attn_desc, TensorBytes{0}, q->attn_desc_host,
                                       stride.times((uint64_t)st->plan->n_layer * 2u)) == 0)
         return fail("could not upload the attention descriptors");
-    /* L338 P2: the rows whose bank runs the runtime adapter (the LoRAs launch on them only) */
+    /* L338 P2: the rows whose bank runs the runtime adapter (the LoRAs launch on them only): one u8 a row, so the upload
+     * is the rows' bytes (L438: it wrapped the row count as bytes, right only because the flag is one byte) */
     q->step_adapter = false;
     for (uint32_t r = 0; r < st->n_rows; r++) {
         /* in the pool: the driver's forward checked the step's banks */
@@ -814,7 +815,7 @@ bool stage(const pulsar_driver_step *st0, uint64_t *graph_key) {
     }
     if (q->step_adapter && pulsar_gpu_tensor_write_async(q->scratch[ARENA_ROWS],
                                                          rows_layout(q->max_rows).ad.before(),
-                                                         q->row_adapter, TensorBytes{st->n_rows}) == 0)
+                                                         q->row_adapter, bytes_of<uint8_t>(st->n_rows)) == 0)
         return fail("could not upload the adapter rows");
     /* the key: the "G4" tag in bits 48..63, bit 47 the LoRAs launched (L338 P2: which rows they touch is the mask's,
      * read at replay), the bound in bits 1..32, bit 0 set (a key is nonzero); a decode step's shapes follow from the
