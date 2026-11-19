@@ -230,12 +230,12 @@ void server::watchdog_dump(int64_t stalled_s) {
                    pulsar_gib(s->m_kv_reserved), pulsar_gib(s->m_kv_budget),
                    pulsar_gib(s->guard_touched_ceiling), pulsar_gib(avail),
                    pulsar_gib(server_mem_floor()), swap);
-        for (int i = 0; i < s->n_slots.raw(); i++) {   /* L441: the published snapshot, by the slot's number */
+        for (SlotIdx i : s->n_slots.slots()) {   /* the published snapshot (L444: slot tables) */
             const int ph = s->m_slot_phase[i];
             if (ph == 0 && s->m_slot_pos[i] == 0) continue;   /* idle and empty */
             server_log(PULSAR_LOG_DEFAULT,
-                       "pulsar-server: STALL:   slot %d bank %d: %s, position %d of %d, prefill %d/%d%s%s", i,
-                       s->m_slot_bank[i], phase_name(ph), s->m_slot_pos[i],
+                       "pulsar-server: STALL:   slot %u bank %d: %s, position %d of %d, prefill %d/%d%s%s", i.raw(),
+                       s->m_slot_bank[i].raw(), phase_name(ph), s->m_slot_pos[i],
                        s->m_slot_ctx[i], s->m_slot_prefill_done[i], s->m_slot_prefill_total[i],
                        s->m_slot_spilled[i] ? ", spilled" : "", s->m_slot_preempted[i] ? ", preempted" : "");
         }

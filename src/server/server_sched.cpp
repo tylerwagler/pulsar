@@ -372,14 +372,14 @@ void server::slot_prefix_match(const session_slot *sl, const pulsar_tokens *prom
  * bank's ledger charge, a share of memory the create had already made
  * resident, against the host's MemAvailable even where the KV is a discrete
  * card's. */
-/// @param n_provisioned banks provisioned already (the first is exempt)
+/// @param n_provisioned banks provisioned already (the first is exempt; L444: a count)
 /// @param pages_resident the bank's pages are already resident
 /// @param m the free-memory readings (server::mem_reading)
 /// @param demand the demand-paged bytes the provision is checked for (server_bank_provision_demand)
 /// @return true when the floor refuses the provision
-static bool server_bank_floor_refuses(int n_provisioned, bool pages_resident, const server_mem_reading &m,
+static bool server_bank_floor_refuses(BankCount n_provisioned, bool pages_resident, const server_mem_reading &m,
                                       KvBytes demand) {
-    return n_provisioned > 0 && !pages_resident && !server_kv_headroom_admits(m, demand);
+    return n_provisioned.any() && !pages_resident && !server_kv_headroom_admits(m, demand);
 }
 
 /* The free bank to provision: the one with the most resident pages (engine
@@ -450,8 +450,8 @@ server_mem_reading server::mem_reading() const {
     return m;
 }
 
-bool server::ledger_open_pool(KvBytes budget, KvBytes admitted, uint32_t priced_banks, char *err, size_t errlen) {
-    const uint32_t chat = pool_banks.any() ? (uint32_t)pool_banks.raw() : 0u;   /* the ledger's uint32 bank count */
+bool server::ledger_open_pool(KvBytes budget, KvBytes admitted, BankCount priced_banks, char *err, size_t errlen) {
+    const BankCount chat = pool_banks.any() ? pool_banks : BankCount{0};   /* the chat pool's banks */
     const KvBytes reserved = server_bank_charges(admitted, priced_banks, chat, priced_banks);
     if (!server_ledger_self_check(admitted, priced_banks, chat, reserved, budget, err, errlen)) return false;
     kv_budget_bytes = budget;
@@ -465,13 +465,13 @@ bool server::ledger_open_pool(KvBytes budget, KvBytes admitted, uint32_t priced_
 void server::ledger_open_classic(KvBytes budget, KvBytes session_actual) {
     kv_budget_bytes = budget;
     ledger_admitted_bytes = KvBytes{};
-    ledger_priced_banks = 0;
+    ledger_priced_banks = BankCount{0};
     ledger_reserved_bytes = KvBytes{};
     kv_committed_bytes = session_actual;
 }
 
 KvBytes server::bank_charge(BankId b) const {
-    return b.is_token() ? server_bank_charge(ledger_admitted_bytes, ledger_priced_banks, (uint32_t)b.raw()) : KvBytes{};
+    return b.is_token() ? server_bank_charge(ledger_admitted_bytes, ledger_priced_banks, b) : KvBytes{};
 }
 
 bool server::ledger_admits_bank(BankId b) {
@@ -499,14 +499,14 @@ session_slot *server::provision_bank(provision_refusal *refusal) {
     /* Pool mode: bank 0 is an ordinary bank (no boot pre-provisioning, no
      * pinning) — the uniform loop from 0 replaced the boot-phantom /
      * empty-reuse / soft-evict special-case family (2026-08-10). */
-    int n_provisioned = 0;
+    BankCount n_provisioned{0};
     slot_flags provisioned;
     pulsar_indexed<KvBytes, SlotIdx, PULSAR_SESSION_POOL_CAP> resident;
     for (SlotIdx i : s->pool_banks.slots()) {   /* slot i holds bank i: the pool's banks are its slots */
         provisioned[i] = s->slots[i].provisioned;
         resident[i] = provisioned[i] ? KvBytes{}
                     : pulsar_session_bank_touched_kv_bytes(s->sess, s->slots[i].bank);
-        if (provisioned[i]) n_provisioned++;
+        if (provisioned[i]) ++n_provisioned;
     }
     const SlotIdx idx = server_pick_free_bank(provisioned, resident, s->pool_banks);
     if (idx.is_none()) { *refusal = PROVISION_REFUSED_POOL_FULL; return NULL; }
@@ -1397,7 +1397,9 @@ bool server::worker_eviction_could_help(const slot_flags *protect) {
         const KvBytes after = committed > reclaimable ? committed - reclaimable : KvBytes{};
         return server_kv_admits(s->kv_budget_bytes, after,
                                 server_bank_charge(s->ledger_admitted_bytes, s->ledger_priced_banks,
-                                                   s->ledger_priced_banks ? s->ledger_priced_banks - 1 : 0));
+                                                   s->ledger_priced_banks.any()
+                                                       ? (s->ledger_priced_banks - BankCount{1}).bank_past()
+                                                       : BankId{0}));   /* the last priced bank's charge */
     }
     /* Classic mode (L391): the one session is slot 0 -- never provisioned again (provision_slot), never a victim
      * (worker_evict) -- so no eviction frees anything.  The arithmetic that stood here priced a second whole
@@ -2095,14 +2097,13 @@ void server::publish_metrics_snapshot() {
     const KvBytes kv_budget = s->guard_enabled ? s->guard_budget() : KvBytes{};
     pthread_mutex_lock(&s->mu);
     for (SlotIdx i : s->n_slots.slots()) {
-        /* L441: the published snapshot is the client threads' (/metrics, the stall dump), indexed by the slot's
-         * number -- its `slot` label -- as it leaves the worker */
-        const uint32_t k = i.raw();
+        /* L441: the published snapshot is the client threads' (/metrics, the stall dump), per slot (L444: slot
+         * tables, subscripted by the slot -- its `slot` label) */
         /* Bank-aware: a non-live bank's pos is its saved carry, never the pool's
          * live cursor, and a decoder in the plain batch reads its feed position
          * (server::slot_frontier_pos). Pure host read, no CUDA. */
-        s->m_slot_pos[k] = s->slot_frontier_pos(&s->slots[i]).raw();
-        s->m_slot_ctx[k] = s->slots[i].ctx_size;
+        s->m_slot_pos[i] = s->slot_frontier_pos(&s->slots[i]).raw();
+        s->m_slot_ctx[i] = s->slots[i].ctx_size;
         /* Phase + prefill progress: pure host reads of the slot's gen_state,
          * published here because send_metrics runs on a client thread and must
          * not walk worker-owned structures. Phase is stored +1 so an unbound
@@ -2110,15 +2111,15 @@ void server::publish_metrics_snapshot() {
          * progress callback fires, so clamp it here. */
         const session_slot *sl = &s->slots[i];
         const gen_state *g = sl->active_job ? sl->gen : NULL;
-        s->m_slot_phase[k]         = g ? (int)g->phase + 1 : 0;
-        s->m_slot_prefill_done[k]  = (g && g->prefill_last_current > 0) ? g->prefill_last_current : 0;
-        s->m_slot_prefill_total[k] = (g && g->prefill_total > 0) ? g->prefill_total : 0;
-        s->m_slot_bank[k]      = sl->bank.raw();   /* L372: the stall dump's (the watchdog reads only the snapshot) */
-        s->m_slot_spilled[k]   = sl->spilled;
-        s->m_slot_preempted[k] = sl->preempted;
+        s->m_slot_phase[i]         = g ? (int)g->phase + 1 : 0;
+        s->m_slot_prefill_done[i]  = (g && g->prefill_last_current > 0) ? g->prefill_last_current : 0;
+        s->m_slot_prefill_total[i] = (g && g->prefill_total > 0) ? g->prefill_total : 0;
+        s->m_slot_bank[i]      = sl->bank;   /* L372: the stall dump's (the watchdog reads only the snapshot) */
+        s->m_slot_spilled[i]   = sl->spilled;
+        s->m_slot_preempted[i] = sl->preempted;
         /* L112: adaptive draft depth, live-or-carry (pure host read) -- DSpark's; the Qwen MTP lane's
          * depth is fixed and the family refuses the query. */
-        s->m_slot_depth[k] = sl->provisioned && pulsar_engine_has_spec_rounds(s->engine)
+        s->m_slot_depth[i] = sl->provisioned && pulsar_engine_has_spec_rounds(s->engine)
                 ? pulsar_session_bank_spec_depth(s->sess, sl->bank) : 0;
     }
     s->m_spec = m;
@@ -3997,10 +3998,10 @@ const char *const prefill_mem_step_names[PREFILL_MEM_STEPS] = { "go", "spill", "
 /// @param n_idle_victims idle banks whose spill frees something
 /// @param preemptible a decoder may be preempted
 /// @return the step
-prefill_mem_step server_prefill_mem_step(const server_mem_reading &m, KvBytes need, int n_idle_victims,
+prefill_mem_step server_prefill_mem_step(const server_mem_reading &m, KvBytes need, BankCount n_idle_victims,
                                          bool preemptible) {
     if (server_kv_headroom_admits(m, need)) return PREFILL_MEM_GO;
-    if (n_idle_victims > 0) return PREFILL_MEM_SPILL;
+    if (n_idle_victims.any()) return PREFILL_MEM_SPILL;
     if (preemptible) return PREFILL_MEM_PREEMPT;
     return PREFILL_MEM_REFUSE;
 }
@@ -4020,7 +4021,7 @@ bool server::floor_admits_chunk(int rows, char *err, size_t errlen) {
         SlotIdx useful[PULSAR_SESSION_POOL_CAP];
         const BankCount n_idle = s->guard_enabled && s->pool_banks.any() ? guard_spill_victims(s, NULL, 0, useful, NULL)
                                                                          : BankCount{0};
-        const prefill_mem_step step = server_prefill_mem_step(mem, need, n_idle.raw(), /*preemptible=*/false);
+        const prefill_mem_step step = server_prefill_mem_step(mem, need, n_idle, /*preemptible=*/false);
         if (step == PREFILL_MEM_GO) return true;
         if (step != PREFILL_MEM_SPILL || !s->spill_bank(&s->slots[useful[0]])) break;
         s->count_metric(&s->m_spills);
@@ -4091,7 +4092,7 @@ bool server::prefill_headroom_ok(session_slot *sl) {
         bool decoders = false;
         for (SlotIdx i{0u}; s->n_slots.covers(i) && !preempt_tried; ++i)
             decoders |= &s->slots[i] != sl && slot_is_batchable_decode(&s->slots[i]);
-        const prefill_mem_step step = server_prefill_mem_step(mem, need, n_idle.raw(), decoders && !preempt_tried);
+        const prefill_mem_step step = server_prefill_mem_step(mem, need, n_idle, decoders && !preempt_tried);
         if (step == PREFILL_MEM_GO) return true;
         /* L372 (O12): with no idle chat bank left, the judge bank goes before a decoder is preempted or the prompt
          * refused (server_judge_release: never under a judge request) */

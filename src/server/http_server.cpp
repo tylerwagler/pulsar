@@ -405,7 +405,7 @@ bool server::send_health(int fd) {
     double kv = 0.0; /* max KV utilization across provisioned slots */
     pthread_mutex_lock(&s->mu);
     draining = s->stopping;
-    n_slots  = s->n_slots.raw();   /* L441: the published snapshot is indexed by the slot's number */
+    n_slots  = s->n_slots.raw();   /* the provisioned slots' high-water, as reported */
     /* The pool the run was sized for, not the number of banks provisioned so
      * far. Banks 1..pool_banks-1 are provisioned lazily as conversations
      * arrive, so `total` ramps from 1 while this does not move — and a reader
@@ -416,7 +416,7 @@ bool server::send_health(int fd) {
     running  = s->n_generating;
     waiting  = s->n_queued;
     started  = s->started;
-    for (int i = 0; i < n_slots; i++) {
+    for (SlotIdx i : s->n_slots.slots()) {   /* L444: the published slot tables */
         const int pos = s->m_slot_pos[i];
         const int ctx = s->m_slot_ctx[i];
         double u = (ctx > 0 && pos > 0) ? (double)pos / (double)ctx : 0.0;
@@ -592,21 +592,21 @@ bool server::send_metrics(int fd) {
     const std::string model_label = prometheus_label(server_served_model_id(s));   /* L354 */
     const char *model = model_label.c_str();
     pulsar_spec_metrics m;
-    int n_slots;
-    double slot_kv[PULSAR_SESSION_POOL_CAP];
-    int slot_pos[PULSAR_SESSION_POOL_CAP];
-    int slot_ctx[PULSAR_SESSION_POOL_CAP];
-    int slot_phase[PULSAR_SESSION_POOL_CAP];
-    int slot_depth[PULSAR_SESSION_POOL_CAP];
-    int slot_pf_done[PULSAR_SESSION_POOL_CAP];
-    int slot_pf_total[PULSAR_SESSION_POOL_CAP];
+    BankCount n_slots;   /* L444: the snapshot's slot count and its copies, per-slot tables (the `slot` label) */
+    slot_doubles slot_kv;
+    slot_ints slot_pos;
+    slot_ints slot_ctx;
+    slot_ints slot_phase;
+    slot_ints slot_depth;
+    slot_ints slot_pf_done;
+    slot_ints slot_pf_total;
     pthread_mutex_lock(&s->mu);
     m = s->m_spec;
     const pulsar_verify_curve_view vc = s->m_verify_curve;
     const pulsar_spec_calibration cal = s->m_spec_calib;
     const char *drafter = s->m_drafter_name ? s->m_drafter_name : "";
-    n_slots = s->n_slots.raw();   /* L441: the published snapshot is indexed by the slot's number */
-    for (int i = 0; i < n_slots; i++) {
+    n_slots = s->n_slots;
+    for (SlotIdx i : n_slots.slots()) {
         const int pos = s->m_slot_pos[i];
         const int ctx = s->m_slot_ctx[i];
         double kv = (ctx > 0 && pos > 0) ? (double)pos / (double)ctx : 0.0;
@@ -707,7 +707,7 @@ bool server::send_metrics(int fd) {
     if (running < 0) running = 0;
     if (waiting < 0) waiting = 0;
     double kv = 0.0; /* unlabeled gauge: max across provisioned slots */
-    for (int i = 0; i < n_slots; i++) {
+    for (SlotIdx i : n_slots.slots()) {
         if (slot_kv[i] > kv) kv = slot_kv[i];
     }
 
@@ -877,8 +877,8 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# HELP vllm:kv_cache_usage_perc KV cache utilization (0-1); unlabeled = max across slots.\n");
     buf_puts(&b, "# TYPE vllm:kv_cache_usage_perc gauge\n");
     buf_printf(&b, "vllm:kv_cache_usage_perc %.6f\n", kv);
-    for (int i = 0; i < n_slots; i++) {
-        buf_printf(&b, "vllm:kv_cache_usage_perc{slot=\"%d\"} %.6f\n", i, slot_kv[i]);
+    for (SlotIdx i : n_slots.slots()) {
+        buf_printf(&b, "vllm:kv_cache_usage_perc{slot=\"%u\"} %.6f\n", i.raw(), slot_kv[i]);
     }
     buf_puts(&b, "# HELP vllm:num_requests_running Requests currently generating.\n");
     buf_puts(&b, "# TYPE vllm:num_requests_running gauge\n");
@@ -891,7 +891,7 @@ bool server::send_metrics(int fd) {
      * position advance identically whether it is prefilling a prompt or
      * decoding tokens; this is what separates the two. */
     int prefilling = 0;
-    for (int i = 0; i < n_slots; i++) {
+    for (SlotIdx i : n_slots.slots()) {
         const int idx = slot_phase_index(slot_phase[i]);
         if (idx == 1 || idx == 2 || idx == 5) prefilling++;   /* L330: a restoring prompt is ingesting too */
     }
@@ -905,36 +905,36 @@ bool server::send_metrics(int fd) {
     buf_printf(&b, "pulsar:slot_pool_capacity %d\n", s->pool_banks.any() ? s->pool_banks.raw() : 1);
     buf_puts(&b, "# HELP pulsar:spec_draft_depth Adaptive draft depth per slot (0 = no drafter/idle).\n");
     buf_puts(&b, "# TYPE pulsar:spec_draft_depth gauge\n");
-    for (int i = 0; i < n_slots; i++)
-        buf_printf(&b, "pulsar:spec_draft_depth{slot=\"%d\"} %d\n", i, slot_depth[i]);
+    for (SlotIdx i : n_slots.slots())
+        buf_printf(&b, "pulsar:spec_draft_depth{slot=\"%u\"} %d\n", i.raw(), slot_depth[i]);
     buf_puts(&b, "# HELP pulsar:slot_phase Generation phase per slot (state set; 1 = current).\n");
     buf_puts(&b, "# TYPE pulsar:slot_phase gauge\n");
-    for (int i = 0; i < n_slots; i++) {
+    for (SlotIdx i : n_slots.slots()) {
         const int idx = slot_phase_index(slot_phase[i]);
         for (int p = 0; p < SLOT_PHASE_COUNT; p++)
-            buf_printf(&b, "pulsar:slot_phase{slot=\"%d\",phase=\"%s\"} %d\n",
-                       i, slot_phase_names[p], p == idx ? 1 : 0);
+            buf_printf(&b, "pulsar:slot_phase{slot=\"%u\",phase=\"%s\"} %d\n",
+                       i.raw(), slot_phase_names[p], p == idx ? 1 : 0);
     }
     /* Absolute token positions. kv_cache_usage_perc is the ratio only; these
      * let a dashboard show "14203 / 32768" and size the remaining context. */
     buf_puts(&b, "# HELP pulsar:slot_position_tokens KV frontier position per slot, in tokens.\n");
     buf_puts(&b, "# TYPE pulsar:slot_position_tokens gauge\n");
-    for (int i = 0; i < n_slots; i++)
-        buf_printf(&b, "pulsar:slot_position_tokens{slot=\"%d\"} %d\n", i, slot_pos[i]);
+    for (SlotIdx i : n_slots.slots())
+        buf_printf(&b, "pulsar:slot_position_tokens{slot=\"%u\"} %d\n", i.raw(), slot_pos[i]);
     buf_puts(&b, "# HELP pulsar:slot_context_tokens Context size the slot was admitted for.\n");
     buf_puts(&b, "# TYPE pulsar:slot_context_tokens gauge\n");
-    for (int i = 0; i < n_slots; i++)
-        buf_printf(&b, "pulsar:slot_context_tokens{slot=\"%d\"} %d\n", i, slot_ctx[i]);
+    for (SlotIdx i : n_slots.slots())
+        buf_printf(&b, "pulsar:slot_context_tokens{slot=\"%u\"} %d\n", i.raw(), slot_ctx[i]);
     /* Prefill progress, so a long cold prompt shows a moving bar instead of a
      * slot that merely looks busy. Both read 0 outside a prefill phase. */
     buf_puts(&b, "# HELP pulsar:slot_prefill_done_tokens Prompt tokens synced so far on this slot.\n");
     buf_puts(&b, "# TYPE pulsar:slot_prefill_done_tokens gauge\n");
-    for (int i = 0; i < n_slots; i++)
-        buf_printf(&b, "pulsar:slot_prefill_done_tokens{slot=\"%d\"} %d\n", i, slot_pf_done[i]);
+    for (SlotIdx i : n_slots.slots())
+        buf_printf(&b, "pulsar:slot_prefill_done_tokens{slot=\"%u\"} %d\n", i.raw(), slot_pf_done[i]);
     buf_puts(&b, "# HELP pulsar:slot_prefill_total_tokens Prefill target for this slot's prompt.\n");
     buf_puts(&b, "# TYPE pulsar:slot_prefill_total_tokens gauge\n");
-    for (int i = 0; i < n_slots; i++)
-        buf_printf(&b, "pulsar:slot_prefill_total_tokens{slot=\"%d\"} %d\n", i, slot_pf_total[i]);
+    for (SlotIdx i : n_slots.slots())
+        buf_printf(&b, "pulsar:slot_prefill_total_tokens{slot=\"%u\"} %d\n", i.raw(), slot_pf_total[i]);
     buf_puts(&b, "# HELP pulsar:num_requests_prefilling Requests currently in a prefill phase (or restoring a disk KV chain, L330).\n");
     buf_puts(&b, "# TYPE pulsar:num_requests_prefilling gauge\n");
     buf_printf(&b, "pulsar:num_requests_prefilling %d\n", prefilling);

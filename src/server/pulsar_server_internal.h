@@ -2398,6 +2398,10 @@ typedef pulsar_indexed<bool, SlotIdx, PULSAR_SESSION_POOL_CAP> slot_flags;
 typedef pulsar_indexed<bool, BankId, PULSAR_SESSION_POOL_CAP> bank_flags;
 /** L441: a per-slot table of ints (a slot's history length). */
 typedef pulsar_indexed<int, SlotIdx, PULSAR_SESSION_POOL_CAP> slot_ints;
+/** L444: a per-slot table of banks (the bank each slot holds, as the /metrics snapshot publishes it). */
+typedef pulsar_indexed<BankId, SlotIdx, PULSAR_SESSION_POOL_CAP> slot_banks;
+/** L444: a per-slot table of doubles (a slot's KV utilisation, as /metrics reports it). */
+typedef pulsar_indexed<double, SlotIdx, PULSAR_SESSION_POOL_CAP> slot_doubles;
 /** L441: a slot x slot table (the common-prefix matrix of two slots' histories). */
 typedef pulsar_indexed<slot_ints, SlotIdx, PULSAR_SESSION_POOL_CAP> slot_matrix;
 /** L441: a per-slot word whose bit b names slot b (the census's deep pairs). */
@@ -3077,7 +3081,7 @@ struct server {
      *  of the banks no chat slot holds (the judge's bank, any past the slot cap), committed at startup and never
      *  released.  With every chat bank provisioned kv_committed_bytes == ledger_admitted_bytes, to the byte. */
     KvBytes      ledger_admitted_bytes;
-    uint32_t     ledger_priced_banks;   ///< see ledger_admitted_bytes
+    BankCount    ledger_priced_banks;   ///< see ledger_admitted_bytes
     KvBytes      ledger_reserved_bytes; ///< see ledger_admitted_bytes
     KvBytes      kv_budget_bytes;  ///< admission ceiling computed at startup
     /** Context-scaled KV one bank holds at the configured context — the
@@ -3266,24 +3270,24 @@ struct server {
      * above forbids engine calls on client threads, so the worker exports
      * per-slot KV positions/contexts and the engine spec-decode counters here
      * (server_publish_metrics_snapshot, at bind time and once per quantum);
-     * send_metrics reads only these. */
-    int m_slot_pos[PULSAR_SESSION_POOL_CAP];  ///< pulsar_session_pos per provisioned slot
-    int m_slot_ctx[PULSAR_SESSION_POOL_CAP];  ///< ctx_size per provisioned slot
+     * send_metrics reads only these.  L444: per-slot tables, subscripted by the slot (its `slot` label). */
+    slot_ints m_slot_pos;  ///< pulsar_session_pos per provisioned slot
+    slot_ints m_slot_ctx;  ///< ctx_size per provisioned slot
     /** Per-slot generation phase and prefill progress. Without these a scraper
      * cannot tell a slot that is prefilling from one that is decoding: both
      * only show m_slot_pos advancing, and a prefill chunk and a decode quantum
      * are indistinguishable once sampled at scrape cadence.
      * Stored as gen_phase + 1, so 0 (a zeroed server, or a slot with no bound
      * job) reads as idle rather than as GEN_PREFILL_COLD. */
-    int m_slot_phase[PULSAR_SESSION_POOL_CAP];
-    int m_slot_depth[PULSAR_SESSION_POOL_CAP];  ///< L112: adaptive draft depth per slot (0 = n/a)
-    int m_slot_prefill_done[PULSAR_SESSION_POOL_CAP];  ///< tokens synced so far
-    int m_slot_prefill_total[PULSAR_SESSION_POOL_CAP];  ///< prefill target, 0 if not prefilling
+    slot_ints m_slot_phase;
+    slot_ints m_slot_depth;  ///< L112: adaptive draft depth per slot (0 = n/a)
+    slot_ints m_slot_prefill_done;  ///< tokens synced so far
+    slot_ints m_slot_prefill_total;  ///< prefill target, 0 if not prefilling
     /** L372: what the stall dump names of a slot beside the fields above -- its bank and whether it is guard-spilled
      *  or parked (preempted).  The dump runs on the watchdog thread and read these from the worker's own slots. */
-    int m_slot_bank[PULSAR_SESSION_POOL_CAP];
-    bool m_slot_spilled[PULSAR_SESSION_POOL_CAP];    ///< session_slot::spilled, as published
-    bool m_slot_preempted[PULSAR_SESSION_POOL_CAP];  ///< session_slot::preempted, as published
+    slot_banks m_slot_bank;
+    slot_flags m_slot_spilled;    ///< session_slot::spilled, as published
+    slot_flags m_slot_preempted;  ///< session_slot::preempted, as published
     pulsar_spec_metrics m_spec;  ///< engine spec-decode counters
     /* Request-latency histograms. req_timings is already computed for every
      * request (generate_job_end) and was previously only serialized into the
@@ -4528,7 +4532,7 @@ struct server {
     /// @param err           receives the refusal
     /// @param errlen        its size
     /// @return true when the ledger is open and adds up
-    bool ledger_open_pool(KvBytes budget, KvBytes admitted, uint32_t priced_banks, char *err, size_t errlen);
+    bool ledger_open_pool(KvBytes budget, KvBytes admitted, BankCount priced_banks, char *err, size_t errlen);
     /** L391: open the session-cost ledger of classic mode (no pool): the one session's cost, the actual its create
      *  allocated, is the whole commitment for the life of the process. */
     /// @param budget          the admission budget (kv_budget_bytes)
@@ -6468,14 +6472,15 @@ KvBytes server_bank_provision_demand(bool growth_guarded, KvBytes kv_bank_bytes)
 /// @param priced_banks  the bank count it was priced over (0: no charge)
 /// @param bank          the bank's index
 /// @return the charge
-KvBytes server_bank_charge(KvBytes admitted, uint32_t priced_banks, uint32_t bank);
-/** L391: the summed charges of banks [from, to) (server_bank_charge). */
+KvBytes server_bank_charge(KvBytes admitted, BankCount priced_banks, BankId bank);
+/** L391: the summed charges of banks [from, to) (server_bank_charge): the banks past the first `from` and below
+ *  `to` (L444: two counts -- the callers' bounds are the chat pool's and the priced pool's bank counts). */
 /// @param admitted      what startup admission charged for the pool
 /// @param priced_banks  the bank count it was priced over
-/// @param from          the first bank
-/// @param to            one past the last (clamped to priced_banks)
+/// @param from          the count of banks skipped (the first bank summed is bank `from`)
+/// @param to            the count of banks the range ends at (clamped to priced_banks)
 /// @return the sum
-KvBytes server_bank_charges(KvBytes admitted, uint32_t priced_banks, uint32_t from, uint32_t to);
+KvBytes server_bank_charges(KvBytes admitted, BankCount priced_banks, BankCount from, BankCount to);
 /** L391: the pool ledger's startup self-check.  True when the ledger adds up: with every chat bank provisioned the
  *  committed bytes -- `reserved` plus the chat banks' charges -- equal `admitted` to the byte, and the budget holds
  *  it, so no chat bank's provision can ever be refused by the ledger.  False says why in `err`. */
@@ -6487,14 +6492,14 @@ KvBytes server_bank_charges(KvBytes admitted, uint32_t priced_banks, uint32_t fr
 /// @param err           receives the refusal
 /// @param errlen        its size
 /// @return true when the ledger adds up and fits
-bool server_ledger_self_check(KvBytes admitted, uint32_t priced_banks, uint32_t chat_banks, KvBytes reserved,
+bool server_ledger_self_check(KvBytes admitted, BankCount priced_banks, BankCount chat_banks, KvBytes reserved,
                               KvBytes budget, char *err, size_t errlen);
 /** The per-chunk prefill re-check's next move (server::prefill_headroom_ok): GO when the readings cover the chunk
  *  over the floors (server_kv_headroom_admits); else SPILL while an idle bank can go, else PREEMPT while a decoder
  *  can, else REFUSE. */
 typedef enum { PREFILL_MEM_GO = 0, PREFILL_MEM_SPILL, PREFILL_MEM_PREEMPT, PREFILL_MEM_REFUSE, PREFILL_MEM_STEPS } prefill_mem_step;
 extern const char *const prefill_mem_step_names[PREFILL_MEM_STEPS];
-prefill_mem_step server_prefill_mem_step(const server_mem_reading &m, KvBytes need, int n_idle_victims,
+prefill_mem_step server_prefill_mem_step(const server_mem_reading &m, KvBytes need, BankCount n_idle_victims,
                                          bool preemptible);
 
 /* ==== The stall watchdog (watchdog.cpp) ===================================================================

@@ -418,31 +418,35 @@ KvBytes server_bank_provision_demand(bool growth_guarded, KvBytes kv_bank_bytes)
     return growth_guarded ? KvBytes{} : kv_bank_bytes;
 }
 
-KvBytes server_bank_charge(KvBytes admitted, uint32_t priced_banks, uint32_t bank) {
-    if (priced_banks == 0 || bank >= priced_banks) return KvBytes{};
-    return KvBytes{admitted.raw() / priced_banks + (bank < admitted.raw() % priced_banks ? 1u : 0u)};
+KvBytes server_bank_charge(KvBytes admitted, BankCount priced_banks, BankId bank) {
+    if (!priced_banks.covers(bank)) return KvBytes{};   /* no pool, or no such bank */
+    /* the split: bytes divided by the bank count, the remainder a byte each on the banks below it (the count and
+     * the bank leave their types here, as the divisor and the remainder's rank) */
+    const uint64_t n = (uint64_t)priced_banks.raw();
+    return KvBytes{admitted.raw() / n + ((uint64_t)bank.raw() < admitted.raw() % n ? 1u : 0u)};
 }
 
-KvBytes server_bank_charges(KvBytes admitted, uint32_t priced_banks, uint32_t from, uint32_t to) {
+KvBytes server_bank_charges(KvBytes admitted, BankCount priced_banks, BankCount from, BankCount to) {
     KvBytes sum{};
-    for (uint32_t b = from; b < to && b < priced_banks; b++) sum += server_bank_charge(admitted, priced_banks, b);
+    for (BankId b : to.banks())
+        if (!from.covers(b) && priced_banks.covers(b)) sum += server_bank_charge(admitted, priced_banks, b);
     return sum;
 }
 
-bool server_ledger_self_check(KvBytes admitted, uint32_t priced_banks, uint32_t chat_banks, KvBytes reserved,
+bool server_ledger_self_check(KvBytes admitted, BankCount priced_banks, BankCount chat_banks, KvBytes reserved,
                               KvBytes budget, char *err, size_t errlen) {
-    if (admitted == KvBytes{} || chat_banks == 0 || chat_banks > priced_banks) {
-        snprintf(err, errlen, "a pool of %u chat bank(s) priced at %llu bytes over %u bank(s) is no pool", chat_banks,
-                 (unsigned long long)admitted.raw(), priced_banks);
+    if (admitted == KvBytes{} || !chat_banks.any() || chat_banks > priced_banks) {
+        snprintf(err, errlen, "a pool of %d chat bank(s) priced at %llu bytes over %d bank(s) is no pool",
+                 chat_banks.raw(), (unsigned long long)admitted.raw(), priced_banks.raw());
         return false;
     }
-    const KvBytes all_live = reserved + server_bank_charges(admitted, priced_banks, 0, chat_banks);
+    const KvBytes all_live = reserved + server_bank_charges(admitted, priced_banks, BankCount{0}, chat_banks);
     if (all_live != admitted) {
         snprintf(err, errlen,
-                 "with every chat bank live the ledger holds %llu bytes (%llu reserved + %u chat bank charges) but "
-                 "the pool was admitted at %llu over %u bank(s)",
-                 (unsigned long long)all_live.raw(), (unsigned long long)reserved.raw(), chat_banks,
-                 (unsigned long long)admitted.raw(), priced_banks);
+                 "with every chat bank live the ledger holds %llu bytes (%llu reserved + %d chat bank charges) but "
+                 "the pool was admitted at %llu over %d bank(s)",
+                 (unsigned long long)all_live.raw(), (unsigned long long)reserved.raw(), chat_banks.raw(),
+                 (unsigned long long)admitted.raw(), priced_banks.raw());
         return false;
     }
     if (!server_kv_admits(budget, KvBytes{}, admitted)) {
@@ -1497,7 +1501,7 @@ int main(int argc, char **argv) {
          * un-evictable squatter, and the compensating special cases each of
          * those needed. */
         char ledger_err[320];
-        if (!s.ledger_open_pool(kv_budget_final, session_est, (uint32_t)pool_banks, ledger_err, sizeof ledger_err)) {
+        if (!s.ledger_open_pool(kv_budget_final, session_est, BankCount{pool_banks}, ledger_err, sizeof ledger_err)) {
             server_log(PULSAR_LOG_ERROR, "pulsar-server: refusing to start: the session-cost ledger does not add up "
                        "-- %s (L391)", ledger_err);
             pulsar_session_free(session);

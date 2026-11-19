@@ -14800,9 +14800,9 @@ static void test_l372_judge_bank_floor_and_release(void) {
     TEST_ASSERT(!server_judge_release(&s) && !J->released);   /* nothing resident: nothing freed, nothing to re-back */
     /* the order: an idle chat bank is spilled first; the judge bank's turn is where the step would preempt or refuse */
     const uint64_t MiB = 1024ull * 1024ull, F = 4538ull * MiB, need = 52ull * MiB;
-    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(F, F), KvBytes{need}, 1, true) == PREFILL_MEM_SPILL);
-    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(F, F), KvBytes{need}, 0, true) == PREFILL_MEM_PREEMPT);
-    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(F, F), KvBytes{need}, 0, false) == PREFILL_MEM_REFUSE);
+    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(F, F), KvBytes{need}, BankCount{1}, true) == PREFILL_MEM_SPILL);
+    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(F, F), KvBytes{need}, BankCount{0}, true) == PREFILL_MEM_PREEMPT);
+    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(F, F), KvBytes{need}, BankCount{0}, false) == PREFILL_MEM_REFUSE);
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     if (sv[0] >= 0 && sv[1] >= 0) {
@@ -17449,22 +17449,22 @@ static void test_l179_bank_floor_exempts_first_bank(void) {
     const uint64_t demand = 2560ull * MiB;                   /* 2.5 GiB of demand-paged KV */
     const uint64_t floor = demand + PULSAR_SERVER_MEM_FLOOR_BYTES;
     /* first bank: exempt everywhere */
-    TEST_ASSERT(!server_bank_floor_refuses(0, false, test_mem_unified(0, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
-    TEST_ASSERT(!server_bank_floor_refuses(0, false, test_mem_unified(floor - 1, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
-    TEST_ASSERT(!server_bank_floor_refuses(0, false, test_mem_unified(floor, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
-    TEST_ASSERT(!server_bank_floor_refuses(0, false, test_mem_unified(1ull * GiB, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
+    TEST_ASSERT(!server_bank_floor_refuses(BankCount{0}, false, test_mem_unified(0, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
+    TEST_ASSERT(!server_bank_floor_refuses(BankCount{0}, false, test_mem_unified(floor - 1, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
+    TEST_ASSERT(!server_bank_floor_refuses(BankCount{0}, false, test_mem_unified(floor, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
+    TEST_ASSERT(!server_bank_floor_refuses(BankCount{0}, false, test_mem_unified(1ull * GiB, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
     /* second bank onward, fresh pages: gauge and floor both bind */
-    TEST_ASSERT(server_bank_floor_refuses(1, false, test_mem_unified(0, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
-    TEST_ASSERT(server_bank_floor_refuses(1, false, test_mem_unified(floor - 1, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
-    TEST_ASSERT(!server_bank_floor_refuses(1, false, test_mem_unified(floor, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
-    TEST_ASSERT(server_bank_floor_refuses(3, false, test_mem_unified(0, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
-    TEST_ASSERT(server_bank_floor_refuses(3, false, test_mem_unified(floor - 1, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
-    TEST_ASSERT(!server_bank_floor_refuses(3, false, test_mem_unified(floor, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
-    TEST_ASSERT(!server_bank_floor_refuses(3, false, test_mem_unified(100ull * GiB, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
+    TEST_ASSERT(server_bank_floor_refuses(BankCount{1}, false, test_mem_unified(0, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
+    TEST_ASSERT(server_bank_floor_refuses(BankCount{1}, false, test_mem_unified(floor - 1, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
+    TEST_ASSERT(!server_bank_floor_refuses(BankCount{1}, false, test_mem_unified(floor, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
+    TEST_ASSERT(server_bank_floor_refuses(BankCount{3}, false, test_mem_unified(0, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
+    TEST_ASSERT(server_bank_floor_refuses(BankCount{3}, false, test_mem_unified(floor - 1, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
+    TEST_ASSERT(!server_bank_floor_refuses(BankCount{3}, false, test_mem_unified(floor, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
+    TEST_ASSERT(!server_bank_floor_refuses(BankCount{3}, false, test_mem_unified(100ull * GiB, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
     /* a recycled bank (resident pages): admitted however tight the box reads */
-    TEST_ASSERT(!server_bank_floor_refuses(15, true, test_mem_unified(floor - 1, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
-    TEST_ASSERT(!server_bank_floor_refuses(15, true, test_mem_unified(4ull * GiB + 1, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
-    TEST_ASSERT(!server_bank_floor_refuses(15, true, test_mem_unified(0, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
+    TEST_ASSERT(!server_bank_floor_refuses(BankCount{15}, true, test_mem_unified(floor - 1, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
+    TEST_ASSERT(!server_bank_floor_refuses(BankCount{15}, true, test_mem_unified(4ull * GiB + 1, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
+    TEST_ASSERT(!server_bank_floor_refuses(BankCount{15}, true, test_mem_unified(0, PULSAR_SERVER_MEM_FLOOR_BYTES), kvb(demand)));
 }
 
 /* ---- L391: the session-cost ledger and the free-memory readings ------------------------------------------------
@@ -17523,45 +17523,45 @@ static void test_l391_ledger_sums_to_the_estimate(void) {
                                (uint64_t)47 << 30 | 12345};
     for (uint64_t price : prices)
         for (uint32_t n = 1; n <= PULSAR_SESSION_POOL_CAP; n++) {
-            TEST_ASSERT(server_bank_charges(kvb(price), n, 0, n) == kvb(price));
+            TEST_ASSERT(server_bank_charges(kvb(price), BankCount{n}, BankCount{0}, BankCount{n}) == kvb(price));
             /* an even split: no two banks differ by more than the remainder's one byte */
-            TEST_ASSERT(server_bank_charge(kvb(price), n, 0).raw() - server_bank_charge(kvb(price), n, n - 1).raw() <= 1);
-            TEST_ASSERT(server_bank_charge(kvb(price), n, n) == kvb(0));   /* no such bank: no charge */
+            TEST_ASSERT(server_bank_charge(kvb(price), BankCount{n}, BankId{0}).raw() - server_bank_charge(kvb(price), BankCount{n}, BankId{n - 1}).raw() <= 1);
+            TEST_ASSERT(server_bank_charge(kvb(price), BankCount{n}, BankId{n}) == kvb(0));   /* no such bank: no charge */
             for (uint32_t chat = 1; chat <= n; chat++) {
                 char err[320] = "";
-                const KvBytes reserved = server_bank_charges(kvb(price), n, chat, n);
-                TEST_ASSERT(server_ledger_self_check(kvb(price), n, chat, reserved, kvb(price), err, sizeof err));
+                const KvBytes reserved = server_bank_charges(kvb(price), BankCount{n}, BankCount{chat}, BankCount{n});
+                TEST_ASSERT(server_ledger_self_check(kvb(price), BankCount{n}, BankCount{chat}, reserved, kvb(price), err, sizeof err));
             }
         }
-    TEST_ASSERT(server_bank_charge(kvb(100), 0, 0) == kvb(0));
+    TEST_ASSERT(server_bank_charge(kvb(100), BankCount{0}, BankId{0}) == kvb(0));
 
     char err[320] = "";
     /* the pre-L391 ledger on Gemma: priced over 3 banks, 2 chat banks charged, the judge's share committed nowhere */
-    TEST_ASSERT(!server_ledger_self_check(kvb(L391_GEMMA_ADMITTED), 3, 2, kvb(0), kvb(L391_GEMMA_BUDGET), err,
+    TEST_ASSERT(!server_ledger_self_check(kvb(L391_GEMMA_ADMITTED), BankCount{3}, BankCount{2}, kvb(0), kvb(L391_GEMMA_BUDGET), err,
                                           sizeof err));
     TEST_ASSERT(strstr(err, "with every chat bank live the ledger holds") != NULL);
     /* a reserve priced over another bank count */
-    TEST_ASSERT(!server_ledger_self_check(kvb(L391_GEMMA_ADMITTED), 3, 2,
-                                          server_bank_charges(kvb(L391_GEMMA_ADMITTED), 2, 1, 2),
+    TEST_ASSERT(!server_ledger_self_check(kvb(L391_GEMMA_ADMITTED), BankCount{3}, BankCount{2},
+                                          server_bank_charges(kvb(L391_GEMMA_ADMITTED), BankCount{2}, BankCount{1}, BankCount{2}),
                                           kvb(L391_GEMMA_BUDGET), err, sizeof err));
     /* a price the budget does not hold */
     err[0] = 0;
-    TEST_ASSERT(!server_ledger_self_check(kvb(L391_GEMMA_ADMITTED), 3, 2,
-                                          server_bank_charges(kvb(L391_GEMMA_ADMITTED), 3, 2, 3),
+    TEST_ASSERT(!server_ledger_self_check(kvb(L391_GEMMA_ADMITTED), BankCount{3}, BankCount{2},
+                                          server_bank_charges(kvb(L391_GEMMA_ADMITTED), BankCount{3}, BankCount{2}, BankCount{3}),
                                           kvb(L391_GEMMA_ADMITTED - 1), err, sizeof err));
     TEST_ASSERT(strstr(err, "past the budget") != NULL);
     /* no pool at all: more chat banks than were priced, no chat bank, no price */
-    TEST_ASSERT(!server_ledger_self_check(kvb(L391_GEMMA_ADMITTED), 2, 3, kvb(0), kvb(L391_GEMMA_BUDGET), err, sizeof err));
-    TEST_ASSERT(!server_ledger_self_check(kvb(L391_GEMMA_ADMITTED), 3, 0, kvb(L391_GEMMA_ADMITTED),
+    TEST_ASSERT(!server_ledger_self_check(kvb(L391_GEMMA_ADMITTED), BankCount{2}, BankCount{3}, kvb(0), kvb(L391_GEMMA_BUDGET), err, sizeof err));
+    TEST_ASSERT(!server_ledger_self_check(kvb(L391_GEMMA_ADMITTED), BankCount{3}, BankCount{0}, kvb(L391_GEMMA_ADMITTED),
                                           kvb(L391_GEMMA_BUDGET), err, sizeof err));
-    TEST_ASSERT(!server_ledger_self_check(kvb(0), 3, 2, kvb(0), kvb(L391_GEMMA_BUDGET), err, sizeof err));
+    TEST_ASSERT(!server_ledger_self_check(kvb(0), BankCount{3}, BankCount{2}, kvb(0), kvb(L391_GEMMA_BUDGET), err, sizeof err));
 
     /* the server's opener runs it: a pool whose price is past the budget is not opened, and says so */
     server s;
     l391_pool_server(&s, 2);
     err[0] = 0;
-    TEST_ASSERT(!s.ledger_open_pool(kvb(L391_GEMMA_ADMITTED - 1), kvb(L391_GEMMA_ADMITTED), 3, err, sizeof err));
-    TEST_ASSERT(strstr(err, "past the budget") != NULL && s.ledger_priced_banks == 0 && s.kv_budget_bytes == kvb(0));
+    TEST_ASSERT(!s.ledger_open_pool(kvb(L391_GEMMA_ADMITTED - 1), kvb(L391_GEMMA_ADMITTED), BankCount{3}, err, sizeof err));
+    TEST_ASSERT(strstr(err, "past the budget") != NULL && s.ledger_priced_banks == BankCount{0} && s.kv_budget_bytes == kvb(0));
     pthread_mutex_destroy(&s.tool_mu);
     pthread_mutex_destroy(&s.mu);
 }
@@ -17585,7 +17585,7 @@ static void test_l391_ledger_two_modes(void) {
     l391_pool_server(&s, 16);
     const KvBytes qwen_budget = server_kv_budget_bytes(hostb(L391_QWEN_WEIGHTS));
     TEST_ASSERT(qwen_budget > kvb(36ull * GiB) && qwen_budget < kvb(37ull * GiB));   /* 36.92 GiB */
-    TEST_ASSERT(s.ledger_open_pool(qwen_budget, kvb(L391_QWEN_ADMITTED), 16, err, sizeof err));
+    TEST_ASSERT(s.ledger_open_pool(qwen_budget, kvb(L391_QWEN_ADMITTED), BankCount{16}, err, sizeof err));
     TEST_ASSERT(s.kv_committed_bytes == kvb(0) && s.ledger_reserved_bytes == kvb(0));
     for (BankId b : BankCount{16}.banks()) {
         TEST_ASSERT(s.slot_of_bank(b)->bank_charge_bytes == kvb(0));
@@ -17607,7 +17607,7 @@ static void test_l391_ledger_two_modes(void) {
     /* Gemma: 2 chat banks + the judge's.  Before L391 the two chat banks' charges were all the ledger ever held
      * (two thirds of the estimate); now the judge's share is committed at startup. */
     l391_pool_server(&s, 2);
-    TEST_ASSERT(s.ledger_open_pool(kvb(L391_GEMMA_BUDGET), kvb(L391_GEMMA_ADMITTED), 3, err, sizeof err));
+    TEST_ASSERT(s.ledger_open_pool(kvb(L391_GEMMA_BUDGET), kvb(L391_GEMMA_ADMITTED), BankCount{3}, err, sizeof err));
     TEST_ASSERT(s.ledger_reserved_bytes == s.bank_charge(BankId{2}) && s.kv_committed_bytes == s.ledger_reserved_bytes);
     TEST_ASSERT(s.ledger_reserved_bytes > kvb(0));
     for (BankId b : BankCount{2}.banks()) {
@@ -17636,7 +17636,7 @@ static void test_l391_provision_consults_the_ledger(void) {
     char err[320] = "";
     for (const auto &sh : shapes) {
         l391_pool_server(&s, sh.chat);
-        TEST_ASSERT(s.ledger_open_pool(sh.budget, kvb(sh.admitted), sh.priced, err, sizeof err));
+        TEST_ASSERT(s.ledger_open_pool(sh.budget, kvb(sh.admitted), BankCount{sh.priced}, err, sizeof err));
         /* a churn of provisions and evictions: every bank the pool can hand out is admitted */
         uint32_t x = 12345;
         for (int step = 0; step < 4000; step++) {
@@ -17671,7 +17671,7 @@ static void test_l391_provision_consults_the_ledger(void) {
 
     /* (b) Gemma's pool with bank 0 live and the budget one byte short of bank 1's charge */
     l391_pool_server(&s, 2);
-    TEST_ASSERT(s.ledger_open_pool(kvb(L391_GEMMA_BUDGET), kvb(L391_GEMMA_ADMITTED), 3, err, sizeof err));
+    TEST_ASSERT(s.ledger_open_pool(kvb(L391_GEMMA_BUDGET), kvb(L391_GEMMA_ADMITTED), BankCount{3}, err, sizeof err));
     l391_provision(&s, bx(0));
     s.kv_budget_bytes = s.kv_committed_bytes + s.bank_charge(BankId{1}) - kvb(1);
     provision_refusal refusal = PROVISION_OK;
@@ -17733,7 +17733,7 @@ static void test_l391_ledger_share_prices_growth(void) {
     server s;
     char err[320] = "";
     l391_pool_server(&s, 16);
-    TEST_ASSERT(s.ledger_open_pool(budget, kvb(L391_QWEN_ADMITTED), 16, err, sizeof err));
+    TEST_ASSERT(s.ledger_open_pool(budget, kvb(L391_QWEN_ADMITTED), BankCount{16}, err, sizeof err));
     l391_provision(&s, bx(0));
     const KvBytes before = s.kv_committed_bytes;
     s.slots[SlotIdx{0u}].spilled = true;
@@ -17752,18 +17752,18 @@ static void test_l391_provision_demand_is_demand_paged(void) {
     TEST_ASSERT(server_bank_provision_demand(false, kvb(L391_GEMMA_BANK_KV)) == kvb(L391_GEMMA_BANK_KV));
     /* Qwen, guarded.  Before L391 the second bank needed the floor + its 0.96 GiB ledger charge free; half a GiB
      * over the floor was refused though the charge was resident already.  Now the floor alone decides. */
-    const KvBytes charge = server_bank_charge(kvb(L391_QWEN_ADMITTED), 16, 1);
+    const KvBytes charge = server_bank_charge(kvb(L391_QWEN_ADMITTED), BankCount{16}, BankId{1});
     TEST_ASSERT(charge > kvb(512ull * MiB));
     const KvBytes guarded = server_bank_provision_demand(true, kvb(L391_QWEN_BANK_KV));
-    TEST_ASSERT(server_bank_floor_refuses(1, false, test_mem_unified(F + 512ull * MiB, F), charge));     /* was */
-    TEST_ASSERT(!server_bank_floor_refuses(1, false, test_mem_unified(F + 512ull * MiB, F), guarded));   /* is */
-    TEST_ASSERT(!server_bank_floor_refuses(1, false, test_mem_unified(F, F), guarded));
-    TEST_ASSERT(server_bank_floor_refuses(1, false, test_mem_unified(F - 1, F), guarded));   /* under the floor */
-    TEST_ASSERT(server_bank_floor_refuses(1, false, test_mem_unified(0, F), guarded));       /* unreadable: closed */
+    TEST_ASSERT(server_bank_floor_refuses(BankCount{1}, false, test_mem_unified(F + 512ull * MiB, F), charge));     /* was */
+    TEST_ASSERT(!server_bank_floor_refuses(BankCount{1}, false, test_mem_unified(F + 512ull * MiB, F), guarded));   /* is */
+    TEST_ASSERT(!server_bank_floor_refuses(BankCount{1}, false, test_mem_unified(F, F), guarded));
+    TEST_ASSERT(server_bank_floor_refuses(BankCount{1}, false, test_mem_unified(F - 1, F), guarded));   /* under the floor */
+    TEST_ASSERT(server_bank_floor_refuses(BankCount{1}, false, test_mem_unified(0, F), guarded));       /* unreadable: closed */
     /* unguarded (PULSAR_OVERCOMMIT=0): the bank's whole KV must fit over the floor */
     const KvBytes whole = server_bank_provision_demand(false, kvb(L391_QWEN_BANK_KV));
-    TEST_ASSERT(server_bank_floor_refuses(1, false, test_mem_unified(F + L391_QWEN_BANK_KV - 1, F), whole));
-    TEST_ASSERT(!server_bank_floor_refuses(1, false, test_mem_unified(F + L391_QWEN_BANK_KV, F), whole));
+    TEST_ASSERT(server_bank_floor_refuses(BankCount{1}, false, test_mem_unified(F + L391_QWEN_BANK_KV - 1, F), whole));
+    TEST_ASSERT(!server_bank_floor_refuses(BankCount{1}, false, test_mem_unified(F + L391_QWEN_BANK_KV, F), whole));
     /* a host-only server reads unified memory: one reading for the KV and the host, the memory floor for both */
     server s;
     l391_pool_server(&s, 2);
@@ -17786,16 +17786,16 @@ static void test_l391_discrete_reads_the_device(void) {
     /* host MemAvailable low -- over its floor by less than the chunk -- and the device roomy: admitted */
     const server_mem_reading host_low = test_mem_discrete(2ull * GiB, DF, HF + 1ull * MiB, HF);
     TEST_ASSERT(server_kv_headroom_admits(host_low, chunk));
-    TEST_ASSERT(server_prefill_mem_step(host_low, chunk, 1, true) == PREFILL_MEM_GO);
+    TEST_ASSERT(server_prefill_mem_step(host_low, chunk, BankCount{1}, true) == PREFILL_MEM_GO);
     /* the old test: refused (the KV chunk against the host's reading: since L442 the crossing has to be spelt out) */
     TEST_ASSERT(!server_headroom_admits(host_low.host_avail, pulsar_unified_host_bytes(pulsar_kv_device_bytes(chunk)),
                                         host_low.host_floor));
     /* the device full and the host roomy: an idle bank is spilled, else a decoder preempted, else refused */
     const server_mem_reading dev_full = test_mem_discrete(DF + chunk.raw() - 1, DF, 20ull * GiB, HF);
     TEST_ASSERT(!server_kv_headroom_admits(dev_full, chunk));
-    TEST_ASSERT(server_prefill_mem_step(dev_full, chunk, 1, true) == PREFILL_MEM_SPILL);
-    TEST_ASSERT(server_prefill_mem_step(dev_full, chunk, 0, true) == PREFILL_MEM_PREEMPT);
-    TEST_ASSERT(server_prefill_mem_step(dev_full, chunk, 0, false) == PREFILL_MEM_REFUSE);
+    TEST_ASSERT(server_prefill_mem_step(dev_full, chunk, BankCount{1}, true) == PREFILL_MEM_SPILL);
+    TEST_ASSERT(server_prefill_mem_step(dev_full, chunk, BankCount{0}, true) == PREFILL_MEM_PREEMPT);
+    TEST_ASSERT(server_prefill_mem_step(dev_full, chunk, BankCount{0}, false) == PREFILL_MEM_REFUSE);
     TEST_ASSERT(server_headroom_admits(dev_full.host_avail, pulsar_unified_host_bytes(pulsar_kv_device_bytes(chunk)),
                                        dev_full.host_floor));    /* the old test: admitted */
     TEST_ASSERT(server_kv_headroom_admits(test_mem_discrete(DF + chunk.raw(), DF, 20ull * GiB, HF), chunk));
@@ -17806,12 +17806,12 @@ static void test_l391_discrete_reads_the_device(void) {
     /* a provision.  Guarded (production): it pages in nothing, so the device is not asked -- the prompt's growth
      * is the touched budget's, read against the device (server_guard_avail_bytes) -- and the host floor stands. */
     const KvBytes guarded = server_bank_provision_demand(true, kvb(L391_GEMMA_BANK_KV));
-    TEST_ASSERT(!server_bank_floor_refuses(1, false, test_mem_discrete(DF - 1, DF, 20ull * GiB, HF), guarded));
-    TEST_ASSERT(server_bank_floor_refuses(1, false, test_mem_discrete(8ull * GiB, DF, HF - 1, HF), guarded));
+    TEST_ASSERT(!server_bank_floor_refuses(BankCount{1}, false, test_mem_discrete(DF - 1, DF, 20ull * GiB, HF), guarded));
+    TEST_ASSERT(server_bank_floor_refuses(BankCount{1}, false, test_mem_discrete(8ull * GiB, DF, HF - 1, HF), guarded));
     /* unguarded: the bank's whole KV against the device, not the host */
     const KvBytes whole = server_bank_provision_demand(false, kvb(L391_GEMMA_BANK_KV));
-    TEST_ASSERT(server_bank_floor_refuses(1, false, test_mem_discrete(2ull * GiB, DF, 20ull * GiB, HF), whole));
-    TEST_ASSERT(!server_bank_floor_refuses(1, false, test_mem_discrete(DF + L391_GEMMA_BANK_KV, DF, HF, HF), whole));
+    TEST_ASSERT(server_bank_floor_refuses(BankCount{1}, false, test_mem_discrete(2ull * GiB, DF, 20ull * GiB, HF), whole));
+    TEST_ASSERT(!server_bank_floor_refuses(BankCount{1}, false, test_mem_discrete(DF + L391_GEMMA_BANK_KV, DF, HF, HF), whole));
     /* unified memory is one reading: the same test as before L391 */
     TEST_ASSERT(server_kv_headroom_admits(test_mem_unified(HF + chunk.raw(), HF), chunk));
     TEST_ASSERT(!server_kv_headroom_admits(test_mem_unified(HF + chunk.raw() - 1, HF), chunk));
@@ -17909,15 +17909,15 @@ static void test_l442_mem_split_values_unchanged(void) {
                                                       : pre ? PREFILL_MEM_PREEMPT : PREFILL_MEM_REFUSE;
                         const prefill_mem_step want_d = ok_d ? PREFILL_MEM_GO : idle ? PREFILL_MEM_SPILL
                                                       : pre ? PREFILL_MEM_PREEMPT : PREFILL_MEM_REFUSE;
-                        TEST_ASSERT(server_prefill_mem_step(u, kvb(n), idle, pre != 0) == want_u);
-                        TEST_ASSERT(server_prefill_mem_step(d, kvb(n), idle, pre != 0) == want_d);
+                        TEST_ASSERT(server_prefill_mem_step(u, kvb(n), BankCount{idle}, pre != 0) == want_u);
+                        TEST_ASSERT(server_prefill_mem_step(d, kvb(n), BankCount{idle}, pre != 0) == want_d);
                     }
                 /* the provision's floor, both platforms, first bank exempt, a resident hole admitted */
                 for (int prov = 0; prov < 2; prov++)
                     for (int res = 0; res < 2; res++) {
-                        TEST_ASSERT(server_bank_floor_refuses(prov, res != 0, u, kvb(n)) ==
+                        TEST_ASSERT(server_bank_floor_refuses(BankCount{prov}, res != 0, u, kvb(n)) ==
                                     (prov > 0 && !res && !l442_old_kv_headroom(false, a, HF, a, HF, n)));
-                        TEST_ASSERT(server_bank_floor_refuses(prov, res != 0, d, kvb(n)) ==
+                        TEST_ASSERT(server_bank_floor_refuses(BankCount{prov}, res != 0, d, kvb(n)) ==
                                     (prov > 0 && !res && !l442_old_kv_headroom(true, a, DF, h, HF, n)));
                     }
                 checked++;
@@ -20445,13 +20445,13 @@ static void test_l281_prefill_chunk_publishes_the_slot_gauges(void) {
 
     gen_prefill_progress_cb(&g, "prefill_chunk", TokPos{4096}, TokCount{320284});
     TEST_ASSERT(g.prefill_last_current == 4096 && g.prefill_total == 320284);
-    TEST_ASSERT(s.m_slot_prefill_done[0] == 4096);
-    TEST_ASSERT(s.m_slot_prefill_total[0] == 320284);
-    TEST_ASSERT(s.m_slot_phase[0] == (int)GEN_PREFILL_MAIN + 1);
+    TEST_ASSERT(s.m_slot_prefill_done[SlotIdx{0u}] == 4096);
+    TEST_ASSERT(s.m_slot_prefill_total[SlotIdx{0u}] == 320284);
+    TEST_ASSERT(s.m_slot_phase[SlotIdx{0u}] == (int)GEN_PREFILL_MAIN + 1);
     TEST_ASSERT(s.metrics_generation == gen0 + 1);
 
     gen_prefill_progress_cb(&g, "prefill_chunk", TokPos{8192}, TokCount{320284});
-    TEST_ASSERT(s.m_slot_prefill_done[0] == 8192);
+    TEST_ASSERT(s.m_slot_prefill_done[SlotIdx{0u}] == 8192);
     TEST_ASSERT(g.prefill_chunks_done == 1);
     TEST_ASSERT(s.metrics_generation == gen0 + 2);
 
@@ -22028,19 +22028,19 @@ static void test_l347_i3b_failure_rules(void) {
  * headroom leg's single conversation: one bank, nothing to spill, the 503 is right). */
 static void test_prefill_mem_step_tries_remedies_first(void) {
     const uint64_t MiB = 1024ull * 1024ull, F = 4538ull * MiB, need = 52ull * MiB;
-    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(F + need, F), kvb(need), 0, false) == PREFILL_MEM_GO);
-    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(F + need, F), kvb(need), 3,
+    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(F + need, F), kvb(need), BankCount{0}, false) == PREFILL_MEM_GO);
+    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(F + need, F), kvb(need), BankCount{3},
                                         true) == PREFILL_MEM_GO);     /* room: no remedy */
-    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(F + need - 1, F), kvb(need), 3, true) == PREFILL_MEM_SPILL);
-    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(F, F), kvb(need), 1,
+    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(F + need - 1, F), kvb(need), BankCount{3}, true) == PREFILL_MEM_SPILL);
+    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(F, F), kvb(need), BankCount{1},
                                         false) == PREFILL_MEM_SPILL);       /* an idle bank first */
-    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(F, F), kvb(need), 0,
+    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(F, F), kvb(need), BankCount{0},
                                         true) == PREFILL_MEM_PREEMPT);      /* then a decoder */
-    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(F, F), kvb(need), 0,
+    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(F, F), kvb(need), BankCount{0},
                                         false) == PREFILL_MEM_REFUSE);      /* nothing to free */
-    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(0, F), kvb(need), 0,
+    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(0, F), kvb(need), BankCount{0},
                                         false) == PREFILL_MEM_REFUSE);      /* unreadable: closed */
-    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(0, F), kvb(need), 2,
+    TEST_ASSERT(server_prefill_mem_step(test_mem_unified(0, F), kvb(need), BankCount{2},
                                         false) == PREFILL_MEM_SPILL);       /* ... but freeing helps */
     TEST_ASSERT(!strcmp(prefill_mem_step_names[PREFILL_MEM_REFUSE], "refuse"));
 }
@@ -23792,6 +23792,172 @@ static void test_l441_pool_spaces(void) {
     free(s);
 }
 
+/* ---- L444: L441's slot / bank types in L442's memory code ---------------------------------------------------------- */
+static_assert(std::is_same_v<decltype(server::m_slot_pos), slot_ints> &&
+                  std::is_same_v<decltype(server::m_slot_ctx), slot_ints> &&
+                  std::is_same_v<decltype(server::m_slot_phase), slot_ints> &&
+                  std::is_same_v<decltype(server::m_slot_depth), slot_ints> &&
+                  std::is_same_v<decltype(server::m_slot_prefill_done), slot_ints> &&
+                  std::is_same_v<decltype(server::m_slot_prefill_total), slot_ints> &&
+                  std::is_same_v<decltype(server::m_slot_bank), slot_banks> &&
+                  std::is_same_v<decltype(server::m_slot_spilled), slot_flags> &&
+                  std::is_same_v<decltype(server::m_slot_preempted), slot_flags>,
+              "the published /metrics snapshot is per-slot tables (L444)");
+static_assert(l441_subscripts<slot_banks, SlotIdx> && !l441_subscripts<slot_banks, BankId> &&
+                  !l441_subscripts<slot_banks, int> && l441_subscripts<slot_doubles, SlotIdx> &&
+                  !l441_subscripts<slot_doubles, BankId> && !l441_subscripts<slot_doubles, int> &&
+                  !l441_subscripts<slot_ints, BankId> && !l441_subscripts<slot_flags, int> &&
+                  std::is_same_v<decltype(std::declval<slot_banks &>()[SlotIdx{}]), BankId &>,
+              "a slot's published bank and utilisation are read by the slot only");
+static_assert(sizeof(slot_ints) == sizeof(int[PULSAR_SESSION_POOL_CAP]) &&
+                  sizeof(slot_banks) == sizeof(int[PULSAR_SESSION_POOL_CAP]) &&
+                  alignof(slot_banks) == alignof(int) &&
+                  sizeof(slot_doubles) == sizeof(double[PULSAR_SESSION_POOL_CAP]) &&
+                  alignof(slot_doubles) == alignof(double) && std::is_trivial_v<slot_banks> &&
+                  std::is_trivial_v<slot_doubles> && std::is_trivial_v<slot_ints>,
+              "each snapshot table is the array it replaced (the server struct is memset whole)");
+static_assert(std::is_same_v<decltype(server::ledger_priced_banks), BankCount> &&
+                  std::is_same_v<decltype(&server_bank_charge), KvBytes (*)(KvBytes, BankCount, BankId)> &&
+                  std::is_same_v<decltype(&server_bank_charges), KvBytes (*)(KvBytes, BankCount, BankCount, BankCount)> &&
+                  std::is_same_v<decltype(&server_ledger_self_check),
+                                 bool (*)(KvBytes, BankCount, BankCount, KvBytes, KvBytes, char *, size_t)> &&
+                  std::is_same_v<decltype(&server::ledger_open_pool),
+                                 bool (server::*)(KvBytes, KvBytes, BankCount, char *, size_t)> &&
+                  std::is_same_v<decltype(&server_prefill_mem_step),
+                                 prefill_mem_step (*)(const server_mem_reading &, KvBytes, BankCount, bool)> &&
+                  std::is_same_v<decltype(&server_bank_floor_refuses),
+                                 bool (*)(BankCount, bool, const server_mem_reading &, KvBytes)>,
+              "the ledger's and the memory steps' bank counts and bank index are typed (L444)");
+static_assert(!std::is_invocable_v<decltype(&server_bank_charge), KvBytes, uint32_t, uint32_t> &&
+                  !std::is_invocable_v<decltype(&server_bank_charge), KvBytes, BankCount, BankCount> &&
+                  !std::is_invocable_v<decltype(&server_bank_charge), KvBytes, BankId, BankCount> &&
+                  !std::is_invocable_v<decltype(&server_prefill_mem_step), const server_mem_reading &, KvBytes, int,
+                                       bool> &&
+                  !std::is_invocable_v<decltype(&server_bank_floor_refuses), int, bool, const server_mem_reading &,
+                                       KvBytes>,
+              "a bare integer is neither the ledger's bank count nor its bank");
+
+/* L444: the ledger's split, sum and self-check compute with BankCount / BankId what they computed with uint32_t (the
+ * pre-L444 formulas, inline): every price below, every bank count 0 .. cap + 1, every bank -1 .. cap + 1, every
+ * [from, to) range; and the memory steps' counts decide as their ints did. */
+static uint64_t l444_old_charge(uint64_t admitted, uint32_t priced, uint32_t bank) {
+    if (priced == 0 || bank >= priced) return 0;
+    return admitted / priced + (bank < admitted % priced ? 1u : 0u);
+}
+static void test_l444_ledger_counts_unchanged(void) {
+    const uint64_t prices[] = {0, 1, 7, 16, 17, 1000003, L391_QWEN_ADMITTED, L391_GEMMA_ADMITTED,
+                               (uint64_t)47 << 30 | 12345};
+    for (uint64_t price : prices)
+        for (int n = 0; n <= PULSAR_SESSION_POOL_CAP + 1; n++) {
+            for (int b = -1; b <= PULSAR_SESSION_POOL_CAP + 1; b++)
+                TEST_ASSERT(server_bank_charge(KvBytes{price}, BankCount{n}, BankId{b}).raw() ==
+                            l444_old_charge(price, (uint32_t)n, (uint32_t)b));
+            for (int from = 0; from <= PULSAR_SESSION_POOL_CAP + 1; from++)
+                for (int to = 0; to <= PULSAR_SESSION_POOL_CAP + 1; to++) {
+                    uint64_t old = 0;
+                    for (uint32_t b = (uint32_t)from; b < (uint32_t)to && b < (uint32_t)n; b++)
+                        old += l444_old_charge(price, (uint32_t)n, b);
+                    TEST_ASSERT(server_bank_charges(KvBytes{price}, BankCount{n}, BankCount{from}, BankCount{to}).raw() ==
+                                old);
+                }
+            for (int chat = 0; chat <= PULSAR_SESSION_POOL_CAP + 1; chat++) {
+                uint64_t reserved = 0;
+                for (uint32_t b = (uint32_t)chat; b < (uint32_t)n; b++) reserved += l444_old_charge(price, (uint32_t)n, b);
+                const bool old_ok = price != 0 && chat != 0 && (uint32_t)chat <= (uint32_t)n;   /* reserved + all = price */
+                char err[320] = "";
+                TEST_ASSERT(server_ledger_self_check(KvBytes{price}, BankCount{n}, BankCount{chat}, KvBytes{reserved},
+                                                     KvBytes{price}, err, sizeof err) == old_ok);
+                if (!old_ok && (price == 0 || chat == 0 || chat > n)) {   /* the refusal prints the counts as before */
+                    char want[320];
+                    snprintf(want, sizeof want, "a pool of %u chat bank(s) priced at %llu bytes over %u bank(s) is no pool",
+                             (uint32_t)chat, (unsigned long long)price, (uint32_t)n);
+                    TEST_ASSERT(!strcmp(err, want));
+                }
+            }
+        }
+    /* the floor's count and the prefill step's idle-victim count decide as `n > 0` did */
+    const uint64_t MiB = 1024ull * 1024ull, F = 4538ull * MiB;
+    for (int n = 0; n <= 3; n++) {
+        TEST_ASSERT(server_bank_floor_refuses(BankCount{n}, false, test_mem_unified(F - 1, F), kvb(MiB)) == (n > 0));
+        TEST_ASSERT(server_prefill_mem_step(test_mem_unified(F, F), kvb(MiB), BankCount{n}, false) ==
+                    (n > 0 ? PREFILL_MEM_SPILL : PREFILL_MEM_REFUSE));
+    }
+}
+
+/** The /metrics reader of test_l444_metrics_slot_lines: reads its fd to EOF. */
+struct l444_metrics_read {
+    int fd;           ///< the socket's read end
+    char *text;       ///< what was read (malloc'd)
+};
+/** Read a whole /metrics body on its own thread (the body outgrows the socket's buffer).
+ *  @param p the l444_metrics_read */
+/// @return NULL
+static void *l444_metrics_reader(void *p) {
+    l444_metrics_read *r = (l444_metrics_read *)p;
+    r->text = read_socket_text(r->fd);
+    return NULL;
+}
+
+/* L444: /metrics' per-slot series read the snapshot's slot tables and print the slot label as the int loop did: each
+ * line is compared with the pre-L444 format ("%d" of an int slot), byte for byte. */
+static void test_l444_metrics_slot_lines(void) {
+    server *s = (server *)calloc(1, sizeof(server));
+    pthread_mutex_init(&s->mu, NULL);
+    s->n_slots = BankCount{3};
+    s->pool_banks = BankCount{4};
+    const int pos[3] = {0, 1200, 70000}, ctx[3] = {4096, 4096, 65536}, phase[3] = {0, (int)GEN_PREFILL_MAIN + 1, 3};
+    const int depth[3] = {0, 4, 7}, done[3] = {0, 800, -1}, total[3] = {0, 2000, 0};
+    for (SlotIdx i : s->n_slots.slots()) {
+        const int k = (int)i.raw();
+        s->m_slot_pos[i] = pos[k];
+        s->m_slot_ctx[i] = ctx[k];
+        s->m_slot_phase[i] = phase[k];
+        s->m_slot_depth[i] = depth[k];
+        s->m_slot_prefill_done[i] = done[k];
+        s->m_slot_prefill_total[i] = total[k];
+    }
+    int fds[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    l444_metrics_read r = {fds[1], NULL};
+    pthread_t th;
+    TEST_ASSERT(pthread_create(&th, NULL, l444_metrics_reader, &r) == 0);
+    TEST_ASSERT(s->send_metrics(fds[0]));
+    shutdown(fds[0], SHUT_WR);
+    pthread_join(th, NULL);
+    TEST_ASSERT(r.text != NULL);
+    char want[256];
+    for (int k = 0; k < 3; k++) {
+        double kv = (ctx[k] > 0 && pos[k] > 0) ? (double)pos[k] / (double)ctx[k] : 0.0;
+        if (kv > 1.0) kv = 1.0;
+        snprintf(want, sizeof want, "\nvllm:kv_cache_usage_perc{slot=\"%d\"} %.6f\n", k, kv);
+        TEST_ASSERT(strstr(r.text, want) != NULL);
+        snprintf(want, sizeof want, "\npulsar:spec_draft_depth{slot=\"%d\"} %d\n", k, depth[k]);
+        TEST_ASSERT(strstr(r.text, want) != NULL);
+        const int idx = slot_phase_index(phase[k]);
+        for (int p = 0; p < SLOT_PHASE_COUNT; p++) {
+            snprintf(want, sizeof want, "\npulsar:slot_phase{slot=\"%d\",phase=\"%s\"} %d\n", k, slot_phase_names[p],
+                     p == idx ? 1 : 0);
+            TEST_ASSERT(strstr(r.text, want) != NULL);
+        }
+        snprintf(want, sizeof want, "\npulsar:slot_position_tokens{slot=\"%d\"} %d\n", k, pos[k] > 0 ? pos[k] : 0);
+        TEST_ASSERT(strstr(r.text, want) != NULL);
+        snprintf(want, sizeof want, "\npulsar:slot_context_tokens{slot=\"%d\"} %d\n", k, ctx[k] > 0 ? ctx[k] : 0);
+        TEST_ASSERT(strstr(r.text, want) != NULL);
+        snprintf(want, sizeof want, "\npulsar:slot_prefill_done_tokens{slot=\"%d\"} %d\n", k, done[k] > 0 ? done[k] : 0);
+        TEST_ASSERT(strstr(r.text, want) != NULL);
+        snprintf(want, sizeof want, "\npulsar:slot_prefill_total_tokens{slot=\"%d\"} %d\n", k, total[k]);
+        TEST_ASSERT(strstr(r.text, want) != NULL);
+    }
+    TEST_ASSERT(strstr(r.text, "\nvllm:kv_cache_usage_perc 1.000000\n") != NULL);   /* the max over the three */
+    TEST_ASSERT(strstr(r.text, "{slot=\"3\"}") == NULL);                           /* the count bounds the walk */
+    TEST_ASSERT(count_substr(r.text, "pulsar:slot_position_tokens{slot=") == 3);
+    free(r.text);
+    close(fds[0]);
+    close(fds[1]);
+    pthread_mutex_destroy(&s->mu);
+    free(s);
+}
+
 static void pulsar_server_unit_tests_run(void) {
     test_l333_kv_units();
     test_l334_p2b_crossings();
@@ -23817,6 +23983,8 @@ static void pulsar_server_unit_tests_run(void) {
     test_l441_pool_spaces();
     test_l441_trivial_ceiling_is_the_jobs();
     test_l441_admission_prices_the_stitch();
+    test_l444_ledger_counts_unchanged();
+    test_l444_metrics_slot_lines();
     test_mem_floor_is_derived_from_the_watermarks();
     test_guard_budget_reads_live_memavailable();
     test_guard_discrete_reads_the_device();
