@@ -93,7 +93,7 @@ void gpu_graph_debug_dump_tensor(
         const char       *name,
         pulsar_gpu_tensor *t,
         uint64_t          n_f32,
-        uint32_t          il,
+        uint32_t            il,
         uint32_t          pos) {
     if (!t || n_f32 == 0 || !gpu_graph_debug_wants(name, il, pos)) return;
     const char *prefix = gpu_graph_debug_dump_prefix();
@@ -140,7 +140,7 @@ void gpu_graph_debug_dump_hc_tensor(
         const char       *name,
         pulsar_gpu_tensor *t,
         uint64_t          n_elems,
-        uint32_t          il,
+        uint32_t            il,
         uint32_t          pos) {
     if (!t || n_elems == 0 || !gpu_graph_debug_wants(name, il, pos)) return;
     const char *prefix = gpu_graph_debug_dump_prefix();
@@ -192,7 +192,7 @@ void gpu_graph_debug_dump_q_tensor(
         const char       *name,
         pulsar_gpu_tensor *t,
         uint64_t          n_elems,
-        uint32_t          il,
+        uint32_t            il,
         uint32_t          pos) {
     if (!t || n_elems == 0 || !gpu_graph_debug_wants(name, il, pos)) return;
     const char *prefix = gpu_graph_debug_dump_prefix();
@@ -236,7 +236,7 @@ void gpu_graph_debug_dump_i32_tensor(
         const char       *name,
         pulsar_gpu_tensor *t,
         uint64_t          n_i32,
-        uint32_t          il,
+        uint32_t            il,
         uint32_t          pos) {
     if (!t || n_i32 == 0 || !gpu_graph_debug_wants(name, il, pos)) return;
     const char *prefix = gpu_graph_debug_dump_prefix();
@@ -348,7 +348,7 @@ static void gpu_graph_compute_dims(
     d->prefill_cap = prefill_cap;
 
     uint32_t min_ratio = UINT32_MAX;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio != 0 && ratio < min_ratio) min_ratio = ratio;
     }
@@ -358,8 +358,8 @@ static void gpu_graph_compute_dims(
     if (d->attn_comp_stage_cap < 2u) d->attn_comp_stage_cap = 2u;
     /* CSA2: a pool exists at kv sources only; a member layer's cap is its
      * source's, reached through gpu_graph_kv_source(il). */
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        d->layer_comp_cap[il] = gpu_graph_layer_is_kv_source(il)
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
+        d->layer_comp_cap[il.raw()] = gpu_graph_layer_is_kv_source(il)
             ? gpu_graph_comp_cap(ctx_size, pulsar_layer_compress_ratio(il)) : 0u;
     }
 
@@ -376,7 +376,7 @@ static void gpu_graph_compute_dims(
      * shared staging the moment a V4 layer ran through it. */
     d->comp_width_max = 0;
     d->index_comp_width_max = 0;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         const uint64_t w = pulsar_comp_row_width(ratio, PULSAR_N_HEAD_DIM);
         if (w > d->comp_width_max) d->comp_width_max = w;
@@ -495,21 +495,21 @@ static bool gpu_graph_bank_slabs_alloc(
     b->cur_bank = 0;
     b->raw_bank_bytes = TensorBytes{pulsar_kv_row_bytes(PULSAR_KV_ROW_RING)}.times(dz->raw_cap);
     bool ok = true;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER && ok; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER) && ok; ++il) {
         const pulsar_layer_attn *attn = pulsar_layer_attn_layout(il);
         /* uint32 row-ABI audit: batched kernels address rows as
          * seq_id * cap + local in uint32; reject the geometry up front. */
         if ((uint64_t)n_banks * dz->raw_cap > 4294967296ull ||
-            (uint64_t)n_banks * dz->layer_comp_cap[il] > 4294967296ull) {
+            (uint64_t)n_banks * dz->layer_comp_cap[il.raw()] > 4294967296ull) {
             fprintf(stderr,
                     "pulsar: bank pool geometry overflows the uint32 row ABI "
                     "(%u banks x raw_cap %u / comp_cap %u)\n",
-                    n_banks, dz->raw_cap, dz->layer_comp_cap[il]);
+                    n_banks, dz->raw_cap, dz->layer_comp_cap[il.raw()]);
             return false;
         }
-        b->raw[il] = gpu_graph_alloc_kv_cache_tensor(
+        b->raw[il.raw()] = gpu_graph_alloc_kv_cache_tensor(
                 managed_kv_cache, b->raw_bank_bytes.times(n_banks));
-        ok = b->raw[il] != NULL;
+        ok = b->raw[il.raw()] != NULL;
         /* CSA2 (L218): only a kv source owns a compressed pool, an index-K
          * pool and (at ratio > 1) a compressor state lane.  A kv source is
          * not the same question as an indexer -- 0731's ratio-128 HCA layers
@@ -523,34 +523,34 @@ static bool gpu_graph_bank_slabs_alloc(
         const uint64_t attn_width = pulsar_comp_row_width(attn->ratio, PULSAR_N_HEAD_DIM);
         const uint64_t attn_rows = attn->ratio > 1u ? pulsar_comp_state_rows(attn->ratio) : 0u;
         const TensorBytes attn_lane = bytes_of<float>(attn_width * attn_rows);
-        b->comp_bank_bytes[il] = TensorBytes{pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP)}.times(dz->layer_comp_cap[il]);
-        b->index_bank_bytes[il] = indexed
-            ? TensorBytes{pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX)}.times(dz->layer_comp_cap[il]) : TensorBytes{0};
-        b->astate_bank_bytes[il] = attn_lane;
+        b->comp_bank_bytes[il.raw()] = TensorBytes{pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP)}.times(dz->layer_comp_cap[il.raw()]);
+        b->index_bank_bytes[il.raw()] = indexed
+            ? TensorBytes{pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX)}.times(dz->layer_comp_cap[il.raw()]) : TensorBytes{0};
+        b->astate_bank_bytes[il.raw()] = attn_lane;
         /* Increment 2a: one cudaMallocManaged PER BANK (not one n_banks*bytes
          * slab) so the eviction guard can cudaFree a single idle bank's physical
-         * directly. Uniform stride (comp_bank_bytes[il] is bank-independent). */
+         * directly. Uniform stride (comp_bank_bytes[il.raw()] is bank-independent). */
         void *comp_ptr_h[PULSAR_MSEQ_MAX], *index_ptr_h[PULSAR_MSEQ_MAX];
         for (uint32_t bk = 0; ok && bk < n_banks; bk++) {
-            b->comp[il][bk] = pulsar_gpu_tensor_alloc_managed(b->comp_bank_bytes[il]);
-            ok = b->comp[il][bk] != NULL;
+            b->comp[il.raw()][bk] = pulsar_gpu_tensor_alloc_managed(b->comp_bank_bytes[il.raw()]);
+            ok = b->comp[il.raw()][bk] != NULL;
             if (ok && indexed) {
-                b->index[il][bk] = pulsar_gpu_tensor_alloc_managed(b->index_bank_bytes[il]);
-                ok = b->index[il][bk] != NULL;
+                b->index[il.raw()][bk] = pulsar_gpu_tensor_alloc_managed(b->index_bank_bytes[il.raw()]);
+                ok = b->index[il.raw()][bk] != NULL;
             }
             if (ok) {
-                comp_ptr_h[bk] = pulsar_gpu_tensor_device_ptr(b->comp[il][bk]);
-                index_ptr_h[bk] = indexed ? pulsar_gpu_tensor_device_ptr(b->index[il][bk]) : NULL;
+                comp_ptr_h[bk] = pulsar_gpu_tensor_device_ptr(b->comp[il.raw()][bk]);
+                index_ptr_h[bk] = indexed ? pulsar_gpu_tensor_device_ptr(b->index[il.raw()][bk]) : NULL;
             }
         }
         /* Device base-pointer tables (indexed by seq_id) the batched READ
          * kernels use instead of base + seq_id*comp_cap over one slab. */
-        if (ok) b->comp_bases[il] = pulsar_gpu_tensor_alloc(bytes_of<void *>(n_banks));
-        if (ok && indexed) b->index_bases[il] = pulsar_gpu_tensor_alloc(bytes_of<void *>(n_banks));
-        ok = ok && b->comp_bases[il] && (!indexed || b->index_bases[il]) &&
-             pulsar_gpu_tensor_write(b->comp_bases[il], TensorBytes{0}, comp_ptr_h,
+        if (ok) b->comp_bases[il.raw()] = pulsar_gpu_tensor_alloc(bytes_of<void *>(n_banks));
+        if (ok && indexed) b->index_bases[il.raw()] = pulsar_gpu_tensor_alloc(bytes_of<void *>(n_banks));
+        ok = ok && b->comp_bases[il.raw()] && (!indexed || b->index_bases[il.raw()]) &&
+             pulsar_gpu_tensor_write(b->comp_bases[il.raw()], TensorBytes{0}, comp_ptr_h,
                                   bytes_of<void *>(n_banks)) &&
-             (!indexed || pulsar_gpu_tensor_write(b->index_bases[il], TensorBytes{0}, index_ptr_h,
+             (!indexed || pulsar_gpu_tensor_write(b->index_bases[il.raw()], TensorBytes{0}, index_ptr_h,
                                   bytes_of<void *>(n_banks)));
         /* V4's indexer keeps a SECOND recurrent lane (it compresses its own key);
          * V4.1 derives the index key from the latent and keeps none.  Same two
@@ -559,37 +559,37 @@ static bool gpu_graph_bank_slabs_alloc(
         const TensorBytes index_lane = own_index && attn_rows
             ? bytes_of<float>(pulsar_comp_row_width(attn->ratio, PULSAR_N_INDEXER_HEAD_DIM) *
                               pulsar_comp_state_rows(attn->ratio)) : TensorBytes{0};
-        b->istate_bank_bytes[il] = index_lane;
+        b->istate_bank_bytes[il.raw()] = index_lane;
         if (ok && attn_lane != TensorBytes{0}) {
-            b->askv[il] = pulsar_gpu_tensor_alloc(attn_lane.times(n_banks));
-            b->assc[il] = pulsar_gpu_tensor_alloc(attn_lane.times(n_banks));
+            b->askv[il.raw()] = pulsar_gpu_tensor_alloc(attn_lane.times(n_banks));
+            b->assc[il.raw()] = pulsar_gpu_tensor_alloc(attn_lane.times(n_banks));
             if (index_lane != TensorBytes{0}) {
-                b->iskv[il] = pulsar_gpu_tensor_alloc(index_lane.times(n_banks));
-                b->issc[il] = pulsar_gpu_tensor_alloc(index_lane.times(n_banks));
+                b->iskv[il.raw()] = pulsar_gpu_tensor_alloc(index_lane.times(n_banks));
+                b->issc[il.raw()] = pulsar_gpu_tensor_alloc(index_lane.times(n_banks));
             }
             /* L183 grid snapshot lanes: written by a save before any restore reads them. */
             if (enable_spec) {
                 /* No fill: a snapshot always writes a lane before its restore
                  * reads it, and nothing else reads these. */
-                b->spec_askv[il] = pulsar_gpu_tensor_alloc(attn_lane.times(n_banks));
-                b->spec_assc[il] = pulsar_gpu_tensor_alloc(attn_lane.times(n_banks));
+                b->spec_askv[il.raw()] = pulsar_gpu_tensor_alloc(attn_lane.times(n_banks));
+                b->spec_assc[il.raw()] = pulsar_gpu_tensor_alloc(attn_lane.times(n_banks));
                 if (index_lane != TensorBytes{0}) {
-                    b->spec_iskv[il] = pulsar_gpu_tensor_alloc(index_lane.times(n_banks));
-                    b->spec_issc[il] = pulsar_gpu_tensor_alloc(index_lane.times(n_banks));
-                    ok = ok && b->spec_iskv[il] && b->spec_issc[il];
+                    b->spec_iskv[il.raw()] = pulsar_gpu_tensor_alloc(index_lane.times(n_banks));
+                    b->spec_issc[il.raw()] = pulsar_gpu_tensor_alloc(index_lane.times(n_banks));
+                    ok = ok && b->spec_iskv[il.raw()] && b->spec_issc[il.raw()];
                 }
-                ok = ok && b->spec_askv[il] && b->spec_assc[il];
+                ok = ok && b->spec_askv[il.raw()] && b->spec_assc[il.raw()];
             }
-            ok = ok && b->askv[il] && b->assc[il] &&
-                 (index_lane == TensorBytes{0} || (b->iskv[il] && b->issc[il])) &&
-                 gpu_tensor_fill_f32(b->askv[il], 0.0f,
+            ok = ok && b->askv[il.raw()] && b->assc[il.raw()] &&
+                 (index_lane == TensorBytes{0} || (b->iskv[il.raw()] && b->issc[il.raw()])) &&
+                 gpu_tensor_fill_f32(b->askv[il.raw()], 0.0f,
                                      (uint64_t)n_banks * attn_width * attn_rows) &&
-                 gpu_tensor_fill_f32(b->assc[il], PULSAR_NEG_INF,
+                 gpu_tensor_fill_f32(b->assc[il.raw()], PULSAR_NEG_INF,
                                      (uint64_t)n_banks * attn_width * attn_rows) &&
                  (index_lane == TensorBytes{0} ||
-                  (gpu_tensor_fill_f32(b->iskv[il], 0.0f,
+                  (gpu_tensor_fill_f32(b->iskv[il.raw()], 0.0f,
                                        (uint64_t)n_banks * (index_lane.raw() / sizeof(float))) &&
-                   gpu_tensor_fill_f32(b->issc[il], PULSAR_NEG_INF,
+                   gpu_tensor_fill_f32(b->issc[il.raw()], PULSAR_NEG_INF,
                                        (uint64_t)n_banks * (index_lane.raw() / sizeof(float)))));
         }
     }
@@ -607,18 +607,18 @@ static bool gpu_graph_bank_slabs_alloc(
 /// @param comp_slab its comp slab (NULL nulls the entry)
 /// @param index_slab its index slab (NULL nulls the entry)
 /// @return false = a table write failed
-static bool bank_bases_set(pulsar_gpu_graph *g, uint32_t il, uint32_t bank,
+static bool bank_bases_set(pulsar_gpu_graph *g, TrunkLayer il, uint32_t bank,
                            pulsar_gpu_tensor *comp_slab, pulsar_gpu_tensor *index_slab) {
     pulsar_bank_slabs *b = &g->banks;
     bool ok = true;
-    if (b->comp_bases[il]) {
+    if (b->comp_bases[il.raw()]) {
         void *cp = comp_slab ? pulsar_gpu_tensor_device_ptr(comp_slab) : NULL;
-        ok = pulsar_gpu_tensor_write(b->comp_bases[il], bytes_of<void *>(bank),
+        ok = pulsar_gpu_tensor_write(b->comp_bases[il.raw()], bytes_of<void *>(bank),
                                   &cp, bytes_of<void *>(1)) != 0;
     }
-    if (ok && b->index_bases[il]) {
+    if (ok && b->index_bases[il.raw()]) {
         void *ip = index_slab ? pulsar_gpu_tensor_device_ptr(index_slab) : NULL;
-        ok = pulsar_gpu_tensor_write(b->index_bases[il], bytes_of<void *>(bank),
+        ok = pulsar_gpu_tensor_write(b->index_bases[il.raw()], bytes_of<void *>(bank),
                                   &ip, bytes_of<void *>(1)) != 0;
     }
     return ok;
@@ -646,17 +646,17 @@ bool gpu_graph_bank_free_physical(pulsar_gpu_graph *g, uint32_t bank) {
     if (bank == g->banks.cur_bank) return false;   /* precondition: never free cur */
     pulsar_bank_slabs *b = &g->banks;
     bool table_ok = true;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
-        pulsar_gpu_tensor_free(b->comp[il][bank]);
-        b->comp[il][bank] = NULL;
-        pulsar_gpu_tensor_free(b->index[il][bank]);
-        b->index[il][bank] = NULL;
+        pulsar_gpu_tensor_free(b->comp[il.raw()][bank]);
+        b->comp[il.raw()][bank] = NULL;
+        pulsar_gpu_tensor_free(b->index[il.raw()][bank]);
+        b->index[il.raw()][bank] = NULL;
         table_ok = bank_bases_set(g, il, bank, NULL, NULL) && table_ok;
         /* Finding 2: a freed bank contributes 0 resident KV -- its frontier AND
          * its resident high-water, the one place the pages actually go. */
-        g->ms_n_comp[bank][il] = 0;
-        g->ms_comp_hw[bank][il] = 0;
+        g->ms_n_comp[bank][il.raw()] = 0;
+        g->ms_comp_hw[bank][il.raw()] = 0;
     }
     /* L264: the bank's grid checkpoints are left in place: their slab is
      * eager, nothing reads them while the bank is evicted, and every way back
@@ -681,17 +681,17 @@ bool gpu_graph_bank_alloc_physical(pulsar_gpu_graph *g, uint32_t bank) {
     if (!g || g->banks.n_banks == 0 || bank >= g->banks.n_banks) return false;
     pulsar_bank_slabs *b = &g->banks;
     bool ok = true;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER && ok; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER) && ok; ++il) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
-        if (!b->comp[il][bank]) {
-            b->comp[il][bank] = pulsar_gpu_tensor_alloc_managed(b->comp_bank_bytes[il]);
-            ok = b->comp[il][bank] != NULL;
+        if (!b->comp[il.raw()][bank]) {
+            b->comp[il.raw()][bank] = pulsar_gpu_tensor_alloc_managed(b->comp_bank_bytes[il.raw()]);
+            ok = b->comp[il.raw()][bank] != NULL;
         }
-        if (ok && b->index_bank_bytes[il] != TensorBytes{0} && !b->index[il][bank]) {
-            b->index[il][bank] = pulsar_gpu_tensor_alloc_managed(b->index_bank_bytes[il]);
-            ok = b->index[il][bank] != NULL;
+        if (ok && b->index_bank_bytes[il.raw()] != TensorBytes{0} && !b->index[il.raw()][bank]) {
+            b->index[il.raw()][bank] = pulsar_gpu_tensor_alloc_managed(b->index_bank_bytes[il.raw()]);
+            ok = b->index[il.raw()][bank] != NULL;
         }
-        if (ok) ok = bank_bases_set(g, il, bank, b->comp[il][bank], b->index[il][bank]);
+        if (ok) ok = bank_bases_set(g, il, bank, b->comp[il.raw()][bank], b->index[il.raw()][bank]);
     }
     if (!ok) {
         /* TRANSACTIONAL: roll the bank back to fully-evicted rather than leaving
@@ -700,10 +700,10 @@ bool gpu_graph_bank_alloc_physical(pulsar_gpu_graph *g, uint32_t bank) {
          * marked spilled, but the bank now LOOKS partly live.  Returning it to a
          * clean evicted state keeps gpu_graph_bank_is_evicted's answer truthful
          * and lets a later retry start from scratch. */
-        for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
             if (!gpu_graph_layer_is_kv_source(il)) continue;
-            if (b->comp[il][bank])  { pulsar_gpu_tensor_free(b->comp[il][bank]);  b->comp[il][bank] = NULL; }
-            if (b->index[il][bank]) { pulsar_gpu_tensor_free(b->index[il][bank]); b->index[il][bank] = NULL; }
+            if (b->comp[il.raw()][bank])  { pulsar_gpu_tensor_free(b->comp[il.raw()][bank]);  b->comp[il.raw()][bank] = NULL; }
+            if (b->index[il.raw()][bank]) { pulsar_gpu_tensor_free(b->index[il.raw()][bank]); b->index[il.raw()][bank] = NULL; }
             (void)bank_bases_set(g, il, bank, NULL, NULL);
         }
     }
@@ -724,10 +724,10 @@ bool gpu_graph_bank_is_evicted(const pulsar_gpu_graph *g, uint32_t bank) {
      * it is entitled to --
      * an index pool only where the layer runs an indexer, so an unindexed
      * source's absent index slab is not eviction. */
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
-        if (g->banks.comp[il][bank] == NULL) return true;
-        if (gpu_graph_layer_has_index_pool(il) && g->banks.index[il][bank] == NULL) return true;
+        if (g->banks.comp[il.raw()][bank] == NULL) return true;
+        if (gpu_graph_layer_has_index_pool(il) && g->banks.index[il.raw()][bank] == NULL) return true;
     }
     return false;
 }
@@ -742,15 +742,15 @@ bool gpu_graph_bank_is_evicted(const pulsar_gpu_graph *g, uint32_t bank) {
 /// @param il the layer
 /// @param bank the bank
 /// @return false = a bad bank or a failed fill
-static bool compressor_state_reset_layer(pulsar_gpu_graph *g, uint32_t il, uint32_t bank) {
+static bool compressor_state_reset_layer(pulsar_gpu_graph *g, TrunkLayer il, uint32_t bank) {
     {
         pulsar_gpu_tensor *kv, *sc; TensorBytes off, lane;
         if (g->banks.n_banks) {
             if (bank >= g->banks.n_banks) return false;
-            kv = g->banks.askv[il]; sc = g->banks.assc[il];
-            lane = g->banks.astate_bank_bytes[il]; off = lane.times(bank);
+            kv = g->banks.askv[il.raw()]; sc = g->banks.assc[il.raw()];
+            lane = g->banks.astate_bank_bytes[il.raw()]; off = lane.times(bank);
         } else {
-            kv = g->layer_attn_state_kv[il]; sc = g->layer_attn_state_score[il];
+            kv = g->layer_attn_state_kv[il.raw()]; sc = g->layer_attn_state_score[il.raw()];
             lane = pulsar_gpu_tensor_bytes(kv); off = TensorBytes{0};   /* 0 for NULL */
         }
         if (!kv || !sc || lane == TensorBytes{0}) return false;
@@ -761,7 +761,7 @@ static bool compressor_state_reset_layer(pulsar_gpu_graph *g, uint32_t il, uint3
                         gpu_tensor_fill_f32(vs, PULSAR_NEG_INF, lane.raw() / sizeof(float));
         pulsar_gpu_tensor_free(vk);
         pulsar_gpu_tensor_free(vs);
-        if (!ok) { fprintf(stderr, "pulsar: compressor state reset failed at layer %u\n", il); return false; }
+        if (!ok) { fprintf(stderr, "pulsar: compressor state reset failed at layer %u\n", il.raw()); return false; }
         /* V4: the indexer's own compressor is a SECOND recurrent lane with the
          * same empty group (kv 0 / score -INF).  It lives only on an indexed
          * ratio-4 source, and leaving it unreset would carry a stale slot into
@@ -775,12 +775,12 @@ static bool compressor_state_reset_layer(pulsar_gpu_graph *g, uint32_t il, uint3
                              gpu_tensor_fill_f32(is, PULSAR_NEG_INF, pulsar_gpu_tensor_bytes(is).raw() / sizeof(float));
             pulsar_gpu_tensor_free(is);
             pulsar_gpu_tensor_free(ik);
-            if (!iok) { fprintf(stderr, "pulsar: indexer-compressor state reset failed at layer %u\n", il); return false; }
-        } else if (g->layer_index_state_kv[il]) {
-            const uint64_t ib = pulsar_gpu_tensor_bytes(g->layer_index_state_kv[il]).raw();
-            if (!gpu_tensor_fill_f32(g->layer_index_state_kv[il], 0.0f, ib / sizeof(float)) ||
-                !gpu_tensor_fill_f32(g->layer_index_state_score[il], PULSAR_NEG_INF, ib / sizeof(float))) {
-                fprintf(stderr, "pulsar: indexer-compressor state reset failed at layer %u\n", il);
+            if (!iok) { fprintf(stderr, "pulsar: indexer-compressor state reset failed at layer %u\n", il.raw()); return false; }
+        } else if (g->layer_index_state_kv[il.raw()]) {
+            const uint64_t ib = pulsar_gpu_tensor_bytes(g->layer_index_state_kv[il.raw()]).raw();
+            if (!gpu_tensor_fill_f32(g->layer_index_state_kv[il.raw()], 0.0f, ib / sizeof(float)) ||
+                !gpu_tensor_fill_f32(g->layer_index_state_score[il.raw()], PULSAR_NEG_INF, ib / sizeof(float))) {
+                fprintf(stderr, "pulsar: indexer-compressor state reset failed at layer %u\n", il.raw());
                 return false;
             }
         }
@@ -790,7 +790,7 @@ static bool compressor_state_reset_layer(pulsar_gpu_graph *g, uint32_t il, uint3
 
 bool gpu_graph_compressor_state_reset(pulsar_gpu_graph *g, uint32_t bank) {
     if (!g) return false;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         if (!gpu_graph_layer_has_comp_state(il)) continue;
         if (!compressor_state_reset_layer(g, il, bank)) return false;
     }
@@ -809,69 +809,69 @@ bool gpu_graph_bank_repoint(pulsar_gpu_graph *g, uint32_t bank) {
     pulsar_bank_slabs *b = &g->banks;
     if (bank == b->cur_bank) return true;
     bool ok = true;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER && ok; il++) {
-        pulsar_gpu_tensor_free(g->layer_raw_cache[il]);
-        g->layer_raw_cache[il] = pulsar_gpu_tensor_view(
-                b->raw[il], b->raw_bank_bytes.times(bank), b->raw_bank_bytes);
-        ok = g->layer_raw_cache[il] != NULL;
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER) && ok; ++il) {
+        pulsar_gpu_tensor_free(g->layer_raw_cache[il.raw()]);
+        g->layer_raw_cache[il.raw()] = pulsar_gpu_tensor_view(
+                b->raw[il.raw()], b->raw_bank_bytes.times(bank), b->raw_bank_bytes);
+        ok = g->layer_raw_cache[il.raw()] != NULL;
         if (!ok || !gpu_graph_layer_is_kv_source(il)) continue;
-        pulsar_gpu_tensor_free(g->layer_attn_comp_cache[il]);
-        pulsar_gpu_tensor_free(g->layer_index_comp_cache[il]);
-        g->layer_attn_comp_cache[il] = pulsar_gpu_tensor_view(
-                b->comp[il][bank], TensorBytes{0}, b->comp_bank_bytes[il]);
+        pulsar_gpu_tensor_free(g->layer_attn_comp_cache[il.raw()]);
+        pulsar_gpu_tensor_free(g->layer_index_comp_cache[il.raw()]);
+        g->layer_attn_comp_cache[il.raw()] = pulsar_gpu_tensor_view(
+                b->comp[il.raw()][bank], TensorBytes{0}, b->comp_bank_bytes[il.raw()]);
         /* The index-K pool exists only where an indexer runs (0731's ratio-128
          * HCA layers publish none), so an absent pool is not a failure. */
-        g->layer_index_comp_cache[il] = b->index_bank_bytes[il] != TensorBytes{0}
-            ? pulsar_gpu_tensor_view(b->index[il][bank], TensorBytes{0}, b->index_bank_bytes[il]) : NULL;
-        ok = g->layer_attn_comp_cache[il] &&
-             (b->index_bank_bytes[il] == TensorBytes{0} || g->layer_index_comp_cache[il]);
-        if (!ok || b->astate_bank_bytes[il] == TensorBytes{0}) continue;   /* ratio 1: no state lane */
-        pulsar_gpu_tensor_free(g->layer_attn_state_kv[il]);
-        pulsar_gpu_tensor_free(g->layer_attn_state_score[il]);
-        g->layer_attn_state_kv[il] = pulsar_gpu_tensor_view(
-                b->askv[il], b->astate_bank_bytes[il].times(bank),
-                b->astate_bank_bytes[il]);
-        g->layer_attn_state_score[il] = pulsar_gpu_tensor_view(
-                b->assc[il], b->astate_bank_bytes[il].times(bank),
-                b->astate_bank_bytes[il]);
-        ok = g->layer_attn_state_kv[il] && g->layer_attn_state_score[il];
+        g->layer_index_comp_cache[il.raw()] = b->index_bank_bytes[il.raw()] != TensorBytes{0}
+            ? pulsar_gpu_tensor_view(b->index[il.raw()][bank], TensorBytes{0}, b->index_bank_bytes[il.raw()]) : NULL;
+        ok = g->layer_attn_comp_cache[il.raw()] &&
+             (b->index_bank_bytes[il.raw()] == TensorBytes{0} || g->layer_index_comp_cache[il.raw()]);
+        if (!ok || b->astate_bank_bytes[il.raw()] == TensorBytes{0}) continue;   /* ratio 1: no state lane */
+        pulsar_gpu_tensor_free(g->layer_attn_state_kv[il.raw()]);
+        pulsar_gpu_tensor_free(g->layer_attn_state_score[il.raw()]);
+        g->layer_attn_state_kv[il.raw()] = pulsar_gpu_tensor_view(
+                b->askv[il.raw()], b->astate_bank_bytes[il.raw()].times(bank),
+                b->astate_bank_bytes[il.raw()]);
+        g->layer_attn_state_score[il.raw()] = pulsar_gpu_tensor_view(
+                b->assc[il.raw()], b->astate_bank_bytes[il.raw()].times(bank),
+                b->astate_bank_bytes[il.raw()]);
+        ok = g->layer_attn_state_kv[il.raw()] && g->layer_attn_state_score[il.raw()];
         /* V4: the indexer-compressor lane follows the bank too (views only; the
          * lane is eager slab memory, not per-bank managed). */
-        if (ok && b->istate_bank_bytes[il] != TensorBytes{0}) {
-            pulsar_gpu_tensor_free(g->layer_index_state_kv[il]);
-            pulsar_gpu_tensor_free(g->layer_index_state_score[il]);
-            g->layer_index_state_kv[il] = pulsar_gpu_tensor_view(
-                    b->iskv[il], b->istate_bank_bytes[il].times(bank),
-                    b->istate_bank_bytes[il]);
-            g->layer_index_state_score[il] = pulsar_gpu_tensor_view(
-                    b->issc[il], b->istate_bank_bytes[il].times(bank),
-                    b->istate_bank_bytes[il]);
-            ok = g->layer_index_state_kv[il] && g->layer_index_state_score[il];
-            if (ok && b->spec_iskv[il]) {
-                pulsar_gpu_tensor_free(g->spec_index_state_kv[il]);
-                pulsar_gpu_tensor_free(g->spec_index_state_score[il]);
-                g->spec_index_state_kv[il] = pulsar_gpu_tensor_view(
-                        b->spec_iskv[il], b->istate_bank_bytes[il].times(bank),
-                        b->istate_bank_bytes[il]);
-                g->spec_index_state_score[il] = pulsar_gpu_tensor_view(
-                        b->spec_issc[il], b->istate_bank_bytes[il].times(bank),
-                        b->istate_bank_bytes[il]);
-                ok = g->spec_index_state_kv[il] && g->spec_index_state_score[il];
+        if (ok && b->istate_bank_bytes[il.raw()] != TensorBytes{0}) {
+            pulsar_gpu_tensor_free(g->layer_index_state_kv[il.raw()]);
+            pulsar_gpu_tensor_free(g->layer_index_state_score[il.raw()]);
+            g->layer_index_state_kv[il.raw()] = pulsar_gpu_tensor_view(
+                    b->iskv[il.raw()], b->istate_bank_bytes[il.raw()].times(bank),
+                    b->istate_bank_bytes[il.raw()]);
+            g->layer_index_state_score[il.raw()] = pulsar_gpu_tensor_view(
+                    b->issc[il.raw()], b->istate_bank_bytes[il.raw()].times(bank),
+                    b->istate_bank_bytes[il.raw()]);
+            ok = g->layer_index_state_kv[il.raw()] && g->layer_index_state_score[il.raw()];
+            if (ok && b->spec_iskv[il.raw()]) {
+                pulsar_gpu_tensor_free(g->spec_index_state_kv[il.raw()]);
+                pulsar_gpu_tensor_free(g->spec_index_state_score[il.raw()]);
+                g->spec_index_state_kv[il.raw()] = pulsar_gpu_tensor_view(
+                        b->spec_iskv[il.raw()], b->istate_bank_bytes[il.raw()].times(bank),
+                        b->istate_bank_bytes[il.raw()]);
+                g->spec_index_state_score[il.raw()] = pulsar_gpu_tensor_view(
+                        b->spec_issc[il.raw()], b->istate_bank_bytes[il.raw()].times(bank),
+                        b->istate_bank_bytes[il.raw()]);
+                ok = g->spec_index_state_kv[il.raw()] && g->spec_index_state_score[il.raw()];
             }
         }
         /* inc 6: the spec frontier snapshot lanes follow the live views, so
          * the snapshot machinery (incl. its re-prepared copy tables) is
          * bank-correct with no call-site changes. */
-        if (ok && b->spec_askv[il]) {
-            pulsar_gpu_tensor_free(g->spec_attn_state_kv[il]);
-            pulsar_gpu_tensor_free(g->spec_attn_state_score[il]);
-            g->spec_attn_state_kv[il] = pulsar_gpu_tensor_view(
-                    b->spec_askv[il], b->astate_bank_bytes[il].times(bank),
-                    b->astate_bank_bytes[il]);
-            g->spec_attn_state_score[il] = pulsar_gpu_tensor_view(
-                    b->spec_assc[il], b->astate_bank_bytes[il].times(bank),
-                    b->astate_bank_bytes[il]);
-            ok = g->spec_attn_state_kv[il] && g->spec_attn_state_score[il];
+        if (ok && b->spec_askv[il.raw()]) {
+            pulsar_gpu_tensor_free(g->spec_attn_state_kv[il.raw()]);
+            pulsar_gpu_tensor_free(g->spec_attn_state_score[il.raw()]);
+            g->spec_attn_state_kv[il.raw()] = pulsar_gpu_tensor_view(
+                    b->spec_askv[il.raw()], b->astate_bank_bytes[il.raw()].times(bank),
+                    b->astate_bank_bytes[il.raw()]);
+            g->spec_attn_state_score[il.raw()] = pulsar_gpu_tensor_view(
+                    b->spec_assc[il.raw()], b->astate_bank_bytes[il.raw()].times(bank),
+                    b->astate_bank_bytes[il.raw()]);
+            ok = g->spec_attn_state_kv[il.raw()] && g->spec_attn_state_score[il.raw()];
         }
     }
     /* Option F: swap the per-bank DSpark drafter ring views (present only when
@@ -934,9 +934,9 @@ uint32_t gpu_graph_bank_pool_count(const pulsar_gpu_graph *g) {
     return g->banks.n_banks ? g->banks.n_banks : 1u;
 }
 
-pulsar_gpu_tensor *gpu_graph_bank_raw_pool(pulsar_gpu_graph *g, uint32_t il) {
-    if (!g || il >= PULSAR_N_LAYER) return NULL;
-    return g->banks.n_banks ? g->banks.raw[il] : g->layer_raw_cache[il];
+pulsar_gpu_tensor *gpu_graph_bank_raw_pool(pulsar_gpu_graph *g, TrunkLayer il) {
+    if (!g || !il.below(PULSAR_N_LAYER)) return NULL;
+    return g->banks.n_banks ? g->banks.raw[il.raw()] : g->layer_raw_cache[il.raw()];
 }
 
 /* Nominal comp/index operand for the batched attention/indexer wrappers. With
@@ -956,33 +956,33 @@ static pulsar_gpu_tensor *bank_nominal_slab(pulsar_gpu_tensor *const *per_bank, 
     return NULL;
 }
 
-pulsar_gpu_tensor *gpu_graph_bank_attn_comp_pool(pulsar_gpu_graph *g, uint32_t il) {
-    if (!g || il >= PULSAR_N_LAYER) return NULL;
-    return g->banks.n_banks ? bank_nominal_slab(g->banks.comp[il], g->banks.n_banks) : g->layer_attn_comp_cache[il];
+pulsar_gpu_tensor *gpu_graph_bank_attn_comp_pool(pulsar_gpu_graph *g, TrunkLayer il) {
+    if (!g || !il.below(PULSAR_N_LAYER)) return NULL;
+    return g->banks.n_banks ? bank_nominal_slab(g->banks.comp[il.raw()], g->banks.n_banks) : g->layer_attn_comp_cache[il.raw()];
 }
 
 /// @param g the graph
 /// @param il the layer
 /// @return the lowest resident bank's index slab (pool), else the classic index cache; NULL for a bad layer
-pulsar_gpu_tensor *gpu_graph_bank_index_comp_pool(pulsar_gpu_graph *g, uint32_t il) {
-    if (!g || il >= PULSAR_N_LAYER) return NULL;
-    return g->banks.n_banks ? bank_nominal_slab(g->banks.index[il], g->banks.n_banks) : g->layer_index_comp_cache[il];
+pulsar_gpu_tensor *gpu_graph_bank_index_comp_pool(pulsar_gpu_graph *g, TrunkLayer il) {
+    if (!g || !il.below(PULSAR_N_LAYER)) return NULL;
+    return g->banks.n_banks ? bank_nominal_slab(g->banks.index[il.raw()], g->banks.n_banks) : g->layer_index_comp_cache[il.raw()];
 }
 
 /* Per-bank comp/index base-pointer tables (device arrays of n_banks pointers,
  * indexed by seq_id) the batched READ kernels use in place of base +
  * seq_id*comp_cap. NULL when the pool is disabled. */
-pulsar_gpu_tensor *gpu_graph_bank_attn_comp_bases(pulsar_gpu_graph *g, uint32_t il) {
-    if (!g || il >= PULSAR_N_LAYER) return NULL;
-    return g->banks.n_banks ? g->banks.comp_bases[il] : NULL;
+pulsar_gpu_tensor *gpu_graph_bank_attn_comp_bases(pulsar_gpu_graph *g, TrunkLayer il) {
+    if (!g || !il.below(PULSAR_N_LAYER)) return NULL;
+    return g->banks.n_banks ? g->banks.comp_bases[il.raw()] : NULL;
 }
 
 /// @param g the graph
 /// @param il the layer
 /// @return the index base-pointer table, or NULL when the pool is disabled
-pulsar_gpu_tensor *gpu_graph_bank_index_comp_bases(pulsar_gpu_graph *g, uint32_t il) {
-    if (!g || il >= PULSAR_N_LAYER) return NULL;
-    return g->banks.n_banks ? g->banks.index_bases[il] : NULL;
+pulsar_gpu_tensor *gpu_graph_bank_index_comp_bases(pulsar_gpu_graph *g, TrunkLayer il) {
+    if (!g || !il.below(PULSAR_N_LAYER)) return NULL;
+    return g->banks.n_banks ? g->banks.index_bases[il.raw()] : NULL;
 }
 
 /* One accessor body for all six per-(bank,layer) view kinds: a fresh view of
@@ -1000,14 +1000,14 @@ static pulsar_gpu_tensor *bank_lane_view(pulsar_gpu_graph *g,
                                       pulsar_gpu_tensor *slab,
                                       const TensorBytes *lane_bytes,
                                       pulsar_gpu_tensor *classic,
-                                      uint32_t il, uint32_t bank) {
-    if (!g || il >= PULSAR_N_LAYER) return NULL;
+                                      TrunkLayer il, uint32_t bank) {
+    if (!g || !il.below(PULSAR_N_LAYER)) return NULL;
     if (g->banks.n_banks == 0) {
         if (bank != 0 || !classic) return NULL;
         return pulsar_gpu_tensor_view(classic, TensorBytes{0}, pulsar_gpu_tensor_bytes(classic));
     }
     if (bank >= g->banks.n_banks || !slab) return NULL;
-    return pulsar_gpu_tensor_view(slab, lane_bytes[il].times(bank), lane_bytes[il]);
+    return pulsar_gpu_tensor_view(slab, lane_bytes[il.raw()].times(bank), lane_bytes[il.raw()]);
 }
 
 /* Per-bank comp/index view: with split allocations the bank's whole allocation
@@ -1023,20 +1023,20 @@ static pulsar_gpu_tensor *bank_split_view(pulsar_gpu_graph *g,
                                        pulsar_gpu_tensor *bank_slab,
                                        const TensorBytes *lane_bytes,
                                        pulsar_gpu_tensor *classic,
-                                       uint32_t il, uint32_t bank) {
-    if (!g || il >= PULSAR_N_LAYER) return NULL;
+                                       TrunkLayer il, uint32_t bank) {
+    if (!g || !il.below(PULSAR_N_LAYER)) return NULL;
     if (g->banks.n_banks == 0) {
         if (bank != 0 || !classic) return NULL;
         return pulsar_gpu_tensor_view(classic, TensorBytes{0}, pulsar_gpu_tensor_bytes(classic));
     }
     if (bank >= g->banks.n_banks || !bank_slab) return NULL;
-    return pulsar_gpu_tensor_view(bank_slab, TensorBytes{0}, lane_bytes[il]);
+    return pulsar_gpu_tensor_view(bank_slab, TensorBytes{0}, lane_bytes[il.raw()]);
 }
 
-pulsar_gpu_tensor *gpu_graph_bank_attn_comp_view(pulsar_gpu_graph *g, uint32_t il, BankId bank) {
-    return bank_split_view(g, g->banks.n_banks ? g->banks.comp[il][bank.raw()] : NULL,
+pulsar_gpu_tensor *gpu_graph_bank_attn_comp_view(pulsar_gpu_graph *g, TrunkLayer il, BankId bank) {
+    return bank_split_view(g, g->banks.n_banks ? g->banks.comp[il.raw()][bank.raw()] : NULL,
                            g->banks.comp_bank_bytes,
-                           g->layer_attn_comp_cache[il], il, (uint32_t)bank.raw());
+                           g->layer_attn_comp_cache[il.raw()], il, (uint32_t)bank.raw());
 }
 
 /// Bank `bank`'s index comp pool at layer il.
@@ -1044,10 +1044,10 @@ pulsar_gpu_tensor *gpu_graph_bank_attn_comp_view(pulsar_gpu_graph *g, uint32_t i
 /// @param il the layer
 /// @param bank the bank
 /// @return a fresh view (the caller frees it), or NULL
-pulsar_gpu_tensor *gpu_graph_bank_index_comp_view(pulsar_gpu_graph *g, uint32_t il, BankId bank) {
-    return bank_split_view(g, g->banks.n_banks ? g->banks.index[il][bank.raw()] : NULL,
+pulsar_gpu_tensor *gpu_graph_bank_index_comp_view(pulsar_gpu_graph *g, TrunkLayer il, BankId bank) {
+    return bank_split_view(g, g->banks.n_banks ? g->banks.index[il.raw()][bank.raw()] : NULL,
                            g->banks.index_bank_bytes,
-                           g->layer_index_comp_cache[il], il, (uint32_t)bank.raw());
+                           g->layer_index_comp_cache[il.raw()], il, (uint32_t)bank.raw());
 }
 
 /// Bank `bank`'s attention compressor state lane (kv) at layer il.
@@ -1055,9 +1055,9 @@ pulsar_gpu_tensor *gpu_graph_bank_index_comp_view(pulsar_gpu_graph *g, uint32_t 
 /// @param il the layer
 /// @param bank the bank
 /// @return a fresh view (the caller frees it), or NULL
-pulsar_gpu_tensor *gpu_graph_bank_attn_state_kv_view(pulsar_gpu_graph *g, uint32_t il, BankId bank) {
-    return bank_lane_view(g, g->banks.askv[il], g->banks.astate_bank_bytes,
-                          g->layer_attn_state_kv[il], il, (uint32_t)bank.raw());
+pulsar_gpu_tensor *gpu_graph_bank_attn_state_kv_view(pulsar_gpu_graph *g, TrunkLayer il, BankId bank) {
+    return bank_lane_view(g, g->banks.askv[il.raw()], g->banks.astate_bank_bytes,
+                          g->layer_attn_state_kv[il.raw()], il, (uint32_t)bank.raw());
 }
 
 /// Bank `bank`'s attention compressor state lane (score) at layer il.
@@ -1065,12 +1065,12 @@ pulsar_gpu_tensor *gpu_graph_bank_attn_state_kv_view(pulsar_gpu_graph *g, uint32
 /// @param il the layer
 /// @param bank the bank
 /// @return a fresh view (the caller frees it), or NULL
-pulsar_gpu_tensor *gpu_graph_bank_attn_state_score_view(pulsar_gpu_graph *g, uint32_t il, BankId bank) {
-    return bank_lane_view(g, g->banks.assc[il], g->banks.astate_bank_bytes,
-                          g->layer_attn_state_score[il], il, (uint32_t)bank.raw());
+pulsar_gpu_tensor *gpu_graph_bank_attn_state_score_view(pulsar_gpu_graph *g, TrunkLayer il, BankId bank) {
+    return bank_lane_view(g, g->banks.assc[il.raw()], g->banks.astate_bank_bytes,
+                          g->layer_attn_state_score[il.raw()], il, (uint32_t)bank.raw());
 }
 
-pulsar_gpu_tensor *gpu_graph_bank_index_state_kv_view(pulsar_gpu_graph *g, uint32_t il, BankId bank) {
+pulsar_gpu_tensor *gpu_graph_bank_index_state_kv_view(pulsar_gpu_graph *g, TrunkLayer il, BankId bank) {
     /* No lane at all on a profile whose indexer keeps none: bank_lane_view hands
      * back NULL, so a caller can tell "this model has no such lane" from "the
      * bank is wrong".
@@ -1080,11 +1080,11 @@ pulsar_gpu_tensor *gpu_graph_bank_index_state_kv_view(pulsar_gpu_graph *g, uint3
      * returned NULL for a mixed decode step's index lane on a pool-less graph,
      * and the silent conjunction in the index compressor's caller turned that
      * into "attention batch encode failed" at layer 2.  Ask the lane, not the
-     * stride: iskv[il] is NULL where there is no lane, and the classic tensor is
+     * stride: iskv[il.raw()] is NULL where there is no lane, and the classic tensor is
      * NULL too. */
-    if (!g || il >= PULSAR_N_LAYER) return NULL;
-    return bank_lane_view(g, g->banks.iskv[il], g->banks.istate_bank_bytes,
-                          g->layer_index_state_kv[il], il, (uint32_t)bank.raw());
+    if (!g || !il.below(PULSAR_N_LAYER)) return NULL;
+    return bank_lane_view(g, g->banks.iskv[il.raw()], g->banks.istate_bank_bytes,
+                          g->layer_index_state_kv[il.raw()], il, (uint32_t)bank.raw());
 }
 
 /// Bank `bank`'s indexer compressor state lane (score) at layer il; NULL on a profile with none.
@@ -1092,10 +1092,10 @@ pulsar_gpu_tensor *gpu_graph_bank_index_state_kv_view(pulsar_gpu_graph *g, uint3
 /// @param il the layer
 /// @param bank the bank
 /// @return a fresh view (the caller frees it), or NULL
-pulsar_gpu_tensor *gpu_graph_bank_index_state_score_view(pulsar_gpu_graph *g, uint32_t il, BankId bank) {
-    if (!g || il >= PULSAR_N_LAYER) return NULL;
-    return bank_lane_view(g, g->banks.issc[il], g->banks.istate_bank_bytes,
-                          g->layer_index_state_score[il], il, (uint32_t)bank.raw());
+pulsar_gpu_tensor *gpu_graph_bank_index_state_score_view(pulsar_gpu_graph *g, TrunkLayer il, BankId bank) {
+    if (!g || !il.below(PULSAR_N_LAYER)) return NULL;
+    return bank_lane_view(g, g->banks.issc[il.raw()], g->banks.istate_bank_bytes,
+                          g->layer_index_state_score[il.raw()], il, (uint32_t)bank.raw());
 }
 
 void gpu_graph_bank_counters_capture(pulsar_gpu_graph *g, uint32_t bank) {
@@ -1143,10 +1143,10 @@ KvBytes gpu_graph_bank_touched_kv_bytes(const pulsar_gpu_graph *g, uint32_t bank
     const uint64_t attn_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP);
     const uint64_t idx_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX);
     uint64_t bytes = 0;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         /* one emit writes a comp row AND an index-K row */
-        bytes += (uint64_t)g->ms_comp_hw[bank][il] * (attn_row + idx_row);
+        bytes += (uint64_t)g->ms_comp_hw[bank][il.raw()] * (attn_row + idx_row);
     }
     return KvBytes{bytes};   /* per-layer compressed rows times their row bytes: the conversion, raw inside */
 }
@@ -1160,7 +1160,7 @@ KvBytes gpu_graph_quantum_growth_bytes_per_bank(KvRows rows) {
     const uint64_t attn_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP);
     const uint64_t idx_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX);
     uint64_t bytes = 0;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         bytes += (uint64_t)((q + ratio - 1u) / ratio) * (attn_row + idx_row);
@@ -1253,19 +1253,19 @@ bool gpu_graph_multiseq_step_begin(pulsar_gpu_graph *g, const int32_t *pos,
         if (t > 0 && seq[t] == seq[t - 1]) continue;
         const uint32_t b = (uint32_t)seq[t];
         const uint32_t p = (uint32_t)pos[t];
-        for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
             if (!gpu_graph_layer_is_kv_source(il)) continue;
             const uint32_t ratio = pulsar_layer_compress_ratio(il);
             /* Stage 1b made the per-bank array the only frontier storage; the
              * cur-bank selector that stood here chose between two names for
              * the same memory (L178). */
-            const uint32_t have_comp = g->ms_n_comp[b][il];
+            const uint32_t have_comp = g->ms_n_comp[b][il.raw()];
             if (have_comp != p / ratio) {
                 fprintf(stderr,
                         "pulsar: multiseq step rejected: bank %u frontier not "
                         "position-true at kv source %u (pos %u ratio %u: "
                         "n_comp %u want %u)\n",
-                        b, il, p, ratio, have_comp, p / ratio);
+                        b, il.raw(), p, ratio, have_comp, p / ratio);
                 return false;
             }
         }
@@ -1313,18 +1313,18 @@ bool gpu_graph_multiseq_step_begin(pulsar_gpu_graph *g, const int32_t *pos,
      * would inflate the frontiers a recovering classic caller decodes
      * with). */
     uint32_t sup[PULSAR_MAX_LAYER];
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        sup[il] = 0;
+        sup[il.raw()] = 0;
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         for (uint32_t t = 0; t < n_rows; t++) {
             const uint32_t v = ((uint32_t)pos[t] + 1u) / ratio;
-            if (v > sup[il]) sup[il] = v;
+            if (v > sup[il.raw()]) sup[il.raw()] = v;
         }
-        if (sup[il] > g->layer_comp_cap[il]) {
+        if (sup[il.raw()] > g->layer_comp_cap[il.raw()]) {
             fprintf(stderr,
                     "pulsar: multiseq step rejected: superset %u exceeds comp "
-                    "cap %u at layer %u\n", sup[il], g->layer_comp_cap[il], il);
+                    "cap %u at layer %u\n", sup[il.raw()], g->layer_comp_cap[il.raw()], il.raw());
             return false;
         }
     }
@@ -1420,18 +1420,18 @@ bool gpu_graph_multiseq_step_end(pulsar_gpu_graph *g) {
      * STAGE 1b: the companion "scalar superset" check is gone with the scalar
      * (see below) -- there is no longer a shared value for a bank to corrupt. */
     bool ok = true;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER && ok; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER) && ok; ++il) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         for (uint32_t t = 0; t < n_rows && ok; t++) {
             if (t + 1 < n_rows && g->ms_seq_id[t + 1] == g->ms_seq_id[t]) continue;
             const uint32_t b = (uint32_t)g->ms_seq_id[t];
             const uint32_t want = ((uint32_t)g->ms_positions[t] + 1u) / ratio;
-            if (g->ms_n_comp[b][il] != want) {
+            if (g->ms_n_comp[b][il.raw()] != want) {
                 fprintf(stderr,
                         "pulsar: multiseq step_end FAILED: bank %u kv source %u "
                         "frontier %u want %u (ratio %u)\n",
-                        b, il, g->ms_n_comp[b][il], want, ratio);
+                        b, il.raw(), g->ms_n_comp[b][il.raw()], want, ratio);
                 ok = false;
             }
         }
@@ -1502,8 +1502,8 @@ bool gpu_graph_alloc_raw_cap(
     }
     g->comp_cap = dz.comp_cap;
     g->attn_comp_stage_cap = dz.attn_comp_stage_cap;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        g->layer_comp_cap[il] = dz.layer_comp_cap[il];
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
+        g->layer_comp_cap[il.raw()] = dz.layer_comp_cap[il.raw()];
     }
 
     const uint64_t hc_dim = dz.hc_dim;
@@ -1594,9 +1594,9 @@ bool gpu_graph_alloc_raw_cap(
     bool state_init_ok = true;
     /* WINDOW rows -- see the bank sizing above. */
     const TensorBytes raw_row_bytes_pack = TensorBytes{pulsar_kv_row_bytes(PULSAR_KV_ROW_RING)};
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        g->layer_raw_cache[il] = banked
-            ? pulsar_gpu_tensor_view(g->banks.raw[il], TensorBytes{0}, g->banks.raw_bank_bytes)
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
+        g->layer_raw_cache[il.raw()] = banked
+            ? pulsar_gpu_tensor_view(g->banks.raw[il.raw()], TensorBytes{0}, g->banks.raw_bank_bytes)
             : gpu_graph_alloc_kv_cache_tensor(
                     managed_kv_cache,
                     raw_row_bytes_pack.times(raw_cap));
@@ -1612,51 +1612,51 @@ bool gpu_graph_alloc_raw_cap(
             const TensorBytes index_row_bytes = TensorBytes{pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX)};
             const bool indexed = pulsar_attn_runs_indexer(attn->mode);
             if (banked) {
-                g->layer_attn_comp_cache[il] = pulsar_gpu_tensor_view(
-                        g->banks.comp[il][0], TensorBytes{0}, g->banks.comp_bank_bytes[il]);
+                g->layer_attn_comp_cache[il.raw()] = pulsar_gpu_tensor_view(
+                        g->banks.comp[il.raw()][0], TensorBytes{0}, g->banks.comp_bank_bytes[il.raw()]);
                 if (indexed) {
-                    g->layer_index_comp_cache[il] = pulsar_gpu_tensor_view(
-                            g->banks.index[il][0], TensorBytes{0}, g->banks.index_bank_bytes[il]);
+                    g->layer_index_comp_cache[il.raw()] = pulsar_gpu_tensor_view(
+                            g->banks.index[il.raw()][0], TensorBytes{0}, g->banks.index_bank_bytes[il.raw()]);
                 }
             } else {
-                g->layer_attn_comp_cache[il] = gpu_graph_alloc_kv_cache_tensor(
+                g->layer_attn_comp_cache[il.raw()] = gpu_graph_alloc_kv_cache_tensor(
                         managed_kv_cache,
-                        comp_row_bytes.times(g->layer_comp_cap[il]));
+                        comp_row_bytes.times(g->layer_comp_cap[il.raw()]));
                 if (indexed) {
-                    g->layer_index_comp_cache[il] = gpu_graph_alloc_kv_cache_tensor(
+                    g->layer_index_comp_cache[il.raw()] = gpu_graph_alloc_kv_cache_tensor(
                             managed_kv_cache,
-                            index_row_bytes.times(g->layer_comp_cap[il]));
+                            index_row_bytes.times(g->layer_comp_cap[il.raw()]));
                 }
             }
-            state_init_ok = state_init_ok && g->layer_attn_comp_cache[il] &&
-                            (!indexed || g->layer_index_comp_cache[il]);
+            state_init_ok = state_init_ok && g->layer_attn_comp_cache[il.raw()] &&
+                            (!indexed || g->layer_index_comp_cache[il.raw()]);
             if (state_bytes) {
                 if (banked) {
-                    g->layer_attn_state_kv[il] = pulsar_gpu_tensor_view(
-                            g->banks.askv[il], TensorBytes{0}, g->banks.astate_bank_bytes[il]);
-                    g->layer_attn_state_score[il] = pulsar_gpu_tensor_view(
-                            g->banks.assc[il], TensorBytes{0}, g->banks.astate_bank_bytes[il]);
+                    g->layer_attn_state_kv[il.raw()] = pulsar_gpu_tensor_view(
+                            g->banks.askv[il.raw()], TensorBytes{0}, g->banks.astate_bank_bytes[il.raw()]);
+                    g->layer_attn_state_score[il.raw()] = pulsar_gpu_tensor_view(
+                            g->banks.assc[il.raw()], TensorBytes{0}, g->banks.astate_bank_bytes[il.raw()]);
                 } else {
-                    g->layer_attn_state_kv[il] = pulsar_gpu_tensor_alloc(TensorBytes{state_bytes});
-                    g->layer_attn_state_score[il] = pulsar_gpu_tensor_alloc(TensorBytes{state_bytes});
+                    g->layer_attn_state_kv[il.raw()] = pulsar_gpu_tensor_alloc(TensorBytes{state_bytes});
+                    g->layer_attn_state_score[il.raw()] = pulsar_gpu_tensor_alloc(TensorBytes{state_bytes});
                 }
-                state_init_ok = state_init_ok && g->layer_attn_state_kv[il] && g->layer_attn_state_score[il];
+                state_init_ok = state_init_ok && g->layer_attn_state_kv[il.raw()] && g->layer_attn_state_score[il.raw()];
                 if (enable_spec) {
                     if (banked) {
-                        g->spec_attn_state_kv[il] = pulsar_gpu_tensor_view(
-                                g->banks.spec_askv[il], TensorBytes{0}, g->banks.astate_bank_bytes[il]);
-                        g->spec_attn_state_score[il] = pulsar_gpu_tensor_view(
-                                g->banks.spec_assc[il], TensorBytes{0}, g->banks.astate_bank_bytes[il]);
+                        g->spec_attn_state_kv[il.raw()] = pulsar_gpu_tensor_view(
+                                g->banks.spec_askv[il.raw()], TensorBytes{0}, g->banks.astate_bank_bytes[il.raw()]);
+                        g->spec_attn_state_score[il.raw()] = pulsar_gpu_tensor_view(
+                                g->banks.spec_assc[il.raw()], TensorBytes{0}, g->banks.astate_bank_bytes[il.raw()]);
                     } else {
-                        g->spec_attn_state_kv[il] = pulsar_gpu_tensor_alloc(TensorBytes{state_bytes});
-                        g->spec_attn_state_score[il] = pulsar_gpu_tensor_alloc(TensorBytes{state_bytes});
+                        g->spec_attn_state_kv[il.raw()] = pulsar_gpu_tensor_alloc(TensorBytes{state_bytes});
+                        g->spec_attn_state_score[il.raw()] = pulsar_gpu_tensor_alloc(TensorBytes{state_bytes});
                     }
-                    state_init_ok = state_init_ok && g->spec_attn_state_kv[il] && g->spec_attn_state_score[il];
+                    state_init_ok = state_init_ok && g->spec_attn_state_kv[il.raw()] && g->spec_attn_state_score[il.raw()];
                 }
                 /* Banked mode primes every bank's state lanes at slab alloc. */
                 if (!banked && state_init_ok) {
-                    state_init_ok = gpu_tensor_fill_f32(g->layer_attn_state_kv[il], 0.0f, attn_width * attn_rows) &&
-                                    gpu_tensor_fill_f32(g->layer_attn_state_score[il], PULSAR_NEG_INF, attn_width * attn_rows);
+                    state_init_ok = gpu_tensor_fill_f32(g->layer_attn_state_kv[il.raw()], 0.0f, attn_width * attn_rows) &&
+                                    gpu_tensor_fill_f32(g->layer_attn_state_score[il.raw()], PULSAR_NEG_INF, attn_width * attn_rows);
                 }
             }
             /* V4 ONLY: the indexer's OWN compressor lane (see the struct note).
@@ -1668,42 +1668,42 @@ bool gpu_graph_alloc_raw_cap(
             if (g_pulsar_shape.indexer_own_compressor && indexed && attn_rows != 0u) {
                 if (banked) {
                     /* V4's indexer-compressor lane, per bank, from the slab. */
-                    g->layer_index_state_kv[il] = pulsar_gpu_tensor_view(
-                            g->banks.iskv[il], TensorBytes{0}, g->banks.istate_bank_bytes[il]);
-                    g->layer_index_state_score[il] = pulsar_gpu_tensor_view(
-                            g->banks.issc[il], TensorBytes{0}, g->banks.istate_bank_bytes[il]);
+                    g->layer_index_state_kv[il.raw()] = pulsar_gpu_tensor_view(
+                            g->banks.iskv[il.raw()], TensorBytes{0}, g->banks.istate_bank_bytes[il.raw()]);
+                    g->layer_index_state_score[il.raw()] = pulsar_gpu_tensor_view(
+                            g->banks.issc[il.raw()], TensorBytes{0}, g->banks.istate_bank_bytes[il.raw()]);
                     if (enable_spec) {
-                        g->spec_index_state_kv[il] = pulsar_gpu_tensor_view(
-                                g->banks.spec_iskv[il], TensorBytes{0}, g->banks.istate_bank_bytes[il]);
-                        g->spec_index_state_score[il] = pulsar_gpu_tensor_view(
-                                g->banks.spec_issc[il], TensorBytes{0}, g->banks.istate_bank_bytes[il]);
+                        g->spec_index_state_kv[il.raw()] = pulsar_gpu_tensor_view(
+                                g->banks.spec_iskv[il.raw()], TensorBytes{0}, g->banks.istate_bank_bytes[il.raw()]);
+                        g->spec_index_state_score[il.raw()] = pulsar_gpu_tensor_view(
+                                g->banks.spec_issc[il.raw()], TensorBytes{0}, g->banks.istate_bank_bytes[il.raw()]);
                         state_init_ok = state_init_ok &&
-                                        g->spec_index_state_kv[il] && g->spec_index_state_score[il];
+                                        g->spec_index_state_kv[il.raw()] && g->spec_index_state_score[il.raw()];
                     }
                     state_init_ok = state_init_ok &&
-                                    g->layer_index_state_kv[il] && g->layer_index_state_score[il];
+                                    g->layer_index_state_kv[il.raw()] && g->layer_index_state_score[il.raw()];
                 } else {
                     const uint64_t index_state_bytes =
                             pulsar_comp_row_width(attn->ratio, PULSAR_N_INDEXER_HEAD_DIM) *
                             pulsar_comp_state_rows(attn->ratio) * sizeof(float);
-                    g->layer_index_state_kv[il] = pulsar_gpu_tensor_alloc(TensorBytes{index_state_bytes});
-                    g->layer_index_state_score[il] = pulsar_gpu_tensor_alloc(TensorBytes{index_state_bytes});
-                    if (!g->layer_index_state_kv[il] || !g->layer_index_state_score[il]) {
+                    g->layer_index_state_kv[il.raw()] = pulsar_gpu_tensor_alloc(TensorBytes{index_state_bytes});
+                    g->layer_index_state_score[il.raw()] = pulsar_gpu_tensor_alloc(TensorBytes{index_state_bytes});
+                    if (!g->layer_index_state_kv[il.raw()] || !g->layer_index_state_score[il.raw()]) {
                         fprintf(stderr, "pulsar: layer %u: indexer-compressor state lane alloc failed (%llu B each)\n",
-                                il, (unsigned long long)index_state_bytes);
+                                il.raw(), (unsigned long long)index_state_bytes);
                     }
-                    state_init_ok = state_init_ok && g->layer_index_state_kv[il] && g->layer_index_state_score[il];
+                    state_init_ok = state_init_ok && g->layer_index_state_kv[il.raw()] && g->layer_index_state_score[il.raw()];
                     if (enable_spec) {
-                        g->spec_index_state_kv[il] = pulsar_gpu_tensor_alloc(TensorBytes{index_state_bytes});
-                        g->spec_index_state_score[il] = pulsar_gpu_tensor_alloc(TensorBytes{index_state_bytes});
+                        g->spec_index_state_kv[il.raw()] = pulsar_gpu_tensor_alloc(TensorBytes{index_state_bytes});
+                        g->spec_index_state_score[il.raw()] = pulsar_gpu_tensor_alloc(TensorBytes{index_state_bytes});
                         state_init_ok = state_init_ok &&
-                                        g->spec_index_state_kv[il] && g->spec_index_state_score[il];
+                                        g->spec_index_state_kv[il.raw()] && g->spec_index_state_score[il.raw()];
                     }
                     if (state_init_ok) {
                         const uint64_t n = index_state_bytes / sizeof(float);
-                        if (!gpu_tensor_fill_f32(g->layer_index_state_kv[il], 0.0f, n) ||
-                            !gpu_tensor_fill_f32(g->layer_index_state_score[il], PULSAR_NEG_INF, n)) {
-                            fprintf(stderr, "pulsar: layer %u: indexer-compressor state lane prime failed\n", il);
+                        if (!gpu_tensor_fill_f32(g->layer_index_state_kv[il.raw()], 0.0f, n) ||
+                            !gpu_tensor_fill_f32(g->layer_index_state_score[il.raw()], PULSAR_NEG_INF, n)) {
+                            fprintf(stderr, "pulsar: layer %u: indexer-compressor state lane prime failed\n", il.raw());
                             state_init_ok = false;
                         }
                     }
@@ -1824,9 +1824,9 @@ bool gpu_graph_alloc_raw_cap(
     g->batch_routed_out = pulsar_gpu_tensor_alloc(bytes_of<float>(pc * PULSAR_N_EMBD));
 
     bool layer_cache_ok = true;
-    for (uint32_t il = 0; layer_cache_ok && il < PULSAR_N_LAYER; il++) {
-        if (!g->layer_raw_cache[il]) {
-            fprintf(stderr, "pulsar: layer %u: the raw ring cache is missing -- refusing\n", il);
+    for (TrunkLayer il{0u}; layer_cache_ok && il.below(PULSAR_N_LAYER); ++il) {
+        if (!g->layer_raw_cache[il.raw()]) {
+            fprintf(stderr, "pulsar: layer %u: the raw ring cache is missing -- refusing\n", il.raw());
             layer_cache_ok = false;
             break;
         }
@@ -1838,12 +1838,12 @@ bool gpu_graph_alloc_raw_cap(
          * "sampled CLI generation requires a session backend". */
         const bool indexed = pulsar_attn_runs_indexer(pulsar_layer_attn_layout(il)->mode);
         if (gpu_graph_layer_is_kv_source(il) &&
-            (!g->layer_attn_comp_cache[il] || !g->idx_comp_stage ||
-             (indexed && !g->layer_index_comp_cache[il]))) {
+            (!g->layer_attn_comp_cache[il.raw()] || !g->idx_comp_stage ||
+             (indexed && !g->layer_index_comp_cache[il.raw()]))) {
             fprintf(stderr, "pulsar: layer %u: kv-source cache missing (comp pool %s, index pool %s, "
                             "index stage %s) -- refusing\n",
-                    il, g->layer_attn_comp_cache[il] ? "ok" : "MISSING",
-                    !indexed ? "n/a (no indexer)" : (g->layer_index_comp_cache[il] ? "ok" : "MISSING"),
+                    il.raw(), g->layer_attn_comp_cache[il.raw()] ? "ok" : "MISSING",
+                    !indexed ? "n/a (no indexer)" : (g->layer_index_comp_cache[il.raw()] ? "ok" : "MISSING"),
                     g->idx_comp_stage ? "ok" : "MISSING");
             layer_cache_ok = false;
             break;
@@ -1852,21 +1852,21 @@ bool gpu_graph_alloc_raw_cap(
          * profile says it exists (the same predicate the allocation used). */
         const bool own_index = g_pulsar_shape.indexer_own_compressor && indexed;
         if (gpu_graph_layer_has_comp_state(il) &&
-            (!g->layer_attn_state_kv[il] || !g->layer_attn_state_score[il] ||
-             (own_index && (!g->layer_index_state_kv[il] || !g->layer_index_state_score[il])) ||
-             (enable_spec && (!g->spec_attn_state_kv[il] || !g->spec_attn_state_score[il])) ||
+            (!g->layer_attn_state_kv[il.raw()] || !g->layer_attn_state_score[il.raw()] ||
+             (own_index && (!g->layer_index_state_kv[il.raw()] || !g->layer_index_state_score[il.raw()])) ||
+             (enable_spec && (!g->spec_attn_state_kv[il.raw()] || !g->spec_attn_state_score[il.raw()])) ||
              (enable_spec && own_index &&
-              (!g->spec_index_state_kv[il] || !g->spec_index_state_score[il])))) {
+              (!g->spec_index_state_kv[il.raw()] || !g->spec_index_state_score[il.raw()])))) {
             fprintf(stderr, "pulsar: layer %u: compressor state missing (attn %s/%s, index %s/%s, "
                             "spec %s/%s, spec index %s/%s) -- refusing\n",
-                    il, g->layer_attn_state_kv[il] ? "ok" : "MISSING",
-                    g->layer_attn_state_score[il] ? "ok" : "MISSING",
-                    !own_index ? "n/a (no index compressor)" : (g->layer_index_state_kv[il] ? "ok" : "MISSING"),
-                    !own_index ? "n/a (no index compressor)" : (g->layer_index_state_score[il] ? "ok" : "MISSING"),
-                    !enable_spec ? "off" : (g->spec_attn_state_kv[il] ? "ok" : "MISSING"),
-                    !enable_spec ? "off" : (g->spec_attn_state_score[il] ? "ok" : "MISSING"),
-                    (!enable_spec || !own_index) ? "off" : (g->spec_index_state_kv[il] ? "ok" : "MISSING"),
-                    (!enable_spec || !own_index) ? "off" : (g->spec_index_state_score[il] ? "ok" : "MISSING"));
+                    il.raw(), g->layer_attn_state_kv[il.raw()] ? "ok" : "MISSING",
+                    g->layer_attn_state_score[il.raw()] ? "ok" : "MISSING",
+                    !own_index ? "n/a (no index compressor)" : (g->layer_index_state_kv[il.raw()] ? "ok" : "MISSING"),
+                    !own_index ? "n/a (no index compressor)" : (g->layer_index_state_score[il.raw()] ? "ok" : "MISSING"),
+                    !enable_spec ? "off" : (g->spec_attn_state_kv[il.raw()] ? "ok" : "MISSING"),
+                    !enable_spec ? "off" : (g->spec_attn_state_score[il.raw()] ? "ok" : "MISSING"),
+                    (!enable_spec || !own_index) ? "off" : (g->spec_index_state_kv[il.raw()] ? "ok" : "MISSING"),
+                    (!enable_spec || !own_index) ? "off" : (g->spec_index_state_score[il.raw()] ? "ok" : "MISSING"));
             layer_cache_ok = false;
             break;
         }
@@ -1928,7 +1928,7 @@ bool gpu_graph_alloc_raw_cap(
 /// @param g the graph
 /// @param target_layer_ids the layers whose hiddens condition the drafter
 /// @return false = allocation failed
-bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_layer_ids[3]) {
+bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const TrunkLayer target_layer_ids[3]) {
     bool ok = true;
     for (int i = 0; i < 3; i++) {
         g->dspark_target_layer_ids[i] = target_layer_ids[i];
@@ -2015,32 +2015,32 @@ bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_lay
      * row) + one emit-sink scratch row.  The index-K row derives from the
      * emitted latent, so no separate indexer save exists. */
     {
-        for (uint32_t il = 0; il < PULSAR_N_LAYER && ok; il++) {
-            g->spec_comp_kv_save[il] = NULL;
-            g->spec_comp_sc_save[il] = NULL;
-            g->spec_icomp_kv_save[il] = NULL;
-            g->spec_icomp_sc_save[il] = NULL;
+        for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER) && ok; ++il) {
+            g->spec_comp_kv_save[il.raw()] = NULL;
+            g->spec_comp_sc_save[il.raw()] = NULL;
+            g->spec_icomp_kv_save[il.raw()] = NULL;
+            g->spec_icomp_sc_save[il.raw()] = NULL;
             if (!gpu_graph_layer_has_comp_state(il)) continue;
             /* saved rows are the compressor PROJECTIONS, so their width is the
              * layer's coff width, not head_dim */
             const uint32_t il_ratio = pulsar_layer_compress_ratio(il);
             const uint64_t attn_w = pulsar_comp_row_width(il_ratio, PULSAR_N_HEAD_DIM);
-            g->spec_comp_kv_save[il] = pulsar_gpu_tensor_alloc(
+            g->spec_comp_kv_save[il.raw()] = pulsar_gpu_tensor_alloc(
                     bytes_of<float>((PULSAR_SPEC_LOGITS_ROWS + 1ull) * attn_w));
-            g->spec_comp_sc_save[il] = pulsar_gpu_tensor_alloc(
+            g->spec_comp_sc_save[il.raw()] = pulsar_gpu_tensor_alloc(
                     bytes_of<float>((PULSAR_SPEC_LOGITS_ROWS + 1ull) * attn_w));
-            ok = ok && g->spec_comp_kv_save[il] && g->spec_comp_sc_save[il];
+            ok = ok && g->spec_comp_kv_save[il.raw()] && g->spec_comp_sc_save[il.raw()];
             /* V4's indexer owns a SECOND recurrent lane over the same rows, so a
              * rejected draft has to roll it back from its own projections -- the
              * attention pair says nothing about it.  V4.1 has no such lane and
              * must not pay for one. */
             if (g_pulsar_shape.indexer_own_compressor && pulsar_attn_runs_indexer(pulsar_layer_attn_layout(il)->mode)) {
                 const uint64_t idx_w = pulsar_comp_row_width(il_ratio, PULSAR_N_INDEXER_HEAD_DIM);
-                g->spec_icomp_kv_save[il] = pulsar_gpu_tensor_alloc(
+                g->spec_icomp_kv_save[il.raw()] = pulsar_gpu_tensor_alloc(
                         bytes_of<float>((PULSAR_SPEC_LOGITS_ROWS + 1ull) * idx_w));
-                g->spec_icomp_sc_save[il] = pulsar_gpu_tensor_alloc(
+                g->spec_icomp_sc_save[il.raw()] = pulsar_gpu_tensor_alloc(
                         bytes_of<float>((PULSAR_SPEC_LOGITS_ROWS + 1ull) * idx_w));
-                ok = ok && g->spec_icomp_kv_save[il] && g->spec_icomp_sc_save[il];
+                ok = ok && g->spec_icomp_kv_save[il.raw()] && g->spec_icomp_sc_save[il.raw()];
             }
         }
         g->spec_comp_scratch_row = pulsar_gpu_tensor_alloc(bytes_of<float>(PULSAR_N_HEAD_DIM));

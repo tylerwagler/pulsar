@@ -78,8 +78,8 @@ static bool ds4_walk(void *state, int dir, bool frontier, pulsar_gpu_tensor *sla
     const uint32_t n = G < W ? G : W, skip = W - n;
     const uint32_t first = n ? (G - n) % g->raw_cap : 0u;
     const uint32_t run = (g->raw_cap - first) < n ? (g->raw_cap - first) : n;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER && ok; il++) {
-        pulsar_gpu_tensor *raw = g->layer_raw_cache[il];
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER) && ok; ++il) {
+        pulsar_gpu_tensor *raw = g->layer_raw_cache[il.raw()];
         const TensorBytes at = off + raw_row.times(skip);
         if (dir == 0 && n) {
             ok = pulsar_gpu_tensor_copy_async(slab, at, raw, raw_row.times(first), raw_row.times(run)) != 0 &&
@@ -94,10 +94,10 @@ static bool ds4_walk(void *state, int dir, bool frontier, pulsar_gpu_tensor *sla
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (!frontier && (ratio <= 1u || pulsar_compress_coff(ratio) == 1u)) continue;
-        lane(g->layer_attn_state_kv[il]);
-        lane(g->layer_attn_state_score[il]);
-        lane(g->layer_index_state_kv[il]);
-        lane(g->layer_index_state_score[il]);
+        lane(g->layer_attn_state_kv[il.raw()]);
+        lane(g->layer_attn_state_score[il.raw()]);
+        lane(g->layer_index_state_kv[il.raw()]);
+        lane(g->layer_index_state_score[il.raw()]);
     }
     /* The frontier's drafter (DSpark, when loaded): its raw KV ring and prompt-window ring, the installed bank's
      * views, and their counters as a host tail -- the state the next speculative round drafts from (Qwen's MTP
@@ -141,7 +141,7 @@ static TokPos ds4_min_checkpoint(void *state) { return pulsar_ckpt_pos(G_(state)
 /// @param G  the frontier
 /// @param il a KV-source layer
 /// @return its complete rows
-static CompRows ds4_rows_at(TokPos G, uint32_t il) {
+static CompRows ds4_rows_at(TokPos G, TrunkLayer il) {
     return pulsar_comp_rows_held(G.before(), TokPerRow{pulsar_layer_compress_ratio(il)});
 }
 
@@ -154,11 +154,11 @@ static CompRows ds4_rows_at(TokPos G, uint32_t il) {
 static bool ds4_stands_at(void *state, TokPos G, char *why, size_t whylen) {
     pulsar_gpu_graph *g = G_(state);
     const BankId bank = gpu_graph_cur_bank(g);
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const CompRows want = ds4_rows_at(G, il);
         if (gpu_graph_n_comp(g, bank, il) != want) {
-            snprintf(why, whylen, "layer %u holds %d compressed rows, a frontier at %u holds %d", il,
+            snprintf(why, whylen, "layer %u holds %d compressed rows, a frontier at %u holds %d", il.raw(),
                      gpu_graph_n_comp(g, bank, il).raw(), pulsar_ckpt_raw(G), want.raw());
             return false;
         }
@@ -171,7 +171,7 @@ static bool ds4_stands_at(void *state, TokPos G, char *why, size_t whylen) {
 static bool ds4_holds(void *state, TokPos G) {
     pulsar_gpu_graph *g = G_(state);
     const BankId bank = gpu_graph_cur_bank(g);
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++)
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il)
         if (gpu_graph_layer_is_kv_source(il) && gpu_graph_n_comp(g, bank, il) < ds4_rows_at(G, il))
             return false;
     return true;
@@ -182,7 +182,7 @@ static bool ds4_holds(void *state, TokPos G) {
  *  @param bank the bank
  *  @param G    the frontier, in tokens */
 static void ds4_set_frontier(pulsar_gpu_graph *g, BankId bank, TokPos G) {
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++)
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il)
         if (gpu_graph_layer_is_kv_source(il)) gpu_graph_set_n_comp(g, bank, il, ds4_rows_at(G, il));
 }
 
@@ -252,13 +252,13 @@ static bool ds4_stale(void *state, BankId bank) {
 static uint32_t ds4_pools(void *state, pulsar_kv_pool *out, uint32_t cap) {
     pulsar_gpu_graph *g = G_(state);
     uint32_t n = 0;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const TokPerRow r{pulsar_layer_compress_ratio(il)};
-        if (n < cap) out[n] = { g->layer_attn_comp_cache[il], r, pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP), true };
+        if (n < cap) out[n] = { g->layer_attn_comp_cache[il.raw()], r, pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP), true };
         n++;
         if (!gpu_graph_layer_has_index_pool(il)) continue;
-        if (n < cap) out[n] = { g->layer_index_comp_cache[il], r, pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX), true };
+        if (n < cap) out[n] = { g->layer_index_comp_cache[il.raw()], r, pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX), true };
         n++;
     }
     return n;
@@ -278,13 +278,13 @@ static uint32_t ds4_bank_pools(void *state, BankId bank_id, pulsar_kv_pool *out,
     if (b->n_banks == 0 || !bank_id.below(b->n_banks)) return 0;
     const uint32_t bank = pulsar_bank_index(bank_id);
     uint32_t n = 0;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const TokPerRow r{pulsar_layer_compress_ratio(il)};
-        if (n < cap) out[n] = { b->comp[il][bank], r, pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP), true };
+        if (n < cap) out[n] = { b->comp[il.raw()][bank], r, pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP), true };
         n++;
         if (!gpu_graph_layer_has_index_pool(il)) continue;
-        if (n < cap) out[n] = { b->index[il][bank], r, pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX), true };
+        if (n < cap) out[n] = { b->index[il.raw()][bank], r, pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX), true };
         n++;
     }
     return n;

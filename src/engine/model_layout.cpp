@@ -21,7 +21,7 @@ static pulsar_layer_attn g_pulsar_attn_layout[PULSAR_MAX_LAYER];
 /* A LAYER-SUBSET FIXTURE (L269 W2): an artifact that keeps some of a profile's
  * layers -- tools/container `build.py --layers`, which writes the map as
  * `pulsar.fixture.source_layers`.  Block il of the artifact IS source layer
- * g_layer_source[il] of the profile; everything a layer's index means in the
+ * g_layer_source[il.raw()] of the profile; everything a layer's index means in the
  * source model (its compression ratio, which caches it reads, its Engram hash
  * multipliers, its row table) is asked of the SOURCE index through
  * pulsar_layer_source, and every per-block array the artifact declares (ratios,
@@ -38,9 +38,9 @@ static pulsar_shape g_source_profile;
 
 
 
-uint32_t pulsar_layer_source(uint32_t il) {
-    if (il >= PULSAR_N_LAYER) pulsar_die("DeepSeek4 layer index is outside the loaded model layout");
-    return g_layer_subset ? g_layer_source[il] : il;
+SrcBlock pulsar_layer_source(TrunkLayer il) {
+    if (!il.below(PULSAR_N_LAYER)) pulsar_die("DeepSeek4 layer index is outside the loaded model layout");
+    return g_layer_subset ? SrcBlock{g_layer_source[il.raw()]} : SrcBlock{il.raw()};
 }
 
 
@@ -113,16 +113,16 @@ bool pulsar_layer_subset_install(const uint32_t *source_layers, uint32_t n) {
 
 /* Attention compression is read from the model's metadata after validating that it
  * matches the exact layout expected for the loaded model shape. */
-uint32_t pulsar_layer_compress_ratio(uint32_t il) {
-    if (il >= PULSAR_N_LAYER) pulsar_die("DeepSeek4 layer index is outside the loaded model layout");
-    return g_pulsar_attn_layout[il].ratio;
+uint32_t pulsar_layer_compress_ratio(TrunkLayer il) {
+    if (!il.below(PULSAR_N_LAYER)) pulsar_die("DeepSeek4 layer index is outside the loaded model layout");
+    return g_pulsar_attn_layout[il.raw()].ratio;
 }
 
 
 
-const pulsar_layer_attn *pulsar_layer_attn_layout(uint32_t il) {
-    if (il >= PULSAR_N_LAYER) pulsar_die("DeepSeek4 layer index is outside the loaded model layout");
-    return &g_pulsar_attn_layout[il];
+const pulsar_layer_attn *pulsar_layer_attn_layout(TrunkLayer il) {
+    if (!il.below(PULSAR_N_LAYER)) pulsar_die("DeepSeek4 layer index is outside the loaded model layout");
+    return &g_pulsar_attn_layout[il.raw()];
 }
 
 
@@ -132,9 +132,9 @@ const pulsar_layer_attn *pulsar_layer_attn_layout(uint32_t il) {
  * REAP ds4-compact-v1 model the pruned layers report their dense survivor
  * count. Only the expert *weight* tensors are trimmed to this; the router and
  * bias stay padded to n_expert. */
-uint32_t pulsar_layer_n_expert(uint32_t il) {
-    if (il >= PULSAR_N_LAYER) pulsar_die("DeepSeek4 layer index is outside the loaded model layout");
-    const uint32_t v = g_pulsar_layer_expert_count[il];
+uint32_t pulsar_layer_n_expert(TrunkLayer il) {
+    if (!il.below(PULSAR_N_LAYER)) pulsar_die("DeepSeek4 layer index is outside the loaded model layout");
+    const uint32_t v = g_pulsar_layer_expert_count[il.raw()];
     return v ? v : PULSAR_N_EXPERT;
 }
 
@@ -143,8 +143,8 @@ uint32_t pulsar_layer_n_expert(uint32_t il) {
 /* REAP compact detection: any layer whose physical routed-expert count was
  * trimmed below the architecture's n_expert marks the model as pruned. */
 bool pulsar_engine::is_pruned() const {
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const uint32_t v = g_pulsar_layer_expert_count[il];
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
+        const uint32_t v = g_pulsar_layer_expert_count[il.raw()];
         if (v != 0 && v != PULSAR_N_EXPERT) return true;
     }
     return false;
@@ -161,8 +161,8 @@ bool pulsar_engine::is_pruned() const {
  * plans/96-SPIKE0-results.md S2. */
 /// @param block an artifact block (asked of its source layer)
 /// @return the expected ratio (0 = window-only); dies on an unknown variant
-static uint32_t expected_layer_compress_ratio(uint32_t block) {
-    const uint32_t il = pulsar_layer_source(block);   /* the profile speaks of source layers */
+static uint32_t expected_layer_compress_ratio(TrunkLayer block) {
+    const uint32_t il = pulsar_layer_source(block).raw();   /* the profile speaks of source layers: its number */
     if (il < 2) return 0;   /* both profiles: the first two layers are window-only */
     switch (g_pulsar_shape.variant) {
     case PULSAR_VARIANT_V4:
@@ -225,7 +225,8 @@ static bool expect_source_set(const char *what,
 
 /* The most recent source at or below `il`, or PULSAR_NO_LAYER.  This is the
  * reference's rule: a layer reads whatever the last source published. */
-/// @param il a layer
+/// @param il a layer's number -- in the numbering `sources` is in (L436: the loaded shape's blocks, or the full
+///           profile's source layers a fixture is checked against; the rule is the same in both)
 /// @param sources [n] ascending source layers
 /// @param n their count
 /// @return the last source <= il, or PULSAR_NO_LAYER
@@ -255,19 +256,19 @@ bool pulsar_attn_layout_install(const uint32_t *ratios,
     }
 
     memset(g_pulsar_attn_layout, 0, sizeof(g_pulsar_attn_layout));
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        pulsar_layer_attn *a = &g_pulsar_attn_layout[il];
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
+        pulsar_layer_attn *a = &g_pulsar_attn_layout[il.raw()];
         const uint32_t expected = expected_layer_compress_ratio(il);
-        if (ratios[il] != expected) {
+        if (ratios[il.raw()] != expected) {
             fprintf(stderr,
                     "pulsar: unexpected DeepSeek4 compression ratio at layer %u for %s: got %u, expected %u\n",
-                    il, PULSAR_MODEL_SHAPE_NAME, ratios[il], expected);
+                    il.raw(), PULSAR_MODEL_SHAPE_NAME, ratios[il.raw()], expected);
             pulsar_load_refuse();
             return false;
         }
-        a->ratio = ratios[il];
-        a->kv_source = latest_source(il, kv_sources, n_kv);
-        a->index_source = latest_source(il, index_sources, n_index);
+        a->ratio = ratios[il.raw()];
+        a->kv_source = TrunkLayer{latest_source(il.raw(), kv_sources, n_kv)};   /* PULSAR_NO_LAYER enters as none() */
+        a->index_source = TrunkLayer{latest_source(il.raw(), index_sources, n_index)};
         const bool is_kv = a->kv_source == il;
         const bool is_index = a->index_source == il;
 
@@ -275,16 +276,16 @@ bool pulsar_attn_layout_install(const uint32_t *ratios,
             /* A window-only layer must not be a source and must not sit past
              * one: the reference slices the shared cache with the reader's own
              * ratio, so a ratio-0 layer after a source has no meaning. */
-            if (is_kv || is_index || a->kv_source != PULSAR_NO_LAYER || a->index_source != PULSAR_NO_LAYER) {
-                fprintf(stderr, "pulsar: layer %u has compress ratio 0 but lies inside a CSA2 source span\n", il);
+            if (is_kv || is_index || !a->kv_source.is_none() || !a->index_source.is_none()) {
+                fprintf(stderr, "pulsar: layer %u has compress ratio 0 but lies inside a CSA2 source span\n", il.raw());
                 pulsar_load_refuse();
                 return false;
             }
             a->mode = PULSAR_ATTN_WINDOW;
             continue;
         }
-        if (a->kv_source == PULSAR_NO_LAYER || a->index_source == PULSAR_NO_LAYER) {
-            fprintf(stderr, "pulsar: layer %u compresses (ratio %u) but no kv/index source precedes it\n", il, a->ratio);
+        if (a->kv_source.is_none() || a->index_source.is_none()) {
+            fprintf(stderr, "pulsar: layer %u compresses (ratio %u) but no kv/index source precedes it\n", il.raw(), a->ratio);
             pulsar_load_refuse();
             return false;
         }
@@ -305,31 +306,32 @@ bool pulsar_attn_layout_install(const uint32_t *ratios,
          * ratio-128 layer is just the last even layer -- ratio 4 by
          * construction -- and the layer was rejected for a source it never
          * reads.  That is the whole of S2's asymmetry. */
-        if (ratios[a->kv_source] != a->ratio ||
-            (pulsar_attn_reads_index(a->mode) && ratios[a->index_source] != a->ratio)) {
+        if (ratios[a->kv_source.raw()] != a->ratio ||
+            (pulsar_attn_reads_index(a->mode) && ratios[a->index_source.raw()] != a->ratio)) {
             fprintf(stderr, "pulsar: layer %u (ratio %u) reads sources %u/%u of ratio %u/%u\n",
-                    il, a->ratio, a->kv_source, a->index_source, ratios[a->kv_source], ratios[a->index_source]);
+                    il.raw(), a->ratio, a->kv_source.raw(), a->index_source.raw(), ratios[a->kv_source.raw()],
+                    ratios[a->index_source.raw()]);
             pulsar_load_refuse();
             return false;
         }
-        a->candidate_source = candidate_source >= 0 && (uint32_t)candidate_source == il;
-        a->uses_candidates = is_index && candidate_source >= 0 && (uint32_t)candidate_source < il;
+        a->candidate_source = candidate_source >= 0 && (uint32_t)candidate_source == il.raw();
+        a->uses_candidates = is_index && candidate_source >= 0 && (uint32_t)candidate_source < il.raw();
         if (g_layer_subset) {
             /* A fixture block reads what its SOURCE layer reads in the full model, or it is refused: the latest
              * kept source at or below it is a different cache when the real one was dropped. */
             const pulsar_shape *f = &g_source_profile;
-            const uint32_t s = pulsar_layer_source(il);
+            const uint32_t s = pulsar_layer_source(il).raw();   /* the block's source layer, in the full profile's numbers */
             const uint32_t want_kv = latest_source(s, f->kv_source_layer, f->n_kv_source);
             const uint32_t want_ix = latest_source(s, f->index_source_layer, f->n_index_source);
             const bool want_cand = s == want_ix && f->candidate_source_layer >= 0 &&
                                    (uint32_t)f->candidate_source_layer < s;
-            const char *dropped = pulsar_layer_source(a->kv_source) != want_kv ? "kv source"
-                                : pulsar_attn_reads_index(a->mode) && pulsar_layer_source(a->index_source) != want_ix
+            const char *dropped = pulsar_layer_source(a->kv_source).raw() != want_kv ? "kv source"
+                                : pulsar_attn_reads_index(a->mode) && pulsar_layer_source(a->index_source).raw() != want_ix
                                       ? "index source"
                                 : want_cand && !a->uses_candidates ? "candidate source" : NULL;
             if (dropped) {
                 fprintf(stderr, "pulsar: fixture block %u (source layer %u) reads %s %u of the full model, which the "
-                                "fixture does not keep -- refusing\n", il, s, dropped,
+                                "fixture does not keep -- refusing\n", il.raw(), s, dropped,
                         dropped[0] == 'k' ? want_kv : dropped[0] == 'i' ? want_ix
                                                                          : (uint32_t)f->candidate_source_layer);
                 pulsar_load_refuse();
@@ -337,7 +339,7 @@ bool pulsar_attn_layout_install(const uint32_t *ratios,
             }
         }
         if (a->candidate_source && !is_index) {
-            fprintf(stderr, "pulsar: candidate source layer %u runs no indexer\n", il);
+            fprintf(stderr, "pulsar: candidate source layer %u runs no indexer\n", il.raw());
             pulsar_load_refuse();
             return false;
         }
@@ -345,7 +347,7 @@ bool pulsar_attn_layout_install(const uint32_t *ratios,
             /* The mask is over the candidate source's compressed positions; it
              * only means something to an indexer scoring the same cache. */
             fprintf(stderr, "pulsar: layer %u would apply layer %d's candidate mask to a different KV cache\n",
-                    il, candidate_source);
+                    il.raw(), candidate_source);
             pulsar_load_refuse();
             return false;
         }

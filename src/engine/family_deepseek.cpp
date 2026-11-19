@@ -38,11 +38,11 @@ static int ds4_quant_bits(pulsar_engine *e) {
      * EXL3 artifact never shares KV with the IQ2 (2) or MXFP4 (4) tier of the
      * same model id. */
     int bits = 0;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         const pulsar_tensor *proj[3] = {
-            e->weights.layer[il].ffn_gate_exps,
-            e->weights.layer[il].ffn_up_exps,
-            e->weights.layer[il].ffn_down_exps,
+            e->weights.layer[il.raw()].ffn_gate_exps,
+            e->weights.layer[il.raw()].ffn_up_exps,
+            e->weights.layer[il.raw()].ffn_down_exps,
         };
         for (int k = 0; k < 3; k++) {
             const pulsar_tensor *t = proj[k];
@@ -113,7 +113,7 @@ static bool ds4_sync_state_agrees(pulsar_session *s) {
     const BankId bank = gpu_graph_cur_bank(g);
     if (s->mseq_dirty || g->ms_comp_state_stale[pulsar_bank_index(bank)]) return false;
     const TokCount len = s->hist_end().before();
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++)
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il)
         if (gpu_graph_layer_is_kv_source(il) &&
             gpu_graph_n_comp(g, bank, il) >
                 pulsar_comp_rows_held(len, TokPerRow{pulsar_layer_compress_ratio(il)}))

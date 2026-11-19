@@ -124,7 +124,7 @@ static void install_and_grade(const pulsar_shape *shape, const char *what,
      * fails the moment a profile or artifact breaks the coupling. */
     unsigned n_idx_own = 0, n_ratio4 = 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const pulsar_layer_attn *a = pulsar_layer_attn_layout(il);
+        const pulsar_layer_attn *a = pulsar_layer_attn_layout(TrunkLayer{il});
         counts[a->mode]++;
 
         pulsar_attn_mode want_mode = a->mode;
@@ -184,11 +184,11 @@ static void install_and_grade(const pulsar_shape *shape, const char *what,
          * The install enforces this, so reaching here with a mismatch would mean
          * the check was relaxed; assert the postcondition independently. */
         if (a->mode != PULSAR_ATTN_WINDOW) {
-            snprintf(detail, sizeof detail, "ratio %u, kv_source %u (ratio %u)", a->ratio, a->kv_source, ratios[a->kv_source]);
-            check(ratios[a->kv_source] == a->ratio, "kv source ratio differs from the layer's", il, detail);
+            snprintf(detail, sizeof detail, "ratio %u, kv_source %u (ratio %u)", a->ratio, a->kv_source.raw(), ratios[a->kv_source.raw()]);
+            check(ratios[a->kv_source.raw()] == a->ratio, "kv source ratio differs from the layer's", il, detail);
             if (pulsar_attn_reads_index(a->mode)) {
-                snprintf(detail, sizeof detail, "ratio %u, index_source %u (ratio %u)", a->ratio, a->index_source, ratios[a->index_source]);
-                check(ratios[a->index_source] == a->ratio, "index source ratio differs from the layer's", il, detail);
+                snprintf(detail, sizeof detail, "ratio %u, index_source %u (ratio %u)", a->ratio, a->index_source.raw(), ratios[a->index_source.raw()]);
+                check(ratios[a->index_source.raw()] == a->ratio, "index source ratio differs from the layer's", il, detail);
             }
         }
     }
@@ -245,17 +245,17 @@ static void fixture_checks(void) {
         PULSAR_ATTN_REUSE, PULSAR_ATTN_REINDEX,
     };
     for (uint32_t b = 0; b < 7; b++) {
-        const pulsar_layer_attn *a = pulsar_layer_attn_layout(b);
+        const pulsar_layer_attn *a = pulsar_layer_attn_layout(TrunkLayer{b});
         char detail[160];
         snprintf(detail, sizeof detail, "source layer %u: got %s, want %s (V4.1 layer %u's own mode)", FIX_SRC[b],
                  pulsar_attn_mode_name(a->mode), pulsar_attn_mode_name(want[b]), FIX_SRC[b]);
         check(a->mode == want[b] && a->mode == V41_WANT[FIX_SRC[b]], "fixture block mode", b, detail);
-        check(pulsar_layer_source(b) == FIX_SRC[b], "fixture block's source layer", b, "pulsar_layer_source");
+        check(pulsar_layer_source(TrunkLayer{b}) == SrcBlock{FIX_SRC[b]}, "fixture block's source layer", b, "pulsar_layer_source");
     }
-    check(pulsar_layer_attn_layout(2)->kv_source == 1 && pulsar_layer_attn_layout(5)->kv_source == 4,
+    check(pulsar_layer_attn_layout(TrunkLayer{2u})->kv_source == TrunkLayer{1u} && pulsar_layer_attn_layout(TrunkLayer{5u})->kv_source == TrunkLayer{4u},
           "a REUSE block reads its source's block", 2, "kv_source");
-    check(pulsar_layer_attn_layout(4)->candidate_source, "block 4 (source 20) publishes the candidate mask", 4, "cand");
-    check(pulsar_layer_attn_layout(6)->uses_candidates, "block 6 (source 24) scores inside the candidate mask", 6,
+    check(pulsar_layer_attn_layout(TrunkLayer{4u})->candidate_source, "block 4 (source 20) publishes the candidate mask", 4, "cand");
+    check(pulsar_layer_attn_layout(TrunkLayer{6u})->uses_candidates, "block 6 (source 24) scores inside the candidate mask", 6,
           "uses_candidates");
     check(pulsar_layer_subset(), "the fixture is announced as one", 0, "pulsar_layer_subset");
 
@@ -288,9 +288,9 @@ int main(void) {
     /* The specific row the old unconditional ratio check refused: a ratio-128
      * layer whose "index source" is the last even layer.  Named here so that if
      * the asymmetry is ever re-broken, the failure says which layer and why. */
-    const pulsar_layer_attn *hca = pulsar_layer_attn_layout(3);
+    const pulsar_layer_attn *hca = pulsar_layer_attn_layout(TrunkLayer{3u});
     check(hca->ratio == 128, "layer 3 should be 0731's first ratio-128 HCA layer", 3, "ratio");
-    check(hca->index_source == 2, "layer 3's index source is the last even layer", 3, "index_source");
+    check(hca->index_source == TrunkLayer{2u}, "layer 3's index source is the last even layer", 3, "index_source");
     check(hca->mode == PULSAR_ATTN_FULL_UNINDEXED, "layer 3 compresses without an indexer", 3, pulsar_attn_mode_name(hca->mode));
     check(pulsar_attn_owns_kv(hca->mode), "FULL_UNINDEXED still owns its compressor", 3, pulsar_attn_mode_name(hca->mode));
     check(!pulsar_attn_runs_indexer(hca->mode), "FULL_UNINDEXED runs no indexer", 3, pulsar_attn_mode_name(hca->mode));

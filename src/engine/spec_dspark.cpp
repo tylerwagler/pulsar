@@ -156,19 +156,19 @@ static bool spec_frontier_copy_tables_init(pulsar_gpu_graph *g) {
      * exactly where the profile says so (s119 found this copy set missing it;
      * a rejected round then rolled the attention lane back and left the
      * indexer's carry where the rejected draft had put it). */
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         if (!gpu_graph_layer_has_comp_state(il)) continue;
-        const TensorBytes ab = pulsar_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
-        dst[n] = g->spec_attn_state_kv[il];    src[n] = g->layer_attn_state_kv[il];    bytes[n++] = ab;
-        dst[n] = g->spec_attn_state_score[il]; src[n] = g->layer_attn_state_score[il]; bytes[n++] = ab;
+        const TensorBytes ab = pulsar_gpu_tensor_bytes(g->layer_attn_state_kv[il.raw()]);
+        dst[n] = g->spec_attn_state_kv[il.raw()];    src[n] = g->layer_attn_state_kv[il.raw()];    bytes[n++] = ab;
+        dst[n] = g->spec_attn_state_score[il.raw()]; src[n] = g->layer_attn_state_score[il.raw()]; bytes[n++] = ab;
         if (ab > mx) mx = ab;
-        if (g->layer_index_state_kv[il]) {
-            const TensorBytes ib = pulsar_gpu_tensor_bytes(g->layer_index_state_kv[il]);
-            dst[n] = g->spec_index_state_kv[il];
-            src[n] = g->layer_index_state_kv[il];
+        if (g->layer_index_state_kv[il.raw()]) {
+            const TensorBytes ib = pulsar_gpu_tensor_bytes(g->layer_index_state_kv[il.raw()]);
+            dst[n] = g->spec_index_state_kv[il.raw()];
+            src[n] = g->layer_index_state_kv[il.raw()];
             bytes[n++] = ib;
-            dst[n] = g->spec_index_state_score[il];
-            src[n] = g->layer_index_state_score[il];
+            dst[n] = g->spec_index_state_score[il.raw()];
+            src[n] = g->layer_index_state_score[il.raw()];
             bytes[n++] = ib;
             if (ib > mx) mx = ib;
         }
@@ -210,9 +210,9 @@ static bool spec_frontier_snapshot(pulsar_spec_frontier *f, pulsar_session *s) {
     if (!spec_frontier_copy_tables_init(g)) return false;
 
     bool ok = pulsar_gpu_begin_commands() != 0;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         /* the snapshot's raw copy */
-        f->n_comp[il] = (uint32_t)gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il).raw();
+        f->n_comp[il.raw()] = (uint32_t)gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il).raw();
     }
     if (ok && g->spec_frontier_copy_n)
         ok = pulsar_gpu_batched_copy_run(g->spec_snap_copies,
@@ -239,8 +239,8 @@ static bool spec_frontier_restore(pulsar_spec_frontier *f, pulsar_session *s) {
      * WAS the fallback. */
     if (!spec_frontier_copy_tables_init(g)) return false;
     bool ok = pulsar_gpu_begin_commands() != 0;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        gpu_graph_set_n_comp(g, gpu_graph_cur_bank(g), il, CompRows{(int)f->n_comp[il]});
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
+        gpu_graph_set_n_comp(g, gpu_graph_cur_bank(g), il, CompRows{(int)f->n_comp[il.raw()]});
     }
     if (ok && g->spec_frontier_copy_n)
         ok = pulsar_gpu_batched_copy_run(g->spec_restore_copies,
@@ -350,7 +350,7 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
         base_row[j] = (int32_t)n_rows;
         if (banks) {
             const uint32_t b = pulsar_bank_index(banks[j]);   /* in the pool: checked above */
-            for (uint32_t li = 0; li < 3; li++) bank_n_raw[b][li] = g->ms_dspark_n_raw[b][li];
+            for (DraftLayer li{0u}; li.below(3); ++li) bank_n_raw[b][li.raw()] = g->ms_dspark_n_raw[b][li.raw()];
             bank_n_draft[b] = q->n_draft;
         }
         for (uint32_t k = 0; k < q->n_draft; k++) {

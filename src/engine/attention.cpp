@@ -28,7 +28,7 @@
 
 
 /* Dense layers and compressed layers use different RoPE bases. */
-float layer_rope_freq_base(uint32_t il) {
+float layer_rope_freq_base(TrunkLayer il) {
     return pulsar_layer_compress_ratio(il) != 0 && PULSAR_COMPRESS_ROPE_FREQ_BASE > 0.0f
         ? PULSAR_COMPRESS_ROPE_FREQ_BASE
         : PULSAR_ROPE_FREQ_BASE;
@@ -38,7 +38,7 @@ float layer_rope_freq_base(uint32_t il) {
 
 /// @param il a layer
 /// @return its rope frequency scale: 1 for a window-only layer or no scaling, else 1 / PULSAR_ROPE_SCALE_FACTOR
-float layer_rope_freq_scale(uint32_t il) {
+float layer_rope_freq_scale(TrunkLayer il) {
     if (pulsar_layer_compress_ratio(il) == 0 || PULSAR_ROPE_SCALE_FACTOR <= 0.0f) {
         return 1.0f;
     }

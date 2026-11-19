@@ -158,10 +158,10 @@ bool engram_bind(pulsar_weights *w, const pulsar_model *m, const char *model_pat
         snprintf(dir, sizeof dir, "%.*s", slash ? (int)(slash - mp + 1) : 0, mp);
     }
     for (uint64_t l = 0; l < n; l++) {
-        const uint32_t il = (uint32_t)blocks[l];
-        if (blocks[l] < 0 || il >= PULSAR_N_LAYER || (l && blocks[l] <= blocks[l - 1]))
+        const TrunkLayer il{(uint32_t)blocks[l]};   /* the artifact names its Engram layers by block */
+        if (blocks[l] < 0 || !il.below(PULSAR_N_LAYER) || (l && blocks[l] <= blocks[l - 1]))
             return engram_refuse("deepseek4.engram.layers is not ascending blocks of this model");
-        const uint32_t src = pulsar_layer_source(il);
+        const uint32_t src = pulsar_layer_source(il).raw();   /* the row table and its tensors are named by the source layer */
         em->block[l] = il;
         char key[96], name[128], path[4096 + 256];
         pulsar_str file = {NULL, 0};
@@ -170,7 +170,7 @@ bool engram_bind(pulsar_weights *w, const pulsar_model *m, const char *model_pat
         snprintf(path, sizeof path, "%s%.*s", dir, (int)file.len, file.ptr);
         if (!pulsar_engram_table_open(&em->table[l], path, src, em->num_embeddings[l]))
             return engram_refuse("a row table does not open against this model");
-        pulsar_layer_weights *L = &w->layer[il];
+        pulsar_layer_weights *L = &w->layer[il.raw()];
         snprintf(name, sizeof name, "layers.%u.engram.wkv.weight", src);
         L->engram_wkv = model_find_tensor(m, name);
         snprintf(name, sizeof name, "layers.%u.engram.q_weight", src);
@@ -188,13 +188,13 @@ bool engram_bind(pulsar_weights *w, const pulsar_model *m, const char *model_pat
                 return engram_refuse("a block's q_weight / k_weight is missing or not [n_hc][dim] f32 / bf16");
         if (tensor_map_base(m, wkv) != tensor_map_base(m, L->attn_norm))
             return engram_refuse("a block's `wkv` is not in its layer's mapping");
-        L->engram_slot = (uint32_t)l;
+        L->engram_slot = KindOrd{(uint32_t)l};
     }
     em->io = pulsar_engram_io_create(PULSAR_ENGRAM_IO_THREADS);
     if (!em->io) return engram_refuse("the row reader pool did not start");
     for (uint64_t l = 0; l < n; l++)
-        fprintf(stderr, "pulsar: engram: block %u (source layer %u): %s, %llu rows, %u pread threads\n", em->block[l],
-                pulsar_layer_source(em->block[l]), em->table[l].path, (unsigned long long)em->table[l].n_rows,
+        fprintf(stderr, "pulsar: engram: block %u (source layer %u): %s, %llu rows, %u pread threads\n", em->block[l].raw(),
+                pulsar_layer_source(em->block[l]).raw(), em->table[l].path, (unsigned long long)em->table[l].n_rows,
                 PULSAR_ENGRAM_IO_THREADS);
     return true;
 }
@@ -206,7 +206,7 @@ bool engram_upload(pulsar_weights *w, const pulsar_model *m) {
     float *qk = (float *)xmalloc(hd * sizeof(float));
     bool ok = true;
     for (uint32_t l = 0; ok && l < em->n_layers; l++) {
-        const uint32_t src = pulsar_layer_source(em->block[l]);
+        const uint32_t src = pulsar_layer_source(em->block[l]).raw();
         char name[128];
         snprintf(name, sizeof name, "layers.%u.engram.q_weight", src);
         const pulsar_tensor *q = model_find_tensor(m, name);
@@ -361,12 +361,12 @@ bool gpu_graph_engram_stage(pulsar_gpu_graph *g, const TokId *tok, const int32_t
 }
 
 bool gpu_graph_engram_apply(pulsar_gpu_graph *g, const pulsar_model *model, const pulsar_layer_weights *layer,
-                            uint32_t il, uint32_t n_tokens) {
+                            TrunkLayer il, uint32_t n_tokens) {
     if (!layer->engram_wkv) return true;
     const pulsar_engram_model *em = g->engram.model;
-    const uint32_t l = layer->engram_slot;
+    const uint32_t l = layer->engram_slot.raw();   /* the layer's ordinal among the Engram layers: its table's index */
     if (!em || l >= em->n_layers || em->block[l] != il || !g->engram.pending[l] || g->engram.pending_n != n_tokens) {
-        fprintf(stderr, "pulsar: engram: block %u has no staged gather for this %u-row step -- refusing\n", il,
+        fprintf(stderr, "pulsar: engram: block %u has no staged gather for this %u-row step -- refusing\n", il.raw(),
                 n_tokens);
         return false;
     }
@@ -374,10 +374,10 @@ bool gpu_graph_engram_apply(pulsar_gpu_graph *g, const pulsar_model *model, cons
     g->engram.pending[l] = NULL;
     if (!got) return engram_refuse("a row gather failed (message above)");
     static bool announced[PULSAR_MAX_LAYER];
-    if (!announced[il]) {
-        announced[il] = true;
+    if (!announced[il.raw()]) {
+        announced[il.raw()] = true;
         fprintf(stderr, "pulsar: engram: block %u runs rows -> MX slot -> wkv -> gate + add (first step %u rows)\n",
-                il, n_tokens);
+                il.raw(), n_tokens);
     }
     const TensorBytes rec = TensorBytes{PULSAR_ENGRAM_ROW_BYTES}.times(PULSAR_ENGRAM_N_COLS);
     bool ok = pulsar_gpu_tensor_write(g->engram.rows, TensorBytes{0}, g->engram.host_rows[l], rec.times(n_tokens)) != 0;
@@ -387,6 +387,6 @@ bool gpu_graph_engram_apply(pulsar_gpu_graph *g, const pulsar_model *model, cons
     pulsar_gpu_act_slot_drop(g->engram.x_key);
     ok = ok && pulsar_gpu_engram_gate_add(g->batch_cur_hc, g->engram.kv, em->qk[l], NULL, n_tokens, PULSAR_N_HC,
                                           PULSAR_N_EMBD, PULSAR_RMS_EPS) != 0;
-    if (!ok) fprintf(stderr, "pulsar: engram: block %u device op failed\n", il);
+    if (!ok) fprintf(stderr, "pulsar: engram: block %u device op failed\n", il.raw());
     return ok;
 }

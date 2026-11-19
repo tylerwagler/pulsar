@@ -473,7 +473,7 @@ bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt) 
     /* The layer plan: one kind for every layer.  The per-layer attention mode
      * (SWA / compressed / indexed) stays in pulsar_attn_layout, its authority. */
     e->plan.n_layer = PULSAR_N_LAYER;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) e->plan.kind[il] = PULSAR_LAYER_DS4_BLOCK;
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) e->plan.kind[il.raw()] = PULSAR_LAYER_DS4_BLOCK;
     return true;
 }
 
@@ -518,10 +518,10 @@ bool pulsar_ds4_tp_slices(pulsar_engine *e, pulsar_tp_plan *plan) {
                pulsar_tp_plan_add1(plan, m, L->attn_output_a, PULSAR_TP_AXIS_OUT, a_lo, a_hi) &&
                pulsar_tp_plan_add1(plan, m, L->attn_output_b, PULSAR_TP_AXIS_IN, a_lo, a_hi);
     };
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const pulsar_layer_weights *L = &e->weights.layer[il];
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
+        const pulsar_layer_weights *L = &e->weights.layer[il.raw()];
         if (!attention(&e->model, L)) {
-            fprintf(stderr, "pulsar: layer %u: the attention projections do not split -- refusing\n", il);
+            fprintf(stderr, "pulsar: layer %u: the attention projections do not split -- refusing\n", il.raw());
             return false;
         }
         /* 4g-3: the attention INPUT side is row-split too -- q_a, kv, the compressor and indexer projections, each
@@ -533,14 +533,14 @@ bool pulsar_ds4_tp_slices(pulsar_engine *e, pulsar_tp_plan *plan) {
             uint32_t lo = 0, hi = 0;
             if (!pulsar_tp_owned_range(tp_rk, tp_nr, (uint32_t)out, &lo, &hi) ||
                 !pulsar_tp_plan_add1(plan, &e->model, w, PULSAR_TP_AXIS_OUT, lo, hi)) {
-                fprintf(stderr, "pulsar: layer %u: %.*s does not row-split -- refusing\n", il, (int)w->name.len,
+                fprintf(stderr, "pulsar: layer %u: %.*s does not row-split -- refusing\n", il.raw(), (int)w->name.len,
                         w->name.ptr);
                 return false;
             }
         }
         if (!tp_declare_shared_split(plan, &e->model, L, tp_rk, tp_nr) ||
             !tp_declare_expert_half(plan, &e->model, L, tp_rk, tp_nr)) {
-            fprintf(stderr, "pulsar: layer %u: the experts do not split -- refusing\n", il);
+            fprintf(stderr, "pulsar: layer %u: the experts do not split -- refusing\n", il.raw());
             return false;
         }
     }
@@ -582,8 +582,8 @@ bool pulsar_ds4_family_after_gpu(pulsar_engine *e) {
          * truthful about the mix or it defeats its own purpose. */
         uint32_t n_grouped = 0, n_tiled = 0, n_routed = 0;
         const pulsar_layer_weights *ml = NULL;
-        for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-            const pulsar_layer_weights *l = &e->weights.layer[il];
+        for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
+            const pulsar_layer_weights *l = &e->weights.layer[il.raw()];
             if (!l->ffn_gate_exps || !l->ffn_down_exps) continue;
             if (!ml) ml = l;                    /* first routed layer, for the type sample */
             n_routed++;
@@ -1641,7 +1641,7 @@ void pulsar_session::rewind(TokPos at) {
      * n_comp) and are rewritten by the next emit at that index; the clamp also
      * drops the grid checkpoints above pos (gpu_graph_set_n_comp). */
     const BankId rw_bank = gpu_graph_cur_bank(s->graph);
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const CompRows want = pulsar_comp_rows_held(pos.before(), TokPerRow{pulsar_layer_compress_ratio(il)});
         if (gpu_graph_n_comp(s->graph, rw_bank, il) > want)

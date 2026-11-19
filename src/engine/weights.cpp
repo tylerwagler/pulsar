@@ -391,7 +391,7 @@ bool weights_have_output_head(const pulsar_weights *w) {
 /// @param l the layer's tensors, or NULL
 /// @param il the layer
 /// @return true when every tensor the layer's attention mode and routing need is bound
-static bool weights_layer_has_required(const pulsar_layer_weights *l, uint32_t il) {
+static bool weights_layer_has_required(const pulsar_layer_weights *l, TrunkLayer il) {
     if (!l) return false;
     if (!l->hc_attn_fn ||
         !l->hc_attn_scale ||
@@ -420,7 +420,7 @@ static bool weights_layer_has_required(const pulsar_layer_weights *l, uint32_t i
         return false;
     }
     /* 0731: a hash-routed layer without its table cannot route at all. */
-    if (pulsar_layer_source(il) < PULSAR_N_HASH_LAYER && !l->ffn_gate_tid2eid) return false;
+    if (pulsar_layer_source(il).below(PULSAR_N_HASH_LAYER) && !l->ffn_gate_tid2eid) return false;
 
     const pulsar_layer_attn *a = pulsar_layer_attn_layout(il);
     if (pulsar_attn_owns_kv(a->mode) &&
@@ -447,8 +447,8 @@ static bool weights_layer_has_required(const pulsar_layer_weights *l, uint32_t i
 
 const pulsar_layer_weights *weights_first_bound_layer(const pulsar_weights *w) {
     if (!w) return NULL;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        if (weights_layer_has_required(&w->layer[il], il)) return &w->layer[il];
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
+        if (weights_layer_has_required(&w->layer[il.raw()], il)) return &w->layer[il.raw()];
     }
     return NULL;
 }
@@ -459,13 +459,13 @@ const pulsar_layer_weights *weights_first_bound_layer(const pulsar_weights *w) {
  * Token embedding and output head are validated when present. */
 /// @param w the weights
 /// @param layer_start first layer
-/// @param layer_end last layer, inclusive (UINT32_MAX = the last)
+/// @param layer_end last layer, inclusive (none() = the last)
 /// @param require_token_embd die without token_embd
 /// @param require_output die without the output head
 static void weights_validate_layout(
         const pulsar_weights *w,
-        uint32_t           layer_start,
-        uint32_t           layer_end,
+        TrunkLayer         layer_start,
+        TrunkLayer         layer_end,
         bool               require_token_embd,
         bool               require_output) {
     const uint64_t hc_dim = (uint64_t)PULSAR_N_EMBD * PULSAR_N_HC;
@@ -474,9 +474,9 @@ static void weights_validate_layout(
     const uint64_t out_low_dim = (uint64_t)PULSAR_N_OUT_GROUP * PULSAR_N_LORA_O;
 
     if (!w) pulsar_die("internal error: missing weights while validating layout");
-    if (layer_start >= PULSAR_N_LAYER) pulsar_die("invalid first layer in weight layout validation");
-    if (layer_end == UINT32_MAX) layer_end = PULSAR_N_LAYER - 1u;
-    if (layer_end >= PULSAR_N_LAYER || layer_end < layer_start) {
+    if (!layer_start.below(PULSAR_N_LAYER)) pulsar_die("invalid first layer in weight layout validation");
+    if (layer_end.is_none()) layer_end = TrunkLayer{PULSAR_N_LAYER - 1u};
+    if (!layer_end.below(PULSAR_N_LAYER) || layer_end < layer_start) {
         pulsar_die("invalid layer range in weight layout validation");
     }
 
@@ -505,10 +505,10 @@ static void weights_validate_layout(
             tensor_expect_mxfp8(w->output,       2, PULSAR_N_EMBD, PULSAR_N_VOCAB, 0);
     }
 
-    for (uint32_t il = layer_start; il <= layer_end; il++) {
-        const pulsar_layer_weights *l = &w->layer[il];
+    for (TrunkLayer il = layer_start; il <= layer_end; ++il) {
+        const pulsar_layer_weights *l = &w->layer[il.raw()];
         if (!weights_layer_has_required(l, il)) {
-            fprintf(stderr, "pulsar: required tensors for layer %u are missing\n", il);
+            fprintf(stderr, "pulsar: required tensors for layer %u are missing\n", il.raw());
             pulsar_load_refuse();
             return;
         }
@@ -895,18 +895,18 @@ static void validate_reap_metadata(const pulsar_model *m) {
     }
 
     pulsar_cursor c = cursor_at(m, arr.data_pos);
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         uint32_t got = 0;
         int32_t v = 0;
         const bool read = arr.type == PULSAR_META_UINT32 ? cursor_u32(&c, &got) : cursor_read(&c, &v, sizeof(v));
         if (!read) {
-            fprintf(stderr, "pulsar: %s[%u]: %s -- refusing\n", key, il, c.error);
+            fprintf(stderr, "pulsar: %s[%u]: %s -- refusing\n", key, il.raw(), c.error);
             pulsar_load_refuse();
             return;
         }
         if (arr.type == PULSAR_META_INT32) {
             if (v < 0) {
-                fprintf(stderr, "pulsar: %s[%u]=%d is negative -- refusing\n", key, il, v);
+                fprintf(stderr, "pulsar: %s[%u]=%d is negative -- refusing\n", key, il.raw(), v);
                 pulsar_load_refuse();
                 return;
             }
@@ -915,11 +915,11 @@ static void validate_reap_metadata(const pulsar_model *m) {
         if (got == 0 || got > PULSAR_N_EXPERT) {
             fprintf(stderr,
                     "pulsar: reap.layer.keep_count[%u]=%u out of range [1, %u]\n",
-                    il, got, PULSAR_N_EXPERT);
+                    il.raw(), got, PULSAR_N_EXPERT);
             pulsar_load_refuse();
             return;
         }
-        g_pulsar_layer_expert_count[il] = got;
+        g_pulsar_layer_expert_count[il.raw()] = got;
     }
 }
 
@@ -1426,24 +1426,24 @@ static void weights_bind_output(pulsar_weights *w, const pulsar_model *m) {
 /// @param[out] l the layer
 /// @param m the model
 /// @param il the layer
-static void weights_bind_layer(pulsar_layer_weights *l, const pulsar_model *m, uint32_t il) {
+static void weights_bind_layer(pulsar_layer_weights *l, const pulsar_model *m, TrunkLayer il) {
     const pulsar_layer_attn *attn = pulsar_layer_attn_layout(il);
     l->n_expert = PULSAR_N_EXPERT;
     l->n_expert_used = PULSAR_N_EXPERT_USED;
     l->n_expert_present = pulsar_layer_n_expert(il);
 
-    l->hc_attn_fn      = required_tensorf(m, "blk.%u.hc_attn_fn.weight", il);
-    l->hc_attn_scale   = required_tensorf(m, "blk.%u.hc_attn_scale.weight", il);
-    l->hc_attn_base    = required_tensorf(m, "blk.%u.hc_attn_base.weight", il);
-    l->attn_norm       = required_tensorf(m, "blk.%u.attn_norm.weight", il);
-    l->attn_q_a        = required_tensorf(m, "blk.%u.attn_q_a.weight", il);
-    l->attn_q_a_norm   = required_tensorf(m, "blk.%u.attn_q_a_norm.weight", il);
-    l->attn_q_b        = required_tensorf(m, "blk.%u.attn_q_b.weight", il);
-    l->attn_kv         = required_tensorf(m, "blk.%u.attn_kv.weight", il);
-    l->attn_kv_a_norm  = required_tensorf(m, "blk.%u.attn_kv_a_norm.weight", il);
-    l->attn_sinks      = required_tensorf(m, "blk.%u.attn_sinks.weight", il);
-    l->attn_output_a   = required_tensorf(m, "blk.%u.attn_output_a.weight", il);
-    l->attn_output_b   = required_tensorf(m, "blk.%u.attn_output_b.weight", il);
+    l->hc_attn_fn      = required_tensorf(m, "blk.%u.hc_attn_fn.weight", il.raw());
+    l->hc_attn_scale   = required_tensorf(m, "blk.%u.hc_attn_scale.weight", il.raw());
+    l->hc_attn_base    = required_tensorf(m, "blk.%u.hc_attn_base.weight", il.raw());
+    l->attn_norm       = required_tensorf(m, "blk.%u.attn_norm.weight", il.raw());
+    l->attn_q_a        = required_tensorf(m, "blk.%u.attn_q_a.weight", il.raw());
+    l->attn_q_a_norm   = required_tensorf(m, "blk.%u.attn_q_a_norm.weight", il.raw());
+    l->attn_q_b        = required_tensorf(m, "blk.%u.attn_q_b.weight", il.raw());
+    l->attn_kv         = required_tensorf(m, "blk.%u.attn_kv.weight", il.raw());
+    l->attn_kv_a_norm  = required_tensorf(m, "blk.%u.attn_kv_a_norm.weight", il.raw());
+    l->attn_sinks      = required_tensorf(m, "blk.%u.attn_sinks.weight", il.raw());
+    l->attn_output_a   = required_tensorf(m, "blk.%u.attn_output_a.weight", il.raw());
+    l->attn_output_b   = required_tensorf(m, "blk.%u.attn_output_b.weight", il.raw());
     /* The compressor lives on every kv source; the indexer's q/score weights on
      * every index source; a REUSE layer owns neither.  Which index-KEY family a
      * model uses is the profile's: V4.1 projects it from the kv source's latent
@@ -1452,24 +1452,24 @@ static void weights_bind_layer(pulsar_layer_weights *l, const pulsar_model *m, u
      * not own it is a wrong artifact. */
     if (pulsar_attn_owns_kv(attn->mode)) {
         if (g_pulsar_shape.compressor_ape) {
-            l->attn_compressor_ape = required_tensorf(m, "blk.%u.attn_compressor_ape.weight", il);
+            l->attn_compressor_ape = required_tensorf(m, "blk.%u.attn_compressor_ape.weight", il.raw());
         }
-        l->attn_compressor_kv   = required_tensorf(m, "blk.%u.attn_compressor_kv.weight", il);
-        if (attn->ratio > 1) l->attn_compressor_gate = required_tensorf(m, "blk.%u.attn_compressor_gate.weight", il);
-        l->attn_compressor_norm = required_tensorf(m, "blk.%u.attn_compressor_norm.weight", il);
+        l->attn_compressor_kv   = required_tensorf(m, "blk.%u.attn_compressor_kv.weight", il.raw());
+        if (attn->ratio > 1) l->attn_compressor_gate = required_tensorf(m, "blk.%u.attn_compressor_gate.weight", il.raw());
+        l->attn_compressor_norm = required_tensorf(m, "blk.%u.attn_compressor_norm.weight", il.raw());
         if (!g_pulsar_shape.indexer_own_compressor) {
-            l->indexer_k        = required_tensorf(m, "blk.%u.indexer.attn_k.weight", il);
-            l->indexer_k_norm   = required_tensorf(m, "blk.%u.indexer.k_norm.weight", il);
+            l->indexer_k        = required_tensorf(m, "blk.%u.indexer.attn_k.weight", il.raw());
+            l->indexer_k_norm   = required_tensorf(m, "blk.%u.indexer.k_norm.weight", il.raw());
         }
     }
     if (pulsar_attn_runs_indexer(attn->mode)) {
-        l->indexer_attn_q_b = required_tensorf(m, "blk.%u.indexer.attn_q_b.weight", il);
-        l->indexer_proj     = required_tensorf(m, "blk.%u.indexer.proj.weight", il);
+        l->indexer_attn_q_b = required_tensorf(m, "blk.%u.indexer.attn_q_b.weight", il.raw());
+        l->indexer_proj     = required_tensorf(m, "blk.%u.indexer.proj.weight", il.raw());
         if (g_pulsar_shape.indexer_own_compressor) {
-            l->indexer_compressor_ape  = required_tensorf(m, "blk.%u.indexer_compressor_ape.weight", il);
-            l->indexer_compressor_kv   = required_tensorf(m, "blk.%u.indexer_compressor_kv.weight", il);
-            l->indexer_compressor_gate = required_tensorf(m, "blk.%u.indexer_compressor_gate.weight", il);
-            l->indexer_compressor_norm = required_tensorf(m, "blk.%u.indexer_compressor_norm.weight", il);
+            l->indexer_compressor_ape  = required_tensorf(m, "blk.%u.indexer_compressor_ape.weight", il.raw());
+            l->indexer_compressor_kv   = required_tensorf(m, "blk.%u.indexer_compressor_kv.weight", il.raw());
+            l->indexer_compressor_gate = required_tensorf(m, "blk.%u.indexer_compressor_gate.weight", il.raw());
+            l->indexer_compressor_norm = required_tensorf(m, "blk.%u.indexer_compressor_norm.weight", il.raw());
         }
     }
     static const char *const attn_owned[] = {
@@ -1488,48 +1488,48 @@ static void weights_bind_layer(pulsar_layer_weights *l, const pulsar_model *m, u
     };
     for (size_t i = 0; i < sizeof(attn_owned) / sizeof(attn_owned[0]); i++) {
         char name[128];
-        const int n = snprintf(name, sizeof(name), "blk.%u.%s", il, attn_owned[i]);
+        const int n = snprintf(name, sizeof(name), "blk.%u.%s", il.raw(), attn_owned[i]);
         if (n < 0 || (size_t)n >= sizeof(name)) pulsar_die("tensor name is too long");
         if (!attn_bound[i] && model_find_tensor(m, name)) {
-            fprintf(stderr, "pulsar: layer %u carries %s but its CSA2 mode does not own it -- refusing\n", il, name);
+            fprintf(stderr, "pulsar: layer %u carries %s but its CSA2 mode does not own it -- refusing\n", il.raw(), name);
             pulsar_load_refuse();
             return;
         }
     }
-    l->hc_ffn_fn       = required_tensorf(m, "blk.%u.hc_ffn_fn.weight", il);
-    l->hc_ffn_scale    = required_tensorf(m, "blk.%u.hc_ffn_scale.weight", il);
-    l->hc_ffn_base     = required_tensorf(m, "blk.%u.hc_ffn_base.weight", il);
-    l->ffn_norm        = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
-    l->ffn_gate_inp    = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
+    l->hc_ffn_fn       = required_tensorf(m, "blk.%u.hc_ffn_fn.weight", il.raw());
+    l->hc_ffn_scale    = required_tensorf(m, "blk.%u.hc_ffn_scale.weight", il.raw());
+    l->hc_ffn_base     = required_tensorf(m, "blk.%u.hc_ffn_base.weight", il.raw());
+    l->ffn_norm        = required_tensorf(m, "blk.%u.ffn_norm.weight", il.raw());
+    l->ffn_gate_inp    = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il.raw());
     /* OPTIONAL, like the drafter's: text-only artifacts do not ship it. */
-    l->ffn_exp_probs_b = optional_tensorf(m, "blk.%u.exp_probs_b.bias", il);
+    l->ffn_exp_probs_b = optional_tensorf(m, "blk.%u.exp_probs_b.bias", il.raw());
     /* Vision-Exp only: the router adds THIS bias instead of ffn_exp_probs_b for
      * tokens whose id is >= vocab_size (image slots).  Optional for the same
      * reason as the drafter's: text-only artifacts do not ship it. */
-    l->ffn_exp_probs_b_vl = optional_tensorf(m, "blk.%u.exp_probs_b_vl.bias", il);
+    l->ffn_exp_probs_b_vl = optional_tensorf(m, "blk.%u.exp_probs_b_vl.bias", il.raw());
     /* 0731's leading layers route by token id.  Required exactly on the hash
      * layers and REFUSED on any other, so an artifact cannot carry a table that
      * would silently replace the gate's routing. */
-    if (pulsar_layer_source(il) < PULSAR_N_HASH_LAYER) {
-        l->ffn_gate_tid2eid = required_tensorf(m, "blk.%u.ffn_gate_tid2eid.weight", il);
+    if (pulsar_layer_source(il).below(PULSAR_N_HASH_LAYER)) {
+        l->ffn_gate_tid2eid = required_tensorf(m, "blk.%u.ffn_gate_tid2eid.weight", il.raw());
     } else {
         char tid_name[128];
-        const int n = snprintf(tid_name, sizeof(tid_name), "blk.%u.ffn_gate_tid2eid.weight", il);
+        const int n = snprintf(tid_name, sizeof(tid_name), "blk.%u.ffn_gate_tid2eid.weight", il.raw());
         if (n < 0 || (size_t)n >= sizeof(tid_name)) pulsar_die("tensor name is too long");
         if (model_find_tensor(m, tid_name)) {
             fprintf(stderr, "pulsar: layer %u carries ffn_gate_tid2eid but only the first %u "
                             "layers are hash-routed -- refusing\n",
-                    il, (unsigned)PULSAR_N_HASH_LAYER);
+                    il.raw(), (unsigned)PULSAR_N_HASH_LAYER);
             pulsar_load_refuse();
             return;
         }
     }
-    l->ffn_gate_exps   = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
-    l->ffn_up_exps     = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
-    l->ffn_down_exps   = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
-    l->ffn_gate_shexp  = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
-    l->ffn_up_shexp    = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
-    l->ffn_down_shexp  = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
+    l->ffn_gate_exps   = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il.raw());
+    l->ffn_up_exps     = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il.raw());
+    l->ffn_down_exps   = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il.raw());
+    l->ffn_gate_shexp  = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il.raw());
+    l->ffn_up_shexp    = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il.raw());
+    l->ffn_down_shexp  = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il.raw());
 
     /* A LAYER'S TENSORS MUST ALL LIVE IN ONE MAPPING.  A safetensors checkpoint
      * is one file per layer, and the kernels resolve a weight as
@@ -1567,11 +1567,11 @@ void weights_bind(pulsar_weights *w, const pulsar_model *m) {
     w->token_embd = required_tensor(m, "token_embd.weight");
     weights_bind_output(w, m);
 
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        weights_bind_layer(&w->layer[il], m, il);
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
+        weights_bind_layer(&w->layer[il.raw()], m, il);
     }
 
-    weights_validate_layout(w, 0, PULSAR_N_LAYER - 1u, true, true);
+    weights_validate_layout(w, TrunkLayer{0u}, TrunkLayer{PULSAR_N_LAYER - 1u}, true, true);
 }
 
 
@@ -1606,8 +1606,8 @@ static void dspark_weights_validate_layout(const pulsar_dspark_weights *w) {
     tensor_expect_mxfp8(w->main_proj, 2, 3ull * E, E, 0);
     tensor_expect_f32_or_bf16(w->main_norm, 1, E, 0, 0);
 
-    for (int li = 0; li < 3; li++) {
-        const pulsar_layer_weights *l = &w->layer[li];
+    for (DraftLayer li{0u}; li.below(3); ++li) {
+        const pulsar_layer_weights *l = &w->layer[li.raw()];
         tensor_expect_plain_layout(l->hc_attn_fn, 2, hc_dim, hc_mix_dim, 0);
         tensor_expect_layout(l->hc_attn_scale, PULSAR_TENSOR_F32, 1, 3, 0, 0);
         tensor_expect_layout(l->hc_attn_base, PULSAR_TENSOR_F32, 1, hc_mix_dim, 0, 0);
@@ -1695,28 +1695,28 @@ void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m) {
     w->main_proj = required_tensor(m, "dspark.main_proj.weight");
     w->main_norm = required_tensor(m, "dspark.main_norm.weight");
 
-    for (int li = 0; li < 3; li++) {
-        pulsar_layer_weights *l = &w->layer[li];
+    for (DraftLayer li{0u}; li.below(3); ++li) {
+        pulsar_layer_weights *l = &w->layer[li.raw()];
         l->n_expert = PULSAR_N_DSPARK_EXPERT;
         l->n_expert_used = PULSAR_N_DSPARK_EXPERT_USED;
         l->n_expert_present = PULSAR_N_DSPARK_EXPERT;
-        l->hc_attn_fn      = required_tensorf(m, "dspark.%d.hc_attn_fn.weight", li);
-        l->hc_attn_scale   = required_tensorf(m, "dspark.%d.hc_attn_scale.weight", li);
-        l->hc_attn_base    = required_tensorf(m, "dspark.%d.hc_attn_base.weight", li);
-        l->attn_norm       = required_tensorf(m, "dspark.%d.attn_norm.weight", li);
-        l->attn_q_a        = required_tensorf(m, "dspark.%d.attn_q_a.weight", li);
-        l->attn_q_a_norm   = required_tensorf(m, "dspark.%d.attn_q_a_norm.weight", li);
-        l->attn_q_b        = required_tensorf(m, "dspark.%d.attn_q_b.weight", li);
-        l->attn_kv         = required_tensorf(m, "dspark.%d.attn_kv.weight", li);
-        l->attn_kv_a_norm  = required_tensorf(m, "dspark.%d.attn_kv_a_norm.weight", li);
-        l->attn_sinks      = required_tensorf(m, "dspark.%d.attn_sinks.weight", li);
-        l->attn_output_a   = required_tensorf(m, "dspark.%d.attn_output_a.weight", li);
-        l->attn_output_b   = required_tensorf(m, "dspark.%d.attn_output_b.weight", li);
-        l->hc_ffn_fn       = required_tensorf(m, "dspark.%d.hc_ffn_fn.weight", li);
-        l->hc_ffn_scale    = required_tensorf(m, "dspark.%d.hc_ffn_scale.weight", li);
-        l->hc_ffn_base     = required_tensorf(m, "dspark.%d.hc_ffn_base.weight", li);
-        l->ffn_norm        = required_tensorf(m, "dspark.%d.ffn_norm.weight", li);
-        l->ffn_gate_inp    = required_tensorf(m, "dspark.%d.ffn_gate_inp.weight", li);
+        l->hc_attn_fn      = required_tensorf(m, "dspark.%d.hc_attn_fn.weight", li.raw());
+        l->hc_attn_scale   = required_tensorf(m, "dspark.%d.hc_attn_scale.weight", li.raw());
+        l->hc_attn_base    = required_tensorf(m, "dspark.%d.hc_attn_base.weight", li.raw());
+        l->attn_norm       = required_tensorf(m, "dspark.%d.attn_norm.weight", li.raw());
+        l->attn_q_a        = required_tensorf(m, "dspark.%d.attn_q_a.weight", li.raw());
+        l->attn_q_a_norm   = required_tensorf(m, "dspark.%d.attn_q_a_norm.weight", li.raw());
+        l->attn_q_b        = required_tensorf(m, "dspark.%d.attn_q_b.weight", li.raw());
+        l->attn_kv         = required_tensorf(m, "dspark.%d.attn_kv.weight", li.raw());
+        l->attn_kv_a_norm  = required_tensorf(m, "dspark.%d.attn_kv_a_norm.weight", li.raw());
+        l->attn_sinks      = required_tensorf(m, "dspark.%d.attn_sinks.weight", li.raw());
+        l->attn_output_a   = required_tensorf(m, "dspark.%d.attn_output_a.weight", li.raw());
+        l->attn_output_b   = required_tensorf(m, "dspark.%d.attn_output_b.weight", li.raw());
+        l->hc_ffn_fn       = required_tensorf(m, "dspark.%d.hc_ffn_fn.weight", li.raw());
+        l->hc_ffn_scale    = required_tensorf(m, "dspark.%d.hc_ffn_scale.weight", li.raw());
+        l->hc_ffn_base     = required_tensorf(m, "dspark.%d.hc_ffn_base.weight", li.raw());
+        l->ffn_norm        = required_tensorf(m, "dspark.%d.ffn_norm.weight", li.raw());
+        l->ffn_gate_inp    = required_tensorf(m, "dspark.%d.ffn_gate_inp.weight", li.raw());
         /* The drafter's expert routing carries the same trained correction bias
          * as the target's layers (mtp.N.ffn.gate.bias -> dspark.N.exp_probs_b.bias,
          * F32 [n_expert]).  OPTIONAL, like the target's blk.N.exp_probs_b.bias:
@@ -1727,13 +1727,13 @@ void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m) {
          * (gpu_prefill.cpp, has_bias = ffn_exp_probs_b != NULL), which the
          * drafter now reaches through the same gpu_graph_encode_layer_ffn_batch.
          * 0731's drafter rebuild with the bias is a separate follow-up. */
-        l->ffn_exp_probs_b = optional_tensorf(m, "dspark.%d.exp_probs_b.bias", li);
-        l->ffn_gate_exps   = required_tensorf(m, "dspark.%d.ffn_gate_exps.weight", li);
-        l->ffn_up_exps     = required_tensorf(m, "dspark.%d.ffn_up_exps.weight", li);
-        l->ffn_down_exps   = required_tensorf(m, "dspark.%d.ffn_down_exps.weight", li);
-        l->ffn_gate_shexp  = required_tensorf(m, "dspark.%d.ffn_gate_shexp.weight", li);
-        l->ffn_up_shexp    = required_tensorf(m, "dspark.%d.ffn_up_shexp.weight", li);
-        l->ffn_down_shexp  = required_tensorf(m, "dspark.%d.ffn_down_shexp.weight", li);
+        l->ffn_exp_probs_b = optional_tensorf(m, "dspark.%d.exp_probs_b.bias", li.raw());
+        l->ffn_gate_exps   = required_tensorf(m, "dspark.%d.ffn_gate_exps.weight", li.raw());
+        l->ffn_up_exps     = required_tensorf(m, "dspark.%d.ffn_up_exps.weight", li.raw());
+        l->ffn_down_exps   = required_tensorf(m, "dspark.%d.ffn_down_exps.weight", li.raw());
+        l->ffn_gate_shexp  = required_tensorf(m, "dspark.%d.ffn_gate_shexp.weight", li.raw());
+        l->ffn_up_shexp    = required_tensorf(m, "dspark.%d.ffn_up_shexp.weight", li.raw());
+        l->ffn_down_shexp  = required_tensorf(m, "dspark.%d.ffn_down_shexp.weight", li.raw());
     }
 
     w->markov_w1        = required_tensor(m, "dspark.2.markov_head.markov_w1.weight");
@@ -1747,11 +1747,11 @@ void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m) {
      * hiddens the drafter conditions on (V4.1: 37, 38, 39 of 40).  No
      * derivation from the layer count -- a drafter trained on other anchors
      * would run and draft garbage. */
-    w->target_layer_ids[0] = required_u32(m, "dspark.target_layer_ids.0");
-    w->target_layer_ids[1] = required_u32(m, "dspark.target_layer_ids.1");
-    w->target_layer_ids[2] = required_u32(m, "dspark.target_layer_ids.2");
+    w->target_layer_ids[0] = TrunkLayer{required_u32(m, "dspark.target_layer_ids.0")};
+    w->target_layer_ids[1] = TrunkLayer{required_u32(m, "dspark.target_layer_ids.1")};
+    w->target_layer_ids[2] = TrunkLayer{required_u32(m, "dspark.target_layer_ids.2")};
     for (int i = 0; i < 3; i++) {
-        if (w->target_layer_ids[i] >= PULSAR_N_LAYER || (i && w->target_layer_ids[i] <= w->target_layer_ids[i - 1])) {
+        if (!w->target_layer_ids[i].below(PULSAR_N_LAYER) || (i && w->target_layer_ids[i] <= w->target_layer_ids[i - 1])) {
             pulsar_die("dspark.target_layer_ids must be ascending target layer indices");
         }
     }
@@ -1808,15 +1808,15 @@ bool vision_weights_bind(pulsar_vision_weights *w, const pulsar_model *m) {
         return false;
     }
 
-    for (uint32_t li = 0; li < PULSAR_VISION_LAYERS; li++) {
-        w->block[li].norm1     = required_tensorf(m, "vision.blocks.%u.norm1.weight", li);
-        w->block[li].wqkv      = required_tensorf(m, "vision.blocks.%u.attn.wqkv.weight", li);
-        w->block[li].wqkv_bias = required_tensorf(m, "vision.blocks.%u.attn.wqkv.bias", li);
-        w->block[li].wo        = required_tensorf(m, "vision.blocks.%u.attn.wo.weight", li);
-        w->block[li].wo_bias   = required_tensorf(m, "vision.blocks.%u.attn.wo.bias", li);
-        w->block[li].norm2     = required_tensorf(m, "vision.blocks.%u.norm2.weight", li);
-        w->block[li].w1        = required_tensorf(m, "vision.blocks.%u.mlp.w1.weight", li);
-        w->block[li].w2        = required_tensorf(m, "vision.blocks.%u.mlp.w2.weight", li);
+    for (VisLayer li{0u}; li.below(PULSAR_VISION_LAYERS); ++li) {
+        w->block[li.raw()].norm1     = required_tensorf(m, "vision.blocks.%u.norm1.weight", li.raw());
+        w->block[li.raw()].wqkv      = required_tensorf(m, "vision.blocks.%u.attn.wqkv.weight", li.raw());
+        w->block[li.raw()].wqkv_bias = required_tensorf(m, "vision.blocks.%u.attn.wqkv.bias", li.raw());
+        w->block[li.raw()].wo        = required_tensorf(m, "vision.blocks.%u.attn.wo.weight", li.raw());
+        w->block[li.raw()].wo_bias   = required_tensorf(m, "vision.blocks.%u.attn.wo.bias", li.raw());
+        w->block[li.raw()].norm2     = required_tensorf(m, "vision.blocks.%u.norm2.weight", li.raw());
+        w->block[li.raw()].w1        = required_tensorf(m, "vision.blocks.%u.mlp.w1.weight", li.raw());
+        w->block[li.raw()].w2        = required_tensorf(m, "vision.blocks.%u.mlp.w2.weight", li.raw());
     }
     w->n_layers = PULSAR_VISION_LAYERS;
 
@@ -1832,15 +1832,15 @@ bool vision_weights_bind(pulsar_vision_weights *w, const pulsar_model *m) {
     tensor_expect_f32_or_bf16(w->image_newline, 1, T, 0, 0);
     if (w->image_pad) tensor_expect_f32_or_bf16(w->image_pad, 1, T, 0, 0);
 
-    for (uint32_t li = 0; li < PULSAR_VISION_LAYERS; li++) {
-        tensor_expect_f32_or_bf16(w->block[li].norm1, 1, D, 0, 0);
-        tensor_expect_f32_or_bf16(w->block[li].wqkv, 2, D, 3u * D, 0);
-        tensor_expect_f32_or_bf16(w->block[li].wqkv_bias, 1, 3u * D, 0, 0);
-        tensor_expect_f32_or_bf16(w->block[li].wo, 2, D, D, 0);
-        tensor_expect_f32_or_bf16(w->block[li].wo_bias, 1, D, 0, 0);
-        tensor_expect_f32_or_bf16(w->block[li].norm2, 1, D, 0, 0);
-        tensor_expect_f32_or_bf16(w->block[li].w1, 2, D, 2u * I, 0);
-        tensor_expect_f32_or_bf16(w->block[li].w2, 2, I, D, 0);
+    for (VisLayer li{0u}; li.below(PULSAR_VISION_LAYERS); ++li) {
+        tensor_expect_f32_or_bf16(w->block[li.raw()].norm1, 1, D, 0, 0);
+        tensor_expect_f32_or_bf16(w->block[li.raw()].wqkv, 2, D, 3u * D, 0);
+        tensor_expect_f32_or_bf16(w->block[li.raw()].wqkv_bias, 1, 3u * D, 0, 0);
+        tensor_expect_f32_or_bf16(w->block[li.raw()].wo, 2, D, D, 0);
+        tensor_expect_f32_or_bf16(w->block[li.raw()].wo_bias, 1, D, 0, 0);
+        tensor_expect_f32_or_bf16(w->block[li.raw()].norm2, 1, D, 0, 0);
+        tensor_expect_f32_or_bf16(w->block[li.raw()].w1, 2, D, 2u * I, 0);
+        tensor_expect_f32_or_bf16(w->block[li.raw()].w2, 2, I, D, 0);
     }
     /* The head count must divide the width; the tower asserts it here so the
      * forward can assume a whole head_dim. */

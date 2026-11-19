@@ -91,11 +91,11 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
         pulsar_gpu_tensor_free(g->dspark_prompt_h[i]);
         pulsar_gpu_tensor_free(g->dspark_target_h_batch[i]);
     }
-    for (uint32_t il = 0; il < PULSAR_MAX_LAYER; il++) {
-        pulsar_gpu_tensor_free(g->spec_comp_kv_save[il]);
-        pulsar_gpu_tensor_free(g->spec_comp_sc_save[il]);
-        pulsar_gpu_tensor_free(g->spec_icomp_kv_save[il]);
-        pulsar_gpu_tensor_free(g->spec_icomp_sc_save[il]);
+    for (TrunkLayer il{0u}; il.below(PULSAR_MAX_LAYER); ++il) {
+        pulsar_gpu_tensor_free(g->spec_comp_kv_save[il.raw()]);
+        pulsar_gpu_tensor_free(g->spec_comp_sc_save[il.raw()]);
+        pulsar_gpu_tensor_free(g->spec_icomp_kv_save[il.raw()]);
+        pulsar_gpu_tensor_free(g->spec_icomp_sc_save[il.raw()]);
     }
     pulsar_gpu_tensor_free(g->spec_comp_scratch_row);
     pulsar_gpu_tensor_free(g->dspark_concat);
@@ -119,51 +119,51 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
     pulsar_gpu_tensor_free(g->cand_mask);
     pulsar_gpu_tensor_free(g->cand_bscore);
     pulsar_gpu_tensor_free(g->indexer_scores);
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        pulsar_gpu_tensor_free(g->layer_raw_cache[il]);
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
+        pulsar_gpu_tensor_free(g->layer_raw_cache[il.raw()]);
     }
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        pulsar_gpu_tensor_free(g->layer_attn_comp_cache[il]);
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
+        pulsar_gpu_tensor_free(g->layer_attn_comp_cache[il.raw()]);
     }
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        pulsar_gpu_tensor_free(g->layer_attn_state_kv[il]);
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
+        pulsar_gpu_tensor_free(g->layer_attn_state_kv[il.raw()]);
     }
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        pulsar_gpu_tensor_free(g->layer_attn_state_score[il]);
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
+        pulsar_gpu_tensor_free(g->layer_attn_state_score[il.raw()]);
     }
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        pulsar_gpu_tensor_free(g->layer_index_comp_cache[il]);
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
+        pulsar_gpu_tensor_free(g->layer_index_comp_cache[il.raw()]);
     }
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        pulsar_gpu_tensor_free(g->layer_index_state_kv[il]);
-        pulsar_gpu_tensor_free(g->layer_index_state_score[il]);
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
+        pulsar_gpu_tensor_free(g->layer_index_state_kv[il.raw()]);
+        pulsar_gpu_tensor_free(g->layer_index_state_score[il.raw()]);
     }
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        pulsar_gpu_tensor_free(g->spec_attn_state_kv[il]);
-        pulsar_gpu_tensor_free(g->spec_attn_state_score[il]);
-        pulsar_gpu_tensor_free(g->spec_index_state_kv[il]);
-        pulsar_gpu_tensor_free(g->spec_index_state_score[il]);
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
+        pulsar_gpu_tensor_free(g->spec_attn_state_kv[il.raw()]);
+        pulsar_gpu_tensor_free(g->spec_attn_state_score[il.raw()]);
+        pulsar_gpu_tensor_free(g->spec_index_state_kv[il.raw()]);
+        pulsar_gpu_tensor_free(g->spec_index_state_score[il.raw()]);
     }
     /* Bank-pool slabs (the layer_* pointers freed above were views into
      * these when the pool was enabled; view frees release no memory). */
-    for (uint32_t il = 0; il < PULSAR_MAX_LAYER; il++) {
-        pulsar_gpu_tensor_free(g->banks.raw[il]);
+    for (TrunkLayer il{0u}; il.below(PULSAR_MAX_LAYER); ++il) {
+        pulsar_gpu_tensor_free(g->banks.raw[il.raw()]);
         /* Per-bank split comp/index allocations (increment 2a): each bank is its
          * own cudaMallocManaged so the eviction guard can cudaFree it directly. */
         for (uint32_t bk = 0; bk < PULSAR_MSEQ_MAX; bk++) {
-            pulsar_gpu_tensor_free(g->banks.comp[il][bk]);
-            pulsar_gpu_tensor_free(g->banks.index[il][bk]);
+            pulsar_gpu_tensor_free(g->banks.comp[il.raw()][bk]);
+            pulsar_gpu_tensor_free(g->banks.index[il.raw()][bk]);
         }
-        pulsar_gpu_tensor_free(g->banks.comp_bases[il]);
-        pulsar_gpu_tensor_free(g->banks.index_bases[il]);
-        pulsar_gpu_tensor_free(g->banks.askv[il]);
-        pulsar_gpu_tensor_free(g->banks.assc[il]);
-        pulsar_gpu_tensor_free(g->banks.iskv[il]);
-        pulsar_gpu_tensor_free(g->banks.issc[il]);
-        pulsar_gpu_tensor_free(g->banks.spec_askv[il]);
-        pulsar_gpu_tensor_free(g->banks.spec_assc[il]);
-        pulsar_gpu_tensor_free(g->banks.spec_iskv[il]);
-        pulsar_gpu_tensor_free(g->banks.spec_issc[il]);
+        pulsar_gpu_tensor_free(g->banks.comp_bases[il.raw()]);
+        pulsar_gpu_tensor_free(g->banks.index_bases[il.raw()]);
+        pulsar_gpu_tensor_free(g->banks.askv[il.raw()]);
+        pulsar_gpu_tensor_free(g->banks.assc[il.raw()]);
+        pulsar_gpu_tensor_free(g->banks.iskv[il.raw()]);
+        pulsar_gpu_tensor_free(g->banks.issc[il.raw()]);
+        pulsar_gpu_tensor_free(g->banks.spec_askv[il.raw()]);
+        pulsar_gpu_tensor_free(g->banks.spec_assc[il.raw()]);
+        pulsar_gpu_tensor_free(g->banks.spec_iskv[il.raw()]);
+        pulsar_gpu_tensor_free(g->banks.spec_issc[il.raw()]);
     }
     /* Option F per-bank drafter-ring slabs (dspark_raw_cache[i]/dspark_prompt_h[i]
      * freed above were bank views into these). */
