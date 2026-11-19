@@ -583,16 +583,27 @@ static_assert(sizeof(TextBytes) == sizeof(uint64_t) && std::is_trivial<TextBytes
  * local to out_parser::feed / find_marker, converted by out_parser::stream_at), the Markdown scanner (run lengths
  * only, no offset) and the grammar gate's trigger matchers (KMP states: prefix lengths of a PATTERN).  The scanners
  * under DeepSeek's DSML walk and under the call-body readers take a (text, index) pair like any string function; a
- * typed cursor becomes that index in one place each (walk_ix, body_ix). */
+ * typed cursor becomes that index in one place each (walk_ix, body_ix).
+ *
+ * The PROMPT side has one typed offset space of its own, with rendered text's TextBytes for its lengths:
+ *
+ *   ContentOff  an offset into ONE chat message's content text as the server holds it (chat_msg::content): where an
+ *               image's placeholder sits, where a tool reference was written.  Not an offset of the rendered prompt
+ *               the content is later copied into, nor of the content a family renderer is handed with its markers
+ *               stripped.
+ *
+ * The rendered prompt's own offsets stay as L334 P7 left them: TextBytes where a chain's or a prompt's text is
+ * measured, and the renderer's pulsar_text_span {lo, hi} uint32 pair, which the engine's tokenizers read. */
 
 /** Tag of GenBytes (never instantiated). */
 struct pulsar_gen_bytes_tag;
 /** Bytes of generated text: a length, or the distance between two offsets of one text (L437). */
 typedef pulsar_unit<pulsar_gen_bytes_tag, size_t> GenBytes;
 
-/** An offset into the text named by `Tag`, in bytes from its first byte, with GenBytes distances (L437).  Held as the
- *  size_t it replaces; SIZE_MAX (std::string::npos) is none(), "no offset". */
-template <class Tag>
+/** An offset into the text named by `Tag`, in bytes from its first byte, with `Dist` distances -- GenBytes for the
+ *  output path's texts, TextBytes for the prompt side's (L437).  Held as the size_t it replaces; SIZE_MAX
+ *  (std::string::npos) is none(), "no offset". */
+template <class Tag, class Dist = GenBytes>
 class pulsar_text_off {
     /// The raw value of none().
     static constexpr size_t kNone = std::numeric_limits<size_t>::max();
@@ -630,31 +641,31 @@ public:
     /** The offset past the first `n` bytes (offset 0 plus n): where a text of that length ends.
      *  @param n the bytes before it */
     /// @return offset n
-    static constexpr pulsar_text_off after(GenBytes n) { return moved(n.raw(), "after(len)"); }
+    static constexpr pulsar_text_off after(Dist n) { return moved(n.raw(), "after(len)"); }
     /** The bytes before this offset (it minus offset 0). */
     /// @return the distance from offset 0 (fatal on none())
-    constexpr GenBytes before() const { return live("before()"), GenBytes(v_); }
+    constexpr Dist before() const { return live("before()"), Dist(v_); }
 
     /** An offset moved forward by a length. */
-    friend constexpr pulsar_text_off operator+(pulsar_text_off p, GenBytes d) {
+    friend constexpr pulsar_text_off operator+(pulsar_text_off p, Dist d) {
         return p.live("off + len"), moved(p.v_ + d.raw(), "off + len");
     }
     /** An offset moved back by a length. */
-    friend constexpr pulsar_text_off operator-(pulsar_text_off p, GenBytes d) {
+    friend constexpr pulsar_text_off operator-(pulsar_text_off p, Dist d) {
         return p.live("off - len"), moved(p.v_ - d.raw(), "off - len");
     }
     /** The distance from b to a (size_t's: callers that must not wrap compare first, as before). */
-    friend constexpr GenBytes operator-(pulsar_text_off a, pulsar_text_off b) {
-        return a.live("off - off"), b.live("off - off"), GenBytes(a.v_ - b.v_);
+    friend constexpr Dist operator-(pulsar_text_off a, pulsar_text_off b) {
+        return a.live("off - off"), b.live("off - off"), Dist(a.v_ - b.v_);
     }
     /** Move forward in place. */
     /// @param d the length to move by
     /// @return `*this`
-    constexpr pulsar_text_off &operator+=(GenBytes d) { return *this = *this + d; }
+    constexpr pulsar_text_off &operator+=(Dist d) { return *this = *this + d; }
     /** Move back in place. */
     /// @param d the length to move by
     /// @return `*this`
-    constexpr pulsar_text_off &operator-=(GenBytes d) { return *this = *this - d; }
+    constexpr pulsar_text_off &operator-=(Dist d) { return *this = *this - d; }
     /** Equal (none() equals none() only). */
     friend constexpr bool operator==(pulsar_text_off a, pulsar_text_off b) { return a.v_ == b.v_; }
     /** Not equal. */
@@ -693,6 +704,10 @@ typedef pulsar_text_off<pulsar_gen_off_tag> GenOff;
 typedef pulsar_text_off<pulsar_stream_off_tag> StreamOff;
 /** An offset into an open tool call's body, as its out_call_body reader is handed it (L437). */
 typedef pulsar_text_off<pulsar_body_off_tag> BodyOff;
+/** Tag of ContentOff (never instantiated). */
+struct pulsar_content_off_tag;
+/** An offset into one chat message's content text (chat_msg::content), with TextBytes distances (L437). */
+typedef pulsar_text_off<pulsar_content_off_tag, TextBytes> ContentOff;
 
 static_assert(sizeof(GenBytes) == sizeof(size_t) && sizeof(GenOff) == sizeof(size_t) &&
                   sizeof(StreamOff) == sizeof(size_t) && std::is_trivial<GenBytes>::value &&
@@ -722,6 +737,15 @@ static_assert(!std::is_convertible<size_t, GenOff>::value && !std::is_convertibl
                   !std::is_convertible<size_t, GenBytes>::value && !std::is_convertible<GenBytes, size_t>::value &&
                   !std::is_convertible<int, GenOff>::value && !std::is_convertible<int, GenBytes>::value,
               "no implicit way in or out of a bare integer");
+static_assert(sizeof(ContentOff) == sizeof(size_t) && std::is_trivial<ContentOff>::value &&
+                  !std::is_constructible<ContentOff, GenOff>::value && !std::is_constructible<GenOff, ContentOff>::value &&
+                  !std::is_constructible<ContentOff, BodyOff>::value &&
+                  !std::is_constructible<ContentOff, StreamOff>::value &&
+                  !std::is_constructible<ContentOff, TextBytes>::value &&
+                  !std::is_constructible<TextBytes, ContentOff>::value &&
+                  !std::is_constructible<ContentOff, GenBytes>::value &&
+                  !std::is_convertible<size_t, ContentOff>::value && !std::is_convertible<ContentOff, size_t>::value,
+              "a message content's offset is no offset of generated text and no length, and enters by name only");
 /* ==== L437: offsets into the texts of the OUTPUT path (end) ======================================================== */
 
 #endif

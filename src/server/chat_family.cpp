@@ -445,7 +445,7 @@ bool chat_strip_image_markers(const chat_msg *m, chat_msg_images *out, char *err
     const size_t n = strlen(c), ph = strlen(PULSAR_IMAGE_PLACEHOLDER);
     size_t at = 0;
     for (int k = 0; k < m->images_len; k++) {
-        const size_t off = m->image_ph_off[k];
+        const size_t off = content_ix(m->image_ph_off[k]);
         out->content.append(c + at, off - at);
         out->at.push_back((uint32_t)out->content.size());
         at = off + ph;
@@ -553,15 +553,15 @@ bool chat_expand_tool_refs(chat_conversation *c, const request *r, char *err, si
         const size_t n = strlen(src);
         buf out = {0};
         size_t at = 0;
-        std::vector<size_t> moved(m->image_ph_off, m->image_ph_off + m->images_len);
+        std::vector<ContentOff> moved(m->image_ph_off, m->image_ph_off + m->images_len);
         for (int k = 0; k < m->tool_refs_len;) {
-            const size_t off = std::min(m->tool_ref_off[k], n);
+            const size_t off = std::min(content_ix(m->tool_ref_off[k]), n);
             buf_append(&out, src + at, off - at);
             at = off;
             const size_t before = out.len;
             /* the run of references at this offset, in order; consecutive deferred ones are ONE block of definitions */
             buf lines = {0};
-            for (; k < m->tool_refs_len && std::min(m->tool_ref_off[k], n) == off; k++) {
+            for (; k < m->tool_refs_len && std::min(content_ix(m->tool_ref_off[k]), n) == off; k++) {
                 char *line = deferred_tool_line(c, m->tool_ref_name[k]);
                 if (line) {
                     if (lines.len) buf_putc(&lines, '\n');
@@ -582,7 +582,7 @@ bool chat_expand_tool_refs(chat_conversation *c, const request *r, char *err, si
             }
             /* every image placeholder at or after the run moves by what it wrote */
             for (int q = 0; q < m->images_len; q++)
-                if (m->image_ph_off[q] >= off) moved[(size_t)q] += out.len - before;
+                if (content_ix(m->image_ph_off[q]) >= off) moved[(size_t)q] += TextBytes{out.len - before};
         }
         buf_append(&out, src + at, n - at);
         for (int q = 0; q < m->images_len; q++) m->image_ph_off[q] = moved[(size_t)q];

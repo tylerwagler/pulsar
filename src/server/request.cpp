@@ -196,12 +196,12 @@ void chat_msg_clear_images(chat_msg *m) {
  * `content`.  Both are pushed together so an image and its offset cannot
  * desync; `placeholder_off` is the offset the placeholder was (or is about to
  * be) written at. */
-void chat_msg_add_image(chat_msg *m, uint8_t *bytes, size_t len, size_t placeholder_off) {
+void chat_msg_add_image(chat_msg *m, uint8_t *bytes, size_t len, ContentOff placeholder_off) {
     if (m->images_len == m->images_cap) {
         m->images_cap = m->images_cap ? m->images_cap * 2 : 4;
         m->images = (chat_image *)server_xrealloc(m->images,
                                                   (size_t)m->images_cap * sizeof(m->images[0]));
-        m->image_ph_off = (size_t *)server_xrealloc(m->image_ph_off,
+        m->image_ph_off = (ContentOff *)server_xrealloc(m->image_ph_off,
                                                     (size_t)m->images_cap * sizeof(m->image_ph_off[0]));
     }
     m->images[m->images_len].bytes = bytes;
@@ -220,7 +220,7 @@ bool chat_msg_image_offsets_check(const chat_msg *m, char *err, size_t errlen) {
     const size_t n = strlen(c), ph = strlen(PULSAR_IMAGE_PLACEHOLDER);
     size_t at = 0;
     for (int k = 0; k < m->images_len; k++) {
-        const size_t off = m->image_ph_off ? m->image_ph_off[k] : SIZE_MAX;
+        const size_t off = m->image_ph_off ? content_ix(m->image_ph_off[k]) : SIZE_MAX;
         if (off == SIZE_MAX || off > n || n - off < ph || memcmp(c + off, PULSAR_IMAGE_PLACEHOLDER, ph)) {
             snprintf(err, errlen, "image %d of a message has no placeholder at its offset", k);
             return false;
@@ -238,10 +238,10 @@ bool chat_msg_image_offsets_check(const chat_msg *m, char *err, size_t errlen) {
 
 
 /* L325: one tool_reference at byte `off` of the message's content (chat_msg::tool_ref_off). */
-void chat_msg_add_tool_ref(chat_msg *m, size_t off, const char *name) {
+void chat_msg_add_tool_ref(chat_msg *m, ContentOff off, const char *name) {
     if (m->tool_refs_len == m->tool_refs_cap) {
         m->tool_refs_cap = m->tool_refs_cap ? m->tool_refs_cap * 2 : 4;
-        m->tool_ref_off = (size_t *)server_xrealloc(m->tool_ref_off, (size_t)m->tool_refs_cap * sizeof(size_t));
+        m->tool_ref_off = (ContentOff *)server_xrealloc(m->tool_ref_off, (size_t)m->tool_refs_cap * sizeof(ContentOff));
         m->tool_ref_name = (char **)server_xrealloc(m->tool_ref_name, (size_t)m->tool_refs_cap * sizeof(char *));
     }
     m->tool_ref_off[m->tool_refs_len] = off;
@@ -1941,7 +1941,7 @@ bool server_add_image_block(chat_msg *msg, const char *url, buf *out,
     size_t n = 0;
     uint8_t *bytes = server_decode_image_data_url(url, &n, err, errlen);
     if (!bytes) return false;
-    chat_msg_add_image(msg, bytes, n, out->len);
+    chat_msg_add_image(msg, bytes, n, content_end(out->len));
     buf_puts(out, PULSAR_IMAGE_PLACEHOLDER);
     return true;
 }
@@ -2291,7 +2291,8 @@ static bool anthropic_tool_result_read(chat_msg *part, const char *content_raw, 
                     const bool ok = parse_anthropic_content_block(&rp, NULL, &inner, err, errlen);
                     /* L325: a tool_reference's position moves with the text it sits in */
                     for (int k = 0; ok && k < inner.tool_refs_len; k++)
-                        chat_msg_add_tool_ref(part, out.len + inner.tool_ref_off[k], inner.tool_ref_name[k]);
+                        chat_msg_add_tool_ref(part, content_end(out.len) + inner.tool_ref_off[k].before(),
+                                              inner.tool_ref_name[k]);
                     if (ok && inner.content) buf_puts(&out, inner.content);
                     chat_msg_free(&inner);
                     free(raw);
@@ -2559,7 +2560,7 @@ static bool parse_anthropic_content_block(const char **p, chat_msgs *parts, chat
             snprintf(err, errlen, "malformed base64 in the image source data");
             goto bad;
         }
-        const size_t ph_off = msg->content ? strlen(msg->content) : 0;
+        const ContentOff ph_off = content_end(msg->content ? strlen(msg->content) : 0);
         chat_msg_add_image(msg, bytes, n, ph_off);
         buf b = {0};
         buf_puts(&b, msg->content ? msg->content : "");
@@ -2600,7 +2601,7 @@ static bool parse_anthropic_content_block(const char **p, chat_msgs *parts, chat
         /* Tool search loaded this tool.  L325: only its position is read here (the tools array may follow the
          * messages); chat_expand_tool_refs writes the definition, or a notice, there before the family renders. */
         if (!msg->content) msg->content = server_xstrdup("");
-        chat_msg_add_tool_ref(msg, strlen(msg->content), tool_name ? tool_name : "(unnamed)");
+        chat_msg_add_tool_ref(msg, content_end(strlen(msg->content)), tool_name ? tool_name : "(unnamed)");
     } else if (type && !strcmp(type, "redacted_thinking")) {
         /* Encrypted reasoning only Anthropic's API can read.  It arrives only
          * in history produced there (a resumed session); nothing here can use

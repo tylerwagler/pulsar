@@ -371,7 +371,7 @@ static void test_responses_input_tool_search_output_loads_tools(void) {
     TEST_ASSERT(!strcmp(msgs.v[0].calls.v[0].name, "tool_search"));
     /* L326: the item's message references the loaded tool (rendered there, chat_expand_tool_refs), not its JSON */
     TEST_ASSERT(msgs.v[1].content && !msgs.v[1].content[0]);
-    TEST_ASSERT(msgs.v[1].tool_refs_len == 1 && msgs.v[1].tool_ref_off[0] == 0 &&
+    TEST_ASSERT(msgs.v[1].tool_refs_len == 1 && msgs.v[1].tool_ref_off[0] == ContentOff{0} &&
                 !strcmp(msgs.v[1].tool_ref_name[0], "mcp__perplexity__perplexity_search"));
 
     buf_free(&loaded);
@@ -3847,8 +3847,8 @@ static chat_msg qwen_test_image_msg(const char *role, const char *before, const 
     std::string c = std::string(before) + PULSAR_IMAGE_PLACEHOLDER + after;
     chat_msg m = qwen_test_msg(role, c.c_str());
     m.images = (chat_image *)calloc(1, sizeof(chat_image));
-    m.image_ph_off = (size_t *)malloc(sizeof(size_t));
-    m.image_ph_off[0] = strlen(before);
+    m.image_ph_off = (ContentOff *)malloc(sizeof(ContentOff));
+    m.image_ph_off[0] = content_end(strlen(before));
     m.images_len = m.images_cap = 1;
     return m;
 }
@@ -3912,8 +3912,8 @@ static void test_image_offsets_out_of_order_refuse(void) {
         for (int o = 0; o < 3; o++) {
             chat_conversation c = {};
             chat_msg m = qwen_test_msg("user", text.c_str());
-            chat_msg_add_image(&m, NULL, 0, orders[o][0]);
-            chat_msg_add_image(&m, NULL, 0, orders[o][1]);
+            chat_msg_add_image(&m, NULL, 0, ContentOff{orders[o][0]});
+            chat_msg_add_image(&m, NULL, 0, ContentOff{orders[o][1]});
             chat_msgs_push(&c.msgs, m);
             c.tool_choice = CHAT_TOOL_CHOICE_AUTO;
             request r;
@@ -10248,7 +10248,7 @@ static void test_responses_input_image_blocks(void) {
          * but not the offset renders as one client span, so the placeholder never
          * becomes an image token (the L226 defect). */
         TEST_ASSERT(msgs.v[0].image_ph_off != NULL);
-        TEST_ASSERT(!strncmp(msgs.v[0].content + msgs.v[0].image_ph_off[0],
+        TEST_ASSERT(!strncmp(msgs.v[0].content + content_ix(msgs.v[0].image_ph_off[0]),
                              PULSAR_IMAGE_PLACEHOLDER, strlen(PULSAR_IMAGE_PLACEHOLDER)));
         /* Text first, then the sentinel where the image block sat. */
         TEST_ASSERT(strstr(msgs.v[0].content, "look") == msgs.v[0].content);
@@ -10365,7 +10365,7 @@ static void test_multi_image_blocks_and_offsets(void) {
              * a placeholder. */
             TEST_ASSERT(msgs.v[0].image_ph_off[0] < msgs.v[0].image_ph_off[1]);
             for (int i = 0; i < 2; i++) {
-                TEST_ASSERT(!strncmp(msgs.v[0].content + msgs.v[0].image_ph_off[i],
+                TEST_ASSERT(!strncmp(msgs.v[0].content + content_ix(msgs.v[0].image_ph_off[i]),
                                      PULSAR_IMAGE_PLACEHOLDER, ph_len));
             }
             int occurrences = 0;
@@ -10421,7 +10421,7 @@ static void test_multi_image_blocks_and_offsets(void) {
     if (rmsgs.v[0].image_ph_off) {
         TEST_ASSERT(rmsgs.v[0].image_ph_off[0] < rmsgs.v[0].image_ph_off[1]);
         for (int i = 0; i < rmsgs.v[0].images_len; i++) {
-            TEST_ASSERT(!strncmp(rmsgs.v[0].content + rmsgs.v[0].image_ph_off[i],
+            TEST_ASSERT(!strncmp(rmsgs.v[0].content + content_ix(rmsgs.v[0].image_ph_off[i]),
                                  PULSAR_IMAGE_PLACEHOLDER, ph_len));
         }
     }
@@ -10460,7 +10460,7 @@ static void test_image_placeholder_is_not_client_text(void) {
         /* The parser recorded where IT put the placeholder (the content keeps
          * going after it: "before" + placeholder + "after"). */
         TEST_ASSERT(msgs.v[0].image_ph_off != NULL);
-        TEST_ASSERT(!strncmp(msgs.v[0].content + msgs.v[0].image_ph_off[0],
+        TEST_ASSERT(!strncmp(msgs.v[0].content + content_ix(msgs.v[0].image_ph_off[0]),
                              PULSAR_IMAGE_PLACEHOLDER, ph_len));
 
         pulsar_text_span *spans = NULL;
@@ -21700,6 +21700,23 @@ static_assert(std::is_invocable_v<decltype(&out_call_body::grow), out_call_body 
                                       std::vector<out_event> *, out_call *, const char **, BodyOff *> &&
                   std::is_same_v<decltype(body_ix(BodyOff{})), size_t>,
               "the body readers take the kit's held bytes as a length and report where a reading stopped as a BodyOff");
+
+/* L437: a chat message's content offsets (ContentOff: where an image's placeholder or a tool reference sits) -- no
+ * offset of generated text, of a call body or of a parser's stream passes for one, nor a length or an integer; it
+ * moves by rendered text's TextBytes, not by GenBytes. */
+static_assert(!l334_passes<ContentOff, GenOff> && !l334_passes<GenOff, ContentOff> && !l334_passes<size_t, ContentOff> &&
+                  !l334_passes<ContentOff, size_t> && !l334_passes<TextBytes, ContentOff> &&
+                  !l334_passes<ContentOff, TextBytes> && !l334_passes<BodyOff, ContentOff> &&
+                  !std::is_constructible_v<ContentOff, GenOff> && !std::is_constructible_v<ContentOff, TextBytes> &&
+                  !std::is_constructible_v<TextBytes, ContentOff> && !std::is_constructible_v<ContentOff, StreamOff> &&
+                  l333_adds<ContentOff, TextBytes> && !l333_adds<ContentOff, GenBytes> && !l333_adds<GenOff, TextBytes> &&
+                  !l333_adds<ContentOff, size_t> && !l333_orders<ContentOff, GenOff> && !l333_equates<ContentOff, size_t> &&
+                  std::is_same_v<decltype(ContentOff{} - ContentOff{}), TextBytes> &&
+                  std::is_same_v<decltype(ContentOff{}.before()), TextBytes> &&
+                  std::is_same_v<decltype(chat_msg{}.image_ph_off), ContentOff *> &&
+                  std::is_same_v<decltype(chat_msg{}.tool_ref_off), ContentOff *> &&
+                  (ContentOff{9} + TextBytes{4}).raw() == 13 && ContentOff::after(TextBytes{7}) == ContentOff{7},
+              "a message content's offset mixes with no other text's and moves by TextBytes; the message carries them");
 
 /* L334 fix: what a state at live position G serves of the request across a token seam -- the conversion both the
  * bank's own resume (pulsar_session_bank_resume_at) and an adopt's rank (pulsar_session_bank_adopt_score) now read.

@@ -403,7 +403,7 @@ typedef struct {
      * to resolve them to the image token -- the surrounding client text keeps
      * its BPE-only span.  A placeholder occurrence the CLIENT typed is not in
      * this list and therefore stays ordinary text (the L223 invariant). */
-    size_t *image_ph_off; ///< owned, `images_len` entries
+    ContentOff *image_ph_off; ///< owned, `images_len` entries
     char *reasoning;      ///< the assistant's reasoning for this turn, owned; NULL when absent
     char *tool_call_id;   ///< for a tool-result message, the call it answers, owned
     char **tool_call_ids; ///< for a multi-result message, the calls it answers, owned
@@ -428,7 +428,7 @@ typedef struct {
      * prompt's tools block -- so a tool loaded mid-conversation leaves every earlier byte as it was;
      * chat_expand_tool_refs writes them into `content` before the family renders (any other name renders its
      * notice).  Parallel arrays, owned. */
-    size_t *tool_ref_off;
+    ContentOff *tool_ref_off;
     /// per reference: the tool it names (owned, NUL-terminated); parallel to tool_ref_off
     char **tool_ref_name;
     /// references present
@@ -4950,7 +4950,7 @@ void chat_msg_add_tool_call_id(chat_msg *m, const char *id);
 /// @param bytes            the encoded file, ownership taken
 /// @param len              its length, bytes
 /// @param placeholder_off  the placeholder's byte offset in m->content
-void chat_msg_add_image(chat_msg *m, uint8_t *bytes, size_t len, size_t placeholder_off);
+void chat_msg_add_image(chat_msg *m, uint8_t *bytes, size_t len, ContentOff placeholder_off);
 /** L335: every image's placeholder sits at its recorded offset, the offsets ascending without overlap. */
 /// @param m       the message (its content, images_len and image_ph_off)
 /// @param err     receives the reason on false
@@ -4961,7 +4961,16 @@ bool chat_msg_image_offsets_check(const chat_msg *m, char *err, size_t errlen);
 /// @param m     the message
 /// @param off   the byte offset in m->content
 /// @param name  the tool named (copied; NULL = "")
-void chat_msg_add_tool_ref(chat_msg *m, size_t off, const char *name);
+void chat_msg_add_tool_ref(chat_msg *m, ContentOff off, const char *name);
+/** L437: the end of a content text of `len` bytes, as an offset into it (where a placeholder about to be appended
+ *  will sit). */
+/// @param len  the content's length so far, bytes
+/// @return the offset one past its last byte
+static inline ContentOff content_end(size_t len) { return ContentOff::after(TextBytes{len}); }
+/** L437: a content offset as the index the string functions under a reader take -- the ONE place it leaves its type. */
+/// @param at  an offset into a message's content
+/// @return it as a byte index
+static inline size_t content_ix(ContentOff at) { return at.raw(); }
 /** L325: drop the message's tool_reference records (chat_expand_tool_refs has written them). */
 /// @param m  the message
 void chat_msg_clear_tool_refs(chat_msg *m);
