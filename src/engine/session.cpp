@@ -1598,6 +1598,25 @@ PromptToks pulsar_tokens_prompt_held_with(pulsar_token_text_fn text, void *ud, c
     return PromptToks{j};
 }
 
+int pulsar_tokens_in_text_with(pulsar_token_piece_fn piece, void *ud, const TokId *tokens, int len, const char *text,
+                               TextBytes end) {
+    if (!piece || !tokens || !text) return 0;
+    const size_t lim = (size_t)end.raw();
+    size_t off = 0;
+    int i = 0;
+    while (i < len && off < lim) {   /* at `end` the count stops: a piece there would lie past it, or have no bytes */
+        size_t n = 0;
+        int span = 1;
+        char *t = piece(ud, tokens, len, i, &n, &span);
+        const bool held = t && span > 0 && n <= lim - off && (n == 0 || !memcmp(text + off, t, n));
+        free(t);
+        if (!held) break;
+        off += n;
+        i += span;
+    }
+    return i;
+}
+
 void pulsar_session::prefix_match(const pulsar_tokens *prompt,
                                  pulsar_prefix_match *out) {
     auto *s = this;

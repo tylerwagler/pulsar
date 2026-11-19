@@ -1288,8 +1288,8 @@ typedef struct request {
     uint64_t seed;               ///< sampling seed; 0 = unseeded
     bool stream;                 ///< deliver the response as SSE
     bool stream_include_usage;   ///< append a usage event to the stream
-    int cache_read_tokens;       ///< prompt tokens served from cache (reported back as usage)
-    int cache_write_tokens;      ///< prompt tokens written to cache (reported back as usage)
+    PromptToks cache_read_tokens;   ///< prompt tokens served from cache (reported back as usage; L434: typed)
+    PromptToks cache_write_tokens;  ///< prompt tokens written to cache (reported back as usage)
     /** L417: generated tokens of this chat that were emitted inside a reasoning block, across decode attempts as the
      *  reported completion tokens are (reasoning_usage_note counts them; reported back as usage: OpenAI's
      *  completion_tokens_details / output_tokens_details). */
@@ -1817,8 +1817,8 @@ PromptToks server_resume_memory_depth(PromptToks own, PromptToks adopt);
  *  else the bank's own state. */
 /// @param own           the depth the bank's own state serves, the request's tokens (L334 P7: prompt-side)
 /// @param adopt         the deepest adoptable checkpoint, the request's tokens (0 = none)
-/// @param disk          the disk chain's end as the request's tokens (0 = none) -- a chain's end is a live-side
-///                      position; its caller crosses it, marked (L334 P7: P1's reported mix-up)
+/// @param disk          the request's tokens the disk chain holds (server::kv_chain_served; 0 = none) -- never the
+///                      chain's own end, which counts its writer's tokens (L434)
 /// @param disk_verdict  the chain's restore verdict
 /// @return the pick
 resume_pick server_resume_pick(PromptToks own, PromptToks adopt, PromptToks disk, kv_restore_verdict disk_verdict);
@@ -1830,6 +1830,14 @@ resume_pick server_resume_pick(PromptToks own, PromptToks adopt, PromptToks disk
  *  @param bank_kept the restore never wrote the bank
  *  @return RESUME_OWN or RESUME_ADOPT */
 resume_pick server_failed_restore_pick(PromptToks own, PromptToks adopt, bool bank_kept);
+/** L434: does a chain whose text ends at byte `chain_text_end` of a request's rendered text end at that text's end
+ *  (`text_len`)?  Such a chain serves the whole prompt and cannot be resumed (L353 no. 15).  Asked of the text, the
+ *  one position a chain and a request share: the chain's token end is its writer's count and the prompt's length the
+ *  request's.
+ *  @param chain_text_end the chain's text end (pulsar_segstore_seg::text_end)
+ *  @param text_len the request's rendered text, bytes
+ *  @return true when the chain covers the whole text */
+bool server_chain_ends_at_text_end(TextBytes chain_text_end, TextBytes text_len);
 
 /** L329 (a): the shared-prefix wait (after TensorFold #1321).  Requests that arrive together on a NEW shared prefix
  *  (Claude Code's subagent fan-out: a dozen requests within seconds over one ~20-25k-token preamble) all bound at
@@ -3319,15 +3327,27 @@ struct server {
     /// @param prompt_n_spans      spans in `prompt_spans`
     /// @param image_hashes        the request's image hashes, in prompt order (a chain loads past an image only on a match)
     /// @param n_images            hashes in `image_hashes`
-    /// @param base                where the bank's own state resumes the prompt, a live-side position (0 = nothing)
+    /// @param prompt              the prompt's tokens (`prompt_text` tokenised): what the chain's depth is counted on
+    /// @param own                 L434: where the bank's own state resumes the prompt, both currencies (`served` ranks
+    ///                            the chain and prices what it adds, `at` is where that prefill would start)
     /// @param effective_prompt    receives the prompt to sync: the stored tokens + the tokenized rest of the text
     /// @param loaded_key_out      receives the loaded chain's last segment key (owned; NULL on a miss); may be NULL
     /// @param responses_protocol  the request is a Responses one (the chain's tool maps are read for it)
     /// @return the position restored, TokPos{0} when nothing was (L334 P7: the int's 0 kept)
     TokPos kv_cache_try_load_text(session_slot *sl, const char *prompt_text,
                                   const pulsar_text_span *prompt_spans, uint32_t prompt_n_spans,
-                                  const uint64_t *image_hashes, int n_images, TokPos base,
-                                  pulsar_tokens *effective_prompt, char **loaded_key_out, bool responses_protocol);
+                                  const uint64_t *image_hashes, int n_images, const pulsar_tokens *prompt,
+                                  pulsar_bank_resume own, pulsar_tokens *effective_prompt, char **loaded_key_out,
+                                  bool responses_protocol);
+    /** L434: the prompt-side depth of a found chain: how many of `prompt`'s tokens the chain's text holds
+     *  (pulsar_prompt_held_by_text at the last segment's text end).  The chain's own end (kv_cache_find's return) counts
+     *  the tokens its WRITER spent on those bytes; this is what ranks it against the memory tiers, prices what it adds
+     *  and counts as the cache read.  One walk of the prompt's tokens up to the chain's end. */
+    /// @param hit          a found chain (n = 0: none)
+    /// @param prompt       the request's tokens
+    /// @param prompt_text  the request's rendered text the chain was found by
+    /// @return the request's tokens the chain holds, 0 for none
+    PromptToks kv_chain_served(const kv_chain_hit *hit, const pulsar_tokens *prompt, const char *prompt_text);
     /** L318: the stored chain a restore of `prompt_text` would load (the deepest whose text is a byte prefix of it,
      * cut at the first image `image_hashes` does not bring), nothing loaded.  @return the position it ends at -- a
      * live-side position in the chain's writer's spelling -- TokPos{0} for none (L334 P7: the int's 0 kept). */
@@ -3343,34 +3363,37 @@ struct server {
     TokPos kv_cache_find_req(const request *req, kv_chain_hit *hit);
     /** L310: the restore-vs-recompute verdict on `hit`, priced on the tokens it adds past `base` (which it must
      * exceed); counted on /metrics and logged. */
-    /// @param hit   a found chain (n > 0)
-    /// @param base_at  where the bank's own state resumes, a live-side position (clamped at 0)
+    /// @param hit      a found chain (n > 0)
+    /// @param gained   L434: the request's tokens the chain serves past the memory tiers (kv_chain_served minus the
+    ///                 memory depth; the chain's own length for a spilled bank's own history) -- the prefill it saves
+    /// @param base_at  where that prefill would start computing, a live-side position (clamped at 0)
     /// @return the verdict (also counted in kv.meter under mu)
-    kv_restore_verdict kv_cache_price(const kv_chain_hit *hit, TokPos base_at);
+    kv_restore_verdict kv_cache_price(const kv_chain_hit *hit, PromptToks gained, TokPos base_at);
     /** Load `hit` into the installed bank (live at the chain's end) and build the prompt to sync: the exact stored
-     * tokens + the rest of `prompt_text`.  `base` is where the bank would have resumed without it (the restored-tokens
-     * counter).  @return the position restored, TokPos{0} when a segment would not load (the bank is then invalid). */
+     * tokens + the rest of `prompt_text`.  @return the position restored, TokPos{0} when a segment would not load (the
+     * bank is then invalid). */
     /// @param hit                 the chain to load (kv_cache_find)
     /// @param prompt_text         the prompt text the chain's boundary is checked against
     /// @param prompt_spans        its text spans, for tokenizing the rest
     /// @param prompt_n_spans      spans in `prompt_spans`
-    /// @param base                where the bank would have resumed without the chain, a live-side position
+    /// @param gained              the request's tokens the chain adds (the restored-tokens counter; kv_cache_price's)
+    /// @param verify              check the chain before the load writes the bank (the bank serves some of the prompt)
     /// @param effective_prompt    receives the prompt to sync
     /// @param loaded_key_out      receives the last segment's key (owned), NULL on failure; may be NULL
     /// @param responses_protocol  the request is a Responses one
     TokPos kv_cache_load(const kv_chain_hit *hit, const char *prompt_text, const pulsar_text_span *prompt_spans,
-                         uint32_t prompt_n_spans, TokPos base, pulsar_tokens *effective_prompt, char **loaded_key_out,
-                         bool responses_protocol);
+                         uint32_t prompt_n_spans, PromptToks gained, bool verify, pulsar_tokens *effective_prompt,
+                         char **loaded_key_out, bool responses_protocol);
     /** L330: start a load of `hit` (nothing read yet); `sliced` prices each segment's read for
      *  server_restore_slice_segments (a one-shot load reads the chain as one slice and needs none).  L347 I3b: the
      *  chain is pinned in the store (pulsar_kvchain_pin) until kv_restore_end. */
     /// @param r       the restore to start (caller-owned; keeps a pointer to `hit`, which must outlive it)
     /// @param hit     the chain to load
-    /// @param base    where the bank's own state resumes, a live-side position (clamped at 0)
+    /// @param gained  L434: the request's tokens the chain adds over the memory tiers (the restored-tokens counter)
     /// @param sliced  price each segment's read for sliced loading
     /// @param verify  L347 I3b: check every part of the chain before the first load writes the bank (the bank holds a
     ///                history the request would resume from if the restore fails)
-    void kv_restore_begin(kv_restore *r, const kv_chain_hit *hit, TokPos base, bool sliced, bool verify);
+    void kv_restore_begin(kv_restore *r, const kv_chain_hit *hit, PromptToks gained, bool sliced, bool verify);
     /** L347 I3b: end a restore begun by kv_restore_begin, loaded or not: the chain's pin is released (idempotent).
      *  @param r the restore */
     void kv_restore_end(kv_restore *r);
@@ -3552,8 +3575,9 @@ struct server {
      *  mid-restore, the slot's own) -- the resume pick's scan, and a failed restore's look again.
      *  @param sl  the slot whose job resumes
      *  @param src the bank (-1: none)
-     *  @return the request's tokens it serves */
-    int gen_adopt_depth(const session_slot *sl, int src);
+     *  @return what it serves: `served` the request's tokens (the rank), `at` its T on the source's history (L434:
+     *          both, typed -- it returned the rank as an int its callers re-wrapped) */
+    pulsar_bank_resume gen_adopt_depth(const session_slot *sl, int src);
     /** L318 / L347 I3b: copy bank `src`'s published state into the slot's installed bank (the caller picked it) and say
      *  where the sync then resumes in `res` (cached, resumed_at, cache_source; a refused adopt leaves the bank invalid
      *  and `res` at 0).
@@ -4489,7 +4513,7 @@ typedef struct trace_cache_diag {
 typedef struct kv_restore {
     const kv_chain_hit *hit;   ///< the chain (pulsar_kvchain_find's), not owned
     int next;                  ///< segments loaded so far
-    TokPos base;               ///< where the bank resumed without the chain (the restored-tokens counter)
+    PromptToks gained;         ///< L434: the request's tokens the chain adds over the memory tiers (the restored-tokens counter)
     double read_ms;            ///< the slices' own wall time: the read the meter observes
     double slice_max_ms;       ///< the longest slice -- the longest the worker stood still for this restore
     int slices;                ///< slices read
@@ -4508,14 +4532,20 @@ typedef struct kv_restore {
  *  across a sliced disk restore when the resume pick is the disk chain (then the plan runs once the chain is in). */
 typedef struct gen_resolution {
     const pulsar_tokens *prompt_for_sync;   ///< &j->req.prompt or &g->effective_prompt
-    int cached;                             ///< tokens the bank serves the prompt from (the request's: the cache read)
+    /** The cache read: tokens of the prompt usage counts that the state serves -- the request's own tokenisation, or
+     *  a live continuation's effective prompt (L434: typed; it carried a chain's end, its writer's tokens). */
+    PromptToks cached;
+    /** L434: tokens of `prompt_for_sync` the state holds (what indexes that prompt: the cold cut's test, an image
+     *  continuation's history).  `cached` itself except after a byte-only disk match, whose sync runs the chain's
+     *  spelling (the effective prompt) while usage counts the request's own tokens. */
+    PromptToks sync_held;
     /** L334: where the sync's computed rows start on the prompt it runs (the prefill watermark, the progress line's
      *  start): a live continuation's and a disk chain's end are `cached` itself (server_live_continuation_start);
      *  across a token seam the bank's own resume and an adopt start at a live-side position that holds fewer of the
      *  request's tokens */
     TokPos resumed_at;
     const char *cache_source;               ///< which layer served them (the trace's and the log's word)
-    int disk_cached;                        ///< ... of which a disk chain loaded
+    PromptToks disk_cached;                 ///< ... of which a disk chain loaded (the request's tokens it holds)
     bool responses_live_continuation;       ///< a live Responses continuation (the effective prompt is its)
     bool anthropic_live_continuation;       ///< a live Anthropic continuation
     const char *responses_live_match;       ///< how the Responses continuation matched (the log's word)
@@ -4537,6 +4567,8 @@ struct gen_restore {
     /** L347 I3b (D7): the resume pick's in-memory sources, for a failed restore (GEN_RESTORE_RESUME): the bank's own
      *  depth (`res` holds its resolution) and the best other bank's */
     PromptToks own;
+    /** L434: the request's tokens the chain holds (server::kv_chain_served at the pick): the cache read once it is in */
+    PromptToks disk_served;
     int adopt_src;           ///< the bank adopt would copy from (-1: none)
     kv_chain_hit hit;        ///< the chain
     kv_restore r;            ///< its load
@@ -4569,7 +4601,6 @@ typedef struct server_prefill_progress {
     server *srv;         ///< owning server
     session_slot *slot;  ///< slot whose session is prefilling (worker thread)
     req_kind kind;       ///< which API shape the request arrived on
-    PromptToks prompt_tokens;   ///< the request's prompt length being prefilled (L334 P7: request-side)
     TokPos cached_tokens;       ///< where the computed rows start on the prompt the sync runs (L334 P7: live-side)
     char ctx[48];        ///< context span string, for log lines
     const char *phase;   ///< current phase name, for log lines
@@ -4750,7 +4781,12 @@ struct gen_state {
     bool responses_live_continuation;   ///< resuming a live /responses stream rather than starting one
     bool anthropic_live_continuation;   ///< resuming a live Anthropic stream
     char *disk_cache_path;            ///< KV file backing this prompt, owned; NULL when none
-    int prompt_tokens;                ///< prompt length actually prefilled
+    /** The prompt's tokens as usage reports them (L434: the request's own tokenisation; a live continuation's
+     *  effective prompt) -- not the length the sync runs, which is the stitch's (prefill_end). */
+    int prompt_tokens;
+    /** L434: where the prompt's prefill ended on the bank's history (the live side; position 0 until the main prefill
+     *  completes): what `kv req:`'s prefilled_now and the decode log's context span count from. */
+    TokPos prefill_end;
     double t0;                        ///< wall time the request began, for latency accounting
     double first_token_t;  ///< wall time the first output token was produced (TTFT); 0 until set. Request-lifetime: survives decode_again so it reflects the genuinely first token emitted.
     uint64_t trace_id;   ///< correlates every trace event for this request
@@ -6215,6 +6251,50 @@ inline TokPos server_bank_pos(pulsar_session *s, BankId bank) {
  *  @param live_pos the live history's end */
 /// @return where the sync starts
 TokPos server_live_continuation_start(TokCount common, TokPos live_pos);
+/** L434: the prefill progress line's two numbers, on one side (the live one). */
+typedef struct {
+    TokCount done;   ///< rows computed so far
+    TokCount of;     ///< rows the sync computes in all
+} prefill_display;
+/** L434: what the prefill progress line shows -- rows computed of the rows to compute -- from the three numbers the
+ *  sync itself reports on the prompt it runs (the stitch): where its computed rows start, where it stands, and that
+ *  prompt's length.  All live-side; the request's own prompt length takes no part (across a seam it is another count,
+ *  and was the total the positions were subtracted from).  A start outside the prompt, or at its end, shows the whole
+ *  prompt from 0; `done` is held within [0, of].
+ *  @param start where the computed rows start (server_prefill_progress::cached_tokens)
+ *  @param current the position the prefill stands at
+ *  @param total the length of the prompt the sync runs */
+/// @return the line's numbers
+prefill_display server_prefill_display(TokPos start, TokPos current, TokCount total);
+/** L434: the tokens of an EFFECTIVE prompt that are the bank's history up to `at` -- the one place a live-side
+ *  position becomes a count on a prompt, and only because that prompt was BUILT from the history (a live
+ *  continuation's, a loaded chain's: the history's tokens, then newly tokenised text), so its first `at` tokens are
+ *  the history's by id.  Checked, not assumed: fatal when they are not (the count would be on another spelling).
+ *  @param history the bank's tokens the prompt was built on
+ *  @param at the live position the prompt keeps the history to
+ *  @param effective the effective prompt */
+/// @return `at` as a count of the effective prompt's tokens
+PromptToks server_effective_prefix(const pulsar_tokens *history, TokPos at, const pulsar_tokens *effective);
+/** L434: a loaded chain whose tokens are the request's own first tokens (by id) holds exactly that many of the
+ *  request's tokens: the depth the pick ranked it by (server::kv_chain_served, the text walk) must be that number.
+ *  Said in the log (an error line) when it is not -- the cache read then counts the id-proven prefix.
+ *  @param served the request's tokens the chain's text held, as ranked
+ *  @param own_prefix the request's first tokens the loaded chain is, by id (server_effective_prefix) */
+/// @return true when they agree
+bool server_disk_depths_agree(PromptToks served, PromptToks own_prefix);
+/** L434: a request's usage, on one prompt. */
+typedef struct {
+    PromptToks prompt;    ///< prompt_tokens / input tokens
+    PromptToks cached;    ///< of them, served from state (cached_tokens / cache_read_input_tokens)
+    PromptToks written;   ///< of them, prefilled by this request (cache_write_tokens): prompt - cached
+} usage_split;
+/** L434: the usage of a prompt of `prompt` tokens of which `cached` were served from state: cached + written = prompt,
+ *  each >= 0.  Both counts are the same prompt's tokens (the type says so); a cache read past the prompt is a count
+ *  on another prompt and fatal -- it used to be clamped at the emitters (resolve_cache_split), which hid it.
+ *  @param prompt the prompt's tokens
+ *  @param cached of them, served from state */
+/// @return the split
+usage_split server_usage_split(PromptToks prompt, PromptToks cached);
 /* Tier-2 bank-aware frontier position of `sl`, correct whether or not sl->bank
  * is the currently-installed bank of the shared pool session (a non-live bank
  * reads its saved host carry via pulsar_session_bank_pos; the live bank reads the

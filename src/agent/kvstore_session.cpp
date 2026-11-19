@@ -162,9 +162,13 @@ int agent_kv_load(agent_worker *w, const pulsar_tokens *tokens) {
     pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
     int n = 0;
     char err[384];
-    const int cached = pulsar_kvchain_restore(w->kv, w->engine, w->session, text, text_len, NULL, 0, TokCount{0},
-                                              chain, PULSAR_KVCHAIN_MAX, &n, err, sizeof(err)).raw();
-    if (!cached && err[0]) agent_trace(w, "kv restore refused: %s", err);
+    const TokPos G = pulsar_kvchain_restore(w->kv, w->engine, w->session, text, text_len, NULL, 0, TokCount{0},
+                                            chain, PULSAR_KVCHAIN_MAX, &n, err, sizeof(err));
+    if (G == TokPos{0} && err[0]) agent_trace(w, "kv restore refused: %s", err);
+    /* L434: the caller counts this against `tokens`, so it is THEIR count the chain's text holds -- the chain's own
+     * end counts its writer's tokens (the same in a session saved and loaded on one spelling, not by law) */
+    const int cached = G > TokPos{0} ? pulsar_prompt_held_by_text(w->engine, tokens, text, chain[n - 1].text_end).raw()
+                                     : 0;
     free(text);
     return cached;
 }

@@ -264,6 +264,12 @@ overlap = true
 budget = 60   # L426: synthetic containers in /tmp and store opens; seconds
 
 [[test]]
+name = "disk-depth-gate"
+tier = "check"
+overlap = true
+budget = 60   # L434: host walks and one store in /tmp; seconds
+
+[[test]]
 name = "gen-host-gate"
 tier = "check"
 overlap = true

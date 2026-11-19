@@ -391,8 +391,8 @@ void resolve_cache_split(int *cache_read, int *cache_write, int total) {
 /// @param completion_tokens  the tokens generated
 void append_openai_usage_json(buf *b, const request *r,
                                      int prompt_tokens, int completion_tokens) {
-    int cached_tokens = r ? r->cache_read_tokens : 0;
-    int cache_write_tokens = r ? r->cache_write_tokens : 0;
+    int cached_tokens = r ? r->cache_read_tokens.raw() : 0;
+    int cache_write_tokens = r ? r->cache_write_tokens.raw() : 0;
     resolve_cache_split(&cached_tokens, &cache_write_tokens, prompt_tokens);
     /* OpenAI defines cached_tokens as prompt tokens retrieved from cache.
      * Newly-prefilled tokens are useful to expose, but they are a DS4 extension

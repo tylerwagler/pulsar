@@ -2635,7 +2635,9 @@ static void test_l375_template_refusal_is_a_result(void) {
     free(e);
 }
 
+static void test_l434_lookup_reads_the_text(void);   ///< below, with the L434 host group
 static void test_server_unit_group(void) {
+    test_l434_lookup_reads_the_text();
     pulsar_server_unit_tests_run();
     test_l334_bank_pos_and_adopt_result();
     test_l372_sync_hooks_last_one_sync();
@@ -4447,6 +4449,142 @@ static void test_kv_identity(void) {
     test_l426_engine_identity();
     test_l426_kv_identity_weights();
     test_l386_kv_identity_arithmetic();
+}
+
+/** L434: the toy vocabulary (server_tests.cpp l334_vocab) as a family tokenizer's token_text.
+ *  @param id the token  @param len receives its bytes  @return the malloc'd text ("" for an id outside the table) */
+static char *l434_token_text(pulsar_engine *, TokId id, size_t *len) {
+    const int n = (int)(sizeof l334_vocab / sizeof l334_vocab[0]);
+    if (id.raw() < 0 || id.raw() >= n) {
+        if (len) *len = 0;
+        return server_xstrdup("");
+    }
+    return l334_text(NULL, id, len);
+}
+/** Store one segment of a chain in its WRITER's tokens: [G_prev, G) rendering to `text`, with a restore point at G.
+ *  @param st the store  @param parent the parent's key ("" for a root)  @param G_prev the writer's position it
+ *  starts at  @param G the writer's position it ends at  @param text its text  @param key receives its key */
+static void l434_put(pulsar_segstore *st, const char *parent, int G_prev, int G, const std::string &text, char key[41]) {
+    l323_payload p = { (uint32_t)G_prev, (uint32_t)G, l323_rows_bytes((uint32_t)G_prev, (uint32_t)G) };
+    char err[256];
+    pulsar_segstore_child_key(parent, text.data(), TextBytes{text.size()}, key);
+    TEST_ASSERT(pulsar_segstore_put(st, parent, TokPos{G_prev}, TokPos{G}, text.data(), TextBytes{text.size()}, p.bytes,
+                                    l323_payload_write, 0, NULL, &p, key, err, sizeof err));
+    TEST_ASSERT(l323_put_rp(st, key, (uint32_t)G));
+}
+
+/* L434: the differing case through the server's own lookup, on a real store and a vocabulary (the toy one behind a
+ * family tokenizer -- no model).  A chain is found by its TEXT and ends at the tokens its writer spent; the request
+ * spends its own.  (1) the writer sampled X + 100 x (a|b|cd) + Y, 302 tokens; the request re-spells those 402 bytes
+ * in 202 tokens and adds Z (203): the chain's end, taken for the request's tokens, was "the whole prompt and more",
+ * so the lookup gave the chain up and the request prefilled cold.  (2) the other way round -- the writer's spelling
+ * the shorter -- a chain that does cover the whole prompt (202 of its tokens, 302 of the request's) passed as a
+ * resumable prefix and was loaded, though a chain at the prompt's end cannot be resumed (L353 no. 15). */
+static void test_l434_lookup_reads_the_text(void) {
+    static pulsar_family_tokenizer tk{};
+    tk.token_text = l434_token_text;
+    static pulsar_family fam{};
+    fam.name = "L434 toy vocabulary";
+    fam.tokenizer = &tk;
+    pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
+    e->family = &fam;
+    char t[] = "/tmp/pulsar-l434.XXXXXX";
+    char *dir = l323_tmpdir(t);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) { free(e); return; }
+    pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    TEST_ASSERT(st != NULL);
+    server s;
+    memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.mu, NULL);
+    s.engine = e;
+    s.kv.enabled = true;
+    s.kv.st = st;
+    kv_chain_hit *hit = (kv_chain_hit *)calloc(1, sizeof(kv_chain_hit));
+    TEST_ASSERT(hit != NULL);
+    const int y[] = {L334_Y}, yz[] = {L334_Y, L334_Z};
+    if (st && hit) {
+        /* (1) the writer's chain: one cell X + 50 stretches (151 tokens), then 50 stretches + Y (to 302) */
+        const std::vector<TokId> w_all = l434_spell(true, 100, y, 1), w_head = l434_spell(true, 50, NULL, 0);
+        const std::string w_text = l434_render(w_all), w_head_text = l434_render(w_head);
+        char k1[41], k2[41];
+        l434_put(st, "", 0, 151, w_head_text, k1);
+        l434_put(st, k1, 151, 302, w_text.substr(w_head_text.size()), k2);
+        std::vector<TokId> prompt = l434_spell(false, 100, yz, 2);
+        std::string text = l434_render(prompt);
+        request req;
+        memset(&req, 0, sizeof req);
+        req.prompt = {prompt.data(), (int)prompt.size(), (int)prompt.size()};
+        req.prompt_text = text.data();
+        const TokPos G = s.kv_cache_find_req(&req, hit);
+        /* found whole: the chain's own end is its writer's 302 ... */
+        TEST_ASSERT(hit->n == 2 && G == TokPos{302} && hit->chain[1].text_end == TextBytes{402});
+        /* ... which the old rule (the end against the prompt's token count) read as the prompt's end: given up */
+        TEST_ASSERT(!(G.raw() < req.prompt.len));
+        /* the request's tokens it holds: 202 of 203 -- the depth the pick ranks and the cache read counts */
+        const PromptToks served = s.kv_chain_served(hit, &req.prompt, req.prompt_text);
+        TEST_ASSERT(served == PromptToks{202} && served < PromptToks{req.prompt.len});
+        TEST_ASSERT(server_resume_pick(PromptToks{0}, PromptToks{0}, served, KV_RESTORE_LOAD) == RESUME_DISK);
+        const usage_split u = server_usage_split(PromptToks{req.prompt.len}, served);
+        TEST_ASSERT(u.prompt == PromptToks{203} && u.cached == PromptToks{202} && u.written == PromptToks{1});
+        /* a request that IS the chain's text (no Z): the chain ends at the prompt's end by the text, so the lookup
+         * goes below it -- to the first cell, 151 of the writer's tokens, 101 of the request's */
+        prompt.pop_back();
+        text = l434_render(prompt);
+        req.prompt = {prompt.data(), (int)prompt.size(), (int)prompt.size()};
+        req.prompt_text = text.data();
+        TEST_ASSERT(s.kv_cache_find_req(&req, hit) == TokPos{151} && hit->n == 1);
+        TEST_ASSERT(s.kv_chain_served(hit, &req.prompt, req.prompt_text) == PromptToks{101});
+        /* no chain: nothing served */
+        hit->n = 0;
+        TEST_ASSERT(s.kv_chain_served(hit, &req.prompt, req.prompt_text) == PromptToks{0});
+    }
+    if (st && hit) {
+        /* (2) a writer on the canonical spelling: a preamble cell P (another root: "Z" first), then the stretches */
+        const int z[] = {L334_Z};
+        std::vector<TokId> w_head = {l334_id(L334_Z)};
+        for (TokId id : l434_spell(false, 50, NULL, 0)) w_head.push_back(id);          /* Z X + 50 x (abc|d): 102 */
+        std::vector<TokId> w_all = w_head;
+        for (int i = 0; i < 50; i++) { w_all.push_back(l334_id(L334_ABC)); w_all.push_back(l334_id(L334_D)); }
+        w_all.push_back(l334_id(L334_Y));                                              /* 203 */
+        (void)z;
+        const std::string w_text = l434_render(w_all), w_head_text = l434_render(w_head);
+        char k1[41], k2[41];
+        l434_put(st, "", 0, 102, w_head_text, k1);
+        l434_put(st, k1, 102, 203, w_text.substr(w_head_text.size()), k2);
+        /* the request: the same bytes in the sampled spelling -- Z X + 100 x (a|b|cd) + Y, 303 tokens */
+        std::vector<TokId> prompt = {l334_id(L334_Z)};
+        for (TokId id : l434_spell(true, 100, y, 1)) prompt.push_back(id);
+        const std::string text = l434_render(prompt);
+        TEST_ASSERT(text == w_text && prompt.size() == 303);
+        request req;
+        memset(&req, 0, sizeof req);
+        req.prompt = {prompt.data(), (int)prompt.size(), (int)prompt.size()};
+        req.prompt_text = const_cast<char *>(text.data());
+        /* the old rule: the chain's 203 < the prompt's 303, "a prefix": the whole-prompt chain was returned */
+        TEST_ASSERT(203 < req.prompt.len);
+        const TokPos G = s.kv_cache_find_req(&req, hit);
+        /* now: the text says it ends at the prompt's end, and the lookup returns the point below it */
+        TEST_ASSERT(G == TokPos{102} && hit->n == 1 && !strcmp(hit->chain[0].key, k1));
+        TEST_ASSERT(s.kv_chain_served(hit, &req.prompt, req.prompt_text) == PromptToks{152});   /* Z X + 50 x 3 */
+    }
+    free(hit);
+    if (st) pulsar_segstore_close(st);
+    l323_rmdir(dir);
+    free(e);
+}
+
+/* L434: the host-only group the check tier runs (make disk-depth-gate): a stored chain's depth against the request's
+ * own tokens -- the text walk, the lookup's end-of-prompt rule on a real store, the pick's rank, usage, the progress
+ * line and the `kv req:` fields, each on a case where the two counts differ (server_tests.cpp). */
+static void test_disk_depth(void) {
+    test_l434_text_position_on_each_spelling();
+    test_l434_lookup_reads_the_text();
+    test_l434_pick_ranks_the_requests_tokens();
+    test_l434_usage_is_one_prompts();
+    test_l434_progress_line_is_live_side();
+    test_l434_kv_req_fields_are_consistent();
+    test_l334_prompt_held_across_a_seam();
 }
 
 /* L430: the host-only group the check tier runs (make gen-host-gate): the generation path's host work that must not
@@ -6832,6 +6970,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--driver-context-bound", "driver-context-bound", "the driver's one context bound: a decode, eval or verify row at or past the pool's capacity is refused before the family's trunk (L375)", test_driver_context_bound},
     {"--spec-env", "spec-env", "PULSAR_SPEC_DEPTH / PULSAR_SPEC_TAU: one parse, an unparsable value refused by name at the open (L375)", test_spec_env},
     {"--gen-host", "gen-host", "the generation path's host work against its earlier reading, on random turns of every family: a speculative round's look ahead (greedy rows, the usable chain) answers the same and leaves the attempt as it was (L430); the stop-string scan finds the same stop at the same byte and releases the same text (L431)", test_gen_host},
+    {"--disk-depth", "disk-depth", "a stored chain's depth against the request's own tokens, on cases where the two differ: the text walk, the lookup's end-of-prompt rule on a real store, the resume pick's rank, usage, the prefill progress line and the kv req fields (L434)", test_disk_depth},
     {"--kv-identity", "kv-identity", "the disk KV identity's weights and tokenizer words: the container content digest (stable across opens and copies, moved by a weight byte of the same layout, its sampling limit) and a store of another identity set aside and said once (L426)", test_kv_identity},
     {"--st-integers", "st-integers", "the safetensors header's integers are exact: a fractional or past-2^53 shape is refused (L335)", test_st_exact_integers},
     {"--bank-carry-restore", "bank-carry-restore", "a bank carry's restore is all or nothing: a live row that fails leaves the host view untouched (L335)", test_bank_carry_restore},

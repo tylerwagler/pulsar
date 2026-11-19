@@ -114,8 +114,8 @@ void append_anthropic_content(buf *b, const char *text, const char *reasoning,
 /// @param completion_tokens  the tokens generated
 static void append_anthropic_usage_json(buf *b, const request *r,
                                         int prompt_tokens, int completion_tokens) {
-    int cache_read_tokens = r ? r->cache_read_tokens : 0;
-    int cache_write_tokens = r ? r->cache_write_tokens : 0;
+    int cache_read_tokens = r ? r->cache_read_tokens.raw() : 0;
+    int cache_write_tokens = r ? r->cache_write_tokens.raw() : 0;
     resolve_cache_split(&cache_read_tokens, &cache_write_tokens, prompt_tokens);
     int input_tokens = prompt_tokens - cache_read_tokens - cache_write_tokens;
     if (input_tokens < 0) input_tokens = 0;

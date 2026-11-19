@@ -250,7 +250,15 @@ Usage blocks report prompt, completion and cached tokens: `cached_tokens` on the
 OpenAI surfaces, and `cache_read_input_tokens` / `cache_creation_input_tokens` on
 the Anthropic one. `cached_tokens` counts the request's own prompt tokens that a
 reused state served. Since L334 this is counted correctly even when the client
-re-spells text the model generated.
+re-spells text the model generated. Since L434 the same holds for a state loaded
+from disk: `prompt_tokens` is the request's own token count whether it ran cold,
+from memory or from a disk chain written in another spelling of the same text
+(it was the length of the prompt the sync ran, the chain's tokens plus the rest),
+and `cached_tokens` is how many of those tokens the chain's text holds, so it
+never exceeds `prompt_tokens` and the two plus `cache_write_tokens` add up. A
+live tool continuation (Responses, Anthropic) names state the server holds and
+replays no history: its prompt is that state plus the request's new text, and
+its usage counts that prompt.
 
 The OpenAI surfaces also report `reasoning_tokens` (chat completions:
 `usage.completion_tokens_details`; Responses: `usage.output_tokens_details`):
@@ -590,16 +598,16 @@ unserved. A request that never bound to a bank has `bank=-` and `-` in every fie
 | `sess`, `agent`, `parent` | the `x-claude-code-session-id`, `-agent-id` and `-parent-agent-id` hints as received, cut to 16 characters |
 | `pre` | hex16: FNV-1a 64 of the prompt's token ids from 0 to the preamble's end, the first user marker (the shared system prompt and tools). `-` when the prompt has no user marker before its first assistant marker |
 | `conv` | hex16: the same hash from 0 to the first assistant marker: the preamble and the user turns before the first reply. The same on every turn of one conversation, different for two conversations behind one preamble. The whole prompt when it has no assistant marker (a completion) |
-| `prompt` | the prompt's tokens |
+| `prompt` | the prompt's tokens, as usage counts them: the request's own tokenisation; for a live tool continuation (`pick=live`) the prompt built on the bank's state (L434) |
 | `bank` | the bank it ran on |
 | `route` | the router's verdict: `in-place` (continues on its best bank), `fresh` (an empty, dead, newly provisioned or just evicted bank), `clobber` (its best bank over another conversation's history, no fresh bank to be had), `owner` (the bank that owns its live tool call ids), `matched` (its best bank, in place: no fresh bank could be had and the only bank an eviction would free was that one, L379), `none` (never routed) |
 | `best`, `common`, `score`, `anchor`, `frontier`, `prefilled` | the numbers of the `route:` line: the best-scoring free bank, the tokens shared with it, where its sync would resume, its route anchor, its frontier and its prefill frontier |
 | `noresume` | only when `score=0` and `common>0`: why the best bank has no resume point inside the match. `ckpt-above`: every checkpoint it holds lies above what it may resume. `no-ckpt`: it holds no checkpoint at all. `not-continued`: the request extends its whole history, but the bank does not continue it (decode rows past its prefill, an end off the grid, stale rows) and no checkpoint lies below. `images`: a checkpoint within the match was refused, the bank's images are not the request's. `no-match` cannot print (it has `common=0`) |
 | `pick` | the state the sync started from: `own` (the bank's history), `adopt` (another bank's state, copied), `disk` (a disk chain), `live` (a live Responses / Anthropic tool continuation), `spilled` (the bank's own history, read back from its spill chain), `none` (token 0) |
 | `from` | the bank an adopt copied from; `disk` for a disk chain |
-| `at` | the position the sync started computing at |
-| `reused` | the request's tokens served from state (the cache read) |
-| `prefilled_now` | tokens this request prefilled |
+| `at` | the position the sync started computing at, on the bank's history |
+| `reused` | the request's tokens served from state (the cache read): tokens of `prompt`, never more than it |
+| `prefilled_now` | rows this request prefilled: from `at` to where its prefill ended on the bank's history (to its last chunk when it stopped). `at`, `prefilled_now`, `common`, `frontier`, `prefilled` and `below` count the bank's tokens, `prompt` and `reused` the request's; after a turn the model sampled the two spell the same text in slightly different numbers of tokens, so `reused + prefilled_now` is `prompt` only when they agree (L434) |
 | `below` | tokens between `at` and the deepest match any free bank had when the request was routed: what a resume at that match would have saved |
 | `epcut` | the prefill's cut at the prompt's message endpoint (the start of its generation header; the cut leaves the record a later prompt resumes from when it re-renders that header differently, and costs a prefill chunk): `1` made and recorded, `0` waived, `-` no endpoint lay ahead of the prefill (a tool round past it, a family that makes no such cut, a prefill in the fused lane, no prefill). Waived when the request starts computing (`at`) at or past the end of the last prompt its bank prefilled whole, from the bank's own state (`pick=own` or `live`), and no resume-grid point lies between the endpoint and the prompt's end; a request on a bank with no prompt end standing, one that resumes below it, an adopt and a disk chain all cut |
 | `reply` | what the request found of the reply its bank's last finished turn left there, read from its byte match with the bank's history (the reply included): `1` it continued from the reply (matched it to its end, or a live Responses / Anthropic continuation), `0` it carried that turn's prompt to its generation header and parted before the reply's end (a client or template that re-renders the reply: stripped reasoning, a different header), `-` no evidence (no reply on record: a first turn, an evicted, spilled or re-bound bank, a failed or abandoned turn; an adopt, a disk chain or a start at token 0; a request that parts below the header: another conversation, an edit of earlier history; the same prompt again). It decides the turn's terminal checkpoint (the idle re-prefill of the reply, which only a request that continues from the reply uses): after a `0`, a turn whose reply is of the same kind (closing its turn, or ending in tool calls) arms none and the log says `terminal checkpoint: bank B skipped: ...`; a `1` for that kind arms it again; a `-` other than the same prompt again forgets both kinds |
@@ -641,7 +649,7 @@ publishes: the line and `/metrics` are two prints of the same counters.
 | `removed_budget_bytes` | ... of them, evicted for room (the budget, a full disk) | `...{op="removed_budget"}` |
 | `removed_unread_bytes` | ... of `removed_bytes`, files no load had mapped since the process started. The store keeps the bit in memory only, so a file left by an earlier run counts as unread until this run reads it | `...{op="removed_unread"}` |
 | `restores_begun`, `restores_done`, `restores_failed` | disk chain restores; the rest are running or were cancelled | `pulsar:kv_disk_restores_total{outcome}` |
-| `restored_tokens` | tokens the loaded chains added past the banks' own resumes | `pulsar:kv_disk_restored_tokens_total` |
+| `restored_tokens` | the requests' tokens the loaded chains served past the banks' own resumes | `pulsar:kv_disk_restored_tokens_total` |
 | `dup_banks`, `dup_pages_resident`, `dup_pages_shared`, `dup_bytes`, `dup_bytes_peak`, `dup_deep_pairs`, `dup_deep_longest` | the duplicate census as last taken: resident banks with a whole page, pages held, distinct pages two banks share, the bytes held twice and their peak, bank pairs sharing more than the preamble and their longest shared prefix | `pulsar:kv_dup_*` |
 | `spills`, `preemptions`, `readmissions` | guard spills, decoders preempted and readmitted | `pulsar:bank_spills_total`, `pulsar:decoder_preemptions_total`, `pulsar:decoder_readmissions_total` |
 | `refused_<cause>` | 503 answers: `admission` (the prompt's KV does not fit), `image_busy`, `parse_busy`, `connections`, `shutdown`, `systemone` | `pulsar:refused_503_total{cause}` |

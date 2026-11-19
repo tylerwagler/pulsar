@@ -564,8 +564,8 @@ static const char *responses_status_for_finish(const char *finish) {
 /// @param output_tokens  the tokens generated
 static void append_responses_usage_json(buf *b, const request *r,
                                         int input_tokens, int output_tokens) {
-    int cached_tokens = r ? r->cache_read_tokens : 0;
-    int cache_write_tokens = r ? r->cache_write_tokens : 0;
+    int cached_tokens = r ? r->cache_read_tokens.raw() : 0;
+    int cache_write_tokens = r ? r->cache_write_tokens.raw() : 0;
     resolve_cache_split(&cached_tokens, &cache_write_tokens, input_tokens);
     buf_printf(b,
         "{\"input_tokens\":%d,\"input_tokens_details\":{\"cached_tokens\":%d,\"cache_write_tokens\":%d},"

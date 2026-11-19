@@ -2394,7 +2394,9 @@ void server::kv_req_log(job *j, const session_slot *sl, const char *finish) {
         r->out = g->completion_total + g->completion;
         if (r->at >= 0) {
             /* a prefill that ran to its end computed the prompt past `at`; one that stopped, to its last chunk */
-            const int upto = g->decode_t0 > 0.0 ? g->prompt_tokens : sl->prefill_counted;
+            /* L434: both live-side, as `at` is -- where the prefill ended on the bank's history (the stitch's end).
+             * It was the request's prompt length: across a seam, another count than the position it is taken from */
+            const int upto = g->decode_t0 > 0.0 ? g->prefill_end.raw() : sl->prefill_counted;
             r->prefilled_now = upto > r->at ? upto - r->at : 0;
         }
         if (!finish) r->finish = g->kv_finish;
@@ -4052,7 +4054,7 @@ bool server::prefill_headroom_ok(session_slot *sl) {
              server_mem_reading_words(mem).c_str(), (double)need.raw() / gib);
     unsigned skipped = 0;
     if (warn_limiter_due(&s->prefill_mem_warn, server_now_sec(), PULSAR_SERVER_MEM_FLOOR_WARN_SEC, &skipped))
-        server_log(PULSAR_LOG_WARNING, "pulsar-server: prefill REFUSED (503) on bank %d at %d of %d tokens -- %s after "
+        server_log(PULSAR_LOG_WARNING, "pulsar-server: prefill REFUSED (503) on bank %d at %d (a prompt of %d tokens) -- %s after "
                    "%d spill(s)%s: %s (%u more refused since the last line)", sl->bank.raw(),
                    server_bank_pos(s->sess, sl->bank).raw(), g->prompt_tokens, why, spilled,
                    preempt_tried ? " and a preemption try" : "", g->err, skipped);
@@ -5141,6 +5143,9 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                  * fused rounds was silent to its client for minutes), the
                  * prefill log line with its rate, and the L114 counter through
                  * the per-slot watermark. */
+                /* L434: the total is live-side like the position: a prompt rides fused rounds only while the bank's
+                 * history IS its first tokens by id (server::fuse_prepare: else "needs a rewind/stitch"), so its length
+                 * is the length of what the bank will hold */
                 gen_prefill_progress_cb(pg, "prefill_chunk", TokPos{(int)(fr[r].p0 + fr[r].k)},
                                         TokCount{pg->prompt_for_sync->len});
                 rider_verdict *v = &rv[c - s->slots];
