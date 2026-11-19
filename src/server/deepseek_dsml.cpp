@@ -603,6 +603,34 @@ const char *find_any_tool_end(const char *s) {
 
 
 
+/// find_any_tool_start over `n` bytes: the walk's form, which reads only the bytes it was given (L437).
+/// @param s  the bytes
+/// @param n  how many
+/// @return the earliest opener that lies whole inside them, or NULL
+const char *find_any_tool_start_n(const char *s, size_t n) {
+    const char *best = NULL;
+    for (size_t i = 0; i < PULSAR_DSML_SYNTAXES; i++) {
+        const char *p = find_lit_bounded(s, n, pulsar_dsml_syntaxes[i].tool_calls_start);
+        if (p && (!best || p < best)) best = p;
+    }
+    return best;
+}
+
+/// find_any_tool_end over `n` bytes (L437).
+/// @param s  the bytes
+/// @param n  how many
+/// @return the earliest closer that lies whole inside them, or NULL
+const char *find_any_tool_end_n(const char *s, size_t n) {
+    const char *best = NULL;
+    for (size_t i = 0; i < PULSAR_DSML_SYNTAXES; i++) {
+        const char *p = find_lit_bounded(s, n, pulsar_dsml_syntaxes[i].tool_calls_end);
+        if (p && (!best || p < best)) best = p;
+    }
+    return best;
+}
+
+
+
 /// The marker scan: set the flags for the tool_calls opener / closer found in `scan`; a closer only counts after
 /// an opener (earlier or in `scan`), else it is an orphan.
 /// @param scan        the text to scan (NULL: nothing)
@@ -1070,7 +1098,7 @@ size_t text_stream_safe_limit(const char *raw, size_t start,
 
     size_t limit = raw_len;
     if (has_tools) {
-        const char *tool = find_any_tool_start(raw + start);
+        const char *tool = find_any_tool_start_n(raw + start, raw_len - start);   /* L437: inside raw_len only */
         if (tool) {
             limit = trim_tool_separator_ws(raw, start, (size_t)(tool - raw));
             return utf8_stream_safe_len(raw, start, limit, true);

@@ -164,6 +164,8 @@ size_t trim_truncated_dsml_close_tail(const char *raw, size_t start, size_t len)
 const char *find_any_tool_start(const char *s);
 
 const char *find_any_tool_end(const char *s);
+const char *find_any_tool_start_n(const char *s, size_t n);
+const char *find_any_tool_end_n(const char *s, size_t n);
 
 bool complete_tool_call_inside_thinking(const char *text, size_t len, GenOff *scan_from);
 

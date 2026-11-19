@@ -6590,6 +6590,97 @@ static void test_l437_logprobs_ride_with_their_text(void) {
     l303_server_free(&srv);
 }
 
+/* L437: a sink that writes down what DeepSeek's walk tells it. */
+struct l437_walk_log {
+    std::string events;        ///< every event, in order
+    const char *raw = NULL;    ///< the text the walk was given
+    size_t released = 0;       ///< bytes of it released when the event arrived
+    bool past = false;         ///< an event carried text, or a watermark, past the released bytes
+};
+static bool l437_log_text(chat_sink *k, bool reasoning, const char *text, size_t len, GenOff upto) {
+    l437_walk_log *lg = (l437_walk_log *)k->st;
+    lg->events += (reasoning ? "R[" : "C[") + std::string(text, len) + "]@" + std::to_string(upto.raw()) + " ";
+    if (upto.raw() > lg->released || (text >= lg->raw && (size_t)(text - lg->raw) + len > lg->released)) lg->past = true;
+    return true;
+}
+static bool l437_log_end(chat_sink *k, bool think_closed) {
+    ((l437_walk_log *)k->st)->events += think_closed ? "END(close) " : "END ";
+    return true;
+}
+static bool l437_log_tool_begin(chat_sink *k, int index, const char *, const char *name) {
+    ((l437_walk_log *)k->st)->events += "CALL" + std::to_string(index) + "(" + name + ") ";
+    return true;
+}
+static bool l437_log_tool_args(chat_sink *k, int index, const char *text, size_t len) {
+    ((l437_walk_log *)k->st)->events += "ARGS" + std::to_string(index) + "[" + std::string(text, len) + "] ";
+    return true;
+}
+static bool l437_log_tool_end(chat_sink *k, int index) {
+    ((l437_walk_log *)k->st)->events += "DONE" + std::to_string(index) + " ";
+    return true;
+}
+
+/* L437: DeepSeek's walk is given the generated text and how many of its bytes the stop-string scan has RELEASED
+ * (raw_len); the bytes past that are held because a client stop string may still claim them.  The walk looked for
+ * "</think>" and for a DSML block's opener with strstr, to the text's NUL -- so it acted on a marker inside the
+ * hold-back: it closed the reasoning section, or left the answer for a block, before those bytes were released (the
+ * block's projection then found its opener past raw_len, gave up, and the calls were not streamed live).  The walk's
+ * reading may depend only on text[0, raw_len): at every step of a walk fed the whole text with a lagging raw_len,
+ * the events must be those of a walk fed a copy CUT at raw_len, and none may carry text or a watermark past it. */
+static void test_l437_deepseek_walk_reads_released_bytes_only(void) {
+    l303_vocab v;
+    server srv;
+    l303_server(&srv, v);
+    const l428_fam *ds = NULL;
+    for (const l428_fam &f : k_l428_fams)
+        if (f.fmt == PULSAR_CHAT_DS4_V41) ds = &f;
+    TEST_ASSERT(ds != NULL);
+    const std::string turn = std::string(ds->before) + "Checking." + ds->open + ds->call + ds->between + ds->now +
+                             ds->close + "\n\nafter";
+    static const sink_tool_ops tool_ops = {l437_log_tool_begin, l437_log_tool_args, l437_log_tool_end};
+    int steps = 0, differed = 0;
+    for (int tools = 0; tools < 2; tools++) {
+        for (size_t hold : {(size_t)0, (size_t)3, (size_t)12, (size_t)40}) {
+            job j;
+            memset(&j, 0, sizeof j);
+            char err[300];
+            const std::string body = std::string("{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]") +
+                                     (tools ? "," L428_TOOLS : "") + "}";
+            TEST_ASSERT(l303_request(&srv, PULSAR_CHAT_DS4_V41, API_OPENAI, body.c_str(), &j.req, err, sizeof err));
+            TEST_ASSERT(pulsar_think_mode_enabled(j.req.think_mode));
+            deepseek_stream_walk whole, cut;
+            deepseek_stream_walk_init(&whole, &j.req);
+            deepseek_stream_walk_init(&cut, &j.req);
+            l437_walk_log lw, lc;
+            chat_sink kw = {-1, NULL, &j.req, "id", &lw, l437_log_text, l437_log_end, &tool_ops, false};
+            chat_sink kc = kw;
+            kc.st = &lc;
+            for (size_t len = 1; len <= turn.size(); len++) {   /* a byte a token: `len` generated, `hold` held */
+                const size_t released = len > hold ? len - hold : 0;
+                const std::string seen = turn.substr(0, len), prefix = turn.substr(0, released);
+                lw.raw = seen.c_str();
+                lc.raw = prefix.c_str();
+                lw.released = lc.released = released;
+                TEST_ASSERT(deepseek_stream_update(&whole, &kw, seen.c_str(), released, false));
+                TEST_ASSERT(deepseek_stream_update(&cut, &kc, prefix.c_str(), released, false));
+                steps++;
+                if (lw.events != lc.events || whole.mode != cut.mode || whole.emit_pos != cut.emit_pos) differed++;
+                TEST_ASSERT(whole.emit_pos <= gen_text_end(released));
+            }
+            if (lw.events != lc.events)
+                fprintf(stderr, "l437 walk (tools %d, hold %zu):\n  whole text: %s\n  cut text:   %s\n", tools, hold,
+                        lw.events.c_str(), lc.events.c_str());
+            TEST_ASSERT(lw.events == lc.events && whole.mode == cut.mode && !lw.past && !lc.past);
+            if (hold == 0) TEST_ASSERT(lw.events.find(tools ? "CALL0(search)" : "C[") != std::string::npos);
+            deepseek_stream_walk_free(&whole);
+            deepseek_stream_walk_free(&cut);
+            request_free(&j.req);
+        }
+    }
+    TEST_ASSERT(steps > 0 && differed == 0);
+    l303_server_free(&srv);
+}
+
 /* L428, the prefix: after a turn the server ended at its first call, the bank holds the prompt and the turn's tokens
  * through the call's close -- gen_emit_token is the one place a decoded token reaches the client, and the lanes
  * commit what it took (a speculative round's later drafts are cut before the round, gen_turn_draft_prefix, and a
@@ -21653,6 +21744,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l437_stream_offsets_and_conversion();
     test_l437_parser_started_mid_text();
     test_l437_logprobs_ride_with_their_text();
+    test_l437_deepseek_walk_reads_released_bytes_only();
     test_l428_next_prompt_extends_the_cut_turn();
     test_l420_stop_inside_reasoning_answers_with_it();
     test_l420_other_endings_are_unchanged();
