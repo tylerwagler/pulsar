@@ -726,17 +726,33 @@ int server_route_anchor(const pulsar_tokens *bank, int prefilled, const pulsar_t
  * behind one 2.3k-token prompt all landed on bank 0 and clobbered one another
  * every turn) -- diverges INSIDE the bank's first user turn, before any anchor,
  * so it takes a fresh bank, which restores the shared prefix from the disk
- * chain. */
+ * chain.
+ * L394: or when it leaves the bank, short of the anchor, less than one resume-grid step of history (frontier - common <
+ * grid) and the bank resumes it on a checkpoint of its own (score > 0).  Claude Code's stage-2 judge prompt is a fixed
+ * system prompt, a windowed transcript that grows at its end, and a fixed closing block, so each call shares the
+ * previous one through the old transcript and diverges in the old closing block, 94 tokens before the bank's header
+ * anchor (CT 130 gemma, 2026-11-18: common 58723, resume 57344, frontier = prefilled 58830, anchor 58817, prompt 59210;
+ * the bank's tail 107-108 tokens in every such instance).  Each went fresh: the fresh bank spilled the session's own
+ * bank, restored the chain from disk only to ~41.9k and re-prefilled 14-18k tokens (~25 s on sm_75), where in place
+ * re-prefills prompt - score (1,866 here; 2,405 in 4.6 s when L379 ran one in place).  Why one grid step: what the bank
+ * loses is then finer than its state is kept at -- every resume already starts on the grid, up to a step below its
+ * match, so a tail that short is the rounding a resume pays anyway, not a conversation worth a fresh bank; another
+ * conversation behind a shared prefix leaves its own message and reply (the 2026-10-04 clobber: 582 tokens).  Score 0
+ * is a bank with no checkpoint in the match (L378's ckpt-above): in place would prefill the whole prompt, where a fresh
+ * bank restores the chain (02:07:30, 02:28:51: to 65536 of ~66-68k). */
 /// @param common tokens the job shares with the bank
 /// @param score where the sync would resume (the deepest grid checkpoint within the match)
 /// @param frontier the bank's frontier position
 /// @param prefilled tokens the bank prefilled
 /// @param protect_floor the discard under which in-place reuse is always allowed, tokens
 /// @param anchor the bank's last-turn anchor (server_route_turn_anchor; -1: none)
+/// @param grid the model's resume grid (pulsar_session_resume_grid), tokens: a tail past the match under it is
+///        dropped in place (L394); 0: no such tail
 /// @return true when the job continues on the bank in place
 bool server_route_in_place(int common, int score, int frontier, int prefilled, int protect_floor,
-                           int anchor) {
-    return common >= prefilled || (anchor >= 0 && common > anchor) || frontier - score < protect_floor;
+                           int anchor, int grid) {
+    return common >= prefilled || (anchor >= 0 && common > anchor) || frontier - score < protect_floor ||
+           (anchor >= 0 && score > 0 && frontier - common < grid);
 }
 
 /* L261 / L372: the phases in which a job whose client is gone ends by an abandon that keeps its bank's history, so a
@@ -898,7 +914,8 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
         ? server_route_anchor(pulsar_session_bank_tokens(s->sess, best->bank), prefilled, &s->turn_markers)
         : -1;
     const bool in_place = best && server_route_in_place(best_common, best_score, frontier, prefilled,
-                                                        s->slot_trivial_common_tokens, anchor);
+                                                        s->slot_trivial_common_tokens, anchor,
+                                                        s->sess ? (int)pulsar_session_resume_grid(s->sess) : 0);
     /* L378: the decision's numbers, for the request's `kv req:` line (the last routing of a head that waited) */
     j->kvr.best = best ? best->bank.raw() : -1;
     j->kvr.common = best ? best_common : -1;

@@ -12202,18 +12202,18 @@ static void test_l264_route_in_place(void) {
      * stripped by the client: the match reaches the end of what the bank
      * prefilled (51200), then diverges in the generated tail -- in place,
      * however much the tail holds */
-    TEST_ASSERT(server_route_in_place(51200, 51200, 58000, 51200, floor_, -1));
+    TEST_ASSERT(server_route_in_place(51200, 51200, 58000, 51200, floor_, -1, 128));
     /* the measured clobber (2026-10-04): another conversation behind the same
      * 2.3k-token system prompt matches 2318 of a bank that prefilled 2723 --
      * fresh preferred */
-    TEST_ASSERT(!server_route_in_place(2318, 2304, 2900, 2723, floor_, -1));
+    TEST_ASSERT(!server_route_in_place(2318, 2304, 2900, 2723, floor_, -1, 128));
     /* ...unless what it would discard is under the protect floor */
-    TEST_ASSERT(server_route_in_place(2318, 2304, 2304 + floor_ - 1, 2723, floor_, -1));
-    TEST_ASSERT(!server_route_in_place(2318, 2304, 2304 + floor_, 2723, floor_, -1));
+    TEST_ASSERT(server_route_in_place(2318, 2304, 2304 + floor_ - 1, 2723, floor_, -1, 128));
+    TEST_ASSERT(!server_route_in_place(2318, 2304, 2304 + floor_, 2723, floor_, -1, 128));
     /* an empty bank is simply free */
-    TEST_ASSERT(server_route_in_place(0, 0, 0, 0, floor_, -1));
+    TEST_ASSERT(server_route_in_place(0, 0, 0, 0, floor_, -1, 128));
     /* one token short of the bank's prefill is a different branch */
-    TEST_ASSERT(!server_route_in_place(2722, 2688, 4000, 2723, floor_, -1));
+    TEST_ASSERT(!server_route_in_place(2722, 2688, 4000, 2723, floor_, -1, 128));
 }
 
 /* L275: the bank's last-turn anchor -- the position of its last user marker when
@@ -12319,13 +12319,13 @@ static void test_l311_route_header_anchor(void) {
     TEST_ASSERT(server_route_header_anchor(&b, prefilled, &q) == 345);
     TEST_ASSERT(server_route_turn_anchor(&b, prefilled, &q) == -1);   /* a first-turn bank has no last-turn anchor */
     /* turn 2 matches through "<think>" (348): in place, where the last-turn anchor alone took a fresh bank */
-    TEST_ASSERT(server_route_in_place(348, 256, b.len, prefilled, 157, 345));
-    TEST_ASSERT(!server_route_in_place(348, 256, b.len, prefilled, 157, -1));
+    TEST_ASSERT(server_route_in_place(348, 256, b.len, prefilled, 157, 345, 128));
+    TEST_ASSERT(!server_route_in_place(348, 256, b.len, prefilled, 157, -1, 128));
     /* a request matching only the header's first token (a side request's "<|im_start|>user" there) is not this
      * conversation's next turn by the header rule (the last-turn anchor decides it) */
-    TEST_ASSERT(!server_route_in_place(345, 256, b.len, prefilled, 157, 345));
+    TEST_ASSERT(!server_route_in_place(345, 256, b.len, prefilled, 157, 345, 128));
     /* the clobber: another conversation behind the same system prompt diverges inside the first user message */
-    TEST_ASSERT(!server_route_in_place(320, 256, b.len, prefilled, 157, 345));
+    TEST_ASSERT(!server_route_in_place(320, 256, b.len, prefilled, 157, 345, 128));
     /* the header's second token past what the bank prefilled: the marker before it */
     TEST_ASSERT(server_route_header_anchor(&b, 345, &q) == -1);
     const pulsar_turn_markers none = {};
@@ -12383,14 +12383,16 @@ static void test_l351_tool_turns(void) {
     TEST_ASSERT(pulsar_turn_endpoint(NULL, b.v, b.len) == -1);
     /* the work box's verdict, in shape: the bank prefilled the whole turn (its terminal checkpoint re-prefilled the
      * replies); the next user turn re-renders reply 1 without its reasoning and diverges just past its header (common
-     * = 8 + 3); the resume is the endpoint record at 8.  The route anchor is now the client's message: in place. */
+     * = 8 + 3); the resume is the endpoint record at 8.  The route anchor is now the client's message: in place.
+     * These toy banks are shorter than one resume-grid step, so every tail in them is one L394 drops in place: the
+     * anchor verdicts below pass grid 0 (as they pass protect floor 0) to read the anchors alone. */
     const int common = u2 + 4 + 3, resume = u2 + 4;
     const int anchor = server_route_anchor(&b2, b2.len, &q);
     TEST_ASSERT(anchor == u2);
-    TEST_ASSERT(server_route_in_place(common, resume, b2.len, b2.len, 0, anchor));
+    TEST_ASSERT(server_route_in_place(common, resume, b2.len, b2.len, 0, anchor, 0));
     /* the old markers (tool results as user turns): the anchor was the last tool result, past the divergence */
     const int old_anchor = server_route_anchor(&b2, b2.len, &plain);
-    TEST_ASSERT(old_anchor > common && !server_route_in_place(common, resume, b2.len, b2.len, 0, old_anchor));
+    TEST_ASSERT(old_anchor > common && !server_route_in_place(common, resume, b2.len, b2.len, 0, old_anchor, 0));
     /* the FIRST turn's bank (the repro of 2026-11-04): no user turn after an assistant one, so the last-turn anchor is
      * -1 and the header anchor decides -- the header of the client's turn (8 + 1), not the tool round's (30 + 1) */
     TEST_ASSERT(server_route_header_anchor(&b, b.len, &q) == 9);
@@ -12398,10 +12400,12 @@ static void test_l351_tool_turns(void) {
     const int anchor1 = server_route_anchor(&b, b.len, &q);
     TEST_ASSERT(anchor1 == 9);
     /* turn 2 re-renders reply 1 without its reasoning: it matches through the header + "\n" (common 11) */
-    TEST_ASSERT(server_route_in_place(11, 8, b.len, b.len, 0, anchor1));
-    TEST_ASSERT(!server_route_in_place(11, 8, b.len, b.len, 0, server_route_anchor(&b, b.len, &plain)));
+    TEST_ASSERT(server_route_in_place(11, 8, b.len, b.len, 0, anchor1, 0));
+    TEST_ASSERT(!server_route_in_place(11, 8, b.len, b.len, 0, server_route_anchor(&b, b.len, &plain), 0));
     /* a request that stops short of the header (a side request inside the client's message) is not this turn */
-    TEST_ASSERT(!server_route_in_place(7, 3, b.len, b.len, 0, anchor1));
+    TEST_ASSERT(!server_route_in_place(7, 3, b.len, b.len, 0, anchor1, 0));
+    /* ...though at the production grid its 30-token tail is under one step: L394 drops it in place */
+    TEST_ASSERT(b.len - 7 < 128 && server_route_in_place(7, 3, b.len, b.len, 0, anchor1, 128));
     pulsar_tokens_free(&b);
     pulsar_tokens_free(&b2);
 }
@@ -12583,17 +12587,17 @@ static void test_l322_route_side_call(void) {
      * shape (common 178833 = the real turn's end 178828 + 5; resume 178816, the grid checkpoint below) */
     const int common = side_user + 3, score = turn_end - turn_end % 128 > 0 ? turn_end - turn_end % 128 : 128;
     TEST_ASSERT(frontier - score >= 157);   /* the protect floor alone would not keep it */
-    TEST_ASSERT(server_route_in_place(common, score, frontier, prefilled, 157, server_route_anchor(&b, prefilled, &q)));
+    TEST_ASSERT(server_route_in_place(common, score, frontier, prefilled, 157, server_route_anchor(&b, prefilled, &q), 128));
     /* ...where the deeper anchor (L311's combination) took a fresh bank */
-    TEST_ASSERT(!server_route_in_place(common, score, frontier, prefilled, 157, server_route_header_anchor(&b, prefilled, &q)));
+    TEST_ASSERT(!server_route_in_place(common, score, frontier, prefilled, 157, server_route_header_anchor(&b, prefilled, &q), 128));
     /* the side call itself carries everything the bank prefilled before it: in place either way */
-    TEST_ASSERT(server_route_in_place(turn_end, score, turn_end, turn_end, 157, server_route_anchor(&b, turn_end, &q)));
+    TEST_ASSERT(server_route_in_place(turn_end, score, turn_end, turn_end, 157, server_route_anchor(&b, turn_end, &q), 128));
     /* a request that leaves the history BEFORE the bank's last user marker (an edit of an earlier turn, a subagent
      * sibling sharing the conversation only up to there) is not taken by the anchor */
-    TEST_ASSERT(!server_route_in_place(turn_end, score, frontier, prefilled, 157, server_route_anchor(&b, prefilled, &q)));
-    TEST_ASSERT(!server_route_in_place(user_n + 20, 384, frontier, prefilled, 157, server_route_anchor(&b, prefilled, &q)));
+    TEST_ASSERT(!server_route_in_place(turn_end, score, frontier, prefilled, 157, server_route_anchor(&b, prefilled, &q), 128));
+    TEST_ASSERT(!server_route_in_place(user_n + 20, 384, frontier, prefilled, 157, server_route_anchor(&b, prefilled, &q), 128));
     /* the 2026-10-04 clobber (another conversation inside the first user message) stays fresh */
-    TEST_ASSERT(!server_route_in_place(320, 256, frontier, prefilled, 157, server_route_anchor(&b, prefilled, &q)));
+    TEST_ASSERT(!server_route_in_place(320, 256, frontier, prefilled, 157, server_route_anchor(&b, prefilled, &q), 128));
     /* a first-turn bank has no last-turn anchor: the header's decides (L311) */
     TEST_ASSERT(server_route_anchor(&b, side_user - 1, &q) == user_n);   /* turn N prefilled through its reply */
     pulsar_tokens fb = {0};
@@ -12611,21 +12615,53 @@ static void test_l275_route_in_place_through_last_turn(void) {
     /* the session recap on the idle main bank: the bank prefilled 41670 (its
      * last user turn starts at 41505) and generated to 41860; the recap matches
      * 41517 and appends its instruction -- in place, the tail is one turn */
-    TEST_ASSERT(server_route_in_place(41517, 41472, 41860, 41670, floor_, 41505));
+    TEST_ASSERT(server_route_in_place(41517, 41472, 41860, 41670, floor_, 41505, 128));
     /* the same request without an anchor took a fresh bank (the behaviour
      * measured 2026-09-29 .. 2026-10-06) */
-    TEST_ASSERT(!server_route_in_place(41517, 41472, 41860, 41670, floor_, -1));
+    TEST_ASSERT(!server_route_in_place(41517, 41472, 41860, 41670, floor_, -1, 128));
     /* a subagent summary against the previous summary's bank: that bank
      * prefilled the main prompt + 153 summary tokens; the new one matches
      * through the tool result */
-    TEST_ASSERT(server_route_in_place(42468, 42112, 42825, 42620, floor_, 42300));
+    TEST_ASSERT(server_route_in_place(42468, 42112, 42825, 42620, floor_, 42300, 128));
     /* the match ends BEFORE the last user marker (an edited earlier turn, or a
      * conversation sharing the history only up to there): fresh */
-    TEST_ASSERT(!server_route_in_place(41400, 41216, 41860, 41670, floor_, 41505));
+    TEST_ASSERT(!server_route_in_place(41400, 41216, 41860, 41670, floor_, 41505, 128));
     /* the match ends AT the marker: the marker itself did not match -- fresh */
-    TEST_ASSERT(!server_route_in_place(41505, 41472, 41860, 41670, floor_, 41505));
+    TEST_ASSERT(!server_route_in_place(41505, 41472, 41860, 41670, floor_, 41505, 128));
     /* the 2026-10-04 clobber: a first-turn bank has no anchor, so it stays fresh */
-    TEST_ASSERT(!server_route_in_place(2318, 2304, 2900, 2723, floor_, -1));
+    TEST_ASSERT(!server_route_in_place(2318, 2304, 2900, 2723, floor_, -1, 128));
+}
+
+/* L394: a divergence a short way before the anchor -- Claude Code's stage-2 judge on CT 130 gemma (2026-11-18): each
+ * call is the previous one's system prompt and transcript, the transcript grown at its end, then the fixed closing
+ * block; it diverges in the bank's old closing block, 94 tokens before the header anchor, and leaves the bank a
+ * 107-108-token tail.  Those went fresh (spill, a chain restore to ~41.9k, 14-18k re-prefilled); in place re-prefills
+ * prompt - resume.  Grid 128: the gemma (every family's) resume grid. */
+static void test_l394_route_short_tail_in_place(void) {
+    const int floor_ = 65, G = 128;   /* gemma's trivial-match threshold: header 1 + allowance 64 */
+    /* the incident, 02:19:41 (prompt 59210: in place re-prefills 1,866 from 57344) */
+    TEST_ASSERT(server_route_in_place(58723, 57344, 58830, 58830, floor_, 58817, G));
+    /* ...which every clause before this row sent fresh: the tail rule is what takes it */
+    TEST_ASSERT(!server_route_in_place(58723, 57344, 58830, 58830, floor_, 58817, 0));
+    /* the other instances: 02:23:37 (common 55903, prompt 56545), 02:18:14, 02:20:53, 1119 11:52:38 */
+    TEST_ASSERT(server_route_in_place(55903, 53248, 56011, 56011, floor_, 55997, G));
+    TEST_ASSERT(server_route_in_place(57434, 57344, 57541, 57541, floor_, 57528, G));
+    TEST_ASSERT(server_route_in_place(59110, 57344, 59217, 59217, floor_, 59204, G));
+    TEST_ASSERT(server_route_in_place(65405, 61440, 65512, 65512, floor_, 65499, G));
+    /* 02:28:51 (common 68299, prompt 68597): no checkpoint in the match (resume 0, ckpt-above) and a 716-token tail --
+     * still fresh: in place would prefill all 68,597 tokens, the fresh bank restored the chain to 65536 */
+    TEST_ASSERT(!server_route_in_place(68299, 0, 69015, 69015, floor_, 68393, G));
+    /* the boundary: a tail of G - 1 is dropped, a tail of G is kept (fresh) */
+    TEST_ASSERT(server_route_in_place(58830 - (G - 1), 57344, 58830, 58830, floor_, 58817, G));
+    TEST_ASSERT(!server_route_in_place(58830 - G, 57344, 58830, 58830, floor_, 58817, G));
+    /* the bank's generated tail counts: the same divergence with a reply decoded past the prefill is kept */
+    TEST_ASSERT(!server_route_in_place(58723, 57344, 58830 + 64, 58830, floor_, 58817, G));
+    /* a short tail but no checkpoint in the match: in place would prefill the whole prompt -- fresh */
+    TEST_ASSERT(!server_route_in_place(58723, 0, 58830, 58830, floor_, 58817, G));
+    /* no anchor (markers unknown): the short-tail rule does not apply -- the protect floor decides as before */
+    TEST_ASSERT(!server_route_in_place(58723, 57344, 58830, 58830, floor_, -1, G));
+    /* the 2026-10-04 clobber shape with an anchor: another conversation's 582-token tail stays fresh */
+    TEST_ASSERT(!server_route_in_place(2318, 2304, 2900, 2723, 157, 2720, G));
 }
 
 static void test_slot_route_trivial_match_decision(void) {
@@ -17649,6 +17685,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l275_route_turn_anchor();
     test_l273_image_cold_cut();
     test_l275_route_in_place_through_last_turn();
+    test_l394_route_short_tail_in_place();
     test_l311_route_header_anchor();
     test_l351_tool_turns();
     test_l322_route_side_call();
