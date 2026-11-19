@@ -4589,6 +4589,7 @@ static void test_disk_depth(void) {
     test_l439_context_admits_the_stitch();
     test_l439_prefix_wait_seamed_leader();
     test_l439_prefill_bounds_are_live_side();
+    test_l439_fused_lane_refuses_a_seam();
 }
 
 /* L430: the host-only group the check tier runs (make gen-host-gate): the generation path's host work that must not

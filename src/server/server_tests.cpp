@@ -22337,6 +22337,10 @@ static_assert(std::is_same_v<decltype(kv_req_line::prompt), PromptToks> &&
                   std::is_same_v<decltype(prefix_lead::pos), TokPos> &&
                   std::is_same_v<decltype(prefix_lead::len), PromptToks>,
               "the carriers are typed: the kv req line's fields, the prompt's carriers in gen_state, the prefix wait's");
+static_assert(std::is_same_v<decltype(&server::worker_mixed_batch_quantum),
+                                 void (server::*)(session_slot **, int, session_slot *, const fuse_witness &)> &&
+                  std::is_same_v<decltype(&fuse_witness_of_history), fuse_witness (*)(const slot_tokens &, prompt_view, TokPos)>,
+              "the mixed fused lane runs only with its pick's witness");
 static_assert(std::is_same_v<decltype(prefix_lead::seamed), bool> &&
                   std::is_same_v<decltype(&prefix_mark_on_bank), TokPos (*)(PromptPos)>,
               "the prefix wait converts its cut to a bank position by one rule, behind the no-seam gate");
@@ -22841,6 +22845,43 @@ static void test_l439_prefix_wait_seamed_leader(void) {
                 PREFIX_WAIT_HOLD);
 }
 
+/* L439 (6): the fused lanes read a prompt at the bank's position only through a witness that the bank's history IS
+ * the prompt's first tokens by id.  The seamed pair: after a classic chunk the bank holds the stitch (the sampled
+ * spelling, then the prompt's own tail); at position 150 the stitch's token and the prompt's token 150 differ, and the
+ * mixed lane, which had no gate, fed the latter.  Now no witness: the lane refuses the bank. */
+static void test_l439_fused_lane_refuses_a_seam(void) {
+    const int z[] = {L334_Z};
+    const l439_seam f = l439_make(true, false, NULL, 0, z, 1);
+    pulsar_tokens prompt = {const_cast<TokId *>(f.prompt.data()), (int)f.prompt.size(), (int)f.prompt.size()};
+    /* the stitch the sync runs: the bank's 302, then the prompt's tokens past its cut (202) */
+    std::vector<TokId> stitch(f.bank.begin(), f.bank.begin() + f.m.live_cut.raw());
+    stitch.insert(stitch.end(), f.prompt.begin() + f.m.prompt_cut.raw(), f.prompt.end());
+    TEST_ASSERT(stitch.size() == 303);
+    /* the bank after a classic chunk to 150 of it (still inside the sampled spelling) */
+    pulsar_tokens bank = {stitch.data(), 150, 150};
+    const TokPos pos{150};
+    TEST_ASSERT(stitch[150] != f.prompt[150]);   /* the old read: prompt[live position] is another token */
+    TEST_ASSERT(!fuse_witness_of_history(slot_tokens{&bank, NULL}, prompt_view_of(&prompt), pos));
+    TEST_ASSERT(!fuse_witness::when_history_is_prefix(prompt_view_of(&prompt),
+                                                     TokCount{pulsar_tokens_common_prefix(&bank, &prompt)}, pos));
+    /* no seam: the bank is the prompt's first 150 tokens -- a witness, and it reads the prompt's token there */
+    pulsar_tokens own = {const_cast<TokId *>(f.prompt.data()), 150, 150};
+    const fuse_witness w = fuse_witness_of_history(slot_tokens{&own, NULL}, prompt_view_of(&prompt), TokPos{150});
+    TEST_ASSERT((bool)w && w.token(TokPos{150}) == f.prompt[150] && w.end() == TokPos{203} &&
+                w.run(TokPos{150}) == prompt.v + 150);
+    /* a history that stands past the position: only the first `pos` tokens are compared */
+    pulsar_tokens longer = {const_cast<TokId *>(f.prompt.data()), 180, 180};
+    TEST_ASSERT((bool)fuse_witness_of_history(slot_tokens{&longer, NULL}, prompt_view_of(&prompt), TokPos{150}));
+    /* a foreign token below the position: none; position 0 and a prompt shorter than the position: none */
+    std::vector<TokId> other(f.prompt.begin(), f.prompt.begin() + 150);
+    other[100] = l334_id(L334_Z);
+    pulsar_tokens foreign = {other.data(), 150, 150};
+    TEST_ASSERT(!fuse_witness_of_history(slot_tokens{&foreign, NULL}, prompt_view_of(&prompt), TokPos{150}));
+    TEST_ASSERT(!fuse_witness_of_history(slot_tokens{&own, NULL}, prompt_view_of(&prompt), TokPos{0}));
+    pulsar_tokens all = {stitch.data(), 303, 303};
+    TEST_ASSERT(!fuse_witness_of_history(slot_tokens{&all, NULL}, prompt_view_of(&prompt), TokPos{204}));
+}
+
 static void pulsar_server_unit_tests_run(void) {
     test_l333_kv_units();
     test_l334_p2b_crossings();
@@ -22862,6 +22903,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l439_context_admits_the_stitch();
     test_l439_prefill_bounds_are_live_side();
     test_l439_prefix_wait_seamed_leader();
+    test_l439_fused_lane_refuses_a_seam();
     test_mem_floor_is_derived_from_the_watermarks();
     test_guard_budget_reads_live_memavailable();
     test_guard_discrete_reads_the_device();

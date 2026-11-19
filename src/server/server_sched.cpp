@@ -5589,7 +5589,15 @@ static bool mixed_deep_guard_blocks(const session_slot *slots, int n_slots, int 
  * <= chunk stays classic; it carries the prefill->decode completion bookkeeping).
  * Its bank is necessarily DISTINCT from every decode bank (different phase). NULL
  * when the flag is off, not in pool mode, or nothing qualifies. */
-session_slot *server::worker_find_fuse_prefill() {
+fuse_witness fuse_witness_of_history(const slot_tokens &h, prompt_view p, TokPos pos) {
+    if (!p || pos.is_none() || pos <= TokPos{0} || TokPos::after(TokCount{p.len().raw()}) < pos) return fuse_witness{};
+    /* the prompt's first `pos` tokens, borrowed, against the history's */
+    const pulsar_tokens head = {const_cast<TokId *>(p.tokens()->v), pos.raw(), pos.raw()};
+    const slot_tokens ph = {&head, NULL};
+    return fuse_witness::when_history_is_prefix(p, TokCount{slot_tokens_common(h, ph)}, pos);
+}
+
+session_slot *server::worker_find_fuse_prefill(fuse_witness *w) {
     PULSAR_NVTX_FN();
     auto *s = this;
     if (!s->mixed_batch_enabled || s->pool_banks <= 0) return NULL;
@@ -5619,6 +5627,12 @@ session_slot *server::worker_find_fuse_prefill() {
         if (prefix_mark_on_bank(g->share_mark) > P) continue;   /* L329 (a): the classic sync stops at the cut */
         /* 2026-10-29: the fused run is prefill chunks too -- short of the floor it goes classic (prefill_headroom_ok) */
         if (!s->prefill_headroom_fused_ok(sl)) continue;
+        /* L439: the lane feeds the prompt's token at each bank position, true only while the bank's history IS the
+         * prompt's first tokens by id.  A prompt whose sync stitched a seam (the bank holds the sampled spelling of a
+         * re-sent reply) stands at other positions than its own indices: the lane fed it the wrong tokens.  The spec
+         * lane's gate (fuse_prepare) refused that; this one had none.  The classic sync owns such a prefill. */
+        *w = fuse_witness_of_history(s->slot_history(sl), g->prompt_for_sync, P);
+        if (!*w) continue;
         return sl;                                              /* P=1: first qualifier */
     }
     return NULL;
@@ -5676,7 +5690,7 @@ static int mixed_prefill_giveup(int rc, int kthis, int m) {
     return m > 0 ? MIXED_GIVEUP_RETRY_DECODE : MIXED_GIVEUP_STOP;
 }
 
-void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot *pf) {
+void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot *pf, const fuse_witness &w) {
     PULSAR_NVTX_FN();
     auto *s = this;
     if (n <= 0 || !pf || !pf->gen || !pf->gen->prompt_for_sync) return;
@@ -5744,9 +5758,9 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
     const int cap = pulsar_session_prefill_cap(pool).raw();   /* mixed-step row ceiling */
     if (kstep > cap - PULSAR_SESSION_POOL_CAP) kstep = cap - PULSAR_SESSION_POOL_CAP;
     if (kstep < 1) kstep = 1;
-    /* L439 (typing; value unchanged): this lane reads the prompt at the bank's position and takes the prompt's own
-     * length for the bank's end, with no test that the bank's history is the prompt's prefix */
-    const int len = seam_unconverted_live(pp.len()).raw();
+    /* L439: the prompt read at the bank's positions, by the witness worker_find_fuse_prefill made: its end is where
+     * the bank stands with the whole prompt in */
+    const int len = w.end().raw();
     int pf_done = 0;
     bool reached_end = false;                     /* prefill reached len this quantum */
     bool pf_giveup = false;                        /* prefill rejected -> stop folding it */
@@ -5793,7 +5807,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
         for (int j = 0; j < kthis; j++) {
             reqs[m + j].bank = pf->bank;
             reqs[m + j].pos = TokPos{pos_now + j};
-            reqs[m + j].token = pp.at(seam_unconverted_prompt(TokPos{pos_now + j}));
+            reqs[m + j].token = w.token(TokPos{pos_now + j});
         }
         const int nrows = m + kthis;
         if (nrows == 0) break;
@@ -5868,7 +5882,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
          * bank's prefill frontier moves with them (a resume computes its grid
          * point from it) and a commit that ends on the grid is a checkpoint. */
         if (pulsar_session_bank_state_restore(pool, pf->bank) &&
-            pulsar_session_note_prefilled(pool, pp.from(seam_unconverted_prompt(TokPos{P0})), pf_done, -1) == 0) {
+            pulsar_session_note_prefilled(pool, w.run(TokPos{P0}), pf_done, -1) == 0) {
             pf->committed_pos = TokPos{P0 + pf_done};
             s->live_bank = pf->bank;
             if (reached_end) {
@@ -6212,15 +6226,16 @@ void *server_worker_main(void *arg) {
              * admissible) => pf_fuse==NULL => today's exact decode-quantum +
              * separate-prefill time-slice, byte-identical. */
             session_slot *pf_fuse = NULL;
+        fuse_witness pf_witness;   /* L439: pf_fuse's, from its pick */
             const int budget = worker_decode_budget(s);
             if (use_spec_batched) {
                 pulsar_stall_mark("spec batched quantum");
                 s->worker_spec_batched_quantum(dec, n_dec, budget);
             } else {
-                pf_fuse = s->worker_find_fuse_prefill();
+                pf_fuse = s->worker_find_fuse_prefill(&pf_witness);
                 if (pf_fuse) {
                     pulsar_stall_mark("mixed batch quantum");
-                    s->worker_mixed_batch_quantum(dec, n_dec, pf_fuse);
+                    s->worker_mixed_batch_quantum(dec, n_dec, pf_fuse, pf_witness);
                 } else {
                     pulsar_stall_mark("batched decode quantum");
                     s->worker_batched_decode_quantum(dec, n_dec, budget);

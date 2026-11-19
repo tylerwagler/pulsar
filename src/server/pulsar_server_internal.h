@@ -4433,8 +4433,9 @@ struct server {
      * Its bank is necessarily DISTINCT from every decode bank (different phase). NULL
      * when the flag is off, not in pool mode, or nothing qualifies.
      */
+    /// @param w  receives the slot's witness (L439: the lane reads its prompt at the bank's position only through it)
     /// @return the slot to fold, or NULL
-    session_slot * worker_find_fuse_prefill();
+    session_slot * worker_find_fuse_prefill(fuse_witness *w);
     /** plan-34 phase-2 inc 5 — FUSED mixed-batch quantum. One decode quantum whose EVERY
      * step folds a small (s->mixed_chunk_tokens) prefill run for `pf` into the SAME
      * pulsar_session_decode_mixed sweep as the decode banks (true continuous batching,
@@ -4452,7 +4453,8 @@ struct server {
     /// @param dec  the decoding slots
     /// @param n    how many
     /// @param pf   the prefilling slot folded into the steps
-    void worker_mixed_batch_quantum(session_slot **dec, int n, session_slot *pf);
+    /// @param w    pf's witness from worker_find_fuse_prefill (L439)
+    void worker_mixed_batch_quantum(session_slot **dec, int n, session_slot *pf, const fuse_witness &w);
     /** Provision a bank in the shared pool (Tier-2). No GPU allocation happens here:
      * the whole n-bank pool was allocated and admitted ONCE at startup, so this is
      * pure host bookkeeping — find a free bank slot, install it, reset it to an
@@ -6458,6 +6460,14 @@ KvBytes server_ledger_release(KvBytes committed_total, KvBytes slot_cost);
 inline bool server_slot_batch_decoding(const session_slot *sl) {
     return sl && sl->gen && sl->gen->batch_active && sl->gen->phase == GEN_DECODE;
 }
+/** L439: the mixed fused lane's gate and its proof (fuse_witness): the bank's history `h` holds `p`'s first `pos`
+ *  tokens by id (no token seam and no foreign token below the bank's position), so the lane reads `p` at the bank's
+ *  positions.  The tokens compared are the first `pos` of each: a history that stands past `pos` is not read.
+ *  @param h   the slot's history (server::slot_history)
+ *  @param p   the prompt its prefill was handed
+ *  @param pos the bank's position */
+/// @return the witness, or none
+fuse_witness fuse_witness_of_history(const slot_tokens &h, prompt_view p, TokPos pos);
 /** L380: slot_tokens' length.  @param h the history */
 /// @return its tokens (0 for none)
 inline int slot_tokens_len(const slot_tokens &h) { return h.base ? h.base->len + (h.tail ? h.tail->len : 0) : 0; }
