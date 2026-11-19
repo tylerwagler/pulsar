@@ -141,16 +141,16 @@ KvBytes server_reconciled_session_cost(int slot_idx, int ctx, KvBytes est_bytes,
  * shrinks, so this is a belt-and-suspenders floor check on top of the
  * ledger, not a precise gauge. */
 /// @return MemAvailable in bytes; 0 when /proc/meminfo is unreadable or has no such line
-KvBytes server_mem_available_bytes(void) {
+HostBytes server_mem_available_bytes(void) {
     FILE *fp = fopen("/proc/meminfo", "r");
-    if (!fp) return KvBytes{};
+    if (!fp) return HostBytes{};
     char line[256];
     unsigned long long kib = 0;
     while (fgets(line, sizeof(line), fp)) {
         if (sscanf(line, "MemAvailable: %llu kB", &kib) == 1) break;
     }
     fclose(fp);
-    return KvBytes{(uint64_t)kib * 1024ull};   /* the kernel's reading enters the ledger's unit here */
+    return HostBytes{(uint64_t)kib * 1024ull};   /* the kernel's reading enters the host's unit here */
 }
 
 /* The guard's live budget (pulsar_server_internal.h, server::guard_budget).  Before 2026-10-29 every decision read
@@ -180,7 +180,7 @@ KvBytes server::guard_budget() {
                    (double)pulsar_session_touched_kv_bytes(sess).raw() / gib,
                    guard_discrete ? "device free" : "MemAvailable", (double)guard_avail.raw() / gib,
                    (double)guard_floor.raw() / gib,
-                   guard_avail != KvBytes{} ? "" : " -- the headroom reading is unreadable: fail closed");
+                   guard_avail != DeviceBytes{} ? "" : " -- the headroom reading is unreadable: fail closed");
         guard_budget_said = b;
     }
     return b;
@@ -452,7 +452,8 @@ server_mem_reading server::mem_reading() const {
     m.discrete = guard_discrete;
     m.host_avail = server_mem_available_bytes();
     m.host_floor = server_mem_floor();
-    m.kv_avail = guard_discrete ? server_guard_avail_bytes(true) : m.host_avail;
+    /* the KV's memory: the device's free memory, or on unified memory the host's reading (one pool) */
+    m.kv_avail = guard_discrete ? server_guard_avail_bytes(true) : pulsar_unified_device_bytes(m.host_avail);
     m.kv_floor = server_guard_floor(guard_discrete);
     return m;
 }

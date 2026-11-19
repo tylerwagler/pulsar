@@ -2517,18 +2517,21 @@ typedef struct {
  *  plus the guard's floor (PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES, the one reserve).
  *  @param working_set_bytes the working set: PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES at sizing
  *  @return the margin, bytes */
-static inline KvBytes server_discrete_margin_bytes(KvBytes working_set_bytes) {
-    return working_set_bytes + KvBytes{PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES};
+static inline DeviceBytes server_discrete_margin_bytes(DeviceBytes working_set_bytes) {
+    return working_set_bytes + DeviceBytes{PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES};
 }
 /** L347 I4: the working set the warmup measured on a discrete card (0 when the readings say none).
  *  @param free_before_create the device's free memory just before the session's create
  *  @param free_after_warmup  its free memory after the warmup
- *  @param session_resident   what of the session is resident then (its price less untouched demand-paged VA)
+ *  @param session_resident   what of the session is resident then (its price less untouched demand-paged VA): KV,
+ *                            in the device's memory (pulsar_kv_device_bytes)
  *  @return bytes */
-static inline KvBytes server_discrete_working_set_bytes(KvBytes free_before_create, KvBytes free_after_warmup,
-                                                        KvBytes session_resident) {
-    const KvBytes taken = free_before_create > free_after_warmup ? free_before_create - free_after_warmup : KvBytes{};
-    return taken > session_resident ? taken - session_resident : KvBytes{};
+static inline DeviceBytes server_discrete_working_set_bytes(DeviceBytes free_before_create, DeviceBytes free_after_warmup,
+                                                            KvBytes session_resident) {
+    const DeviceBytes taken =
+        free_before_create > free_after_warmup ? free_before_create - free_after_warmup : DeviceBytes{};
+    const DeviceBytes resident = pulsar_kv_device_bytes(session_resident);
+    return taken > resident ? taken - resident : DeviceBytes{};
 }
 /// The box's usable memory for the static admission formula, bytes (an upper bound after warm-up).
 #define PULSAR_SERVER_USABLE_BYTES          (121ull * 1024ull * 1024ull * 1024ull)
@@ -2573,10 +2576,11 @@ static inline KvBytes server_discrete_working_set_bytes(KvBytes free_before_crea
 #define PULSAR_SERVER_MEM_FLOOR_BYTES        (4ull * 1024ull * 1024ull * 1024ull)
 
 /** L391: the free-memory readings a headroom check compares a need with, each beside its own floor.  KV bytes are
- *  device memory on a discrete card and unified memory on the GB10, and both are KvBytes: a KV need tested against
- *  the host's MemAvailable on a discrete card (as provision_bank and the per-chunk prefill checks did) reads the
- *  wrong memory and the type cannot say so.  So the reading and its floor travel together, named by what they
- *  measure, and a need is tested only through server_kv_headroom_admits.
+ *  device memory on a discrete card and unified memory on the GB10: a KV need tested against the host's MemAvailable
+ *  on a discrete card (as provision_bank and the per-chunk prefill checks did) reads the wrong memory.  So the reading
+ *  and its floor travel together, named by what they measure, and a need is tested only through
+ *  server_kv_headroom_admits.  L442: the pairs are typed by their memory (pulsar_units.h, HostBytes / DeviceBytes),
+ *  so a KV need (KvBytes) compiles against the device's pair only, through pulsar_kv_device_bytes.
  *    kv_*    the memory the KV occupies: the device's free memory over PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES on a
  *            discrete card, MemAvailable over the memory floor on unified memory (server_guard_avail_bytes /
  *            server_guard_floor -- the guard's own pair).
@@ -2586,11 +2590,11 @@ static inline KvBytes server_discrete_working_set_bytes(KvBytes free_before_crea
  *  cache's RAM tier are allocated once (pulsar_ckpt_alloc, kv_cache_open), and a persist asks the host floor for its
  *  own bytes where it runs (kv_cache.cpp).  So a chunk's host need is zero: the host must only be at its floor. */
 typedef struct server_mem_reading {
-    bool    discrete;    ///< the KV is a discrete card's (the two pairs are different memories)
-    KvBytes kv_avail;    ///< free memory where the KV lives (0 = unreadable)
-    KvBytes kv_floor;    ///< the floor that reading keeps
-    KvBytes host_avail;  ///< the host's MemAvailable (0 = unreadable)
-    KvBytes host_floor;  ///< the memory floor (server_mem_floor)
+    bool        discrete;    ///< the KV is a discrete card's (the two pairs are different memories)
+    DeviceBytes kv_avail;    ///< free memory where the KV lives (0 = unreadable); on unified memory the host's reading
+    DeviceBytes kv_floor;    ///< the floor that reading keeps
+    HostBytes   host_avail;  ///< the host's MemAvailable (0 = unreadable)
+    HostBytes   host_floor;  ///< the memory floor (server_mem_floor)
 } server_mem_reading;
 
 /// A slot's lifecycle state (session_slot::state).
@@ -3054,8 +3058,8 @@ struct server {
     KvBytes      guard_touched_ceiling;  ///< the startup ceiling (post-warmup reading); the live budget never exceeds it
     KvBytes      guard_kv_budget;        ///< the ledger budget the ceiling was cut from
     KvBytes      guard_eager_bytes;      ///< eager floor already resident
-    KvBytes      guard_avail;            ///< the headroom reading the live budget last used (server_guard_avail_bytes)
-    KvBytes      guard_floor;            ///< the floor that reading must stay above (server_guard_floor)
+    DeviceBytes  guard_avail;            ///< the headroom reading the live budget last used (server_guard_avail_bytes)
+    DeviceBytes  guard_floor;            ///< the floor that reading must stay above (server_guard_floor)
     /** L338: the KV is a discrete card's: its readings are the device's.  L391: set whether or not the guard runs
      *  -- every headroom check reads the memory the bytes occupy through it (server::mem_reading). */
     bool         guard_discrete;
@@ -6279,8 +6283,8 @@ bool server_route_in_place(TokCount common, TokPos resume_at, TokPos frontier, T
 int server_image_cold_cut(int cut, const pulsar_image_ref *images, int n_images, int *inside);
 /* The admission budgets (unified memory; a discrete card's own) and the command line with its disk KV directory
  * resolved: defined in cli_main.cpp for main(), unit-tested in server_tests.cpp. */
-KvBytes server_kv_budget_bytes(KvBytes weights_resident_bytes);
-KvBytes server_kv_budget_discrete_bytes(KvBytes free_bytes, KvBytes working_set_bytes);
+KvBytes server_kv_budget_bytes(HostBytes weights_resident_bytes);
+KvBytes server_kv_budget_discrete_bytes(DeviceBytes free_bytes, DeviceBytes working_set_bytes);
 server_config server_parse_options(int argc, char **argv);
 void server_resolve_kv_disk_dir(server_config *c);
 /* Admission predicate (defined in cli_main.cpp; unit-tested there). */
@@ -6288,9 +6292,9 @@ bool server_kv_admits(KvBytes kv_budget_bytes, KvBytes committed_bytes, KvBytes 
 /* L319: the touched-KV ceiling -- min(kv budget − eager, touched + avail − floor); 0 when avail is at or under the
  * floor, or unreadable (defined in cli_main.cpp; unit-tested there).  The startup ceiling reads the post-warmup
  * headroom; the guard's live budget (server::guard_budget) the current one.  What avail and floor are is the device's
- * (server_guard_avail_bytes, server_guard_floor). */
+ * (server_guard_avail_bytes, server_guard_floor): device memory, which on unified memory is MemAvailable. */
 KvBytes server_guard_touched_budget(KvBytes kv_budget_bytes, KvBytes eager_bytes, KvBytes touched_bytes,
-                                    KvBytes avail_bytes, KvBytes floor);
+                                    DeviceBytes avail_bytes, DeviceBytes floor);
 /* L338: the guard's headroom on a DISCRETE card.  Its demand-paged KV lands in the card's own memory, so the reading
  * is the device's free memory (cudaMemGetInfo, exact there) above PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES, and the
  * ledger's share (budget − eager) does not cap it: on a discrete card the budget is free-after-weights less the
@@ -6299,11 +6303,12 @@ KvBytes server_guard_touched_budget(KvBytes kv_budget_bytes, KvBytes eager_bytes
  * prompt over ~2K tokens was refused (2026-11-02, CT 130).  GB10's unified memory keeps MemAvailable, the host floor
  * and the ledger's share. */
 /// @param discrete the KV lives in a discrete card's memory (pulsar_gpu_integrated() == 0)
-/// @return the headroom reading in bytes (0 = unreadable: every decision fails closed)
-KvBytes server_guard_avail_bytes(bool discrete);
+/// @return the headroom reading in bytes (0 = unreadable: every decision fails closed): the device's free memory, or
+///         on unified memory MemAvailable (the one pool)
+DeviceBytes server_guard_avail_bytes(bool discrete);
 /// @param discrete as server_guard_avail_bytes
 /// @return the floor that reading keeps free
-KvBytes server_guard_floor(bool discrete);
+DeviceBytes server_guard_floor(bool discrete);
 
 /* ==== The memory floor (2026-10-29 production hang) ========================================================
  * The hang: Nemotron 3.5 Super, 16 banks at --ctx 1M, a continued prefill at ~188k.  The guard's ceiling had
@@ -6322,35 +6327,48 @@ KvBytes server_guard_floor(bool discrete);
  * test, a tool) it is the OS margin alone. */
 /** The derived floor (bytes). */
 /// @return the floor, bytes
-KvBytes server_mem_floor(void);
+HostBytes server_mem_floor(void);
 /** Derive and set the floor: the OS margin + `zone_high_bytes` + `step_bytes`; returns it. */
 /// @param zone_high_bytes  the zones' high watermarks, bytes
 /// @param step_bytes  the largest demand of one worker step, bytes
 /// @return the floor, bytes
-KvBytes server_mem_floor_init(KvBytes zone_high_bytes, KvBytes step_bytes);
+HostBytes server_mem_floor_init(HostBytes zone_high_bytes, HostBytes step_bytes);
+/** The floor's step term (server_mem_floor_init): the largest host demand one worker step makes between two checks --
+ *  a prefill chunk's new KV pages on one bank (`chunk_kv`) and a persist's (`persist`). */
+/// @param chunk_kv  one prefill chunk's KV growth on one bank (the family's growth price)
+/// @param persist   a persist's host bytes at the full context (server_persist_host_bytes)
+/// @return the step, bytes
+HostBytes server_floor_step_bytes(KvBytes chunk_kv, HostBytes persist);
 /** Sum of every zone's `high` watermark in a /proc/zoneinfo text, in bytes (pages of `page_bytes`); 0 when none
  *  parses (the caller logs it and the floor keeps the OS margin). */
 /// @param zoneinfo  the file's text
 /// @param page_bytes  the page size, bytes
 /// @return bytes
-KvBytes server_zoneinfo_high_bytes(const char *zoneinfo, uint64_t page_bytes);
+HostBytes server_zoneinfo_high_bytes(const char *zoneinfo, uint64_t page_bytes);
 /** /proc/zoneinfo's high watermarks (server_zoneinfo_high_bytes over the live file); 0 when unreadable. */
 /// @return bytes
-KvBytes server_zone_high_watermark_bytes(void);
+HostBytes server_zone_high_watermark_bytes(void);
 /** The host bytes one disk-KV persist of a `tokens`-long history can take beyond the pinned staging buffer: the
  *  writeback window of dirty page cache (PULSAR_WRITEBACK_STEP) and the two renders of the history's text
  *  (pulsar_kvchain_persist), bounded at PERSIST_TEXT_BYTES_PER_TOKEN a token. */
 /// @param tokens  the history's length
 /// @return bytes
-KvBytes server_persist_host_bytes(int tokens);
+HostBytes server_persist_host_bytes(int tokens);
 /// Rendered-text bytes a token is bounded at for a persist's host demand (server_persist_host_bytes).
 #define PERSIST_TEXT_BYTES_PER_TOKEN 64u
-/** Does MemAvailable `avail` leave `floor` after `need` more bytes?  avail 0 (unreadable) is no. */
+/** Does the host's MemAvailable `avail` leave `floor` after `need` more bytes?  avail 0 (unreadable) is no. */
 /// @param avail  MemAvailable, bytes (0 = unreadable)
 /// @param need  the bytes about to be taken
 /// @param floor  the floor, bytes
 /// @return true when the floor stays
-bool server_headroom_admits(KvBytes avail, KvBytes need, KvBytes floor);
+bool server_headroom_admits(HostBytes avail, HostBytes need, HostBytes floor);
+/** The same test on the device's memory (a KV need, through pulsar_kv_device_bytes): the reading, the need and the
+ *  floor are all one memory's, or the call does not compile. */
+/// @param avail  the device's free memory, bytes (0 = unreadable)
+/// @param need  the bytes about to be taken
+/// @param floor  the floor, bytes
+/// @return true when the floor stays
+bool server_headroom_admits(DeviceBytes avail, DeviceBytes need, DeviceBytes floor);
 /** L391: do the readings admit `kv_need` more bytes of KV?  The KV's own memory must keep its floor after the need
  *  (the device on a discrete card, where a need of zero asks nothing of it), and the host must be at or over its
  *  floor (on unified memory the two are one reading and one test).  An unreadable reading (0) refuses. */
@@ -6407,7 +6425,7 @@ prefill_mem_step server_prefill_mem_step(const server_mem_reading &m, KvBytes ne
 /* MemAvailable from /proc/meminfo, in bytes (0 on parse failure — callers
  * fail closed).  Never called on a token/layer hot path (defined in
  * generate.cpp; also used by startup warmup/budget derivation in cli_main.cpp). */
-KvBytes server_mem_available_bytes(void);
+HostBytes server_mem_available_bytes(void);
 
 /* ==== The stall watchdog (watchdog.cpp) ===================================================================
  * The worker marks every CUDA-heavy section it enters (src/lib/pulsar_stall.h; each mark a heartbeat).  A watchdog

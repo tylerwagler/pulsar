@@ -221,7 +221,7 @@ void server::watchdog_dump(int64_t stalled_s) {
                (long long)stalled_s, s->stall_limit_s, where ? where : "(none yet)", where_age,
                (unsigned long long)g_pulsar_stall.beats.load(std::memory_order_relaxed));
     /* memory: what MemAvailable, swap and the KV figures read now */
-    const KvBytes avail = server_mem_available_bytes();
+    const HostBytes avail = server_mem_available_bytes();
     uint64_t swap_total = 0, swap_free = 0;
     const meminfo_read rt = meminfo_kib("/proc/meminfo", "SwapTotal:", &swap_total);
     const meminfo_read rf = meminfo_kib("/proc/meminfo", "SwapFree:", &swap_free);

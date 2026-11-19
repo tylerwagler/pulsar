@@ -60,7 +60,7 @@ static bool server_warmup_generation(pulsar_engine *engine, pulsar_session *sess
                                      int ctx_size) {
     const double t0 = server_now_sec();
     pulsar_gpu_seg_catalog_open();
-    const KvBytes avail_before = server_mem_available_bytes();
+    const HostBytes avail_before = server_mem_available_bytes();
     /* One full prefill-cap chunk plus a tail: exercises the widened chunk
      * prefill shape AND the sub-chunk tail shape.  The session's resolved
      * cap is used (the config value can be 0 = engine default). */
@@ -157,7 +157,7 @@ static bool server_warmup_generation(pulsar_engine *engine, pulsar_session *sess
     pulsar_tokens_free(&prompt);
     pulsar_tokens_free(&body);
     const uint64_t graph_failed = pulsar_gpu_seg_catalog_close();
-    const KvBytes avail_after = server_mem_available_bytes();
+    const HostBytes avail_after = server_mem_available_bytes();
     if (ok) {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: warmup generation: %d prompt + %d decode tokens "
@@ -167,7 +167,7 @@ static bool server_warmup_generation(pulsar_engine *engine, pulsar_session *sess
                    (double)avail_before.raw() / (1024.0 * 1024.0 * 1024.0),
                    (double)avail_after.raw() / (1024.0 * 1024.0 * 1024.0),
                    (double)(avail_before > avail_after
-                                ? avail_before - avail_after : KvBytes{}).raw() /
+                                ? avail_before - avail_after : HostBytes{}).raw() /
                        (1024.0 * 1024.0 * 1024.0));
     } else {
         server_log(PULSAR_LOG_WARNING,
@@ -287,15 +287,16 @@ static bool server_overcommit_enabled(void) {
  * resident weights, a fixed process-overhead reserve, and the free-memory
  * floor (PULSAR_SERVER_MEM_FLOOR_BYTES) — committing the full budget must still
  * leave the floor free. Returns 0 if the reserves already exceed usable. */
-/// @param weights_resident_bytes the resident weights, bytes
+/// @param weights_resident_bytes the resident weights, bytes (their host mapping: on unified memory the pool's)
 /// @return the session budget in bytes (0 when the reserves exceed PULSAR_SERVER_USABLE_BYTES)
-KvBytes server_kv_budget_bytes(KvBytes weights_resident_bytes) {
-    const KvBytes usable{PULSAR_SERVER_USABLE_BYTES};
-    const KvBytes reserved = weights_resident_bytes +
-                             KvBytes{PULSAR_SERVER_PROCESS_OVERHEAD_BYTES} +
-                             KvBytes{PULSAR_SERVER_MEM_FLOOR_BYTES};
+KvBytes server_kv_budget_bytes(HostBytes weights_resident_bytes) {
+    const HostBytes usable{PULSAR_SERVER_USABLE_BYTES};
+    const HostBytes reserved = weights_resident_bytes +
+                               HostBytes{PULSAR_SERVER_PROCESS_OVERHEAD_BYTES} +
+                               HostBytes{PULSAR_SERVER_MEM_FLOOR_BYTES};
     if (reserved >= usable) return KvBytes{};
-    return usable - reserved;
+    /* unified memory's formula (server_kv_budget_for_device): the box's one pool, what is left of it room for KV */
+    return pulsar_kv_room_bytes(pulsar_unified_device_bytes(usable - reserved));
 }
 
 /* L338: a DISCRETE card's sessions live in its own memory, which server_kv_budget_bytes' constants (GB10's unified
@@ -306,9 +307,9 @@ KvBytes server_kv_budget_bytes(KvBytes weights_resident_bytes) {
 /// @param free_bytes        the device's free memory, the weights staged
 /// @param working_set_bytes the working set the margin keeps (PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES at sizing)
 /// @return the session budget in bytes (0 when the margin exceeds what is free)
-KvBytes server_kv_budget_discrete_bytes(KvBytes free_bytes, KvBytes working_set_bytes) {
-    const KvBytes margin = server_discrete_margin_bytes(working_set_bytes);
-    return free_bytes > margin ? free_bytes - margin : KvBytes{};
+KvBytes server_kv_budget_discrete_bytes(DeviceBytes free_bytes, DeviceBytes working_set_bytes) {
+    const DeviceBytes margin = server_discrete_margin_bytes(working_set_bytes);
+    return free_bytes > margin ? pulsar_kv_room_bytes(free_bytes - margin) : KvBytes{};
 }
 
 #ifndef PULSAR_SERVER_TEST   /* main() only: the harnesses that include this file run no server */
@@ -316,11 +317,12 @@ KvBytes server_kv_budget_discrete_bytes(KvBytes free_bytes, KvBytes working_set_
  * else (GB10, or a device that did not answer) the unified one. */
 /// @param weights_resident_bytes the resident weights, bytes (the unified formula's)
 /// @return the session budget in bytes
-static KvBytes server_kv_budget_for_device(KvBytes weights_resident_bytes) {
+static KvBytes server_kv_budget_for_device(HostBytes weights_resident_bytes) {
     if (pulsar_gpu_integrated() == 0) {
         uint64_t free_b = 0, total_b = 0;
         pulsar_gpu_mem_info(&free_b, &total_b);
-        return server_kv_budget_discrete_bytes(KvBytes{free_b}, KvBytes{PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES});
+        return server_kv_budget_discrete_bytes(DeviceBytes{free_b},
+                                               DeviceBytes{PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES});
     }
     return server_kv_budget_bytes(weights_resident_bytes);
 }
@@ -387,15 +389,30 @@ bool server_kv_admits(KvBytes kv_budget_bytes, KvBytes committed_bytes, KvBytes 
  * closed — this guard exists precisely for when other accounting is wrong, so
  * it must not silently disarm itself.  A KV need is asked through
  * server_kv_headroom_admits, which reads the memory the KV occupies (L391). */
-bool server_headroom_admits(KvBytes avail, KvBytes need, KvBytes floor) {
-    if (avail == KvBytes{} || need > KvBytes::max() - floor) return false;
+/// @brief server_headroom_admits on one memory's unit (HostBytes or DeviceBytes): the two overloads' one body.
+/// @param avail the reading (0 = unreadable)
+/// @param need the bytes about to be taken
+/// @param floor the floor
+/// @return true when the floor stays
+template <class B>
+static bool server_headroom_admits_in(B avail, B need, B floor) {
+    if (avail == B{} || need > B::max() - floor) return false;
     return avail >= need + floor;
 }
 
+bool server_headroom_admits(HostBytes avail, HostBytes need, HostBytes floor) {
+    return server_headroom_admits_in(avail, need, floor);
+}
+
+bool server_headroom_admits(DeviceBytes avail, DeviceBytes need, DeviceBytes floor) {
+    return server_headroom_admits_in(avail, need, floor);
+}
+
 bool server_kv_headroom_admits(const server_mem_reading &m, KvBytes kv_need) {
-    if (!m.discrete) return server_headroom_admits(m.kv_avail, kv_need, m.kv_floor);
-    if (!server_headroom_admits(m.host_avail, KvBytes{}, m.host_floor)) return false;
-    return kv_need == KvBytes{} || server_headroom_admits(m.kv_avail, kv_need, m.kv_floor);
+    const DeviceBytes need = pulsar_kv_device_bytes(kv_need);   /* the KV lives in the device's memory */
+    if (!m.discrete) return server_headroom_admits(m.kv_avail, need, m.kv_floor);
+    if (!server_headroom_admits(m.host_avail, HostBytes{}, m.host_floor)) return false;
+    return kv_need == KvBytes{} || server_headroom_admits(m.kv_avail, need, m.kv_floor);
 }
 
 KvBytes server_bank_provision_demand(bool growth_guarded, KvBytes kv_bank_bytes) {
@@ -442,16 +459,23 @@ bool server_ledger_self_check(KvBytes admitted, uint32_t priced_banks, uint32_t 
  * the worker starts, and read-only after that. */
 /// The memory floor in bytes (server_mem_floor / server_mem_floor_init); main thread writes it before any other
 /// thread starts.
-static KvBytes g_server_mem_floor{PULSAR_SERVER_MEM_FLOOR_BYTES};
+static HostBytes g_server_mem_floor{PULSAR_SERVER_MEM_FLOOR_BYTES};
 
-KvBytes server_mem_floor(void) { return g_server_mem_floor; }
+HostBytes server_mem_floor(void) { return g_server_mem_floor; }
 
-KvBytes server_mem_floor_init(KvBytes zone_high_bytes, KvBytes step_bytes) {
-    g_server_mem_floor = KvBytes{PULSAR_SERVER_MEM_FLOOR_BYTES} + zone_high_bytes + step_bytes;
+HostBytes server_mem_floor_init(HostBytes zone_high_bytes, HostBytes step_bytes) {
+    g_server_mem_floor = HostBytes{PULSAR_SERVER_MEM_FLOOR_BYTES} + zone_high_bytes + step_bytes;
     return g_server_mem_floor;
 }
 
-KvBytes server_zoneinfo_high_bytes(const char *zoneinfo, uint64_t page_bytes) {
+HostBytes server_floor_step_bytes(KvBytes chunk_kv, HostBytes persist) {
+    /* L442 FINDING (a marked crossing, value unchanged): a chunk's KV pages are host memory only on unified memory,
+     * where the device allocates from the host's pool.  On a discrete card they land in the device's memory, and this
+     * adds them to the HOST's floor all the same -- the floor sits one chunk's KV (one bank) too high there. */
+    return pulsar_unified_host_bytes(pulsar_kv_device_bytes(chunk_kv)) + persist;
+}
+
+HostBytes server_zoneinfo_high_bytes(const char *zoneinfo, uint64_t page_bytes) {
     uint64_t pages = 0;
     bool any = false;
     for (const char *p = zoneinfo; p && *p;) {
@@ -466,12 +490,12 @@ KvBytes server_zoneinfo_high_bytes(const char *zoneinfo, uint64_t page_bytes) {
         if (!eol) break;
         p = eol + 1;
     }
-    return KvBytes{any ? pages * page_bytes : 0};   /* the kernel's reserve enters the floor's unit here */
+    return HostBytes{any ? pages * page_bytes : 0};   /* the kernel's reserve enters the floor's unit here */
 }
 
-KvBytes server_zone_high_watermark_bytes(void) {
+HostBytes server_zone_high_watermark_bytes(void) {
     FILE *fp = fopen("/proc/zoneinfo", "r");
-    if (!fp) return KvBytes{};
+    if (!fp) return HostBytes{};
     std::string text;
     char line[512];
     while (fgets(line, sizeof line, fp)) text += line;
@@ -480,9 +504,9 @@ KvBytes server_zone_high_watermark_bytes(void) {
     return server_zoneinfo_high_bytes(text.c_str(), pg > 0 ? (uint64_t)pg : 4096u);
 }
 
-KvBytes server_persist_host_bytes(int tokens) {
+HostBytes server_persist_host_bytes(int tokens) {
     const uint64_t t = tokens > 0 ? (uint64_t)tokens : 0u;
-    return KvBytes{PULSAR_WRITEBACK_STEP + 2u * t * PERSIST_TEXT_BYTES_PER_TOKEN};
+    return HostBytes{PULSAR_WRITEBACK_STEP + 2u * t * PERSIST_TEXT_BYTES_PER_TOKEN};
 }
 
 /* L319: the resident-KV ceiling every touched-KV decision keys on (the decode guard's spills, L280's prompt
@@ -500,25 +524,26 @@ KvBytes server_persist_host_bytes(int tokens) {
 /// @param floor the floor that reading keeps free (server_guard_floor)
 /// @return the resident-KV budget in bytes; 0 when the reading is at or under the floor
 KvBytes server_guard_touched_budget(KvBytes kv_budget_bytes, KvBytes eager_bytes, KvBytes touched_bytes,
-                                    KvBytes avail_bytes, KvBytes floor) {
+                                    DeviceBytes avail_bytes, DeviceBytes floor) {
     if (avail_bytes <= floor) return KvBytes{};
     const KvBytes ledger = kv_budget_bytes > eager_bytes ? kv_budget_bytes - eager_bytes : KvBytes{};
-    const KvBytes headroom = avail_bytes - floor;
+    const KvBytes headroom = pulsar_kv_room_bytes(avail_bytes - floor);
     const KvBytes physical = touched_bytes > KvBytes::max() - headroom ? KvBytes::max() : touched_bytes + headroom;
     return ledger < physical ? ledger : physical;
 }
 
 
 
-KvBytes server_guard_avail_bytes(bool discrete) {
-    if (!discrete) return server_mem_available_bytes();
+DeviceBytes server_guard_avail_bytes(bool discrete) {
+    if (!discrete) return pulsar_unified_device_bytes(server_mem_available_bytes());   /* unified: one pool */
     uint64_t free_b = 0, total_b = 0;
     pulsar_gpu_mem_info(&free_b, &total_b);
-    return KvBytes{free_b};   /* the device's reading enters the guard's unit here */
+    return DeviceBytes{free_b};   /* the device's reading enters its unit here */
 }
 
-KvBytes server_guard_floor(bool discrete) {
-    return discrete ? KvBytes{PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES} : server_mem_floor();
+DeviceBytes server_guard_floor(bool discrete) {
+    return discrete ? DeviceBytes{PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES}
+                    : pulsar_unified_device_bytes(server_mem_floor());   /* unified: the host's floor is the pool's */
 }
 
 void server::close_resources() {
@@ -1017,7 +1042,7 @@ int main(int argc, char **argv) {
      * + prefill working set + drafter state, pulsar_engine_session_cost_bytes),
      * then gate the slot's graph allocation on it. The scheduler runs the same
      * predicate for every lazily provisioned slot. */
-    const KvBytes weights_resident = pulsar_engine_weights_resident_bytes(engine);
+    const HostBytes weights_resident = pulsar_engine_weights_resident_bytes(engine);
     const KvBytes kv_budget = server_kv_budget_for_device(weights_resident);
 
     /* Tier-2 pool auto-sizing (batching ON by default, auto-fit). Batching is
@@ -1131,7 +1156,7 @@ int main(int argc, char **argv) {
                    "against the warmup), budget=%.1f GiB",
                    (double)total_b / (1024.0 * 1024.0 * 1024.0), (double)free_b / (1024.0 * 1024.0 * 1024.0),
                    (double)weights_resident.raw() / (1024.0 * 1024.0 * 1024.0),
-                   (double)server_discrete_margin_bytes(KvBytes{PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES}).raw() /
+                   (double)server_discrete_margin_bytes(DeviceBytes{PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES}).raw() /
                        (1024.0 * 1024.0 * 1024.0),
                    (double)PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES / (1024.0 * 1024.0 * 1024.0),
                    (double)PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES / (1024.0 * 1024.0 * 1024.0),
@@ -1162,11 +1187,11 @@ int main(int argc, char **argv) {
 
     /* L347 I4: the device's free memory before the create -- the warmup's working set is measured against it */
     const bool discrete = pulsar_gpu_integrated() == 0;
-    KvBytes dev_free_before_create{};
+    DeviceBytes dev_free_before_create{};
     if (discrete) {
         uint64_t free_b = 0, total_unused = 0;
         pulsar_gpu_mem_info(&free_b, &total_unused);
-        dev_free_before_create = KvBytes{free_b};
+        dev_free_before_create = DeviceBytes{free_b};
     }
     pulsar_session *session = NULL;
     if (pulsar_session_create(&session, engine, cfg.ctx_size) != 0) {
@@ -1202,7 +1227,7 @@ int main(int argc, char **argv) {
         kv_ram_plan_for(pulsar_gpu_integrated(), mem_total, cfg.kv_ram_mb, &ram.bytes, &ram.retain);
     }
     /* the host pool the cache opens with */
-    const KvBytes kv_pool_charge{cfg.kv_disk_dir && cfg.kv_disk_dir[0] ? ram.bytes : 0u};
+    const HostBytes kv_pool_charge{cfg.kv_disk_dir && cfg.kv_disk_dir[0] ? ram.bytes : 0u};
     if (!server_warmup_generation(engine, session, cfg.ctx_size)) {
         pulsar_session_free(session);
         pulsar_engine_close(engine);
@@ -1223,24 +1248,24 @@ int main(int argc, char **argv) {
      * the session's per-step growth is known: the OS margin, the kernel's high watermarks, and one worker step's
      * host/driver demand -- a prefill chunk's new KV pages on one bank plus a persist at the full context. */
     {
-        const KvBytes zone_high = server_zone_high_watermark_bytes();
+        const HostBytes zone_high = server_zone_high_watermark_bytes();
         const KvBytes chunk_kv = pulsar_session_quantum_growth_bytes_per_bank(
             session, pulsar_kv_rows(pulsar_session_prefill_cap(session)));
-        const KvBytes persist = server_persist_host_bytes(cfg.ctx_size);
-        const KvBytes step = chunk_kv + persist;
-        const KvBytes floor = server_mem_floor_init(zone_high, step);
+        const HostBytes persist = server_persist_host_bytes(cfg.ctx_size);
+        const HostBytes step = server_floor_step_bytes(chunk_kv, persist);
+        const HostBytes floor = server_mem_floor_init(zone_high, step);
         const double mib = 1024.0 * 1024.0;
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: memory floor %.0f MiB = OS margin %.0f + kernel high watermarks %.0f%s + one "
                    "step's demand %.0f (a %d-token prefill chunk's KV %.0f + a persist at %d tokens %.0f)",
                    (double)floor.raw() / mib, (double)PULSAR_SERVER_MEM_FLOOR_BYTES / mib,
-                   (double)zone_high.raw() / mib, zone_high != KvBytes{} ? "" : " (/proc/zoneinfo unreadable)",
+                   (double)zone_high.raw() / mib, zone_high != HostBytes{} ? "" : " (/proc/zoneinfo unreadable)",
                    (double)step.raw() / mib, pulsar_session_prefill_cap(session).raw(), (double)chunk_kv.raw() / mib,
                    cfg.ctx_size, (double)persist.raw() / mib);
     }
     KvBytes kv_budget_final = kv_budget;
-    KvBytes warm_avail{};   /* L319: the touched-KV ceiling's measurement (below) */
-    KvBytes warm_dev_free{};   /* L338: its discrete-card reading, the device's free memory at the same point */
+    HostBytes warm_avail{};   /* L319: the touched-KV ceiling's measurement (below) */
+    DeviceBytes warm_dev_free{};   /* L338: its discrete-card reading, the device's free memory at the same point */
     KvBytes warm_touched{};
     {
         /* What of slot 0 is RESIDENT now, and so already out of MemAvailable:
@@ -1259,8 +1284,8 @@ int main(int argc, char **argv) {
         const KvBytes untouched_va = demand_va > touched_now ? demand_va - touched_now : KvBytes{};
         const KvBytes resident_now = session_actual > untouched_va ? session_actual - untouched_va : KvBytes{};
         /* L347: the disk cache's host pool, opened after this reading, is charged to it now */
-        const KvBytes avail_raw = server_mem_available_bytes();
-        const KvBytes avail_now = avail_raw > kv_pool_charge ? avail_raw - kv_pool_charge : KvBytes{};
+        const HostBytes avail_raw = server_mem_available_bytes();
+        const HostBytes avail_now = avail_raw > kv_pool_charge ? avail_raw - kv_pool_charge : HostBytes{};
         warm_avail = avail_now;
         warm_touched = touched_now;
         if (discrete) warm_dev_free = server_guard_avail_bytes(true);   /* the same reading */
@@ -1269,10 +1294,10 @@ int main(int argc, char **argv) {
              * not describe.  Past the estimate the banks were sized with, the start is refused (rule 9). */
             uint64_t free_b = 0, total_unused = 0;
             pulsar_gpu_mem_info(&free_b, &total_unused);
-            const KvBytes dev_free_now{free_b};
-            const KvBytes ws = server_discrete_working_set_bytes(dev_free_before_create, dev_free_now, resident_now);
+            const DeviceBytes dev_free_now{free_b};
+            const DeviceBytes ws = server_discrete_working_set_bytes(dev_free_before_create, dev_free_now, resident_now);
             const double gib = 1024.0 * 1024.0 * 1024.0;
-            if (ws > KvBytes{PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES}) {
+            if (ws > DeviceBytes{PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES}) {
                 server_log(PULSAR_LOG_ERROR,
                            "pulsar-server: refusing to start: the warmup's working set is %.2f GiB (device free %.2f "
                            "GiB before the create, %.2f after the warmup, session resident %.2f) -- past the %.2f GiB "
@@ -1293,10 +1318,11 @@ int main(int argc, char **argv) {
                        (double)dev_free_before_create.raw() / gib, (double)dev_free_now.raw() / gib,
                        (double)resident_now.raw() / gib, (double)kv_budget_final.raw() / gib,
                        (double)PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES / gib);
-        } else if (avail_now > KvBytes{}) {
-            const KvBytes floor = server_mem_floor();
-            const KvBytes headroom = avail_now > floor ? avail_now - floor : KvBytes{};
-            KvBytes measured = resident_now + headroom;
+        } else if (avail_now > HostBytes{}) {
+            const HostBytes floor = server_mem_floor();
+            const HostBytes headroom = avail_now > floor ? avail_now - floor : HostBytes{};
+            /* unified memory (this branch's): the host's headroom is the pool's, room for KV */
+            KvBytes measured = resident_now + pulsar_kv_room_bytes(pulsar_unified_device_bytes(headroom));
             /* The measured budget is one-shot and PERMANENT, while the
              * MemAvailable it derives from can read transiently low at
              * startup (a previous model process still releasing memory;
@@ -1486,8 +1512,8 @@ int main(int argc, char **argv) {
         }
         /* L347 I4: where the checkpoints are (the store's placement): a discrete card's are pinned host RAM */
         char ckpt_where[96];
-        const KvBytes ckpt_host = pulsar_session_ckpt_host_bytes(session);
-        if (ckpt_host != KvBytes{})
+        const HostBytes ckpt_host = pulsar_session_ckpt_host_bytes(session);
+        if (ckpt_host != HostBytes{})
             snprintf(ckpt_where, sizeof ckpt_where, "in pinned host RAM (%.2f GiB), not in the price",
                      (double)ckpt_host.raw() / (1024.0 * 1024.0 * 1024.0));
         else
@@ -1538,7 +1564,8 @@ int main(int argc, char **argv) {
          * would grow until the box runs dry.  2026-10-29: every guard decision reads the LIVE budget under this
          * ceiling (server::guard_budget). */
         s.guard_kv_budget = budget;
-        const KvBytes guard_warm_avail = s.guard_discrete ? warm_dev_free : warm_avail;
+        /* the guard's reading: the device's free memory, or on unified memory MemAvailable (the one pool) */
+        const DeviceBytes guard_warm_avail = s.guard_discrete ? warm_dev_free : pulsar_unified_device_bytes(warm_avail);
         s.guard_touched_ceiling = server_guard_touched_budget(s.guard_kv_budget, s.guard_eager_bytes, warm_touched,
                                                               guard_warm_avail, s.guard_floor);
         s.guard_enabled = (s.guard_touched_ceiling > KvBytes{});

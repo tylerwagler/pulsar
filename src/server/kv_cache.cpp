@@ -946,8 +946,8 @@ int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chai
      * reserve) holds room for a persist. */
     if (why != KV_PERSIST_SPILL) {
         const pulsar_tokens *toks = pulsar_session_tokens(s->sess);
-        const KvBytes need = server_persist_host_bytes(toks ? toks->len : 0);
-        const KvBytes avail = server_mem_available_bytes();
+        const HostBytes need = server_persist_host_bytes(toks ? toks->len : 0);
+        const HostBytes avail = server_mem_available_bytes();
         if (!server_headroom_admits(avail, need, server_mem_floor())) {
             s->count_metric(&s->m_persist_skipped);
             unsigned skipped = 0;
@@ -958,7 +958,7 @@ int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chai
                            "the %.2f GiB it may take over the %.2f GiB floor%s (%u more skipped since the last line)",
                            reason, (double)avail.raw() / gib, (double)need.raw() / gib,
                            (double)server_mem_floor().raw() / gib,
-                           avail != KvBytes{} ? "" : " (MemAvailable unreadable)", skipped);
+                           avail != HostBytes{} ? "" : " (MemAvailable unreadable)", skipped);
             }
             if (no_room) *no_room = true;   /* L353 no. 14: nothing was stored, and a caller may say so */
             return 0;
