@@ -1696,7 +1696,7 @@ void server::kv_dup_census_update() {
                        "pulsar-server: kv dup: banks %d and %d share %d tokens (%d whole pages of %d, %.2f GiB held "
                        "twice) -- deeper than the preamble (%d)", s->slots[a].bank.raw(), s->slots[b].bank.raw(),
                        shared, shared / grid, grid,
-                       (double)page_bytes.times((uint64_t)(shared / grid)).raw() / PULSAR_GIB,
+                       pulsar_gib(page_bytes.times((uint64_t)(shared / grid))),
                        PULSAR_KV_DUP_DEEP_TOKENS);
         }
         s->w_dup_deep[a] = deep[a];

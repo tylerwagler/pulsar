@@ -1124,7 +1124,7 @@ int main(int argc, char **argv) {
                        chosen, cfg.ctx_size,
                        pulsar_gib(price.eager_per_bank),
                        pulsar_gib(price.demand_per_bank), pulsar_gib(price.shared),
-                       (double)price.admission((uint32_t)chosen).raw() / PULSAR_GIB,
+                       pulsar_gib(price.admission((uint32_t)chosen)),
                        chosen > 1 ? "ON" : "OFF");
         } else {
             server_log(PULSAR_LOG_DEFAULT,
@@ -1254,7 +1254,7 @@ int main(int argc, char **argv) {
                    pulsar_mib(floor), (double)PULSAR_SERVER_MEM_FLOOR_BYTES / PULSAR_MIB,
                    pulsar_mib(zone_high), zone_high != HostBytes{} ? "" : " (/proc/zoneinfo unreadable)",
                    pulsar_mib(step), pulsar_session_prefill_cap(session).raw(),
-                   (double)(step - persist).raw() / PULSAR_MIB,   /* the chunk's KV the floor holds: none on a discrete card */
+                   pulsar_mib(step - persist),   /* the chunk's KV the floor holds: none on a discrete card */
                    cfg.ctx_size, pulsar_mib(persist));
     }
     KvBytes kv_budget_final = kv_budget;
