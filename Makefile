@@ -1146,6 +1146,17 @@ LOADER_CONTRACT_WORK ?= /var/tmp/pulsar-loader-contract
 .PHONY: loader-contract-gate
 loader-contract-gate: tests/loader_open
 	python3 tests/loader_contract.py --open ./tests/loader_open --work $(LOADER_CONTRACT_WORK) $(FRONTIER_MODEL) $(QWEN_GATE_MODEL)
+# L436: the layer index spaces (src/lib/pulsar_units.h: TrunkLayer, LayerSlot, DraftLayer, SrcBlock, KindOrd, VisLayer,
+# TpSlot) -- their non-convertibility at compile time, each crossing against the open-coded expression it replaced, and,
+# on every served family's published container opened inspect-only (headers only, seconds), the assumptions the
+# crossings rest on: trunk slots are the plan's layers, the slots past them one drafter's, the taps' block -> layer,
+# the slab's exchange slots (tests/layer_index_gate.cpp).  Host-only; the program opens under an instance lock of its
+# own, so it never meets another gate's.
+LAYER_INDEX_MODELS ?= $(FRONTIER_MODEL) $(QWEN_GATE_MODEL) $(NEMOTRON_GATE_MODEL) $(GEMMA4_GATE_MODEL) \
+                      $(SMOKE_EMBED_MODEL) $(SMOKE_RERANK_MODEL) $(SMOKE_PARSE_MODEL)
+.PHONY: layer-index-gate
+layer-index-gate: tests/layer_index_gate
+	./tests/layer_index_gate $(LAYER_INDEX_MODELS)
 # L338 E2: the Gemma 4 family's load on a built container (tests/gemma4_family_gate.cpp): every tensor bound by its
 # bind record, every byte priced, the plan (PULSAR_FFN_DENSE_MOE), the stored widths, the facts, the session refusals;
 # then the loader contract's neutral faults on it.  Host-only.  The container: tools/container/build.py emit --hf <the
@@ -3239,6 +3250,11 @@ tests/gemma4_jev_gate.o: tests/gemma4_jev_gate.cpp tests/gate_entry.h tests/gate
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
 tests/gemma4_jev_gate: tests/gemma4_jev_gate.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+tests/layer_index_gate.o: tests/layer_index_gate.cpp src/lib/pulsar_units.h src/engine/pulsar_engine_internal.h \
+                          src/engine/state_kinds.h src/engine/step_driver.h src/engine/spec_block.h src/pulsar.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
+tests/layer_index_gate: tests/layer_index_gate.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 tests/nemotron_family_gate.o: tests/nemotron_family_gate.cpp src/families/nemotron_h/nemotron_h.h src/engine/role_bind.h \
                               src/engine/pulsar_engine_internal.h src/pulsar.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
@@ -3638,7 +3654,7 @@ clean:
 	rm -rf .build
 	rm -rf tests/runner
 	rm -f tools/quality-testing/score_official tools/quality-testing/score_official.o tools/quality-testing/score_official.d
-	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/families/*/*.o src/families/*/*.d src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o $(XGRAMMAR_OBJS) $(XGRAMMAR_OBJS:.o=.d) tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/vision_chunk_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/spec_sampling_gate tests/spec_sampling_gate_wide tests/algo_stability_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/draft_refusal_gate tests/scratch_poison_gate tests/scratch_poison_gate_mutant tests/gates_runner_mutant_* tests/mutant/family_qwen_s4_l307.cpp tests/mutant/family_qwen_s4_l307.o tests/mutant/family_qwen_s4_l307.d tests/decode_reference_gate tests/verify_width_probe tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/sampler_device_gate tests/nt_crossover_sweep tests/vision_router_gate tests/router_gate tests/bf16_rows_gate tests/nvfp4_rows_gate tests/lilicorr_head_gate tests/inkling_family_gate tests/nemotron_family_gate tests/nemotron_fwd_gate tests/nemotron_enc_gate tests/nemotron_parse_gate tests/rowops_gate tests/state_kinds_gate tests/payload_frontier_gate tests/prompt_end_gate tests/bank_adopt_gate tests/bank_residency_gate tests/bank_isolation_gate tests/kv_accounting_gate tests/graph_eager_gate
+	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/families/*/*.o src/families/*/*.d src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o $(XGRAMMAR_OBJS) $(XGRAMMAR_OBJS:.o=.d) tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/vision_chunk_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/spec_sampling_gate tests/spec_sampling_gate_wide tests/algo_stability_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/draft_refusal_gate tests/scratch_poison_gate tests/scratch_poison_gate_mutant tests/gates_runner_mutant_* tests/mutant/family_qwen_s4_l307.cpp tests/mutant/family_qwen_s4_l307.o tests/mutant/family_qwen_s4_l307.d tests/decode_reference_gate tests/verify_width_probe tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/sampler_device_gate tests/nt_crossover_sweep tests/vision_router_gate tests/router_gate tests/bf16_rows_gate tests/nvfp4_rows_gate tests/lilicorr_head_gate tests/inkling_family_gate tests/nemotron_family_gate tests/layer_index_gate tests/nemotron_fwd_gate tests/nemotron_enc_gate tests/nemotron_parse_gate tests/rowops_gate tests/state_kinds_gate tests/payload_frontier_gate tests/prompt_end_gate tests/bank_adopt_gate tests/bank_residency_gate tests/bank_isolation_gate tests/kv_accounting_gate tests/graph_eager_gate
 
 # Pull in the generated header dependencies.  `-include` (not `include`) so a
 # tree with no .d files yet -- a fresh clone, or right after `make clean` -- is
