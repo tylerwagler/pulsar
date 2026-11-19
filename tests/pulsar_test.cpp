@@ -5517,10 +5517,10 @@ static void test_state_plan_overflow(void) {
     q.n_trunk = q.n_slots = PULSAR_STATE_SLOTS_MAX - 2u;
     for (uint32_t k = 0; k < q.n_trunk; k++) q.slot[k] = 1u << id;
     q.session = 0xA5A5A5A5u;   /* the word after slot[]: a write past the table would land here */
-    TEST_ASSERT(pulsar_state_plan_add_slot(&q, 1u << id) == PULSAR_STATE_SLOTS_MAX - 2u);
-    TEST_ASSERT(pulsar_state_plan_add_slot(&q, 1u << id) == PULSAR_STATE_SLOTS_MAX - 1u);
+    TEST_ASSERT(pulsar_state_plan_add_slot(&q, 1u << id) == LayerSlot{PULSAR_STATE_SLOTS_MAX - 2u});
+    TEST_ASSERT(pulsar_state_plan_add_slot(&q, 1u << id) == LayerSlot{PULSAR_STATE_SLOTS_MAX - 1u});
     TEST_ASSERT(q.n_slots == PULSAR_STATE_SLOTS_MAX && q.slot_overflow == 0u && pulsar_state_plan_slots_fit(&q, "test"));
-    for (uint32_t i = 0; i < 3u; i++) TEST_ASSERT(pulsar_state_plan_add_slot(&q, 1u << id) == PULSAR_STATE_SLOTS_MAX);
+    for (uint32_t i = 0; i < 3u; i++) TEST_ASSERT(pulsar_state_plan_add_slot(&q, 1u << id) == LayerSlot{PULSAR_STATE_SLOTS_MAX});
     TEST_ASSERT(q.n_slots == PULSAR_STATE_SLOTS_MAX && q.slot_overflow == 3u && q.session == 0xA5A5A5A5u);
     TEST_ASSERT(!pulsar_state_plan_slots_fit(&q, "test"));
     q.session = 0u;

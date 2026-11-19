@@ -404,9 +404,9 @@ bool pulsar_nemotron_h_read_shape(const pulsar_model *m, pulsar_nemotron_h_shape
 void pulsar_nemotron_h_plan(const pulsar_nemotron_h_shape *s, pulsar_layer_plan *plan) {
     memset(plan, 0, sizeof(*plan));
     plan->n_layer = s->n_layer;
-    for (uint32_t il = 0; il < s->n_layer; il++) {
-        plan->kind[il] = PULSAR_LAYER_BLOCKS;
-        plan->desc[il].mixer = s->mamba_layers >> il & 1u ? PULSAR_MIXER_MAMBA2 : PULSAR_MIXER_ATTN_FULL;
-        plan->desc[il].ffn = s->moe_layers >> il & 1u ? PULSAR_FFN_MOE : PULSAR_FFN_NONE;
+    for (TrunkLayer il{0u}; il.below(s->n_layer); ++il) {
+        plan->kind[il.raw()] = PULSAR_LAYER_BLOCKS;
+        plan->desc[il.raw()].mixer = s->mamba_layers >> il.raw() & 1u ? PULSAR_MIXER_MAMBA2 : PULSAR_MIXER_ATTN_FULL;
+        plan->desc[il.raw()].ffn = s->moe_layers >> il.raw() & 1u ? PULSAR_FFN_MOE : PULSAR_FFN_NONE;
     }
 }

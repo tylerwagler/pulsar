@@ -42,13 +42,13 @@ uint32_t pulsar_state_plan_add(pulsar_state_plan *p, const pulsar_state_decl &d)
     return p->n_decl++;
 }
 
-uint32_t pulsar_state_plan_add_slot(pulsar_state_plan *p, uint32_t mask) {
+LayerSlot pulsar_state_plan_add_slot(pulsar_state_plan *p, uint32_t mask) {
     if (p->n_slots >= PULSAR_STATE_SLOTS_MAX) {   /* counted: the load refuses the model (pulsar_state_plan_slots_fit) */
         p->slot_overflow++;
-        return PULSAR_STATE_SLOTS_MAX;
+        return LayerSlot{PULSAR_STATE_SLOTS_MAX};
     }
     p->slot[p->n_slots] = mask;
-    return p->n_slots++;
+    return LayerSlot{p->n_slots++};
 }
 
 bool pulsar_state_plan_slots_fit(const pulsar_state_plan *p, const char *arch) {
@@ -257,12 +257,21 @@ bool pulsar_state_reset_bank(pulsar_state_set *ss, BankId bank) {
     return ok;
 }
 
-uint64_t pulsar_state_capture_offset(const pulsar_state_set *ss, uint32_t slot, uint32_t id) {
-    const pulsar_state_decl *d = &ss->plan->decl[id];
-    return (uint64_t)ss->ord[slot][id] * capture_gens(d) * ss->verify_rows * capture_row_bytes(d);
+/** L436: slot `slot`'s ordinal among the trunk slots carrying decl `id` -- where its rows sit in the decl's capture.
+ *  @param ss   the set
+ *  @param slot a trunk layer's slot
+ *  @param id   the decl id */
+/// @return the ordinal (0 for a slot that does not carry the decl, as the table reads)
+static KindOrd pulsar_state_slot_ord(const pulsar_state_set *ss, LayerSlot slot, uint32_t id) {
+    return KindOrd{ss->ord[slot.raw()][id]};
 }
 
-void *pulsar_state_capture_rows(const pulsar_state_set *ss, uint32_t slot, uint32_t id) {
+uint64_t pulsar_state_capture_offset(const pulsar_state_set *ss, LayerSlot slot, uint32_t id) {
+    const pulsar_state_decl *d = &ss->plan->decl[id];
+    return (uint64_t)pulsar_state_slot_ord(ss, slot, id).raw() * capture_gens(d) * ss->verify_rows * capture_row_bytes(d);
+}
+
+void *pulsar_state_capture_rows(const pulsar_state_set *ss, LayerSlot slot, uint32_t id) {
     if (!ss->cap_rows[id]) return NULL;
     return (uint8_t *)dptr(ss->cap_rows[id]) + pulsar_state_capture_offset(ss, slot, id);
 }
@@ -316,7 +325,7 @@ bool pulsar_state_fold_flush(pulsar_state_set *ss, BankId bank) {
         for (uint32_t id = 0; ok && id < p->n_decl; id++)
             if (has(p->slot[k], id) && p->decl[id].capture == PULSAR_STATE_CAPTURE_DELTA)
                 ok = p->decl[id].commit(dptr(ss->t[k][id]), bank,
-                                        (const uint8_t *)pulsar_state_capture_rows(ss, k, id) +
+                                        (const uint8_t *)pulsar_state_capture_rows(ss, LayerSlot{k}, id) +
                                             (uint64_t)row * p->decl[id].capture_bytes,
                                         (uint32_t)keep);
     if (!ok) {

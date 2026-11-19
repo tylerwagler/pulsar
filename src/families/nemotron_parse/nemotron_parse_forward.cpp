@@ -260,14 +260,14 @@ bool tower(ctx &c, const pulsar_nemotron_parse_page &pg, uint32_t n_patch) {
         uint32_t N, D;
     } hu = {&c, &ph, N, D};
     const pulsar_vit_hooks hooks = {
-        [](void *ud, uint32_t) {
+        [](void *ud, VisLayer) {
             hooks_ud *h = (hooks_ud *)ud;
             h->ph->reset();
             h->ph->emplace();
         },
-        [](void *ud, uint32_t il) {
+        [](void *ud, VisLayer il) {
             hooks_ud *h = (hooks_ud *)ud;
-            if (il == 13) h->c->put("vit_mid", h->c->r->t[B_RES], h->N, h->D);
+            if (il == VisLayer{13u}) h->c->put("vit_mid", h->c->r->t[B_RES], h->N, h->D);
         },
         &hu};
     const pulsar_vit_dims dims = {D, s.vit_heads, HD, M, s.vit_depth, s.vit_eps};
@@ -357,8 +357,8 @@ bool decoder(ctx &c, uint32_t pos0, uint32_t n, bool prompt) {
     io.ld_out = E;
     io.workspace = dp(r->t[B_DAWS]);
     io.workspace_bytes = r->bytes[B_DAWS];
-    for (uint32_t il = 0; il < s.n_layer; il++) {
-        const pulsar_nemotron_parse_dec_layer &L = w->layer[il];
+    for (TrunkLayer il{0u}; il.below(s.n_layer); ++il) {
+        const pulsar_nemotron_parse_dec_layer &L = w->layer[il.raw()];
         for (uint32_t r0 = 0; r0 < n; r0 += NP_CHUNK) {
             const uint32_t m = n - r0 < NP_CHUNK ? n - r0 : NP_CHUNK;
             const uint16_t *xc = xn + (size_t)r0 * E;
@@ -374,14 +374,14 @@ bool decoder(ctx &c, uint32_t pos0, uint32_t n, bool prompt) {
                 return fail(c.err, c.errlen, "the decoder's q / k / v refused");
         }
         pulsar_gqa_seq seq = {};
-        seq.kv = (uint8_t *)dp(r->t[B_POOLS]) + (uint64_t)il * r->pool_bytes;
+        seq.kv = (uint8_t *)dp(r->t[B_POOLS]) + (uint64_t)il.raw() * r->pool_bytes;
         seq.bytes = r->pool_bytes;
         seq.cap = s.max_seq;
         if (pulsar_gqa_forward(&r->dec, &seq, 1, row_seq.data(), row_pos.data(), n, &io, 0) != 0)
             return fail(c.err, c.errlen, "the decoder's attention refused");
-        const bool last = il + 1 == s.n_layer;
-        const float *nn = last ? c.fp(w->output_norm, "output norm") : c.fp(w->layer[il + 1].attn_norm, "attn norm");
-        const float *nb = last ? c.fp(w->output_norm_b, "output norm") : c.fp(w->layer[il + 1].attn_norm_b, "attn norm");
+        const bool last = il.last_of(s.n_layer);
+        const float *nn = last ? c.fp(w->output_norm, "output norm") : c.fp(w->layer[il.next().raw()].attn_norm, "attn norm");
+        const float *nb = last ? c.fp(w->output_norm_b, "output norm") : c.fp(w->layer[il.next().raw()].attn_norm_b, "attn norm");
         for (uint32_t r0 = 0; r0 < n; r0 += NP_CHUNK) {
             const uint32_t m = n - r0 < NP_CHUNK ? n - r0 : NP_CHUNK;
             float *hc = h + (size_t)r0 * E;

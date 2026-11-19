@@ -230,10 +230,10 @@ typedef struct pulsar_block_drafter {
     float eps, rope_theta;
     /// The target blocks tapped, 1 .. PULSAR_BLOCK_MAX_TAPS: the context row is n_taps x hidden wide.
     uint32_t n_taps;
-    uint32_t tap_block[PULSAR_BLOCK_MAX_TAPS];   ///< the target blocks (in the target's own numbering) tapped AFTER
+    SrcBlock tap_block[PULSAR_BLOCK_MAX_TAPS];   ///< the target blocks (in the target's own numbering) tapped AFTER
     /* the family's: tap j reads the residual after trunk layer tap_layer[j]'s sublayer tap_sub[j] */
     /// Tap j's trunk layer (the family's numbering).
-    uint32_t tap_layer[PULSAR_BLOCK_MAX_TAPS];
+    TrunkLayer tap_layer[PULSAR_BLOCK_MAX_TAPS];
     /// Tap j's sublayer in that layer: a pulsar_block_tap_sub value.
     uint32_t tap_sub[PULSAR_BLOCK_MAX_TAPS];
     /* the weights (bind block `drafter`) */
@@ -327,7 +327,7 @@ void pulsar_block_lane_free(pulsar_block_lane *l);
 /// @param ld_dst out: the destination's row stride, elements
 /// @param refused out: set when the step is wider than the tap rows
 /// @return the destination, or NULL
-uint16_t *pulsar_block_tap_dst(pulsar_driver_state *d, uint32_t il, uint32_t sub, uint32_t n, uint32_t *j,
+uint16_t *pulsar_block_tap_dst(pulsar_driver_state *d, TrunkLayer il, uint32_t sub, uint32_t n, uint32_t *j,
                                uint64_t *ld_dst, bool *refused);
 /** The family's trunk forward, after trunk layer il's sublayer `sub` wrote the step's n rows: `emit(dst, ld_dst)`
  *  writes them as the drafter's tap (bf16, hidden wide, row r at dst + r * ld_dst) for every tap reading there -- the
@@ -341,7 +341,7 @@ uint16_t *pulsar_block_tap_dst(pulsar_driver_state *d, uint32_t il, uint32_t sub
 /// @param emit writes the rows at a destination
 /// @return false = refused (said)
 template <class Emit>
-bool pulsar_block_tap_rows(pulsar_driver_state *d, uint32_t il, uint32_t sub, uint32_t n, Emit emit) {
+bool pulsar_block_tap_rows(pulsar_driver_state *d, TrunkLayer il, uint32_t sub, uint32_t n, Emit emit) {
     uint32_t j = 0;
     uint64_t ld = 0;
     bool refused = false;
@@ -357,7 +357,7 @@ bool pulsar_block_tap_rows(pulsar_driver_state *d, uint32_t il, uint32_t sub, ui
 /// @param ld h's row stride, elements
 /// @param n rows
 /// @return false = refused (said)
-bool pulsar_block_tap(pulsar_driver_state *d, uint32_t il, uint32_t sub, const uint16_t *h, uint64_t ld, uint32_t n);
+bool pulsar_block_tap(pulsar_driver_state *d, TrunkLayer il, uint32_t sub, const uint16_t *h, uint64_t ld, uint32_t n);
 
 /** The driver's absorb (pulsar_driver_ops::absorb) for a family whose drafter is a block drafter or a chained MTP:
  *  the session's lane's lockstep (spec_mtp.h pulsar_mtp_absorb, or the block lane's context absorb of the step's

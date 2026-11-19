@@ -743,10 +743,10 @@ static int open_load(pulsar_engine **out, const pulsar_engine_options *opt) {
         return 1;
     }
     {
-        uint32_t at = 0;
+        TrunkLayer at{0u};
         if (const char *bad = pulsar_layer_plan_check(&e->plan, &at)) {   /* L295: the one layer description, asserted */
             fprintf(stderr, "pulsar: %s: the layer plan is malformed at layer %u: %s -- refusing\n", e->family->name,
-                    at, bad);
+                    at.raw(), bad);
             e->destroy();
             *out = NULL;
             return 1;

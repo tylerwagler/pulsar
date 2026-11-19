@@ -27,7 +27,7 @@ const char *ARCH(const pulsar_session *s) { return s->engine->family->arch; }
 /// @param l the lane (l->modules >= 1)
 /// @param j the chain step, 1-based
 /// @return the module index, 0-based: j - 1, capped at the last module
-uint32_t chain_module(const pulsar_mtp_lane *l, uint32_t j) { return (j < l->modules ? j : l->modules) - 1u; }
+DraftLayer chain_module(const pulsar_mtp_lane *l, uint32_t j) { return DraftLayer{(j < l->modules ? j : l->modules) - 1u}; }
 
 /* the parked rows of every bank (drafter slot n_trunk, the family's pending decl) */
 /// The tensor holding every bank's parked conditioning row.
@@ -35,7 +35,7 @@ uint32_t chain_module(const pulsar_mtp_lane *l, uint32_t j) { return (j < l->mod
 /// @return the state tensor of the family's pend_decl on drafter slot n_trunk (owned by the state set)
 pulsar_gpu_tensor *pend_tensor(const pulsar_session *s) {
     const pulsar_state_set *ss = s->states;
-    return pulsar_state_tensor(ss, ss->plan->n_trunk, LANE(s)->ops->pend_decl);
+    return pulsar_state_tensor(ss, pulsar_drafter_slot(ss->plan, DraftLayer{0u}), LANE(s)->ops->pend_decl);
 }
 
 /* Does bank `b`'s parked row sit just before position `p` -- the trunk row a module row at `p` pairs with?  (none()
@@ -73,7 +73,7 @@ bool step(pulsar_session *s, const pulsar_mtp_step &m) {
 /// @param n rows in the step
 /// @param cond the conditioning rows, row i at i * cond_bytes
 /// @return the step; the arrays are borrowed, not copied
-pulsar_mtp_step step_of(uint32_t module, pulsar_step_mode mode, bool decode_rows, const TokId *tok,
+pulsar_mtp_step step_of(DraftLayer module, pulsar_step_mode mode, bool decode_rows, const TokId *tok,
                         const int32_t *pos, const BankId *bank, uint32_t n, const pulsar_gpu_tensor *cond) {
     pulsar_mtp_step m{};
     m.module = module;
@@ -212,7 +212,7 @@ bool pulsar_mtp_absorb(pulsar_session *s, pulsar_step_mode mode, const TokId *to
         }
     }
     if (!ok || k == 0) return ok;
-    pulsar_mtp_step m = step_of(0u, mode, false, mt.data(), mp.data(), mb.data(), k, l->cond);
+    pulsar_mtp_step m = step_of(DraftLayer{0u}, mode, false, mt.data(), mp.data(), mb.data(), k, l->cond);
     /* the probe: every row headed, appended to its rows (k <= the head width: a longer chunk is not probed) */
     pulsar_mtp_probe *pr = l->probe;
     if (pr && k <= PULSAR_DRIVER_HEADS_MAX && pr->n + k <= pr->cap) {
@@ -285,7 +285,7 @@ bool pulsar_mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const Ban
         }
         i = j;
     }
-    if (ok && m > 0) ok = step(s, step_of(0u, PULSAR_STEP_PREFILL, true, tok, pos, bank, m, l->cond));
+    if (ok && m > 0) ok = step(s, step_of(DraftLayer{0u}, PULSAR_STEP_PREFILL, true, tok, pos, bank, m, l->cond));
     for (uint32_t i = 0; i < n;) {
         const uint32_t b = (uint32_t)banks[i].raw();   /* read below only inside the pool (none() included) */
         uint32_t j = i + 1;

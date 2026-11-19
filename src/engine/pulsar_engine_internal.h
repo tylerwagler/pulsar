@@ -5986,7 +5986,7 @@ typedef struct {
 /// @param addend folded in first and zeroed, or NULL
 /// @param what the caller, for messages
 /// @return false on a transport failure
-bool pulsar_tp_allreduce_rows(const pulsar_tp_rows *x, uint32_t slot, uint32_t n_rows, pulsar_gpu_tensor *t,
+bool pulsar_tp_allreduce_rows(const pulsar_tp_rows *x, TpSlot slot, uint32_t n_rows, pulsar_gpu_tensor *t,
                               pulsar_gpu_tensor *addend, const char *what);
 /** What a vocab gather borrows (tp_rows.cpp, L266): the transport, the slab's device mapping, the stage ticket,
  *  the own-slice scratch (pulsar_tp_vocab_own_bytes; NULL off a row-lane pair), the gather's seq, the vocab

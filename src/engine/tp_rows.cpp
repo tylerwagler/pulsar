@@ -12,10 +12,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-bool pulsar_tp_allreduce_rows(const pulsar_tp_rows *g, uint32_t il, uint32_t n_tokens,
+bool pulsar_tp_allreduce_rows(const pulsar_tp_rows *g, TpSlot slot, uint32_t n_tokens,
                               pulsar_gpu_tensor *t, pulsar_gpu_tensor *addend,
                               const char *what) {
     if (!g->tp) return 1;
+    /* L436: the exchange slot leaves the type system here -- the transport (pulsar_tp.h) numbers its slab layers and
+     * the frame's layer field with the raw value */
+    const uint32_t il = slot.raw();
     const uint64_t nelt = (uint64_t)n_tokens * g->n_embd;
     const uint64_t bytes = nelt * sizeof(float);
     /* Decode and verify rows on a pair ride the ROW LANE (4g-2): enqueued

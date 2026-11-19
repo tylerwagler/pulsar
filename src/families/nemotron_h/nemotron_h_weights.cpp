@@ -105,8 +105,8 @@ bool pulsar_nemotron_h_bind(const pulsar_model *m, pulsar_nemotron_h_model *w) {
     w->embed = pulsar_role_bind(b, pulsar_role_top("embed"), A_BF16, 2, E, V);
     w->output_norm = pulsar_role_bind(b, pulsar_role_top("output_norm"), A_BF16, 1, E);
     w->head = pulsar_role_bind(b, pulsar_role_top("head"), A_HEAD, 2, E, V);
-    for (uint32_t il = 0; il < s->n_layer; il++)
-        bind_block(b, s, LAYERS, (int32_t)il, s->mamba_layers >> il & 1u, s->moe_layers >> il & 1u, &w->layer[il]);
+    for (TrunkLayer il{0u}; il.below(s->n_layer); ++il)
+        bind_block(b, s, LAYERS, (int32_t)il.raw(), s->mamba_layers >> il.raw() & 1u, s->moe_layers >> il.raw() & 1u, &w->layer[il.raw()]);
     /* the drafter: one {attention, MoE} layer plus its input side and its out norm, when the open selected it (L298:
      * otherwise declared unloaded -- never staged, never priced) */
     if (s->mtp_written && !w->drafting) {

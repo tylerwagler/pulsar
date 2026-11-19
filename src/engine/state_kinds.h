@@ -156,8 +156,42 @@ uint32_t pulsar_state_plan_add(pulsar_state_plan *p, const pulsar_state_decl &d)
  *  writes nothing and counts the slot in slot_overflow. */
 /// @param p    the plan being built (its trunk slots [0, n_trunk) already set)
 /// @param mask the slot's decl ids, bit i = decl[i]
-/// @return the new slot's index, or PULSAR_STATE_SLOTS_MAX when the table is full
-uint32_t pulsar_state_plan_add_slot(pulsar_state_plan *p, uint32_t mask);
+/// @return the new slot, or slot PULSAR_STATE_SLOTS_MAX (past the table) when the table is full
+LayerSlot pulsar_state_plan_add_slot(pulsar_state_plan *p, uint32_t mask);
+
+/* ---- L436: the layer slot's crossings (the state layout owns them: slots [0, n_trunk) ARE the trunk's layers in
+ * order, slots [n_trunk, n_slots) a drafter's layers in order) ---------------------------------------------------- */
+/** The layer slot of trunk layer `il`: the same number (the plan's first n_trunk slots are the trunk's layers).
+ *  @param il a trunk layer */
+/// @return its layer slot
+static inline LayerSlot pulsar_layer_slot_of(TrunkLayer il) { return LayerSlot{il.raw()}; }
+/** The layer slot of a drafter's layer / module `l`: n_trunk + l -- the drafter's slots follow the trunk's, in the
+ *  drafter's own order.  It assumes ONE drafter's slots after the trunk's (a family appends the selected drafter's
+ *  only: the chained-MTP lane checks n_slots == n_trunk + its modules, spec_mtp.cpp).
+ *  @param p the state plan
+ *  @param l the drafter's layer */
+/// @return its layer slot
+static inline LayerSlot pulsar_drafter_slot(const pulsar_state_plan *p, DraftLayer l) {
+    return LayerSlot{p->n_trunk + l.raw()};
+}
+/** Is `slot` one of the trunk's (below n_trunk)?
+ *  @param p    the state plan
+ *  @param slot a layer slot */
+/// @return true for a trunk layer's slot, false for a drafter's
+static inline bool pulsar_slot_is_trunk(const pulsar_state_plan *p, LayerSlot slot) { return slot.below(p->n_trunk); }
+/** The trunk layer a trunk slot is: the same number.  A drafter's slot is no trunk layer (fatal: indexing the plan,
+ *  a shape mask or a tap list with it is always a bug).
+ *  @param p    the state plan
+ *  @param slot a trunk layer's slot */
+/// @return the trunk layer
+static inline TrunkLayer pulsar_slot_trunk_layer(const pulsar_state_plan *p, LayerSlot slot) {
+    if (!pulsar_slot_is_trunk(p, slot)) {
+        fprintf(stderr, "pulsar: layer slot %u is a drafter's (the trunk has %u) -- refusing to take it for a trunk "
+                        "layer\n", slot.raw(), p->n_trunk);
+        abort();
+    }
+    return TrunkLayer{slot.raw()};
+}
 /** L375 O48: the load-time verdict on a built plan's slots -- false, said, when a drafter's slots did not fit beside
  *  the trunk's.  Every family's load calls it after building its plan and refuses the model on false. */
 /// @param p    the built plan
@@ -183,7 +217,8 @@ typedef struct pulsar_state_set {
     pulsar_gpu_tensor *cap_rows[PULSAR_STATE_DECLS_MAX];   ///< SNAPSHOT / DELTA / STAGE rows
     pulsar_gpu_tensor *cap_runs[PULSAR_STATE_DECLS_MAX];   ///< STAGE: each run's block before the step
     uint8_t *cap_host[PULSAR_STATE_DECLS_MAX];             ///< REPLAY: each run's bank bytes before the step
-    uint8_t ord[PULSAR_STATE_SLOTS_MAX][PULSAR_STATE_DECLS_MAX];   ///< a slot's index among the slots carrying a decl
+    /// a trunk slot's index among the trunk slots carrying a decl (a KindOrd, stored as a byte; pulsar_state_slot_ord)
+    uint8_t ord[PULSAR_STATE_SLOTS_MAX][PULSAR_STATE_DECLS_MAX];
     /* L339 the fold (the header's THE FOLD) */
     pulsar_gpu_tensor *fold_dev;   ///< int32 [1 + 2 n_banks]: the fold table the ops read; NULL = the set does not fold
     int32_t *fold_host;            ///< its host image, the authority: [0] capture row, [1 + 2 b] / [2 + 2 b] pending
@@ -242,8 +277,8 @@ static inline void pulsar_state_set_pos(pulsar_state_set *ss, BankId bank, TokPo
 /// @param slot the layer slot
 /// @param id   the decl id
 /// @return the tensor (the set's), NULL when the slot does not carry the decl
-static inline pulsar_gpu_tensor *pulsar_state_tensor(const pulsar_state_set *ss, uint32_t slot, uint32_t id) {
-    return ss->t[slot][id];
+static inline pulsar_gpu_tensor *pulsar_state_tensor(const pulsar_state_set *ss, LayerSlot slot, uint32_t id) {
+    return ss->t[slot.raw()][id];
 }
 /** Bank `bank`'s tensor of a POOL decl on slot `slot` (NULL while the bank is evicted). */
 /// @param ss   the set
@@ -251,9 +286,9 @@ static inline pulsar_gpu_tensor *pulsar_state_tensor(const pulsar_state_set *ss,
 /// @param id   the decl id
 /// @param bank the bank
 /// @return the bank's pool tensor (the set's), or NULL
-static inline pulsar_gpu_tensor *pulsar_state_pool(const pulsar_state_set *ss, uint32_t slot, uint32_t id,
+static inline pulsar_gpu_tensor *pulsar_state_pool(const pulsar_state_set *ss, LayerSlot slot, uint32_t id,
                                                    BankId bank) {
-    return ss->pool[slot][id] ? ss->pool[slot][id][pulsar_bank_index(bank)] : NULL;
+    return ss->pool[slot.raw()][id] ? ss->pool[slot.raw()][id][pulsar_bank_index(bank)] : NULL;
 }
 /** Bank `bank`'s bytes of a session host decl. */
 /// @param ss   the set
@@ -266,17 +301,18 @@ static inline void *pulsar_state_host(const pulsar_state_set *ss, uint32_t id, B
 /** The verify capture's rows of decl `id` on slot `slot` (device; step row r at + r * the row's bytes): where a
  *  verify's op writes them -- as a pointer, or as its tensor and the byte offset into it (a copy's destination). */
 /// @param ss   the set
-/// @param slot the layer slot
+/// @param slot the layer slot (a trunk layer's: the capture holds the trunk slots only)
 /// @param id   the decl id
 /// @return the device pointer of the slot's capture rows, NULL when the decl has no capture tensor
-void *pulsar_state_capture_rows(const pulsar_state_set *ss, uint32_t slot, uint32_t id);
+void *pulsar_state_capture_rows(const pulsar_state_set *ss, LayerSlot slot, uint32_t id);
 /** The byte offset of slot `slot`'s capture rows of decl `id` in pulsar_state_capture_tensor(ss, id): the slot's
  *  index among the decl's slots x verify_rows x one capture row's bytes.
  *  @param ss   the set
- *  @param slot the layer slot
+ *  @param slot the layer slot (a trunk layer's: the capture holds the trunk slots only, and a drafter's slot has no
+ *              ordinal -- it would read 0, the first trunk slot's rows)
  *  @param id   the decl id
  *  @return the offset, in bytes */
-uint64_t pulsar_state_capture_offset(const pulsar_state_set *ss, uint32_t slot, uint32_t id);
+uint64_t pulsar_state_capture_offset(const pulsar_state_set *ss, LayerSlot slot, uint32_t id);
 /** The capture tensor of decl `id` (every slot's rows, at pulsar_state_capture_offset).
  *  @param ss the set
  *  @param id the decl id

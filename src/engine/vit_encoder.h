@@ -97,9 +97,9 @@ typedef struct {
 /** Optional per-block hooks (the caller's GPU phases, its stage dumps): before block il, after it.  NULL = none. */
 typedef struct {
     /// called before block il runs (NULL = none)
-    void (*before_block)(void *ud, uint32_t il);
+    void (*before_block)(void *ud, VisLayer il);
     /// called after block il ran (NULL = none)
-    void (*after_block)(void *ud, uint32_t il);
+    void (*after_block)(void *ud, VisLayer il);
     /// the hooks' first argument
     void *ud;
 } pulsar_vit_hooks;

@@ -147,14 +147,14 @@ bool read_layer_types(const pulsar_model *m, uint32_t n, uint64_t *mask) {
     if (!model_get_array(m, key, &arr) || arr.type != PULSAR_META_STRING || arr.len != n)
         return refuse("%s is missing or not an array of one string per layer%s", key);
     pulsar_cursor c = cursor_at(m, arr.data_pos);
-    for (uint32_t il = 0; il < n; il++) {
+    for (TrunkLayer il{0u}; il.below(n); ++il) {
         pulsar_str t = {NULL, 0};
         if (!cursor_string(&c, &t)) return refuse("%s is unreadable%s", key);
         if (pulsar_streq(t, "full_attention")) {
-            *mask |= 1ull << il;
+            *mask |= 1ull << il.raw();
         } else if (!pulsar_streq(t, "sliding_attention")) {
             char why[96];
-            snprintf(why, sizeof(why), "[%u] = '%.*s': sliding_attention or full_attention", il, (int)(t.len < 40 ? t.len : 40),
+            snprintf(why, sizeof(why), "[%u] = '%.*s': sliding_attention or full_attention", il.raw(), (int)(t.len < 40 ? t.len : 40),
                      t.ptr);
             return refuse("%s%s", key, why);
         }
@@ -272,11 +272,11 @@ bool pulsar_gemma4_read_shape(const pulsar_model *m, pulsar_gemma4_shape *s) {
 void pulsar_gemma4_plan(const pulsar_gemma4_shape *s, pulsar_layer_plan *plan) {
     memset(plan, 0, sizeof(*plan));
     plan->n_layer = s->n_layer;
-    for (uint32_t il = 0; il < s->n_layer; il++) {
+    for (TrunkLayer il{0u}; il.below(s->n_layer); ++il) {
         const bool full = pulsar_gemma4_is_full(s, il);
-        plan->kind[il] = PULSAR_LAYER_BLOCKS;
-        plan->desc[il].mixer = full ? PULSAR_MIXER_ATTN_FULL : PULSAR_MIXER_ATTN_WINDOW;
-        plan->desc[il].ffn = PULSAR_FFN_DENSE_MOE;
-        plan->desc[il].window = full ? 0u : s->window;
+        plan->kind[il.raw()] = PULSAR_LAYER_BLOCKS;
+        plan->desc[il.raw()].mixer = full ? PULSAR_MIXER_ATTN_FULL : PULSAR_MIXER_ATTN_WINDOW;
+        plan->desc[il.raw()].ffn = PULSAR_FFN_DENSE_MOE;
+        plan->desc[il.raw()].window = full ? 0u : s->window;
     }
 }

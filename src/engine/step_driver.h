@@ -196,7 +196,7 @@ static inline uint32_t pulsar_step_verify_runs(const pulsar_driver_step *st) {
 
 /** One layer's block: reads and writes the step's slots for layer il.  false after printing what failed; the
  *  driver refuses the step. */
-typedef bool (*pulsar_block_fn)(const pulsar_driver_step *st, uint32_t il);
+typedef bool (*pulsar_block_fn)(const pulsar_driver_step *st, TrunkLayer il);
 
 /** What a family supplies to run on the driver (pulsar_family::driver). */
 typedef struct pulsar_driver_ops {
@@ -245,7 +245,7 @@ typedef struct pulsar_driver_ops {
     bool (*image_rows)(const pulsar_driver_step *st, const uint16_t *rows, uint32_t n_rows, uint32_t row0,
                        uint32_t n_tokens);
     /** Optional: the per-layer diagnostic tap, called after layer il while PULSAR_CUDA_GRAPH_DUMP_PREFIX is armed. */
-    void (*dump)(const pulsar_driver_step *st, uint32_t il);
+    void (*dump)(const pulsar_driver_step *st, TrunkLayer il);
     /** The artifact digest the session's segments are keyed by (pulsar_ckpt_store::artifact). */
     uint64_t (*artifact)(const pulsar_engine *e);
     /** Optional (L296 perf): the step's HOST HALF -- every upload its launches read (token ids, sequence tables,
@@ -286,11 +286,17 @@ typedef struct pulsar_driver_ops {
  *  nothing is missing.  The driver refuses a session with exactly this. */
 /// @param ops      the family's driver ops
 /// @param plan     the layer plan
-/// @param at_layer receives the layer whose block is missing, else UINT32_MAX
+/// @param at_layer receives the layer whose block is missing, else none()
 /// @return the missing piece's name ("embed", "block", "head", or "read_ahead_pool" when read_ahead and
 ///         read_ahead_pool are not both set or both NULL), or NULL
 const char *pulsar_driver_first_missing(const pulsar_driver_ops *ops, const pulsar_layer_plan *plan,
-                                        uint32_t *at_layer);
+                                        TrunkLayer *at_layer);
+/** L436: a layer slot's exchange slot in the tensor-parallel slab -- the slot's own number (the trunk's layers in
+ *  order, a drafter layer's after them: what pulsar_family::tp_shape sizes the slab for).  The driver's one crossing
+ *  from the declared state's slot space to the transport's.
+ *  @param slot the layer slot whose block exchanges */
+/// @return its exchange slot
+static inline TpSlot pulsar_tp_slot_of(LayerSlot slot) { return TpSlot{slot.raw()}; }
 /** L266 step 7: a block's tensor-parallel exchange -- the group's sum of the step's partial output rows `y` (f32
  *  [n_rows][width]) in exchange slot `slot` (the layer's; a drafter layer's after the trunk's).  One GPU: nothing. */
 /// @param st    the step (its n_rows rows; its driver buffers carry the transport)
@@ -299,7 +305,7 @@ const char *pulsar_driver_first_missing(const pulsar_driver_ops *ops, const puls
 /// @param width the row width in floats
 /// @param what  names the exchange in refusals
 /// @return false (said) when the exchange failed; true with no transport
-bool pulsar_driver_tp_allreduce(const pulsar_driver_step *st, uint32_t slot, pulsar_gpu_tensor *y, uint32_t width,
+bool pulsar_driver_tp_allreduce(const pulsar_driver_step *st, TpSlot slot, pulsar_gpu_tensor *y, uint32_t width,
                                 const char *what);
 /** The speculation round's verify target for a driver family (spec_ops.h): the verify is a heads-on-every-row
  *  decode_mixed, the commit the declared state's (pulsar_state_commit), the cut an invalidate. */

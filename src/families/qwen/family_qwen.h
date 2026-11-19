@@ -76,7 +76,7 @@ typedef struct {
     uint32_t n_ff_exp;         ///< moe_intermediate_size (640)
     uint32_t n_ff_shexp;       ///< shared_expert_intermediate_size (640)
     /* PLE / n-gram (one layer) */
-    uint32_t ple_layer;        ///< the 0-based layer carrying PLE: ple_layer_ids is 1-BASED in the config ([2] -> 1)
+    TrunkLayer ple_layer;      ///< the 0-based layer carrying PLE: ple_layer_ids is 1-BASED in the config ([2] -> 1)
     uint32_t ngram_size;       ///< ngram_size (3): bigrams + trigrams; also the PLE conv dilation
     uint32_t ngram_heads;      ///< heads_per_ngram (8) per n-gram order -> 16 tables
     uint32_t ple_embed_dim;    ///< ple_embed_dim (2560) = 16 heads x 160
@@ -307,7 +307,8 @@ typedef struct {
     pulsar_tensor *token_embd;     ///< model.language_model.embed_tokens.weight [n_embd x n_vocab]
     pulsar_tensor *output;         ///< lm_head.weight [n_embd -> n_vocab]
     pulsar_qwen_gr_weights mixer;         ///< model.language_model.hyper_connection_mixer
-    /** [0, n_layer) the trunk; [n_layer] the MTP layer when mtp.present (a QSA layer, split experts) */
+    /** [0, n_layer) the trunk; [n_layer] the MTP layer when mtp.present (a QSA layer, split experts).  Indexed by the
+     *  LAYER SLOT (L436): the array is laid out as the declared state's slots are (pulsar_qwen_layer_w). */
     pulsar_qwen_layer_weights layer[PULSAR_FAMILY_MAX_LAYER];
     /// the MTP layer's own tensors (mtp.present says whether the artifact carries and the open loaded it)
     pulsar_qwen_mtp_weights mtp;
@@ -349,6 +350,32 @@ typedef struct {
     /// the <|image_pad|> token id image blocks are made of; -1 = no tower
     int32_t vision_pad_id;
 } pulsar_qwen_weights;
+
+/** L436: the MTP layer's slot -- the one past the trunk's (n_layer): its weights (pulsar_qwen_weights::layer), its
+ *  declared state (the state plan's first drafter slot, pulsar_drafter_slot(plan, DraftLayer{0}): qwen_state_plan
+ *  appends it right after the trunk's) and its tensor-parallel exchange all sit there.
+ *  @param plan the layer plan */
+/// @return the MTP layer's slot
+static inline LayerSlot pulsar_qwen_mtp_slot(const pulsar_layer_plan *plan) { return LayerSlot{plan->n_layer}; }
+/** L436: the trunk layer of a block in the source checkpoint's numbering (a block drafter's tap ids): HF layer i is
+ *  the trunk's layer i -- the plan has one layer per checkpoint layer.
+ *  @param b the checkpoint's block */
+/// @return the trunk layer
+static inline TrunkLayer pulsar_qwen_block_layer(SrcBlock b) { return TrunkLayer{b.raw()}; }
+/** L436: the tensors of the layer at slot `slot` (a trunk layer's, or the MTP layer's at pulsar_qwen_mtp_slot).
+ *  @param w    the weights
+ *  @param slot the layer slot */
+/// @return its tensors
+static inline pulsar_qwen_layer_weights &pulsar_qwen_layer_w(pulsar_qwen_weights *w, LayerSlot slot) {
+    return w->layer[slot.raw()];
+}
+/** The read-only form of pulsar_qwen_layer_w.
+ *  @param w    the weights
+ *  @param slot the layer slot */
+/// @return its tensors
+static inline const pulsar_qwen_layer_weights &pulsar_qwen_layer_w(const pulsar_qwen_weights *w, LayerSlot slot) {
+    return w->layer[slot.raw()];
+}
 
 /* ---- 4. Session state -------------------------------------------------------
  *
@@ -580,9 +607,10 @@ struct pulsar_qwen_step : pulsar_driver_step {
     bool draft_head;
 };
 
-/** A per-layer op: reads/writes the step's slots for layer il.  Returns false
+/** A per-layer op: reads/writes the step's slots for the layer at slot il (L436: a trunk layer's slot, or the MTP
+ * layer's -- the ops read the slot's weights and declared state and never ask which).  Returns false
  * after printing what failed; the driver refuses the step. */
-typedef bool (*pulsar_qwen_layer_fn)(const pulsar_qwen_step *st, uint32_t il);
+typedef bool (*pulsar_qwen_layer_fn)(const pulsar_qwen_step *st, LayerSlot il);
 
 /* ---- S4's ops (src/families/qwen/family_qwen_s4.cpp) --------------------------------
  * embed, PLE, the gated-residual read / write, the MoE block and the head
@@ -597,24 +625,24 @@ bool pulsar_qwen_s4_embed(const pulsar_qwen_step *st);
  * @param st the step
  * @param il the PLE layer
  * @return false (printed) on a failed gather or launch */
-bool pulsar_qwen_s4_ple(const pulsar_qwen_step *st, uint32_t il);
+bool pulsar_qwen_s4_ple(const pulsar_qwen_step *st, LayerSlot il);
 /** The gated-residual read: the streams into the block input x (bf16) and the side's per-row inject output (scratch, read by the write).
  * @param st the step
  * @param il the layer
  * @param side which unit
  * @return false (printed) on a missing weight or failed launch */
-bool pulsar_qwen_s4_gr_read(const pulsar_qwen_step *st, uint32_t il, pulsar_qwen_gr_side side);
+bool pulsar_qwen_s4_gr_read(const pulsar_qwen_step *st, LayerSlot il, pulsar_qwen_gr_side side);
 /** The gated-residual write: the block output y folded into the streams with the read's inject output.
  * @param st the step
  * @param il the layer (unused)
  * @param side which unit
  * @return false on a failed launch */
-bool pulsar_qwen_s4_gr_write(const pulsar_qwen_step *st, uint32_t il, pulsar_qwen_gr_side side);
+bool pulsar_qwen_s4_gr_write(const pulsar_qwen_step *st, LayerSlot il, pulsar_qwen_gr_side side);
 /** The MoE block at layer il: router, routed experts and the gated shared expert, x into y.
  * @param st the step
  * @param il the layer
  * @return false (printed) on a failed launch */
-bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il);
+bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, LayerSlot il);
 /** The head (mixer read + lm_head, or the draft head) over step rows [row0, row0 + n) into logits rows
  *  [out0, out0 + n).
  * @param st the step
@@ -689,12 +717,12 @@ bool pulsar_qwen_s4_ngram_replay(const pulsar_qwen_weights *w, int32_t ctx[2], c
  * @param st the step
  * @param il a GDN layer
  * @return false (printed) on a failed launch */
-bool pulsar_qwen_s2_gdn(const pulsar_qwen_step *st, uint32_t il);
+bool pulsar_qwen_s2_gdn(const pulsar_qwen_step *st, LayerSlot il);
 /** The QSA attention block at layer il (S3): projections, indexer, sparse attention, o_proj, x into y.
  * @param st the step
  * @param il a QSA layer
  * @return false (printed) on a failed launch */
-bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, uint32_t il);
+bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, LayerSlot il);
 /** Bytes of one op's scratch arena (pulsar_driver_ops::scratch_bytes).
  * @param op the op
  * @param s the loaded shape

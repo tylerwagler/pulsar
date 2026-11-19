@@ -2740,7 +2740,7 @@ bool gpu_graph_tp_allreduce_rows(pulsar_gpu_graph *g, uint32_t il, uint32_t n_to
     /* L266: the lanes are the engine's (tp_rows.cpp); the graph lends its transport, slab, ticket and seq */
     const pulsar_tp_rows x = {g->tp, g->tp_slab_dev, g->tp_bulk_dev, g->tp_stage_ticket, &g->tp_prefill_seq,
                               (uint32_t)PULSAR_N_EMBD};
-    return pulsar_tp_allreduce_rows(&x, il, n_tokens, t, addend, what);
+    return pulsar_tp_allreduce_rows(&x, TpSlot{il}, n_tokens, t, addend, what);
 }
 
 /** @def PULSAR_CUDA_ENCODE_PREFILL_SHARED_EXPERT

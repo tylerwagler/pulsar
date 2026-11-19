@@ -123,13 +123,13 @@ static inline std::vector<gate_state_piece> gate_bank_state(pulsar_session *s, u
             const pulsar_gpu_tensor *t;
             uint64_t off, n;
             if (d->kind == PULSAR_STATE_POOL) {
-                t = pulsar_state_pool(ss, k, id, BankId{b});
+                t = pulsar_state_pool(ss, LayerSlot{k}, id, BankId{b});
                 n = whole ? pulsar_gpu_tensor_bytes(t).raw() : (uint64_t)rows / d->tokens * d->bytes;
                 off = 0;
             } else {
                 n = d->kind == PULSAR_STATE_STAGED && !whole ? (uint64_t)(rows % d->tokens) * d->bytes
                                                              : pulsar_state_decl_bank_bytes(d);
-                t = pulsar_state_tensor(ss, k, id);
+                t = pulsar_state_tensor(ss, LayerSlot{k}, id);
                 off = (uint64_t)b * pulsar_state_decl_bank_bytes(d);
             }
             gate_state_piece pc;

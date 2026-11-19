@@ -25,11 +25,11 @@ pulsar_driver_heads pulsar_driver_heads_span(StepRow row0, StepRows n) {
 }
 
 const char *pulsar_driver_first_missing(const pulsar_driver_ops *ops, const pulsar_layer_plan *plan,
-                                        uint32_t *at_layer) {
-    *at_layer = UINT32_MAX;
+                                        TrunkLayer *at_layer) {
+    *at_layer = TrunkLayer::none();
     if (!ops->embed) return "embed";
-    for (uint32_t il = 0; il < plan->n_layer; il++) {
-        if (plan->kind[il] >= PULSAR_LAYER_KIND_COUNT || !ops->block[plan->kind[il]]) {
+    for (TrunkLayer il{0u}; il.below(plan->n_layer); ++il) {
+        if (plan->kind[il.raw()] >= PULSAR_LAYER_KIND_COUNT || !ops->block[plan->kind[il.raw()]]) {
             *at_layer = il;
             return "block";
         }
@@ -40,7 +40,7 @@ const char *pulsar_driver_first_missing(const pulsar_driver_ops *ops, const puls
 
 /* L266 step 7: under TP a rank's block leaves a PARTIAL output in y; the group's sum is the block's.  One exchange,
  * f32 [rows][width], in exchange slot `slot`.  One GPU: nothing to do. */
-bool pulsar_driver_tp_allreduce(const pulsar_driver_step *st, uint32_t slot, pulsar_gpu_tensor *y, uint32_t width,
+bool pulsar_driver_tp_allreduce(const pulsar_driver_step *st, TpSlot slot, pulsar_gpu_tensor *y, uint32_t width,
                                 const char *what) {
     pulsar_driver_state *d = st->buf;
     if (!d->tp) return true;
@@ -81,11 +81,11 @@ static void driver_bufs_free(pulsar_driver_state *d) {
 int pulsar_driver_session_create(pulsar_session *s, uint32_t n_banks) {
     pulsar_engine *e = s->engine;
     const pulsar_driver_ops *ops = DOPS(e);
-    uint32_t at = 0;
+    TrunkLayer at{0u};
     if (const char *miss = pulsar_driver_first_missing(ops, &e->plan, &at)) {
         char where[48] = "";
-        if (at != UINT32_MAX) snprintf(where, sizeof(where), " for layer %u (%s)", at,
-                                       pulsar_layer_kind_name(e->plan.kind[at]));
+        if (!at.is_none()) snprintf(where, sizeof(where), " for layer %u (%s)", at.raw(),
+                                    pulsar_layer_kind_name(e->plan.kind[at.raw()]));
         fprintf(stderr, "pulsar: %s: the family supplies no %s%s -- refusing the session\n", ARCH(e), miss, where);
         return 1;
     }
@@ -386,8 +386,8 @@ static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const TokId
                                                s->sync_n_images, (uint32_t)pos[0], n_rows, driver_image_rows, &u);
             }
         }
-        for (uint32_t il = 0; lok && il < e->plan.n_layer; il++) {
-            lok = ops->block[e->plan.kind[il]](&st, il);
+        for (TrunkLayer il{0u}; lok && il.below(e->plan.n_layer); ++il) {
+            lok = ops->block[e->plan.kind[il.raw()]](&st, il);
             /* the diagnostic tap after layer il (PULSAR_CUDA_GRAPH_DUMP_PREFIX armed; the family's dump re-checks
              * its own arming, so an unarmed run does no work) */
             if (lok && ops->dump && gpu_graph_debug_dump_enabled()) ops->dump(&st, il);

@@ -48,7 +48,7 @@ const pulsar_qwen_shape PULSAR_QWEN_SHAPE_FLASH_NEXT = {
     /* .n_expert_used     = */ 10,
     /* .n_ff_exp          = */ 640,
     /* .n_ff_shexp        = */ 640,
-    /* .ple_layer         = */ 1,
+    /* .ple_layer         = */ TrunkLayer{1u},
     /* .ngram_size        = */ 3,
     /* .ngram_heads       = */ 8,
     /* .ple_embed_dim     = */ 2560,
@@ -161,7 +161,12 @@ static bool qwen_shape_check(const pulsar_qwen_shape *got, const pulsar_qwen_sha
     QCHK_U(idx_n_head); QCHK_U(idx_n_head_kv); QCHK_U(idx_head_dim); QCHK_U(idx_block);
     QCHK_U(idx_budget);
     QCHK_U(n_expert); QCHK_U(n_expert_used); QCHK_U(n_ff_exp); QCHK_U(n_ff_shexp);
-    QCHK_U(ple_layer); QCHK_U(ngram_size); QCHK_U(ngram_heads); QCHK_U(ple_embed_dim);
+    if (got->ple_layer != want->ple_layer) {
+        fprintf(stderr, "pulsar: %s: %s = %llu, %s has %llu\n", PULSAR_QWEN_ARCH, "ple_layer",
+                (unsigned long long)got->ple_layer.raw(), want->name, (unsigned long long)want->ple_layer.raw());
+        ok = false;
+    }
+    QCHK_U(ngram_size); QCHK_U(ngram_heads); QCHK_U(ple_embed_dim);
     QCHK_U(ple_conv_kernel); QCHK_U(ngram_vocab_base); QCHK_U(ngram_split_parts);
     QCHK_F(rms_eps);
     QCHK_U(max_position); QCHK_U(eos_id); QCHK_U(n_mtp_layer);
@@ -214,7 +219,7 @@ static bool qwen_read_shape(const pulsar_model *m, pulsar_qwen_shape *s) {
             fprintf(stderr, "pulsar: %s: ple_layer_ids holds 0, but the ids are 1-based\n", PULSAR_QWEN_ARCH);
             ok = false;
         }
-        s->ple_layer = (uint32_t)(ple_id - 1u);
+        s->ple_layer = TrunkLayer{(uint32_t)(ple_id - 1u)};   /* the config's 1-based id -> the plan's layer */
     } else {
         ok = false;
     }
@@ -361,19 +366,19 @@ static bool qwen_read_plan(const pulsar_model *m, uint32_t n_layer, pulsar_layer
     memset(plan, 0, sizeof(*plan));
     plan->n_layer = n_layer;
     pulsar_cursor c = cursor_at(m, arr.data_pos);
-    for (uint32_t il = 0; il < n_layer; il++) {
+    for (TrunkLayer il{0u}; il.below(n_layer); ++il) {
         pulsar_str t = {NULL, 0};
         if (!cursor_string(&c, &t)) {
-            fprintf(stderr, "pulsar: %s: %s[%u] is unreadable\n", PULSAR_QWEN_ARCH, key, il);
+            fprintf(stderr, "pulsar: %s: %s[%u] is unreadable\n", PULSAR_QWEN_ARCH, key, il.raw());
             return false;
         }
         if (pulsar_streq(t, "linear_attention")) {
-            plan->kind[il] = PULSAR_LAYER_QWEN_GDN;
+            plan->kind[il.raw()] = PULSAR_LAYER_QWEN_GDN;
         } else if (pulsar_streq(t, "full_attention")) {
-            plan->kind[il] = PULSAR_LAYER_QWEN_QSA;
+            plan->kind[il.raw()] = PULSAR_LAYER_QWEN_QSA;
         } else {
             fprintf(stderr, "pulsar: %s: %s[%u] = '%.*s' is neither linear_attention nor full_attention\n",
-                    PULSAR_QWEN_ARCH, key, il, (int)t.len, t.ptr);
+                    PULSAR_QWEN_ARCH, key, il.raw(), (int)t.len, t.ptr);
             return false;
         }
     }
@@ -591,7 +596,8 @@ static bool qwen_bind_mtp(const pulsar_model *m, const pulsar_qwen_shape *s, con
     w->mtp.fc_embd     = qbind(m, &ok, "mtp.fc_embedding.weight", 2, E, E);
     w->mtp.fc_hidden   = qbind(m, &ok, "mtp.fc_hidden.weight", 2, E, E);
     qwen_bind_gr(m, &ok, s, "mtp.hyper_connection_mixer.", &w->mtp.mixer, false);
-    qwen_bind_layer(m, &ok, s, PULSAR_LAYER_QWEN_QSA, "mtp.layers.0.", false, true, &w->layer[plan->n_layer]);
+    qwen_bind_layer(m, &ok, s, PULSAR_LAYER_QWEN_QSA, "mtp.layers.0.", false, true,
+                    &pulsar_qwen_layer_w(w, pulsar_qwen_mtp_slot(plan)));
     if (!ok) {
         fprintf(stderr, "pulsar: %s: the artifact carries mtp.* but not all of it -- refusing\n", PULSAR_QWEN_ARCH);
         return false;
@@ -645,10 +651,11 @@ static bool qwen_bind_weights(const pulsar_model *m, const pulsar_qwen_shape *s,
     w->token_embd = qbind(m, &ok, QWEN_TEXT "embed_tokens.weight", 2, E, V);
     w->output = qbind(m, &ok, "lm_head.weight", 2, E, V);
     qwen_bind_gr(m, &ok, s, QWEN_TEXT "hyper_connection_mixer.", &w->mixer, false);
-    for (uint32_t il = 0; il < plan->n_layer; il++) {
+    for (TrunkLayer il{0u}; il.below(plan->n_layer); ++il) {
         char lp[128];
-        snprintf(lp, sizeof(lp), QWEN_TEXT "layers.%u.", il);
-        qwen_bind_layer(m, &ok, s, plan->kind[il], lp, il == s->ple_layer, split, &w->layer[il]);
+        snprintf(lp, sizeof(lp), QWEN_TEXT "layers.%u.", il.raw());   /* the container names a trunk layer by its number */
+        qwen_bind_layer(m, &ok, s, plan->kind[il.raw()], lp, il == s->ple_layer, split,
+                        &pulsar_qwen_layer_w(w, pulsar_layer_slot_of(il)));
     }
     ok &= qwen_read_ple_tables(m, s, w);
     ok &= qwen_bind_mtp(m, s, plan, w, mtp_selected);
@@ -714,12 +721,12 @@ static bool qwen_block_read(pulsar_engine *e, const pulsar_qwen_shape *s, pulsar
     pulsar_block_drafter *d = w->block;
     if (!pulsar_block_drafter_read(&e->model, d)) return false;
     for (uint32_t j = 0; j < d->n_taps; j++) {
-        if (d->tap_block[j] >= s->n_layer) {
+        if (!d->tap_block[j].below(s->n_layer)) {
             fprintf(stderr, "pulsar: %s: the drafter taps layer %u of a %u-layer target -- refusing\n", PULSAR_QWEN_ARCH,
-                    d->tap_block[j], s->n_layer);
+                    d->tap_block[j].raw(), s->n_layer);
             return false;
         }
-        d->tap_layer[j] = d->tap_block[j];        /* HF layer i is the trunk's layer i */
+        d->tap_layer[j] = pulsar_qwen_block_layer(d->tap_block[j]);
         d->tap_sub[j] = PULSAR_BLOCK_TAP_FFN;     /* its completed output: after the MLP side's gated-residual write */
     }
     if (d->hidden != s->n_embd || d->vocab != s->n_vocab) {
@@ -908,7 +915,7 @@ static bool qwen_family_load(pulsar_engine *e, const pulsar_engine_options *opt)
     if (!qwen_read_rope(&e->model, opt, &s)) return false;
     g_qwen_shape = s;
     if (!qwen_read_plan(&e->model, s.n_layer, &e->plan)) return false;
-    if (e->plan.kind[s.ple_layer] == PULSAR_LAYER_NONE) return false;
+    if (e->plan.kind[s.ple_layer.raw()] == PULSAR_LAYER_NONE) return false;
     pulsar_qwen_of(e)->weights = (pulsar_qwen_weights *)xcalloc(1, sizeof(*pulsar_qwen_of(e)->weights));
     {
         uint64_t h = 1469598103934665603ull;
@@ -981,7 +988,7 @@ static bool qwen_family_load(pulsar_engine *e, const pulsar_engine_options *opt)
     fprintf(stderr, "pulsar: %s: %s, %u GDN + %u QSA layers, PLE at layer %u\n",
             PULSAR_QWEN_ARCH, g_qwen_shape.name,
             pulsar_layer_plan_count(&e->plan, PULSAR_LAYER_QWEN_GDN),
-            pulsar_layer_plan_count(&e->plan, PULSAR_LAYER_QWEN_QSA), g_qwen_shape.ple_layer);
+            pulsar_layer_plan_count(&e->plan, PULSAR_LAYER_QWEN_QSA), g_qwen_shape.ple_layer.raw());
     return true;
 }
 
@@ -1022,7 +1029,7 @@ bool pulsar_qwen_tp_load(pulsar_engine *e) {
 /// @param e the engine
 /// @return true
 static bool qwen_family_after_gpu(pulsar_engine *e) {
-    uint32_t at = 0;
+    TrunkLayer at{0u};
     const char *miss = pulsar_driver_first_missing(e->family->driver, &e->plan, &at);
     fprintf(stderr, "pulsar: %s: the core step driver over %u qwen_gdn + %u qwen_qsa blocks%s%s%s\n", PULSAR_QWEN_ARCH,
             pulsar_layer_plan_count(&e->plan, PULSAR_LAYER_QWEN_GDN), pulsar_layer_plan_count(&e->plan, PULSAR_LAYER_QWEN_QSA),
@@ -1053,8 +1060,8 @@ static pulsar_drafter_kind qwen_drafter(pulsar_engine *e) {
 static int qwen_quant_bits(pulsar_engine *e) {
     int bits = 0;
     if (!pulsar_qwen_of(e)->weights) return 0;
-    for (uint32_t il = 0; il < e->plan.n_layer; il++) {
-        const pulsar_qwen_layer_weights &L = pulsar_qwen_of(e)->weights->layer[il];
+    for (TrunkLayer il{0u}; il.below(e->plan.n_layer); ++il) {
+        const pulsar_qwen_layer_weights &L = pulsar_qwen_layer_w(pulsar_qwen_of(e)->weights, pulsar_layer_slot_of(il));
         for (const pulsar_tensor *t : {L.moe_gate_up, L.moe_gate, L.moe_up, L.moe_down}) {
             const int k2 = t ? exl3_type_k2(t->type) : 0;
             if (k2 && 20 + k2 > bits) bits = 20 + k2;
@@ -1182,9 +1189,9 @@ void qwen_state_plan(pulsar_engine *e) {
     for (uint32_t id = 0; id < PULSAR_QWEN_STATE_COUNT; id++) (void)pulsar_state_plan_add(p, d[id]);
     const uint32_t gdn = 1u << PULSAR_QWEN_STATE_GDN_REC | 1u << PULSAR_QWEN_STATE_GDN_CONV;
     const uint32_t qsa = 1u << PULSAR_QWEN_STATE_KV | 1u << PULSAR_QWEN_STATE_IDX_KEYS | 1u << PULSAR_QWEN_STATE_IDX_TAIL;
-    for (uint32_t il = 0; il < lp->n_layer; il++)
-        p->slot[il] = (lp->kind[il] == PULSAR_LAYER_QWEN_GDN ? gdn : qsa) |
-                      (il == s->ple_layer ? 1u << PULSAR_QWEN_STATE_PLE_CONV : 0u);
+    for (TrunkLayer il{0u}; il.below(lp->n_layer); ++il)
+        p->slot[pulsar_layer_slot_of(il).raw()] = (lp->kind[il.raw()] == PULSAR_LAYER_QWEN_GDN ? gdn : qsa) |
+                                                   (il == s->ple_layer ? 1u << PULSAR_QWEN_STATE_PLE_CONV : 0u);
     p->n_trunk = lp->n_layer;
     p->n_slots = lp->n_layer;
     /* the MTP layer's slot and the chained-MTP lane's hooks (L296 N9: its parked row and stage kept with the walk) */
@@ -1299,24 +1306,26 @@ static const pulsar_qwen_step *QS(const pulsar_driver_step *st) { return static_
 /// @param il the layer
 /// @param mixer the layer kind's mixer op
 /// @return false at the first op that fails
-static bool qwen_layer(const pulsar_qwen_step *st, uint32_t il, pulsar_qwen_layer_fn mixer) {
+static bool qwen_layer(const pulsar_qwen_step *st, LayerSlot il, pulsar_qwen_layer_fn mixer) {
     const bool mtp = st->draft_head;   /* the MTP layer's lane */
     bool ok = true;
-    if (il == g_qwen_shape.ple_layer) ok = pulsar_qwen_s4_ple(st, il);
+    /* the PLE layer is a TRUNK layer (the load refuses one the plan does not hold): its slot is never the MTP layer's */
+    if (il == pulsar_layer_slot_of(g_qwen_shape.ple_layer)) ok = pulsar_qwen_s4_ple(st, il);
     if (ok) ok = pulsar_qwen_s4_gr_read(st, il, PULSAR_QWEN_GR_ATTN);
     if (ok) ok = mixer(st, il);
-    if (ok) ok = pulsar_driver_tp_allreduce(st, il, st->st->y, g_qwen_shape.n_embd, mtp ? "MTP mixer" : "mixer");
+    if (ok) ok = pulsar_driver_tp_allreduce(st, pulsar_tp_slot_of(il), st->st->y, g_qwen_shape.n_embd, mtp ? "MTP mixer" : "mixer");
     if (ok) ok = pulsar_qwen_s4_gr_write(st, il, PULSAR_QWEN_GR_ATTN);
     if (ok) ok = pulsar_qwen_s4_gr_read(st, il, PULSAR_QWEN_GR_MLP);
     if (ok) ok = pulsar_qwen_s4_moe(st, il);
-    if (ok) ok = pulsar_driver_tp_allreduce(st, il, st->st->y, g_qwen_shape.n_embd, mtp ? "MTP moe" : "moe");
+    if (ok) ok = pulsar_driver_tp_allreduce(st, pulsar_tp_slot_of(il), st->st->y, g_qwen_shape.n_embd, mtp ? "MTP moe" : "moe");
     if (ok) ok = pulsar_qwen_s4_gr_write(st, il, PULSAR_QWEN_GR_MLP);
     /* L299: the block drafter's taps after a tapped layer's completed output -- the mean of its n_hc streams (the
      * trunk's rows only; never the MTP layer's) */
     if (ok && !mtp) {
         const uint64_t HC = pulsar_qwen_hc_dim(&g_qwen_shape);
         const uint16_t *h = (const uint16_t *)pulsar_gpu_tensor_device_ptr(st->streams);
-        ok = pulsar_block_tap_rows(st->st, il, PULSAR_BLOCK_TAP_FFN, st->n_rows, [&](uint16_t *dst, uint64_t ld) {
+        const TrunkLayer tl = pulsar_slot_trunk_layer(st->states->plan, il);   /* the trunk's lane: a trunk slot */
+        ok = pulsar_block_tap_rows(st->st, tl, PULSAR_BLOCK_TAP_FFN, st->n_rows, [&](uint16_t *dst, uint64_t ld) {
             return pulsar_blockdraft_stream_mean_launch(h, HC, g_qwen_shape.n_hc, st->n_rows, g_qwen_shape.n_embd, dst,
                                                         ld, 0) == 0;
         });
@@ -1328,12 +1337,16 @@ static bool qwen_layer(const pulsar_qwen_step *st, uint32_t il, pulsar_qwen_laye
 /// @param st the core driver's step (a pulsar_qwen_step)
 /// @param il the layer
 /// @return qwen_layer's
-static bool qwen_block_gdn(const pulsar_driver_step *st, uint32_t il) { return qwen_layer(QS(st), il, pulsar_qwen_s2_gdn); }
+static bool qwen_block_gdn(const pulsar_driver_step *st, TrunkLayer il) {
+    return qwen_layer(QS(st), pulsar_layer_slot_of(il), pulsar_qwen_s2_gdn);
+}
 /// The QSA layer block.
 /// @param st the core driver's step (a pulsar_qwen_step)
 /// @param il the layer
 /// @return qwen_layer's
-static bool qwen_block_qsa(const pulsar_driver_step *st, uint32_t il) { return qwen_layer(QS(st), il, pulsar_qwen_s3_qsa); }
+static bool qwen_block_qsa(const pulsar_driver_step *st, TrunkLayer il) {
+    return qwen_layer(QS(st), pulsar_layer_slot_of(il), pulsar_qwen_s3_qsa);
+}
 /// pulsar_driver_ops::embed.
 /// @param st the core driver's step (a pulsar_qwen_step)
 /// @return pulsar_qwen_s4_embed's
@@ -1373,9 +1386,9 @@ static uint64_t qwen_artifact(const pulsar_engine *e) { return pulsar_qwen_of(e)
  * -- filter with PULSAR_CUDA_GRAPH_DUMP_LAYER/_POS, since the dump helper synchronizes mid-graph. */
 /// @param st the core driver's step (a pulsar_qwen_step)
 /// @param il the layer just run
-static void qwen_dump(const pulsar_driver_step *st, uint32_t il) {
+static void qwen_dump(const pulsar_driver_step *st, TrunkLayer il) {
     gpu_graph_debug_dump_hc_tensor("qwen_h", QS(st)->streams, (uint64_t)st->n_rows * pulsar_qwen_hc_dim(&g_qwen_shape),
-                                   il, (uint32_t)st->pos[st->n_rows - 1]);
+                                   il.raw(), (uint32_t)st->pos[st->n_rows - 1]);
 }
 
 /* L268: the step's multi-axis rope positions (pulsar_image_rope3 over each row's bank's image records) -- NULL when
@@ -1461,7 +1474,7 @@ static bool qwen_mtp_forward(pulsar_session *s, pulsar_step_mode mode, const pul
                              bool decode_rows) {
     pulsar_engine *e = s->engine;
     pulsar_qwen_state *q = qwen_st(s);
-    const uint32_t il = e->plan.n_layer;                /* the MTP layer's slot */
+    const LayerSlot il = pulsar_qwen_mtp_slot(&e->plan);   /* the MTP layer's slot */
     uint32_t run_first[PULSAR_QWEN_SPEC_ROWS + 1] = {0};
     uint32_t n_runs = 0;
     if (decode_rows) {
@@ -1566,8 +1579,8 @@ static pulsar_gpu_tensor *qwen_mtp_out_rows(pulsar_session *s) { return qwen_st(
 /// @param m the step's request
 /// @return false (printed) on a refusal or failed step
 static bool qwen_mtp_step(pulsar_session *s, const pulsar_mtp_step *m) {
-    if (m->module != 0) {
-        fprintf(stderr, "pulsar: %s: MTP module %u of one -- refusing\n", PULSAR_QWEN_ARCH, m->module);
+    if (m->module != DraftLayer{0u}) {
+        fprintf(stderr, "pulsar: %s: MTP module %u of one -- refusing\n", PULSAR_QWEN_ARCH, m->module.raw());
         return false;
     }
     qwen_mtp_pick pk[PULSAR_QWEN_HEAD_ROWS_MAX];
@@ -1595,7 +1608,8 @@ static const pulsar_gpu_tensor *qwen_mtp_q_rows(pulsar_session *s, const pulsar_
 static bool qwen_mtp_stage_save(pulsar_session *s, uint32_t bank) {
     const TensorBytes itb = TensorBytes{pulsar_qwen_index_tail_bytes(&g_qwen_shape)};
     return pulsar_gpu_tensor_copy_async(qwen_st(s)->mtp_stage, itb.times(bank),
-                                        pulsar_state_tensor(s->states, s->engine->plan.n_layer, PULSAR_QWEN_STATE_IDX_TAIL),
+                                        pulsar_state_tensor(s->states, pulsar_qwen_mtp_slot(&s->engine->plan),
+                                                            PULSAR_QWEN_STATE_IDX_TAIL),
                                         itb.times(bank), itb) != 0;
 }
 /// Restore what qwen_mtp_stage_save kept.
@@ -1604,7 +1618,8 @@ static bool qwen_mtp_stage_save(pulsar_session *s, uint32_t bank) {
 /// @return false on a failed copy
 static bool qwen_mtp_stage_restore(pulsar_session *s, uint32_t bank) {
     const TensorBytes itb = TensorBytes{pulsar_qwen_index_tail_bytes(&g_qwen_shape)};
-    return pulsar_gpu_tensor_copy_async(pulsar_state_tensor(s->states, s->engine->plan.n_layer, PULSAR_QWEN_STATE_IDX_TAIL),
+    return pulsar_gpu_tensor_copy_async(pulsar_state_tensor(s->states, pulsar_qwen_mtp_slot(&s->engine->plan),
+                                                            PULSAR_QWEN_STATE_IDX_TAIL),
                                         itb.times(bank), qwen_st(s)->mtp_stage, itb.times(bank), itb) != 0;
 }
 

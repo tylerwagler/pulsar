@@ -97,8 +97,8 @@ bool fail(const char *what) {
  *  @param what  the reason
  *  @param il    the layer (or drafter slot)
  *  @return always false */
-bool failf(const char *what, uint32_t il) {
-    fprintf(stderr, "pulsar: %s: %s (layer %u) -- refusing the step\n", ARCH, what, il);
+bool failf(const char *what, LayerSlot il) {
+    fprintf(stderr, "pulsar: %s: %s (layer %u) -- refusing the step\n", ARCH, what, il.raw());
     return false;
 }
 
@@ -452,8 +452,8 @@ struct nh_state : pulsar_driver_state {
      * from the uploaded descriptors -- the step's launches read no host value but the step's shape */
     /// The plan's attention layers; call n_attn is the MTP module's
     uint32_t n_attn;              /* attention layers in the plan; call n_attn is the MTP module's (N9, drafting) */
-    /// Host [n_layer]: each layer's attention ordinal (UINT32_MAX = a Mamba-2 layer)
-    uint32_t *attn_slot;          /* host [n_layer]: the layer's attention ordinal (UINT32_MAX = none) */
+    /// Host [n_layer]: each layer's attention ordinal (none() = a Mamba-2 layer); read through attn_ord
+    KindOrd *attn_slot;           /* host [n_layer]: the layer's attention ordinal (none() = a Mamba-2 layer) */
     /// Host [n_calls]: each attention call's plan
     pulsar_gqa_call *attn_call;   /* host [n_calls]: the calls' plans */
     /// Host [n_calls]: each call's descriptors' byte offset in attn_desc / attn_desc_host
@@ -492,7 +492,18 @@ const pulsar_nemotron_h_model *W(const pulsar_engine *e) { return (const pulsar_
 /** @param st  the step
  *  @param il  the layer
  *  @return the layer's weights */
-const pulsar_nemotron_h_block &LW(const nh_step *st, uint32_t il) { return st->module ? *st->module : st->w->layer[il]; }
+const pulsar_nemotron_h_block &LW(const nh_step *st, LayerSlot il) {
+    return st->module ? *st->module : st->w->layer[pulsar_slot_trunk_layer(st->states->plan, il).raw()];
+}
+/* L436: the attention calls are compacted over the plan's ATTENTION layers -- call k is the k-th attention layer's,
+ * and the MTP module's is the one past them.  These two are the only ways to a call's ordinal. */
+/** @param q   the family state (its attn_slot table, built at create)
+ *  @param il  a trunk layer
+ *  @return its ordinal among the plan's attention layers; none() for a Mamba-2 layer */
+KindOrd attn_ord(const nh_state *q, TrunkLayer il) { return q->attn_slot[il.raw()]; }
+/** @param q   the family state
+ *  @return the MTP module's attention call: the one past the trunk's n_attn */
+KindOrd mtp_attn_ord(const nh_state *q) { return KindOrd{q->n_attn}; }
 
 /** Free the family state and everything it owns.
  *  @param st  the state (NULL = nothing) */
@@ -545,9 +556,9 @@ pulsar_driver_state *create(pulsar_session *s, uint32_t n_banks) {
     st->trunk->res = st->h;
     /* L296 perf: the attention calls -- the trunk's attention layers, then (N9, when the session drafts) the MTP
      * module's at ordinal n_attn; each call's descriptors at its own offset of one device region */
-    st->attn_slot = (uint32_t *)xmalloc((size_t)e->plan.n_layer * sizeof(uint32_t));
-    for (uint32_t il = 0; il < e->plan.n_layer; il++)
-        st->attn_slot[il] = e->plan.desc[il].mixer == PULSAR_MIXER_ATTN_FULL ? st->n_attn++ : UINT32_MAX;
+    st->attn_slot = (KindOrd *)xmalloc((size_t)e->plan.n_layer * sizeof(KindOrd));
+    for (TrunkLayer il{0u}; il.below(e->plan.n_layer); ++il)
+        st->attn_slot[il.raw()] = e->plan.desc[il.raw()].mixer == PULSAR_MIXER_ATTN_FULL ? KindOrd{st->n_attn++} : KindOrd::none();
     const uint32_t n_calls = st->n_attn + (W(e)->drafting ? 1u : 0u);
     st->attn_desc_max = a256(pulsar_gqa_desc_bytes((uint32_t)R));
     st->attn_call = (pulsar_gqa_call *)xcalloc(n_calls ? n_calls : 1u, sizeof(pulsar_gqa_call));
@@ -764,7 +775,7 @@ uint32_t attn_bound(const nh_step *st) {
  *  @param off     the descriptors' byte offset in attn_desc_host
  *  @param stride  one call's descriptor bytes
  *  @return true = planned; false = a pool is evicted or the plan refused (said) */
-bool plan_call(const nh_step *st, uint32_t il, uint32_t k, uint32_t bound, uint64_t off, uint64_t stride) {
+bool plan_call(const nh_step *st, LayerSlot il, KindOrd k, uint32_t bound, uint64_t off, uint64_t stride) {
     nh_state *q = st->st;
     const pulsar_gqa_layer G1 = gqa_decl(st->w->shape);
     const uint64_t tb = pulsar_gqa_kv_token_bytes(&G1);
@@ -776,9 +787,9 @@ bool plan_call(const nh_step *st, uint32_t il, uint32_t k, uint32_t bound, uint6
         sq.bytes = pulsar_gpu_tensor_bytes(pool).raw();
         sq.cap = (uint32_t)(sq.bytes / tb);
     }
-    q->attn_off[k] = off;
+    q->attn_off[k.raw()] = off;
     return pulsar_gqa_plan(&G1, q->seqs, q->n_seq, q->row_seq, q->row_pos, st->n_rows, bound, q->attn_desc_host + off,
-                           stride, &q->attn_call[k]) == 0 ||
+                           stride, &q->attn_call[k.raw()]) == 0 ||
            failf("the attention's plan refused", il);
 }
 
@@ -791,9 +802,9 @@ bool plan_attention(const nh_step *st, uint32_t *bound_out) {
     if (!q->n_attn) return true;
     const uint32_t bound = attn_bound(st);
     const uint64_t stride = a256(pulsar_gqa_desc_bytes(st->n_rows));
-    for (uint32_t il = 0; il < st->plan->n_layer; il++) {
-        const uint32_t k = q->attn_slot[il];
-        if (k != UINT32_MAX && !plan_call(st, il, k, bound, (uint64_t)k * stride, stride)) return false;
+    for (TrunkLayer il{0u}; il.below(st->plan->n_layer); ++il) {
+        const KindOrd k = attn_ord(q, il);
+        if (!k.is_none() && !plan_call(st, pulsar_layer_slot_of(il), k, bound, (uint64_t)k.raw() * stride, stride)) return false;
     }
     *bound_out = bound;
     return pulsar_gpu_tensor_write_async(q->attn_desc, TensorBytes{0}, q->attn_desc_host,
@@ -806,13 +817,13 @@ bool plan_attention(const nh_step *st, uint32_t *bound_out) {
 /** @param st  the MTP module's step
  *  @param il  the drafter slot
  *  @return true = staged; false = refused (said) */
-bool mtp_stage(const nh_step *st, uint32_t il) {
+bool mtp_stage(const nh_step *st, LayerSlot il) {
     nh_state *q = st->st;
     for (uint32_t r = 0; r < st->n_rows; r++)
         if (!st->tokens[r].below(st->w->shape.n_vocab))
             return fail("a token id outside the vocabulary");
     const uint64_t off = (uint64_t)q->n_attn * q->attn_desc_max;
-    return build_tables(st) && plan_call(st, il, q->n_attn, attn_bound(st), off, q->attn_desc_max) &&
+    return build_tables(st) && plan_call(st, il, mtp_attn_ord(q), attn_bound(st), off, q->attn_desc_max) &&
            (pulsar_gpu_tensor_write_async(q->attn_desc, TensorBytes{off}, q->attn_desc_host + off,
                                           TensorBytes{q->attn_desc_max}) != 0 ||
             fail("could not upload the MTP attention's descriptors"));
@@ -899,13 +910,13 @@ bool image_rows(const pulsar_driver_step *st0, const uint16_t *rows, uint32_t n_
  *  @param arena  the buffer holding the rows (NULL = nothing)
  *  @param off    the rows' byte offset in it
  *  @param width  the row width in bf16 values
- *  @param il     the layer the dump is tagged with */
+ *  @param il     the layer slot the dump is tagged with (a drafter slot tags past the trunk's layers) */
 void dump_rows(const nh_step *st, const char *name, pulsar_gpu_tensor *arena, uint64_t off, uint32_t width,
-               uint32_t il) {
+               LayerSlot il) {
     if (!gpu_graph_debug_dump_enabled()) return;
     const uint64_t n = (uint64_t)st->n_rows * width;
     pulsar_gpu_tensor *v = arena ? pulsar_gpu_tensor_view(arena, TensorBytes{off}, bytes_of<uint16_t>(n)) : NULL;
-    if (v) gpu_graph_debug_dump_hc_tensor(name, v, n, il, (uint32_t)st->pos[st->n_rows - 1]);
+    if (v) gpu_graph_debug_dump_hc_tensor(name, v, n, il.raw(), (uint32_t)st->pos[st->n_rows - 1]);
     pulsar_gpu_tensor_free(v);
 }
 
@@ -918,7 +929,7 @@ void dump_rows(const nh_step *st, const char *name, pulsar_gpu_tensor *arena, ui
  *  @param base  the MIX arena's device base
  *  @param M     the MIX arena's layout
  *  @return true = launched (the delta in M.db); false = refused (said) */
-bool mamba(const nh_step *st, uint32_t il, uint8_t *base, const mix_scratch &M) {
+bool mamba(const nh_step *st, LayerSlot il, uint8_t *base, const mix_scratch &M) {
     nh_state *q = st->st;
     const pulsar_nemotron_h_shape &s = st->w->shape;
     const pulsar_nemotron_h_block &L = LW(st, il);
@@ -1004,7 +1015,7 @@ bool mamba(const nh_step *st, uint32_t il, uint8_t *base, const mix_scratch &M) 
  *  @param base  the MIX arena's device base
  *  @param M     the MIX arena's layout
  *  @return true = launched (the delta in M.db); false = refused (said) */
-bool attention(const nh_step *st, uint32_t il, uint8_t *base, const mix_scratch &M) {
+bool attention(const nh_step *st, LayerSlot il, uint8_t *base, const mix_scratch &M) {
     nh_state *q = st->st;
     const pulsar_nemotron_h_shape &s = st->w->shape;
     const pulsar_nemotron_h_block &L = LW(st, il);
@@ -1024,8 +1035,9 @@ bool attention(const nh_step *st, uint32_t il, uint8_t *base, const mix_scratch 
             return failf("the q / k / v projections refused", il);
     }
     const pulsar_gqa_layer G1 = gqa_decl(s);
-    const uint32_t slot = st->module ? q->n_attn : q->attn_slot[il];   /* N9: the MTP module's call is n_attn */
-    if (slot == UINT32_MAX || q->attn_call[slot].n_rows != n) return failf("an attention layer the step did not plan", il);
+    /* N9: the MTP module's call is the one past the trunk's; a trunk layer's is its attention ordinal */
+    const KindOrd slot = st->module ? mtp_attn_ord(q) : attn_ord(q, pulsar_slot_trunk_layer(st->states->plan, il));
+    if (slot.is_none() || q->attn_call[slot.raw()].n_rows != n) return failf("an attention layer the step did not plan", il);
     pulsar_gqa_io io{};
     io.q = {qb, Q, s.head_dim};
     io.k = {kb, KV, s.head_dim};
@@ -1036,8 +1048,8 @@ bool attention(const nh_step *st, uint32_t il, uint8_t *base, const mix_scratch 
     io.workspace_bytes = M.gqa_bytes;
     /* O59: the step's non-finite flag (step_end reads it); bit 23 marks an attention operand */
     io.nf_flag = (uint32_t *)((uint8_t *)dptr(st->st->scratch[ARENA_ROWS]) + rows_layout(st->st->max_rows).nf);
-    io.nf_code = 0x4E800000u | il;
-    if (pulsar_gqa_launch(&G1, &q->attn_call[slot], (const uint8_t *)dptr(q->attn_desc) + q->attn_off[slot],
+    io.nf_code = 0x4E800000u | il.raw();
+    if (pulsar_gqa_launch(&G1, &q->attn_call[slot.raw()], (const uint8_t *)dptr(q->attn_desc) + q->attn_off[slot.raw()],
                           &io, 0) != 0)
         return failf("the attention refused", il);
     const pulsar_tensor *t[1] = {L.attn_o};
@@ -1061,7 +1073,7 @@ bool attention(const nh_step *st, uint32_t il, uint8_t *base, const mix_scratch 
  *  @param F     the FFN arena's layout
  *  @return true = launched; false = refused (said); a decode step's routed chain may then be forked and not joined
  *          (moe abandons it) */
-bool moe_block(const nh_step *st, uint32_t il, float *fo, uint8_t *base, const ffn_scratch &F) {
+bool moe_block(const nh_step *st, LayerSlot il, float *fo, uint8_t *base, const ffn_scratch &F) {
     const pulsar_nemotron_h_shape &s = st->w->shape;
     const pulsar_nemotron_h_block &L = LW(st, il);
     const uint32_t n = st->n_rows;
@@ -1124,7 +1136,7 @@ bool moe_block(const nh_step *st, uint32_t il, float *fo, uint8_t *base, const f
     c.ws = parts.routed;
     c.ws_bytes = parts.routed_bytes;
     c.nf_flag = (uint32_t *)((uint8_t *)dptr(st->st->scratch[ARENA_ROWS]) + R.nf);
-    c.nf_code = 0x4E000000u | il;
+    c.nf_code = 0x4E000000u | il.raw();
     c.stream = rs;
     if (!arm_segments(st, 0, n, [&](bool prompt, uint32_t r0, uint32_t rows) {
             c.selected = parts.sel + (size_t)r0 * K;
@@ -1163,7 +1175,7 @@ bool moe_block(const nh_step *st, uint32_t il, float *fo, uint8_t *base, const f
  *  @param base  the FFN arena's device base
  *  @param F     the FFN arena's layout
  *  @return true = launched; false = refused (said), with no fork left pending */
-bool moe(const nh_step *st, uint32_t il, float *fo, uint8_t *base, const ffn_scratch &F) {
+bool moe(const nh_step *st, LayerSlot il, float *fo, uint8_t *base, const ffn_scratch &F) {
     if (moe_block(st, il, fo, base, F)) return true;
     pulsar_rows_moe_lanes_abandon(NULL);   /* the block's stream: the per-thread default */
     return false;
@@ -1175,9 +1187,9 @@ bool moe(const nh_step *st, uint32_t il, float *fo, uint8_t *base, const ffn_scr
 /** @param st  the step
  *  @param il  a trunk layer
  *  @return its mixer pre-norm's device weight (ssm_pre_norm or attn_norm), or NULL */
-const uint16_t *mixer_norm(const nh_step *st, uint32_t il) {
-    const pulsar_nemotron_h_block &L = st->w->layer[il];
-    return (const uint16_t *)wp(st, st->plan->desc[il].mixer == PULSAR_MIXER_MAMBA2 ? L.ssm_pre_norm : L.attn_norm,
+const uint16_t *mixer_norm(const nh_step *st, TrunkLayer il) {
+    const pulsar_nemotron_h_block &L = st->w->layer[il.raw()];
+    return (const uint16_t *)wp(st, st->plan->desc[il.raw()].mixer == PULSAR_MIXER_MAMBA2 ? L.ssm_pre_norm : L.attn_norm,
                                 "nemotron_h mixer norm");
 }
 /* L296 perf: the norm whatever reads h after trunk layer il applies -- layer il + 1's mixer pre-norm, or the final
@@ -1185,8 +1197,8 @@ const uint16_t *mixer_norm(const nh_step *st, uint32_t il) {
 /** @param st  the step
  *  @param il  a trunk layer
  *  @return the device weight of the norm the next reader of h applies, or NULL */
-const uint16_t *next_norm(const nh_step *st, uint32_t il) {
-    if (il + 1u < st->plan->n_layer) return mixer_norm(st, il + 1u);
+const uint16_t *next_norm(const nh_step *st, TrunkLayer il) {
+    if (il.next().below(st->plan->n_layer)) return mixer_norm(st, il.next());
     return (const uint16_t *)wp(st, st->w->output_norm, "nemotron_h norm_f");
 }
 
@@ -1204,7 +1216,7 @@ const uint16_t *next_norm(const nh_step *st, uint32_t il) {
  *  @param nn        the next reader's norm weight
  *  @param nout      where rmsnorm(h) * nn is written
  *  @return true = launched; false = refused (said) */
-bool compose(const nh_step *st, uint32_t il, bool is_mamba, bool is_moe, const uint16_t *pre, const uint16_t *nn,
+bool compose(const nh_step *st, LayerSlot il, bool is_mamba, bool is_moe, const uint16_t *pre, const uint16_t *nn,
              uint16_t *nout) {
     nh_state *q = st->st;
     const pulsar_nemotron_h_shape &s = st->w->shape;
@@ -1225,7 +1237,8 @@ bool compose(const nh_step *st, uint32_t il, bool is_mamba, bool is_moe, const u
                                     0) != 0)
         return failf("the mixer's residual add refused", il);
     /* L298: a block drafter's taps after this HF block (the trunk's steps only) */
-    if (!st->module && !pulsar_block_tap(q, il, PULSAR_BLOCK_TAP_MIXER, h, E, n)) return failf("the drafter tap refused", il);
+    if (!st->module && !pulsar_block_tap(q, pulsar_slot_trunk_layer(st->states->plan, il), PULSAR_BLOCK_TAP_MIXER, h, E, n))
+        return failf("the drafter tap refused", il);
     if (!is_moe) return true;
     dump_rows(st, "nemotron_mid", st->res, 0, E, il);
     /* the MoE's HF block */
@@ -1238,7 +1251,8 @@ bool compose(const nh_step *st, uint32_t il, bool is_mamba, bool is_moe, const u
     dump_rows(st, "nemotron_ffn", q->scratch[ARENA_FFN], F.db, E, il);
     if (pulsar_rows_add_launch(h, E, db, E, n, E, nn, s.rms_eps, nout, E, 0) != 0)
         return failf("the MoE's residual add refused", il);
-    return st->module || pulsar_block_tap(q, il, PULSAR_BLOCK_TAP_FFN, h, E, n) || failf("the drafter tap refused", il);
+    return st->module || pulsar_block_tap(q, pulsar_slot_trunk_layer(st->states->plan, il), PULSAR_BLOCK_TAP_FFN, h, E, n) ||
+           failf("the drafter tap refused", il);
 }
 
 /* block[PULSAR_LAYER_BLOCKS]: one layer as its description says; its pre-norm is the previous layer's last add's
@@ -1247,15 +1261,17 @@ bool compose(const nh_step *st, uint32_t il, bool is_mamba, bool is_moe, const u
  *  @param st0  the trunk's step
  *  @param il   the layer
  *  @return true = launched; false = refused (said) */
-bool block(const pulsar_driver_step *st0, uint32_t il) {
+bool block(const pulsar_driver_step *st0, TrunkLayer il) {
     const nh_step *st = S(st0);
-    const pulsar_layer_desc &d = st0->plan->desc[il];
+    const pulsar_layer_desc &d = st0->plan->desc[il.raw()];
+    const LayerSlot slot = pulsar_layer_slot_of(il);   /* the trunk layer's state slot: what the composition carries */
     const bool is_mamba = d.mixer == PULSAR_MIXER_MAMBA2, is_moe = d.ffn == PULSAR_FFN_MOE;
     if ((!is_mamba && d.mixer != PULSAR_MIXER_ATTN_FULL) || (!is_moe && d.ffn != PULSAR_FFN_NONE))
-        return failf("a layer description that is not {Mamba-2 | full attention} x {MoE | none}", il);
-    const uint16_t *pre = il == 0 ? mixer_norm(st, 0) : NULL;
-    if (il == 0 && !pre) return failf("the mixer norm's weight is missing", il);
-    return compose(st, il, is_mamba, is_moe, pre, next_norm(st, il), (uint16_t *)dptr(st->st->xn));
+        return failf("a layer description that is not {Mamba-2 | full attention} x {MoE | none}", slot);
+    const bool first = il == TrunkLayer{0u};
+    const uint16_t *pre = first ? mixer_norm(st, TrunkLayer{0u}) : NULL;
+    if (first && !pre) return failf("the mixer norm's weight is missing", slot);
+    return compose(st, slot, is_mamba, is_moe, pre, next_norm(st, il), (uint16_t *)dptr(st->st->xn));
 }
 
 /* n normed bf16 rows xb -> logits rows [out0, out0 + n) of the driver's slab: the head linear (the decode arm at every
@@ -1330,9 +1346,9 @@ bool step_end(const pulsar_driver_step *st0, bool ok) {
 /** pulsar_driver_ops::dump.
  *  @param st0  the step
  *  @param il   the layer just run */
-void dump(const pulsar_driver_step *st0, uint32_t il) {
+void dump(const pulsar_driver_step *st0, TrunkLayer il) {
     const nh_step *st = S(st0);
-    gpu_graph_debug_dump_hc_tensor("nemotron_h", st->res, (uint64_t)st->n_rows * st->w->shape.n_embd, il,
+    gpu_graph_debug_dump_hc_tensor("nemotron_h", st->res, (uint64_t)st->n_rows * st->w->shape.n_embd, il.raw(),
                                    (uint32_t)st->pos[st->n_rows - 1]);
 }
 
@@ -1411,7 +1427,7 @@ bool mtp_forward(pulsar_session *s, const pulsar_mtp_step *m) {
     const pulsar_nemotron_h_model *w = W(e);
     const pulsar_nemotron_h_shape &sh = w->shape;
     const uint32_t n = m->n, E = sh.n_embd, V = sh.n_vocab;
-    if (!q->mtp || m->module != 0 || n == 0 || n > q->max_rows || m->head_n > n ||
+    if (!q->mtp || m->module != DraftLayer{0u} || n == 0 || n > q->max_rows || m->head_n > n ||
         m->head_n > PULSAR_DRIVER_HEADS_MAX || (m->pick && m->head_n == 0) ||
         (m->decode_rows && (m->mode != PULSAR_STEP_PREFILL || n > PULSAR_DRIVER_HEADS_MAX)))
         return fail("an MTP step outside the module's rows (one module; its heads within the driver's)");
@@ -1448,7 +1464,7 @@ bool mtp_forward(pulsar_session *s, const pulsar_mtp_step *m) {
     st.run_first = n_runs ? run_first : NULL;
     st.n_dec = m->decode_rows ? n : pulsar_step_n_dec(m->mode, 0u, n);
     st.tap = NULL;
-    const uint32_t il = e->state_plan.n_trunk + m->module;   /* the module's drafter slot */
+    const LayerSlot il = pulsar_drafter_slot(&e->state_plan, m->module);   /* the module's drafter slot */
     const pulsar_nemotron_h_draft &D = w->mtp;
     const mix_scratch M = mix_layout(q->max_rows, s->states->ctx);
     uint8_t *mbase = (uint8_t *)dptr(q->scratch[ARENA_MIX]);
@@ -1555,8 +1571,8 @@ void pulsar_nemotron_h_state_plan(pulsar_engine *e) {
     d[PULSAR_NEMOTRON_H_STATE_MTP_PEND] = {"mtp_pend", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_NONE, false, false, 0,
                                            mtp_cond_bytes(e), 0, 0, NULL, NULL, NULL};
     for (uint32_t id = 0; id < PULSAR_NEMOTRON_H_STATE_COUNT; id++) (void)pulsar_state_plan_add(p, d[id]);
-    for (uint32_t il = 0; il < lp->n_layer; il++)
-        p->slot[il] = lp->desc[il].mixer == PULSAR_MIXER_MAMBA2
+    for (TrunkLayer il{0u}; il.below(lp->n_layer); ++il)
+        p->slot[pulsar_layer_slot_of(il).raw()] = lp->desc[il.raw()].mixer == PULSAR_MIXER_MAMBA2
                           ? 1u << PULSAR_NEMOTRON_H_STATE_SSM | 1u << PULSAR_NEMOTRON_H_STATE_CONV
                           : 1u << PULSAR_NEMOTRON_H_STATE_KV;
     p->n_trunk = lp->n_layer;

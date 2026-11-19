@@ -142,9 +142,9 @@ bool pulsar_nemotron_h_vision_bind(const pulsar_model *m, pulsar_role_binder *b,
     v->patch = pulsar_role_bind(b, top("vit_patch"), A_LINEAR, 2, P, D);
     v->cls = pulsar_role_bind(b, top("vit_cls"), A_BF16, 2, D, s.prefix);
     v->pos = pulsar_role_bind(b, top("vit_pos"), A_BF16, 2, D, G);
-    for (uint32_t il = 0; il < s.depth; il++) {
-        auto k = [&](const char *r) { return pulsar_role_in(r, "vit", (int32_t)il); };
-        pulsar_vit_block &B = v->vit[il];
+    for (VisLayer il{0u}; il.below(s.depth); ++il) {
+        auto k = [&](const char *r) { return pulsar_role_in(r, "vit", (int32_t)il.raw()); };
+        pulsar_vit_block &B = v->vit[il.raw()];
         B.norm1 = pulsar_role_bind(b, k("vit_norm1"), A_F32, 1, D);
         B.norm1_b = pulsar_role_bind(b, k("vit_norm1_bias"), A_F32, 1, D);
         B.qkv = pulsar_role_bind(b, k("vit_qkv"), A_LINEAR, 2, D, 3u * D);

@@ -161,12 +161,12 @@ int main(int argc, char **argv) {
         for (uint32_t i = 0; i < n_parts; i++) pp[i] = paths[i].c_str();
         pulsar_engram_table t;
         if (rowfile) {
-            CHECK(!pulsar_qwen_ngram_table_open(&t, rowfile, 2u, &L), "the row file opened as layer 2 is refused (message above expected)");
+            CHECK(!pulsar_qwen_ngram_table_open(&t, rowfile, TrunkLayer{2u}, &L), "the row file opened as layer 2 is refused (message above expected)");
             pulsar_qwen_ngram_layout L2 = L;
             L2.n_rows += 128;
-            CHECK(!pulsar_qwen_ngram_table_open(&t, rowfile, 1u, &L2), "a layout with another row count is refused (message above expected)");
+            CHECK(!pulsar_qwen_ngram_table_open(&t, rowfile, TrunkLayer{1u}, &L2), "a layout with another row count is refused (message above expected)");
         }
-        if (rowfile ? !pulsar_qwen_ngram_table_open(&t, rowfile, 1u, &L)
+        if (rowfile ? !pulsar_qwen_ngram_table_open(&t, rowfile, TrunkLayer{1u}, &L)
                     : !pulsar_engram_table_open_parts(&t, 1u, n_parts, pp.data(), bases.data(), rows_per_part,
                                                       PULSAR_QWEN_NGRAM_ROW_BYTES, L.n_rows)) {
             CHECK(0, "open the table (%s)", rowfile ? rowfile : pp[0]);

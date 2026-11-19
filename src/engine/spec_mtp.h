@@ -54,7 +54,7 @@ typedef struct {
 /** One module step the lane asks of the family: `n` rows, row i the module's input for (conditioning row i of
  *  `cond`, tokens[i]) at pos[i] of bank[i]. */
 typedef struct {
-    uint32_t module;            ///< which declared module runs (< modules(e)); its state is drafter slot n_trunk + module
+    DraftLayer module;          ///< which declared module runs (< modules(e)); its state is pulsar_drafter_slot(plan, module)
     pulsar_step_mode mode;      ///< DECODE: one row a bank; PREFILL: one bank's run of consecutive positions
     /** PREFILL only: the rows are runs of any number of banks (one run a bank) taken as DECODE rows -- the decode
      *  arms, the verify's row kind (the absorb of every bank's kept rows); without it a PREFILL step is one bank's

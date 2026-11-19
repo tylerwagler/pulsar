@@ -83,12 +83,12 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
             }
             /* the taps: HF decoder layer i's output = the residual after layer i's scaled add (its last sublayer) */
             for (uint32_t j = 0; j < d->n_taps; j++) {
-                if (d->tap_block[j] >= w->shape.n_layer) {
+                if (!d->tap_block[j].below(w->shape.n_layer)) {
                     fprintf(stderr, "pulsar: %s: the drafter taps layer %u of a %u-layer target -- refusing\n", ARCH,
-                            d->tap_block[j], w->shape.n_layer);
+                            d->tap_block[j].raw(), w->shape.n_layer);
                     return false;
                 }
-                d->tap_layer[j] = d->tap_block[j];
+                d->tap_layer[j] = pulsar_gemma4_block_layer(d->tap_block[j]);
                 d->tap_sub[j] = PULSAR_BLOCK_TAP_FFN;
             }
             /* E5: the target's embedding scale, bf16(sqrt(hidden)) (gemma4_forward.cpp head_decl), nearest even */
@@ -143,7 +143,7 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
     }
     const pulsar_gemma4_shape *s = &w->shape;
     uint32_t n_full = 0;
-    for (uint32_t il = 0; il < e->plan.n_layer; il++) n_full += e->plan.desc[il].mixer == PULSAR_MIXER_ATTN_FULL;
+    for (TrunkLayer il{0u}; il.below(e->plan.n_layer); ++il) n_full += e->plan.desc[il.raw()].mixer == PULSAR_MIXER_ATTN_FULL;
     fprintf(stderr, "pulsar: %s: %s, %u layers: %u window (%u keys, %uq/%ukv x %u) + %u global (%uq/%ukv x %u, K = V); "
                     "every layer a dense GeGLU MLP (%u, stored %u) + %u of %u experts (%u, stored %u); the pack's EXL3 head, "
                     "soft-cap %g; %.2f GiB bound\n",
@@ -159,7 +159,7 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
 /** @param e  the engine
  *  @return always true (a missing block is said here and refused by the session) */
 bool after_gpu(pulsar_engine *e) {
-    uint32_t at = 0;
+    TrunkLayer at{0u};
     const char *miss = pulsar_driver_first_missing(e->family->driver, &e->plan, &at);
     fprintf(stderr, "pulsar: %s: the core step driver over %u layers of shared blocks (F1 GQA window 256 / global 512 "
                     "K = V, the rows dense GeGLU MLP + F2 router 128 / 8 + the rows MoE's GeGLU experts, E5 head soft-cap); "
@@ -210,8 +210,8 @@ pulsar_drafter_kind drafter(pulsar_engine *e) {
 int quant_bits(pulsar_engine *e) {
     const pulsar_gemma4_model *w = model_of(e);
     int bits = 0;
-    for (uint32_t il = 0; il < w->shape.n_layer; il++)
-        for (const pulsar_tensor *t : {w->layer[il].exp_gate, w->layer[il].exp_up, w->layer[il].exp_down}) {
+    for (TrunkLayer il{0u}; il.below(w->shape.n_layer); ++il)
+        for (const pulsar_tensor *t : {w->layer[il.raw()].exp_gate, w->layer[il.raw()].exp_up, w->layer[il.raw()].exp_down}) {
             const int k2 = t ? exl3_type_k2(t->type) : 0;
             if (k2 && 20 + k2 > bits) bits = 20 + k2;
         }

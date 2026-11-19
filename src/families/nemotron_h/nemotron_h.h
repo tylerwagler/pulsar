@@ -110,6 +110,23 @@ typedef struct {
     uint8_t block_sub[PULSAR_NEMOTRON_H_MAX_BLOCKS];
 } pulsar_nemotron_h_shape;
 
+/** L436: the trunk layer HF block `b` belongs to -- the plan groups a mixer block and the MoE block after it into ONE
+ *  layer, so a block's number is NOT its layer's.  The shape's table
+ *  (pulsar_nemotron_h_read_shape's grouping) is the one crossing.
+ *  @param s the shape
+ *  @param b an HF block, below s->n_blocks */
+/// @return the trunk layer holding the block
+static inline TrunkLayer pulsar_nemotron_h_block_layer(const pulsar_nemotron_h_shape *s, SrcBlock b) {
+    return TrunkLayer{s->block_layer[b.raw()]};
+}
+/** L436: which half of its layer HF block `b` is: PULSAR_BLOCK_TAP_MIXER or PULSAR_BLOCK_TAP_FFN.
+ *  @param s the shape
+ *  @param b an HF block, below s->n_blocks */
+/// @return the block's sublayer
+static inline uint32_t pulsar_nemotron_h_block_sub(const pulsar_nemotron_h_shape *s, SrcBlock b) {
+    return s->block_sub[b.raw()];
+}
+
 /// The one profile (Nemotron-3.5 Super): the geometry every container must equal.
 extern const pulsar_nemotron_h_shape PULSAR_NEMOTRON_H_SHAPE_SUPER;
 

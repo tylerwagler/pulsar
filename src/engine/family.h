@@ -161,7 +161,8 @@ typedef struct {
 } pulsar_family_imatrix;
 
 /** The layer plan: built once by the family's load from the artifact, then
- * read-only.  kind[il] for il < n_layer is never PULSAR_LAYER_NONE. */
+ * read-only.  kind[il] for il < n_layer is never PULSAR_LAYER_NONE.  Its index is the TrunkLayer (L436,
+ * pulsar_units.h): kind[] / desc[] are subscripted with a TrunkLayer's raw() and nothing else. */
 typedef struct {
     /// layers the loaded model runs (<= PULSAR_FAMILY_MAX_LAYER)
     uint32_t n_layer;
@@ -181,9 +182,9 @@ uint32_t pulsar_layer_plan_count(const pulsar_layer_plan *p, pulsar_layer_kind k
  *  mixer is set (its FFN may be NONE) and whose window is non-zero exactly on PULSAR_MIXER_ATTN_WINDOW.  NULL when it holds, else
  *  what broke, with the layer in *at_layer.  The engine refuses a load whose plan fails it. */
 /// @param p the plan
-/// @param[out] at_layer the failing layer (UINT32_MAX when it holds)
+/// @param[out] at_layer the failing layer (none() when it holds, or when the layer count itself is refused)
 /// @return NULL, or the broken invariant
-const char *pulsar_layer_plan_check(const pulsar_layer_plan *p, uint32_t *at_layer);
+const char *pulsar_layer_plan_check(const pulsar_layer_plan *p, TrunkLayer *at_layer);
 
 /** Session features beyond the core forward.  A C API entry point whose
  * feature the loaded family does not declare refuses by name

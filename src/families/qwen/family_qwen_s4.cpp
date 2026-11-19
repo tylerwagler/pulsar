@@ -50,9 +50,9 @@ namespace {
 constexpr uint64_t kGrInjStride = (uint64_t)PULSAR_QWEN_HC * sizeof(float);   /* inj per row */
 
 /// @param st the step
-/// @param il layer index (n_layer = the MTP layer)
+/// @param il the layer's slot (a trunk layer's, or the MTP layer's)
 /// @return layer il's tensors
-const pulsar_qwen_layer_weights &layer_w(const pulsar_qwen_step *st, uint32_t il) { return st->w->layer[il]; }
+const pulsar_qwen_layer_weights &layer_w(const pulsar_qwen_step *st, LayerSlot il) { return pulsar_qwen_layer_w(st->w, il); }
 
 /* the core resolves a weight (the rank's TP slice, else the mapped range: linear.cpp) */
 /// @param st the step (its model)
@@ -103,8 +103,8 @@ bool pulsar_qwen_tp_slices(pulsar_engine *e, pulsar_tp_plan *plan) {
         ok = ok && pulsar_tp_plan_add1(plan, m, t, PULSAR_TP_AXIS_IN, lo, hi);
     };
     const uint32_t n_state = e->plan.n_layer + (w->mtp.present ? 1u : 0u);
-    for (uint32_t il = 0; ok && il < n_state; il++) {
-        const pulsar_qwen_layer_weights &L = w->layer[il];
+    for (LayerSlot il{0u}; ok && il.below(n_state); ++il) {   /* every slot's layer: the trunk's, then the MTP layer */
+        const pulsar_qwen_layer_weights &L = pulsar_qwen_layer_w(w, il);
         if (L.gdn_in_qkv) {
             ok = pulsar_tp_plan_add(plan, m, L.gdn_in_qkv, PULSAR_TP_AXIS_OUT, 3, qkv_lo, qkv_hi);
             out(L.gdn_in_z, vt.lo, vt.hi);
@@ -676,8 +676,8 @@ bool pulsar_qwen_s4_load(pulsar_engine *e, const pulsar_engine_options *opt) {
     const pulsar_qwen_shape *s = &g_qwen_shape;
     bool ok = admit_bf16(w->token_embd) & admit_head(e, w) & admit_gr(w->mixer);
     uint32_t tessera_layers = 0;
-    for (uint32_t il = 0; il < e->plan.n_layer; il++) {
-        const pulsar_qwen_layer_weights &L = w->layer[il];
+    for (TrunkLayer il{0u}; il.below(e->plan.n_layer); ++il) {
+        const pulsar_qwen_layer_weights &L = pulsar_qwen_layer_w(w, pulsar_layer_slot_of(il));
         ok &= admit_gr(L.gr_attn) & admit_gr(L.gr_mlp);
         ok &= admit_moe(L);
         tessera_layers += L.moe_tess[PULSAR_QWEN_TESS_GATE][PULSAR_QWEN_TESS_WORDS] != NULL;
@@ -693,7 +693,7 @@ bool pulsar_qwen_s4_load(pulsar_engine *e, const pulsar_engine_options *opt) {
         /* L251 MTP: the layer's GR sites and MoE as the trunk's (split experts); the head side's
          * norms bf16 and its two fc Linears mxfp8_lt (the sidecar recipe); the mixer's pair as the
          * trunk mixer's rule allows */
-        const pulsar_qwen_layer_weights &L = w->layer[e->plan.n_layer];
+        const pulsar_qwen_layer_weights &L = pulsar_qwen_layer_w(w, pulsar_qwen_mtp_slot(&e->plan));
         ok &= admit_gr(L.gr_attn) & admit_gr(L.gr_mlp) & admit_moe(L) & admit_gr(w->mtp.mixer);
         ok &= admit_bf16(w->mtp.norm_embd) & admit_bf16(w->mtp.norm_hidden) &
               admit_mx8(w->mtp.fc_embd) & admit_mx8(w->mtp.fc_hidden);
@@ -933,7 +933,7 @@ bool pulsar_qwen_s4_step_end(const pulsar_qwen_step *st, bool ok) {
     return true;
 }
 
-bool pulsar_qwen_s4_ple(const pulsar_qwen_step *st, uint32_t il) {
+bool pulsar_qwen_s4_ple(const pulsar_qwen_step *st, LayerSlot il) {
     const uint32_t n = st->n_rows;
     pulsar_qwen_ple_io *io = st->w->ple_io;
     if (!io || !io->pending || io->pending_n != n) return fail("the PLE op found no gather for this step");
@@ -1001,7 +1001,7 @@ bool pulsar_qwen_s4_ple(const pulsar_qwen_step *st, uint32_t il) {
                                   base + p.ws, p.ws_bytes, 0) == 0;
 }
 
-bool pulsar_qwen_s4_gr_read(const pulsar_qwen_step *st, uint32_t il, pulsar_qwen_gr_side side) {
+bool pulsar_qwen_s4_gr_read(const pulsar_qwen_step *st, LayerSlot il, pulsar_qwen_gr_side side) {
     const pulsar_qwen_layer_weights &L = layer_w(st, il);
     const pulsar_qwen_gr_weights &gw = side == PULSAR_QWEN_GR_ATTN ? L.gr_attn : L.gr_mlp;
     const gr_scratch g = gr_layout(st->st->max_rows);
@@ -1025,7 +1025,7 @@ bool pulsar_qwen_s4_gr_read(const pulsar_qwen_step *st, uint32_t il, pulsar_qwen
     });
 }
 
-bool pulsar_qwen_s4_gr_write(const pulsar_qwen_step *st, uint32_t, pulsar_qwen_gr_side side) {
+bool pulsar_qwen_s4_gr_write(const pulsar_qwen_step *st, LayerSlot, pulsar_qwen_gr_side side) {
     const gr_scratch g = gr_layout(st->st->max_rows);
     pulsar_gpu_tensor *sc = st->st->scratch[PULSAR_QWEN_OP_GR_READ];
     if (!sc) return fail("no GR scratch");
@@ -1066,7 +1066,7 @@ static bool tessera_proj(const pulsar_qwen_step *st, pulsar_tensor *const P[PULS
 /// @param st the step
 /// @param il the layer
 /// @return false (said) on any refusal; forks may then be pending on the shared expert's lane
-static bool moe_block(const pulsar_qwen_step *st, uint32_t il) {
+static bool moe_block(const pulsar_qwen_step *st, LayerSlot il) {
     const uint32_t n = st->n_rows;
     const pulsar_qwen_shape *s = st->shape;
     const int H = (int)s->n_embd, SMID = (int)s->n_ff_shexp;
@@ -1142,7 +1142,7 @@ static bool moe_block(const pulsar_qwen_step *st, uint32_t il) {
     rc.ws = parts.routed;
     rc.ws_bytes = parts.routed_bytes;
     rc.nf_flag = (uint32_t *)(base + m.nf);
-    rc.nf_code = 0x51000000u | il;
+    rc.nf_code = 0x51000000u | il.raw();
     pulsar_tessera_proj tp[PULSAR_QWEN_TESS_PROJS];
     if (L.moe_tess[PULSAR_QWEN_TESS_GATE][PULSAR_QWEN_TESS_WORDS]) {
         /* L255: the layer's experts are Tessera planes; the front door reads them through tp, built once here and
@@ -1210,7 +1210,7 @@ static bool moe_block(const pulsar_qwen_step *st, uint32_t il) {
     });
 }
 
-bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il) {
+bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, LayerSlot il) {
     if (moe_block(st, il)) return true;
     /* every refusal between a shared expert's fork and its join ends here: nothing of this step stays pending for
      * the next step's join to find (the block launches on the default stream, 0) */
@@ -1423,7 +1423,7 @@ bool pulsar_qwen_s4_ngram_replay(const pulsar_qwen_weights *w, int32_t ctx[2], c
  * dense arm -> pulsar_gdn_forward (the recurrence; it EMITS the A8 slot) ->
  * out_proj -> y f32.  The four kernel weights are bf16, the container's
  * storage; the kernel widens them (rule 3). */
-bool pulsar_qwen_s2_gdn(const pulsar_qwen_step *st, uint32_t il) {
+bool pulsar_qwen_s2_gdn(const pulsar_qwen_step *st, LayerSlot il) {
     const pulsar_qwen_shape *s = st->shape;
     const uint32_t n = st->n_rows;
     const int H = (int)s->n_embd, CD = (int)pulsar_qwen_gdn_conv_dim(s);
@@ -1539,7 +1539,7 @@ bool pulsar_qwen_s2_gdn(const pulsar_qwen_step *st, uint32_t il) {
  * through the EXL3 dense arm -> pulsar_gpu_qsa_forward (appends K/V + the pooled
  * block keys to the bank's caches and EMITS the A8 slot) -> o_proj -> y f32.
  * The four norms are bf16 (the recipe's format; the kernel widens). */
-bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, uint32_t il) {
+bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, LayerSlot il) {
     const pulsar_qwen_shape *s = st->shape;
     const uint32_t n = st->n_rows;
     const int H = (int)s->n_embd;

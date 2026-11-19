@@ -59,10 +59,10 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
     /* the plan is the decoder's layers (the tower is the family's own front, run once a page) */
     memset(&e->plan, 0, sizeof(e->plan));
     e->plan.n_layer = w->shape.n_layer;
-    for (uint32_t il = 0; il < w->shape.n_layer; il++) {
-        e->plan.kind[il] = PULSAR_LAYER_BLOCKS;
-        e->plan.desc[il].mixer = PULSAR_MIXER_ATTN_FULL;
-        e->plan.desc[il].ffn = PULSAR_FFN_DENSE;
+    for (TrunkLayer il{0u}; il.below(w->shape.n_layer); ++il) {
+        e->plan.kind[il.raw()] = PULSAR_LAYER_BLOCKS;
+        e->plan.desc[il.raw()].mixer = PULSAR_MIXER_ATTN_FULL;
+        e->plan.desc[il.raw()].ffn = PULSAR_FFN_DENSE;
     }
     weights_reject_unsupported_types(&e->model);
     weights_reject_bad_e8m0(&e->model);

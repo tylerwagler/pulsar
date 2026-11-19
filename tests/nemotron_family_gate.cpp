@@ -98,7 +98,7 @@ int main(int argc, char **argv) {
     check(plan_ok && n_mamba + n_moe + (s->n_layer - n_mamba) == s->n_blocks,
           "plan: %u blocks -> %u layers [%s]: %u Mamba-2 + %u attention, %u MoE + %u mixer-only", s->n_blocks,
           p->n_layer, kinds.c_str(), n_mamba, p->n_layer - n_mamba, n_moe, p->n_layer - n_moe);
-    uint32_t at = 0;
+    TrunkLayer at{0u};
     check(pulsar_layer_plan_check(p, &at) == NULL, "the plan passes the one layer-description check");
 
     /* every tensor bound, every byte priced, the price is what is staged and charged */
@@ -202,7 +202,7 @@ int main(int argc, char **argv) {
     /* the session side as declared (N3 / N7): the driver's table covers the plan; the state is the Mamba-2 layers'
      * SSM (FIXED, DELTA with its commit) + conv tail (FIXED, SNAPSHOT), the attention layers' K|V pool, the drafter's
      * slot's K|V pool when the container holds the MTP module */
-    uint32_t miss_at = 0;
+    TrunkLayer miss_at{0u};
     const char *miss = pulsar_driver_first_missing(e->family->driver, p, &miss_at);
     check(e->family->driver && !miss, "the core driver's table covers the plan (%s)", miss ? miss : "nothing missing");
     const pulsar_state_plan *sp = &e->state_plan;
