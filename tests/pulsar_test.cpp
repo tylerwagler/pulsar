@@ -4586,6 +4586,7 @@ static void test_disk_depth(void) {
     test_l434_kv_req_fields_are_consistent();
     test_l334_prompt_held_across_a_seam();
     test_l439_route_discard_is_live_side();   /* L439: the server's remaining seam crossings */
+    test_l439_context_admits_the_stitch();
 }
 
 /* L430: the host-only group the check tier runs (make gen-host-gate): the generation path's host work that must not

@@ -330,6 +330,12 @@ TokCount server::slot_common_prefix(const session_slot *sl,
     return m.live_cut;
 }
 
+TokCount server::slot_sync_len(const session_slot *sl, prompt_view p) const {
+    pulsar_prefix_match m;
+    slot_prefix_match(sl, p.tokens(), &m);
+    return pulsar_prefix_match_stitched_len(&m, p.len());
+}
+
 /* L115: the one prefix-reuse question, asked of a slot.  Callers that need
  * the request-side count (accounting, prefill bounds) read `prompt_cut`;
  * callers that need KV rows or a cut point read `live_cut`.  Across a seam

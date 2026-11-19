@@ -1383,6 +1383,28 @@ void server::gen_begin(session_slot *sl) {
     s->gen_begin_plan(sl, &res);
 }
 
+sync_admit server_sync_admit(TokCount ctx, TokCount sync_len, PromptToks own, bool replays_history) {
+    if (sync_len < ctx) return SYNC_ADMIT_FITS;
+    return replays_history && prompt_rows_cold(own) < ctx ? SYNC_ADMIT_COLD : SYNC_ADMIT_REFUSE;
+}
+
+void server::gen_context_refuse(session_slot *sl, TokCount sync_len, TokCount ctx) {
+    auto *s = this;
+    gen_state *g = sl->gen;
+    job *j = g->j;
+    server_log(PULSAR_LOG_WARNING,
+               "pulsar-server: bank %d: the prompt's sync runs %d tokens (its own %d), not below the context %d -- "
+               "refused (400 context_length_exceeded)", sl->bank.raw(), sync_len.raw(),
+               request_prompt_toks(&j->req).raw(), ctx.raw());
+    s->trace_event(g->trace_id, "context refused: sync %d of context %d", sync_len.raw(), ctx.raw());
+    slot_writer_install(&g->writer);
+    if (!(j->req.stream && g->progress.stream_failed))
+        (void)send_context_refusal(j->fd, &j->req, j->req.stream && g->progress.headers_sent, sync_len.raw(),
+                                   ctx.raw());
+    gen_kv_finish(g, "refused-context");
+    g->phase = GEN_DONE;
+}
+
 void server::gen_begin_plan(session_slot *sl, gen_resolution *r) {
     auto *s = this;
     gen_state *g = sl->gen;
@@ -1422,6 +1444,40 @@ void server::gen_begin_plan(session_slot *sl, gen_resolution *r) {
             responses_live_continuation = false;
             anthropic_live_continuation = false;
         }
+    }
+    /* L439 (3): admission on the length the sync RUNS -- the stitch onto the bank's history, which the engine caps
+     * (sync_driver.cpp).  The front door checked the request's own tokens; a re-spelled stretch below the match can
+     * make the stitch longer.  When the request's own tokens fit, it prefills them cold on its bank, emptied (no
+     * history, no stitch); a live continuation (its own tokens are no conversation) and a prompt that fits neither
+     * way are refused as the front door refuses.  Before: the engine refused the sync, a backend failure (500). */
+    {
+        const TokCount ctx = pulsar_session_ctx(s->sess);
+        const TokCount sync_len = s->slot_sync_len(sl, prompt_for_sync);
+        sync_admit v = server_sync_admit(ctx, sync_len, request_prompt_toks(&j->req),
+                                         !responses_live_continuation && !anthropic_live_continuation);
+        if (v == SYNC_ADMIT_COLD) {
+            if (s->bank_switch(sl->bank)) {
+                server_log(PULSAR_LOG_WARNING,
+                           "pulsar-server: bank %d: the prompt's sync onto its history runs %d tokens, not below the "
+                           "context %d; its own %d fit -- prefilling them cold (the %s resume dropped)",
+                           sl->bank.raw(), sync_len.raw(), ctx.raw(), request_prompt_toks(&j->req).raw(), cache_source);
+                if (prompt_for_sync.is(&effective_prompt)) pulsar_tokens_free(&effective_prompt);
+                pulsar_session_invalidate(s->sess);   /* the live bank: no history, so no stitch */
+                prompt_for_sync = request_prompt(&j->req);
+                cached_toks = PromptToks{0};
+                sync_held = PromptToks{0};
+                resumed_at = TokPos{0};
+                disk_cached = PromptToks{0};
+                cache_source = "none";
+            } else {
+                v = SYNC_ADMIT_REFUSE;
+            }
+        }
+        if (v == SYNC_ADMIT_REFUSE) {
+            s->gen_context_refuse(sl, sync_len, ctx);
+            return;
+        }
+        g->sync_end = TokPos::after(s->slot_sync_len(sl, prompt_for_sync));
     }
     /* L434: usage is counted on ONE prompt a request -- its own tokenisation (what a cold prefill of it reports and a
      * client can reproduce), or for a live continuation, which names server-held state and replays no history, the
@@ -1737,6 +1793,8 @@ void server::gen_step_prefill(session_slot *sl) {
         s->kv_cache_persist(sl, KV_PERSIST_ANCHOR);
         pulsar_tokens_free(&g->cold_prefix);
         g->phase = GEN_PREFILL_MAIN;
+        /* L439: the bank's history is the cold prefix now: the main prompt's stitch is taken against it */
+        g->sync_end = TokPos::after(s->slot_sync_len(sl, g->prompt_for_sync));
         return; /* the cold store is a quantum boundary of its own */
     }
 

@@ -1502,6 +1502,31 @@ inline prompt_view request_prompt(const request *r) { return prompt_view{&r->pro
  *  @param r the request */
 /// @return the tokens
 inline PromptToks request_prompt_toks(const request *r) { return PromptToks{r->prompt.len}; }
+/** L439: the rows a COLD prefill of a prompt puts on an empty bank -- one a token of its own (no history below it, so
+ *  no token seam: the stitch is the prompt itself).  The front door's context check reads a request this way; the
+ *  length a sync runs on a bank that holds a history is the stitch's (server::slot_sync_len).
+ *  @param own the prompt's tokens */
+/// @return the same number as rows of a bank
+inline TokCount prompt_rows_cold(PromptToks own) { return TokCount{own.raw()}; }
+
+/** L439: context admission on the length a sync RUNS (the engine's cap, sync_driver.cpp: a prompt at or past the
+ *  context is refused there, and so is a token-seam stitch).  The front door admits on the request's own tokens; once
+ *  the request is bound, the stitch onto its bank's history is known and can be longer (a sampled reply the client
+ *  re-sends in fewer tokens): within the seam's shift of the edge the engine refused it and the client got a backend
+ *  failure instead of context_length_exceeded. */
+typedef enum {
+    SYNC_ADMIT_FITS,     ///< the sync's prompt fits: run it as resolved
+    SYNC_ADMIT_COLD,     ///< it does not, but the request's own tokens do: prefill them cold on the bank, emptied
+    SYNC_ADMIT_REFUSE,   ///< neither: refuse with context_length_exceeded (400), as the front door does
+} sync_admit;
+/** The admission's rule, pure.
+ *  @param ctx              the context (rows of a bank)
+ *  @param sync_len         the length the sync would run (server::slot_sync_len)
+ *  @param own              the request's own tokens
+ *  @param replays_history  the request carries its whole conversation (false for a live tool continuation, whose
+ *                          own tokens name server-held state and are no prompt of their own) */
+/// @return the verdict
+sync_admit server_sync_admit(TokCount ctx, TokCount sync_len, PromptToks own, bool replays_history);
 
 /** L439: a common prefix BY ID is a length of both sequences -- the same tokens at the same indices -- so the live
  *  side's count of it is the prompt side's with no match in between (pulsar_session_common_prefix,
@@ -3716,6 +3741,12 @@ struct server {
      */
     /// @param sl the slot whose job this is (its gen_state; its bank installed by the caller unless said)
     void gen_prefill_fail(session_slot *sl);
+    /** L439: end a bound job whose sync would not fit the context (server_sync_admit's REFUSE): the 400 refusal
+     *  (send_context_refusal), its `kv req:` finish `refused-context`, GEN_DONE.  Nothing was prefilled.
+     *  @param sl        the slot whose job this is
+     *  @param sync_len  the length the sync would run
+     *  @param ctx       the context */
+    void gen_context_refuse(session_slot *sl, TokCount sync_len, TokCount ctx);
     /** L318 / L347 I3b: what bank `src`'s published state serves of the slot's request (its tokens held to the state's
      *  T, pulsar_session_bank_adopt_score), 0 when it may not be adopted from (not resident, spilled, preempted,
      *  mid-restore, the slot's own) -- the resume pick's scan, and a failed restore's look again.
@@ -4511,6 +4542,14 @@ struct server {
     /// @param prompt  the request's tokens
     /// @return the live-side common prefix (pulsar_prefix_match::live_cut), the slot's tokens
     TokCount slot_common_prefix(const session_slot *sl, const pulsar_tokens *prompt) const;
+    /** L439: the length, on the slot's bank, of the prompt a sync of `p` runs -- the token-seam stitch onto the
+     *  bank's history (pulsar_prefix_match_stitched_len over slot_prefix_match, the match the engine's sync stitches
+     *  at): `p`'s own length when no seam lies in the match, the live tokens of a re-spelled stretch in place of the
+     *  prompt's when one does.  An empty bank: `p`'s own length.
+     *  @param sl the slot
+     *  @param p  the prompt a sync is handed */
+    /// @return the stitched length, rows of the bank
+    TokCount slot_sync_len(const session_slot *sl, prompt_view p) const;
     /** L115: the one prefix-reuse question, asked of a slot.  Callers that need
      * the request-side count (accounting, prefill bounds) read `prompt_cut`;
      * callers that need KV rows or a cut point read `live_cut`.  Across a seam
@@ -4939,6 +4978,11 @@ struct gen_state {
     /** L434: where the prompt's prefill ended on the bank's history (the live side; position 0 until the main prefill
      *  completes): what `kv req:`'s prefilled_now and the decode log's context span count from. */
     TokPos prefill_end;
+    /** L439: where the bank stands once prompt_for_sync is in -- the stitch's length (server::slot_sync_len), the
+     *  live-side end the prefill bounds read (the decode budget, the fused lanes' "done", their log).  Its own length
+     *  (prompt_for_sync.len()) is the request's count when it is the request's prompt: across a seam another number.
+     *  Set by gen_begin_plan, again when a cold phase ends (the bank's history changed under it). */
+    TokPos sync_end;
     double t0;                        ///< wall time the request began, for latency accounting
     double first_token_t;  ///< wall time the first output token was produced (TTFT); 0 until set. Request-lifetime: survives decode_again so it reflects the genuinely first token emitted.
     uint64_t trace_id;   ///< correlates every trace event for this request
@@ -5945,6 +5989,16 @@ int gen_constrain_draft_prefix(struct server *s, struct gen_state *g, TokId base
 const uint32_t *gen_constrain_base_mask(struct server *s, struct gen_state *g);
 
 bool request_exceeds_context(const request *r, TokCount ctx_size);
+/** L439: the context_length_exceeded refusal (400) once a request is bound: the front door's response
+ *  (http_error_context_length_exceeded) while nothing was written, else the same message as an error event in the
+ *  open stream (as worker_try_bind's) -- never a 500.
+ *  @param fd           the client socket
+ *  @param r            the request (its protocol's shape)
+ *  @param stream_open  the SSE stream is open (its headers sent)
+ *  @param n_tokens     the tokens that do not fit
+ *  @param ctx          the context size
+ *  @return false when a write failed */
+bool send_context_refusal(int fd, const request *r, bool stream_open, int n_tokens, int ctx);
 bool gen_client_disconnected(int fd);
 /** A decoding job whose bank could not be installed (server::bank_switch refused): it finishes on an error -- the one
  *  statement of it for generate_job_step, batch_leave, the three quanta's entry and the batched round's begin.  An

@@ -96,8 +96,11 @@ bool pulsar_session_seam_stitch(pulsar_session *s, const pulsar_tokens *prompt, 
 
 int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, const pulsar_image_ref *images,
                                 int n_images, const pulsar_sync_ops *ops, char *err, size_t errlen) {
-    /* a prompt that fills the context leaves no row for the eval that follows it (L272 B4) */
-    if (!prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
+    /* a prompt that fills the context leaves no row for the eval that follows it (L272 B4).  L439: the cap is on the
+     * length the sync RUNS, rows of the bank -- the prompt's own here, the stitch's below once a seam is found; the
+     * server admits a bound request on the same length (server_sync_admit over server::slot_sync_len) */
+    const TokCount ctx{s->ctx_size};
+    if (!prompt || prompt->len <= 0 || TokCount{prompt->len} >= ctx) {
         if (err) snprintf(err, errlen, "%s: prompt length %d outside [1, %d)", ops->name, prompt ? prompt->len : -1,
                           s->ctx_size);
         return 1;
@@ -126,7 +129,7 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
     pulsar_seam_stitch seam;
     if (s->checkpoint_valid && common < s->checkpoint.len &&
         pulsar_session_seam_stitch(s, prompt, images, n_images, common, &seam)) {
-        if (seam.tokens.len >= s->ctx_size) {
+        if (TokCount{seam.tokens.len} >= ctx) {   /* the stitch is what the bank would hold */
             if (err) snprintf(err, errlen, "%s: prompt length %d outside [1, %d)", ops->name, seam.tokens.len,
                               s->ctx_size);
             return 1;

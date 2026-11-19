@@ -22336,6 +22336,11 @@ static_assert(std::is_same_v<decltype(kv_req_line::prompt), PromptToks> &&
                   std::is_same_v<decltype(prefix_lead::pos), TokPos> &&
                   std::is_same_v<decltype(prefix_lead::len), PromptToks>,
               "the carriers are typed: the kv req line's fields, the prompt's carriers in gen_state, the prefix wait's");
+static_assert(std::is_same_v<decltype(&server_sync_admit), sync_admit (*)(TokCount, TokCount, PromptToks, bool)> &&
+                  std::is_same_v<decltype(&server::slot_sync_len), TokCount (server::*)(const session_slot *, prompt_view) const> &&
+                  std::is_same_v<decltype(gen_state::sync_end), TokPos> &&
+                  std::is_same_v<decltype(&prompt_rows_cold), TokCount (*)(PromptToks)>,
+              "the bound admission reads the length the sync runs, live side, against the context");
 
 /* L434: the text walk -- a text position as a count on one tokenisation of that text.  The differing case: the chain's
  * writer sampled X + 100 x (a|b|cd) + Y, 302 tokens; the request spells the same 402 bytes X + 100 x (abc|d) + Y in
@@ -22679,6 +22684,91 @@ static void test_l439_route_discard_is_live_side(void) {
     }
 }
 
+/* L439 (3): context admission on the length the sync runs.  (a) the bank sampled the stretches (302 tokens to Y),
+ * the request re-spells them canonically and adds Z: 203 tokens of its own, a stitch of 303 onto the bank.  In a
+ * context of 250 the front door admits it and the engine refused the stitch (a backend failure); now it prefills its
+ * own 203 cold.  (b) the reverse: 303 of its own (the front door's 400, as the engine's own first check), a stitch of
+ * 203 that would fit.  Both edges exactly; a live continuation is refused; the refusal's shape on the three APIs. */
+static void test_l439_context_admits_the_stitch(void) {
+    const int z[] = {L334_Z};
+    {
+        const l439_seam f = l439_make(true, false, NULL, 0, z, 1);
+        TEST_ASSERT(f.bank.size() == 302 && f.prompt.size() == 203 && f.m.seamed);
+        const PromptToks own{(int)f.prompt.size()};
+        const TokCount stitch = pulsar_prefix_match_stitched_len(&f.m, own);
+        TEST_ASSERT(stitch == TokCount{303});
+        request r;
+        test_request_init(&r, REQ_CHAT, 16);
+        r.prompt.len = own.raw();   /* (the check reads the length alone) */
+        TEST_ASSERT(!request_exceeds_context(&r, TokCount{250}));   /* the front door admits it */
+        TEST_ASSERT(server_sync_admit(TokCount{250}, stitch, own, true) == SYNC_ADMIT_COLD);
+        TEST_ASSERT(server_sync_admit(TokCount{250}, stitch, own, false) == SYNC_ADMIT_REFUSE);
+        /* the stitch's edge: 303 rows need a context of 304 */
+        TEST_ASSERT(server_sync_admit(TokCount{303}, stitch, own, true) == SYNC_ADMIT_COLD);
+        TEST_ASSERT(server_sync_admit(TokCount{304}, stitch, own, false) == SYNC_ADMIT_FITS);
+        /* the request's own edge: 203 need 204 (below that the front door refuses, and so would the bound check) */
+        TEST_ASSERT(request_exceeds_context(&r, TokCount{203}) && !request_exceeds_context(&r, TokCount{204}));
+        TEST_ASSERT(server_sync_admit(TokCount{204}, stitch, own, true) == SYNC_ADMIT_COLD);
+        TEST_ASSERT(server_sync_admit(TokCount{203}, stitch, own, true) == SYNC_ADMIT_REFUSE);
+        r.prompt.len = 0;
+        request_free(&r);
+    }
+    {
+        const l439_seam f = l439_make(false, true, NULL, 0, z, 1);
+        TEST_ASSERT(f.bank.size() == 202 && f.prompt.size() == 303 && f.m.seamed);
+        const PromptToks own{(int)f.prompt.size()};
+        const TokCount stitch = pulsar_prefix_match_stitched_len(&f.m, own);
+        TEST_ASSERT(stitch == TokCount{203});
+        request r;
+        test_request_init(&r, REQ_CHAT, 16);
+        r.prompt.len = own.raw();
+        TEST_ASSERT(request_exceeds_context(&r, TokCount{250}));   /* the 400 at the front door, never the engine's */
+        TEST_ASSERT(server_sync_admit(TokCount{250}, stitch, own, true) == SYNC_ADMIT_FITS);
+        r.prompt.len = 0;
+        request_free(&r);
+    }
+    /* no seam: the stitch is the prompt, and the bound check says what the front door said */
+    {
+        const l439_seam f = l439_make(false, false, NULL, 0, z, 1);
+        const PromptToks own{(int)f.prompt.size()};
+        TEST_ASSERT(!f.m.seamed && pulsar_prefix_match_stitched_len(&f.m, own) == prompt_rows_cold(own));
+        for (int c = 200; c <= 206; c++)
+            TEST_ASSERT((server_sync_admit(TokCount{c}, prompt_rows_cold(own), own, true) == SYNC_ADMIT_FITS) ==
+                        (prompt_rows_cold(own) < TokCount{c}));
+    }
+    /* the refusal: 400 context_length_exceeded in each protocol's shape, before a stream opens and inside one */
+    static const api_style apis[] = {API_OPENAI, API_ANTHROPIC, API_RESPONSES};
+    for (api_style api : apis) {
+        for (int open = 0; open < 2; open++) {
+            request r;
+            test_request_init(&r, REQ_CHAT, 16);
+            r.api = api;
+            int sv[2];
+            TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+            TEST_ASSERT(send_context_refusal(sv[0], &r, open != 0, 303, 250));
+            shutdown(sv[0], SHUT_WR);
+            char *out = read_socket_text(sv[1]);
+            TEST_ASSERT(strstr(out, "500") == NULL && strstr(out, "server_error") == NULL &&
+                        strstr(out, "api_error") == NULL);
+            TEST_ASSERT(strstr(out, "invalid_request_error") != NULL);
+            TEST_ASSERT(strstr(out, api == API_ANTHROPIC ? "prompt is too long: 303 tokens > 250 maximum"
+                                                         : "Prompt has 303 tokens, but the configured context size "
+                                                           "is 250 tokens") != NULL);
+            if (open) {
+                TEST_ASSERT(strncmp(out, "event: error\n", 13) == 0);
+            } else {
+                TEST_ASSERT(strstr(out, "HTTP/1.1 400") != NULL && strstr(out, "\"n_prompt_tokens\":303") != NULL);
+                if (api != API_ANTHROPIC) TEST_ASSERT(strstr(out, "\"code\":\"context_length_exceeded\"") != NULL);
+                if (api == API_RESPONSES) TEST_ASSERT(strstr(out, "\"param\":\"input\"") != NULL);
+            }
+            free(out);
+            close(sv[0]);
+            close(sv[1]);
+            request_free(&r);
+        }
+    }
+}
+
 static void pulsar_server_unit_tests_run(void) {
     test_l333_kv_units();
     test_l334_p2b_crossings();
@@ -22697,6 +22787,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l434_progress_line_is_live_side();
     test_l434_kv_req_fields_are_consistent();
     test_l439_route_discard_is_live_side();
+    test_l439_context_admits_the_stitch();
     test_mem_floor_is_derived_from_the_watermarks();
     test_guard_budget_reads_live_memavailable();
     test_guard_discrete_reads_the_device();

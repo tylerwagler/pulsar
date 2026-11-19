@@ -453,6 +453,12 @@ Scheduling (`src/server/server_sched.cpp`, `server_jobs.cpp`):
   released.
 - **Refusal.** A request that cannot be placed is refused with a retryable 503.
   It is not run into memory exhaustion.
+- **Context.** A prompt is admitted on its own tokens at the door, and again on
+  the length its sync runs once it is bound: a re-sent reply the bank holds in
+  its sampled spelling can make that stitch longer (L439). If the stitch does not
+  fit but the prompt's own tokens do, the prompt is prefilled cold on its bank;
+  otherwise (and for a live tool continuation) it is refused with the same 400
+  `context_length_exceeded` as at the door.
 
 Batched decode is not bit-reproducible across load. A co-batched step and a
 single-sequence step can differ in the last float bit, which can flip a greedy
@@ -619,7 +625,7 @@ unserved. A request that never bound to a bank has `bank=-` and `-` in every fie
 | `prefill_ms` | prefill start to decode start (after a retried attempt: to the last attempt's decode start) |
 | `ttft_ms` | acceptance to the first generated token |
 | `out` | tokens generated, every attempt |
-| `finish` | the turn's finish label (`stop`, `length`, `tool_calls`, `abandoned`, `error`, ...), or the server's word for an end that is no turn: `failed`, `busy`, `gone`, `conflict` (409), `stream-failed`, `refused-memory` (a 503 mid-prefill), and for a request that never bound `gone-queued`, `refused-context` (400), `refused-bank` (500), `refused-kv` (503) |
+| `finish` | the turn's finish label (`stop`, `length`, `tool_calls`, `abandoned`, `error`, ...), or the server's word for an end that is no turn: `failed`, `busy`, `gone`, `conflict` (409), `stream-failed`, `refused-memory` (a 503 mid-prefill), `refused-context` (400: a bound request whose sync would not fit, L439), and for a request that never bound `gone-queued`, `refused-context` (400), `refused-bank` (500), `refused-kv` (503) |
 | `temp`, `top_p`, `top_k`, `min_p` | after `finish`, and only the ones the request body itself set (`temperature`, `top_p`, `top_k`, `min_p`; the same on every endpoint): the value as it arrived, in `%g` form (`0`, `0.2`, `0.7`, `1`, `1.5`). When the server replaced an out-of-range value, the value that runs follows a `>`: `top_p=0>1`, `top_k=5000>1024`, `top_k=-1>0`, `min_p=1.5>0`. A knob the request left out has no field (not `-`), so a request that set none ends at `finish`, and the server's default applies. These are the request's values: the greedy draw on a tool call's structure is not shown. Fields added later go after these |
 
 ```text
