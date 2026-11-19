@@ -1983,8 +1983,8 @@ typedef struct {
      * the masks do not cross it (the step fails by name). */
     /** Token mask rows, [mask_rows][ceil(pulsar_engine_logits_width / 32)] words; NULL = unconstrained (see above).  Borrowed. */
     const uint32_t *masks;
-    /** Rows in `masks`. */
-    uint32_t mask_rows;
+    /** Rows in `masks`: the round's verify rows (L443). */
+    VerifyRows mask_rows;
     /* assemble out, round_end in */
     /** The round's base token, drawn by assemble; none() when the step drew none (L334 P3: was -1). */
     TokId first_token;

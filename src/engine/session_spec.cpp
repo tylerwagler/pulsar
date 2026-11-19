@@ -1612,7 +1612,7 @@ void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_st
         if (!st->round || st->round->n_batch == 0 || nw == PULSAR_GPU_SAMPLE_ROWS_MAX) continue;
         if (st->temperature > 0.0f && !st->rng) continue;   /* its round_end refuses below */
         w[nw] = {st->round, pulsar_row_index(st->row0), st->temperature, st->top_k, st->top_p, st->min_p, st->greedy_rows,
-                 st->rng ? *st->rng : 0u, st->masks, st->mask_rows};
+                 st->rng ? *st->rng : 0u, st->masks, (uint32_t)st->mask_rows.raw()};   /* raw inside the walk */
         widx[i] = (int)nw++;
     }
     if (nw > 0) walked = spec_walk_rounds(s, w, nw, wv, werr, sizeof werr);
@@ -1642,7 +1642,7 @@ void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_st
             spec_round_undo_begun(s, st->round);
         } else
             na = spec_round_end_walked(s, st->round, st->first_token.raw(), st->temperature, st->top_k, st->top_p,
-                                       st->min_p, st->greedy_rows, st->masks, st->mask_rows, st->rng,
+                                       st->min_p, st->greedy_rows, st->masks, (uint32_t)st->mask_rows.raw(), st->rng,
                                        &wv[widx[i]], pulsar_row_index(st->row0), n /* L263: the step's flat cost is shared n ways */,
                                        NULL, st->accepted, st->accepted_cap.raw(), st->err, sizeof st->err);
         if (na < 0) st->status = PULSAR_SPEC_STEP_FAILED;

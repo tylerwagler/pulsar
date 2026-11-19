@@ -2656,8 +2656,9 @@ static bool gen_draw_req(server *s, gen_state *g, float temp, int top_k, float t
         if (!gen_constrain_mask(s, g, mask->data())) return false;
     }
     /* L344: the budget spent -- this draw is the close token */
-    if (gen_think_close_row(s, g, NULL, 0, 0) == 0) {
-        const uint32_t *f = gen_think_masks(s, g, 0, 1, live ? mask->data() : NULL, live ? 1 : 0);
+    if (gen_think_close_row(s, g, NULL, TokCount{0}, false) == VerifyRow{0}) {
+        const uint32_t *f = gen_think_masks(s, g, VerifyRow{0}, VerifyRows{1}, live ? mask->data() : NULL,
+                                            VerifyRows{live ? 1 : 0});
         if (!f) return false;
         mask->assign(f, f + gen_think_mask_words(s));
         *d = pulsar_row_draw{temp, top_k, top_p, min_p, &g->rng, false, mask->data()};
@@ -2679,26 +2680,28 @@ size_t gen_think_mask_words(const server *s) {
  * accept walk) and a draft that disagrees is rejected as any refused draft is.  Inside the block the grammar gate
  * masks nothing (its THINK phase), so the forced row never meets a grammar row. */
 
-/// @brief The draw at which the budget closes the block, pure: row i follows the round's first i + `off` tokens
-/// (`toks`; off = 1 when toks[0] is a base not yet emitted -- gen_constrain_round's rows).  Rows past a pending
-/// token that closes the block itself are never forced.
+/// @brief The draw at which the budget closes the block, pure: verify row i follows the round's first
+/// pulsar_verify_tokens_before(i) pending tokens (`toks`; the base among them while pending -- gen_constrain_round's
+/// rows).  Rows past a pending token that closes the block itself are never forced.  L443: the budget and the tokens
+/// are counted in tokens, the answer is a verify row; the two meet only through the named crossings.
 /// @param budget        request::think_budget (0: none)
 /// @param open          the attempt's block is open (inside it, not latched closed)
 /// @param think_tokens  reasoning tokens emitted so far
 /// @param close         the family's close token
 /// @param toks          the round's tokens not yet emitted, in order (may be NULL when n is 0)
 /// @param n             how many
-/// @param off           1 when toks[0] is the base (row 0 follows it), else 0
-/// @return the row to force, or -1 (no budget, block closed, or the budget not reached within the round)
-int think_close_row(int budget, bool open, int think_tokens, TokId close, const TokId *toks, int n, int off) {
-    if (budget <= 0 || !open) return -1;
-    const int rows = n - off + 1;
-    for (int i = 0; i < rows; i++) {
-        const int pre = i + off;   /* the round's tokens before row i */
-        if (pre > 0 && toks[pre - 1] == close) return -1;
+/// @param base_pending  toks[0] is the base (row 0 follows it)
+/// @return the row to force, or none() (no budget, block closed, or the budget not reached within the round)
+VerifyRow think_close_row(TokCount budget, bool open, TokCount think_tokens, TokId close, const TokId *toks, TokCount n,
+                          bool base_pending) {
+    if (budget <= TokCount{0} || !open) return VerifyRow::none();
+    const VerifyRows rows = pulsar_verify_rows(n, base_pending);
+    for (VerifyRow i{0}; i < VerifyRow::after(rows); i += VerifyRows{1}) {
+        const TokCount pre = pulsar_verify_tokens_before(i, base_pending);   /* the round's tokens before row i */
+        if (pre > TokCount{0} && toks[pre.raw() - 1] == close) return VerifyRow::none();
         if (think_tokens + pre >= budget) return i;
     }
-    return -1;
+    return VerifyRow::none();
 }
 
 /// @brief think_close_row for a slot's generation.
@@ -2706,13 +2709,13 @@ int think_close_row(int budget, bool open, int think_tokens, TokId close, const 
 /// @param g     the slot's generation
 /// @param toks  the round's tokens not yet emitted, in order (may be NULL when n is 0)
 /// @param n     how many
-/// @param off   1 when toks[0] is the base, else 0
-/// @return the row to force, or -1
-int gen_think_close_row(server *s, const gen_state *g, const TokId *toks, int n, int off) {
+/// @param base_pending  toks[0] is the base
+/// @return the row to force, or none()
+VerifyRow gen_think_close_row(server *s, const gen_state *g, const TokId *toks, TokCount n, bool base_pending) {
     const int budget = g->j->req.think_budget;
-    if (budget <= 0) return -1;
-    return think_close_row(budget, g->thinking.inside && !g->think_closed, g->think_tokens,
-                           pulsar_token_think_close(s->engine), toks, n, off);
+    if (budget <= 0) return VerifyRow::none();
+    return think_close_row(TokCount{budget}, g->thinking.inside && !g->think_closed, TokCount{g->think_tokens},
+                           pulsar_token_think_close(s->engine), toks, n, base_pending);
 }
 
 /// @brief Lay `rows` mask rows of `W` words into `out`: each the grammar's (`gram`, `gram_rows` of them) or
@@ -2724,14 +2727,15 @@ int gen_think_close_row(server *s, const gen_state *g, const TokId *toks, int n,
 /// @param close      the token row `row` allows
 /// @param gram       the grammar's rows (NULL: none)
 /// @param gram_rows  rows in `gram`
-void think_masks_lay(uint32_t *out, size_t W, int row, int rows, TokId close, const uint32_t *gram, int gram_rows) {
+void think_masks_lay(uint32_t *out, size_t W, VerifyRow row, VerifyRows rows, TokId close, const uint32_t *gram,
+                     VerifyRows gram_rows) {
     const uint32_t bit = (uint32_t)close.raw();   /* its bit (the caller bounded it by W * 32) */
-    for (int i = 0; i < rows; i++) {
+    for (int i = 0; i < rows.raw(); i++) {   /* the rows' memory, indexed by row */
         uint32_t *r = out + (size_t)i * W;
-        if (gram && i < gram_rows) memcpy(r, gram + (size_t)i * W, W * sizeof(uint32_t));
+        if (gram && i < gram_rows.raw()) memcpy(r, gram + (size_t)i * W, W * sizeof(uint32_t));
         else memset(r, 0xff, W * sizeof(uint32_t));
     }
-    uint32_t *f = out + (size_t)row * W;
+    uint32_t *f = out + (size_t)row.raw() * W;
     memset(f, 0, W * sizeof(uint32_t));
     f[bit >> 5] = 1u << (bit & 31u);
 }
@@ -2746,7 +2750,8 @@ void think_masks_lay(uint32_t *out, size_t W, int row, int rows, TokId close, co
 /// @param gram       the grammar's rows (NULL: none)
 /// @param gram_rows  rows in `gram`
 /// @return the rows (rows x the engine's mask width); NULL with g->err set when a grammar row is another width
-const uint32_t *gen_think_masks(server *s, gen_state *g, int row, int rows, const uint32_t *gram, int gram_rows) {
+const uint32_t *gen_think_masks(server *s, gen_state *g, VerifyRow row, VerifyRows rows, const uint32_t *gram,
+                                VerifyRows gram_rows) {
     const size_t W = gen_think_mask_words(s);
     const TokId close = pulsar_token_think_close(s->engine);
     /* chat_resolve_thinking refused a budget without one; the mask rows' width is this check's vocab authority
@@ -2760,7 +2765,7 @@ const uint32_t *gen_think_masks(server *s, gen_state *g, int row, int rows, cons
                  (unsigned)gen_constrain_words(s), W);
         return NULL;
     }
-    const size_t need = (size_t)rows * W;
+    const size_t need = (size_t)rows.raw() * W;
     if (g->think_rows_cap < need) {
         g->think_rows = (uint32_t *)server_xrealloc(g->think_rows, need * sizeof(uint32_t));
         g->think_rows_cap = need;
@@ -5029,7 +5034,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             /* L303: a fresh base draw goes through the grammar's mask (a carry was drawn under one) */
             if (gen_constrain_live(g)) {
                 st->masks = gen_constrain_base_mask(s, g);
-                st->mask_rows = 1u;
+                st->mask_rows = VerifyRows{1};
                 if (!st->masks) {
                     g->finish = "error";
                     g->phase = GEN_FINISH;
@@ -5037,9 +5042,9 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 }
             }
             /* L344: the budget spent -- a fresh base is the close token (a carry was drawn under its row's mask) */
-            if (gen_think_close_row(s, g, NULL, 0, 0) == 0) {
-                st->masks = gen_think_masks(s, g, 0, 1, st->masks, st->masks ? 1 : 0);
-                st->mask_rows = 1u;
+            if (gen_think_close_row(s, g, NULL, TokCount{0}, false) == VerifyRow{0}) {
+                st->masks = gen_think_masks(s, g, VerifyRow{0}, VerifyRows{1}, st->masks, VerifyRows{st->masks ? 1 : 0});
+                st->mask_rows = VerifyRows{1};
                 if (!st->masks) {
                     g->finish = "error";
                     g->phase = GEN_FINISH;
@@ -5294,29 +5299,29 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                     toks[nt++] = reqs[(row0s[q] + StepRows{i}).raw()].token;   /* reqs is indexed by step row */
                 st->greedy_rows = gen_spec_greedy_rows(s, g, toks, TokCount{nt}, base_sent[q]);
                 /* L303: each verify row's mask -- the gate walked through the round's tokens and back */
-                const int mr = gen_constrain_round(s, g, toks, TokCount{nt}, base_sent[q], &st->masks);
-                if (mr < 0) {
+                const VerifyRows mr = gen_constrain_round(s, g, toks, TokCount{nt}, base_sent[q], &st->masks);
+                if (mr < VerifyRows{0}) {
                     /* the grammar failed (g->err says how): masks with no rows make the round refuse and undo
                      * itself, so this request fails and the others' rounds go on */
                     static const uint32_t no_rows = 0;
                     st->masks = &no_rows;
-                    st->mask_rows = 0u;
+                    st->mask_rows = VerifyRows{0};
                     constrain_failed[q] = true;
                 } else {
-                    st->mask_rows = (uint32_t)mr;
+                    st->mask_rows = mr;
                     /* L344: the row where the budget runs out draws the close token */
-                    const int off = base_sent[q] ? 0 : 1;
-                    const int fr_row = gen_think_close_row(s, g, toks, nt, off);
-                    if (fr_row >= 0) {
-                        const int rows = nt - off + 1;
-                        const uint32_t *t = gen_think_masks(s, g, fr_row, rows, mr > 0 ? st->masks : NULL, mr);
+                    const bool base_pending = !base_sent[q];
+                    const VerifyRow fr_row = gen_think_close_row(s, g, toks, TokCount{nt}, base_pending);
+                    if (!fr_row.is_none()) {
+                        const VerifyRows rows = pulsar_verify_rows(TokCount{nt}, base_pending);
+                        const uint32_t *t = gen_think_masks(s, g, fr_row, rows, mr > VerifyRows{0} ? st->masks : NULL, mr);
                         if (t) {
                             st->masks = t;
-                            st->mask_rows = (uint32_t)rows;
+                            st->mask_rows = rows;
                         } else {   /* as a grammar failure: rows-less masks make the round undo itself */
                             static const uint32_t no_rows = 0;
                             st->masks = &no_rows;
-                            st->mask_rows = 0u;
+                            st->mask_rows = VerifyRows{0};
                             constrain_failed[q] = true;
                         }
                     }

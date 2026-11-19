@@ -5351,13 +5351,16 @@ bool request_tokenize_rendered(pulsar_engine *e, struct request *r, char *err, s
 void request_free(request *r);
 bool parse_thinking_control_value(const char **p, bool *thinking_enabled, int *budget_tokens);
 /** L344: the draw at which the budget closes the block, pure (server_sched.cpp). */
-int think_close_row(int budget, bool open, int think_tokens, TokId close, const TokId *toks, int n, int off);
+VerifyRow think_close_row(TokCount budget, bool open, TokCount think_tokens, TokId close, const TokId *toks, TokCount n,
+                          bool base_pending);
 /** L344: lay the forced-close mask rows, pure (server_sched.cpp). */
-void think_masks_lay(uint32_t *out, size_t W, int row, int rows, TokId close, const uint32_t *gram, int gram_rows);
+void think_masks_lay(uint32_t *out, size_t W, VerifyRow row, VerifyRows rows, TokId close, const uint32_t *gram,
+                     VerifyRows gram_rows);
 /** L344: the draw at which the thinking budget closes the reasoning block (server_sched.cpp). */
-int gen_think_close_row(server *s, const gen_state *g, const TokId *toks, int n, int off);
+VerifyRow gen_think_close_row(server *s, const gen_state *g, const TokId *toks, TokCount n, bool base_pending);
 /** L344: mask rows forcing the close token at one row (server_sched.cpp). */
-const uint32_t *gen_think_masks(server *s, gen_state *g, int row, int rows, const uint32_t *gram, int gram_rows);
+const uint32_t *gen_think_masks(server *s, gen_state *g, VerifyRow row, VerifyRows rows, const uint32_t *gram,
+                                VerifyRows gram_rows);
 /** L344: uint32_t words in one sampler mask row. */
 size_t gen_think_mask_words(const server *s);
 const char *server_model_id_from_engine(pulsar_engine *engine);
@@ -5982,8 +5985,8 @@ bool gen_constrain_accept(struct server *s, struct gen_state *g, TokId token);
 /// @param n  how many
 /// @param base_emitted  the base was already emitted (toks are the drafts)
 /// @param masks  receives the rows (the gate's buffer)
-/// @return rows written, 0, or -1
-int gen_constrain_round(struct server *s, struct gen_state *g, const TokId *toks, TokCount n, bool base_emitted,
+/// @return rows written, 0, or -1 (a count below 0: the failure)
+VerifyRows gen_constrain_round(struct server *s, struct gen_state *g, const TokId *toks, TokCount n, bool base_emitted,
                         const uint32_t **masks);
 /** L309: how many of a pending chain's `n` drafts (after the not yet emitted `base`) can be accepted under the
  *  grammar: the gate goes through the base and the drafts, as gen_constrain_round's walk does, and back; the first

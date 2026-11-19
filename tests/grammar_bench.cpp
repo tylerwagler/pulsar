@@ -329,7 +329,7 @@ int main(int argc, char **argv) {
                     const int nt = (int)std::min(ids.size() - i, (size_t)K + 1);
                     const uint32_t *masks = NULL;
                     a = now_us();
-                    const int rows = gen_constrain_round(&srv, &g, round_ids.data() + i, TokCount{nt}, false, &masks);
+                    const int rows = gen_constrain_round(&srv, &g, round_ids.data() + i, TokCount{nt}, false, &masks).raw();
                     round.add(now_us() - a);
                     if (rows < 0) {
                         printf("    round failed: %s\n", g.err);

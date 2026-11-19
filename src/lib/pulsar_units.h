@@ -2,7 +2,7 @@
  *  Typed quantities that share a raw integer type but must never mix (L333, L334): KvRows, KvBytes, TokCount,
  *  PromptToks, TokPos, the P2b index spaces, TokId, BankId, TensorBytes, TextBytes, the layer index spaces (L436),
  *  the output path's text offsets (L437), slab, file and model-map offsets (L438), a fused step's headed prompt
- *  runs (L443) */
+ *  runs and a round's verify rows (L443) */
 #ifndef PULSAR_UNITS_H
 #define PULSAR_UNITS_H
 
@@ -1356,6 +1356,50 @@ static_assert(!std::is_constructible<HeadRow, PromptHead>::value && !std::is_con
                   !std::is_constructible<PromptHeads, HeadRows>::value && !std::is_constructible<TokPos, PromptHead>::value &&
                   !std::is_convertible<int, PromptHead>::value && !std::is_convertible<PromptHead, int>::value,
               "a headed prompt run is no head row, step row or position, not even explicitly: pulsar_prompt_head_row");
+
+/* ---- L443: a speculative round's verify rows ----------------------------------------------------------------------
+ * Row i of a round's verify draws the token after the base and drafts 0..i-1 (row K is a full accept's carry): the
+ * space of its mask rows (the grammar's, the thinking budget's forced close), its greedy bits and the walk.  It is
+ * local to the round -- no step row (the round sits at its row0 of the step) and no token count: the server's
+ * look-aheads hold the round's tokens NOT YET EMITTED (`n`, the base among them while it is pending) and asked
+ * "rows = n - off + 1" and "tokens before row i = i + off" in bare ints beside budget token counts.  Those two are
+ * the crossings, by name, here. */
+/** Tag of VerifyRows (never instantiated). */
+struct pulsar_verify_rows_tag;
+/** Rows of one round's verify: a count (K + 1), or a distance (L443). */
+typedef pulsar_unit<pulsar_verify_rows_tag, int> VerifyRows;
+/** Row i of one round's verify (none() = no row: nothing forced, say). */
+typedef pulsar_point<VerifyRows> VerifyRow;
+
+/** A round's verify rows from its tokens not yet emitted: the drafts + 1 (the base's row 0 .. the carry's row K).
+ *  @param pending      the round's tokens not yet emitted (the base, while pending, then the drafts)
+ *  @param base_pending whether the base is among them (not streamed before the forward) */
+/// @return its rows, pending - base_pending + 1
+constexpr VerifyRows pulsar_verify_rows(TokCount pending, bool base_pending) {
+    return VerifyRows{pending.raw() - (base_pending ? 1 : 0) + 1};
+}
+/** The round's not-yet-emitted tokens before verify row `row` (what is emitted when the walk reaches it).
+ *  @param row          the row (fatal on none())
+ *  @param base_pending whether the base is among the round's pending tokens */
+/// @return row + base_pending tokens
+constexpr TokCount pulsar_verify_tokens_before(VerifyRow row, bool base_pending) {
+    return TokCount{row.before().raw() + (base_pending ? 1 : 0)};
+}
+
+static_assert(sizeof(VerifyRow) == sizeof(int) && std::is_trivial<VerifyRow>::value &&
+                  std::is_standard_layout<VerifyRows>::value,
+              "a verify row is as cheap as the int it replaces");
+static_assert(!std::is_constructible<VerifyRow, StepRow>::value && !std::is_constructible<StepRow, VerifyRow>::value &&
+                  !std::is_constructible<VerifyRow, HeadRow>::value && !std::is_constructible<HeadRow, VerifyRow>::value &&
+                  !std::is_constructible<VerifyRows, TokCount>::value && !std::is_constructible<TokCount, VerifyRows>::value &&
+                  !std::is_constructible<VerifyRows, StepRows>::value && !std::is_constructible<TokPos, VerifyRow>::value &&
+                  !std::is_convertible<int, VerifyRow>::value && !std::is_convertible<VerifyRows, int>::value,
+              "a round's verify row is no step / head row and no token count: pulsar_verify_rows / _tokens_before");
+static_assert(pulsar_verify_rows(TokCount{4}, true).raw() == 4 && pulsar_verify_rows(TokCount{3}, false).raw() == 4 &&
+                  pulsar_verify_rows(TokCount{0}, false).raw() == 1 &&
+                  pulsar_verify_tokens_before(VerifyRow{3}, true).raw() == 4 &&
+                  pulsar_verify_tokens_before(VerifyRow{2}, false).raw() == 2,
+              "the base and K drafts are K + 1 rows; row i follows i + base_pending pending tokens");
 /* ==== L443 (end) ================================================================================================= */
 
 #endif

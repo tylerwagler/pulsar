@@ -2548,35 +2548,39 @@ static void test_l344_thinking_budget_parse(void) {
 static void test_l344_thinking_budget_close_row(void) {
     const TokId close{77};
     /* plain: due at the budget, not before; no budget / closed block: never */
-    TEST_ASSERT(think_close_row(100, true, 99, close, NULL, 0, 0) == -1);
-    TEST_ASSERT(think_close_row(100, true, 100, close, NULL, 0, 0) == 0);
-    TEST_ASSERT(think_close_row(100, true, 140, close, NULL, 0, 0) == 0);   /* a retry over budget: at once */
-    TEST_ASSERT(think_close_row(0, true, 5000, close, NULL, 0, 0) == -1);
-    TEST_ASSERT(think_close_row(100, false, 100, close, NULL, 0, 0) == -1);
+    /* L443: the budget's arithmetic in its types; the answers compared as the ints they were */
+    auto tcr = [](int budget, bool open, int think, TokId cl, const TokId *toks, int n, int off) {
+        return think_close_row(TokCount{budget}, open, TokCount{think}, cl, toks, TokCount{n}, off != 0).raw();
+    };
+    TEST_ASSERT(tcr(100, true, 99, close, NULL, 0, 0) == -1);
+    TEST_ASSERT(tcr(100, true, 100, close, NULL, 0, 0) == 0);
+    TEST_ASSERT(tcr(100, true, 140, close, NULL, 0, 0) == 0);   /* a retry over budget: at once */
+    TEST_ASSERT(tcr(0, true, 5000, close, NULL, 0, 0) == -1);
+    TEST_ASSERT(tcr(100, false, 100, close, NULL, 0, 0) == -1);
     /* a round with the base unsent (off 1): toks = base + 3 drafts, rows 0..3 */
     const TokId r1[] = {TokId{5}, TokId{6}, TokId{7}, TokId{8}};
-    TEST_ASSERT(think_close_row(100, true, 96, close, r1, 4, 1) == 3);   /* 96 + base + 3 drafts = 100 at row 3 */
-    TEST_ASSERT(think_close_row(100, true, 98, close, r1, 4, 1) == 1);
-    TEST_ASSERT(think_close_row(100, true, 99, close, r1, 4, 1) == 0);   /* the base is the budget's last */
-    TEST_ASSERT(think_close_row(100, true, 90, close, r1, 4, 1) == -1);  /* not within the round */
+    TEST_ASSERT(tcr(100, true, 96, close, r1, 4, 1) == 3);   /* 96 + base + 3 drafts = 100 at row 3 */
+    TEST_ASSERT(tcr(100, true, 98, close, r1, 4, 1) == 1);
+    TEST_ASSERT(tcr(100, true, 99, close, r1, 4, 1) == 0);   /* the base is the budget's last */
+    TEST_ASSERT(tcr(100, true, 90, close, r1, 4, 1) == -1);  /* not within the round */
     /* the base already streamed (off 0): toks = 3 drafts, rows 0..3 */
-    TEST_ASSERT(think_close_row(100, true, 98, close, r1 + 1, 3, 0) == 2);
-    TEST_ASSERT(think_close_row(100, true, 100, close, r1 + 1, 3, 0) == 0);
+    TEST_ASSERT(tcr(100, true, 98, close, r1 + 1, 3, 0) == 2);
+    TEST_ASSERT(tcr(100, true, 100, close, r1 + 1, 3, 0) == 0);
     /* a draft closes the block before the budget row: nothing forced past it */
     const TokId r2[] = {TokId{5}, TokId{close.raw()}, TokId{7}, TokId{8}};
-    TEST_ASSERT(think_close_row(100, true, 97, close, r2, 4, 1) == -1);
-    TEST_ASSERT(think_close_row(100, true, 99, close, r2, 4, 1) == 0);   /* ...but a row before it still is */
+    TEST_ASSERT(tcr(100, true, 97, close, r2, 4, 1) == -1);
+    TEST_ASSERT(tcr(100, true, 99, close, r2, 4, 1) == 0);   /* ...but a row before it still is */
 
     /* the rows: 3 rows of 4 words, row 1 forced; grammar rows copied where given, the rest unconstrained */
     const size_t W = 4;
     uint32_t out[3 * W], gram[2 * W];
     for (size_t i = 0; i < 2 * W; i++) gram[i] = 0x0f0f0f0fu + (uint32_t)i;
-    think_masks_lay(out, W, 1, 3, close, gram, 2);
+    think_masks_lay(out, W, VerifyRow{1}, VerifyRows{3}, close, gram, VerifyRows{2});
     TEST_ASSERT(!memcmp(out, gram, W * sizeof(uint32_t)));
     const uint32_t cb = (uint32_t)close.raw();   /* the close token's bit */
     for (size_t w = 0; w < W; w++) TEST_ASSERT(out[W + w] == (w == cb / 32u ? 1u << (cb % 32u) : 0u));
     for (size_t w = 0; w < W; w++) TEST_ASSERT(out[2 * W + w] == 0xffffffffu);
-    think_masks_lay(out, W, 0, 1, TokId{0}, NULL, 0);
+    think_masks_lay(out, W, VerifyRow{0}, VerifyRows{1}, TokId{0}, NULL, VerifyRows{0});
     TEST_ASSERT(out[0] == 1u && out[1] == 0u && out[2] == 0u && out[3] == 0u);
 }
 
@@ -2605,8 +2609,8 @@ static void test_l398_gemma_reasoning_tracker(void) {
     static const char *const turn[] = {"<|channel>", "thought", "\n", "Let", " me", " think", "<channel|>", "Hi"};
     int forced_at = -1;
     for (int i = 0; i < (int)(sizeof turn / sizeof turn[0]); i++) {
-        if (forced_at < 0 && think_close_row(j.req.think_budget, g.thinking.inside && !g.think_closed,
-                                             g.think_tokens, close, NULL, 0, 0) == 0)
+        if (forced_at < 0 && think_close_row(TokCount{j.req.think_budget}, g.thinking.inside && !g.think_closed,
+                                             TokCount{g.think_tokens}, close, NULL, TokCount{0}, false).raw() == 0)
             forced_at = i;
         const bool was = g.thinking.inside;
         g.thinking.feed(turn[i], strlen(turn[i]));
@@ -4953,7 +4957,7 @@ static void test_l428_gate_admits_one_call(void) {
                 const TokId round[3] = {last, TokId{(int)'\n'}, TokId{(int)'x'}};
                 const uint32_t *masks = NULL;
                 const uint32_t W = gen_constrain_words(&srv);
-                TEST_ASSERT(gen_constrain_round(&srv, &g, round, TokCount{3}, false, &masks) == 3 && masks);
+                TEST_ASSERT(gen_constrain_round(&srv, &g, round, TokCount{3}, false, &masks).raw() == 3 && masks);
                 auto bit = [&](int row, int t) {
                     return (masks[(size_t)row * W + ((uint32_t)t >> 5)] >> ((uint32_t)t & 31u)) & 1u;
                 };
@@ -8166,7 +8170,7 @@ static void test_l303_round_masks_match_plain(void) {
         std::vector<TokId> toks;
         for (char c : round) toks.push_back(TokId{(uint8_t)c});
         const uint32_t *masks = NULL;
-        const int rows = gen_constrain_round(&srv, &g, toks.data(), TokCount{(int)toks.size()}, false, &masks);
+        const int rows = gen_constrain_round(&srv, &g, toks.data(), TokCount{(int)toks.size()}, false, &masks).raw();
         TEST_ASSERT(rows == (int)toks.size() && masks);
         /* the gate is back where it was: the next draw's mask is the round's base mask */
         std::vector<uint32_t> row(W);
@@ -8224,7 +8228,7 @@ static void test_l309_draft_prefix(void) {
         if (pc.stop_at < 0) {
             std::vector<TokId> rt(toks.begin(), toks.end());
             const uint32_t *masks = NULL;
-            const int rows = gen_constrain_round(&srv, &g, rt.data(), TokCount{(int)rt.size()}, false, &masks);
+            const int rows = gen_constrain_round(&srv, &g, rt.data(), TokCount{(int)rt.size()}, false, &masks).raw();
             TEST_ASSERT(rows == (int)rt.size() && masks);
             int walk = 0;   /* the drafts the masked walk can accept: row i takes draft i */
             while (walk < n && ((masks[(size_t)walk * W + ((uint32_t)rt[(size_t)walk + 1u].raw() >> 5)] >>
@@ -22195,6 +22199,18 @@ static_assert(std::is_same_v<decltype(&pulsar_session_note_prefilled),
                   std::is_same_v<decltype(pulsar_prompt_head_row(PromptHead{}, 0u)), HeadRow> &&
                   pulsar_prompt_head_row(PromptHead{1}, 3u) == HeadRow{4} && PromptHead::none().raw() == -1,
               "a headed prompt run crosses to its head row by name, after the step's decode heads");
+/* L443 (4): a round's verify rows -- think_close_row answers one, the masks are laid by them, the walk reads them */
+static_assert(std::is_same_v<decltype(&think_close_row),
+                             VerifyRow (*)(TokCount, bool, TokCount, TokId, const TokId *, TokCount, bool)> &&
+                  std::is_same_v<decltype(&gen_think_masks),
+                                 const uint32_t *(*)(server *, gen_state *, VerifyRow, VerifyRows, const uint32_t *,
+                                                     VerifyRows)> &&
+                  std::is_same_v<decltype(gen_constrain_round(nullptr, nullptr, nullptr, TokCount{}, false, nullptr)),
+                                 VerifyRows> &&
+                  std::is_same_v<decltype(pulsar_spec_step{}.mask_rows), VerifyRows> &&
+                  !l334_passes<int, VerifyRow> && !l334_passes<TokCount, VerifyRows> && !l334_passes<StepRow, VerifyRow> &&
+                  offsetof(pulsar_spec_step, mask_rows) == 80,
+              "a verify row is its own space; the budget and the round's tokens are counts");
 /* L443: token ids and the walks' counts at the server's emit boundary -- an id is a TokId, a chain's length a TokCount */
 static_assert(std::is_same_v<decltype(&server::gen_emit_token), bool (server::*)(session_slot *, TokId)> &&
                   std::is_same_v<decltype(&server::gen_emit_piece),

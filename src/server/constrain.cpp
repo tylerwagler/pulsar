@@ -1075,15 +1075,14 @@ static bool mask_bit(const uint32_t *row, TokId tok) {
     return (row[t >> 5] >> (t & 31u)) & 1u;
 }
 
-int gen_constrain_round(server *s, gen_state *g, const TokId *toks, TokCount n_toks, bool base_emitted,
+VerifyRows gen_constrain_round(server *s, gen_state *g, const TokId *toks, TokCount n_toks, bool base_emitted,
                         const uint32_t **masks) {
-    const int n = n_toks.raw();   /* L443: typed at the boundary; the round's rows are counted from it inside */
     constrain_gate *gt = g->gate;
     *masks = NULL;
-    if (!gt) return 0;
-    if (gate_injected(g)) return -1;
+    if (!gt) return VerifyRows{0};
+    if (gate_injected(g)) return VerifyRows{-1};
     const int off = base_emitted ? 0 : 1;
-    const int rows = n - off + 1;
+    const int rows = pulsar_verify_rows(n_toks, !base_emitted).raw();   /* L443: the masks' memory, row by row */
     const uint32_t W = gt->words;
     gt->rows.resize((size_t)rows * W);
     /* A token the gate refuses (a draft, or a base the gate cannot take) ends the walk through the round: the rows
@@ -1119,11 +1118,11 @@ int gen_constrain_round(server *s, gen_state *g, const TokId *toks, TokCount n_t
     }
     if (!gate_rollback(gt, fed) || !ok) {
         gate_fail(g, "grammar round");
-        return -1;
+        return VerifyRows{-1};
     }
-    if (!any_live) return 0;
+    if (!any_live) return VerifyRows{0};
     *masks = gt->rows.data();
-    return rows;
+    return VerifyRows{rows};
 }
 
 /* L309 (after Flare's grammar-pruned copy proposals, helios runtime.rs prepare_copy_proposal): a pending chain is
