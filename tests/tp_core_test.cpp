@@ -76,12 +76,12 @@ static void test_slab_layout(void) {
     /* Per-(layer,gate) slots are monotone and fit their region. */
     for (uint32_t l = 0; l < 43u; l++) {
         for (uint32_t g = 0; g < PULSAR_TP_GATES_PER_LAYER; g++) {
-            const uint64_t o = pulsar_tp_slab_out_offset(&s, l, g, vec);
-            const uint64_t i = pulsar_tp_slab_in_offset(&s, l, g, vec);
+            const uint64_t o = pulsar_tp_slab_out_offset(&s, TpSlot{l}, g, vec);
+            const uint64_t i = pulsar_tp_slab_in_offset(&s, TpSlot{l}, g, vec);
             CHECK(o >= s.out_off && o + vec <= s.in_off, "out slot %u/%u out of range", l, g);
             CHECK(i >= s.in_off && i + vec <= s.in_flags_off, "in slot %u/%u out of range", l, g);
-            const uint64_t bo = pulsar_tp_slab_batch_out_offset(&s, l, vec);
-            const uint64_t bi = pulsar_tp_slab_batch_in_offset(&s, l, vec);
+            const uint64_t bo = pulsar_tp_slab_batch_out_offset(&s, TpSlot{l}, vec);
+            const uint64_t bi = pulsar_tp_slab_batch_in_offset(&s, TpSlot{l}, vec);
             CHECK(bo >= s.batch_out_off && bo + 8u * vec <= s.batch_in_off,
                   "batch-out row block %u out of range", l);
             CHECK(bi >= s.batch_in_off && bi + 8u * vec <= s.slab_bytes,
@@ -89,8 +89,8 @@ static void test_slab_layout(void) {
         }
     }
     /* Monotonic in slot index: FFN(after ATTN) sits after it. */
-    CHECK(pulsar_tp_slab_out_offset(&s, 0, PULSAR_TP_GATE_ATTN, vec) <
-          pulsar_tp_slab_out_offset(&s, 0, PULSAR_TP_GATE_FFN, vec),
+    CHECK(pulsar_tp_slab_out_offset(&s, TpSlot{0}, PULSAR_TP_GATE_ATTN, vec) <
+          pulsar_tp_slab_out_offset(&s, TpSlot{0}, PULSAR_TP_GATE_FFN, vec),
           "ATTN slot must precede FFN slot");
 
     /* The gate ring (v26): one slot per gate, never fewer than the row lane's

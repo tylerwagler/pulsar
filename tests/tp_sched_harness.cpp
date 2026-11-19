@@ -71,7 +71,7 @@ int pulsar_tp_sched_decode_token(pulsar_tp_sched *s, char *err, size_t errlen) {
                 return sched_fail(s, err, errlen,
                                   "tp sched: write_partial l=%u g=%u e=%llu",
                                   layer, gate, (unsigned long long)e);
-            if (!pulsar_tp_gate_exchange(s->tp, layer, gate, e))
+            if (!pulsar_tp_gate_exchange(s->tp, TpSlot{layer}, gate, e))
                 return sched_fail(s, err, errlen,
                                   "tp sched: gate_exchange l=%u g=%u e=%llu",
                                   layer, gate, (unsigned long long)e);
@@ -96,7 +96,7 @@ int pulsar_tp_sched_prefill_chunk(pulsar_tp_sched *s, uint64_t seq,
     for (uint32_t layer = 0; layer < n_layer; layer++) {
         const char *ol = o + (uint64_t)layer * vec;
         char *il = i + (uint64_t)layer * vec;
-        if (!pulsar_tp_big_gate_exchange(s->tp, layer, seq, ol, il, vec))
+        if (!pulsar_tp_big_gate_exchange(s->tp, TpSlot{layer}, seq, ol, il, vec))
             return sched_fail(s, err, errlen,
                               "tp sched: big_gate l=%u seq=%llu",
                               layer, (unsigned long long)seq);

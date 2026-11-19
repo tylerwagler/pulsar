@@ -124,16 +124,16 @@ static int run_rank(pulsar_tp *tp, int rank) {
             const uint32_t slot = layer * PULSAR_TP_GATES_PER_LAYER + gate;
             const uint64_t e = slot + 1;
             float *out = (float *)((uint8_t *)base +
-                pulsar_tp_slab_out_offset(&s, layer, gate, VEC_BYTES));
+                pulsar_tp_slab_out_offset(&s, TpSlot{layer}, gate, VEC_BYTES));
             const uint32_t n = (uint32_t)(VEC_BYTES / sizeof(float));
             for (uint32_t i = 0; i < n; i++) out[i] = pat(rank, slot, i);
-            if (!pulsar_tp_gate_exchange(tp, layer, gate, e)) {
+            if (!pulsar_tp_gate_exchange(tp, TpSlot{layer}, gate, e)) {
                 CHECK(0, "rank %d: gate l=%u g=%u e=%llu failed", rank, layer,
                       gate, (unsigned long long)e);
                 break;
             }
             const float *in = (const float *)((uint8_t *)base +
-                pulsar_tp_slab_in_offset(&s, layer, gate, VEC_BYTES));
+                pulsar_tp_slab_in_offset(&s, TpSlot{layer}, gate, VEC_BYTES));
             for (uint32_t i = 0; i < n; i++) {
                 if (in[i] != pat(1 - rank, slot, i)) {
                     CHECK(0, "rank %d: gate l=%u g=%u i=%u in %g want %g",
@@ -145,15 +145,15 @@ static int run_rank(pulsar_tp *tp, int rank) {
     }
     /* batch gate (3 rows) + big gate (256 KiB) spot checks. */
     float *bout = (float *)((uint8_t *)base +
-        pulsar_tp_slab_batch_out_offset(&s, 10, VEC_BYTES));
+        pulsar_tp_slab_batch_out_offset(&s, TpSlot{10}, VEC_BYTES));
     const uint32_t bn = (uint32_t)(3u * VEC_BYTES / sizeof(float));
     for (uint32_t i = 0; i < bn; i++) bout[i] = pat(rank, 1000, i);
-    CHECK(pulsar_tp_batch_gate_exchange(tp, 10, 3, 1) == 1,
+    CHECK(pulsar_tp_batch_gate_exchange(tp, TpSlot{10}, 3, 1) == 1,
           "rank %d: batch_gate failed", rank);
 
     static float big_out[65536], big_in[65536];   /* 256 KiB f32 partials */
     for (uint32_t i = 0; i < 65536; i++) big_out[i] = pat(rank, 1001, i);
-    CHECK(pulsar_tp_big_gate_exchange(tp, 0, 1, big_out, big_in,
+    CHECK(pulsar_tp_big_gate_exchange(tp, TpSlot{0}, 1, big_out, big_in,
                                       sizeof(big_out)) == 1,
           "rank %d: big_gate failed", rank);
     for (uint32_t i = 0; i < 65536; i += 4096) {

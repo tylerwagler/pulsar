@@ -39,6 +39,8 @@ enum { PULSAR_TP_GATE_ATTN = 0, PULSAR_TP_GATE_FFN = 1, PULSAR_TP_GATES_PER_LAYE
  *  where its peer ran a per-layer MoE gate is caught as a desync by name rather
  *  than passing because the (layer, seq) pair happened to coincide. */
 #define PULSAR_TP_NON_LAYER_TAG UINT32_C(0xFFF0)
+/** L436: the same tag as the exchange slot the transport's calls take. */
+#define PULSAR_TP_NON_LAYER_SLOT (TpSlot{PULSAR_TP_NON_LAYER_TAG})
 /// Most rows one batch/row-lane exchange carries; sizes the slab's per-layer batch regions.
 #define PULSAR_TP_BATCH_MAX_ROWS 8u
 
@@ -213,26 +215,26 @@ uint64_t pulsar_tp_slab_bytes(uint32_t n_layer, uint32_t n_embd);
 /// @param gate      PULSAR_TP_GATE_ATTN or PULSAR_TP_GATE_FFN
 /// @param vec_bytes bytes per vector
 /// @return the offset from the slab base
-uint64_t pulsar_tp_slab_out_offset(const pulsar_tp_slab *s, uint32_t layer, uint32_t gate, uint64_t vec_bytes);
+uint64_t pulsar_tp_slab_out_offset(const pulsar_tp_slab *s, TpSlot layer, uint32_t gate, uint64_t vec_bytes);
 /// Byte offset of in-vector slot [layer, gate].
 /// @param s         the slab layout
 /// @param layer     layer index
 /// @param gate      PULSAR_TP_GATE_ATTN or PULSAR_TP_GATE_FFN
 /// @param vec_bytes bytes per vector
 /// @return the offset from the slab base
-uint64_t pulsar_tp_slab_in_offset(const pulsar_tp_slab *s, uint32_t layer, uint32_t gate, uint64_t vec_bytes);
+uint64_t pulsar_tp_slab_in_offset(const pulsar_tp_slab *s, TpSlot layer, uint32_t gate, uint64_t vec_bytes);
 /// Byte offset of `layer`'s batch-out block (PULSAR_TP_BATCH_MAX_ROWS vectors).
 /// @param s         the slab layout
 /// @param layer     layer index
 /// @param vec_bytes bytes per vector
 /// @return the offset from the slab base
-uint64_t pulsar_tp_slab_batch_out_offset(const pulsar_tp_slab *s, uint32_t layer, uint64_t vec_bytes);
+uint64_t pulsar_tp_slab_batch_out_offset(const pulsar_tp_slab *s, TpSlot layer, uint64_t vec_bytes);
 /// Byte offset of `layer`'s batch-in block (PULSAR_TP_BATCH_MAX_ROWS vectors).
 /// @param s         the slab layout
 /// @param layer     layer index
 /// @param vec_bytes bytes per vector
 /// @return the offset from the slab base
-uint64_t pulsar_tp_slab_batch_in_offset(const pulsar_tp_slab *s, uint32_t layer, uint64_t vec_bytes);
+uint64_t pulsar_tp_slab_batch_in_offset(const pulsar_tp_slab *s, TpSlot layer, uint64_t vec_bytes);
 
 /* Identity acceptance: 0 when compat, -1 with a message in err.  The shape
  * and gate schedule must match; ctx_size is exchanged but NOT compared
@@ -375,7 +377,7 @@ int pulsar_tp_create_mesh(pulsar_tp **out, const pulsar_tp_options *opt,
 /// @param in    caller scratch of `bytes` (clobbered)
 /// @param bytes payload size in bytes
 /// @return 1 on success, 0 on failure
-int pulsar_tp_allreduce_sum(pulsar_tp *tp, uint32_t layer, uint64_t seq,
+int pulsar_tp_allreduce_sum(pulsar_tp *tp, TpSlot layer, uint64_t seq,
                             void *out, const void *in, uint64_t bytes);
 
 /* n-way ROW ALL-GATHER (slice 4d for the vocab, 4g for the attention `low`).
@@ -413,7 +415,7 @@ int pulsar_tp_allreduce_sum(pulsar_tp *tp, uint32_t layer, uint64_t seq,
 /// @param n_units   units per row, partitioned over the group
 /// @param unit      floats per unit
 /// @return 1 on success, 0 on failure
-int pulsar_tp_allgather_rows(pulsar_tp *tp, uint32_t layer, uint64_t seq,
+int pulsar_tp_allgather_rows(pulsar_tp *tp, TpSlot layer, uint64_t seq,
                              float *full_out, const float *own_slice,
                              float *scratch, uint32_t n_rows,
                              uint32_t n_units, uint32_t unit);
@@ -452,12 +454,12 @@ uint64_t pulsar_tp_vec_bytes(const pulsar_tp *tp);   /* n_embd * 4 (f32 partials
 /// @param tp    the transport
 /// @param layer layer index (< n_layer)
 /// @return the layer's batch-out block in the slab, or NULL
-void *pulsar_tp_slab_batch_out(const pulsar_tp *tp, uint32_t layer);
+void *pulsar_tp_slab_batch_out(const pulsar_tp *tp, TpSlot layer);
 /// The slab's batch-in block for `layer`.
 /// @param tp    the transport
 /// @param layer layer index (< n_layer)
 /// @return the layer's batch-in block in the slab, or NULL
-void *pulsar_tp_slab_batch_in(const pulsar_tp *tp, uint32_t layer);
+void *pulsar_tp_slab_batch_in(const pulsar_tp *tp, TpSlot layer);
 
 /* Is [ptr, ptr+bytes) wholly inside the registered slab?  This is the RDMA big
  * gate's DIRECT test: when both payloads answer yes they are already registered
@@ -492,7 +494,7 @@ int pulsar_tp_attach_slab(pulsar_tp *tp, void *base, char *err, size_t errlen);
 /// @param gate  PULSAR_TP_GATE_ATTN or PULSAR_TP_GATE_FFN
 /// @param seq   the exchange counter
 /// @return 1 on success, 0 on failure
-int pulsar_tp_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate,
+int pulsar_tp_gate_exchange(pulsar_tp *tp, TpSlot layer, uint32_t gate,
                             uint64_t seq);
 
 /* The ROW LANE (L241 4g-2): the pair's decode and verify exchanges, fully
@@ -668,7 +670,7 @@ uint64_t pulsar_tp_bulk_rail_split(uint64_t bytes);
 /// @param rows  rows to exchange (<= PULSAR_TP_BATCH_MAX_ROWS)
 /// @param seq   exchange sequence, identical on both ranks
 /// @return 1 on success, 0 on failure
-int pulsar_tp_batch_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t rows,
+int pulsar_tp_batch_gate_exchange(pulsar_tp *tp, TpSlot layer, uint32_t rows,
                                   uint64_t seq);
 
 /* Prefill batch gate: arbitrary-size symmetric payload exchange between the
@@ -681,7 +683,7 @@ int pulsar_tp_batch_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t rows,
 /// @param in    receives the peer's payload
 /// @param bytes payload size in bytes
 /// @return 1 on success, 0 on failure
-int pulsar_tp_big_gate_exchange(pulsar_tp *tp, uint32_t layer, uint64_t seq,
+int pulsar_tp_big_gate_exchange(pulsar_tp *tp, TpSlot layer, uint64_t seq,
                                 const void *out, void *in, uint64_t bytes);
 
 /* Lockstep mirroring (leader side) and worker loop primitives.

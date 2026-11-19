@@ -86,7 +86,7 @@ static int hook_write(void *ud_, uint32_t layer, uint32_t gate, uint64_t e) {
     hook_ctx *c = (hook_ctx *)ud_;
     const uint32_t slot = layer * PULSAR_TP_GATES_PER_LAYER + gate;
     float *out = (float *)(c->slab +
-        pulsar_tp_slab_out_offset(&c->layout, layer, gate, c->vec));
+        pulsar_tp_slab_out_offset(&c->layout, TpSlot{layer}, gate, c->vec));
     CHECK(slot == e_slot(e), "rank %d write slot %u != e_slot(%llu) %u",
           c->rank, slot, (unsigned long long)e, e_slot(e));
     const uint32_t n = (uint32_t)(c->vec / sizeof(float));
@@ -98,7 +98,7 @@ static int hook_read(void *ud_, uint32_t layer, uint32_t gate, uint64_t e) {
     hook_ctx *c = (hook_ctx *)ud_;
     const uint32_t slot = layer * PULSAR_TP_GATES_PER_LAYER + gate;
     const float *in = (const float *)(c->slab +
-        pulsar_tp_slab_in_offset(&c->layout, layer, gate, c->vec));
+        pulsar_tp_slab_in_offset(&c->layout, TpSlot{layer}, gate, c->vec));
     const uint32_t n = (uint32_t)(c->vec / sizeof(float));
     for (uint32_t i = 0; i < n; i++) {
         const float want = pat(1 - c->rank, slot, i);
@@ -118,11 +118,11 @@ static void batch_phase(pulsar_tp *tp, hook_ctx *c) {
     const uint64_t bytes = (uint64_t)rows * c->vec;
     const uint32_t n = (uint32_t)(bytes / sizeof(float));
     float *out = (float *)(c->slab +
-        pulsar_tp_slab_batch_out_offset(&c->layout, layer, c->vec));
+        pulsar_tp_slab_batch_out_offset(&c->layout, TpSlot{layer}, c->vec));
     float *in = (float *)(c->slab +
-        pulsar_tp_slab_batch_in_offset(&c->layout, layer, c->vec));
+        pulsar_tp_slab_batch_in_offset(&c->layout, TpSlot{layer}, c->vec));
     for (uint32_t i = 0; i < n; i++) out[i] = pat(c->rank, 10000u, i);
-    CHECK(pulsar_tp_batch_gate_exchange(tp, layer, rows, 1) == 1,
+    CHECK(pulsar_tp_batch_gate_exchange(tp, TpSlot{layer}, rows, 1) == 1,
           "rank %d batch l=%u rows=%u failed", c->rank, layer, rows);
     for (uint32_t i = 0; i < n; i++) {
         const float want = pat(1 - c->rank, 10000u, i);
@@ -144,7 +144,7 @@ static void big_phase(pulsar_tp *tp, hook_ctx *c) {
     CHECK(out && in, "rank %d big alloc failed", c->rank);
     if (!out || !in) return;
     for (uint32_t i = 0; i < n; i++) out[i] = pat(c->rank, 777u, i);
-    CHECK(pulsar_tp_big_gate_exchange(tp, 0, 1, out, in, bytes) == 1,
+    CHECK(pulsar_tp_big_gate_exchange(tp, TpSlot{0}, 1, out, in, bytes) == 1,
           "rank %d big 1MiB failed", c->rank);
     for (uint32_t i = 0; i < n; i++) {
         if (i % 4096 == 0 && in[i] != pat(1 - c->rank, 777u, i)) {
@@ -284,20 +284,20 @@ static void layout_check(uint32_t n_embd) {
     pulsar_tp_slab_layout_init(N_LAYER, n_embd, &s);
     const uint64_t vec = (uint64_t)n_embd * sizeof(float);
     for (uint32_t layer = 0; layer < N_LAYER; layer++) {
-        CHECK(pulsar_tp_slab_out_offset(&s, layer, 1, vec) ==
-                  pulsar_tp_slab_out_offset(&s, layer, 0, vec) + vec,
+        CHECK(pulsar_tp_slab_out_offset(&s, TpSlot{layer}, 1, vec) ==
+                  pulsar_tp_slab_out_offset(&s, TpSlot{layer}, 0, vec) + vec,
               "embd=%u out stride l=%u", n_embd, layer);
-        CHECK(pulsar_tp_slab_in_offset(&s, layer, 1, vec) ==
-                  pulsar_tp_slab_in_offset(&s, layer, 0, vec) + vec,
+        CHECK(pulsar_tp_slab_in_offset(&s, TpSlot{layer}, 1, vec) ==
+                  pulsar_tp_slab_in_offset(&s, TpSlot{layer}, 0, vec) + vec,
               "embd=%u in stride l=%u", n_embd, layer);
     }
     for (uint32_t layer = 0; layer + 1 < N_LAYER; layer++) {
-        CHECK(pulsar_tp_slab_batch_out_offset(&s, layer + 1, vec) ==
-                  pulsar_tp_slab_batch_out_offset(&s, layer, vec) +
+        CHECK(pulsar_tp_slab_batch_out_offset(&s, TpSlot{layer + 1}, vec) ==
+                  pulsar_tp_slab_batch_out_offset(&s, TpSlot{layer}, vec) +
                       (uint64_t)PULSAR_TP_BATCH_MAX_ROWS * vec,
               "embd=%u batch stride l=%u", n_embd, layer);
-        CHECK(pulsar_tp_slab_batch_in_offset(&s, layer + 1, vec) ==
-                  pulsar_tp_slab_batch_in_offset(&s, layer, vec) +
+        CHECK(pulsar_tp_slab_batch_in_offset(&s, TpSlot{layer + 1}, vec) ==
+                  pulsar_tp_slab_batch_in_offset(&s, TpSlot{layer}, vec) +
                       (uint64_t)PULSAR_TP_BATCH_MAX_ROWS * vec,
               "embd=%u batch_in stride l=%u", n_embd, layer);
     }

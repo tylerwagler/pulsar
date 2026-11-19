@@ -575,8 +575,8 @@ static_assert(sizeof(TextBytes) == sizeof(uint64_t) && std::is_trivial<TextBytes
  *               one module beside the one table that produces it, and no two kinds' ordinals meet.
  *   VisLayer    a block of a vision tower (the shared ViT encoder, Qwen's and DeepSeek's towers): its own depth, its
  *               own weights, beside a decoder's trunk layers in the same family files.
- *   TpSlot      a layer's exchange slot in the tensor-parallel slab (pulsar_tp.h's `layer`, the frame's field on the
- *               wire): the engine's side of the transport boundary, which keeps the raw number.
+ *   TpSlot      a layer's exchange slot in the tensor-parallel slab: what pulsar_tp.h's calls take, down to the
+ *               gate frame's 16-bit field, where it leaves as the raw number the wire always carried.
  *
  * An index, not a quantity: no sum of two, no scaling.  It orders (a loop's bound, "the next layer"), steps by one
  * (++, next()), and is asked against a COUNT by name (below(n): the bound is the owner's -- the plan's n_layer, the

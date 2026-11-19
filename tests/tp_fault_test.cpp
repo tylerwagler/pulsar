@@ -120,7 +120,7 @@ static void run_worker_mode3(pulsar_tp *tp) {
     CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)) == 1, "C: worker recv step 1: %s", err);
     pulsar_tp_command_free(&cmd);
     fill_pat(out, 1, 1, MODE3_GATE_BYTES / 4);
-    CHECK(pulsar_tp_big_gate_exchange(tp, 0, 1, out, in, MODE3_GATE_BYTES) == 1, "C: worker step-1 gate");
+    CHECK(pulsar_tp_big_gate_exchange(tp, TpSlot{0}, 1, out, in, MODE3_GATE_BYTES) == 1, "C: worker step-1 gate");
     verify_pat(in, 0, 1, MODE3_GATE_BYTES / 4);
     CHECK(pulsar_tp_send_command_ack_digest(tp, MODE3_SID, 0, mode3_digest()) == 1, "C: worker ack 1");
     /* Step 2: the leader refuses it before its gate; ours must fail on the abort, promptly. */
@@ -128,7 +128,7 @@ static void run_worker_mode3(pulsar_tp *tp) {
     CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)) == 1, "C: worker recv step 2: %s", err);
     pulsar_tp_command_free(&cmd);
     const double t0 = tp_now_sec();
-    const int rc = pulsar_tp_big_gate_exchange(tp, 0, 2, out, in, MODE3_GATE_BYTES);
+    const int rc = pulsar_tp_big_gate_exchange(tp, TpSlot{0}, 2, out, in, MODE3_GATE_BYTES);
     const double dt = tp_now_sec() - t0;
     CHECK(rc == 0, "C: the worker's gate succeeded against a leader that refused the step");
     CHECK(dt < 10.0, "C: the worker's gate took %.1f s to fail (the leader never aborted: the "
@@ -170,10 +170,10 @@ static void run_worker(int port, int mode) {
     /* Two healthy exchanges to settle the pairing (verified both ways). */
     for (uint32_t layer = 0; layer < 2; layer++) {
         const uint32_t slot = layer * PULSAR_TP_GATES_PER_LAYER;
-        float *out = (float *)(slab + pulsar_tp_slab_out_offset(&s, layer, 0, VEC_BYTES));
-        const float *in = (const float *)(slab + pulsar_tp_slab_in_offset(&s, layer, 0, VEC_BYTES));
+        float *out = (float *)(slab + pulsar_tp_slab_out_offset(&s, TpSlot{layer}, 0, VEC_BYTES));
+        const float *in = (const float *)(slab + pulsar_tp_slab_in_offset(&s, TpSlot{layer}, 0, VEC_BYTES));
         fill_pat(out, 1, slot, n);
-        CHECK(pulsar_tp_gate_exchange(tp, layer, 0, (uint64_t)slot + 1) == 1,
+        CHECK(pulsar_tp_gate_exchange(tp, TpSlot{layer}, 0, (uint64_t)slot + 1) == 1,
               "worker gate l=%u", layer);
         verify_pat(in, 0, slot, n); /* peer's partial landed */
     }
@@ -208,7 +208,7 @@ static void run_leader(int port, int mode) {
         static float out[MODE3_GATE_BYTES / 4], in[MODE3_GATE_BYTES / 4];
         CHECK(pulsar_tp_send_eval(tp, MODE3_SID, 1, TokId{11}) == 1, "C: leader send_eval 1");
         fill_pat(out, 0, 1, MODE3_GATE_BYTES / 4);
-        CHECK(pulsar_tp_big_gate_exchange(tp, 0, 1, out, in, MODE3_GATE_BYTES) == 1, "C: leader step-1 gate");
+        CHECK(pulsar_tp_big_gate_exchange(tp, TpSlot{0}, 1, out, in, MODE3_GATE_BYTES) == 1, "C: leader step-1 gate");
         verify_pat(in, 1, 1, MODE3_GATE_BYTES / 4);
         CHECK(pulsar_tp_defer_command_ack_digest(tp, MODE3_SID, "eval at position 1", mode3_digest()) == 1,
               "C: leader defer 1");
@@ -252,10 +252,10 @@ static void run_leader(int port, int mode) {
     /* Two healthy exchanges (mirrors the worker), then pump until death. */
     for (uint32_t layer = 0; layer < 2; layer++) {
         const uint32_t slot = layer * PULSAR_TP_GATES_PER_LAYER;
-        float *out = (float *)(slab + pulsar_tp_slab_out_offset(&s, layer, 0, VEC_BYTES));
-        const float *in = (const float *)(slab + pulsar_tp_slab_in_offset(&s, layer, 0, VEC_BYTES));
+        float *out = (float *)(slab + pulsar_tp_slab_out_offset(&s, TpSlot{layer}, 0, VEC_BYTES));
+        const float *in = (const float *)(slab + pulsar_tp_slab_in_offset(&s, TpSlot{layer}, 0, VEC_BYTES));
         fill_pat(out, 0, slot, n);
-        CHECK(pulsar_tp_gate_exchange(tp, layer, 0, (uint64_t)slot + 1) == 1,
+        CHECK(pulsar_tp_gate_exchange(tp, TpSlot{layer}, 0, (uint64_t)slot + 1) == 1,
               "leader gate l=%u", layer);
         verify_pat(in, 1, slot, n); /* peer's partial landed */
     }
@@ -267,9 +267,9 @@ static void run_leader(int port, int mode) {
     for (uint32_t layer = 2; layer < N_LAYER && calls < 20; layer++) {
         for (uint32_t gate = 0; gate < PULSAR_TP_GATES_PER_LAYER; gate++) {
             const uint32_t slot = layer * PULSAR_TP_GATES_PER_LAYER + gate;
-            float *out = (float *)(slab + pulsar_tp_slab_out_offset(&s, layer, gate, VEC_BYTES));
+            float *out = (float *)(slab + pulsar_tp_slab_out_offset(&s, TpSlot{layer}, gate, VEC_BYTES));
             fill_pat(out, 0, slot, n);
-            const int rc = pulsar_tp_gate_exchange(tp, layer, gate, (uint64_t)slot + 1);
+            const int rc = pulsar_tp_gate_exchange(tp, TpSlot{layer}, gate, (uint64_t)slot + 1);
             if (rc == 0) saw_dead = 1;
             calls++;
         }
@@ -280,7 +280,7 @@ static void run_leader(int port, int mode) {
 
     /* The separate data socket is dead too: a 1 MiB big gate must return 0. */
     static float big_out[262144], big_in[262144];
-    CHECK(pulsar_tp_big_gate_exchange(tp, 0, 1, big_out, big_in,
+    CHECK(pulsar_tp_big_gate_exchange(tp, TpSlot{0}, 1, big_out, big_in,
                                       sizeof(big_out)) == 0,
           "big_gate on dead data socket did not fail");
 
