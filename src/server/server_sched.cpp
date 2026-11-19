@@ -96,8 +96,8 @@ int server::job_needed_ctx(const job *j) const {
                    (int64_t)(j->req.max_tokens > 0 ? j->req.max_tokens
                                                    : s->default_tokens) +
                    64;
-    const int ref_ctx = s->pool_banks > 0 ? s->pool_ctx_size
-                                          : s->slots[0].ctx_size;
+    const int ref_ctx = s->pool_banks.any() ? s->pool_ctx_size
+                                          : s->slots[SlotIdx{0u}].ctx_size;
     if (need > ref_ctx) need = ref_ctx;
     if (need < 1) need = 1;
     return (int)need;
@@ -116,11 +116,11 @@ int server::job_needed_ctx(const job *j) const {
 /// @param est_bytes the price admission charged, bytes
 /// @param actual_bytes the bytes the allocator committed
 /// @return actual_bytes, or 0 on a mismatch (or 0 actual)
-KvBytes server_reconciled_session_cost(int slot_idx, int ctx, KvBytes est_bytes, KvBytes actual_bytes) {
+KvBytes server_reconciled_session_cost(SlotIdx slot_idx, int ctx, KvBytes est_bytes, KvBytes actual_bytes) {
     const double gib = 1024.0 * 1024.0 * 1024.0;
     server_log(PULSAR_LOG_DEFAULT,
-               "pulsar-server: slot %d session cost: priced=%.2f GiB actual=%.2f GiB (ctx=%d)",
-               slot_idx, (double)est_bytes.raw() / gib, (double)actual_bytes.raw() / gib, ctx);
+               "pulsar-server: slot %u session cost: priced=%.2f GiB actual=%.2f GiB (ctx=%d)",
+               slot_idx.raw(), (double)est_bytes.raw() / gib, (double)actual_bytes.raw() / gib, ctx);
     if (actual_bytes == KvBytes{} || est_bytes != actual_bytes) {
         server_log(PULSAR_LOG_WARNING,
                    "pulsar-server: SESSION COST MISMATCH: priced %llu bytes, allocated %llu "
@@ -217,8 +217,8 @@ KvBytes server::guard_budget() {
 
 bool server::bank_switch(BankId bank, spilled_history *was) {
     auto *s = this;
-    if (s->pool_banks <= 0) return true;          /* classic mode */
-    if (!bank.below((uint32_t)s->pool_banks)) return true;
+    if (!s->pool_banks.any()) return true;          /* classic mode */
+    if (!s->pool_banks.covers(bank)) return true;
     session_slot *const bs = s->slot_of_bank(bank);
     if (bs->preempted) return false;   /* L314: its physical is freed until its readmission reloads it */
     if (bank == s->live_bank && !bs->spilled) return true; /* already installed */
@@ -260,7 +260,7 @@ TokPos server::slot_frontier_pos(const session_slot *sl) const {
      * /metrics and the live bindings' match. */
     if (sl->gen && sl->gen->batch_active) return sl->gen->batch_feed_pos;
     if (!s->sess) return TokPos{0}; /* host-only server (unit tests): no session to read */
-    if (s->pool_banks > 0) return server_bank_pos(s->sess, sl->bank);
+    if (s->pool_banks.any()) return server_bank_pos(s->sess, sl->bank);
     return pulsar_session_pos(s->sess);
 }
 
@@ -306,7 +306,7 @@ TokPos server::slot_frontier_pos(const session_slot *sl) const {
 slot_tokens server::slot_history(const session_slot *sl) const {
     const auto *s = this;
     slot_tokens h = {NULL, NULL};
-    if (!sl || !sl->provisioned || !s->sess || s->pool_banks <= 0) return h;
+    if (!sl || !sl->provisioned || !s->sess || !s->pool_banks.any()) return h;
     const bool batch = server_slot_batch_decoding(sl);
     h.base = pulsar_session_bank_tokens_as(s->sess, sl->bank,
                                            batch ? PULSAR_BANK_VIEW_SAVED : PULSAR_BANK_VIEW_CURRENT);
@@ -348,7 +348,7 @@ void server::slot_prefix_match(const session_slot *sl, const pulsar_tokens *prom
     out->prompt_cut = PromptToks{0};
     out->seamed = false;
     if (!sl || !sl->provisioned) return;
-    if (s->pool_banks > 0) {
+    if (s->pool_banks.any()) {
         /* L380: the bank's history as every reader of the slot takes it; for a decoder in the batch its history at
          * entry (slot_history) */
         const pulsar_tokens *t = s->slot_history(sl).base;
@@ -394,15 +394,16 @@ static bool server_bank_floor_refuses(int n_provisioned, bool pages_resident, co
  * high-water bytes), lowest index on a tie, so a tight box reuses what it has
  * already paged in before touching a bank that never was.  resident[i] is
  * read only where provisioned[i] is false.  -1 when every bank is provisioned. */
-/// @param provisioned per bank: provisioned already
-/// @param resident per bank: its resident pages in bytes (read only where not provisioned)
-/// @param n banks
-/// @return the bank index, or -1
-static int server_pick_free_bank(const bool *provisioned, const KvBytes *resident, int n) {
-    int best = -1;
-    for (int i = 0; i < n; i++) {
+/// @param provisioned per slot (slot i holds bank i): provisioned already
+/// @param resident per slot: its bank's resident pages in bytes (read only where not provisioned)
+/// @param n slots
+/// @return the slot, or none()
+static SlotIdx server_pick_free_bank(const slot_flags &provisioned, const pulsar_indexed<KvBytes, SlotIdx,
+                                     PULSAR_SESSION_POOL_CAP> &resident, BankCount n) {
+    SlotIdx best = SlotIdx::none();
+    for (SlotIdx i : n.slots()) {
         if (provisioned[i]) continue;
-        if (best < 0 || resident[i] > resident[best]) best = i;
+        if (best.is_none() || resident[i] > resident[best]) best = i;
     }
     return best;
 }
@@ -458,7 +459,7 @@ server_mem_reading server::mem_reading() const {
 }
 
 bool server::ledger_open_pool(KvBytes budget, KvBytes admitted, uint32_t priced_banks, char *err, size_t errlen) {
-    const uint32_t chat = pool_banks > 0 ? (uint32_t)pool_banks : 0u;
+    const uint32_t chat = pool_banks.any() ? (uint32_t)pool_banks.raw() : 0u;   /* the ledger's uint32 bank count */
     const KvBytes reserved = server_bank_charges(admitted, priced_banks, chat, priced_banks);
     if (!server_ledger_self_check(admitted, priced_banks, chat, reserved, budget, err, errlen)) return false;
     kv_budget_bytes = budget;
@@ -507,27 +508,28 @@ session_slot *server::provision_bank(provision_refusal *refusal) {
      * pinning) — the uniform loop from 0 replaced the boot-phantom /
      * empty-reuse / soft-evict special-case family (2026-08-10). */
     int n_provisioned = 0;
-    bool provisioned[PULSAR_SESSION_POOL_CAP];
-    KvBytes resident[PULSAR_SESSION_POOL_CAP];
-    for (int i = 0; i < s->pool_banks; i++) {
+    slot_flags provisioned;
+    pulsar_indexed<KvBytes, SlotIdx, PULSAR_SESSION_POOL_CAP> resident;
+    for (SlotIdx i : s->pool_banks.slots()) {   /* slot i holds bank i: the pool's banks are its slots */
         provisioned[i] = s->slots[i].provisioned;
         resident[i] = provisioned[i] ? KvBytes{}
                     : pulsar_session_bank_touched_kv_bytes(s->sess, s->slots[i].bank);
         if (provisioned[i]) n_provisioned++;
     }
-    const int idx = server_pick_free_bank(provisioned, resident, s->pool_banks);
-    if (idx < 0) { *refusal = PROVISION_REFUSED_POOL_FULL; return NULL; }
+    const SlotIdx idx = server_pick_free_bank(provisioned, resident, s->pool_banks);
+    if (idx.is_none()) { *refusal = PROVISION_REFUSED_POOL_FULL; return NULL; }
+    const BankId bank = s->bank_of_slot(idx);
     /* L391: the session-cost ledger admits the bank's charge beside what is committed.  The startup self-check
      * (server_ledger_self_check) proved every chat bank fits with all the others live, so a refusal here is the
      * ledger out of step with its price -- refused by name (ledger_full on /metrics; an eviction releases a charge)
      * rather than run past the budget. */
-    if (!s->ledger_admits_bank(BankId{idx} /* slot i holds bank i */)) {
+    if (!s->ledger_admits_bank(bank)) {
         unsigned skipped = 0;
         if (warn_limiter_due(&s->ledger_full_warn, server_now_sec(), PULSAR_SERVER_MEM_FLOOR_WARN_SEC, &skipped))
             server_log(PULSAR_LOG_WARNING,
                        "pulsar-server: bank provisioning refused: the session-cost ledger does not admit bank %d's "
                        "charge %.2f GiB (committed %.2f of %.2f GiB; job queued; %u refusals in the last %.0f s not "
-                       "logged)", idx, (double)s->bank_charge(BankId{idx}).raw() / (1024.0 * 1024.0 * 1024.0),
+                       "logged)", bank.raw(), (double)s->bank_charge(bank).raw() / (1024.0 * 1024.0 * 1024.0),
                        (double)s->kv_committed_bytes.raw() / (1024.0 * 1024.0 * 1024.0),
                        (double)s->kv_budget_bytes.raw() / (1024.0 * 1024.0 * 1024.0), skipped,
                        PULSAR_SERVER_MEM_FLOOR_WARN_SEC);
@@ -576,17 +578,17 @@ session_slot *server::provision_bank(provision_refusal *refusal) {
      * still names another bank; resetting and saving "bank idx" here would
      * clobber THAT bank's carry with an empty one.  Refuse the provision and
      * let worker_try_bind fail the job (eviction cannot relieve this). */
-    if (!s->bank_switch(BankId{idx} /* slot i holds bank i */)) {
+    if (!s->bank_switch(bank)) {
         server_log(PULSAR_LOG_WARNING,
                    "pulsar-server: bank %d install failed (state restore refused); "
-                   "provisioning refused, job fails", idx);
+                   "provisioning refused, job fails", bank.raw());
         *refusal = PROVISION_REFUSED_CREATE_FAIL;
         return NULL;
     }
     pulsar_session_invalidate(pool);
-    pulsar_session_bank_state_save(pool, BankId{idx} /* slot i holds bank i */);
+    pulsar_session_bank_state_save(pool, bank);
     sl->provisioned = true;
-    sl->bank = BankId{idx};   /* slot i holds bank i */
+    sl->bank = bank;
     sl->committed_pos = TokPos{0};
     sl->state = SLOT_IDLE;
     sl->ctx_size = s->pool_ctx_size;              /* every bank shares pool ctx */
@@ -595,12 +597,12 @@ session_slot *server::provision_bank(provision_refusal *refusal) {
     sl->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
     pthread_mutex_lock(&s->mu);
     s->ledger_commit_bank(sl);
-    if (idx >= s->n_slots) s->n_slots = idx + 1;
+    if (!s->n_slots.covers(idx)) s->n_slots = BankCount::through(idx);
     pthread_mutex_unlock(&s->mu);
     server_log(PULSAR_LOG_DEFAULT,
                "pulsar-server: provisioned bank %d (pooled) marginal=%.2f GiB "
                "total committed=%.2f GiB / %.2f GiB",
-               idx,
+               bank.raw(),
                (double)sl->bank_charge_bytes.raw() / (1024.0 * 1024.0 * 1024.0),
                (double)s->kv_committed_bytes.raw() / (1024.0 * 1024.0 * 1024.0),
                (double)s->kv_budget_bytes.raw() / (1024.0 * 1024.0 * 1024.0));
@@ -609,17 +611,17 @@ session_slot *server::provision_bank(provision_refusal *refusal) {
 
 session_slot *server::empty_bank() {
     auto *s = this;
-    if (s->pool_banks <= 0) return NULL;
+    if (!s->pool_banks.any()) return NULL;
     /* server_pick_free_bank's rule over the empty banks: the most resident pages, the lowest index on a tie */
-    bool taken[PULSAR_SESSION_POOL_CAP];
-    KvBytes resident[PULSAR_SESSION_POOL_CAP];
-    for (int i = 0; i < s->n_slots; i++) {
+    slot_flags taken;
+    pulsar_indexed<KvBytes, SlotIdx, PULSAR_SESSION_POOL_CAP> resident;
+    for (SlotIdx i : s->n_slots.slots()) {
         const session_slot *c = &s->slots[i];
         taken[i] = !c->provisioned || c->active_job || c->spilled || c->preempted || s->slot_frontier_pos(c) != TokPos{0};
         resident[i] = taken[i] ? KvBytes{} : pulsar_session_bank_touched_kv_bytes(s->sess, c->bank);
     }
-    const int i = server_pick_free_bank(taken, resident, s->n_slots);
-    return i < 0 ? NULL : &s->slots[i];
+    const SlotIdx i = server_pick_free_bank(taken, resident, s->n_slots);
+    return i.is_none() ? NULL : &s->slots[i];
 }
 
 /* ---- L249 D: compaction hints ------------------------------------------------------------------------------
@@ -633,7 +635,7 @@ int server::hint_mark_dead(const char *session) {
     auto *s = this;
     if (!session || !session[0]) return 0;
     int n = 0;
-    for (int i = 0; i < s->n_slots; i++) {
+    for (SlotIdx i : s->n_slots.slots()) {
         session_slot *c = &s->slots[i];
         if (!c->provisioned || c->active_job || c->hint_dead || strcmp(c->hint_session, session)) continue;
         c->hint_dead = true;
@@ -648,7 +650,7 @@ int server::hint_mark_dead(const char *session) {
 session_slot *server::hint_dead_bank() {
     auto *s = this;
     session_slot *best = NULL;
-    for (int i = 0; i < s->n_slots; i++) {
+    for (SlotIdx i : s->n_slots.slots()) {
         session_slot *c = &s->slots[i];
         if (!c->provisioned || c->active_job || c->spilled || c->preempted || !c->hint_dead) continue;
         if (!best || c->last_serviced_us < best->last_serviced_us) best = c;
@@ -666,7 +668,7 @@ bool server_hint_persist_skips(bool dead, bool compaction, const char *reason) {
 session_slot *server::provision_slot(int ctx,
                                     provision_refusal *refusal) {
     auto *s = this;
-    if (s->pool_banks > 0) { (void)ctx; return s->provision_bank(refusal); }
+    if (s->pool_banks.any()) { (void)ctx; return s->provision_bank(refusal); }
     /* Classic mode (pool_banks == 0): the ONE session IS slot 0, created at
      * startup — there is no independent session to create, so a request that
      * needs another slot queues until slot 0 frees. */
@@ -684,8 +686,8 @@ session_slot *server::provision_slot(int ctx,
 int server::provision_ctx_for_job(const job *j) const {
     const auto *s = this;
     int ctx = PULSAR_SERVER_EXTRA_SLOT_CTX_TOKENS;
-    const int cap_ctx = s->pool_banks > 0 ? s->pool_ctx_size
-                                          : s->slots[0].ctx_size;
+    const int cap_ctx = s->pool_banks.any() ? s->pool_ctx_size
+                                          : s->slots[SlotIdx{0u}].ctx_size;
     if (ctx > cap_ctx) ctx = cap_ctx;
     const int needed = s->job_needed_ctx(j);
     if (ctx < needed) ctx = needed;
@@ -917,7 +919,7 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
     TokCount deep{-1};                                     /* L378: the deepest match any free bank has */
     pulsar_resume_why best_why = PULSAR_RESUME_WHY_NONE;   /* L378: why the best bank's score is what it is */
     static const int route_debug = getenv("PULSAR_ROUTE_DEBUG") != NULL;
-    for (int i = 0; i < s->n_slots; i++) {
+    for (SlotIdx i : s->n_slots.slots()) {
         session_slot *sl = &s->slots[i];
         if (sl->active_job || !sl->provisioned || sl->ctx_size < needed) continue;
         const TokCount common = s->slot_common_prefix(sl, &j->req.prompt);
@@ -932,8 +934,8 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
         const PromptToks score = resume.served;
         if (route_debug)
             server_log(PULSAR_LOG_DEFAULT,
-                       "pulsar-server: route-scan slot %d bank %d: frontier=%d common=%d score=%d",
-                       i, sl->bank.raw(), s->slot_frontier_pos(sl).raw(), common.raw(), score.raw());
+                       "pulsar-server: route-scan slot %u bank %d: frontier=%d common=%d score=%d",
+                       i.raw(), sl->bank.raw(), s->slot_frontier_pos(sl).raw(), common.raw(), score.raw());
         if (common > deep) deep = common;
         if (score > best_score || (score == best_score && common > best_common)) {
             best_score = score;
@@ -975,7 +977,7 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
     {
         session_slot *gone = NULL;
         TokCount gone_common{-1};
-        for (int i = 0; i < s->n_slots; i++) {
+        for (SlotIdx i : s->n_slots.slots()) {
             session_slot *sl = &s->slots[i];
             if (!sl->active_job || !sl->provisioned || sl->ctx_size < needed) continue;
             if (!gen_gone_wait_phase(sl->gen)) continue;
@@ -1055,7 +1057,8 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
      * continuing on the best bank reuses its resident pages instead (the same clobber the pool-exhausted fallback
      * below takes; gen_begin persists the displaced history first).  Only when THAT fits. */
     if (best) {
-        int order[PULSAR_SESSION_POOL_CAP], n_spill = 0;
+        SlotIdx order[PULSAR_SESSION_POOL_CAP];
+        BankCount n_spill{0};
         KvBytes need_fresh{}, need_best{};
         const prompt_kv_verdict vf = s->prompt_kv_check(empty, j, order, &n_spill, &need_fresh);
         if (vf == PROMPT_KV_WAIT || vf == PROMPT_KV_REFUSE) {
@@ -1079,8 +1082,9 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
      * 2026-08-10: an 8-bank pool pre-churned by 12 one-shots served every later
      * conversation cold off bank 1.  Evict an LRU idle bank (live-tool owners
      * protected) and retry once. */
-    if (!fresh && s->pool_banks > 0 && server_refusal_evictable(*refusal, true)) {
-        int vi = -1, rank = -1;
+    if (!fresh && s->pool_banks.any() && server_refusal_evictable(*refusal, true)) {
+        SlotIdx vi = SlotIdx::none();
+        int rank = -1;
         const make_room_verdict room = s->make_room(best, &vi, &rank);
         if (room == MAKE_ROOM_IN_PLACE) {
             /* L379: the bank an eviction would free is the one this request matched best.  Evicting it bought
@@ -1213,10 +1217,10 @@ void server_slot_take_history(session_slot *sl, const request *r) {
 /// @param allow_slot0 slot 0 may be picked (pool mode)
 /// @param dominated per slot: dominated (NULL: none)
 /// @param scratch per slot: scratch (server_slot_is_scratch; NULL: none)
-/// @return the slot index, or -1
-int server_evict_pick_victim(const session_slot *slots, int n_slots,
-                             const bool *protect, bool allow_slot0, const bool *dominated, const bool *scratch) {
-    int victim = -1;
+/// @return the slot index, or none()
+SlotIdx server_evict_pick_victim(const slot_table &slots, BankCount n_slots, const slot_flags *protect,
+                                 bool allow_slot0, const slot_flags *dominated, const slot_flags *scratch) {
+    SlotIdx victim = SlotIdx::none();
     int victim_rank = 0;
     /* Slot 0 competes in LRU only when the caller says so (pool mode, where
      * bank 0 is just another bank): an idle conversation squatting bank 0 was
@@ -1227,12 +1231,12 @@ int server_evict_pick_victim(const session_slot *slots, int n_slots,
      * dominated slot (server::dominated_slots) goes before any LRU choice.
      * L379: then a scratch one (server_slot_is_scratch), before any LRU choice
      * among conversations. */
-    for (int i = allow_slot0 ? 0 : 1; i < n_slots; i++) {
+    for (SlotIdx i{allow_slot0 ? 0u : 1u}; n_slots.covers(i); ++i) {
         const session_slot *sl = &slots[i];
         if (!sl->provisioned || sl->active_job) continue;
-        if (protect && protect[i]) continue;
-        const int rank = server_victim_rank(dominated && dominated[i], scratch && scratch[i]);
-        if (victim < 0 || rank < victim_rank ||
+        if (protect && (*protect)[i]) continue;
+        const int rank = server_victim_rank(dominated && (*dominated)[i], scratch && (*scratch)[i]);
+        if (victim.is_none() || rank < victim_rank ||
             (rank == victim_rank &&
              (sl->last_serviced_us < slots[victim].last_serviced_us ||
               (sl->last_serviced_us == slots[victim].last_serviced_us &&
@@ -1245,16 +1249,16 @@ int server_evict_pick_victim(const session_slot *slots, int n_slots,
     return victim;
 }
 
-make_room_verdict server_make_room(const session_slot *slots, int n_slots, const bool *owners, const bool *warm,
-                                   bool allow_slot0, const bool *dominated, const bool *scratch, int best,
-                                   int *victim) {
+make_room_verdict server_make_room(const slot_table &slots, BankCount n_slots, const slot_flags *owners,
+                                   const slot_flags *warm, bool allow_slot0, const slot_flags *dominated,
+                                   const slot_flags *scratch, SlotIdx best, SlotIdx *victim) {
     /* first sparing every queued job's usable warm match -- never a scratch bank for its own sake (L379) -- then,
      * when that leaves nothing, with the owners alone: binding must progress */
-    bool soft[PULSAR_SESSION_POOL_CAP];
-    for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++)
-        soft[i] = (owners && owners[i]) || (warm && warm[i] && !(scratch && scratch[i]));
-    int vi = server_evict_pick_victim(slots, n_slots, soft, allow_slot0, dominated, scratch);
-    if (vi < 0) vi = server_evict_pick_victim(slots, n_slots, owners, allow_slot0, dominated, scratch);
+    slot_flags soft;
+    for (SlotIdx i : session_pool_cap.slots())
+        soft[i] = (owners && (*owners)[i]) || (warm && (*warm)[i] && !(scratch && (*scratch)[i]));
+    SlotIdx vi = server_evict_pick_victim(slots, n_slots, &soft, allow_slot0, dominated, scratch);
+    if (vi.is_none()) vi = server_evict_pick_victim(slots, n_slots, owners, allow_slot0, dominated, scratch);
     /* L394: "in place" keeps the matched bank's RESIDENT rows (L379).  A guard-spilled best holds none -- its physical
      * is freed and its history is a disk chain, which any bank restores from (server_resume_pick) -- so running in
      * place keeps nothing and needs the prompt's whole KV paged in, room only another bank's spill could make, and
@@ -1263,19 +1267,19 @@ make_room_verdict server_make_room(const session_slot *slots, int n_slots, const
      * the spilled banks to a resident idle one, under the same two tiers: the job lands on its pages (worker_evict
      * persists its history first unless it is read-only) and restores its match from the chain there.  With no such
      * bank, in place as before. */
-    if (vi >= 0 && vi == best && slots[best].spilled) {
-        bool soft_r[PULSAR_SESSION_POOL_CAP], owners_r[PULSAR_SESSION_POOL_CAP];
-        for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) {
-            const bool gone = i < n_slots && slots[i].spilled;
+    if (!vi.is_none() && vi == best && slots[best].spilled) {
+        slot_flags soft_r, owners_r;
+        for (SlotIdx i : session_pool_cap.slots()) {
+            const bool gone = n_slots.covers(i) && slots[i].spilled;
             soft_r[i] = soft[i] || gone;
-            owners_r[i] = (owners && owners[i]) || gone;
+            owners_r[i] = (owners && (*owners)[i]) || gone;
         }
-        int alt = server_evict_pick_victim(slots, n_slots, soft_r, allow_slot0, dominated, scratch);
-        if (alt < 0) alt = server_evict_pick_victim(slots, n_slots, owners_r, allow_slot0, dominated, scratch);
-        if (alt >= 0) vi = alt;
+        SlotIdx alt = server_evict_pick_victim(slots, n_slots, &soft_r, allow_slot0, dominated, scratch);
+        if (alt.is_none()) alt = server_evict_pick_victim(slots, n_slots, &owners_r, allow_slot0, dominated, scratch);
+        if (!alt.is_none()) vi = alt;
     }
     *victim = vi;
-    if (vi < 0) return MAKE_ROOM_NONE;
+    if (vi.is_none()) return MAKE_ROOM_NONE;
     return vi == best ? MAKE_ROOM_IN_PLACE : MAKE_ROOM_EVICT;
 }
 
@@ -1288,10 +1292,10 @@ make_room_verdict server_make_room(const session_slot *slots, int n_slots, const
  * jobs and each client thread blocks on its job condvar until then. The
  * owner lookups (tool_mu + session pos) run after mu is released — the two
  * locks are never nested. */
-void server::worker_protect_queued_owner_slots(bool protect[PULSAR_SESSION_POOL_CAP]) {
+void server::worker_protect_queued_owner_slots(slot_flags &protect) {
     PULSAR_NVTX_FN();
     auto *s = this;
-    memset(protect, 0, sizeof(protect[0]) * PULSAR_SESSION_POOL_CAP);
+    for (SlotIdx i : session_pool_cap.slots()) protect[i] = false;
     job *queued[PULSAR_SERVER_MAX_CLIENTS];
     int n = 0;
     pthread_mutex_lock(&s->mu);
@@ -1308,7 +1312,7 @@ void server::worker_protect_queued_owner_slots(bool protect[PULSAR_SESSION_POOL_
                    r->anthropic_live_call_ids.len > 0) {
             owner = s->anthropic_live_slot_for_ids(&r->anthropic_live_call_ids);
         }
-        if (owner) protect[owner - s->slots] = true;
+        if (owner) protect[s->slot_index(owner)] = true;
     }
 }
 
@@ -1321,10 +1325,10 @@ void server::worker_protect_queued_owner_slots(bool protect[PULSAR_SESSION_POOL_
  * Best-effort by contract: callers retry without this overlay when it leaves
  * no victim, so binding always progresses. Worker thread only
  * (slot_common_prefix reads engine host carries). */
-void server::worker_protect_queued_warm_matches(bool protect[PULSAR_SESSION_POOL_CAP]) {
+void server::worker_protect_queued_warm_matches(slot_flags &protect) {
     PULSAR_NVTX_FN();
     auto *s = this;
-    if (s->pool_banks <= 0) return;
+    if (!s->pool_banks.any()) return;
     job *queued[PULSAR_SERVER_MAX_CLIENTS];
     int n = 0;
     pthread_mutex_lock(&s->mu);
@@ -1334,8 +1338,9 @@ void server::worker_protect_queued_warm_matches(bool protect[PULSAR_SESSION_POOL
     pthread_mutex_unlock(&s->mu);
     for (int i = 0; i < n; i++) {
         const job *q = queued[i];
-        int best_i = -1, best_score = 0;
-        for (int k = 0; k < s->n_slots && k < PULSAR_SESSION_POOL_CAP; k++) {
+        SlotIdx best_i = SlotIdx::none();
+        int best_score = 0;
+        for (SlotIdx k{0u}; s->n_slots.covers(k) && k.below(PULSAR_SESSION_POOL_CAP); ++k) {
             const session_slot *sl = &s->slots[k];
             if (!sl->provisioned) continue;
             /* L325: the route's score (pulsar_session_bank_resume_at, choose_slot_for_job); L380: a decoder in the
@@ -1343,7 +1348,7 @@ void server::worker_protect_queued_warm_matches(bool protect[PULSAR_SESSION_POOL
             const int score = s->slot_resume_at(sl, &q->req.prompt, q->req.images, q->req.n_images).served.raw();
             if (score > best_score) { best_score = score; best_i = k; }
         }
-        if (best_i >= 0) protect[best_i] = true;
+        if (!best_i.is_none()) protect[best_i] = true;
     }
 }
 
@@ -1356,10 +1361,10 @@ void server::worker_protect_queued_warm_matches(bool protect[PULSAR_SESSION_POOL
  * free, and evicting warm idle sessions would only churn snapshots. (Host
  * arithmetic over the ledger only; runs only on failed bind attempts. Guard #1
  * is the provisioning-refusal reason check in worker_try_bind.) */
-bool server::worker_eviction_could_help(const bool *protect) {
+bool server::worker_eviction_could_help(const slot_flags *protect) {
     PULSAR_NVTX_FN();
     auto *s = this;
-    if (s->pool_banks > 0) {
+    if (s->pool_banks.any()) {
         /* Pool mode: a provision costs one bank's ledger charge, and the
          * hole an eviction leaves keeps its pages, which provision_bank reuses
          * without consulting the floor (server_bank_floor_refuses).  So an
@@ -1370,9 +1375,9 @@ bool server::worker_eviction_could_help(const bool *protect) {
          * ledger check is the exact one). */
         KvBytes reclaimable{};
         bool any = false;
-        for (int i = 0; i < s->pool_banks; i++) {
+        for (SlotIdx i : s->pool_banks.slots()) {
             const session_slot *sl = &s->slots[i];
-            if (!sl->provisioned || sl->active_job || (protect && protect[i])) continue;
+            if (!sl->provisioned || sl->active_job || (protect && (*protect)[i])) continue;
             reclaimable += sl->bank_charge_bytes;
             any = true;
         }
@@ -1431,11 +1436,11 @@ bool server_evict_snapshot_word(bool stored, kv_persist_rule rule, char word[40]
  * (provisioned == false) for provision_slot to reuse. Failure honesty: a failed or unavailable snapshot only costs
  * the returning client a re-prefill — the eviction itself proceeds, and the response always belongs to the right
  * conversation because the freed KV can never be read again. Worker thread only. */
-void server::victim_facts(bool dominated[PULSAR_SESSION_POOL_CAP], bool scratch[PULSAR_SESSION_POOL_CAP]) {
+void server::victim_facts(slot_flags &dominated, slot_flags &scratch) {
     auto *s = this;
     s->dominated_slots(dominated);
-    for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) scratch[i] = false;
-    for (int i = 0; i < s->n_slots; i++) {
+    for (SlotIdx i : session_pool_cap.slots()) scratch[i] = false;
+    for (SlotIdx i : s->n_slots.slots()) {
         const session_slot *sl = &s->slots[i];
         /* L249 D / L353 no. 19: a dead prefix (its session compacted) goes first, like a dominated history */
         dominated[i] = dominated[i] || sl->hint_dead;
@@ -1443,22 +1448,21 @@ void server::victim_facts(bool dominated[PULSAR_SESSION_POOL_CAP], bool scratch[
     }
 }
 
-make_room_verdict server::make_room(const session_slot *best, int *victim, int *rank) {
+make_room_verdict server::make_room(const session_slot *best, SlotIdx *victim, int *rank) {
     PULSAR_NVTX_FN();
     auto *s = this;
-    bool owners[PULSAR_SESSION_POOL_CAP], warm[PULSAR_SESSION_POOL_CAP] = {false};
-    bool dominated[PULSAR_SESSION_POOL_CAP], scratch[PULSAR_SESSION_POOL_CAP];
+    slot_flags owners, warm = {}, dominated, scratch;
     s->worker_protect_queued_owner_slots(owners);       /* live-tool owners: absolute */
     s->worker_protect_queued_warm_matches(warm);        /* the queued jobs' usable warm matches: soft */
     s->victim_facts(dominated, scratch);
     const make_room_verdict v =
-        server_make_room(s->slots, s->n_slots, owners, warm, /*allow_slot0=*/s->pool_banks > 0, dominated, scratch,
-                         best ? (int)(best - s->slots) : -1, victim);
-    *rank = *victim >= 0 ? server_victim_rank(dominated[*victim], scratch[*victim]) : -1;
+        server_make_room(s->slots, s->n_slots, &owners, &warm, /*allow_slot0=*/s->pool_banks.any(), &dominated,
+                         &scratch, best ? s->slot_index(best) : SlotIdx::none(), victim);
+    *rank = !victim->is_none() ? server_victim_rank(dominated[*victim], scratch[*victim]) : -1;
     return v;
 }
 
-void server::worker_evict(int vi, int rank, job *for_job) {
+void server::worker_evict(SlotIdx vi, int rank, job *for_job) {
     PULSAR_NVTX_FN();
     auto *s = this;
     session_slot *sl = &s->slots[vi];
@@ -1506,9 +1510,9 @@ void server::worker_evict(int vi, int rank, job *for_job) {
     char snapshot[40];
     if (server_evict_snapshot_word(stored, rule, snapshot) && live_tokens > 0) {
         server_log(PULSAR_LOG_WARNING,
-                   "pulsar-server: slot %d evicting WITHOUT a disk snapshot (%s); "
+                   "pulsar-server: slot %u evicting WITHOUT a disk snapshot (%s); "
                    "a returning client re-prefills (correctness unaffected)",
-                   vi,
+                   vi.raw(),
                    !s->kv.enabled ? "kv disk cache disabled"
                    : live_tokens < s->kv.opt.min_tokens
                        ? "conversation below kv-cache min-tokens"
@@ -1537,7 +1541,7 @@ void server::worker_evict(int vi, int rank, job *for_job) {
      * flag (invariant: physical freed IFF spilled).  server_bank_switch above
      * re-backed a spilled victim (physical present, flag cleared); this is the
      * case where that failed. */
-    if (s->pool_banks > 0 && sl->spilled) {
+    if (s->pool_banks.any() && sl->spilled) {
         (void)pulsar_session_bank_alloc_physical(s->sess, sl->bank); /* empty physical for reuse */
         sl->spilled = false;
     }
@@ -1562,10 +1566,10 @@ void server::worker_evict(int vi, int rank, job *for_job) {
         snprintf(r->snapshot, sizeof r->snapshot, "%s", snapshot);
     }
     server_log(PULSAR_LOG_DEFAULT,
-               "pulsar-server: evicted slot %d ctx=%d tokens=%d snapshot=%s "
+               "pulsar-server: evicted slot %u ctx=%d tokens=%d snapshot=%s "
                "released=%.2f GiB (allocator freed %.2f GiB) "
                "committed now %.2f / %.2f GiB, MemAvailable %.2f GiB",
-               vi, evicted_ctx, live_tokens, snapshot,
+               vi.raw(), evicted_ctx, live_tokens, snapshot,
                (double)freed.raw() / (1024.0 * 1024.0 * 1024.0),
                (double)freed.raw() / (1024.0 * 1024.0 * 1024.0),
                (double)committed_now.raw() / (1024.0 * 1024.0 * 1024.0),
@@ -1590,9 +1594,9 @@ void server::worker_evict(int vi, int rank, job *for_job) {
 /// @param hist_len per slot: its history length in tokens (0 = none)
 /// @param common common[a][k]: the common prefix of a and k (bank_common_matrix)
 /// @return true when slot a is dominated
-static bool bank_dominated_core(int a, int n_slots, const int *hist_len, const int *const *common) {
+static bool bank_dominated_core(SlotIdx a, BankCount n_slots, const slot_ints &hist_len, const slot_matrix &common) {
     if (hist_len[a] <= 0) return false;
-    for (int k = 0; k < n_slots; k++) {
+    for (SlotIdx k : n_slots.slots()) {
         if (k == a || hist_len[k] < hist_len[a] || (hist_len[k] == hist_len[a] && k > a)) continue;
         if (common[a][k] >= hist_len[a]) return true;
     }
@@ -1609,29 +1613,26 @@ static bool bank_dominated_core(int a, int n_slots, const int *hist_len, const i
 /// @param s the server (worker thread)
 /// @param hist_len receives each slot's history length in tokens
 /// @param common_rows receives the matrix (-1 where not filled)
-static void bank_common_matrix(server *s, int hist_len[PULSAR_SESSION_POOL_CAP],
-                               int common_rows[PULSAR_SESSION_POOL_CAP][PULSAR_SESSION_POOL_CAP]) {
-    slot_tokens hist[PULSAR_SESSION_POOL_CAP];
-    for (int i = 0; i < s->n_slots; i++) {
+static void bank_common_matrix(server *s, slot_ints &hist_len, slot_matrix &common_rows) {
+    pulsar_indexed<slot_tokens, SlotIdx, PULSAR_SESSION_POOL_CAP> hist;
+    for (SlotIdx i : s->n_slots.slots()) {
         hist[i] = s->slot_history(&s->slots[i]);
         hist_len[i] = slot_tokens_len(hist[i]);
     }
-    for (int i = 0; i < s->n_slots; i++)
-        for (int k = 0; k < s->n_slots; k++)
+    for (SlotIdx i : s->n_slots.slots())
+        for (SlotIdx k : s->n_slots.slots())
             common_rows[i][k] = (hist_len[i] > 0 && k != i && hist_len[k] >= hist_len[i])
                 ? slot_tokens_common(hist[k], hist[i]) : -1;
 }
 
-void server::dominated_slots(bool dominated[PULSAR_SESSION_POOL_CAP]) {
+void server::dominated_slots(slot_flags &dominated) {
     auto *s = this;
-    for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) dominated[i] = false;
-    if (!s->sess || s->pool_banks <= 0) return;
-    int hist_len[PULSAR_SESSION_POOL_CAP];
-    int common_rows[PULSAR_SESSION_POOL_CAP][PULSAR_SESSION_POOL_CAP];
-    const int *common[PULSAR_SESSION_POOL_CAP];
-    bank_common_matrix(s, hist_len, common_rows);
-    for (int i = 0; i < s->n_slots; i++) common[i] = common_rows[i];
-    for (int i = 0; i < s->n_slots; i++) dominated[i] = bank_dominated_core(i, s->n_slots, hist_len, common);
+    for (SlotIdx i : session_pool_cap.slots()) dominated[i] = false;
+    if (!s->sess || !s->pool_banks.any()) return;
+    slot_ints hist_len;
+    slot_matrix common;
+    bank_common_matrix(s, hist_len, common);
+    for (SlotIdx i : s->n_slots.slots()) dominated[i] = bank_dominated_core(i, s->n_slots, hist_len, common);
 }
 
 /* L324: the common prefix of slots a and b from the matrix (read in the direction bank_common_matrix fills). */
@@ -1640,21 +1641,21 @@ void server::dominated_slots(bool dominated[PULSAR_SESSION_POOL_CAP]) {
 /// @param hist_len per slot: history length
 /// @param common the matrix
 /// @return their common prefix in tokens
-static int dup_pair_common(int a, int b, const int *hist_len, const int *const *common) {
+static int dup_pair_common(SlotIdx a, SlotIdx b, const slot_ints &hist_len, const slot_matrix &common) {
     return hist_len[a] <= hist_len[b] ? common[a][b] : common[b][a];
 }
 
-void kv_dup_census_core(int n, const int *hist_len, const bool *resident, const int *const *common, int grid,
-                        KvBytes page_bytes, kv_dup_census *out, uint32_t *deep) {
+void kv_dup_census_core(BankCount n, const slot_ints &hist_len, const slot_flags &resident, const slot_matrix &common,
+                        int grid, KvBytes page_bytes, kv_dup_census *out, slot_bits *deep) {
     memset(out, 0, sizeof *out);
     out->grid = grid;
     out->page_bytes = page_bytes;
     if (deep)
-        for (int a = 0; a < n; a++) deep[a] = 0;
+        for (SlotIdx a : n.slots()) (*deep)[a] = 0;
     if (grid <= 0) return;
-    int pages[PULSAR_SESSION_POOL_CAP];
+    slot_ints pages;
     int max_pages = 0;
-    for (int a = 0; a < n; a++) {
+    for (SlotIdx a : n.slots()) {
         pages[a] = resident[a] && hist_len[a] > 0 ? hist_len[a] / grid : 0;
         if (pages[a] > 0) out->banks++;
         out->pages_resident += (uint64_t)pages[a];
@@ -1664,54 +1665,52 @@ void kv_dup_census_core(int n, const int *hist_len, const bool *resident, const 
      * agreement is transitive).  A class's first member stands for it; the others are its extra copies. */
     for (int p = 0; p < max_pages; p++) {
         const int end = (p + 1) * grid;
-        for (int a = 0; a < n; a++) {
+        for (SlotIdx a : n.slots()) {
             if (pages[a] <= p) continue;
             bool first = true;
-            for (int b = 0; b < a && first; b++)
+            for (SlotIdx b{0u}; b < a && first; ++b)
                 if (pages[b] > p && dup_pair_common(a, b, hist_len, common) >= end) first = false;
             if (!first) continue;
             out->pages_distinct++;
-            for (int b = a + 1; b < n; b++)
+            for (SlotIdx b = a.next(); n.covers(b); ++b)
                 if (pages[b] > p && dup_pair_common(a, b, hist_len, common) >= end) { out->pages_shared++; break; }
         }
     }
     out->pages_duplicate = out->pages_resident - out->pages_distinct;
     out->dup_bytes = page_bytes.times(out->pages_duplicate);
-    for (int a = 0; a < n; a++)
-        for (int b = a + 1; b < n; b++) {
+    for (SlotIdx a : n.slots())
+        for (SlotIdx b = a.next(); n.covers(b); ++b) {
             if (pages[a] <= 0 || pages[b] <= 0) continue;
             const int c = dup_pair_common(a, b, hist_len, common);
             if (c < grid) continue;
             const int cls = c >= PULSAR_KV_DUP_DEEP_TOKENS ? 1 : 0;
             out->pairs[cls]++;
             out->longest[cls] = std::max(out->longest[cls], c);
-            if (cls && deep) deep[a] |= 1u << b;
+            if (cls && deep) (*deep)[a] |= slot_bit(b);
         }
 }
 
 void server::kv_dup_census_update() {
     auto *s = this;
-    if (!s->sess || s->pool_banks <= 0) return;
-    int hist_len[PULSAR_SESSION_POOL_CAP];
-    int common_rows[PULSAR_SESSION_POOL_CAP][PULSAR_SESSION_POOL_CAP];
-    const int *common[PULSAR_SESSION_POOL_CAP];
-    bool resident[PULSAR_SESSION_POOL_CAP];
-    bank_common_matrix(s, hist_len, common_rows);
-    for (int i = 0; i < s->n_slots; i++) {
-        common[i] = common_rows[i];
+    if (!s->sess || !s->pool_banks.any()) return;
+    slot_ints hist_len;
+    slot_matrix common;
+    slot_flags resident;   /* per SLOT: its bank's physical backed (pool_residency's table is per bank) */
+    bank_common_matrix(s, hist_len, common);
+    for (SlotIdx i : s->n_slots.slots()) {
         resident[i] = s->slots[i].provisioned && !pulsar_session_bank_is_evicted(s->sess, s->slots[i].bank);
     }
     const int grid = pulsar_kvchain_grid(s->sess).raw();   /* a page's rows: KvRows below */
     const KvBytes page_bytes = grid > 0 ? pulsar_session_quantum_growth_bytes_per_bank(s->sess, KvRows{(uint32_t)grid})
                                         : KvBytes{};
     kv_dup_census c;
-    uint32_t deep[PULSAR_SESSION_POOL_CAP];
-    kv_dup_census_core(s->n_slots, hist_len, resident, common, grid, page_bytes, &c, deep);
+    slot_bits deep;
+    kv_dup_census_core(s->n_slots, hist_len, resident, common, grid, page_bytes, &c, &deep);
     /* a pair that shares more than the preamble: once per pair until it stops (a bank that moves on clears it) */
-    for (int a = 0; a < s->n_slots; a++) {
+    for (SlotIdx a : s->n_slots.slots()) {
         const uint32_t fresh = deep[a] & ~s->w_dup_deep[a];
-        for (int b = a + 1; b < s->n_slots; b++) {
-            if (!(fresh >> b & 1u)) continue;
+        for (SlotIdx b = a.next(); s->n_slots.covers(b); ++b) {
+            if (!(fresh & slot_bit(b))) continue;
             const int shared = dup_pair_common(a, b, hist_len, common);
             server_log(PULSAR_LOG_KVCACHE,
                        "pulsar-server: kv dup: banks %d and %d share %d tokens (%d whole pages of %d, %.2f GiB held "
@@ -1832,15 +1831,15 @@ bool server::prefix_wait_decide(job *j) {
     const request *r = &j->req;
     /* the adopt is what serves the cut: a pooled, single-GPU text request that no live tool state pins to its bank
      * (pulsar_session_bank_adopt refuses a tensor-parallel engine and an image history) */
-    if (s->prefix_wait_ms <= 0 || s->pool_banks <= 1 || !s->sess || pulsar_engine_is_tp(s->engine) ||
+    if (s->prefix_wait_ms <= 0 || s->pool_banks <= BankCount{1} || !s->sess || pulsar_engine_is_tp(s->engine) ||
         r->n_images > 0 || request_prompt_toks(r) <= PromptToks{0} || r->responses_live_call_ids.len > 0 ||
         r->anthropic_live_call_ids.len > 0)
         return false;
     prefix_lead leads[PULSAR_SESSION_POOL_CAP];
-    int lead_slot[PULSAR_SESSION_POOL_CAP];
+    SlotIdx lead_slot[PULSAR_SESSION_POOL_CAP];   /* per lead (the pick's index into leads[]): its slot */
     int n = 0;
     PromptToks have{0};
-    for (int i = 0; i < s->n_slots; i++) {
+    for (SlotIdx i : s->n_slots.slots()) {
         session_slot *sl = &s->slots[i];
         if (!sl->provisioned || sl->spilled || sl->preempted) continue;
         /* the deepest state a bank serves the prompt from now: its own resume, which is what an adopt of it reads
@@ -1961,12 +1960,12 @@ bool server::worker_try_bind() {
     session_slot *sl = s->choose_slot_for_job(j, &reject_ctx, &waiting_owner,
                                            &clobbers, &refusal);
     if ((!sl || clobbers) && !waiting_owner && reject_ctx == 0 &&
-        server_refusal_evictable(refusal, s->pool_banks > 0))
+        server_refusal_evictable(refusal, s->pool_banks.any()))
     {
-        bool protect[PULSAR_SESSION_POOL_CAP];
+        slot_flags protect;
         s->worker_protect_queued_owner_slots(protect);
-        if (s->worker_eviction_could_help(protect)) {
-            while ((!sl || clobbers) && server_refusal_evictable(refusal, s->pool_banks > 0))
+        if (s->worker_eviction_could_help(&protect)) {
+            while ((!sl || clobbers) && server_refusal_evictable(refusal, s->pool_banks.any()))
             {
                 /* Refresh owner protection every iteration (2026-07-15
                  * review): each pass through choose_slot_for_job can stall
@@ -1978,7 +1977,8 @@ bool server::worker_try_bind() {
                 /* L379: the one pick (make_room: the owners refreshed, the warm matches spared first), and its
                  * verdict -- when the bank it would free is the one this job would otherwise clobber, the job's
                  * own best match, nothing is evicted: it runs in place on it */
-                int vi = -1, rank = -1;
+                SlotIdx vi = SlotIdx::none();
+                int rank = -1;
                 const make_room_verdict room = s->make_room(clobbers ? sl : NULL, &vi, &rank);
                 if (room == MAKE_ROOM_NONE) break;
                 if (room == MAKE_ROOM_IN_PLACE) {
@@ -2085,12 +2085,15 @@ void server::publish_metrics_snapshot() {
     const KvBytes kv_reserved = s->guard_enabled ? s->kv_reserved_bytes(NULL) : KvBytes{};
     const KvBytes kv_budget = s->guard_enabled ? s->guard_budget() : KvBytes{};
     pthread_mutex_lock(&s->mu);
-    for (int i = 0; i < s->n_slots; i++) {
+    for (SlotIdx i : s->n_slots.slots()) {
+        /* L441: the published snapshot is the client threads' (/metrics, the stall dump), indexed by the slot's
+         * number -- its `slot` label -- as it leaves the worker */
+        const uint32_t k = i.raw();
         /* Bank-aware: a non-live bank's pos is its saved carry, never the pool's
          * live cursor, and a decoder in the plain batch reads its feed position
          * (server::slot_frontier_pos). Pure host read, no CUDA. */
-        s->m_slot_pos[i] = s->slot_frontier_pos(&s->slots[i]).raw();
-        s->m_slot_ctx[i] = s->slots[i].ctx_size;
+        s->m_slot_pos[k] = s->slot_frontier_pos(&s->slots[i]).raw();
+        s->m_slot_ctx[k] = s->slots[i].ctx_size;
         /* Phase + prefill progress: pure host reads of the slot's gen_state,
          * published here because send_metrics runs on a client thread and must
          * not walk worker-owned structures. Phase is stored +1 so an unbound
@@ -2098,15 +2101,15 @@ void server::publish_metrics_snapshot() {
          * progress callback fires, so clamp it here. */
         const session_slot *sl = &s->slots[i];
         const gen_state *g = sl->active_job ? sl->gen : NULL;
-        s->m_slot_phase[i]         = g ? (int)g->phase + 1 : 0;
-        s->m_slot_prefill_done[i]  = (g && g->prefill_last_current > 0) ? g->prefill_last_current : 0;
-        s->m_slot_prefill_total[i] = (g && g->prefill_total > 0) ? g->prefill_total : 0;
-        s->m_slot_bank[i]      = sl->bank.raw();   /* L372: the stall dump's (the watchdog reads only the snapshot) */
-        s->m_slot_spilled[i]   = sl->spilled;
-        s->m_slot_preempted[i] = sl->preempted;
+        s->m_slot_phase[k]         = g ? (int)g->phase + 1 : 0;
+        s->m_slot_prefill_done[k]  = (g && g->prefill_last_current > 0) ? g->prefill_last_current : 0;
+        s->m_slot_prefill_total[k] = (g && g->prefill_total > 0) ? g->prefill_total : 0;
+        s->m_slot_bank[k]      = sl->bank.raw();   /* L372: the stall dump's (the watchdog reads only the snapshot) */
+        s->m_slot_spilled[k]   = sl->spilled;
+        s->m_slot_preempted[k] = sl->preempted;
         /* L112: adaptive draft depth, live-or-carry (pure host read) -- DSpark's; the Qwen MTP lane's
          * depth is fixed and the family refuses the query. */
-        s->m_slot_depth[i] = sl->provisioned && pulsar_engine_has_spec_rounds(s->engine)
+        s->m_slot_depth[k] = sl->provisioned && pulsar_engine_has_spec_rounds(s->engine)
                 ? pulsar_session_bank_spec_depth(s->sess, sl->bank) : 0;
     }
     s->m_spec = m;
@@ -3154,7 +3157,7 @@ static int lane_price_pick(lane_price *lp, const pulsar_lane_cost *plain, const 
 /// @param n_dec how many
 /// @param n_batched decoders in the plain multiseq batch
 /// @return the lane
-static int server_pick_decode_lane(int pool_banks, bool spec_rounds, uint32_t verify_rows,
+static int server_pick_decode_lane(BankCount pool_banks, bool spec_rounds, uint32_t verify_rows,
                                    session_slot *const *dec, int n_dec, int n_batched) {
     bool all_spec = spec_rounds && n_dec >= 1 && (uint32_t)n_dec <= verify_rows && n_batched == 0;
     for (int i = 0; all_spec && i < n_dec; i++) {
@@ -3162,8 +3165,8 @@ static int server_pick_decode_lane(int pool_banks, bool spec_rounds, uint32_t ve
         if (!dg || !dg->spec_enabled || dg->batch_active)
             all_spec = false;
     }
-    const bool use_spec_batched = pool_banks > 0 && all_spec;
-    const bool use_batched = use_spec_batched || (pool_banks > 0 && n_dec >= 1);
+    const bool use_spec_batched = pool_banks.any() && all_spec;
+    const bool use_batched = use_spec_batched || (pool_banks.any() && n_dec >= 1);
     return n_dec <= 0 ? 0 : (use_spec_batched ? 3 : (use_batched ? 2 : 1));
 }
 
@@ -3249,8 +3252,8 @@ bool server::spill_bank(session_slot *victim) {
         /* L362: said once per bank every 10 s -- a caller that retries each pass (the readmission did, 19.5 MB of
          * this line in 20 minutes) must not flood the log */
         const double now = server_now_sec();
-        if (vb.below(PULSAR_SESSION_POOL_CAP) && now - s->park_refused_said[pulsar_bank_index(vb)] >= 10.0) {
-            s->park_refused_said[pulsar_bank_index(vb)] = now;
+        if (session_pool_cap.covers(vb) && now - s->park_refused_said[vb] >= 10.0) {
+            s->park_refused_said[vb] = now;
             server_log(PULSAR_LOG_WARNING, "pulsar-server: guard: bank %d is the only resident bank -- nowhere to park "
                        "the pool, spill refused", vb.raw());
         }
@@ -3319,12 +3322,13 @@ bool server::spill_bank(session_slot *victim) {
  * sampling alike; beside other decoders the batched lanes are nondeterministic by design, L118).  Readmission is
  * first-preempted first, as soon as the bank's resident KV fits the budget again.  An image request keeps its bank
  * (as Flare's: its image features are not reconstructed). */
-static int guard_victim_order(server *s, session_slot **dec, int n, int *order, bool *dominated_out = nullptr);
-static int guard_spill_victims(server *s, session_slot **dec, int n, int *order, KvBytes *drop,
-                               bool *dominated_out = nullptr, bool room_parks = false);
+static BankCount guard_victim_order(server *s, session_slot **dec, int n, SlotIdx *order,
+                                    slot_flags *dominated_out = nullptr);
+static BankCount guard_spill_victims(server *s, session_slot **dec, int n, SlotIdx *order, KvBytes *drop,
+                                     slot_flags *dominated_out = nullptr, bool room_parks = false);
 static prompt_kv_verdict server_prompt_kv_verdict(KvBytes touched, KvBytes delta, KvBytes bound,
-                                                  const KvBytes *drop, int n_victims, bool busy_may_free,
-                                                  int *n_spill);
+                                                  const KvBytes *drop, BankCount n_victims, bool busy_may_free,
+                                                  BankCount *n_spill);
 
 /* L326: the resident KV an admission decision starts from -- what is touched now plus what every admitted job will
  * still add before it decodes (want[i] = its bank's growth to its prompt's length, have[i] = what the bank holds;
@@ -3365,12 +3369,13 @@ static bool server_slot_reserves(const session_slot *c) {
 /// @param resident per bank: resident
 /// @param n banks
 /// @param except the bank being freed
-/// @return the bank to park on, or -1
-static int server_park_pick(const bool *resident, int n, int except) {
-    if (n > 0 && resident[0] && except != 0) return 0;
-    for (int b = 1; b < n; b++)
-        if (resident[b] && b != except) return b;
-    return -1;
+/// @return the bank to park on, or none()
+static BankId server_park_pick(const bank_flags &resident, BankCount n, BankId except) {
+    const BankId first{0};
+    if (n.any() && resident[first] && except != first) return first;
+    for (BankId b : n.banks())
+        if (b != first && resident[b] && b != except) return b;
+    return BankId::none();
 }
 
 /* L394: how many of a spill plan's victims, in its order, a spill can take.  Each spill parks the pool on another
@@ -3387,15 +3392,16 @@ static int server_park_pick(const bool *resident, int n, int except) {
 /// @param m victims
 /// @param room_parks the room's own bank is resident by the time the spills run
 /// @return the victims a spill can take: m, or m - 1 when the plan would spill the last resident bank
-static int server_spill_parkable(const bool *resident, int n, const int *victim_bank, int m, bool room_parks) {
-    if (m == 0 || room_parks) return m;
-    for (int b = 0; b < n; b++) {
+static BankCount server_spill_parkable(const bank_flags &resident, BankCount n, const BankId *victim_bank, BankCount m,
+                                       bool room_parks) {
+    if (m == BankCount{0} || room_parks) return m;
+    for (BankId b : n.banks()) {
         if (!resident[b]) continue;
         bool victim = false;
-        for (int k = 0; k < m && !victim; k++) victim = victim_bank[k] == b;
+        for (int k : m.positions()) victim = victim || victim_bank[k] == b;
         if (!victim) return m;   /* a resident bank that stays: every spill parks on it */
     }
-    return m - 1;
+    return m - BankCount{1};
 }
 
 /* L328 (2): does preempting a decoder of `freed` bytes make a prompt adding `need` fit, pure -- beside the reserved
@@ -3439,18 +3445,18 @@ static bool server_guard_may_preempt(int n_decoding, bool reserving) {
 /* The chat pool's residency, the one read park_bank and a spill plan's parkability (guard_spill_victims) share:
  * resident[b] for bank b, the judge's reserved bank (past pool_banks) not among them. */
 /// @param s the server
-/// @param resident receives, per bank, whether its physical is backed (room for PULSAR_SESSION_POOL_CAP)
+/// @param resident receives, per bank, whether its physical is backed
 /// @return the banks written
-static int pool_residency(server *s, bool *resident) {
-    const int n = s->pool_banks < PULSAR_SESSION_POOL_CAP ? s->pool_banks : PULSAR_SESSION_POOL_CAP;
-    for (int b = 0; b < n; b++) resident[b] = !pulsar_session_bank_is_evicted(s->sess, BankId{b});
+static BankCount pool_residency(server *s, bank_flags &resident) {
+    const BankCount n = s->pool_banks < session_pool_cap ? s->pool_banks : session_pool_cap;
+    for (BankId b : n.banks()) resident[b] = !pulsar_session_bank_is_evicted(s->sess, b);
     return n;
 }
 
 BankId server::park_bank(BankId except) {
-    bool resident[PULSAR_SESSION_POOL_CAP];
-    const int n = pool_residency(this, resident);
-    return BankId{server_park_pick(resident, n, except.raw())};   /* -1 (nowhere) enters as none() */
+    bank_flags resident;
+    const BankCount n = pool_residency(this, resident);
+    return server_park_pick(resident, n, except);
 }
 
 KvBytes server::kv_reserved_bytes(const session_slot *except) {
@@ -3458,7 +3464,7 @@ KvBytes server::kv_reserved_bytes(const session_slot *except) {
     pulsar_session *pool = s->sess;
     KvBytes want[PULSAR_SESSION_POOL_CAP], have[PULSAR_SESSION_POOL_CAP];
     int n = 0;
-    for (int i = 0; i < s->n_slots && n < PULSAR_SESSION_POOL_CAP; i++) {
+    for (SlotIdx i{0u}; s->n_slots.covers(i) && n < PULSAR_SESSION_POOL_CAP; ++i) {
         const session_slot *c = &s->slots[i];
         if (c == except || !server_slot_reserves(c)) continue;
         /* L439: the rows a prompt adds are its STITCH's (one a token of what the bank ends up holding); the price
@@ -3473,20 +3479,21 @@ KvBytes server::kv_reserved_bytes(const session_slot *except) {
 
 bool server::preempt_newest_decoder(const session_slot *keep, KvBytes need) {
     auto *s = this;
-    if (s->pool_banks <= 1 || !s->kv.enabled || !s->kv.dir || pulsar_engine_is_tp(s->engine)) return false;
-    bool tried[PULSAR_SESSION_POOL_CAP] = {};
+    if (s->pool_banks <= BankCount{1} || !s->kv.enabled || !s->kv.dir || pulsar_engine_is_tp(s->engine)) return false;
+    slot_flags tried = {};
     /* L328 (2): the idle banks the re-check after a preemption spills -- bank 0 among them -- are room too */
     KvBytes idle{};
     {
-        int order[PULSAR_SESSION_POOL_CAP];
+        SlotIdx order[PULSAR_SESSION_POOL_CAP];
         session_slot *self[1] = {(session_slot *)keep};
-        const int n_victims = guard_victim_order(s, self, keep ? 1 : 0, order);
-        for (int k = 0; k < n_victims; k++) idle += pulsar_session_bank_touched_kv_bytes(s->sess, s->slots[order[k]].bank);
+        const BankCount n_victims = guard_victim_order(s, self, keep ? 1 : 0, order);
+        for (int k : n_victims.positions())
+            idle += pulsar_session_bank_touched_kv_bytes(s->sess, s->slots[order[k]].bank);
     }
     for (;;) {
         /* the newest decoder not yet tried, never an image request's */
         session_slot *v = NULL;
-        for (int i = 0; i < s->n_slots; i++) {
+        for (SlotIdx i : s->n_slots.slots()) {
             session_slot *c = &s->slots[i];
             if (c == keep || tried[i] || !slot_is_batchable_decode(c) || c->spilled || c->active_job->req.n_images > 0)
                 continue;
@@ -3497,7 +3504,7 @@ bool server::preempt_newest_decoder(const session_slot *keep, KvBytes need) {
             if (!v || c->gen->t0 > v->gen->t0) v = c;
         }
         if (!v) return false;
-        tried[v - s->slots] = true;
+        tried[s->slot_index(v)] = true;
         gen_state *g = v->gen;
         if (g->batch_active && !s->batch_leave(v)) continue;   /* the plain batch's sampled token is committed first */
         const BankId park = s->park_bank(v->bank);   /* L328 (2): where the pool parks while v's physical goes */
@@ -3546,7 +3553,7 @@ bool server::preempt_newest_decoder(const session_slot *keep, KvBytes need) {
 bool server::worker_readmit_preempted() {
     auto *s = this;
     session_slot *v = NULL;
-    for (int i = 0; i < s->n_slots; i++)
+    for (SlotIdx i : s->n_slots.slots())
         if (s->slots[i].preempted && (!v || s->slots[i].preempt_t < v->preempt_t)) v = &s->slots[i];
     if (!v) return false;
     pulsar_session *pool = s->sess;
@@ -3554,13 +3561,14 @@ bool server::worker_readmit_preempted() {
         /* the admission arithmetic over the idle banks, as a prompt's (L280): fits, or fits once idle banks spill --
          * from the same reserved base (L326: an admitted prompt's coming prefill counts, so the room a preemption
          * made for it is not retaken before it lands; the decoder stays parked until a job ends and frees it) */
-        int order[PULSAR_SESSION_POOL_CAP], n_spill = 0;
+        SlotIdx order[PULSAR_SESSION_POOL_CAP];
+        BankCount n_spill{0};
         KvBytes drop[PULSAR_SESSION_POOL_CAP];
         /* L394: its own bank parks the pool, re-backed first (L362, below) */
-        const int n_victims = guard_spill_victims(s, NULL, 0, order, drop, nullptr, /*room_parks=*/true);
+        const BankCount n_victims = guard_spill_victims(s, NULL, 0, order, drop, nullptr, /*room_parks=*/true);
         bool busy = server_judge_holds_kv(s);   /* another job whose end may make room (L372: a judge request's) */
         int n_decoding = 0;
-        for (int i = 0; i < s->n_slots; i++) {
+        for (SlotIdx i : s->n_slots.slots()) {
             busy = busy || (&s->slots[i] != v && s->slots[i].active_job && !s->slots[i].preempted);
             if (slot_is_batchable_decode(&s->slots[i])) n_decoding++;
         }
@@ -3603,7 +3611,7 @@ bool server::worker_readmit_preempted() {
          * with the victim the only other resident bank, spill_bank refused (nowhere to park), this returned false,
          * and the next pass did the same -- the decoder never came back (#661).  Re-backing touches nothing (the pools
          * are demand-paged), and the reload below re-backs it anyway (alloc_physical is idempotent). */
-        const bool rebacked = n_spill > 0;
+        const bool rebacked = n_spill.any();
         if (rebacked && !pulsar_session_bank_alloc_physical(pool, v->bank)) return false;
         /* L372: a pass that gives up after that re-back frees the bank again, so a decoder still parked has no
          * resident bank: park_bank reads residency, and a later spill or preemption would park the pool on it -- a
@@ -3628,7 +3636,7 @@ bool server::worker_readmit_preempted() {
             if (s->live_bank != v->bank) (void)pulsar_session_bank_free_physical(pool, v->bank);
             return false;
         };
-        for (int k = 0; k < n_spill; k++) {
+        for (int k : n_spill.positions()) {
             if (!s->spill_bank(&s->slots[order[k]])) return give_up();
             s->count_metric(&s->m_spills);
         }
@@ -3688,26 +3696,26 @@ bool server::worker_readmit_preempted() {
 
 /* LRU-idle smallest-frontier victim: NOT in the live decode set, no active job,
  * not already spilled (L328: bank 0 is a victim like any other -- the pool parks
- * on another resident bank, server::park_bank). -1 if none.  L323: a dominated
+ * on another resident bank, server::park_bank). none() if none.  L323: a dominated
  * bank (server::dominated_slots; `dominated` may be NULL) goes before any LRU
  * choice.  L379: then a scratch one -- the make-room eviction's order
  * (server_victim_rank), under the guard's own filter. */
-int server::guard_pick_victim(session_slot **dec, int n, const bool *dominated, const bool *scratch) {
+SlotIdx server::guard_pick_victim(session_slot **dec, int n, const slot_flags *dominated, const slot_flags *scratch) {
     auto *s = this;
     pulsar_session *pool = s->sess;
-    int best = -1;
+    SlotIdx best = SlotIdx::none();
     int best_rank = 0;
     bool best_bound = false;
     uint64_t best_us = UINT64_MAX;
     KvBytes best_touched = KvBytes::max();
-    for (int i = 0; i < s->n_slots; i++) {
+    for (SlotIdx i : s->n_slots.slots()) {
         session_slot *sl = &s->slots[i];
         if (!sl->provisioned || sl->spilled || sl->active_job) continue;
         bool live = false;
         for (int k = 0; k < n; k++) if (dec[k] == sl) { live = true; break; }
         if (live) continue;
         const KvBytes t = pulsar_session_bank_touched_kv_bytes(pool, sl->bank);
-        const int rank = server_victim_rank(dominated && dominated[i], scratch && scratch[i]);
+        const int rank = server_victim_rank(dominated && (*dominated)[i], scratch && (*scratch)[i]);
         /* L353 no. 10: a bank whose client is running a tool last: its turn continues the decoded frontier, which a chain
          * can't reproduce, so spilling it turns that turn into a 409 */
         bool bound;
@@ -3715,7 +3723,7 @@ int server::guard_pick_victim(session_slot **dec, int n, const bool *dominated, 
             pulsar::ScopedLock lk(&s->tool_mu);
             bound = sl->responses_live.valid || sl->anthropic_live.valid;
         }
-        if (best < 0 || (!bound && best_bound) ||
+        if (best.is_none() || (!bound && best_bound) ||
             (bound == best_bound &&
              (rank < best_rank || (rank == best_rank && (sl->last_serviced_us < best_us ||
                                                          (sl->last_serviced_us == best_us && t < best_touched)))))) {
@@ -3740,11 +3748,12 @@ int server::guard_pick_victim(session_slot **dec, int n, const bool *dominated, 
 /// @param per_victim_drop per victim, in spill order: the bytes its spill frees
 /// @param n_victims victims
 /// @return how many to spill
-static int guard_spill_plan(KvBytes touched, KvBytes delta, KvBytes bound,
-                            const KvBytes *per_victim_drop, int n_victims) {
-    int k = 0;
+static BankCount guard_spill_plan(KvBytes touched, KvBytes delta, KvBytes bound,
+                                  const KvBytes *per_victim_drop, BankCount n_victims) {
+    BankCount k{0};
     while (touched + delta > bound && k < n_victims) {
-        const KvBytes drop = per_victim_drop[k++];
+        const KvBytes drop = per_victim_drop[k.raw()];   /* the plan's next victim: its position is the count so far */
+        ++k;
         touched = drop >= touched ? KvBytes{} : touched - drop;
     }
     return k;
@@ -3760,24 +3769,24 @@ static int guard_spill_plan(KvBytes touched, KvBytes delta, KvBytes bound,
 /// @param order receives the victims' slot indexes, in pick order
 /// @param dominated_out receives the dominance facts per slot (may be NULL)
 /// @return victims written
-static int guard_victim_order(server *s, session_slot **dec, int n, int *order, bool *dominated_out) {
+static BankCount guard_victim_order(server *s, session_slot **dec, int n, SlotIdx *order, slot_flags *dominated_out) {
     session_slot *excl[2 * PULSAR_SESSION_POOL_CAP];
     for (int i = 0; i < n; i++) excl[i] = dec[i];
     /* L323: the victim classes once for the whole order -- a spill leaves every bank's history (the host carry)
      * as it was, so they hold across it.  L379: the make-room eviction's own facts (server::victim_facts): dominated
      * and dead banks, then scratch ones, then the conversations by LRU */
-    bool dominated[PULSAR_SESSION_POOL_CAP], scratch[PULSAR_SESSION_POOL_CAP];
+    slot_flags dominated, scratch;
     s->victim_facts(dominated, scratch);
     int m = 0;
     while (n + m < 2 * PULSAR_SESSION_POOL_CAP) {
-        const int vi = s->guard_pick_victim(excl, n + m, dominated, scratch);
-        if (vi < 0) break;
+        const SlotIdx vi = s->guard_pick_victim(excl, n + m, &dominated, &scratch);
+        if (vi.is_none()) break;
         order[m] = vi;
         excl[n + m] = &s->slots[vi];
         m++;
     }
-    if (dominated_out) memcpy(dominated_out, dominated, sizeof dominated);
-    return m;
+    if (dominated_out) *dominated_out = dominated;
+    return BankCount{m};
 }
 
 /* L372: the victims a spill plan is made over -- guard_victim_order's, less the banks that hold no resident KV, each
@@ -3794,22 +3803,22 @@ static int guard_victim_order(server *s, session_slot **dec, int n, int *order, 
 /// @param room_parks the bank the room is for is resident before the spills run though it is not now (a fresh bank
 ///        the job provisions; a parked decoder's bank, re-backed first, L362)
 /// @return victims written
-static int guard_spill_victims(server *s, session_slot **dec, int n, int *order, KvBytes *drop, bool *dominated_out,
-                               bool room_parks) {
-    const int all = guard_victim_order(s, dec, n, order, dominated_out);
-    int m = 0;
-    int banks[PULSAR_SESSION_POOL_CAP];
-    for (int k = 0; k < all; k++) {
+static BankCount guard_spill_victims(server *s, session_slot **dec, int n, SlotIdx *order, KvBytes *drop,
+                                     slot_flags *dominated_out, bool room_parks) {
+    const BankCount all = guard_victim_order(s, dec, n, order, dominated_out);
+    BankCount m{0};
+    BankId banks[PULSAR_SESSION_POOL_CAP];   /* per victim, in order: its bank */
+    for (int k : all.positions()) {
         const KvBytes frees = pulsar_session_bank_touched_kv_bytes(s->sess, s->slots[order[k]].bank);
         if (frees == KvBytes{}) continue;
-        order[m] = order[k];
-        banks[m] = s->slots[order[k]].bank.raw();
-        if (drop) drop[m] = frees;
-        m++;
+        order[m.raw()] = order[k];   /* (the kept victims' list, compacted in place: its next position) */
+        banks[m.raw()] = s->slots[order[k]].bank;
+        if (drop) drop[m.raw()] = frees;
+        ++m;
     }
     /* L394: and only the victims a spill can take -- the last resident bank cannot be (spill_bank: nowhere to park) */
-    bool resident[PULSAR_SESSION_POOL_CAP];
-    const int nb = pool_residency(s, resident);
+    bank_flags resident;
+    const BankCount nb = pool_residency(s, resident);
     return server_spill_parkable(resident, nb, banks, m, room_parks);
 }
 
@@ -3829,16 +3838,16 @@ static int guard_spill_victims(server *s, session_slot **dec, int n, int *order,
 /// @param n_spill receives the spills a SPILL verdict plans
 /// @return the verdict
 static prompt_kv_verdict server_prompt_kv_verdict(KvBytes touched, KvBytes delta, KvBytes bound,
-                                                  const KvBytes *drop, int n_victims, bool busy_may_free,
-                                                  int *n_spill) {
-    *n_spill = 0;
+                                                  const KvBytes *drop, BankCount n_victims, bool busy_may_free,
+                                                  BankCount *n_spill) {
+    *n_spill = BankCount{0};
     /* a job that adds nothing (a continuation on its own resident bank) never waits on a breach it did not cause */
     if (delta == KvBytes{} || touched + delta <= bound) return PROMPT_KV_FITS;
     if (delta > bound) return PROMPT_KV_REFUSE;
-    const int k = guard_spill_plan(touched, delta, bound, drop, n_victims);
+    const BankCount k = guard_spill_plan(touched, delta, bound, drop, n_victims);
     KvBytes t = touched;
-    for (int i = 0; i < k; i++) t = drop[i] >= t ? KvBytes{} : t - drop[i];
-    if (k > 0 && t + delta <= bound) {
+    for (int i : k.positions()) t = drop[i] >= t ? KvBytes{} : t - drop[i];
+    if (k.any() && t + delta <= bound) {
         *n_spill = k;
         return PROMPT_KV_SPILL;
     }
@@ -3860,16 +3869,16 @@ static bool server_slot_end_frees_kv(const session_slot *c) {
 /// @return true when a bound job's end, or a judge request's, may make room
 static bool prompt_kv_busy_may_free(server *s, const session_slot *sl) {
     bool busy = server_judge_holds_kv(s);   /* L372 (O12): as is the judge bank under a judge request */
-    for (int i = 0; i < s->n_slots && !busy; i++) busy = &s->slots[i] != sl && server_slot_end_frees_kv(&s->slots[i]);
+    for (SlotIdx i{0u}; s->n_slots.covers(i) && !busy; ++i) busy = &s->slots[i] != sl && server_slot_end_frees_kv(&s->slots[i]);
     return busy;
 }
 
-prompt_kv_verdict server::prompt_kv_check(const session_slot *sl, const job *j, int *order, int *n_spill,
+prompt_kv_verdict server::prompt_kv_check(const session_slot *sl, const job *j, SlotIdx *order, BankCount *n_spill,
                                           KvBytes *need) {
     auto *s = this;
-    *n_spill = 0;
+    *n_spill = BankCount{0};
     *need = KvBytes{};
-    if (!s->guard_enabled || s->pool_banks <= 0) return PROMPT_KV_FITS;
+    if (!s->guard_enabled || !s->pool_banks.any()) return PROMPT_KV_FITS;
     pulsar_session *pool = s->sess;
     /* L439: as kv_reserved_bytes -- the request's own count for the rows its stitch adds (a marked crossing) */
     const KvBytes want = pulsar_session_quantum_growth_bytes_per_bank(
@@ -3883,7 +3892,8 @@ prompt_kv_verdict server::prompt_kv_check(const session_slot *sl, const job *j, 
      * (gen_begin), after them, so it parks nothing */
     session_slot *self[1] = {(session_slot *)sl};
     KvBytes drop[PULSAR_SESSION_POOL_CAP];
-    const int n_victims = guard_spill_victims(s, self, sl ? 1 : 0, order, drop, nullptr, /*room_parks=*/sl == NULL);
+    const BankCount n_victims =
+        guard_spill_victims(s, self, sl ? 1 : 0, order, drop, nullptr, /*room_parks=*/sl == NULL);
     /* a bank bound to a job now is a victim once that job ends */
     const bool busy = prompt_kv_busy_may_free(s, sl);
     /* L326: from the reserved base -- prompts bound earlier in this worker turn have touched nothing yet */
@@ -3894,8 +3904,8 @@ prompt_kv_verdict server::prompt_kv_check(const session_slot *sl, const job *j, 
 bool server::prompt_kv_admit(session_slot *sl, job *j, bool *refused) {
     auto *s = this;
     *refused = false;
-    int order[PULSAR_SESSION_POOL_CAP];
-    int n_spill = 0;
+    SlotIdx order[PULSAR_SESSION_POOL_CAP];
+    BankCount n_spill{0};
     KvBytes need{};
     prompt_kv_verdict v = s->prompt_kv_check(sl, j, order, &n_spill, &need);
     /* L314: no idle bank can make room: the newest running decoders are preempted through their terminal checkpoints,
@@ -3915,15 +3925,16 @@ bool server::prompt_kv_admit(session_slot *sl, job *j, bool *refused) {
                        "pulsar-server: kv admission: a %d-token prompt adds %.2f GiB of KV to bank %d (resident %.2f + "
                        "%.2f > budget %.2f GiB): spilling %d idle bank(s) first",
                        request_prompt_toks(&j->req).raw(), (double)need.raw() / gib, sl->bank.raw(), (double)touched.raw() / gib,
-                       (double)need.raw() / gib, (double)s->guard_budget().raw() / gib, n_spill);
+                       (double)need.raw() / gib, (double)s->guard_budget().raw() / gib, n_spill.raw());
         bool failed = false;
-        for (int k = 0; k < n_spill && !failed; k++) {
+        for (int k : n_spill.positions()) {
+            if (failed) break;
             failed = !s->spill_bank(&s->slots[order[k]]);
             if (!failed) s->count_metric(&s->m_spills);
         }
         /* a spill that failed leaves the breach: decide again on what is resident now */
         KvBytes again{};
-        int n2 = 0;
+        BankCount n2{0};
         prompt_kv_verdict v2 = s->prompt_kv_check(sl, j, order, &n2, &again);
         if (v2 == PROMPT_KV_FITS) return true;
         /* L394: a plan whose spill just failed is no plan this turn: retried as SPILL it was re-run every worker turn,
@@ -4001,9 +4012,10 @@ bool server::floor_admits_chunk(int rows, char *err, size_t errlen) {
     server_mem_reading mem = s->mem_reading();
     int spilled = 0;
     for (int round = 0; round <= PULSAR_SESSION_POOL_CAP; round++) {
-        int useful[PULSAR_SESSION_POOL_CAP];
-        const int n_idle = s->guard_enabled && s->pool_banks > 0 ? guard_spill_victims(s, NULL, 0, useful, NULL) : 0;
-        const prefill_mem_step step = server_prefill_mem_step(mem, need, n_idle, /*preemptible=*/false);
+        SlotIdx useful[PULSAR_SESSION_POOL_CAP];
+        const BankCount n_idle = s->guard_enabled && s->pool_banks.any() ? guard_spill_victims(s, NULL, 0, useful, NULL)
+                                                                         : BankCount{0};
+        const prefill_mem_step step = server_prefill_mem_step(mem, need, n_idle.raw(), /*preemptible=*/false);
         if (step == PREFILL_MEM_GO) return true;
         if (step != PREFILL_MEM_SPILL || !s->spill_bank(&s->slots[useful[0]])) break;
         s->count_metric(&s->m_spills);
@@ -4019,7 +4031,7 @@ bool server::floor_admits_chunk(int rows, char *err, size_t errlen) {
 bool server::budget_admits_growth(BankId bank, int end_rows, char *err, size_t errlen) {
     auto *s = this;
     /* no guard, no chat pool, or a host-only server (no session to price a row by): no budget to hold */
-    if (!s->guard_enabled || s->pool_banks <= 0 || !s->sess) return true;
+    if (!s->guard_enabled || !s->pool_banks.any() || !s->sess) return true;
     pulsar_session *pool = s->sess;
     const KvBytes want = pulsar_session_quantum_growth_bytes_per_bank(pool, KvRows{(uint32_t)(end_rows > 0 ? end_rows : 0)});
     const double gib = 1024.0 * 1024.0 * 1024.0;
@@ -4031,9 +4043,10 @@ bool server::budget_admits_growth(BankId bank, int end_rows, char *err, size_t e
         const KvBytes have = pulsar_session_bank_touched_kv_bytes(pool, bank);
         need = want > have ? want - have : KvBytes{};
         base = s->kv_reserved_bytes(NULL);
-        int order[PULSAR_SESSION_POOL_CAP], n_spill = 0;
+        SlotIdx order[PULSAR_SESSION_POOL_CAP];
+        BankCount n_spill{0};
         KvBytes drop[PULSAR_SESSION_POOL_CAP];
-        const int n_victims = guard_spill_victims(s, NULL, 0, order, drop);
+        const BankCount n_victims = guard_spill_victims(s, NULL, 0, order, drop);
         const prompt_kv_verdict v = server_prompt_kv_verdict(base, need, s->guard_budget(), drop, n_victims,
                                                              /*busy_may_free=*/false, &n_spill);
         if (v == PROMPT_KV_FITS) return true;
@@ -4042,8 +4055,8 @@ bool server::budget_admits_growth(BankId bank, int end_rows, char *err, size_t e
                    "pulsar-server: kv admission: bank %d's prompt of %d tokens adds %.2f GiB of KV (resident %.2f + "
                    "%.2f > budget %.2f GiB): spilling %d idle bank(s) first",
                    bank.raw(), end_rows, (double)need.raw() / gib, (double)base.raw() / gib, (double)need.raw() / gib,
-                   (double)s->guard_budget().raw() / gib, n_spill);
-        for (int k = 0; k < n_spill; k++) {
+                   (double)s->guard_budget().raw() / gib, n_spill.raw());
+        for (int k : n_spill.positions()) {
             if (!s->spill_bank(&s->slots[order[k]])) break;
             s->count_metric(&s->m_spills);
             spilled++;
@@ -4067,14 +4080,15 @@ bool server::prefill_headroom_ok(session_slot *sl) {
     const char *why = "nothing left to free";   /* the refusal says which: a REFUSE verdict, or a remedy that failed */
     int spilled = 0;
     for (int round = 0; round <= PULSAR_SESSION_POOL_CAP; round++) {
-        int useful[PULSAR_SESSION_POOL_CAP];
+        SlotIdx useful[PULSAR_SESSION_POOL_CAP];
         session_slot *self[1] = {sl};
         /* in the guard's pick order, the idle banks whose spill frees something */
-        const int n_idle = s->guard_enabled && s->pool_banks > 0 ? guard_spill_victims(s, self, 1, useful, NULL) : 0;
+        const BankCount n_idle = s->guard_enabled && s->pool_banks.any() ? guard_spill_victims(s, self, 1, useful, NULL)
+                                                                         : BankCount{0};
         bool decoders = false;
-        for (int i = 0; i < s->n_slots && !preempt_tried; i++)
+        for (SlotIdx i{0u}; s->n_slots.covers(i) && !preempt_tried; ++i)
             decoders |= &s->slots[i] != sl && slot_is_batchable_decode(&s->slots[i]);
-        const prefill_mem_step step = server_prefill_mem_step(mem, need, n_idle, decoders && !preempt_tried);
+        const prefill_mem_step step = server_prefill_mem_step(mem, need, n_idle.raw(), decoders && !preempt_tried);
         if (step == PREFILL_MEM_GO) return true;
         /* L372 (O12): with no idle chat bank left, the judge bank goes before a decoder is preempted or the prompt
          * refused (server_judge_release: never under a judge request) */
@@ -4134,7 +4148,7 @@ bool server::prefill_headroom_fused_ok(session_slot *sl) {
 int server::guard_maybe_evict(session_slot *const *dec, int n, session_slot **kept) {
     auto *s = this;
     for (int i = 0; i < n; i++) kept[i] = dec[i];
-    if (!s->guard_enabled || s->pool_banks <= 0 || n <= 0) return n;
+    if (!s->guard_enabled || !s->pool_banks.any() || n <= 0) return n;
     pulsar_session *pool = s->sess;
     const KvBytes dpb = pulsar_session_quantum_growth_bytes_per_bank(
             pool, KvRows{(uint32_t)PULSAR_SERVER_DECODE_QUANTUM_TOKENS});
@@ -4151,18 +4165,18 @@ int server::guard_maybe_evict(session_slot *const *dec, int n, session_slot **ke
      * that arithmetic over the LRU victim order and evicts exactly the minimum
      * (usually ONE) per breach, NOT the whole idle set (the cascade bug). The
      * per-quantum count log lets the smoke assert no cascade. */
-    int order[PULSAR_SESSION_POOL_CAP];
+    SlotIdx order[PULSAR_SESSION_POOL_CAP];
     KvBytes drop[PULSAR_SESSION_POOL_CAP];
-    bool dominated[PULSAR_SESSION_POOL_CAP];
-    const int n_victims = guard_spill_victims(s, kept, n, order, drop, dominated);
-    const int plan = guard_spill_plan(base, dpb.times((uint64_t)n), bound, drop, n_victims);
-    int spilled_this_quantum = 0;
-    for (int k = 0; k < plan; k++) {
+    slot_flags dominated;
+    const BankCount n_victims = guard_spill_victims(s, kept, n, order, drop, &dominated);
+    const BankCount plan = guard_spill_plan(base, dpb.times((uint64_t)n), bound, drop, n_victims);
+    BankCount spilled_this_quantum{0};
+    for (int k : plan.positions()) {
         if (dominated[order[k]])
             server_log(PULSAR_LOG_KVCACHE, "pulsar-server: guard: bank %d is dominated (another bank holds its whole "
                                            "history) -- spilled first", s->slots[order[k]].bank.raw());
         if (!s->spill_bank(&s->slots[order[k]])) break;   /* spill failed — stop */
-        spilled_this_quantum++;
+        ++spilled_this_quantum;
         s->count_metric(&s->m_spills);
     }
     if (spilled_this_quantum == n_victims) {
@@ -4173,7 +4187,7 @@ int server::guard_maybe_evict(session_slot *const *dec, int n, session_slot **ke
         /* L372 (O12): the judge bank first, when it is no judge request's now */
         if (s->kv_reserved_bytes(NULL) + dpb.times((uint64_t)n) > bound) (void)server_judge_release(s);
         bool reserving = false;
-        for (int i = 0; i < s->n_slots && !reserving; i++) reserving = server_slot_reserves(&s->slots[i]);
+        for (SlotIdx i{0u}; s->n_slots.covers(i) && !reserving; ++i) reserving = server_slot_reserves(&s->slots[i]);
         while (s->kv_reserved_bytes(NULL) + dpb.times((uint64_t)n) > bound && server_guard_may_preempt(n, reserving) &&
                s->preempt_newest_decoder(NULL, n > 0 ? dpb.times((uint64_t)(n - 1)) : KvBytes{})) {
             int m = 0;
@@ -4206,10 +4220,10 @@ int server::guard_maybe_evict(session_slot *const *dec, int n, session_slot **ke
                 (double)projected.raw() / gib, (double)bound.raw() / gib);
         }
     }
-    if (spilled_this_quantum > 0) {
+    if (spilled_this_quantum.any()) {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: guard: spilled %d bank(s) this quantum (touched now %.2f GiB / %.2f GiB)",
-                   spilled_this_quantum,
+                   spilled_this_quantum.raw(),
                    (double)pulsar_session_touched_kv_bytes(pool).raw() / (1024.0*1024.0*1024.0),
                    (double)bound.raw() / (1024.0*1024.0*1024.0));
     }
@@ -4236,9 +4250,9 @@ int server::guard_maybe_evict(session_slot *const *dec, int n, session_slot **ke
 /// @param n how many
 /// @param extra a prefilling slot folded into the quantum (may be NULL)
 /// @return true when the live bank is in none of them and must be saved first
-static bool park_live_bank_needed(BankId live_bank, int pool_banks, session_slot *const *dec, int n,
+static bool park_live_bank_needed(BankId live_bank, BankCount pool_banks, session_slot *const *dec, int n,
                                   const session_slot *extra) {
-    if (pool_banks <= 0 || !live_bank.below((uint32_t)pool_banks)) return false;
+    if (!pool_banks.any() || !pool_banks.covers(live_bank)) return false;
     for (int i = 0; i < n; i++)
         if (dec[i] && dec[i]->bank == live_bank) return false;
     if (extra && extra->bank == live_bank) return false;
@@ -4628,7 +4642,7 @@ static bool slot_fusable_prefill(const session_slot *c) {
 }
 
 bool server::fusion_enabled() const {
-    return pool_banks > 0 && pulsar_engine_has_fused_step(engine);
+    return pool_banks.any() && pulsar_engine_has_fused_step(engine);
 }
 
 bool server::fuse_prepare(session_slot *sl) {
@@ -4747,8 +4761,8 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
     /* rule 5 (L284): each prefilling prompt's verdict over this quantum -- the rows it rode in how many
      * rounds, and why it last did not ride -- printed once at the quantum's end */
     struct rider_verdict { int rounds, rows; const char *why; };
-    rider_verdict rv[PULSAR_SESSION_POOL_CAP];
-    memset(rv, 0, sizeof rv);
+    pulsar_indexed<rider_verdict, SlotIdx, PULSAR_SESSION_POOL_CAP> rv;   /* per slot */
+    memset(rv.data(), 0, sizeof rv);
     int round_ix = 0;
     while (emitted_total < quantum_tokens) {
         const bool first_round = round_ix++ == 0;
@@ -4769,7 +4783,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
         sched_prompt sp[PULSAR_SESSION_POOL_CAP];
         double sp_rate[PULSAR_SESSION_POOL_CAP];
         int n_ps = 0;
-        for (int k = 0; k < s->n_slots; k++) {
+        for (SlotIdx k : s->n_slots.slots()) {
             session_slot *c = &s->slots[k];
             if (!slot_prefilling(c)) continue;
             gen_state *pg = c->gen;
@@ -4929,7 +4943,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 ch.fin[i] = false;
             }
             if (ch.q[i] == 0u) {
-                rv[c - s->slots].why = ch.priced ? "worth less than the wait it causes this round"
+                rv[s->slot_index(c)].why = ch.priced ? "worth less than the wait it causes this round"
                                                  : "unpriced: a continuation rides a full quantum's first round";
                 continue;
             }
@@ -5212,7 +5226,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                  * is the length of what the bank will hold -- L439: read from that proof (fuse_witness::end) */
                 gen_prefill_progress_cb(pg, "prefill_chunk", TokPos{(int)(fr[r].p0 + fr[r].k)},
                                         pg->fuse.end().before());
-                rider_verdict *v = &rv[c - s->slots];
+                rider_verdict *v = &rv[s->slot_index(c)];
                 v->rounds++;
                 v->rows += fr[r].k;
                 if (fr[r].fin) {
@@ -5491,7 +5505,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
         if (n_fin > 0) break;
     }
     free(fused_reqs);
-    for (int k = 0; k < s->n_slots; k++) {
+    for (SlotIdx k : s->n_slots.slots()) {
         if (!rv[k].rounds && !rv[k].why) continue;
         const session_slot *c = &s->slots[k];
         /* L439: the total of the bank's position is where it stands with the prompt in (it printed the prompt's own
@@ -5565,12 +5579,12 @@ bool server::batch_leave(session_slot *sl) {
 /// @param n_dec_out receives the decoders counted (may be NULL)
 /// @param deep_out receives their summed committed depth (may be NULL)
 /// @return true when the guard blocks fusion
-static bool mixed_deep_guard_blocks(const session_slot *slots, int n_slots, int guard_rows,
+static bool mixed_deep_guard_blocks(const slot_table &slots, BankCount n_slots, int guard_rows,
                                     int *n_dec_out, long *deep_out) {
     if (guard_rows <= 0) return false;
     long deep = 0;
     int n_dec = 0;
-    for (int i = 0; i < n_slots; i++) {
+    for (SlotIdx i : n_slots.slots()) {
         const session_slot *dl = &slots[i];
         if (dl->provisioned && dl->active_job && dl->state == SLOT_DECODING) {
             deep += dl->committed_pos.before().raw();   /* the bank's tokens */
@@ -5600,7 +5614,7 @@ fuse_witness fuse_witness_of_history(const slot_tokens &h, prompt_view p, TokPos
 session_slot *server::worker_find_fuse_prefill(fuse_witness *w) {
     PULSAR_NVTX_FN();
     auto *s = this;
-    if (!s->mixed_batch_enabled || s->pool_banks <= 0) return NULL;
+    if (!s->mixed_batch_enabled || !s->pool_banks.any()) return NULL;
     /* Those prefills take the classic (unfused) path instead. */
     int n_dec = 0;
     long deep = 0;
@@ -5615,7 +5629,7 @@ session_slot *server::worker_find_fuse_prefill(fuse_witness *w) {
         return NULL;
     }
     pulsar_session *pool = s->sess;
-    for (int i = 0; i < s->n_slots; i++) {
+    for (SlotIdx i : s->n_slots.slots()) {
         session_slot *sl = &s->slots[i];
         gen_state *g = sl->gen;
         if (!sl->active_job || !g || g->phase != GEN_PREFILL_MAIN || !g->prompt_for_sync ||
@@ -5922,7 +5936,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
 /// @return tokens of decode this iteration: 1 while a prompt is within one chunk of its end, else a full quantum
 static int worker_decode_budget(server *s) {
     const int cap = pulsar_session_prefill_cap(s->sess).raw();
-    for (int i = 0; i < s->n_slots; i++) {
+    for (SlotIdx i : s->n_slots.slots()) {
         const session_slot *c = &s->slots[i];
         if (!slot_prefilling(c)) continue;
         const gen_state *g = c->gen;
@@ -5945,15 +5959,16 @@ static int worker_decode_budget(server *s) {
 /// @param skip a slot not to pick (may be NULL)
 /// @param eligible the slot filter
 /// @return the slot, or NULL
-static session_slot *worker_pick_step(server *s, int *rr, const session_slot *skip,
+static session_slot *worker_pick_step(server *s, SlotIdx *rr, const session_slot *skip,
                                       bool (*eligible)(const session_slot *)) {
     for (int pass = 0; pass < 2; pass++) {
-        for (int k = 0; k < s->n_slots; k++) {
-            session_slot *c = &s->slots[(*rr + k) % s->n_slots];
+        for (SlotIdx k : s->n_slots.slots()) {
+            /* L441: the k-th slot from the cursor, wrapping (the cursor may stand one past the last slot) */
+            session_slot *c = &s->slots[SlotIdx{(rr->raw() + k.raw()) % (uint32_t)s->n_slots.raw()}];
             if (c == skip || !eligible(c)) continue;
             /* L330: a restore slice costs what a prompt chunk does */
             if (pass == 0 && (slot_prefilling(c) || (c->gen && c->gen->phase == GEN_RESTORE))) continue;
-            *rr = (int)(c - s->slots) + 1;
+            *rr = s->slot_index(c).next();
             return c;
         }
     }
@@ -6014,7 +6029,7 @@ static void worker_cond_wait_s(pthread_cond_t *cv, pthread_mutex_t *mu, double s
 void *server_worker_main(void *arg) {
     server *s = (server *)arg;
     __atomic_store_n(&s->worker_tid, (int)syscall(SYS_gettid), __ATOMIC_RELAXED);   /* the stall dump's /proc */
-    int rr = 0; /* round-robin cursor: first slot index to consider next */
+    SlotIdx rr{0u}; /* round-robin cursor: first slot index to consider next */
     for (;;) {
         pulsar_stall_mark("worker: scheduling");   /* the watchdog's heartbeat (pulsar_stall.h) */
         bool bound = false;
@@ -6037,7 +6052,7 @@ void *server_worker_main(void *arg) {
         if (bound) s->publish_metrics_snapshot();
 
         int n_active = 0, n_parked = 0;
-        for (int i = 0; i < s->n_slots; i++) {
+        for (SlotIdx i : s->n_slots.slots()) {
             if (s->slots[i].active_job && !s->slots[i].preempted) n_active++;
             if (s->slots[i].preempted) n_parked++;
             /* L006 heartbeat: swept over ALL bound slots, not just the one
@@ -6106,7 +6121,7 @@ void *server_worker_main(void *arg) {
          * decode round.  Stepped after the quantum as an "other" slot, it
          * waited out a full quantum it was not in (c2 on one Spark: ~600 ms
          * of the second prompt's TTFT). */
-        for (int i = 0; i < s->n_slots; i++) {
+        for (SlotIdx i : s->n_slots.slots()) {
             session_slot *c = &s->slots[i];
             if (!c->active_job || !c->gen || c->gen->phase != GEN_DECODE_INIT) continue;
             s->generate_job_step(c);
@@ -6123,8 +6138,8 @@ void *server_worker_main(void *arg) {
          * three-way lane that lived here is deleted. */
         session_slot *dec[PULSAR_SESSION_POOL_CAP];
         int n_dec = 0, n_batched = 0;
-        if (s->pool_banks > 0) {
-            for (int i = 0; i < s->n_slots; i++) {
+        if (s->pool_banks.any()) {
+            for (SlotIdx i : s->n_slots.slots()) {
                 if (slot_is_batchable_decode(&s->slots[i])) {
                     dec[n_dec++] = &s->slots[i];
                     if (s->slots[i].gen->batch_active) n_batched++;
@@ -6156,7 +6171,7 @@ void *server_worker_main(void *arg) {
         /* L284 lane cost: where the spec lane could carry every decoder, the faster lane by measured price takes
          * them (lane_price_pick, one rule for every family) */
         const uint32_t verify_rows = pulsar_engine_fused_heads_max(s->engine);
-        const bool spec_carries = s->pool_banks > 0 &&
+        const bool spec_carries = s->pool_banks.any() &&
                                   server_spec_lane_carries(pulsar_engine_has_spec_rounds(s->engine), verify_rows,
                                                            dec, n_dec);
         int priced = 0;

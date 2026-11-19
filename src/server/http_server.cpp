@@ -405,14 +405,14 @@ bool server::send_health(int fd) {
     double kv = 0.0; /* max KV utilization across provisioned slots */
     pthread_mutex_lock(&s->mu);
     draining = s->stopping;
-    n_slots  = s->n_slots;
+    n_slots  = s->n_slots.raw();   /* L441: the published snapshot is indexed by the slot's number */
     /* The pool the run was sized for, not the number of banks provisioned so
      * far. Banks 1..pool_banks-1 are provisioned lazily as conversations
      * arrive, so `total` ramps from 1 while this does not move — and a reader
      * that wants to reserve space for the pool (pulsar-gui draws one row per
      * slot) needs the number that will not change under it. Classic mode is a
      * pool of one. */
-    capacity = s->pool_banks > 0 ? s->pool_banks : 1;
+    capacity = s->pool_banks.any() ? s->pool_banks.raw() : 1;
     running  = s->n_generating;
     waiting  = s->n_queued;
     started  = s->started;
@@ -605,7 +605,7 @@ bool server::send_metrics(int fd) {
     const pulsar_verify_curve_view vc = s->m_verify_curve;
     const pulsar_spec_calibration cal = s->m_spec_calib;
     const char *drafter = s->m_drafter_name ? s->m_drafter_name : "";
-    n_slots = s->n_slots;
+    n_slots = s->n_slots.raw();   /* L441: the published snapshot is indexed by the slot's number */
     for (int i = 0; i < n_slots; i++) {
         const int pos = s->m_slot_pos[i];
         const int ctx = s->m_slot_ctx[i];
@@ -902,7 +902,7 @@ bool server::send_metrics(int fd) {
      * slot to the full pool over the first minutes of a session. */
     buf_puts(&b, "# HELP pulsar:slot_pool_capacity Decode banks this run was sized for.\n");
     buf_puts(&b, "# TYPE pulsar:slot_pool_capacity gauge\n");
-    buf_printf(&b, "pulsar:slot_pool_capacity %d\n", s->pool_banks > 0 ? s->pool_banks : 1);
+    buf_printf(&b, "pulsar:slot_pool_capacity %d\n", s->pool_banks.any() ? s->pool_banks.raw() : 1);
     buf_puts(&b, "# HELP pulsar:spec_draft_depth Adaptive draft depth per slot (0 = no drafter/idle).\n");
     buf_puts(&b, "# TYPE pulsar:spec_draft_depth gauge\n");
     for (int i = 0; i < n_slots; i++)

@@ -1,7 +1,8 @@
 /** @file
  *  Typed quantities that share a raw integer type but must never mix (L333, L334): KvRows, KvBytes, TokCount,
  *  PromptToks, TokPos, the P2b index spaces, TokId, BankId, TensorBytes, TextBytes, the layer index spaces (L436),
- *  the output path's text offsets (L437), slab, file and model-map offsets (L438) */
+ *  the output path's text offsets (L437), slab, file and model-map offsets (L438), the server's session slots, bank
+ *  counts and job / trace ids (L441) */
 #ifndef PULSAR_UNITS_H
 #define PULSAR_UNITS_H
 
@@ -717,7 +718,7 @@ static_assert(sizeof(TrunkLayer) == sizeof(uint32_t) && sizeof(LayerSlot) == siz
  *   pulsar_indexed_view<T, Index>   a pointer and its count, for a heap table or a caller's array.
  *
  * operator[](Index) only, bounds checked (fatal: an index past the table, none() included, is a programmer error --
- * rule 9); data() / size() are for where the table leaves the type system whole (memcpy, memset, a kernel launch, a
+ * rule 9; L441: a signed index -- BankId -- is checked as its unsigned 64-bit value, so its none() fails too); data() / size() are for where the table leaves the type system whole (memcpy, memset, a kernel launch, a
  * digest, a walk by another counter in the owner's own module). */
 
 /** A subscript past an indexed table: fatal (rule 9).
@@ -740,7 +741,7 @@ struct pulsar_indexed {
     constexpr T &operator[](Index i) {
         static_assert(sizeof(pulsar_indexed) == sizeof(T[N]) && alignof(pulsar_indexed) == alignof(T[N]),
                       "an indexed table has the size and alignment of the array it replaces");
-        return i.raw() < N ? v_[i.raw()] : (pulsar_indexed_fail(i.raw(), N), v_[0]);
+        return static_cast<uint64_t>(i.raw()) < N ? v_[i.raw()] : (pulsar_indexed_fail(static_cast<uint64_t>(i.raw()), N), v_[0]);
     }
     /** Entry `i`, read-only (fatal past the table).
      *  @param i the index, in this table's space */
@@ -748,7 +749,7 @@ struct pulsar_indexed {
     constexpr const T &operator[](Index i) const {
         static_assert(sizeof(pulsar_indexed) == sizeof(T[N]) && alignof(pulsar_indexed) == alignof(T[N]),
                       "an indexed table has the size and alignment of the array it replaces");
-        return i.raw() < N ? v_[i.raw()] : (pulsar_indexed_fail(i.raw(), N), v_[0]);
+        return static_cast<uint64_t>(i.raw()) < N ? v_[i.raw()] : (pulsar_indexed_fail(static_cast<uint64_t>(i.raw()), N), v_[0]);
     }
     /** The array itself, where it leaves the type system whole. */
     /// @return the first entry's address
@@ -1325,5 +1326,222 @@ static_assert(!std::is_constructible<TensorBytes, KvBytes>::value && !std::is_co
                   !std::is_convertible<uint64_t, TextBytes>::value && !std::is_convertible<TextBytes, uint64_t>::value,
               "tensor, KV and text bytes are three units: none converts to another, to a row count or to an integer");
 /* ==== L438: byte offsets -- into a slab, into a file, into a model map (end) ======================================= */
+
+
+/* ==== L441: the server's session slots, pool counts, job and trace ids (begin) =======================================
+ * The server's bank pool has two index spaces and their count, all once `int`:
+ *
+ *   SlotIdx     a slot of the server's session pool (server::slots[], 0 .. PULSAR_SESSION_POOL_CAP - 1): which
+ *               conversation descriptor.  An index (pulsar_index, above): ordered, stepped, none() the "no slot" the
+ *               int -1 meant (a victim not found, a waiter with no slot).
+ *   BankId      a bank of the engine's pool (L334 P4).  Slot i holds bank i by construction (fae579f0), and that is
+ *               the ONE relation between the two spaces, owned by the server: server::bank_of_slot (slot -> bank)
+ *               and server::slot_of_bank (bank -> slot), both checking it.  A SlotIdx is no integer, so
+ *               `BankId{slot}` does not compile.
+ *   BankCount   how many banks (or slots: the same count, by the identity) a pool, a plan or a list holds: the
+ *               pool's banks, the provisioned slots' high-water, the judge's banks, a spill plan's victims.  Not an
+ *               index of either space: an index is asked against it by name (n.covers(i)), and a loop walks the
+ *               indexes below it (for (SlotIdx i : n.slots()), for (BankId b : n.banks())).  It counts up (++) and
+ *               adds and compares with its own kind; it is held as the int it replaced.
+ *
+ * Tables subscripted by one space are pulsar_indexed<T, SlotIdx, N> or pulsar_indexed<T, BankId, N> (L436's form):
+ * a per-bank residency table cannot be read by a slot, nor a per-slot protect / dominated / scratch table by a bank.
+ *
+ * Ids of the server's work, a sequence number each, 0 = none (the uint64 fields' "not waiting" / "no request"):
+ *
+ *   JobId       the server's job / request number, given at enqueue (job::seq): the `kv req:` id, the persist line's
+ *               id (L415), the prefix wait's leader.  One number: every one of those is copied from job::seq.
+ *   TraceId     a trace's id (server::trace_begin's counter, one per generation that traces): its own count, not a
+ *               job's (a job that begins twice traces twice).
+ *   AgentJobId  the coding agent's background bash job number (its own counter, from 1).
+ *
+ * == / != and is_none() only; next() is the counter's step (the id after this one).  The tool memory's call ids are
+ * client strings, no number: nothing to type there. */
+
+/** Tag of SlotIdx (never instantiated). */
+struct pulsar_server_slot_tag;
+/** A slot of the server's session pool (L441). */
+typedef pulsar_index<pulsar_server_slot_tag> SlotIdx;
+
+/** The indexes 0 .. n-1 of one space, for a range-for: what `for (i = 0; i < n; i++)` walked (L441).  Index enters
+ *  each value explicitly (SlotIdx, BankId; int for the positions of a list a count counts). */
+template <class Index>
+class pulsar_index_range {
+public:
+    /** The walk's cursor. */
+    class iterator {
+    public:
+        /** At raw index `k`.  @param k the raw index */
+        constexpr explicit iterator(uint32_t k) : k_(k) {}
+        /** The index here. */
+        /// @return Index{k}
+        constexpr Index operator*() const { return Index(k_); }
+        /** Step. */
+        /// @return `*this`
+        constexpr iterator &operator++() { ++k_; return *this; }
+        /** Not at the same index. */
+        friend constexpr bool operator!=(iterator a, iterator b) { return a.k_ != b.k_; }
+
+    private:
+        uint32_t k_;  ///< the raw index
+    };
+    /** The indexes below `n`.  @param n the count (0 or more) */
+    constexpr explicit pulsar_index_range(uint32_t n) : n_(n) {}
+    /** The first index. */
+    /// @return the cursor at 0
+    constexpr iterator begin() const { return iterator(0u); }
+    /** Past the last. */
+    /// @return the cursor at n
+    constexpr iterator end() const { return iterator(n_); }
+
+private:
+    uint32_t n_;  ///< the count
+};
+
+/** A count of banks -- of a pool, of the provisioned slots, of a plan's victims (L441): the int it replaced, a count
+ *  of its own kind only. */
+class BankCount {
+public:
+    /** Uninitialised, as the int it replaces (value-initialise for 0). */
+    BankCount() = default;
+    /** Enter from a raw integer (explicit only; bool and floating point are refused).
+     *  @param v the count, converted to int exactly as an assignment to the old field was */
+    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    constexpr explicit BankCount(I v) : v_(static_cast<int>(v)) {}
+    /** The count that reaches slot `i`: i + 1 (the high-water a slot raises; fatal on none()).
+     *  @param i the slot */
+    /// @return i + 1 as a count
+    static constexpr BankCount through(SlotIdx i) {
+        return i.is_none() ? (pulsar_index_fail("BankCount::through"), BankCount(0)) : BankCount(i.raw() + 1u);
+    }
+    /** The bank just past the first n: bank n -- the one count -> bank crossing (a pool's banks are 0 .. n-1, so the
+     *  bank past a chat pool of n is n: the judge's reserved bank, cli_main).  (A negative count is no count: fatal.) */
+    /// @return BankId{n}
+    constexpr BankId bank_past() const {
+        return v_ < 0 ? (pulsar_index_fail("BankCount::bank_past"), BankId::none()) : BankId(v_);
+    }
+    /** The raw count, where it leaves the type system (printf, /metrics, JSON, an engine call that takes an int). */
+    /// @return the count
+    constexpr int raw() const { return v_; }
+    /** Is the count above zero (a pool at all, a plan with a victim)? */
+    /// @return true when > 0
+    constexpr bool any() const { return v_ > 0; }
+    /** Is slot `i` below this count?  none() is below nothing.
+     *  @param i the slot */
+    /// @return true when i < n
+    constexpr bool covers(SlotIdx i) const { return v_ > 0 && i.below((uint32_t)v_); }
+    /** Is bank `b` below this count?  none() is below nothing.
+     *  @param b the bank */
+    /// @return true when 0 <= b < n
+    constexpr bool covers(BankId b) const { return v_ > 0 && b.below((uint32_t)v_); }
+    /** The slots below this count, for a range-for (a negative count walks none). */
+    /// @return SlotIdx 0 .. n-1
+    constexpr pulsar_index_range<SlotIdx> slots() const { return pulsar_index_range<SlotIdx>(v_ > 0 ? (uint32_t)v_ : 0u); }
+    /** The banks below this count, for a range-for (a negative count walks none). */
+    /// @return BankId 0 .. n-1
+    constexpr pulsar_index_range<BankId> banks() const { return pulsar_index_range<BankId>(v_ > 0 ? (uint32_t)v_ : 0u); }
+    /** The positions 0 .. n-1 of a list this count counts (a spill plan's victims, in order): a list's own ordinal,
+     *  neither a slot nor a bank (a negative count walks none). */
+    /// @return int 0 .. n-1
+    constexpr pulsar_index_range<int> positions() const { return pulsar_index_range<int>(v_ > 0 ? (uint32_t)v_ : 0u); }
+    /** One more. */
+    /// @return `*this`
+    constexpr BankCount &operator++() { ++v_; return *this; }
+    /** One more, the old count returned. */
+    /// @return the count before
+    constexpr BankCount operator++(int) { BankCount o = *this; ++v_; return o; }
+    /** Sum. */
+    friend constexpr BankCount operator+(BankCount a, BankCount b) { return BankCount(a.v_ + b.v_); }
+    /** Difference. */
+    friend constexpr BankCount operator-(BankCount a, BankCount b) { return BankCount(a.v_ - b.v_); }
+    /** Equal. */
+    friend constexpr bool operator==(BankCount a, BankCount b) { return a.v_ == b.v_; }
+    /** Not equal. */
+    friend constexpr bool operator!=(BankCount a, BankCount b) { return a.v_ != b.v_; }
+    /** Less. */
+    friend constexpr bool operator<(BankCount a, BankCount b) { return a.v_ < b.v_; }
+    /** Less or equal. */
+    friend constexpr bool operator<=(BankCount a, BankCount b) { return a.v_ <= b.v_; }
+    /** Greater. */
+    friend constexpr bool operator>(BankCount a, BankCount b) { return a.v_ > b.v_; }
+    /** Greater or equal. */
+    friend constexpr bool operator>=(BankCount a, BankCount b) { return a.v_ >= b.v_; }
+
+private:
+    int v_;  ///< the count
+};
+
+/** A sequence number of one kind of the server's (or the agent's) work, 0 = none (L441). */
+template <class Tag, class Rep = uint64_t>
+class pulsar_seq_id {
+    static_assert(std::is_integral<Rep>::value && !std::is_same<Rep, bool>::value, "an id is held as an integer");
+
+public:
+    /** Uninitialised, as the integer it replaces (value-initialise for none()). */
+    pulsar_seq_id() = default;
+    /** Enter from a raw integer (explicit only; bool and floating point are refused; 0 enters as none()).
+     *  @param v the raw id */
+    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    constexpr explicit pulsar_seq_id(I v) : v_(static_cast<Rep>(v)) {}
+    /** No id (0). */
+    /// @return none()
+    static constexpr pulsar_seq_id none() { return pulsar_seq_id(Rep(0)); }
+    /** Is this none()? */
+    /// @return true for 0
+    constexpr bool is_none() const { return v_ == Rep(0); }
+    /** The id the counter gives after this one: the counter's step. */
+    /// @return this + 1
+    constexpr pulsar_seq_id next() const { return pulsar_seq_id(Rep(v_ + Rep(1))); }
+    /** The raw id, where it leaves the type system (a log line, a hash, a wire field). */
+    /// @return the id (none() as 0)
+    constexpr Rep raw() const { return v_; }
+    /** The same id. */
+    friend constexpr bool operator==(pulsar_seq_id a, pulsar_seq_id b) { return a.v_ == b.v_; }
+    /** Another id. */
+    friend constexpr bool operator!=(pulsar_seq_id a, pulsar_seq_id b) { return a.v_ != b.v_; }
+
+private:
+    Rep v_;  ///< the id; 0 = none()
+};
+
+/** Tag of JobId (never instantiated). */
+struct pulsar_job_id_tag;
+/** Tag of TraceId (never instantiated). */
+struct pulsar_trace_id_tag;
+/** Tag of AgentJobId (never instantiated). */
+struct pulsar_agent_job_tag;
+/** The server's job / request number (job::seq) (L441). */
+typedef pulsar_seq_id<pulsar_job_id_tag> JobId;
+/** A trace's id (server::trace_begin) (L441). */
+typedef pulsar_seq_id<pulsar_trace_id_tag> TraceId;
+/** The coding agent's background bash job number (L441). */
+typedef pulsar_seq_id<pulsar_agent_job_tag, int> AgentJobId;
+
+static_assert(sizeof(SlotIdx) == sizeof(uint32_t) && std::is_trivial<SlotIdx>::value &&
+                  std::is_standard_layout<SlotIdx>::value && sizeof(BankCount) == sizeof(int) &&
+                  std::is_trivial<BankCount>::value && std::is_standard_layout<BankCount>::value &&
+                  sizeof(JobId) == sizeof(uint64_t) && std::is_trivial<JobId>::value &&
+                  std::is_standard_layout<JobId>::value && sizeof(TraceId) == sizeof(uint64_t) &&
+                  std::is_trivial<TraceId>::value && sizeof(AgentJobId) == sizeof(int) &&
+                  std::is_trivial<AgentJobId>::value,
+              "a slot, a bank count and the ids are as cheap as the integers they replace (memset / calloc-safe)");
+static_assert(!std::is_constructible<BankId, SlotIdx>::value && !std::is_constructible<SlotIdx, BankId>::value &&
+                  !std::is_constructible<BankCount, SlotIdx>::value && !std::is_constructible<SlotIdx, BankCount>::value &&
+                  !std::is_constructible<BankCount, BankId>::value && !std::is_constructible<BankId, BankCount>::value &&
+                  !std::is_constructible<SlotIdx, TrunkLayer>::value && !std::is_constructible<TrunkLayer, SlotIdx>::value &&
+                  !std::is_constructible<SlotIdx, LayerSlot>::value && !std::is_constructible<LayerSlot, SlotIdx>::value &&
+                  !std::is_constructible<JobId, TraceId>::value && !std::is_constructible<TraceId, JobId>::value &&
+                  !std::is_constructible<JobId, AgentJobId>::value && !std::is_constructible<AgentJobId, JobId>::value &&
+                  !std::is_constructible<JobId, BankId>::value && !std::is_constructible<JobId, TokId>::value &&
+                  !std::is_constructible<BankCount, KvRows>::value && !std::is_constructible<BankCount, TokCount>::value,
+              "a slot is no bank (server::bank_of_slot is the crossing), a count no index of either, a job no trace");
+static_assert(!std::is_convertible<int, SlotIdx>::value && !std::is_convertible<SlotIdx, uint32_t>::value &&
+                  !std::is_convertible<int, BankCount>::value && !std::is_convertible<BankCount, int>::value &&
+                  !std::is_convertible<uint64_t, JobId>::value && !std::is_convertible<JobId, uint64_t>::value &&
+                  !std::is_convertible<uint64_t, TraceId>::value && !std::is_convertible<TraceId, uint64_t>::value &&
+                  !std::is_convertible<int, AgentJobId>::value && !std::is_convertible<AgentJobId, int>::value &&
+                  !std::is_constructible<BankCount, bool>::value && !std::is_constructible<SlotIdx, double>::value,
+              "no implicit way in or out of a bare integer");
+/* ==== L441: the server's session slots, pool counts, job and trace ids (end) ======================================= */
 
 #endif

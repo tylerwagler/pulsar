@@ -37,6 +37,15 @@ static void test_assert(bool cond, const char *file, int line, const char *expr)
 
 #define TEST_ASSERT(expr) test_assert((expr), __FILE__, __LINE__, #expr)
 
+/* ---- L441: the tests name slots and banks by number ---------------------------------------------------------- */
+/** Slot `i` of a test's pool.  @param i the slot's number  @return the slot */
+static SlotIdx sx(uint32_t i) { return SlotIdx{i}; }
+/** Bank `b` of a test's pool.  @param b the bank's number  @return the bank */
+static BankId bx(int b) { return BankId{b}; }
+/** The bank a fixture's slot `i` holds (slot i holds bank i, as cli_main sets every slot).  @param i the slot
+ *  @return its bank */
+static BankId tbank_of(SlotIdx i) { return BankId{(int)i.raw()}; }
+
 /* ---- L439: the routing and prefix-wait predicates on UNSEAMED numbers -----------------------------------------
  * The predicates take each count in its currency (the bank's tokens, the request's, a position on either).  Every
  * test written before that passed bare integers, and each of those cases is one with no token seam: the request's
@@ -3781,10 +3790,10 @@ static void test_anthropic_tool_result_id_validation(void) {
     TEST_ASSERT(strstr(err, "Anthropic continuation state is not available") != NULL);
 
     pthread_mutex_lock(&s.tool_mu);
-    s.n_slots = 1; /* live bindings are per-slot; has_call_id scans slots */
-    s.slots[0].anthropic_live.valid = true;
-    s.slots[0].anthropic_live.live_tokens = TokCount{10};
-    id_list_push_unique(&s.slots[0].anthropic_live.call_ids, "toolu_missing");
+    s.n_slots = BankCount{1}; /* live bindings are per-slot; has_call_id scans slots */
+    s.slots[SlotIdx{0u}].anthropic_live.valid = true;
+    s.slots[SlotIdx{0u}].anthropic_live.live_tokens = TokCount{10};
+    id_list_push_unique(&s.slots[SlotIdx{0u}].anthropic_live.call_ids, "toolu_missing");
     pthread_mutex_unlock(&s.tool_mu);
     bool needs_live_tool_state = false;
     err[0] = '\0';
@@ -3794,7 +3803,7 @@ static void test_anthropic_tool_result_id_validation(void) {
     TEST_ASSERT(needs_live_tool_state);
 
     chat_msgs_free(&msgs);
-    live_tool_state_free(&s.slots[0].anthropic_live);
+    live_tool_state_free(&s.slots[SlotIdx{0u}].anthropic_live);
     pthread_mutex_destroy(&s.tool_mu);
 }
 
@@ -9795,10 +9804,10 @@ static void test_anthropic_tool_use_parses_before_role(void) {
      * tool_result blocks are mistaken for live-only continuations and rejected
      * once the live frontier has moved on to newer tool calls. */
     pthread_mutex_lock(&s.tool_mu);
-    s.n_slots = 1;
-    s.slots[0].anthropic_live.valid = true;
-    s.slots[0].anthropic_live.live_tokens = TokCount{100};
-    id_list_push_unique(&s.slots[0].anthropic_live.call_ids, "toolu_current");
+    s.n_slots = BankCount{1};
+    s.slots[SlotIdx{0u}].anthropic_live.valid = true;
+    s.slots[SlotIdx{0u}].anthropic_live.live_tokens = TokCount{100};
+    id_list_push_unique(&s.slots[SlotIdx{0u}].anthropic_live.call_ids, "toolu_current");
     pthread_mutex_unlock(&s.tool_mu);
 
     const char *json =
@@ -9828,7 +9837,7 @@ static void test_anthropic_tool_use_parses_before_role(void) {
     TEST_ASSERT(!needs_live_tool_state);
 
     chat_msgs_free(&msgs);
-    live_tool_state_free(&s.slots[0].anthropic_live);
+    live_tool_state_free(&s.slots[SlotIdx{0u}].anthropic_live);
     pthread_mutex_destroy(&s.tool_mu);
 }
 
@@ -9917,10 +9926,10 @@ static void test_responses_tool_output_id_validation(void) {
     TEST_ASSERT(strstr(err, "Responses continuation state is not available") != NULL);
 
     pthread_mutex_lock(&s.tool_mu);
-    s.n_slots = 1;
-    s.slots[0].responses_live.valid = true;
-    s.slots[0].responses_live.live_tokens = TokCount{10};
-    id_list_push_unique(&s.slots[0].responses_live.call_ids, "call_missing");
+    s.n_slots = BankCount{1};
+    s.slots[SlotIdx{0u}].responses_live.valid = true;
+    s.slots[SlotIdx{0u}].responses_live.live_tokens = TokCount{10};
+    id_list_push_unique(&s.slots[SlotIdx{0u}].responses_live.call_ids, "call_missing");
     pthread_mutex_unlock(&s.tool_mu);
     err[0] = '\0';
     bool needs_live_tool_state = false;
@@ -9930,7 +9939,7 @@ static void test_responses_tool_output_id_validation(void) {
     TEST_ASSERT(needs_live_tool_state);
 
     chat_msgs_free(&msgs);
-    live_tool_state_free(&s.slots[0].responses_live);
+    live_tool_state_free(&s.slots[SlotIdx{0u}].responses_live);
     pthread_mutex_destroy(&s.tool_mu);
 }
 
@@ -9967,10 +9976,10 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
     TEST_ASSERT(needs_live_reasoning);
 
     pthread_mutex_lock(&s.tool_mu);
-    s.n_slots = 1;
-    s.slots[0].responses_live.valid = true;
-    s.slots[0].responses_live.live_tokens = TokCount{123};
-    id_list_push_unique(&s.slots[0].responses_live.call_ids, "call_replay");
+    s.n_slots = BankCount{1};
+    s.slots[SlotIdx{0u}].responses_live.valid = true;
+    s.slots[SlotIdx{0u}].responses_live.live_tokens = TokCount{123};
+    id_list_push_unique(&s.slots[SlotIdx{0u}].responses_live.call_ids, "call_replay");
     pthread_mutex_unlock(&s.tool_mu);
     err[0] = '\0';
     needs_live_reasoning = false;
@@ -10007,7 +10016,7 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
     TEST_ASSERT(!needs_live_reasoning);
 
     chat_msgs_free(&msgs);
-    live_tool_state_free(&s.slots[0].responses_live);
+    live_tool_state_free(&s.slots[SlotIdx{0u}].responses_live);
     pthread_mutex_destroy(&s.tool_mu);
 }
 
@@ -13446,10 +13455,10 @@ static void test_l353_parked_decoder_frees_nothing(void) {
     sl.active_job = (job *)&dummy;
     sl.provisioned = false;
     TEST_ASSERT(!server_slot_end_frees_kv(&sl));
-    int k = 0;
+    BankCount k{0};
     const KvBytes t{10}, d{10}, b{15};   /* touched + growth past the budget; no victims */
-    TEST_ASSERT(server_prompt_kv_verdict(t, d, b, NULL, 0, true, &k) == PROMPT_KV_WAIT);
-    TEST_ASSERT(server_prompt_kv_verdict(t, d, b, NULL, 0, false, &k) == PROMPT_KV_REFUSE);
+    TEST_ASSERT(server_prompt_kv_verdict(t, d, b, NULL, BankCount{0}, true, &k) == PROMPT_KV_WAIT);
+    TEST_ASSERT(server_prompt_kv_verdict(t, d, b, NULL, BankCount{0}, false, &k) == PROMPT_KV_REFUSE);
 }
 
 /* L354: a refusal frees what the parse read: a thinking control's raw value is the body's size, and repeated refusals
@@ -13584,16 +13593,16 @@ static void test_l353_routing_fixes(void) {
         server s;
         memset(&s, 0, sizeof s);
         pthread_mutex_init(&s.tool_mu, NULL);
-        s.n_slots = 3;
-        for (int i = 0; i < 3; i++) s.slots[i].provisioned = true;
-        s.slots[0].last_serviced_us = 10;   /* the oldest, its client running a tool */
-        s.slots[0].anthropic_live.valid = true;
-        s.slots[1].last_serviced_us = 20;
-        s.slots[2].last_serviced_us = 30;   /* the newest, but dead */
-        s.slots[2].hint_dead = true;
-        int order[PULSAR_SESSION_POOL_CAP];
-        const int n = guard_victim_order(&s, NULL, 0, order);
-        TEST_ASSERT(n == 3 && order[0] == 2 && order[1] == 1 && order[2] == 0);
+        s.n_slots = BankCount{3};
+        for (SlotIdx i : s.n_slots.slots()) s.slots[i].provisioned = true;
+        s.slots[SlotIdx{0u}].last_serviced_us = 10;   /* the oldest, its client running a tool */
+        s.slots[SlotIdx{0u}].anthropic_live.valid = true;
+        s.slots[SlotIdx{1u}].last_serviced_us = 20;
+        s.slots[SlotIdx{2u}].last_serviced_us = 30;   /* the newest, but dead */
+        s.slots[SlotIdx{2u}].hint_dead = true;
+        SlotIdx order[PULSAR_SESSION_POOL_CAP];
+        const BankCount n = guard_victim_order(&s, NULL, 0, order);
+        TEST_ASSERT(n == BankCount{3} && order[0] == sx(2) && order[1] == sx(1) && order[2] == sx(0));
         pthread_mutex_destroy(&s.tool_mu);
     }
 }
@@ -13617,13 +13626,13 @@ static void test_l353_small_fixes(void) {
     {
         server s;
         memset(&s, 0, sizeof s);
-        s.pool_banks = 2;
-        s.n_slots = 1;
-        s.slots[0].provisioned = true;
-        s.slots[0].terminal_pending = true;
-        s.slots[0].hint_dead = true;
+        s.pool_banks = BankCount{2};
+        s.n_slots = BankCount{1};
+        s.slots[SlotIdx{0u}].provisioned = true;
+        s.slots[SlotIdx{0u}].terminal_pending = true;
+        s.slots[SlotIdx{0u}].hint_dead = true;
         TEST_ASSERT(!s.terminal_checkpoint_step(0.0, true));
-        TEST_ASSERT(!s.slots[0].terminal_pending);
+        TEST_ASSERT(!s.slots[SlotIdx{0u}].terminal_pending);
     }
     /* 13: a file that can't be opened now is transient: it and its descendants stay; a missing one is a fault (1).
      * L375 (O25): transient is 3 -- a read that failed now -- not the RAM pool's 2, which the reader waits on the
@@ -13705,15 +13714,15 @@ static void test_l372_predecode_failure_ends_the_job(void) {
         server s;
         memset(&s, 0, sizeof s);
         pthread_mutex_init(&s.mu, NULL);
-        s.pool_banks = 2;
-        s.n_slots = 2;
+        s.pool_banks = BankCount{2};
+        s.n_slots = BankCount{2};
         s.n_generating = 1;
         job j;
         memset(&j, 0, sizeof j);
         pthread_mutex_init(&j.mu, NULL);
         pthread_cond_init(&j.cv, NULL);
         j.fd = sv[0];
-        session_slot *sl = &s.slots[1];
+        session_slot *sl = &s.slots[SlotIdx{1u}];
         sl->provisioned = true;
         sl->bank = BankId{1};
         sl->preempted = true;
@@ -13746,15 +13755,15 @@ static void test_l372_failed_readmission_marks_the_bank_spilled(void) {
     server s;
     memset(&s, 0, sizeof s);
     pthread_mutex_init(&s.mu, NULL);
-    s.pool_banks = 2;
-    s.n_slots = 2;
+    s.pool_banks = BankCount{2};
+    s.n_slots = BankCount{2};
     s.live_bank = BankId::none();   /* nothing installed: the switch below saves no outgoing bank */
     int dummy = 0;
     gen_state g;
     memset(&g, 0, sizeof g);
     g.finish = "length";
     g.phase = GEN_DECODE;
-    session_slot *v = &s.slots[1];
+    session_slot *v = &s.slots[SlotIdx{1u}];
     v->provisioned = true;
     v->bank = BankId{1};
     v->active_job = (job *)&dummy;
@@ -13836,17 +13845,17 @@ static void test_l372_empty_banks_are_not_spill_victims(void) {
     server s;
     memset(&s, 0, sizeof s);
     pthread_mutex_init(&s.tool_mu, NULL);
-    s.n_slots = 3;
-    for (int i = 0; i < 3; i++) {
+    s.n_slots = BankCount{3};
+    for (SlotIdx i : s.n_slots.slots()) {
         s.slots[i].provisioned = true;
-        s.slots[i].bank = BankId{i};
-        s.slots[i].last_serviced_us = (uint64_t)(10 * (i + 1));
+        s.slots[i].bank = tbank_of(i);
+        s.slots[i].last_serviced_us = (uint64_t)(10 * (i.raw() + 1));
     }
-    int order[PULSAR_SESSION_POOL_CAP];
+    SlotIdx order[PULSAR_SESSION_POOL_CAP];
     KvBytes drop[PULSAR_SESSION_POOL_CAP];
-    TEST_ASSERT(guard_victim_order(&s, NULL, 0, order) == 3);
-    TEST_ASSERT(guard_spill_victims(&s, NULL, 0, order, drop) == 0);
-    TEST_ASSERT(guard_spill_victims(&s, NULL, 0, order, NULL) == 0);
+    TEST_ASSERT(guard_victim_order(&s, NULL, 0, order) == BankCount{3});
+    TEST_ASSERT(guard_spill_victims(&s, NULL, 0, order, drop) == BankCount{0});
+    TEST_ASSERT(guard_spill_victims(&s, NULL, 0, order, NULL) == BankCount{0});
     pthread_mutex_destroy(&s.tool_mu);
 }
 
@@ -13901,12 +13910,12 @@ static void test_l372_abandoned_prefill_drops_stale_bindings(void) {
         memset(&s, 0, sizeof s);
         pthread_mutex_init(&s.mu, NULL);
         pthread_mutex_init(&s.tool_mu, NULL);
-        s.pool_banks = 2;
-        s.n_slots = 2;
+        s.pool_banks = BankCount{2};
+        s.n_slots = BankCount{2};
         job j;
         memset(&j, 0, sizeof j);
         j.fd = sv[0];
-        session_slot *sl = &s.slots[1];
+        session_slot *sl = &s.slots[SlotIdx{1u}];
         sl->provisioned = true;
         sl->bank = BankId{1};
         sl->active_job = &j;
@@ -14395,24 +14404,25 @@ static void test_l378_segstore_io_ledger(void) {
 /// @param ro        per bank: its history was taken by a read-only request
 /// @param served    per bank: its last service (the LRU key)
 /// @param scratch   receives, per bank, server_slot_is_scratch at the disk tier's default minimum
-static void l379_banks(session_slot *slots, int n, const int *tokens, const bool *ro, const uint64_t *served,
-                       bool scratch[PULSAR_SESSION_POOL_CAP]) {
-    memset(slots, 0, sizeof(session_slot) * PULSAR_SESSION_POOL_CAP);
-    for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) scratch[i] = false;
+static void l379_banks(slot_table &slots, int n, const int *tokens, const bool *ro, const uint64_t *served,
+                       slot_flags &scratch) {
+    memset(slots.data(), 0, sizeof slots);
+    scratch = {};
     const int min_tokens = kv_cache_default_options().min_tokens;
-    for (int i = 0; i < n; i++) {
+    for (SlotIdx i : BankCount{n}.slots()) {
+        const uint32_t k = i.raw();   /* the fixture's own arrays, by the slot's number */
         slots[i].provisioned = true;
-        slots[i].bank = BankId{i};
-        slots[i].kv_flags = ro[i] ? KV_HDR_READ_ONLY : 0u;
-        slots[i].last_serviced_us = served[i];
-        scratch[i] = unseamed_is_scratch(&slots[i], tokens[i], min_tokens);
+        slots[i].bank = bx((int)k);   /* slot i holds bank i */
+        slots[i].kv_flags = ro[k] ? KV_HDR_READ_ONLY : 0u;
+        slots[i].last_serviced_us = served[k];
+        scratch[i] = unseamed_is_scratch(&slots[i], tokens[k], min_tokens);
     }
 }
 
 static void test_l379_request_does_not_evict_its_matched_bank(void) {
-    session_slot slots[PULSAR_SESSION_POOL_CAP];
-    bool scratch[PULSAR_SESSION_POOL_CAP];
-    int victim = -9;
+    slot_table slots;
+    slot_flags scratch;
+    SlotIdx victim{99u};
     /* (i) bank 0: a judge request's history, 60,987 tokens, read-only; bank 1: a conversation, 69,233 tokens, idle
      * longer.  A read-only request whose best match is bank 0 (common 60,460, score 0: no queued job's warm match)
      * is routed fresh, and no bank is empty.  Before: bank 1, the conversation, was evicted (the LRU; 2026-11-06
@@ -14423,34 +14433,34 @@ static void test_l379_request_does_not_evict_its_matched_bank(void) {
         const bool ro[2] = {true, false};
         const uint64_t served[2] = {200, 100};
         l379_banks(slots, 2, tokens, ro, served, scratch);
-        TEST_ASSERT(scratch[0] && !scratch[1]);
-        TEST_ASSERT(server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, /*best=*/0, &victim) ==
+        TEST_ASSERT(scratch[sx(0)] && !scratch[sx(1)]);
+        TEST_ASSERT(server_make_room(slots, BankCount{2}, NULL, NULL, true, NULL, &scratch, /*best=*/sx(0), &victim) ==
                     MAKE_ROOM_IN_PLACE);
-        TEST_ASSERT(victim == 0);
+        TEST_ASSERT(victim == sx(0));
         /* (ii) the same with bank 1 BUSY.  Before: bank 0, the matched bank, was evicted and the request started
          * fresh on its slot (39 requests, 963,922 tokens of live match).  Now: in place, nothing evicted. */
-        slots[1].active_job = (struct job *)slots;
-        victim = -9;
-        TEST_ASSERT(server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, 0, &victim) == MAKE_ROOM_IN_PLACE);
-        TEST_ASSERT(victim == 0);
+        slots[sx(1)].active_job = (struct job *)slots.data();
+        victim = SlotIdx{99u};
+        TEST_ASSERT(server_make_room(slots, BankCount{2}, NULL, NULL, true, NULL, &scratch, sx(0), &victim) == MAKE_ROOM_IN_PLACE);
+        TEST_ASSERT(victim == sx(0));
         /* a conversation's bank too: with only the matched bank free, the request runs in place on it */
-        slots[0].kv_flags = 0u;
-        scratch[0] = false;
-        TEST_ASSERT(server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, 0, &victim) == MAKE_ROOM_IN_PLACE);
+        slots[sx(0)].kv_flags = 0u;
+        scratch[sx(0)] = false;
+        TEST_ASSERT(server_make_room(slots, BankCount{2}, NULL, NULL, true, NULL, &scratch, sx(0), &victim) == MAKE_ROOM_IN_PLACE);
         /* a request with no best bank (nothing free fits it) evicts as before */
-        TEST_ASSERT(server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, -1, &victim) == MAKE_ROOM_EVICT &&
-                    victim == 0);
+        TEST_ASSERT(server_make_room(slots, BankCount{2}, NULL, NULL, true, NULL, &scratch, SlotIdx::none(), &victim) == MAKE_ROOM_EVICT &&
+                    victim == sx(0));
         /* and with nothing idle, nothing goes */
-        slots[0].active_job = (struct job *)slots;
-        TEST_ASSERT(server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, 0, &victim) == MAKE_ROOM_NONE &&
-                    victim == -1);
+        slots[sx(0)].active_job = (struct job *)slots.data();
+        TEST_ASSERT(server_make_room(slots, BankCount{2}, NULL, NULL, true, NULL, &scratch, sx(0), &victim) == MAKE_ROOM_NONE &&
+                    victim.is_none());
     }
 }
 
 static void test_l379_scratch_banks_go_first(void) {
-    session_slot slots[PULSAR_SESSION_POOL_CAP];
-    bool scratch[PULSAR_SESSION_POOL_CAP];
-    int victim = -9;
+    slot_table slots;
+    slot_flags scratch;
+    SlotIdx victim{99u};
     TEST_ASSERT(server_victim_rank(true, false) == 0 && server_victim_rank(true, true) == 0 &&
                 server_victim_rank(false, true) == 1 && server_victim_rank(false, false) == 2);
     /* (iii) two scratch banks (judge histories): a third read-only conversation, matching the newer one best,
@@ -14460,11 +14470,11 @@ static void test_l379_scratch_banks_go_first(void) {
         const bool ro[2] = {true, true};
         const uint64_t served[2] = {100, 200};
         l379_banks(slots, 2, tokens, ro, served, scratch);
-        TEST_ASSERT(scratch[0] && scratch[1]);
-        TEST_ASSERT(server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, 1, &victim) == MAKE_ROOM_EVICT &&
-                    victim == 0);
-        TEST_ASSERT(server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, -1, &victim) == MAKE_ROOM_EVICT &&
-                    victim == 0);
+        TEST_ASSERT(scratch[sx(0)] && scratch[sx(1)]);
+        TEST_ASSERT(server_make_room(slots, BankCount{2}, NULL, NULL, true, NULL, &scratch, sx(1), &victim) == MAKE_ROOM_EVICT &&
+                    victim == sx(0));
+        TEST_ASSERT(server_make_room(slots, BankCount{2}, NULL, NULL, true, NULL, &scratch, SlotIdx::none(), &victim) == MAKE_ROOM_EVICT &&
+                    victim == sx(0));
     }
     /* (iv) conversation A (idle longer) and a scratch bank: a NEW ordinary conversation -- its best bank is A, the
      * shared preamble, score 0 -- evicts the scratch bank.  Before: A, the LRU (and its own best match). */
@@ -14473,26 +14483,27 @@ static void test_l379_scratch_banks_go_first(void) {
         const bool ro[2] = {false, true};
         const uint64_t served[2] = {100, 200};
         l379_banks(slots, 2, tokens, ro, served, scratch);
-        TEST_ASSERT(!scratch[0] && scratch[1]);
-        TEST_ASSERT(server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, 0, &victim) == MAKE_ROOM_EVICT &&
-                    victim == 1);
-        TEST_ASSERT(server_evict_pick_victim(slots, 2, NULL, true, NULL, scratch) == 1);
-        TEST_ASSERT(server_evict_pick_victim(slots, 2, NULL, true, NULL, NULL) == 0);   /* no facts: plain LRU */
+        TEST_ASSERT(!scratch[sx(0)] && scratch[sx(1)]);
+        TEST_ASSERT(server_make_room(slots, BankCount{2}, NULL, NULL, true, NULL, &scratch, sx(0), &victim) == MAKE_ROOM_EVICT &&
+                    victim == sx(1));
+        TEST_ASSERT(server_evict_pick_victim(slots, BankCount{2}, NULL, true, NULL, &scratch) == sx(1));
+        TEST_ASSERT(server_evict_pick_victim(slots, BankCount{2}, NULL, true, NULL, NULL) == sx(0));   /* no facts: plain LRU */
         /* B5: a read-only request never takes the conversation's bank while a scratch one exists -- whichever is the
          * LRU, whichever it matches best */
         for (int lru = 0; lru < 2; lru++)
             for (int best = -1; best < 2; best++) {
-                slots[0].last_serviced_us = lru == 0 ? 100 : 300;
-                const make_room_verdict v = server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, best, &victim);
-                TEST_ASSERT(victim == 1 && v == (best == 1 ? MAKE_ROOM_IN_PLACE : MAKE_ROOM_EVICT));
+                slots[sx(0)].last_serviced_us = lru == 0 ? 100 : 300;
+                const make_room_verdict v = server_make_room(slots, BankCount{2}, NULL, NULL, true, NULL, &scratch,
+                                                             best < 0 ? SlotIdx::none() : sx(best), &victim);
+                TEST_ASSERT(victim == sx(1) && v == (best == 1 ? MAKE_ROOM_IN_PLACE : MAKE_ROOM_EVICT));
             }
         /* a dominated or dead bank still goes before a scratch one, a protected scratch bank is never taken */
-        bool dom[PULSAR_SESSION_POOL_CAP] = {false};
-        dom[0] = true;
-        TEST_ASSERT(server_evict_pick_victim(slots, 2, NULL, true, dom, scratch) == 0);
-        bool protect[PULSAR_SESSION_POOL_CAP] = {false};
-        protect[1] = true;
-        TEST_ASSERT(server_evict_pick_victim(slots, 2, protect, true, NULL, scratch) == 0);
+        slot_flags dom = {};
+        dom[sx(0)] = true;
+        TEST_ASSERT(server_evict_pick_victim(slots, BankCount{2}, NULL, true, &dom, &scratch) == sx(0));
+        slot_flags protect = {};
+        protect[sx(1)] = true;
+        TEST_ASSERT(server_evict_pick_victim(slots, BankCount{2}, &protect, true, NULL, &scratch) == sx(0));
     }
     /* B5: two conversations: a read-only request (no best among them) evicts the least recently used, as before */
     {
@@ -14500,11 +14511,11 @@ static void test_l379_scratch_banks_go_first(void) {
         const bool ro[2] = {false, false};
         const uint64_t served[2] = {300, 100};
         l379_banks(slots, 2, tokens, ro, served, scratch);
-        TEST_ASSERT(!scratch[0] && !scratch[1]);
-        TEST_ASSERT(server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, -1, &victim) == MAKE_ROOM_EVICT &&
-                    victim == 1);
-        TEST_ASSERT(server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, 0, &victim) == MAKE_ROOM_EVICT &&
-                    victim == 1);
+        TEST_ASSERT(!scratch[sx(0)] && !scratch[sx(1)]);
+        TEST_ASSERT(server_make_room(slots, BankCount{2}, NULL, NULL, true, NULL, &scratch, SlotIdx::none(), &victim) == MAKE_ROOM_EVICT &&
+                    victim == sx(1));
+        TEST_ASSERT(server_make_room(slots, BankCount{2}, NULL, NULL, true, NULL, &scratch, sx(0), &victim) == MAKE_ROOM_EVICT &&
+                    victim == sx(1));
     }
     /* B3: a queued job's warm match is spared -- unless it is scratch.  Bank 0 a conversation (the LRU), bank 1 a
      * scratch bank some queued job would resume on.  Before: the overlay spared bank 1 and the eviction fell on the
@@ -14514,31 +14525,31 @@ static void test_l379_scratch_banks_go_first(void) {
         const bool ro[3] = {false, true, false};
         const uint64_t served[3] = {100, 200, 300};
         l379_banks(slots, 3, tokens, ro, served, scratch);
-        bool warm[PULSAR_SESSION_POOL_CAP] = {false};
-        warm[1] = true;
-        TEST_ASSERT(server_make_room(slots, 3, NULL, warm, true, NULL, scratch, -1, &victim) == MAKE_ROOM_EVICT &&
-                    victim == 1);
+        slot_flags warm = {};
+        warm[sx(1)] = true;
+        TEST_ASSERT(server_make_room(slots, BankCount{3}, NULL, &warm, true, NULL, &scratch, SlotIdx::none(), &victim) == MAKE_ROOM_EVICT &&
+                    victim == sx(1));
         /* a conversation that is a warm match is still spared: the eviction passes over the LRU to the next */
-        warm[1] = false;
-        warm[0] = true;
-        scratch[1] = false;
-        slots[1].kv_flags = 0u;
-        TEST_ASSERT(server_make_room(slots, 3, NULL, warm, true, NULL, scratch, -1, &victim) == MAKE_ROOM_EVICT &&
-                    victim == 1);
+        warm[sx(1)] = false;
+        warm[sx(0)] = true;
+        scratch[sx(1)] = false;
+        slots[sx(1)].kv_flags = 0u;
+        TEST_ASSERT(server_make_room(slots, BankCount{3}, NULL, &warm, true, NULL, &scratch, SlotIdx::none(), &victim) == MAKE_ROOM_EVICT &&
+                    victim == sx(1));
         /* every free bank a warm match: binding must progress -- the LRU goes */
-        warm[1] = warm[2] = true;
-        TEST_ASSERT(server_make_room(slots, 3, NULL, warm, true, NULL, scratch, -1, &victim) == MAKE_ROOM_EVICT &&
-                    victim == 0);
+        warm[sx(1)] = warm[sx(2)] = true;
+        TEST_ASSERT(server_make_room(slots, BankCount{3}, NULL, &warm, true, NULL, &scratch, SlotIdx::none(), &victim) == MAKE_ROOM_EVICT &&
+                    victim == sx(0));
         /* a queued live-tool continuation's owner is never evicted, scratch or not */
-        bool owners[PULSAR_SESSION_POOL_CAP] = {false};
-        owners[1] = true;
-        scratch[1] = true;
-        slots[1].kv_flags = KV_HDR_READ_ONLY;
-        warm[0] = warm[1] = warm[2] = false;
-        TEST_ASSERT(server_make_room(slots, 3, owners, warm, true, NULL, scratch, -1, &victim) == MAKE_ROOM_EVICT &&
-                    victim == 0);
-        owners[0] = owners[2] = true;
-        TEST_ASSERT(server_make_room(slots, 3, owners, warm, true, NULL, scratch, -1, &victim) == MAKE_ROOM_NONE);
+        slot_flags owners = {};
+        owners[sx(1)] = true;
+        scratch[sx(1)] = true;
+        slots[sx(1)].kv_flags = KV_HDR_READ_ONLY;
+        warm[sx(0)] = warm[sx(1)] = warm[sx(2)] = false;
+        TEST_ASSERT(server_make_room(slots, BankCount{3}, &owners, &warm, true, NULL, &scratch, SlotIdx::none(), &victim) == MAKE_ROOM_EVICT &&
+                    victim == sx(0));
+        owners[sx(0)] = owners[sx(2)] = true;
+        TEST_ASSERT(server_make_room(slots, BankCount{3}, &owners, &warm, true, NULL, &scratch, SlotIdx::none(), &victim) == MAKE_ROOM_NONE);
     }
     /* the guard's spill order ranks by the same classes: a dominated bank, then a scratch one, then the
      * conversations by LRU; a bank whose client is running a tool still goes last, scratch or not */
@@ -14546,30 +14557,30 @@ static void test_l379_scratch_banks_go_first(void) {
         server s;
         memset(&s, 0, sizeof s);
         pthread_mutex_init(&s.tool_mu, NULL);
-        s.n_slots = 3;
-        for (int i = 0; i < 3; i++) {
+        s.n_slots = BankCount{3};
+        for (SlotIdx i : s.n_slots.slots()) {
             s.slots[i].provisioned = true;
-            s.slots[i].bank = BankId{i};
-            s.slots[i].last_serviced_us = (uint64_t)(100 * (i + 1));   /* slot 0 is the LRU */
+            s.slots[i].bank = tbank_of(i);
+            s.slots[i].last_serviced_us = (uint64_t)(100 * (i.raw() + 1));   /* slot 0 is the LRU */
         }
-        bool gdom[PULSAR_SESSION_POOL_CAP] = {false}, gscr[PULSAR_SESSION_POOL_CAP] = {false};
-        gscr[1] = true;
-        TEST_ASSERT(s.guard_pick_victim(NULL, 0, gdom, gscr) == 1);
-        TEST_ASSERT(s.guard_pick_victim(NULL, 0, gdom, NULL) == 0);
-        gdom[2] = true;
-        TEST_ASSERT(s.guard_pick_victim(NULL, 0, gdom, gscr) == 2);
-        gdom[2] = false;
-        s.slots[1].anthropic_live.valid = true;
-        TEST_ASSERT(s.guard_pick_victim(NULL, 0, gdom, gscr) == 0);
+        slot_flags gdom = {}, gscr = {};
+        gscr[sx(1)] = true;
+        TEST_ASSERT(s.guard_pick_victim(NULL, 0, &gdom, &gscr) == sx(1));
+        TEST_ASSERT(s.guard_pick_victim(NULL, 0, &gdom, NULL) == sx(0));
+        gdom[sx(2)] = true;
+        TEST_ASSERT(s.guard_pick_victim(NULL, 0, &gdom, &gscr) == sx(2));
+        gdom[sx(2)] = false;
+        s.slots[SlotIdx{1u}].anthropic_live.valid = true;
+        TEST_ASSERT(s.guard_pick_victim(NULL, 0, &gdom, &gscr) == sx(0));
         /* host-only: no session, so no frontier and no disk tier minimum -- the facts name the read-only bank alone */
-        s.slots[1].anthropic_live.valid = false;
-        s.slots[2].kv_flags = KV_HDR_READ_ONLY;
-        bool fd[PULSAR_SESSION_POOL_CAP], fs[PULSAR_SESSION_POOL_CAP];
+        s.slots[SlotIdx{1u}].anthropic_live.valid = false;
+        s.slots[SlotIdx{2u}].kv_flags = KV_HDR_READ_ONLY;
+        slot_flags fd, fs;
         s.victim_facts(fd, fs);
-        TEST_ASSERT(!fs[0] && !fs[1] && fs[2] && !fd[0] && !fd[1] && !fd[2]);
-        s.slots[0].hint_dead = true;
+        TEST_ASSERT(!fs[sx(0)] && !fs[sx(1)] && fs[sx(2)] && !fd[sx(0)] && !fd[sx(1)] && !fd[sx(2)]);
+        s.slots[SlotIdx{0u}].hint_dead = true;
         s.victim_facts(fd, fs);
-        TEST_ASSERT(fd[0]);
+        TEST_ASSERT(fd[sx(0)]);
         pthread_mutex_destroy(&s.tool_mu);
     }
 }
@@ -14580,52 +14591,52 @@ static void test_l379_scratch_banks_go_first(void) {
  * that is the matched bank, so the prompt ran "in place" on a bank with no resident rows -- and its admission could
  * only make room by spilling bank 1, the pool's last resident bank, which the guard refuses every time. */
 static void test_l394_spilled_best_is_not_in_place(void) {
-    session_slot slots[PULSAR_SESSION_POOL_CAP];
-    bool scratch[PULSAR_SESSION_POOL_CAP];
-    int victim = -9;
+    slot_table slots;
+    slot_flags scratch;
+    SlotIdx victim{99u};
     const int tokens[3] = {60987, 41200, 52000};
     const bool ro[3] = {true, true, false};
     const uint64_t served[3] = {100, 200, 300};
     l379_banks(slots, 2, tokens, ro, served, scratch);
-    TEST_ASSERT(scratch[0] && scratch[1]);
+    TEST_ASSERT(scratch[sx(0)] && scratch[sx(1)]);
     /* L379 intact: a RESIDENT best that is the pick runs in place */
-    TEST_ASSERT(server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, 0, &victim) == MAKE_ROOM_IN_PLACE &&
-                victim == 0);
+    TEST_ASSERT(server_make_room(slots, BankCount{2}, NULL, NULL, true, NULL, &scratch, sx(0), &victim) == MAKE_ROOM_IN_PLACE &&
+                victim == sx(0));
     /* the incident: bank 0 spilled -- the resident idle bank 1 goes, and the prompt lands on its pages */
-    slots[0].spilled = true;
-    TEST_ASSERT(server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, 0, &victim) == MAKE_ROOM_EVICT &&
-                victim == 1);
+    slots[sx(0)].spilled = true;
+    TEST_ASSERT(server_make_room(slots, BankCount{2}, NULL, NULL, true, NULL, &scratch, sx(0), &victim) == MAKE_ROOM_EVICT &&
+                victim == sx(1));
     /* bank 1 some queued job's warm match, and a conversation: spared first, taken in the owners tier (binding must
      * progress, and in place on bank 0 cannot) */
-    bool warm[PULSAR_SESSION_POOL_CAP] = {false};
-    warm[1] = true;
-    scratch[1] = false;
-    slots[1].kv_flags = 0u;
-    TEST_ASSERT(server_make_room(slots, 2, NULL, warm, true, NULL, scratch, 0, &victim) == MAKE_ROOM_EVICT &&
-                victim == 1);
+    slot_flags warm = {};
+    warm[sx(1)] = true;
+    scratch[sx(1)] = false;
+    slots[sx(1)].kv_flags = 0u;
+    TEST_ASSERT(server_make_room(slots, BankCount{2}, NULL, &warm, true, NULL, &scratch, sx(0), &victim) == MAKE_ROOM_EVICT &&
+                victim == sx(1));
     /* a queued live-tool continuation owns bank 1: never evicted -- in place, as before */
-    bool owners[PULSAR_SESSION_POOL_CAP] = {false};
-    owners[1] = true;
-    TEST_ASSERT(server_make_room(slots, 2, owners, warm, true, NULL, scratch, 0, &victim) == MAKE_ROOM_IN_PLACE &&
-                victim == 0);
+    slot_flags owners = {};
+    owners[sx(1)] = true;
+    TEST_ASSERT(server_make_room(slots, BankCount{2}, &owners, &warm, true, NULL, &scratch, sx(0), &victim) == MAKE_ROOM_IN_PLACE &&
+                victim == sx(0));
     /* bank 1 busy, or spilled too: no resident idle bank -- in place */
-    slots[1].active_job = (struct job *)slots;
-    TEST_ASSERT(server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, 0, &victim) == MAKE_ROOM_IN_PLACE &&
-                victim == 0);
-    slots[1].active_job = NULL;
-    slots[1].spilled = true;
-    TEST_ASSERT(server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, 0, &victim) == MAKE_ROOM_IN_PLACE &&
-                victim == 0);
+    slots[sx(1)].active_job = (struct job *)slots.data();
+    TEST_ASSERT(server_make_room(slots, BankCount{2}, NULL, NULL, true, NULL, &scratch, sx(0), &victim) == MAKE_ROOM_IN_PLACE &&
+                victim == sx(0));
+    slots[sx(1)].active_job = NULL;
+    slots[sx(1)].spilled = true;
+    TEST_ASSERT(server_make_room(slots, BankCount{2}, NULL, NULL, true, NULL, &scratch, sx(0), &victim) == MAKE_ROOM_IN_PLACE &&
+                victim == sx(0));
     /* three banks, two spilled: the pick passes over both to the resident one, whatever its class */
     l379_banks(slots, 3, tokens, ro, served, scratch);
-    slots[0].spilled = slots[1].spilled = true;
-    TEST_ASSERT(server_make_room(slots, 3, NULL, NULL, true, NULL, scratch, 0, &victim) == MAKE_ROOM_EVICT &&
-                victim == 2);
+    slots[sx(0)].spilled = slots[sx(1)].spilled = true;
+    TEST_ASSERT(server_make_room(slots, BankCount{3}, NULL, NULL, true, NULL, &scratch, sx(0), &victim) == MAKE_ROOM_EVICT &&
+                victim == sx(2));
     /* a spilled bank that is not the best is still a victim like any (its slot is what a fresh bank needs) */
-    TEST_ASSERT(server_make_room(slots, 3, NULL, NULL, true, NULL, scratch, 2, &victim) == MAKE_ROOM_EVICT &&
-                victim == 0);
-    TEST_ASSERT(server_make_room(slots, 3, NULL, NULL, true, NULL, scratch, -1, &victim) == MAKE_ROOM_EVICT &&
-                victim == 0);
+    TEST_ASSERT(server_make_room(slots, BankCount{3}, NULL, NULL, true, NULL, &scratch, sx(2), &victim) == MAKE_ROOM_EVICT &&
+                victim == sx(0));
+    TEST_ASSERT(server_make_room(slots, BankCount{3}, NULL, NULL, true, NULL, &scratch, SlotIdx::none(), &victim) == MAKE_ROOM_EVICT &&
+                victim == sx(0));
 }
 
 /* L394: a spill plan counts only the victims a spill can take (server_spill_parkable): the last resident bank of the
@@ -14637,34 +14648,35 @@ static void test_l394_unparkable_spill_is_no_plan(void) {
     const KvBytes touched{(uint64_t)(1.49 * (double)GiB)}, delta{(uint64_t)(2.47 * (double)GiB)},
             budget{(uint64_t)(2.55 * (double)GiB)};
     const KvBytes drop[1] = {touched};
-    int k = -1;
+    BankCount k{-1};
     /* before: bank 1 counted -- SPILL, and spill_bank refused it every pass */
-    TEST_ASSERT(server_prompt_kv_verdict(touched, delta, budget, drop, 1, false, &k) == PROMPT_KV_SPILL && k == 1);
+    TEST_ASSERT(server_prompt_kv_verdict(touched, delta, budget, drop, BankCount{1}, false, &k) == PROMPT_KV_SPILL && k == BankCount{1});
     /* bank 0 spilled, bank 1 the plan's one victim and the only resident bank: no spill can take it */
-    const bool incident[2] = {false, true};
-    const int v1[1] = {1};
-    const int n = server_spill_parkable(incident, 2, v1, 1, false);
-    TEST_ASSERT(n == 0);
-    TEST_ASSERT(server_prompt_kv_verdict(touched, delta, budget, drop, n, false, &k) == PROMPT_KV_REFUSE && k == 0);
-    TEST_ASSERT(server_prompt_kv_verdict(touched, delta, budget, drop, n, true, &k) == PROMPT_KV_WAIT && k == 0);
+    const bank_flags incident = {{false, true}};
+    const BankId v1[1] = {bx(1)};
+    const BankCount n = server_spill_parkable(incident, BankCount{2}, v1, BankCount{1}, false);
+    TEST_ASSERT(n == BankCount{0});
+    TEST_ASSERT(server_prompt_kv_verdict(touched, delta, budget, drop, n, false, &k) == PROMPT_KV_REFUSE && k == BankCount{0});
+    TEST_ASSERT(server_prompt_kv_verdict(touched, delta, budget, drop, n, true, &k) == PROMPT_KV_WAIT && k == BankCount{0});
     /* the room's own bank resident before the spills (a fresh bank; a parked decoder's, re-backed first, L362): the
      * pool parks on it */
-    TEST_ASSERT(server_spill_parkable(incident, 2, v1, 1, true) == 1);
+    TEST_ASSERT(server_spill_parkable(incident, BankCount{2}, v1, BankCount{1}, true) == BankCount{1});
     /* another resident bank stays: every victim may go */
-    const bool both[2] = {true, true};
-    TEST_ASSERT(server_spill_parkable(both, 2, v1, 1, false) == 1);
-    const bool three[3] = {true, true, true};
-    const int v12[2] = {1, 2};
-    TEST_ASSERT(server_spill_parkable(three, 3, v12, 2, false) == 2);
+    const bank_flags both = {{true, true}};
+    TEST_ASSERT(server_spill_parkable(both, BankCount{2}, v1, BankCount{1}, false) == BankCount{1});
+    const bank_flags three = {{true, true, true}};
+    const BankId v12[2] = {bx(1), bx(2)};
+    TEST_ASSERT(server_spill_parkable(three, BankCount{3}, v12, BankCount{2}, false) == BankCount{2});
     /* every resident bank a victim: the plan stops one short -- the last has nowhere to park */
-    const bool two_of_three[3] = {false, true, true};
-    TEST_ASSERT(server_spill_parkable(two_of_three, 3, v12, 2, false) == 1);
+    const bank_flags two_of_three = {{false, true, true}};
+    TEST_ASSERT(server_spill_parkable(two_of_three, BankCount{3}, v12, BankCount{2}, false) == BankCount{1});
     /* no victims: nothing */
-    TEST_ASSERT(server_spill_parkable(two_of_three, 3, v12, 0, false) == 0);
+    TEST_ASSERT(server_spill_parkable(two_of_three, BankCount{3}, v12, BankCount{0}, false) == BankCount{0});
     /* a one-bank pool (server_park_pick -1): its bank is never a spill */
-    const bool one[1] = {true};
-    const int v0[1] = {0};
-    TEST_ASSERT(server_spill_parkable(one, 1, v0, 1, false) == 0 && server_park_pick(one, 1, 0) == -1);
+    const bank_flags one = {{true}};
+    const BankId v0[1] = {bx(0)};
+    TEST_ASSERT(server_spill_parkable(one, BankCount{1}, v0, BankCount{1}, false) == BankCount{0} &&
+                server_park_pick(one, BankCount{1}, bx(0)).is_none());
 }
 
 /* L379 (v), (vi): what makes a bank scratch -- the history of a read-only request, or one under the disk tier's
@@ -14717,7 +14729,7 @@ static void test_l372_evict_snapshot_word(void) {
     memset(&s, 0, sizeof s);
     pthread_mutex_init(&s.mu, NULL);
     s.kv.enabled = true;
-    session_slot *sl = &s.slots[0];
+    session_slot *sl = &s.slots[SlotIdx{0u}];
     sl->provisioned = true;
     kv_persist_rule rule = KV_PERSIST_RULE_NONE;
     bool no_room = true;
@@ -15831,59 +15843,59 @@ static void test_hint_compaction_marks_dead(void) {
 
     server *s = (server *)calloc(1, sizeof(server));
     pthread_mutex_init(&s->mu, NULL);
-    s->n_slots = 4;
-    for (int i = 0; i < 4; i++) {
+    s->n_slots = BankCount{4};
+    for (SlotIdx i : BankCount{4}.slots()) {
         s->slots[i].provisioned = true;
-        s->slots[i].bank = BankId{i};
-        s->slots[i].last_serviced_us = 100 + (uint64_t)i;
+        s->slots[i].bank = tbank_of(i);
+        s->slots[i].last_serviced_us = 100 + (uint64_t)i.raw();
     }
-    snprintf(s->slots[1].hint_session, PULSAR_HINT_ID_MAX, "sess-a");
-    snprintf(s->slots[2].hint_session, PULSAR_HINT_ID_MAX, "sess-a");
-    snprintf(s->slots[3].hint_session, PULSAR_HINT_ID_MAX, "sess-b");
-    s->slots[2].active_job = (struct job *)s;   /* busy: its job decides, not the hint */
+    snprintf(s->slots[SlotIdx{1u}].hint_session, PULSAR_HINT_ID_MAX, "sess-a");
+    snprintf(s->slots[SlotIdx{2u}].hint_session, PULSAR_HINT_ID_MAX, "sess-a");
+    snprintf(s->slots[SlotIdx{3u}].hint_session, PULSAR_HINT_ID_MAX, "sess-b");
+    s->slots[SlotIdx{2u}].active_job = (struct job *)s;   /* busy: its job decides, not the hint */
     TEST_ASSERT(s->hint_dead_bank() == NULL);
     TEST_ASSERT(s->hint_mark_dead("") == 0 && s->hint_mark_dead("sess-x") == 0);
-    TEST_ASSERT(s->hint_mark_dead("sess-a") == 1 && s->slots[1].hint_dead && !s->slots[2].hint_dead &&
-                !s->slots[3].hint_dead);
+    TEST_ASSERT(s->hint_mark_dead("sess-a") == 1 && s->slots[SlotIdx{1u}].hint_dead && !s->slots[SlotIdx{2u}].hint_dead &&
+                !s->slots[SlotIdx{3u}].hint_dead);
     TEST_ASSERT(s->hint_mark_dead("sess-a") == 0 && s->m_hint_dead_banks == 1);   /* counted once */
-    TEST_ASSERT(s->hint_dead_bank() == &s->slots[1]);
+    TEST_ASSERT(s->hint_dead_bank() == &s->slots[SlotIdx{1u}]);
     /* the dead bank is the make-room eviction's first victim, ahead of the LRU (slot 0 is older) */
-    bool dom[PULSAR_SESSION_POOL_CAP] = {};
-    for (int i = 0; i < 4; i++) dom[i] = s->slots[i].hint_dead;
-    TEST_ASSERT(server_evict_pick_victim(s->slots, 4, NULL, true, dom) == 1);
-    TEST_ASSERT(server_evict_pick_victim(s->slots, 4, NULL, true, NULL) == 0);
+    slot_flags dom = {};
+    for (SlotIdx i : BankCount{4}.slots()) dom[i] = s->slots[i].hint_dead;
+    TEST_ASSERT(server_evict_pick_victim(s->slots, BankCount{4}, NULL, true, &dom) == sx(1));
+    TEST_ASSERT(server_evict_pick_victim(s->slots, BankCount{4}, NULL, true, NULL) == sx(0));
     pthread_mutex_destroy(&s->mu);
     free(s);
 }
 
 static void test_session_eviction_victim_selection(void) {
     const uint64_t GiB = 1024ull * 1024ull * 1024ull;
-    session_slot slots[PULSAR_SESSION_POOL_CAP];
-    memset(slots, 0, sizeof(slots));
-    for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) slots[i].provisioned = true;
-    slots[0].last_serviced_us = 1;              /* oldest of all — but pinned */
-    slots[0].bank_charge_bytes = kvb(9ull * GiB);
-    slots[1].last_serviced_us = 100;
-    slots[1].bank_charge_bytes = kvb(3ull * GiB);
-    slots[2].last_serviced_us = 50;
-    slots[2].bank_charge_bytes = kvb(2ull * GiB);
-    slots[3].last_serviced_us = 50;             /* LRU tie with slot 2 */
-    slots[3].bank_charge_bytes = kvb(1ull * GiB);       /* ...but cheaper to restore */
+    slot_table slots;
+    memset(slots.data(), 0, sizeof slots);
+    for (SlotIdx i : session_pool_cap.slots()) slots[i].provisioned = true;
+    slots[sx(0)].last_serviced_us = 1;              /* oldest of all — but pinned */
+    slots[sx(0)].bank_charge_bytes = kvb(9ull * GiB);
+    slots[sx(1)].last_serviced_us = 100;
+    slots[sx(1)].bank_charge_bytes = kvb(3ull * GiB);
+    slots[sx(2)].last_serviced_us = 50;
+    slots[sx(2)].bank_charge_bytes = kvb(2ull * GiB);
+    slots[sx(3)].last_serviced_us = 50;             /* LRU tie with slot 2 */
+    slots[sx(3)].bank_charge_bytes = kvb(1ull * GiB);       /* ...but cheaper to restore */
 
-    TEST_ASSERT(server_evict_pick_victim(slots, 4, NULL) == 3); /* LRU tie-break */
-    bool protect[PULSAR_SESSION_POOL_CAP] = {0};
-    protect[3] = true;
-    TEST_ASSERT(server_evict_pick_victim(slots, 4, protect) == 2); /* protected skipped */
-    slots[2].active_job = (struct job *)&slots;                    /* busy skipped */
-    TEST_ASSERT(server_evict_pick_victim(slots, 4, protect) == 1);
-    slots[1].provisioned = false;                                  /* hole skipped */
-    TEST_ASSERT(server_evict_pick_victim(slots, 4, protect) == -1);
-    protect[3] = false;
-    TEST_ASSERT(server_evict_pick_victim(slots, 4, protect) == 3);
+    TEST_ASSERT(server_evict_pick_victim(slots, BankCount{4}, NULL) == sx(3)); /* LRU tie-break */
+    slot_flags protect = {};
+    protect[sx(3)] = true;
+    TEST_ASSERT(server_evict_pick_victim(slots, BankCount{4}, &protect) == sx(2)); /* protected skipped */
+    slots[sx(2)].active_job = (struct job *)&slots;                    /* busy skipped */
+    TEST_ASSERT(server_evict_pick_victim(slots, BankCount{4}, &protect) == sx(1));
+    slots[sx(1)].provisioned = false;                                  /* hole skipped */
+    TEST_ASSERT(server_evict_pick_victim(slots, BankCount{4}, &protect).is_none());
+    protect[sx(3)] = false;
+    TEST_ASSERT(server_evict_pick_victim(slots, BankCount{4}, &protect) == sx(3));
     /* n_slots bounds the scan: slot 3 invisible when only 3 are published */
-    TEST_ASSERT(server_evict_pick_victim(slots, 3, protect) == -1);
+    TEST_ASSERT(server_evict_pick_victim(slots, BankCount{3}, &protect).is_none());
     /* slot 0 alone is never a victim */
-    TEST_ASSERT(server_evict_pick_victim(slots, 1, NULL) == -1);
+    TEST_ASSERT(server_evict_pick_victim(slots, BankCount{1}, NULL).is_none());
 }
 
 
@@ -17307,13 +17319,13 @@ static void test_l284_schema_lines_openai_tools(void) {
 static void test_l282_done_slot_is_released(void) {
     server s;
     memset(&s, 0, sizeof s);
-    s.n_slots = 2;
+    s.n_slots = BankCount{2};
     s.n_generating = 1;
     job j;
     memset(&j, 0, sizeof j);
     pthread_mutex_init(&j.mu, NULL);
     pthread_cond_init(&j.cv, NULL);
-    session_slot *sl = &s.slots[1];
+    session_slot *sl = &s.slots[SlotIdx{1u}];
     sl->provisioned = true;
     sl->bank = BankId{1};
     sl->state = SLOT_PREFILLING;
@@ -17335,49 +17347,49 @@ static void test_l282_done_slot_is_released(void) {
  * guard_rows; one decoder never trips it however deep, and guard_rows == 0 is
  * the guard off (the inline code skipped the whole block at 0). */
 static void test_l179_deep_guard_blocks_two_deep_decoders(void) {
-    session_slot slots[4];
-    memset(slots, 0, sizeof slots);
+    slot_table slots;
+    memset(slots.data(), 0, sizeof slots);
     const int rows = 4096;
-    for (int i = 0; i < 4; i++) {
+    for (SlotIdx i : BankCount{4}.slots()) {
         slots[i].provisioned = true;
         slots[i].active_job = (struct job *)&slots;
         slots[i].state = SLOT_DECODING;
-        slots[i].bank = BankId{i};
+        slots[i].bank = tbank_of(i);
     }
     int n_dec = -1;
     long deep = -1;
     /* two decoders at exactly rows: admits (strict >) */
-    slots[0].committed_pos = TokPos{rows / 2};
-    slots[1].committed_pos = TokPos{rows / 2};
-    TEST_ASSERT(!mixed_deep_guard_blocks(slots, 2, rows, &n_dec, &deep));
+    slots[sx(0)].committed_pos = TokPos{rows / 2};
+    slots[sx(1)].committed_pos = TokPos{rows / 2};
+    TEST_ASSERT(!mixed_deep_guard_blocks(slots, BankCount{2}, rows, &n_dec, &deep));
     TEST_ASSERT(n_dec == 2 && deep == rows);
     /* one row over: refuses */
-    slots[1].committed_pos = TokPos{rows / 2 + 1};
-    TEST_ASSERT(mixed_deep_guard_blocks(slots, 2, rows, &n_dec, &deep));
+    slots[sx(1)].committed_pos = TokPos{rows / 2 + 1};
+    TEST_ASSERT(mixed_deep_guard_blocks(slots, BankCount{2}, rows, &n_dec, &deep));
     TEST_ASSERT(deep == rows + 1);
     /* a lone decoder at 10x rows admits */
-    slots[0].committed_pos = TokPos{10 * rows};
-    TEST_ASSERT(!mixed_deep_guard_blocks(slots, 1, rows, NULL, NULL));
+    slots[sx(0)].committed_pos = TokPos{10 * rows};
+    TEST_ASSERT(!mixed_deep_guard_blocks(slots, BankCount{1}, rows, NULL, NULL));
     /* a second slot that is NOT decoding (prefilling / unbound /
      * unprovisioned) is not a decoder */
-    slots[1].committed_pos = TokPos{10 * rows};
-    slots[1].state = SLOT_PREFILLING;
-    TEST_ASSERT(!mixed_deep_guard_blocks(slots, 2, rows, &n_dec, NULL));
+    slots[sx(1)].committed_pos = TokPos{10 * rows};
+    slots[sx(1)].state = SLOT_PREFILLING;
+    TEST_ASSERT(!mixed_deep_guard_blocks(slots, BankCount{2}, rows, &n_dec, NULL));
     TEST_ASSERT(n_dec == 1);
-    slots[1].state = SLOT_DECODING;
-    slots[1].active_job = NULL;
-    TEST_ASSERT(!mixed_deep_guard_blocks(slots, 2, rows, NULL, NULL));
-    slots[1].active_job = (struct job *)&slots;
-    slots[1].provisioned = false;
-    TEST_ASSERT(!mixed_deep_guard_blocks(slots, 2, rows, NULL, NULL));
-    slots[1].provisioned = true;
+    slots[sx(1)].state = SLOT_DECODING;
+    slots[sx(1)].active_job = NULL;
+    TEST_ASSERT(!mixed_deep_guard_blocks(slots, BankCount{2}, rows, NULL, NULL));
+    slots[sx(1)].active_job = (struct job *)&slots;
+    slots[sx(1)].provisioned = false;
+    TEST_ASSERT(!mixed_deep_guard_blocks(slots, BankCount{2}, rows, NULL, NULL));
+    slots[sx(1)].provisioned = true;
     /* restored: two decoders 20x over the guard refuse... */
-    TEST_ASSERT(mixed_deep_guard_blocks(slots, 2, rows, NULL, NULL));
+    TEST_ASSERT(mixed_deep_guard_blocks(slots, BankCount{2}, rows, NULL, NULL));
     /* ...and guard_rows == 0 never blocks (guard off) */
-    TEST_ASSERT(!mixed_deep_guard_blocks(slots, 2, 0, NULL, NULL));
+    TEST_ASSERT(!mixed_deep_guard_blocks(slots, BankCount{2}, 0, NULL, NULL));
     /* n_slots bounds the scan */
-    TEST_ASSERT(!mixed_deep_guard_blocks(slots, 1, rows, NULL, NULL));
-    TEST_ASSERT(mixed_deep_guard_blocks(slots, 4, rows, &n_dec, NULL));
+    TEST_ASSERT(!mixed_deep_guard_blocks(slots, BankCount{1}, rows, NULL, NULL));
+    TEST_ASSERT(mixed_deep_guard_blocks(slots, BankCount{4}, rows, &n_dec, NULL));
     TEST_ASSERT(n_dec == 4);
 }
 
@@ -17442,21 +17454,21 @@ static void l391_pool_server(server *s, int chat) {
     memset(s, 0, sizeof *s);
     pthread_mutex_init(&s->mu, NULL);
     pthread_mutex_init(&s->tool_mu, NULL);
-    s->pool_banks = chat;
+    s->pool_banks = BankCount{chat};
     s->live_bank = BankId::none();
-    for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) s->slots[i].bank = BankId{i};
+    for (SlotIdx i : session_pool_cap.slots()) s->slots[i].bank = tbank_of(i);
 }
 
 /// @brief Mark bank `b` provisioned and commit its charge, as provision_bank does once the bank installed.
 /// @param s the server
 /// @param b the bank
-static void l391_provision(server *s, int b) {
-    session_slot *sl = &s->slots[b];
+static void l391_provision(server *s, BankId b) {
+    session_slot *sl = s->slot_of_bank(b);
     sl->provisioned = true;
     sl->state = SLOT_IDLE;
     pthread_mutex_lock(&s->mu);
     s->ledger_commit_bank(sl);
-    if (b >= s->n_slots) s->n_slots = b + 1;
+    if (!s->n_slots.covers(s->slot_index(sl))) s->n_slots = BankCount::through(s->slot_index(sl));
     pthread_mutex_unlock(&s->mu);
 }
 
@@ -17522,7 +17534,7 @@ static void test_l391_ledger_two_modes(void) {
     l391_pool_server(&s, 0);
     s.ledger_open_classic(kvb(13ull * GiB), kvb(4710ull << 20));
     TEST_ASSERT(s.kv_committed_bytes == kvb(4710ull << 20) && s.kv_budget_bytes == kvb(13ull * GiB));
-    TEST_ASSERT(s.slots[0].bank_charge_bytes == kvb(0) && s.bank_charge(BankId{0}) == kvb(0));
+    TEST_ASSERT(s.slots[SlotIdx{0u}].bank_charge_bytes == kvb(0) && s.bank_charge(BankId{0}) == kvb(0));
     TEST_ASSERT(s.ledger_admitted_bytes == kvb(0) && s.ledger_reserved_bytes == kvb(0));
     TEST_ASSERT(!s.worker_eviction_could_help(NULL));   /* nothing to evict in classic mode, whatever the ledger */
 
@@ -17533,21 +17545,21 @@ static void test_l391_ledger_two_modes(void) {
     TEST_ASSERT(qwen_budget > kvb(36ull * GiB) && qwen_budget < kvb(37ull * GiB));   /* 36.92 GiB */
     TEST_ASSERT(s.ledger_open_pool(qwen_budget, kvb(L391_QWEN_ADMITTED), 16, err, sizeof err));
     TEST_ASSERT(s.kv_committed_bytes == kvb(0) && s.ledger_reserved_bytes == kvb(0));
-    for (int b = 0; b < 16; b++) {
-        TEST_ASSERT(s.slots[b].bank_charge_bytes == kvb(0));
-        TEST_ASSERT(s.ledger_admits_bank(BankId{b}));
+    for (BankId b : BankCount{16}.banks()) {
+        TEST_ASSERT(s.slot_of_bank(b)->bank_charge_bytes == kvb(0));
+        TEST_ASSERT(s.ledger_admits_bank(b));
         l391_provision(&s, b);
-        TEST_ASSERT(s.slots[b].bank_charge_bytes == s.bank_charge(BankId{b}));
+        TEST_ASSERT(s.slot_of_bank(b)->bank_charge_bytes == s.bank_charge(b));
     }
     TEST_ASSERT(s.kv_committed_bytes == kvb(L391_QWEN_ADMITTED));
     /* an eviction releases exactly the slot's charge, and the hole's provision takes it again */
     pthread_mutex_lock(&s.mu);
-    TEST_ASSERT(s.ledger_release_bank(&s.slots[5]) == s.bank_charge(BankId{5}));
+    TEST_ASSERT(s.ledger_release_bank(&s.slots[SlotIdx{5u}]) == s.bank_charge(BankId{5}));
     pthread_mutex_unlock(&s.mu);
-    TEST_ASSERT(s.slots[5].bank_charge_bytes == kvb(0));
+    TEST_ASSERT(s.slots[SlotIdx{5u}].bank_charge_bytes == kvb(0));
     TEST_ASSERT(s.kv_committed_bytes == kvb(L391_QWEN_ADMITTED) - s.bank_charge(BankId{5}));
     TEST_ASSERT(s.ledger_admits_bank(BankId{5}));
-    l391_provision(&s, 5);
+    l391_provision(&s, bx(5));
     TEST_ASSERT(s.kv_committed_bytes == kvb(L391_QWEN_ADMITTED));
 
     /* Gemma: 2 chat banks + the judge's.  Before L391 the two chat banks' charges were all the ledger ever held
@@ -17556,13 +17568,13 @@ static void test_l391_ledger_two_modes(void) {
     TEST_ASSERT(s.ledger_open_pool(kvb(L391_GEMMA_BUDGET), kvb(L391_GEMMA_ADMITTED), 3, err, sizeof err));
     TEST_ASSERT(s.ledger_reserved_bytes == s.bank_charge(BankId{2}) && s.kv_committed_bytes == s.ledger_reserved_bytes);
     TEST_ASSERT(s.ledger_reserved_bytes > kvb(0));
-    for (int b = 0; b < 2; b++) {
-        TEST_ASSERT(s.ledger_admits_bank(BankId{b}));
+    for (BankId b : BankCount{2}.banks()) {
+        TEST_ASSERT(s.ledger_admits_bank(b));
         l391_provision(&s, b);
     }
     TEST_ASSERT(s.kv_committed_bytes == kvb(L391_GEMMA_ADMITTED));
     TEST_ASSERT(s.kv_committed_bytes ==
-                s.ledger_reserved_bytes + s.slots[0].bank_charge_bytes + s.slots[1].bank_charge_bytes);
+                s.ledger_reserved_bytes + s.slots[SlotIdx{0u}].bank_charge_bytes + s.slots[SlotIdx{1u}].bank_charge_bytes);
     pthread_mutex_destroy(&s.tool_mu);
     pthread_mutex_destroy(&s.mu);
 }
@@ -17587,25 +17599,25 @@ static void test_l391_provision_consults_the_ledger(void) {
         uint32_t x = 12345;
         for (int step = 0; step < 4000; step++) {
             x = x * 1664525u + 1013904223u;
-            const int b = (int)((x >> 8) % (uint32_t)sh.chat);
-            if (!s.slots[b].provisioned) {
-                TEST_ASSERT(s.ledger_admits_bank(BankId{b}));
+            const BankId b = bx((int)((x >> 8) % (uint32_t)sh.chat));
+            if (!s.slot_of_bank(b)->provisioned) {
+                TEST_ASSERT(s.ledger_admits_bank(b));
                 l391_provision(&s, b);
             } else {
                 pthread_mutex_lock(&s.mu);
-                (void)s.ledger_release_bank(&s.slots[b]);
+                (void)s.ledger_release_bank(s.slot_of_bank(b));
                 pthread_mutex_unlock(&s.mu);
-                s.slots[b].provisioned = false;
+                s.slot_of_bank(b)->provisioned = false;
             }
             TEST_ASSERT(s.kv_committed_bytes <= kvb(sh.admitted) && s.kv_committed_bytes <= s.kv_budget_bytes);
         }
         /* and the real function: the first bank of an empty pool is never the ledger's to refuse */
-        for (int b = 0; b < sh.chat; b++) {
-            if (!s.slots[b].provisioned) continue;
+        for (BankId b : BankCount{sh.chat}.banks()) {
+            if (!s.slot_of_bank(b)->provisioned) continue;
             pthread_mutex_lock(&s.mu);
-            (void)s.ledger_release_bank(&s.slots[b]);
+            (void)s.ledger_release_bank(s.slot_of_bank(b));
             pthread_mutex_unlock(&s.mu);
-            s.slots[b].provisioned = false;
+            s.slot_of_bank(b)->provisioned = false;
         }
         TEST_ASSERT(s.kv_committed_bytes == s.ledger_reserved_bytes);
         provision_refusal refusal = PROVISION_OK;
@@ -17618,11 +17630,11 @@ static void test_l391_provision_consults_the_ledger(void) {
     /* (b) Gemma's pool with bank 0 live and the budget one byte short of bank 1's charge */
     l391_pool_server(&s, 2);
     TEST_ASSERT(s.ledger_open_pool(kvb(L391_GEMMA_BUDGET), kvb(L391_GEMMA_ADMITTED), 3, err, sizeof err));
-    l391_provision(&s, 0);
+    l391_provision(&s, bx(0));
     s.kv_budget_bytes = s.kv_committed_bytes + s.bank_charge(BankId{1}) - kvb(1);
     provision_refusal refusal = PROVISION_OK;
     TEST_ASSERT(s.provision_bank(&refusal) == NULL && refusal == PROVISION_REFUSED_ADMISSION);
-    TEST_ASSERT(!s.slots[1].provisioned && s.slots[1].bank_charge_bytes == kvb(0));
+    TEST_ASSERT(!s.slots[SlotIdx{1u}].provisioned && s.slots[SlotIdx{1u}].bank_charge_bytes == kvb(0));
     job j;
     memset(&j, 0, sizeof j);
     s.note_provision_refusal(&j, refusal);
@@ -17630,16 +17642,16 @@ static void test_l391_provision_consults_the_ledger(void) {
     TEST_ASSERT(!strcmp(refusal_names[PROVISION_REFUSED_ADMISSION], "ledger_full"));
     /* relief is an eviction: the idle bank's charge comes back, and the precheck knows it would */
     TEST_ASSERT(server_refusal_evictable(refusal, true) && s.worker_eviction_could_help(NULL));
-    bool protect[PULSAR_SESSION_POOL_CAP] = {true};
-    TEST_ASSERT(!s.worker_eviction_could_help(protect));   /* ... but not when the only idle bank is protected */
+    slot_flags protect = {{true}};
+    TEST_ASSERT(!s.worker_eviction_could_help(&protect));   /* ... but not when the only idle bank is protected */
     pthread_mutex_lock(&s.mu);
-    (void)s.ledger_release_bank(&s.slots[0]);
+    (void)s.ledger_release_bank(&s.slots[SlotIdx{0u}]);
     pthread_mutex_unlock(&s.mu);
-    s.slots[0].provisioned = false;
+    s.slots[SlotIdx{0u}].provisioned = false;
     refusal = PROVISION_OK;
     TEST_ASSERT(s.provision_bank(&refusal) == NULL && refusal == PROVISION_REFUSED_CREATE_FAIL);   /* past the ledger */
     /* the exact budget admits: the boundary is server_kv_admits' */
-    l391_provision(&s, 0);
+    l391_provision(&s, bx(0));
     s.kv_budget_bytes = s.kv_committed_bytes + s.bank_charge(BankId{1});
     TEST_ASSERT(s.ledger_admits_bank(BankId{1}));
     pthread_mutex_destroy(&s.tool_mu);
@@ -17660,30 +17672,30 @@ static void test_l391_ledger_share_prices_growth(void) {
     TEST_ASSERT(server_guard_touched_budget(budget, kvb(L391_QWEN_ADMITTED), kvb(0), kvb(28ull * GiB) + floor, floor) ==
                 share);
     TEST_ASSERT(share > kvb(21ull * GiB) && share < kvb(22ull * GiB));
-    int n_spill = 0;
+    BankCount n_spill{0};
     /* a 200k-token prompt on a fresh bank beside 6 GiB resident: fits, as before */
     const KvBytes p200k = kvb(13440ull * 200000ull);
-    TEST_ASSERT(server_prompt_kv_verdict(kvb(6ull * GiB), p200k, share, NULL, 0, false, &n_spill) == PROMPT_KV_FITS);
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(6ull * GiB), p200k, share, NULL, BankCount{0}, false, &n_spill) == PROMPT_KV_FITS);
     /* a full 1M bank (13.125 GiB) beside 8 GiB: fits; beside 9 GiB with a 3 GiB idle bank: one spill makes room */
-    TEST_ASSERT(server_prompt_kv_verdict(kvb(8ull * GiB), kvb(L391_QWEN_BANK_KV), share, NULL, 0, false, &n_spill) ==
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(8ull * GiB), kvb(L391_QWEN_BANK_KV), share, NULL, BankCount{0}, false, &n_spill) ==
                 PROMPT_KV_FITS);
     const KvBytes drop[2] = {kvb(3ull * GiB), kvb(6ull * GiB)};
-    TEST_ASSERT(server_prompt_kv_verdict(kvb(9ull * GiB), kvb(L391_QWEN_BANK_KV), share, drop, 2, false, &n_spill) ==
-                PROMPT_KV_SPILL && n_spill == 1);
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(9ull * GiB), kvb(L391_QWEN_BANK_KV), share, drop, BankCount{2}, false, &n_spill) ==
+                PROMPT_KV_SPILL && n_spill == BankCount{1});
     /* nothing to spill: it waits for a busy bank, or is refused -- never run past the ledger's share */
-    TEST_ASSERT(server_prompt_kv_verdict(kvb(9ull * GiB), kvb(L391_QWEN_BANK_KV), share, NULL, 0, true, &n_spill) ==
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(9ull * GiB), kvb(L391_QWEN_BANK_KV), share, NULL, BankCount{0}, true, &n_spill) ==
                 PROMPT_KV_WAIT);
-    TEST_ASSERT(server_prompt_kv_verdict(kvb(9ull * GiB), kvb(L391_QWEN_BANK_KV), share, NULL, 0, false, &n_spill) ==
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(9ull * GiB), kvb(L391_QWEN_BANK_KV), share, NULL, BankCount{0}, false, &n_spill) ==
                 PROMPT_KV_REFUSE);
     /* a spill leaves the ledger's charges alone */
     server s;
     char err[320] = "";
     l391_pool_server(&s, 16);
     TEST_ASSERT(s.ledger_open_pool(budget, kvb(L391_QWEN_ADMITTED), 16, err, sizeof err));
-    l391_provision(&s, 0);
+    l391_provision(&s, bx(0));
     const KvBytes before = s.kv_committed_bytes;
-    s.slots[0].spilled = true;
-    TEST_ASSERT(s.kv_committed_bytes == before && s.slots[0].bank_charge_bytes == s.bank_charge(BankId{0}));
+    s.slots[SlotIdx{0u}].spilled = true;
+    TEST_ASSERT(s.kv_committed_bytes == before && s.slots[SlotIdx{0u}].bank_charge_bytes == s.bank_charge(BankId{0}));
     pthread_mutex_destroy(&s.tool_mu);
     pthread_mutex_destroy(&s.mu);
 }
@@ -17771,20 +17783,20 @@ static void test_l391_discrete_reads_the_device(void) {
 /* 2026-09-29 -- which free bank provision_bank takes: the most resident pages,
  * lowest index on a tie, provisioned banks never; -1 on a full pool. */
 static void test_bank_pick_prefers_resident_hole(void) {
-    bool prov[6] = {true, false, false, true, false, false};
-    KvBytes res[6] = {kvb(999), kvb(0), kvb(0), kvb(999), kvb(0), kvb(0)};
-    TEST_ASSERT(server_pick_free_bank(prov, res, 6) == 1);    /* all fresh: lowest */
-    res[4] = kvb(5);
-    TEST_ASSERT(server_pick_free_bank(prov, res, 6) == 4);    /* the recycled hole */
-    res[2] = kvb(7);
-    TEST_ASSERT(server_pick_free_bank(prov, res, 6) == 2);    /* the most resident */
-    res[5] = kvb(7);
-    TEST_ASSERT(server_pick_free_bank(prov, res, 6) == 2);    /* tie: lowest index */
-    res[0] = kvb(1ull << 40);                                 /* provisioned: ignored */
-    TEST_ASSERT(server_pick_free_bank(prov, res, 6) == 2);
-    bool full[3] = {true, true, true};
-    KvBytes r3[3] = {kvb(0), kvb(0), kvb(0)};
-    TEST_ASSERT(server_pick_free_bank(full, r3, 3) == -1);
+    slot_flags prov = {{true, false, false, true, false, false}};
+    pulsar_indexed<KvBytes, SlotIdx, PULSAR_SESSION_POOL_CAP> res = {{kvb(999), kvb(0), kvb(0), kvb(999), kvb(0), kvb(0)}};
+    TEST_ASSERT(server_pick_free_bank(prov, res, BankCount{6}) == sx(1));    /* all fresh: lowest */
+    res[sx(4)] = kvb(5);
+    TEST_ASSERT(server_pick_free_bank(prov, res, BankCount{6}) == sx(4));    /* the recycled hole */
+    res[sx(2)] = kvb(7);
+    TEST_ASSERT(server_pick_free_bank(prov, res, BankCount{6}) == sx(2));    /* the most resident */
+    res[sx(5)] = kvb(7);
+    TEST_ASSERT(server_pick_free_bank(prov, res, BankCount{6}) == sx(2));    /* tie: lowest index */
+    res[sx(0)] = kvb(1ull << 40);                                 /* provisioned: ignored */
+    TEST_ASSERT(server_pick_free_bank(prov, res, BankCount{6}) == sx(2));
+    slot_flags full = {{true, true, true}};
+    pulsar_indexed<KvBytes, SlotIdx, PULSAR_SESSION_POOL_CAP> r3 = {{kvb(0), kvb(0), kvb(0)}};
+    TEST_ASSERT(server_pick_free_bank(full, r3, BankCount{3}).is_none());
 }
 
 /* 2026-09-29 -- the refusals an idle-bank eviction relieves: full pool and
@@ -17812,7 +17824,7 @@ static void test_l179_park_live_bank_only_when_not_in_quantum(void) {
     for (int i = 0; i < 4; i++) slots[i].bank = BankId{i};
     session_slot *dec[2] = {&slots[0], &slots[1]};
     const session_slot *pf = &slots[2];
-    const int pool = 4;
+    const BankCount pool{4};
     /* live bank is a decoder: no park */
     TEST_ASSERT(!park_live_bank_needed(BankId{0}, pool, dec, 2, NULL));
     TEST_ASSERT(!park_live_bank_needed(BankId{1}, pool, dec, 2, pf));
@@ -17824,8 +17836,8 @@ static void test_l179_park_live_bank_only_when_not_in_quantum(void) {
     TEST_ASSERT(park_live_bank_needed(BankId{0}, pool, dec, 0, NULL));
     /* no live bank / out of pool: nothing to park */
     TEST_ASSERT(!park_live_bank_needed(BankId::none(), pool, dec, 2, pf));
-    TEST_ASSERT(!park_live_bank_needed(BankId{pool}, pool, dec, 2, pf));
-    TEST_ASSERT(!park_live_bank_needed(BankId{3}, 0, dec, 0, NULL));
+    TEST_ASSERT(!park_live_bank_needed(pool.bank_past(), pool, dec, 2, pf));
+    TEST_ASSERT(!park_live_bank_needed(BankId{3}, BankCount{0}, dec, 0, NULL));
     /* a NULL entry in dec is skipped, not dereferenced */
     session_slot *holey[2] = {NULL, &slots[3]};
     TEST_ASSERT(park_live_bank_needed(BankId{2}, pool, holey, 2, NULL));
@@ -17850,7 +17862,7 @@ static void test_l179_lane_select_spec_needs_every_decoder(void) {
         g[i].spec_enabled = true;
         dec[i] = &slots[i];
     }
-    const int pool = 4;
+    const BankCount pool{4};
     /* nothing to decode: idle */
     TEST_ASSERT(server_pick_decode_lane(pool, true, 16u, dec, 0, 0) == 0);
     TEST_ASSERT(server_pick_decode_lane(pool, false, 16u, dec, 0, 0) == 0);
@@ -17883,9 +17895,9 @@ static void test_l179_lane_select_spec_needs_every_decoder(void) {
     TEST_ASSERT(server_pick_decode_lane(pool, false, 16u, dec, 1, 0) == 2);
     TEST_ASSERT(server_pick_decode_lane(pool, true, 16u, dec, 1, 1) == 2);
     /* no pool: idle with no decoders, else the retired classic code 1 */
-    TEST_ASSERT(server_pick_decode_lane(0, true, false, dec, 0, 0) == 0);
-    TEST_ASSERT(server_pick_decode_lane(0, true, false, dec, 1, 0) == 1);
-    TEST_ASSERT(server_pick_decode_lane(0, false, false, dec, 4, 0) == 1);
+    TEST_ASSERT(server_pick_decode_lane(BankCount{0}, true, false, dec, 0, 0) == 0);
+    TEST_ASSERT(server_pick_decode_lane(BankCount{0}, true, false, dec, 1, 0) == 1);
+    TEST_ASSERT(server_pick_decode_lane(BankCount{0}, false, false, dec, 4, 0) == 1);
 }
 
 
@@ -17921,7 +17933,7 @@ static void test_l284_batch_leave_when_spec_lane_carries_all(void) {
     g[1].spec_enabled = true;
     /* every leave lands in lane 3 once the batch is empty */
     for (int i = 0; i < 2; i++) g[i].batch_active = false;
-    TEST_ASSERT(server_pick_decode_lane(4, true, 2u, dec, 2, 0) == 3);
+    TEST_ASSERT(server_pick_decode_lane(BankCount{4}, true, 2u, dec, 2, 0) == 3);
 }
 
 /* L293 -- a decoder leaving the plain batch for the spec lane (server::batch_leave) never commits past its budget.
@@ -18170,33 +18182,33 @@ static void test_l380_terminal_grace_and_yield(void) {
     memset(&s, 0, sizeof s);
     pthread_mutex_init(&s.mu, NULL);
     pthread_mutex_init(&s.tool_mu, NULL);
-    s.pool_banks = 3;
-    s.n_slots = 3;
-    for (int i = 0; i < 3; i++) {
+    s.pool_banks = BankCount{3};
+    s.n_slots = BankCount{3};
+    for (SlotIdx i : s.n_slots.slots()) {
         s.slots[i].provisioned = true;
-        s.slots[i].bank = BankId{i};
+        s.slots[i].bank = tbank_of(i);
     }
     /* the worker's wait: none pending sleeps untimed (< 0); else the earliest pending slot's deadline */
     TEST_ASSERT(s.terminal_wait_s(100.0) < 0.0);
-    s.slots[0].terminal_pending = true;
-    s.slots[0].turn_ended_at = 100.0;
-    s.slots[2].terminal_pending = true;
-    s.slots[2].turn_ended_at = 100.1;
+    s.slots[SlotIdx{0u}].terminal_pending = true;
+    s.slots[SlotIdx{0u}].turn_ended_at = 100.0;
+    s.slots[SlotIdx{2u}].terminal_pending = true;
+    s.slots[SlotIdx{2u}].turn_ended_at = 100.1;
     TEST_ASSERT(fabs(s.terminal_wait_s(100.05) - (G - 0.05)) < 1e-9);    /* slot 0's, the earlier turn */
     TEST_ASSERT(s.terminal_wait_s(100.0 + G + 0.001) == 0.0 && s.terminal_wait_s(200.0) == 0.0);
-    s.slots[0].hint_dead = true;                                          /* a turn that no longer applies is not waited for */
+    s.slots[SlotIdx{0u}].hint_dead = true;                                          /* a turn that no longer applies is not waited for */
     TEST_ASSERT(fabs(s.terminal_wait_s(100.05) - (G + 0.05)) < 1e-9);
-    s.slots[2].spilled = true;
+    s.slots[SlotIdx{2u}].spilled = true;
     TEST_ASSERT(s.terminal_wait_s(100.05) < 0.0);
-    s.slots[0].hint_dead = false;
-    s.slots[2].spilled = false;
+    s.slots[SlotIdx{0u}].hint_dead = false;
+    s.slots[SlotIdx{2u}].spilled = false;
     /* the step picks nothing inside the grace and leaves both pending; the stale one is dropped whatever the clock */
-    s.slots[1].terminal_pending = true;
-    s.slots[1].turn_ended_at = 100.2;
-    s.slots[1].hint_dead = true;
+    s.slots[SlotIdx{1u}].terminal_pending = true;
+    s.slots[SlotIdx{1u}].turn_ended_at = 100.2;
+    s.slots[SlotIdx{1u}].hint_dead = true;
     TEST_ASSERT(!s.terminal_checkpoint_step(100.05, false));
-    TEST_ASSERT(s.slots[0].terminal_pending && s.slots[2].terminal_pending && !s.slots[1].terminal_pending);
-    TEST_ASSERT(!s.terminal_checkpoint_step(100.0 + G - 0.01, false) && s.slots[0].terminal_pending);
+    TEST_ASSERT(s.slots[SlotIdx{0u}].terminal_pending && s.slots[SlotIdx{2u}].terminal_pending && !s.slots[SlotIdx{1u}].terminal_pending);
+    TEST_ASSERT(!s.terminal_checkpoint_step(100.0 + G - 0.01, false) && s.slots[SlotIdx{0u}].terminal_pending);
 
     /* the cancel predicate: true iff a request is queued -- a job, or a judge call */
     TEST_ASSERT(!server_request_queued(&s));
@@ -18238,7 +18250,7 @@ static void test_l380_terminal_grace_and_yield(void) {
     TEST_ASSERT(!busy.persist && !busy.rearm && busy.invalidate);
 
     /* a yielded slot: pending again with its turn kept, due at once (its turn ended before the checkpoint started) */
-    session_slot *sl = &s.slots[1];
+    session_slot *sl = &s.slots[SlotIdx{1u}];
     sl->hint_dead = false;
     sl->turn_ended_at = 100.2;
     TEST_ASSERT(!sl->terminal_pending && s.slot_interrupted_turn(sl) == NULL);
@@ -18248,7 +18260,7 @@ static void test_l380_terminal_grace_and_yield(void) {
     TEST_ASSERT(turn.len == 0 && turn.v == NULL);
     TEST_ASSERT(sl->terminal_pending && sl->terminal_short_first && sl->provisioned);
     TEST_ASSERT(s.slot_interrupted_turn(sl) == &sl->terminal_turn && sl->terminal_turn.len == 700);
-    s.slots[0].terminal_pending = s.slots[2].terminal_pending = false;
+    s.slots[SlotIdx{0u}].terminal_pending = s.slots[SlotIdx{2u}].terminal_pending = false;
     TEST_ASSERT(s.terminal_wait_s(100.2 + G + 1.0) == 0.0);
     /* its live tool binding matches at the turn's end -- where the checkpoint set it -- not at the bank's position
      * (0 here: no session), so the continuation still finds its owner */
@@ -18393,7 +18405,7 @@ static void test_l380_terminal_skips_unused_replies(void) {
     /* the slot: an eviction forgets the reply and the evidence; the bind's clear of a pending checkpoint does not */
     server s;
     memset(&s, 0, sizeof s);
-    session_slot *sl = &s.slots[0];
+    session_slot *sl = &s.slots[SlotIdx{0u}];
     sl->provisioned = true;
     sl->reply = rep;
     server_terminal_evidence_note(&sl->terminal_ev, REPLY_USE_LEFT, &rep, 35996);
@@ -18531,8 +18543,8 @@ static void test_l380_batch_frontier(void) {
     pthread_mutex_init(&s.tool_mu, NULL);
     gen_state g;
     memset(&g, 0, sizeof g);
-    s.n_slots = 2;
-    session_slot &sl = s.slots[1];
+    s.n_slots = BankCount{2};
+    session_slot &sl = s.slots[SlotIdx{1u}];
     sl.bank = BankId{1};
     sl.gen = &g;
     g.phase = GEN_DECODE;
@@ -18580,9 +18592,9 @@ static void test_l380_batch_frontier(void) {
     live_tool_state_free(&sl.anthropic_live);
 
     /* a busy bank is never an empty one or scratch, whatever its position reads */
-    bool fd[PULSAR_SESSION_POOL_CAP], fs[PULSAR_SESSION_POOL_CAP];
+    slot_flags fd, fs;
     s.victim_facts(fd, fs);
-    TEST_ASSERT(!fs[1] && !fd[1]);
+    TEST_ASSERT(!fs[sx(1)] && !fd[sx(1)]);
     sl.active_job = NULL;
 
     /* the lane prices' depth is that read: band 3 on either lane */
@@ -18621,11 +18633,11 @@ static void test_l380_batch_frontier(void) {
     sl.gen = &g;
     /* a host-only server reads no engine history, in the batch or not (the readers over a session:
      * pulsar_test --batch-history) */
-    s.pool_banks = 2;
+    s.pool_banks = BankCount{2};
     TEST_ASSERT(s.slot_history(&sl).base == NULL && s.slot_history(&sl).tail == NULL);
     pulsar_tokens any = {0};
     TEST_ASSERT(s.slot_common_prefix(&sl, &any) == TokCount{0});
-    s.pool_banks = 0;
+    s.pool_banks = BankCount{0};
     /* a slot's history is the engine's tokens, then the batch's commits: its length and its compares read both */
     TokId bv[4] = {TokId{1}, TokId{2}, TokId{3}, TokId{4}}, tv[2] = {TokId{5}, TokId{6}}, wv[6] = {TokId{1}, TokId{2},
         TokId{3}, TokId{4}, TokId{5}, TokId{7}};
@@ -19380,7 +19392,7 @@ static void l329_fanout(const l329_req *rq, int n, int wait_ms, l329_out *o) {
         for (int k = 0; k < n; k++) {
             prefix_wait *w = &r[k].pw;
             if (!w->leader || r[k].bound || r[k].cancelled || rq[k].arrive > t) continue;
-            st *l = &r[w->slot];
+            st *l = &r[w->slot.raw()];   /* the simulation's requests, by the leader's number */
             const bool live = l->bound && !l->finished && !l->cancelled;
             const prefix_wait_verdict v =
                 unseamed_wait_check(live, l->pos, w->mark.raw(), (t - w->since) * 1e3, wait_ms);
@@ -19413,8 +19425,8 @@ static void l329_fanout(const l329_req *rq, int n, int wait_ms, l329_out *o) {
                     const int pick = wait_ms > 0 ? unseamed_wait_pick(have, rq[k].len, grid, G, leads, nl, &mark)
                                                  : -1;
                     if (pick >= 0) {
-                        r[k].pw = {true, (uint64_t)lead_of[pick] + 1u, lead_of[pick], PromptPos{mark},
-                                   PromptToks{have}, t};
+                        r[k].pw = {true, (uint64_t)lead_of[pick] + 1u, SlotIdx{(uint32_t)lead_of[pick]},
+                                   PromptPos{mark}, PromptToks{have}, t};
                         st *l = &r[lead_of[pick]];
                         l->mark = unseamed_mark_merge(l->mark, mark, l->pos);
                         o->waited[k] = true;
@@ -19522,22 +19534,19 @@ static void test_l324_kv_dup_census(void) {
     const uint64_t PB = 52ull << 20;
     /* 0 main conversation; 1, 2 fan-out siblings (24.5k in common, 14k with the main one: the same-config
      * preamble); 3 a third sibling, SPILLED; 4 a dominated copy of 0 at 150k; 5 another conversation; 6 empty */
-    int hist_len[N] = {180000, 30000, 28000, 26000, 150000, 10000, 0};
-    bool resident[N] = {true, true, true, false, true, true, true};
-    int rows[N][N];
-    const int *common[N];
-    for (int i = 0; i < N; i++) {
-        common[i] = rows[i];
-        for (int k = 0; k < N; k++) rows[i][k] = -1;
-    }
-    auto set = [&](int a, int b, int v) { rows[a][b] = v; rows[b][a] = v; };
+    slot_ints hist_len = {{180000, 30000, 28000, 26000, 150000, 10000, 0}};
+    slot_flags resident = {{true, true, true, false, true, true, true}};
+    slot_matrix rows;
+    for (SlotIdx i : BankCount{(int)N}.slots())
+        for (SlotIdx k : BankCount{(int)N}.slots()) rows[i][k] = -1;
+    auto set = [&](int a, int b, int v) { rows[sx(a)][sx(b)] = v; rows[sx(b)][sx(a)] = v; };
     set(0, 1, 14000); set(0, 2, 14000); set(0, 3, 14000); set(0, 4, 150000); set(0, 5, 200);
     set(1, 2, 24500); set(1, 3, 24500); set(1, 4, 14000); set(1, 5, 200);
     set(2, 3, 24500); set(2, 4, 14000); set(2, 5, 200);
     set(3, 4, 14000); set(3, 5, 200); set(4, 5, 200);
     kv_dup_census c;
-    uint32_t deep[N];
-    kv_dup_census_core(N, hist_len, resident, common, G, kvb(PB), &c, deep);
+    slot_bits deep;
+    kv_dup_census_core(BankCount{(int)N}, hist_len, resident, rows, G, kvb(PB), &c, &deep);
     TEST_ASSERT(c.grid == G && c.page_bytes == kvb(PB));
     TEST_ASSERT(c.banks == 5);                       /* the spilled and the empty bank hold no page */
     TEST_ASSERT(c.pages_resident == 43 + 7 + 6 + 36 + 2);
@@ -19549,29 +19558,30 @@ static void test_l324_kv_dup_census(void) {
     TEST_ASSERT(c.dup_bytes == kvb(44 * PB));
     TEST_ASSERT(c.pairs[0] == 5 && c.pairs[1] == 1);  /* (0,1) (0,2) (1,2) (1,4) (2,4); deep (0,4); 5 shares no page */
     TEST_ASSERT(c.longest[0] == 24500 && c.longest[1] == 150000);
-    TEST_ASSERT(deep[0] == 1u << 4);
-    for (int a = 1; a < N; a++) TEST_ASSERT(deep[a] == 0);
+    TEST_ASSERT(deep[sx(0)] == slot_bit(sx(4)));
+    for (SlotIdx a{1u}; BankCount{(int)N}.covers(a); ++a) TEST_ASSERT(deep[a] == 0);
     /* the spilled sibling resident again: it shares p0-4 with 1 and 2 and p0-2 with 0 and 4 */
-    resident[3] = true;
-    kv_dup_census_core(N, hist_len, resident, common, G, kvb(PB), &c, NULL);
+    resident[sx(3)] = true;
+    kv_dup_census_core(BankCount{(int)N}, hist_len, resident, rows, G, kvb(PB), &c, NULL);
     TEST_ASSERT(c.banks == 6 && c.pages_resident == 94 + 6);
     TEST_ASSERT(c.pages_duplicate == 44 + 5 && c.pairs[0] == 5 + 4);
     /* exactly reaching a page end shares it: two identical 8192-token copies hold 2 pages once each */
     {
-        int hl[2] = {8192, 8192};
-        bool rs[2] = {true, true};
-        int r[2][2] = {{-1, 8192}, {8192, -1}};
-        const int *cm[2] = {r[0], r[1]};
-        kv_dup_census_core(2, hl, rs, cm, G, kvb(PB), &c, NULL);
+        const slot_ints hl = {{8192, 8192}};
+        const slot_flags rs = {{true, true}};
+        slot_matrix r;
+        r[sx(0)][sx(0)] = r[sx(1)][sx(1)] = -1;
+        r[sx(0)][sx(1)] = r[sx(1)][sx(0)] = 8192;
+        kv_dup_census_core(BankCount{2}, hl, rs, r, G, kvb(PB), &c, NULL);
         TEST_ASSERT(c.pages_resident == 4 && c.pages_distinct == 2 && c.pages_shared == 2 && c.pages_duplicate == 2);
         TEST_ASSERT(c.pairs[0] == 1 && c.longest[0] == 8192 && c.pairs[1] == 0);
-        r[0][1] = r[1][0] = 8191;   /* one token short of the second page end */
-        kv_dup_census_core(2, hl, rs, cm, G, kvb(PB), &c, NULL);
+        r[sx(0)][sx(1)] = r[sx(1)][sx(0)] = 8191;   /* one token short of the second page end */
+        kv_dup_census_core(BankCount{2}, hl, rs, r, G, kvb(PB), &c, NULL);
         TEST_ASSERT(c.pages_distinct == 3 && c.pages_duplicate == 1);
     }
     /* no grid, no census */
-    kv_dup_census_core(N, hist_len, resident, common, 0, kvb(PB), &c, deep);
-    TEST_ASSERT(c.pages_resident == 0 && c.dup_bytes == KvBytes{} && deep[0] == 0);
+    kv_dup_census_core(BankCount{(int)N}, hist_len, resident, rows, 0, kvb(PB), &c, &deep);
+    TEST_ASSERT(c.pages_resident == 0 && c.dup_bytes == KvBytes{} && deep[sx(0)] == 0);
 }
 
 /* L323 (4): the ONE bank-dominance predicate (bank_dominated_core; L179 branch 6's superseded scan before it).
@@ -19581,79 +19591,76 @@ static void test_l324_kv_dup_census(void) {
  * copies exactly one is dominated.  Then both pickers take a dominated slot before any LRU choice. */
 static void test_l323_bank_dominated(void) {
     enum { N = 4 };
-    int hist_len[N] = {100, 300, 50, 0};
-    int rows[N][N];
-    const int *common[N];
-    for (int i = 0; i < N; i++) {
-        common[i] = rows[i];
-        for (int k = 0; k < N; k++) rows[i][k] = -1;
-    }
+    slot_ints hist_len = {{100, 300, 50, 0}};
+    slot_matrix rows;
+    for (SlotIdx i : BankCount{(int)N}.slots())
+        for (SlotIdx k : BankCount{(int)N}.slots()) rows[i][k] = -1;
     /* slot 1 extends slot 0's whole 100 tokens; slot 2 shares only 30 */
-    rows[0][1] = 100;
-    rows[2][0] = 30;
-    rows[2][1] = 30;
-    TEST_ASSERT(bank_dominated_core(0, N, hist_len, common));
-    TEST_ASSERT(!bank_dominated_core(1, N, hist_len, common));   /* the longest is never dominated */
-    TEST_ASSERT(!bank_dominated_core(2, N, hist_len, common));
-    TEST_ASSERT(!bank_dominated_core(3, N, hist_len, common));   /* an empty bank is plain LRU's business */
+    rows[sx(0)][sx(1)] = 100;
+    rows[sx(2)][sx(0)] = 30;
+    rows[sx(2)][sx(1)] = 30;
+    TEST_ASSERT(bank_dominated_core(sx(0), BankCount{(int)N}, hist_len, rows));
+    TEST_ASSERT(!bank_dominated_core(sx(1), BankCount{(int)N}, hist_len, rows));   /* the longest is never dominated */
+    TEST_ASSERT(!bank_dominated_core(sx(2), BankCount{(int)N}, hist_len, rows));
+    TEST_ASSERT(!bank_dominated_core(sx(3), BankCount{(int)N}, hist_len, rows));   /* an empty bank is plain LRU's business */
     /* a's whole history must be the prefix: 99 of 100 is not */
-    rows[0][1] = 99;
-    TEST_ASSERT(!bank_dominated_core(0, N, hist_len, common));
-    rows[0][1] = 100;
+    rows[sx(0)][sx(1)] = 99;
+    TEST_ASSERT(!bank_dominated_core(sx(0), BankCount{(int)N}, hist_len, rows));
+    rows[sx(0)][sx(1)] = 100;
     /* a shorter slot never dominates, whatever its common reads */
-    rows[1][0] = 100;
-    TEST_ASSERT(!bank_dominated_core(1, N, hist_len, common));
+    rows[sx(1)][sx(0)] = 100;
+    TEST_ASSERT(!bank_dominated_core(sx(1), BankCount{(int)N}, hist_len, rows));
     /* identical copies (slot 2 made a copy of slot 0): exactly one, the higher index, is dominated */
-    hist_len[2] = 100;
-    rows[2][0] = 100;
-    rows[0][2] = 100;
-    TEST_ASSERT(bank_dominated_core(2, N, hist_len, common));
-    rows[0][1] = -1;   /* slot 0 now has only its identical copy above it */
-    TEST_ASSERT(!bank_dominated_core(0, N, hist_len, common));
+    hist_len[sx(2)] = 100;
+    rows[sx(2)][sx(0)] = 100;
+    rows[sx(0)][sx(2)] = 100;
+    TEST_ASSERT(bank_dominated_core(sx(2), BankCount{(int)N}, hist_len, rows));
+    rows[sx(0)][sx(1)] = -1;   /* slot 0 now has only its identical copy above it */
+    TEST_ASSERT(!bank_dominated_core(sx(0), BankCount{(int)N}, hist_len, rows));
     /* a slot never dominates itself (the diagonal is skipped) */
-    rows[1][1] = 300;
-    TEST_ASSERT(!bank_dominated_core(1, N, hist_len, common));
+    rows[sx(1)][sx(1)] = 300;
+    TEST_ASSERT(!bank_dominated_core(sx(1), BankCount{(int)N}, hist_len, rows));
 
     /* the make-room eviction: a dominated slot goes first even when it is the most recently served */
-    session_slot slots[PULSAR_SESSION_POOL_CAP];
-    memset(slots, 0, sizeof(slots));
-    for (int i = 0; i < 4; i++) slots[i].provisioned = true;
-    slots[1].last_serviced_us = 10;   /* LRU */
-    slots[2].last_serviced_us = 90;
-    slots[3].last_serviced_us = 50;
-    bool dom[PULSAR_SESSION_POOL_CAP] = {false};
-    TEST_ASSERT(server_evict_pick_victim(slots, 4, NULL, false, dom) == 1);
-    dom[2] = true;
-    TEST_ASSERT(server_evict_pick_victim(slots, 4, NULL, false, dom) == 2);
-    dom[3] = true;   /* two dominated: LRU among them */
-    TEST_ASSERT(server_evict_pick_victim(slots, 4, NULL, false, dom) == 3);
-    bool protect[PULSAR_SESSION_POOL_CAP] = {false};
-    protect[3] = true;
-    TEST_ASSERT(server_evict_pick_victim(slots, 4, protect, false, dom) == 2);   /* protection still wins */
-    TEST_ASSERT(server_evict_pick_victim(slots, 4, NULL, false, NULL) == 1);     /* no facts: plain LRU */
+    slot_table slots;
+    memset(slots.data(), 0, sizeof slots);
+    for (SlotIdx i : BankCount{4}.slots()) slots[i].provisioned = true;
+    slots[sx(1)].last_serviced_us = 10;   /* LRU */
+    slots[sx(2)].last_serviced_us = 90;
+    slots[sx(3)].last_serviced_us = 50;
+    slot_flags dom = {};
+    TEST_ASSERT(server_evict_pick_victim(slots, BankCount{4}, NULL, false, &dom) == sx(1));
+    dom[sx(2)] = true;
+    TEST_ASSERT(server_evict_pick_victim(slots, BankCount{4}, NULL, false, &dom) == sx(2));
+    dom[sx(3)] = true;   /* two dominated: LRU among them */
+    TEST_ASSERT(server_evict_pick_victim(slots, BankCount{4}, NULL, false, &dom) == sx(3));
+    slot_flags protect = {};
+    protect[sx(3)] = true;
+    TEST_ASSERT(server_evict_pick_victim(slots, BankCount{4}, &protect, false, &dom) == sx(2));   /* protection still wins */
+    TEST_ASSERT(server_evict_pick_victim(slots, BankCount{4}, NULL, false, NULL) == sx(1));     /* no facts: plain LRU */
 
     /* the guard's spill pick, the same order */
     server s;
     memset(&s, 0, sizeof s);
-    s.n_slots = 4;
-    for (int i = 0; i < 4; i++) {
+    s.n_slots = BankCount{4};
+    for (SlotIdx i : s.n_slots.slots()) {
         s.slots[i].provisioned = true;
-        s.slots[i].bank = BankId{i};
+        s.slots[i].bank = tbank_of(i);
         s.slots[i].last_serviced_us = slots[i].last_serviced_us;
     }
-    s.slots[0].last_serviced_us = 70;   /* L328: bank 0 is a candidate like any bank -- here not the LRU one */
-    bool gdom[PULSAR_SESSION_POOL_CAP] = {false};
-    TEST_ASSERT(s.guard_pick_victim(NULL, 0, gdom) == 1);
-    gdom[2] = true;
-    TEST_ASSERT(s.guard_pick_victim(NULL, 0, gdom) == 2);
-    session_slot *dec[1] = {&s.slots[2]};   /* a live decoder is never a victim, dominated or not */
-    TEST_ASSERT(s.guard_pick_victim(dec, 1, gdom) == 1);
-    s.slots[2].spilled = true;               /* nor a spilled one */
-    TEST_ASSERT(s.guard_pick_victim(NULL, 0, gdom) == 1);
+    s.slots[SlotIdx{0u}].last_serviced_us = 70;   /* L328: bank 0 is a candidate like any bank -- here not the LRU one */
+    slot_flags gdom = {};
+    TEST_ASSERT(s.guard_pick_victim(NULL, 0, &gdom) == sx(1));
+    gdom[sx(2)] = true;
+    TEST_ASSERT(s.guard_pick_victim(NULL, 0, &gdom) == sx(2));
+    session_slot *dec[1] = {&s.slots[SlotIdx{2u}]};   /* a live decoder is never a victim, dominated or not */
+    TEST_ASSERT(s.guard_pick_victim(dec, 1, &gdom) == sx(1));
+    s.slots[SlotIdx{2u}].spilled = true;               /* nor a spilled one */
+    TEST_ASSERT(s.guard_pick_victim(NULL, 0, &gdom) == sx(1));
     /* off the bank pool there are no dominance facts */
-    bool none[PULSAR_SESSION_POOL_CAP];
+    slot_flags none;
     s.dominated_slots(none);
-    for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) TEST_ASSERT(!none[i]);
+    for (SlotIdx i : session_pool_cap.slots()) TEST_ASSERT(!none[i]);
 }
 
 /* L179 branch 7 (i) -- guard_pick_victim on a host-only server (sess NULL:
@@ -19666,49 +19673,49 @@ static void test_l323_bank_dominated(void) {
 static void test_l179_guard_victim_skips_live_spilled(void) {
     server s;
     memset(&s, 0, sizeof s);
-    s.n_slots = 5;
+    s.n_slots = BankCount{5};
     static const uint64_t us[5] = {1, 40, 30, 20, 10};   /* bank 0 the oldest */
-    for (int i = 0; i < 5; i++) {
+    for (SlotIdx i : s.n_slots.slots()) {
         s.slots[i].provisioned = true;
-        s.slots[i].bank = BankId{i};
-        s.slots[i].last_serviced_us = us[i];
+        s.slots[i].bank = tbank_of(i);
+        s.slots[i].last_serviced_us = us[i.raw()];
     }
-    session_slot *dec[2] = {&s.slots[4], &s.slots[3]};
+    session_slot *dec[2] = {&s.slots[SlotIdx{4u}], &s.slots[SlotIdx{3u}]};
     /* 3 and 4 are live: LRU of {0, 1, 2} is bank 0 (before L328 it was pinned and 2 was picked) */
-    TEST_ASSERT(s.guard_pick_victim(dec, 2) == 0);
+    TEST_ASSERT(s.guard_pick_victim(dec, 2) == sx(0));
     /* bank 0 bound: LRU of {1, 2} is 2 */
-    s.slots[0].active_job = (struct job *)&s;
-    TEST_ASSERT(s.guard_pick_victim(dec, 2) == 2);
+    s.slots[SlotIdx{0u}].active_job = (struct job *)&s;
+    TEST_ASSERT(s.guard_pick_victim(dec, 2) == sx(2));
     /* only 2 live: LRU of {1, 3, 4} is 4 */
-    dec[0] = &s.slots[2];
-    TEST_ASSERT(s.guard_pick_victim(dec, 1) == 4);
+    dec[0] = &s.slots[SlotIdx{2u}];
+    TEST_ASSERT(s.guard_pick_victim(dec, 1) == sx(4));
     /* a spilled bank is skipped: {1, 3} -> 3 */
-    s.slots[4].spilled = true;
-    TEST_ASSERT(s.guard_pick_victim(dec, 1) == 3);
+    s.slots[SlotIdx{4u}].spilled = true;
+    TEST_ASSERT(s.guard_pick_victim(dec, 1) == sx(3));
     /* an unprovisioned one too: {1} -> 1 */
-    s.slots[3].provisioned = false;
-    TEST_ASSERT(s.guard_pick_victim(dec, 1) == 1);
+    s.slots[SlotIdx{3u}].provisioned = false;
+    TEST_ASSERT(s.guard_pick_victim(dec, 1) == sx(1));
     /* a bound one too: nothing left -> -1 */
-    s.slots[1].active_job = (struct job *)&s;
-    TEST_ASSERT(s.guard_pick_victim(dec, 1) == -1);
+    s.slots[SlotIdx{1u}].active_job = (struct job *)&s;
+    TEST_ASSERT(s.guard_pick_victim(dec, 1).is_none());
     /* with no decode set slot 2 is idle again and is the only candidate */
-    TEST_ASSERT(s.guard_pick_victim(dec, 0) == 2);
-    s.slots[1].active_job = NULL;
+    TEST_ASSERT(s.guard_pick_victim(dec, 0) == sx(2));
+    s.slots[SlotIdx{1u}].active_job = NULL;
     /* tie on last_serviced_us across 1, 2, 3 (touched is 0 for every bank
      * here): first index */
-    s.slots[3].provisioned = true;
-    s.slots[2].last_serviced_us = us[1];
-    s.slots[3].last_serviced_us = us[1];
-    TEST_ASSERT(s.guard_pick_victim(dec, 0) == 1);
+    s.slots[SlotIdx{3u}].provisioned = true;
+    s.slots[SlotIdx{2u}].last_serviced_us = us[1];
+    s.slots[SlotIdx{3u}].last_serviced_us = us[1];
+    TEST_ASSERT(s.guard_pick_victim(dec, 0) == sx(1));
     /* bank 0 idle again in the tie: it is the first index */
-    s.slots[0].active_job = NULL;
-    s.slots[0].last_serviced_us = us[1];
-    TEST_ASSERT(s.guard_pick_victim(dec, 0) == 0);
+    s.slots[SlotIdx{0u}].active_job = NULL;
+    s.slots[SlotIdx{0u}].last_serviced_us = us[1];
+    TEST_ASSERT(s.guard_pick_victim(dec, 0) == sx(0));
     /* a one-slot pool: bank 0 is the candidate, and the spill finds nowhere to park (server_park_pick -1) */
-    s.n_slots = 1;
-    TEST_ASSERT(s.guard_pick_victim(dec, 0) == 0);
-    const bool one[1] = {true};
-    TEST_ASSERT(server_park_pick(one, 1, 0) == -1);
+    s.n_slots = BankCount{1};
+    TEST_ASSERT(s.guard_pick_victim(dec, 0) == sx(0));
+    const bank_flags one = {{true}};
+    TEST_ASSERT(server_park_pick(one, BankCount{1}, bx(0)).is_none());
 }
 
 /* L179 branch 7 (ii) -- guard_maybe_evict's control law (guard_spill_plan).
@@ -19723,24 +19730,24 @@ static void test_l179_guard_spill_plan_is_minimum(void) {
     const uint64_t GiB = 1024ull * 1024ull * 1024ull;
     const KvBytes drops[3] = {kvb(GiB), kvb(GiB), kvb(GiB)};
     /* fits (exactly at the bound): no spill */
-    TEST_ASSERT(guard_spill_plan(kvb(10 * GiB), kvb(GiB), kvb(11 * GiB), drops, 3) == 0);
+    TEST_ASSERT(guard_spill_plan(kvb(10 * GiB), kvb(GiB), kvb(11 * GiB), drops, BankCount{3}) == BankCount{0});
     /* breach by one byte, three victims available: exactly one spill */
-    TEST_ASSERT(guard_spill_plan(kvb(10 * GiB + 1), kvb(GiB), kvb(11 * GiB), drops, 3) == 1);
+    TEST_ASSERT(guard_spill_plan(kvb(10 * GiB + 1), kvb(GiB), kvb(11 * GiB), drops, BankCount{3}) == BankCount{1});
     /* breach that one victim cannot clear: two */
-    TEST_ASSERT(guard_spill_plan(kvb(12 * GiB), kvb(GiB), kvb(11 * GiB), drops, 3) == 2);
+    TEST_ASSERT(guard_spill_plan(kvb(12 * GiB), kvb(GiB), kvb(11 * GiB), drops, BankCount{3}) == BankCount{2});
     /* breach with no victim: nothing to spill (caller back-pressures) */
-    TEST_ASSERT(guard_spill_plan(kvb(12 * GiB), kvb(GiB), kvb(11 * GiB), NULL, 0) == 0);
+    TEST_ASSERT(guard_spill_plan(kvb(12 * GiB), kvb(GiB), kvb(11 * GiB), NULL, BankCount{0}) == BankCount{0});
     /* victims exhausted while still breaching: all three (caller back-pressures) */
-    TEST_ASSERT(guard_spill_plan(kvb(20 * GiB), kvb(GiB), kvb(11 * GiB), drops, 3) == 3);
+    TEST_ASSERT(guard_spill_plan(kvb(20 * GiB), kvb(GiB), kvb(11 * GiB), drops, BankCount{3}) == BankCount{3});
     /* a hollow victim (nothing resident) does not clear the breach by itself */
     const KvBytes hollow[2] = {kvb(0), kvb(GiB)};
-    TEST_ASSERT(guard_spill_plan(kvb(10 * GiB + 1), kvb(GiB), kvb(11 * GiB), hollow, 2) == 2);
+    TEST_ASSERT(guard_spill_plan(kvb(10 * GiB + 1), kvb(GiB), kvb(11 * GiB), hollow, BankCount{2}) == BankCount{2});
     /* a drop above the running total saturates instead of wrapping */
     const KvBytes huge[1] = {kvb(100 * GiB)};
-    TEST_ASSERT(guard_spill_plan(kvb(12 * GiB), kvb(GiB), kvb(11 * GiB), huge, 1) == 1);
+    TEST_ASSERT(guard_spill_plan(kvb(12 * GiB), kvb(GiB), kvb(11 * GiB), huge, BankCount{1}) == BankCount{1});
     /* growth alone can breach an empty pool: nothing resident to drop, so
      * every victim is "spilled" to no effect and the caller back-pressures */
-    TEST_ASSERT(guard_spill_plan(kvb(0), kvb(2 * GiB), kvb(GiB), drops, 3) == 3);
+    TEST_ASSERT(guard_spill_plan(kvb(0), kvb(2 * GiB), kvb(GiB), drops, BankCount{3}) == BankCount{3});
 }
 
 /* L280 -- the prompt's KV admission (server_prompt_kv_verdict).  The case that took the box down: a third 1M chain
@@ -19751,33 +19758,33 @@ static void test_l179_guard_spill_plan_is_minimum(void) {
  * become a victim and REFUSEs otherwise; a prompt whose growth alone exceeds the budget is REFUSEd at once. */
 static void test_l280_prompt_kv_admission(void) {
     const uint64_t GiB = 1024ull * 1024ull * 1024ull;
-    int k = -1;
+    BankCount k{-1};
     const KvBytes drops[3] = {kvb(3 * GiB), kvb(2 * GiB), kvb(5 * GiB)};
     /* fits, exactly at the bound */
-    TEST_ASSERT(server_prompt_kv_verdict(kvb(10 * GiB), kvb(13 * GiB), kvb(23 * GiB), drops, 3, false,
-                                         &k) == PROMPT_KV_FITS && k == 0);
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(10 * GiB), kvb(13 * GiB), kvb(23 * GiB), drops, BankCount{3}, false,
+                                         &k) == PROMPT_KV_FITS && k == BankCount{0});
     /* the window-C case: 29 GiB resident (two 1M banks: pinned bank 0 + a bound one), +14.6 GiB, budget 23.18 GiB */
     const uint64_t t = 29 * GiB, d = 14 * GiB + 600 * 1024 * 1024, b = 23 * GiB + 180 * 1024 * 1024;
-    TEST_ASSERT(server_prompt_kv_verdict(kvb(t), kvb(d), kvb(b), NULL, 0, true, &k) == PROMPT_KV_WAIT && k == 0);
-    TEST_ASSERT(server_prompt_kv_verdict(kvb(t), kvb(d), kvb(b), NULL, 0, false, &k) == PROMPT_KV_REFUSE && k == 0);
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(t), kvb(d), kvb(b), NULL, BankCount{0}, true, &k) == PROMPT_KV_WAIT && k == BankCount{0});
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(t), kvb(d), kvb(b), NULL, BankCount{0}, false, &k) == PROMPT_KV_REFUSE && k == BankCount{0});
     /* idle victims that make room: the minimum number, in their order */
-    TEST_ASSERT(server_prompt_kv_verdict(kvb(12 * GiB), kvb(13 * GiB), kvb(23 * GiB), drops, 3, false,
-                                         &k) == PROMPT_KV_SPILL && k == 1);
-    TEST_ASSERT(server_prompt_kv_verdict(kvb(14 * GiB), kvb(13 * GiB), kvb(23 * GiB), drops, 3, false,
-                                         &k) == PROMPT_KV_SPILL && k == 2);
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(12 * GiB), kvb(13 * GiB), kvb(23 * GiB), drops, BankCount{3}, false,
+                                         &k) == PROMPT_KV_SPILL && k == BankCount{1});
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(14 * GiB), kvb(13 * GiB), kvb(23 * GiB), drops, BankCount{3}, false,
+                                         &k) == PROMPT_KV_SPILL && k == BankCount{2});
     /* victims that cannot make room are never spilled: wait for a busy bank, or refuse */
     const KvBytes small[2] = {kvb(GiB), kvb(GiB)};
-    TEST_ASSERT(server_prompt_kv_verdict(kvb(20 * GiB), kvb(10 * GiB), kvb(23 * GiB), small, 2, true,
-                                         &k) == PROMPT_KV_WAIT && k == 0);
-    TEST_ASSERT(server_prompt_kv_verdict(kvb(20 * GiB), kvb(10 * GiB), kvb(23 * GiB), small, 2, false,
-                                         &k) == PROMPT_KV_REFUSE && k == 0);
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(20 * GiB), kvb(10 * GiB), kvb(23 * GiB), small, BankCount{2}, true,
+                                         &k) == PROMPT_KV_WAIT && k == BankCount{0});
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(20 * GiB), kvb(10 * GiB), kvb(23 * GiB), small, BankCount{2}, false,
+                                         &k) == PROMPT_KV_REFUSE && k == BankCount{0});
     /* a prompt past the budget by itself: refused even with everything spillable and a busy bank to wait for */
     const KvBytes all[1] = {kvb(20 * GiB)};
-    TEST_ASSERT(server_prompt_kv_verdict(kvb(20 * GiB), kvb(24 * GiB), kvb(23 * GiB), all, 1, true,
-                                         &k) == PROMPT_KV_REFUSE && k == 0);
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(20 * GiB), kvb(24 * GiB), kvb(23 * GiB), all, BankCount{1}, true,
+                                         &k) == PROMPT_KV_REFUSE && k == BankCount{0});
     /* nothing to add (a continuation on its own resident bank) always fits, even over a breached pool */
-    TEST_ASSERT(server_prompt_kv_verdict(kvb(30 * GiB), kvb(0), kvb(23 * GiB), NULL, 0, false,
-                                         &k) == PROMPT_KV_FITS && k == 0);
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(30 * GiB), kvb(0), kvb(23 * GiB), NULL, BankCount{0}, false,
+                                         &k) == PROMPT_KV_FITS && k == BankCount{0});
 }
 
 /* L326 -- L314's readmission decides from the reserved base (server_kv_reserved), as every admission does.  gpuq
@@ -19815,15 +19822,15 @@ static void test_l328_admission_decisions(void) {
     const uint64_t q = 13440, budget = 11984 * q, growth = 16 * q;
     const uint64_t a = 5710 * q;
     {
-        const bool all[4] = {true, true, true, true};
-        TEST_ASSERT(server_park_pick(all, 4, 2) == 0);         /* a spill of bank 2: parked on bank 0, as before */
-        TEST_ASSERT(server_park_pick(all, 4, 0) == 1);         /* a spill of bank 0 itself: the next resident one */
-        const bool b0_out[4] = {false, false, true, true};      /* bank 0 spilled, bank 1 preempted (no physical) */
-        TEST_ASSERT(server_park_pick(b0_out, 4, 3) == 2);
-        TEST_ASSERT(server_park_pick(b0_out, 4, 2) == 3);
-        const bool last[4] = {false, false, true, false};
-        TEST_ASSERT(server_park_pick(last, 4, 2) == -1);        /* the only resident bank cannot be freed */
-        TEST_ASSERT(server_park_pick(last, 4, 0) == 2);
+        const bank_flags all = {{true, true, true, true}};
+        TEST_ASSERT(server_park_pick(all, BankCount{4}, bx(2)) == bx(0));         /* a spill of bank 2: parked on bank 0, as before */
+        TEST_ASSERT(server_park_pick(all, BankCount{4}, bx(0)) == bx(1));         /* a spill of bank 0 itself: the next resident one */
+        const bank_flags b0_out = {{false, false, true, true}};      /* bank 0 spilled, bank 1 preempted (no physical) */
+        TEST_ASSERT(server_park_pick(b0_out, BankCount{4}, bx(3)) == bx(2));
+        TEST_ASSERT(server_park_pick(b0_out, BankCount{4}, bx(2)) == bx(3));
+        const bank_flags last = {{false, false, true, false}};
+        TEST_ASSERT(server_park_pick(last, BankCount{4}, bx(2)).is_none());        /* the only resident bank cannot be freed */
+        TEST_ASSERT(server_park_pick(last, BankCount{4}, bx(0)) == bx(2));
     }
     /* gpuq #474: bank 0 held its warmup high-water (4172 tokens) under W, A (5710) decoded beside it, B (8051) came:
      * resident 0.12 GiB.  Every idle bank spilled is not room enough (A + B > budget), so A is preempted -- and the
@@ -19831,31 +19838,32 @@ static void test_l328_admission_decisions(void) {
      * from fitting at all; then B's re-check SPILLs bank 0 and B binds */
     {
         const uint64_t warm0 = 4172 * q, b = 8051 * q, frame = (1841 + 8051 + 8051 / 4) * q;   /* LW + 1.25 LB */
-        int k = -1;
+        BankCount k{-1};
         const KvBytes drop0[1] = {kvb(warm0)};
-        TEST_ASSERT(server_prompt_kv_verdict(kvb(warm0 + a), kvb(b), kvb(frame), drop0, 1, true, &k) == PROMPT_KV_WAIT);
+        TEST_ASSERT(server_prompt_kv_verdict(kvb(warm0 + a), kvb(b), kvb(frame), drop0, BankCount{1}, true, &k) == PROMPT_KV_WAIT);
         TEST_ASSERT(!server_preempt_fits(kvb(warm0 + a), kvb(a), kvb(0), kvb(b),
                                          kvb(frame)));      /* bank 0 not counted: no fit (the old) */
         TEST_ASSERT(server_preempt_fits(kvb(warm0 + a), kvb(a), kvb(warm0), kvb(b),
                                         kvb(frame)));   /* bank 0 spillable: the preemption fits */
-        TEST_ASSERT(server_prompt_kv_verdict(kvb(warm0), kvb(b), kvb(frame), drop0, 1, true,
-                                             &k) == PROMPT_KV_SPILL && k == 1);
+        TEST_ASSERT(server_prompt_kv_verdict(kvb(warm0), kvb(b), kvb(frame), drop0, BankCount{1}, true,
+                                             &k) == PROMPT_KV_SPILL && k == BankCount{1});
         /* the readmission after B ends: B's bank and bank 0 (spilled already, or idle) are victims; A comes back */
         const KvBytes drop_b[1] = {kvb(b)};
-        TEST_ASSERT(server_prompt_kv_verdict(kvb(b), server_readmit_need(kvb(a), 0, kvb(growth)), kvb(frame), drop_b, 1,
+        TEST_ASSERT(server_prompt_kv_verdict(kvb(b), server_readmit_need(kvb(a), 0, kvb(growth)), kvb(frame), drop_b, BankCount{1},
                                              false, &k) ==
-                    PROMPT_KV_SPILL && k == 1);
+                    PROMPT_KV_SPILL && k == BankCount{1});
         /* a preemption fit never underflows: freed + idle past the base reads as an empty pool */
         TEST_ASSERT(server_preempt_fits(kvb(a), kvb(a), kvb(warm0), kvb(b), kvb(frame)));
         TEST_ASSERT(!server_preempt_fits(kvb(a), kvb(a), kvb(warm0), kvb(frame + 1), kvb(frame)));
     }
     /* (3) the empty bank with the most resident pages (server_pick_free_bank's rule over the empty ones) */
     {
-        const bool taken[4] = {true, false, true, false};   /* banks 1 and 3 are provisioned and empty */
-        const KvBytes resident[4] = {kvb(0), kvb(7 * q), kvb(0), kvb(9 * q)};
-        TEST_ASSERT(server_pick_free_bank(taken, resident, 4) == 3);
-        const bool none[2] = {true, true};
-        TEST_ASSERT(server_pick_free_bank(none, resident, 2) == -1);
+        const slot_flags taken = {{true, false, true, false}};   /* banks 1 and 3 are provisioned and empty */
+        const pulsar_indexed<KvBytes, SlotIdx, PULSAR_SESSION_POOL_CAP> resident = {{kvb(0), kvb(7 * q), kvb(0),
+                                                                                     kvb(9 * q)}};
+        TEST_ASSERT(server_pick_free_bank(taken, resident, BankCount{4}) == sx(3));
+        const slot_flags none = {{true, true}};
+        TEST_ASSERT(server_pick_free_bank(none, resident, BankCount{2}).is_none());
     }
     /* (4) preempt-exact's frame (margin 1.25): W 1841, B 8051, A 5405 + 1500, bank 0's warmup high-water 4172 (the
      * excess touched KV at B's arrival in #474).  With bank 0 a spill victim the frame is LW + 1.25 LB again, and it
@@ -19878,19 +19886,19 @@ static void test_l328_admission_decisions(void) {
              * preempted, and the leg's PREEMPTED check failed */
             if (w_on_0) {
                 const uint64_t hw0 = WARM > LW ? WARM : LW, A485 = 5485;
-                int k = -1;
+                BankCount k{-1};
                 TEST_ASSERT(server_prompt_kv_verdict(kvb((hw0 + A485) * q), kvb((LB - hw0) * q), kvb(frame * q), NULL,
-                                                     0, true, &k) ==
+                                                     BankCount{0}, true, &k) ==
                             PROMPT_KV_WAIT);
                 TEST_ASSERT(server_prompt_kv_verdict(kvb((hw0 + A485) * q), kvb((LB - hw0) * q),
-                                                     kvb((WARM + frame) * q), NULL, 0,
+                                                     kvb((WARM + frame) * q), NULL, BankCount{0},
                                                      true, &k) == PROMPT_KV_FITS);
             }
-            int k = -1;
+            BankCount k{-1};
             const KvBytes drop_b[1] = {kvb(LB * q)};
             TEST_ASSERT(server_prompt_kv_verdict(kvb(LB * q), server_readmit_need(kvb(LA0 * q), 0, kvb(growth)),
-                                                 kvb(frame * q), drop_b, 1,
-                                                 false, &k) == PROMPT_KV_SPILL && k == 1);
+                                                 kvb(frame * q), drop_b, BankCount{1},
+                                                 false, &k) == PROMPT_KV_SPILL && k == BankCount{1});
         }
     }
     /* (5) the guard preempts beside another decoder or a job holding reserved room, never a lone decoder */
@@ -19907,9 +19915,9 @@ static void test_l328_admission_decisions(void) {
         const uint64_t t = budget - growth;   /* two decoders, one quantum each over the budget */
         const uint64_t v = 3000 * q;
         TEST_ASSERT(t + 2 * growth > budget && (t - v) + growth <= budget);
-        int k = -1;
+        BankCount k{-1};
         TEST_ASSERT(server_prompt_kv_verdict(kvb(t - v), server_readmit_need(kvb(v), 1, kvb(growth)), kvb(budget), NULL,
-                                             0, true, &k) ==
+                                             BankCount{0}, true, &k) ==
                     PROMPT_KV_WAIT);
     }
 }
@@ -20093,13 +20101,13 @@ static void test_l330_sliced_restore(void) {
             TEST_ASSERT(server_kv_reserved(kvb(T0 + have), want, have1, 1) == kvb(T0 + W));
         }
         /* a prompt arriving mid-restore that fits only on what is touched does not fit on the reserved base */
-        int k = -1;
+        BankCount k{-1};
         const uint64_t budget = T0 + W + 1000 * q, p = 2000 * q;
         const KvBytes have1[1] = {kvb(8192 * q)};
-        TEST_ASSERT(server_prompt_kv_verdict(kvb(T0 + 8192 * q), kvb(p), kvb(budget), NULL, 0, true,
+        TEST_ASSERT(server_prompt_kv_verdict(kvb(T0 + 8192 * q), kvb(p), kvb(budget), NULL, BankCount{0}, true,
                                              &k) == PROMPT_KV_FITS);
         TEST_ASSERT(server_prompt_kv_verdict(server_kv_reserved(kvb(T0 + 8192 * q), want, have1, 1), kvb(p),
-                                             kvb(budget), NULL, 0,
+                                             kvb(budget), NULL, BankCount{0},
                                              true, &k) == PROMPT_KV_WAIT);
     }
 }
@@ -20107,28 +20115,28 @@ static void test_l330_sliced_restore(void) {
 static void test_l326_readmit_reserved(void) {
     const uint64_t tok = 2048, budget = (uint64_t)(2.2 * 6000) * tok;
     const uint64_t a = 6300 * tok, b = 5966 * tok, c = 6010 * tok;
-    int k = -1;
+    BankCount k{-1};
     /* C bound, nothing of it touched: the readmission waits for a job to end */
     const KvBytes want_c[1] = {kvb(c)}, none[1] = {kvb(0)};
     const KvBytes base = server_kv_reserved(kvb(a), want_c, none, 1);
     TEST_ASSERT(base == kvb(a + c));
-    TEST_ASSERT(server_prompt_kv_verdict(kvb(a), kvb(b), kvb(budget), NULL, 0, true,
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(a), kvb(b), kvb(budget), NULL, BankCount{0}, true,
                                          &k) == PROMPT_KV_FITS);   /* the defect */
-    TEST_ASSERT(server_prompt_kv_verdict(base, kvb(b), kvb(budget), NULL, 0, true, &k) == PROMPT_KV_WAIT && k == 0);
+    TEST_ASSERT(server_prompt_kv_verdict(base, kvb(b), kvb(budget), NULL, BankCount{0}, true, &k) == PROMPT_KV_WAIT && k == BankCount{0});
     /* C prefilled and decoding: it holds its prompt, so it reserves nothing more -- still no room beside A and C */
     const KvBytes have_c[1] = {kvb(c + 16 * tok)};
     TEST_ASSERT(server_kv_reserved(kvb(a + c + 16 * tok), want_c, have_c, 1) == kvb(a + c + 16 * tok));
-    TEST_ASSERT(server_prompt_kv_verdict(kvb(a + c + 16 * tok), kvb(b), kvb(budget), NULL, 0, true,
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(a + c + 16 * tok), kvb(b), kvb(budget), NULL, BankCount{0}, true,
                                          &k) == PROMPT_KV_WAIT);
     /* C ended: its bank is an idle victim -- B comes back by spilling it */
     const KvBytes drop_c[1] = {kvb(c + 16 * tok)};
-    TEST_ASSERT(server_prompt_kv_verdict(kvb(a + c + 16 * tok), kvb(b), kvb(budget), drop_c, 1, true,
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(a + c + 16 * tok), kvb(b), kvb(budget), drop_c, BankCount{1}, true,
                                          &k) == PROMPT_KV_SPILL &&
-                k == 1);
+                k == BankCount{1});
     /* nothing running and no room: the parked decoder is ended by name (REFUSE), never left parked forever */
-    TEST_ASSERT(server_prompt_kv_verdict(base, kvb(b), kvb(budget), NULL, 0, false, &k) == PROMPT_KV_REFUSE);
+    TEST_ASSERT(server_prompt_kv_verdict(base, kvb(b), kvb(budget), NULL, BankCount{0}, false, &k) == PROMPT_KV_REFUSE);
     /* the preemption's own fit (prompt C on A alone after B's KV is freed) reads the same base: it fits */
-    TEST_ASSERT(server_prompt_kv_verdict(server_kv_reserved(kvb(a), NULL, NULL, 0), kvb(c), kvb(budget), NULL, 0, true,
+    TEST_ASSERT(server_prompt_kv_verdict(server_kv_reserved(kvb(a), NULL, NULL, 0), kvb(c), kvb(budget), NULL, BankCount{0}, true,
                                          &k) ==
                 PROMPT_KV_FITS);
 
@@ -20160,17 +20168,17 @@ static void test_l326_readmit_reserved(void) {
     /* #473's readmission: A (5726 tokens) parked, W (1841) on bank 0, B (8051) the only other job.  While B
      * runs, A waits; once B ends its bank is the one idle victim, and A comes back by spilling it -- never refused */
     const uint64_t q = 13440, bq = 11984 * q, w = 1841 * q, pa = 5726 * q, pb = 8051 * q;
-    TEST_ASSERT(server_prompt_kv_verdict(kvb(w + pb), kvb(pa), kvb(bq), NULL, 0, true, &k) == PROMPT_KV_WAIT);
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(w + pb), kvb(pa), kvb(bq), NULL, BankCount{0}, true, &k) == PROMPT_KV_WAIT);
     const KvBytes drop_b[1] = {kvb(pb)};
-    TEST_ASSERT(server_prompt_kv_verdict(kvb(w + pb), kvb(pa), kvb(bq), drop_b, 1, false,
-                                         &k) == PROMPT_KV_SPILL && k == 1);
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(w + pb), kvb(pa), kvb(bq), drop_b, BankCount{1}, false,
+                                         &k) == PROMPT_KV_SPILL && k == BankCount{1});
     /* the preemption that made room for B: W + A resident, A (decoding) reserves nothing, A's bank frees */
     TEST_ASSERT((w + pa) - pa + pb <= bq);
     /* L328 (2): B on bank 0 once left A no room -- bank 0 was no victim -- and A was refused; bank 0 is a victim like
      * any idle bank now, so A comes back by spilling it */
     const KvBytes drop_b0[1] = {kvb(pb)};
-    TEST_ASSERT(server_prompt_kv_verdict(kvb(pb), kvb(pa), kvb(bq), drop_b0, 1, false,
-                                         &k) == PROMPT_KV_SPILL && k == 1);
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(pb), kvb(pa), kvb(bq), drop_b0, BankCount{1}, false,
+                                         &k) == PROMPT_KV_SPILL && k == BankCount{1});
 }
 
 /* L179 branch 11 -- worker_evict_one's slot reset (evict_reset_slot_fields).
@@ -20189,7 +20197,7 @@ static void test_l281_prefill_chunk_publishes_the_slot_gauges(void) {
     memset(&s, 0, sizeof(s));
     pthread_mutex_init(&s.mu, NULL);
     pthread_cond_init(&s.stream_cv, NULL);
-    s.n_slots = 1;
+    s.n_slots = BankCount{1};
     job j;
     memset(&j, 0, sizeof j);
     gen_state g;
@@ -20200,9 +20208,9 @@ static void test_l281_prefill_chunk_publishes_the_slot_gauges(void) {
     g.progress.srv = &s;
     g.progress.t0 = server_now_sec();
     g.progress.fd = -1;
-    s.slots[0].provisioned = true;
-    s.slots[0].active_job = &j;
-    s.slots[0].gen = &g;
+    s.slots[SlotIdx{0u}].provisioned = true;
+    s.slots[SlotIdx{0u}].active_job = &j;
+    s.slots[SlotIdx{0u}].gen = &g;
     const uint64_t gen0 = s.metrics_generation;
 
     gen_prefill_progress_cb(&g, "prefill_chunk", TokPos{4096}, TokCount{320284});
@@ -21189,8 +21197,8 @@ static void test_health_reports_pool_capacity_apart_from_provisioned(void) {
     server s;
     memset(&s, 0, sizeof s);
     pthread_mutex_init(&s.mu, NULL);
-    s.n_slots = 1;      /* one bank provisioned so far */
-    s.pool_banks = 8;   /* sized for eight this run */
+    s.n_slots = BankCount{1};      /* one bank provisioned so far */
+    s.pool_banks = BankCount{8};   /* sized for eight this run */
     s.n_generating = 1;
     s.started = time(NULL);
 
@@ -21217,8 +21225,8 @@ static void test_health_capacity_is_one_in_classic_mode(void) {
     server s;
     memset(&s, 0, sizeof s);
     pthread_mutex_init(&s.mu, NULL);
-    s.n_slots = 1;
-    s.pool_banks = 0;
+    s.n_slots = BankCount{1};
+    s.pool_banks = BankCount{0};
     s.started = time(NULL);
 
     int fds[2];
@@ -21879,8 +21887,8 @@ static void test_health_reports_a_stall(void) {
         server s;
         memset(&s, 0, sizeof s);
         pthread_mutex_init(&s.mu, NULL);
-        s.n_slots = 4;
-        s.pool_banks = 4;
+        s.n_slots = BankCount{4};
+        s.pool_banks = BankCount{4};
         s.n_generating = 1;
         s.started = time(NULL);
         s.stall_s = stalled ? 2160 : 0;
@@ -22642,7 +22650,7 @@ static_assert(std::is_same_v<decltype(gen_resolution::cached), PromptToks> &&
               "the carriers are typed: the cache read is the prompt's tokens, where the sync computes a position");
 static_assert(std::is_same_v<decltype(std::declval<server>().kv_chain_served(nullptr, nullptr, nullptr)), PromptToks> &&
                   std::is_same_v<decltype(std::declval<server>().kv_cache_find(nullptr, nullptr, 0, nullptr)), TokPos> &&
-                  std::is_same_v<decltype(std::declval<server>().gen_adopt_depth(nullptr, 0)), pulsar_bank_resume> &&
+                  std::is_same_v<decltype(std::declval<server>().gen_adopt_depth(nullptr, BankId::none())), pulsar_bank_resume> &&
                   !std::is_convertible_v<TokPos, PromptToks> && !std::is_constructible_v<PromptToks, TokPos> &&
                   !std::is_constructible_v<PromptToks, TokCount> && !std::is_constructible_v<TokPos, PromptToks>,
               "a chain's end and the request's tokens it holds are two types with no conversion, explicit or not");
@@ -23259,6 +23267,100 @@ static void test_l439_fused_lane_refuses_a_seam(void) {
     TEST_ASSERT(!fuse_witness_of_history(slot_tokens{&all, NULL}, prompt_view_of(&prompt), TokPos{204}));
 }
 
+/* ---- L441: the pool's two index spaces, their count, and the ids of the server's work --------------------------- */
+/** True when `T` takes a subscript of type `I`. */
+template <class T, class I, class = void>
+constexpr bool l441_subscripts = false;
+/** `T` takes a subscript of type `I`. */
+template <class T, class I>
+constexpr bool l441_subscripts<T, I, std::void_t<decltype(std::declval<T &>()[std::declval<I>()])>> = true;
+static_assert(l441_subscripts<slot_table, SlotIdx> && !l441_subscripts<slot_table, BankId> &&
+                  !l441_subscripts<slot_table, int> && !l441_subscripts<slot_table, BankCount> &&
+                  l441_subscripts<slot_flags, SlotIdx> && !l441_subscripts<slot_flags, BankId> &&
+                  !l441_subscripts<slot_flags, int> && l441_subscripts<bank_flags, BankId> &&
+                  !l441_subscripts<bank_flags, SlotIdx> && !l441_subscripts<bank_flags, int> &&
+                  l441_subscripts<slot_matrix, SlotIdx> && !l441_subscripts<slot_matrix, BankId> &&
+                  !l441_subscripts<slot_bits, BankId> && !l441_subscripts<slot_ints, int>,
+              "a per-slot table is subscripted by a slot only, a per-bank table by a bank only");
+static_assert(sizeof(slot_table) == sizeof(session_slot[PULSAR_SESSION_POOL_CAP]) &&
+                  alignof(slot_table) == alignof(session_slot) &&
+                  sizeof(slot_flags) == sizeof(bool[PULSAR_SESSION_POOL_CAP]) &&
+                  sizeof(bank_flags) == sizeof(bool[PULSAR_SESSION_POOL_CAP]) &&
+                  sizeof(slot_matrix) == sizeof(int[PULSAR_SESSION_POOL_CAP][PULSAR_SESSION_POOL_CAP]) &&
+                  sizeof(slot_bits) == sizeof(uint32_t[PULSAR_SESSION_POOL_CAP]),
+              "each table is the array it replaced (the server struct is memset whole)");
+static_assert(std::is_same_v<decltype(server::slots), slot_table> && std::is_same_v<decltype(server::n_slots), BankCount> &&
+                  std::is_same_v<decltype(server::pool_banks), BankCount> &&
+                  std::is_same_v<decltype(prefix_wait::slot), SlotIdx> &&
+                  std::is_same_v<decltype(&server::bank_of_slot), BankId (server::*)(SlotIdx) const> &&
+                  std::is_same_v<decltype(&server::slot_index), SlotIdx (server::*)(const session_slot *) const> &&
+                  std::is_same_v<decltype(&server_spill_parkable),
+                                 BankCount (*)(const bank_flags &, BankCount, const BankId *, BankCount, bool)> &&
+                  std::is_same_v<decltype(&server_park_pick), BankId (*)(const bank_flags &, BankCount, BankId)> &&
+                  std::is_same_v<decltype(&pool_residency), BankCount (*)(server *, bank_flags &)> &&
+                  std::is_same_v<decltype(&server_evict_pick_victim),
+                                 SlotIdx (*)(const slot_table &, BankCount, const slot_flags *, bool, const slot_flags *,
+                                             const slot_flags *)> &&
+                  std::is_same_v<decltype(&kv_dup_census_core),
+                                 void (*)(BankCount, const slot_ints &, const slot_flags &, const slot_matrix &, int,
+                                          KvBytes, kv_dup_census *, slot_bits *)>,
+              "the pool's slot / bank / count parameters are typed (L441)");
+static_assert(!std::is_constructible_v<BankId, SlotIdx> && !std::is_constructible_v<SlotIdx, BankId> &&
+                  !std::is_constructible_v<SlotIdx, BankCount> && !std::is_constructible_v<BankId, BankCount> &&
+                  !std::is_constructible_v<BankCount, SlotIdx> && !std::is_constructible_v<BankCount, BankId>,
+              "a slot becomes a bank through server::bank_of_slot alone; a count is neither");
+
+/* L441: the crossings and the count compute what the open-coded int expressions did: slot i holds bank i both ways,
+ * a slot's index is its position, a count walks 0 .. n-1 (none for 0 or less), covers what `i < n` did, reaches a slot
+ * with i + 1, names the bank past it, and a slot's bit is 1 << i; a broken identity is caught by name (a child). */
+static void test_l441_pool_spaces(void) {
+    server *s = (server *)calloc(1, sizeof(server));
+    for (SlotIdx i : session_pool_cap.slots()) s->slots[i].bank = s->bank_of_slot(i);   /* cli_main's boot loop */
+    for (int k = 0; k < PULSAR_SESSION_POOL_CAP; k++) {
+        const SlotIdx i{(uint32_t)k};
+        TEST_ASSERT(s->bank_of_slot(i) == BankId{k} && s->slots[i].bank == BankId{k});
+        TEST_ASSERT(s->slot_of_bank(BankId{k}) == &s->slots[i] && s->slot_index(&s->slots[i]) == i);
+        s->slots[i].provisioned = true;   /* a provisioned slot checks the identity, and holds */
+        TEST_ASSERT(s->bank_of_slot(i) == BankId{k});
+        TEST_ASSERT(slot_bit(i) == 1u << k);
+    }
+    for (int n = -2; n <= PULSAR_SESSION_POOL_CAP; n++) {
+        const BankCount c{n};
+        int walked = 0;
+        for (SlotIdx i : c.slots()) TEST_ASSERT(i == SlotIdx{(uint32_t)walked++});
+        TEST_ASSERT(walked == (n > 0 ? n : 0));
+        walked = 0;
+        for (BankId b : c.banks()) TEST_ASSERT(b == BankId{walked++});
+        TEST_ASSERT(walked == (n > 0 ? n : 0));
+        walked = 0;
+        for (int k : c.positions()) TEST_ASSERT(k == walked++);
+        TEST_ASSERT(walked == (n > 0 ? n : 0) && c.any() == (n > 0));
+        for (int k = -1; k <= PULSAR_SESSION_POOL_CAP; k++) {
+            TEST_ASSERT(c.covers(BankId{k}) == (k >= 0 && k < n));
+            if (k >= 0) TEST_ASSERT(c.covers(SlotIdx{(uint32_t)k}) == (k < n));
+        }
+        TEST_ASSERT(!c.covers(SlotIdx::none()) && !c.covers(BankId::none()));
+        if (n >= 0) TEST_ASSERT(c.bank_past() == BankId{n});
+        if (n >= 0) TEST_ASSERT(BankCount::through(SlotIdx{(uint32_t)n}) == BankCount{n + 1});
+    }
+    BankCount m{0};
+    TEST_ASSERT((m++) == BankCount{0} && m == BankCount{1} && (++m) == BankCount{2} && m - BankCount{1} == BankCount{1});
+    /* the identity broken (a slot's bank written by hand): both crossings refuse by name */
+    s->slots[SlotIdx{3u}].bank = BankId{4};
+    for (int which = 0; which < 2; which++) {
+        const pid_t pid = fork();
+        if (pid == 0) {
+            if (!freopen("/dev/null", "w", stderr)) _exit(3);
+            if (which == 0) (void)s->bank_of_slot(SlotIdx{3u});
+            else (void)s->slot_of_bank(BankId{3});
+            _exit(0);
+        }
+        int st = 0;
+        TEST_ASSERT(pid > 0 && waitpid(pid, &st, 0) == pid && WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT);
+    }
+    free(s);
+}
+
 static void pulsar_server_unit_tests_run(void) {
     test_l333_kv_units();
     test_l334_p2b_crossings();
@@ -23281,6 +23383,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l439_prefill_bounds_are_live_side();
     test_l439_prefix_wait_seamed_leader();
     test_l439_fused_lane_refuses_a_seam();
+    test_l441_pool_spaces();
     test_mem_floor_is_derived_from_the_watermarks();
     test_guard_budget_reads_live_memavailable();
     test_guard_discrete_reads_the_device();

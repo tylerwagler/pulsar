@@ -551,7 +551,7 @@ void server::close_resources() {
     /* The ONE session (server.sess — classic mode == slot 0 alone, pool mode
      * == N banks over it) is freed exactly once here; slots are pure bank
      * descriptors and own nothing to free. */
-    for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) {
+    for (SlotIdx i : session_pool_cap.slots()) {
         live_tool_state_free(&s->slots[i].responses_live);
         live_tool_state_free(&s->slots[i].anthropic_live);
         s->slot_terminal_clear(&s->slots[i]);   /* L380: a yielded checkpoint's kept turn */
@@ -1180,7 +1180,7 @@ int main(int argc, char **argv) {
      * est is the eager floor only; the FULL banked price is what the create
      * allocated (the demand-paged managed VA counts at full size). */
     const KvBytes session_actual =
-        server_reconciled_session_cost(0, cfg.ctx_size,
+        server_reconciled_session_cost(SlotIdx{0u}, cfg.ctx_size,
                                        overcommit ? full_banked_est : session_est,
                                        pulsar_session_resident_bytes(session));
     if (session_actual == KvBytes{}) {
@@ -1368,26 +1368,27 @@ int main(int argc, char **argv) {
                    pool_banks_clamped, PULSAR_SESSION_POOL_CAP);
         pool_banks_clamped = PULSAR_SESSION_POOL_CAP;
     }
-    s.pool_banks = pool_banks_clamped > 1 ? pool_banks_clamped : 0;
+    s.pool_banks = BankCount{pool_banks_clamped > 1 ? pool_banks_clamped : 0};
     s.reasoning_default = cfg.reasoning_default < 0 ? 0 : cfg.reasoning_default + 1;   /* L338 P4: --reasoning */
     if (s.reasoning_default)
         server_log(PULSAR_LOG_DEFAULT, "pulsar-server: --reasoning %s: a request that sends no thinking control %s",
                    cfg.reasoning_default ? "on" : "off", cfg.reasoning_default ? "thinks" : "does not think");
     /* L338 P2.4: the judge's reserved bank -- the pool's last, past the chat pool (no chat slot is it).  The chat
      * pool keeps at least two banks (a pool); a smaller one serves no judge. */
-    int judge_bank = -1;
+    BankId judge_bank = BankId::none();
     {
         const bool has = pulsar_engine_has_adapter(engine);
-        const int want = cfg.judge_banks < 0 ? (has ? 1 : 0) : cfg.judge_banks;
-        if (want > 0 && !has) {
+        /* (--judge-banks -1 is "auto": one when the container carries an adapter) */
+        const BankCount want{cfg.judge_banks < 0 ? (has ? 1 : 0) : cfg.judge_banks};
+        if (want.any() && !has) {
             server_log(PULSAR_LOG_ERROR, "pulsar-server: --judge-banks %d: the container carries no adapter -- "
-                       "refusing to start", want);
+                       "refusing to start", want.raw());
             return 1;
         }
-        if (want > 0 && s.pool_banks - 1 >= 2) {
-            s.pool_banks -= 1;
-            judge_bank = s.pool_banks;
-        } else if (want > 0) {
+        if (want.any() && s.pool_banks - BankCount{1} >= BankCount{2}) {
+            s.pool_banks = s.pool_banks - BankCount{1};
+            judge_bank = s.pool_banks.bank_past();   /* the bank past the chat pool */
+        } else if (want.any()) {
             server_log(PULSAR_LOG_WARNING, "pulsar-server: no /v1/systemone: the bank pool (%d) leaves no chat pool of "
                        "two beside a judge bank (set PULSAR_MSEQ_BANKS >= 3 or a smaller --ctx)", pool_banks_clamped);
         }
@@ -1398,7 +1399,7 @@ int main(int argc, char **argv) {
      * (every decode slot errors, then the decode-only retry errors too).
      * PULSAR_CUDA_PREFILL_CHUNK accepts any value >= 1, so refuse the pooled
      * configuration here instead (L177). */
-    if (s.pool_banks && cfg.engine.prefill_chunk != 0 &&
+    if (s.pool_banks.any() && cfg.engine.prefill_chunk != 0 &&
         cfg.engine.prefill_chunk < (uint32_t)PULSAR_SESSION_POOL_CAP + 1u) {
         server_log(PULSAR_LOG_ERROR,
                    "pulsar-server: prefill_chunk %u is below the pooled minimum %d "
@@ -1445,7 +1446,7 @@ int main(int argc, char **argv) {
         const char *mb = getenv("PULSAR_MIXED_BATCH");
         /* L251/L284: this lane's prompt rows ride decode_mixed beside the decode rows -- a family whose
          * decode_mixed carries none (Qwen: its prompts ride the spec lane's fused step) does not run it */
-        s.mixed_batch_enabled = s.pool_banks > 0 && pulsar_engine_has_mixed_prefill(engine) &&
+        s.mixed_batch_enabled = s.pool_banks.any() && pulsar_engine_has_mixed_prefill(engine) &&
                                 !(mb && (mb[0] == '0' || !strcasecmp(mb, "off")));
         s.mixed_chunk_tokens = 8;          /* the env knobs for these had no caller (L159 inc 4) */
         s.mixed_deep_guard_rows = 16384;
@@ -1456,9 +1457,9 @@ int main(int argc, char **argv) {
                    s.mixed_chunk_tokens,
                    s.mixed_deep_guard_rows);
     }
-    s.n_slots = 1;
-    for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) s.slots[i].bank = BankId{i}; /* slot i holds bank i */
-    if (s.pool_banks > 0) {
+    s.n_slots = BankCount{1};
+    for (SlotIdx i : session_pool_cap.slots()) s.slots[i].bank = s.bank_of_slot(i); /* slot i holds bank i */
+    if (s.pool_banks.any()) {
         /* The pool's ledger (L391, server::ledger_open_pool): the admitted
          * price split evenly over the banks it was priced over -- ALL the
          * session's banks, the judge's included, each one's eager floor being
@@ -1500,7 +1501,7 @@ int main(int argc, char **argv) {
                    pool_banks,
                    (double)s.bank_charge(BankId{0}).raw() / (1024.0 * 1024.0 * 1024.0),
                    (double)session_actual.raw() / (1024.0 * 1024.0 * 1024.0), ckpt_where,
-                   (double)s.ledger_admitted_bytes.raw() / (1024.0 * 1024.0 * 1024.0), pool_banks, s.pool_banks,
+                   (double)s.ledger_admitted_bytes.raw() / (1024.0 * 1024.0 * 1024.0), pool_banks, s.pool_banks.raw(),
                    (double)s.ledger_reserved_bytes.raw() / (1024.0 * 1024.0 * 1024.0));
     } else {
         s.ledger_open_classic(kv_budget_final, session_actual);
@@ -1515,7 +1516,7 @@ int main(int argc, char **argv) {
      * NEVER the coarse cudaMemGetInfo gauge. PULSAR_SERVER_KV_BUDGET_OVERRIDE (bytes)
      * lowers the budget for the memory-safety smoke so the guard fires at modest
      * fills while the box stays far from real OOM. */
-    if (overcommit && s.pool_banks > 0) {
+    if (overcommit && s.pool_banks.any()) {
         /* L338: a discrete card's guard reads the device (server_guard_avail_bytes), and the ledger's share does not
          * cap it unless the test hook below sets a budget. */
         s.guard_floor = server_guard_floor(s.guard_discrete);
@@ -1548,7 +1549,7 @@ int main(int argc, char **argv) {
                        "pulsar-server: refusing to start: a %d-bank pool has no touched-KV headroom (%s %.2f GiB "
                        "post-warmup, floor %.2f GiB; kv budget %.2f − eager %.2f GiB) -- lower --ctx or "
                        "PULSAR_MSEQ_BANKS (L319)",
-                       s.pool_banks, s.guard_discrete ? "device free" : "MemAvailable",
+                       s.pool_banks.raw(), s.guard_discrete ? "device free" : "MemAvailable",
                        (double)guard_warm_avail.raw() / gib,
                        (double)s.guard_floor.raw() / gib,
                        (double)budget.raw() / gib, (double)s.guard_eager_bytes.raw() / gib);
@@ -1578,14 +1579,14 @@ int main(int argc, char **argv) {
      * read regardless of provisioning state.  Classic mode (no pool) keeps
      * the boot session live on slot 0; pool mode provisions bank 0 lazily
      * like every other bank. */
-    s.slots[0].ctx_size = cfg.ctx_size;
+    s.slots[SlotIdx{0u}].ctx_size = cfg.ctx_size;
     s.pool_ctx_size = cfg.ctx_size;
     /* Unconditional: the context-scaled KV one bank holds is a property of the
      * shape and the ctx, not of how admission happens to be gated. */
     s.kv_bank_bytes = pulsar_engine_demand_paged_bytes_per_bank(engine, cfg.ctx_size);
-    if (s.pool_banks == 0) {
-        s.slots[0].provisioned = true;
-        s.slots[0].state = SLOT_IDLE;
+    if (!s.pool_banks.any()) {
+        s.slots[SlotIdx{0u}].provisioned = true;
+        s.slots[SlotIdx{0u}].state = SLOT_IDLE;
     }
     /* Slot-routing trivial-match threshold (choose_slot_for_job): the token
      * depth at which a shared prefix stops meaning "same rendered template
@@ -1620,7 +1621,7 @@ int main(int argc, char **argv) {
             pulsar_engine_close(engine);
             return 1;
         }
-        if (s.pool_banks > 1)
+        if (s.pool_banks > BankCount{1})
             server_log(PULSAR_LOG_DEFAULT, "pulsar-server: prefix wait: a queued request waits up to %d ms for a cut "
                        "another prompt's prefill is filling, then adopts it (PULSAR_SERVER_PREFIX_WAIT_MS; 0 = off)",
                        s.prefix_wait_ms);
@@ -1733,7 +1734,7 @@ int main(int argc, char **argv) {
      * runs before the worker thread starts, so it is still single-threaded
      * engine access. */
     /* L338 P2.4: the judge on its reserved bank (single-threaded: before the worker starts) */
-    if (judge_bank >= 0) {
+    if (judge_bank.is_token()) {
         char jerr[320];
         if (!server_judge_open(&s, cfg.engine.model_path, judge_bank, jerr, sizeof jerr)) {
             server_log(PULSAR_LOG_ERROR, "pulsar-server: /v1/systemone: %s -- refusing to start", jerr);
@@ -1829,7 +1830,7 @@ int main(int argc, char **argv) {
         while (s.clients > 0) pthread_cond_wait(&s.clients_cv, &s.mu);
     }
 
-    for (int i = 0; i < s.n_slots; i++) {
+    for (SlotIdx i : s.n_slots.slots()) {
         session_slot *sl = &s.slots[i];
         /* L330: a guard-spilled bank's history is on disk already (the spill persisted it): nothing to store */
         if (!sl->provisioned || sl->spilled) continue;
@@ -1843,17 +1844,17 @@ int main(int argc, char **argv) {
          * matched that stale cur_bank early-returned "success" over mixed views
          * and silently lost its snapshot too.  Skip the slot if it can't be
          * installed rather than persisting another conversation's frontier. */
-        if (s.pool_banks > 0 && !s.bank_switch(sl->bank)) {
+        if (s.pool_banks.any() && !s.bank_switch(sl->bank)) {
             server_log(PULSAR_LOG_DEFAULT,
-                       "pulsar-server: slot %d bank %d could not be installed at shutdown; "
-                       "skipping its KV persist", i, sl->bank.raw());
+                       "pulsar-server: slot %u bank %d could not be installed at shutdown; "
+                       "skipping its KV persist", i.raw(), sl->bank.raw());
             continue;
         }
         const pulsar_tokens *tokens = pulsar_session_tokens(s.sess);
         if (s.kv.enabled && tokens && tokens->len >= s.kv.opt.min_tokens) {
             server_log(PULSAR_LOG_KVCACHE,
-                       "pulsar-server: persisting slot %d KV cache before shutdown tokens=%d",
-                       i, tokens->len);
+                       "pulsar-server: persisting slot %u KV cache before shutdown tokens=%d",
+                       i.raw(), tokens->len);
             s.kv_cache_persist(sl, KV_PERSIST_SHUTDOWN);
         }
     }
