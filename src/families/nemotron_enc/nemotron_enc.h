@@ -106,7 +106,7 @@ typedef struct {
     pulsar_tensor *output_norm;  ///< output_norm [n_embd]
     pulsar_tensor *score;        ///< score [n_embd -> 1] (Rerank only)
     /// The trunk layers; entries [0, shape.n_layer) are bound.
-    pulsar_nemotron_enc_layer layer[PULSAR_FAMILY_MAX_LAYER];
+    pulsar_indexed<pulsar_nemotron_enc_layer, TrunkLayer, PULSAR_FAMILY_MAX_LAYER> layer;
     /** The score head widened to f32 at load (Rerank): the host's dot with the pooled row. */
     float *score_f32;
     /** What the binding priced (role_bind.h): every byte the core stages, by role. */

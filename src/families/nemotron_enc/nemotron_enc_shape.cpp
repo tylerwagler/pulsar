@@ -295,8 +295,8 @@ void pulsar_nemotron_enc_plan(const pulsar_nemotron_enc_shape *s, pulsar_layer_p
     memset(plan, 0, sizeof(*plan));
     plan->n_layer = s->n_layer;
     for (TrunkLayer il{0u}; il.below(s->n_layer); ++il) {
-        plan->kind[il.raw()] = PULSAR_LAYER_BLOCKS;
-        plan->desc[il.raw()].mixer = PULSAR_MIXER_ATTN_FULL;
-        plan->desc[il.raw()].ffn = PULSAR_FFN_DENSE;
+        plan->kind[il] = PULSAR_LAYER_BLOCKS;
+        plan->desc[il].mixer = PULSAR_MIXER_ATTN_FULL;
+        plan->desc[il].ffn = PULSAR_FFN_DENSE;
     }
 }

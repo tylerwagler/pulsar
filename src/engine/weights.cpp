@@ -448,7 +448,7 @@ static bool weights_layer_has_required(const pulsar_layer_weights *l, TrunkLayer
 const pulsar_layer_weights *weights_first_bound_layer(const pulsar_weights *w) {
     if (!w) return NULL;
     for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
-        if (weights_layer_has_required(&w->layer[il.raw()], il)) return &w->layer[il.raw()];
+        if (weights_layer_has_required(&w->layer[il], il)) return &w->layer[il];
     }
     return NULL;
 }
@@ -506,7 +506,7 @@ static void weights_validate_layout(
     }
 
     for (TrunkLayer il = layer_start; il <= layer_end; ++il) {
-        const pulsar_layer_weights *l = &w->layer[il.raw()];
+        const pulsar_layer_weights *l = &w->layer[il];
         if (!weights_layer_has_required(l, il)) {
             fprintf(stderr, "pulsar: required tensors for layer %u are missing\n", il.raw());
             pulsar_load_refuse();
@@ -874,7 +874,7 @@ static void config_expect_f32(const char *name, float got, float expected);
  * expert weight tensors are dense-trimmed to keep_count. */
 /// @param m the model
 static void validate_reap_metadata(const pulsar_model *m) {
-    memset(g_pulsar_layer_expert_count, 0, sizeof(g_pulsar_layer_expert_count));
+    memset(g_pulsar_layer_expert_count.data(), 0, sizeof(g_pulsar_layer_expert_count));
 
     bool enabled = false;
     if (!model_get_bool(m, "reap.enabled", &enabled) || !enabled) return;
@@ -919,7 +919,7 @@ static void validate_reap_metadata(const pulsar_model *m) {
             pulsar_load_refuse();
             return;
         }
-        g_pulsar_layer_expert_count[il.raw()] = got;
+        g_pulsar_layer_expert_count[il] = got;
     }
 }
 
@@ -1568,7 +1568,7 @@ void weights_bind(pulsar_weights *w, const pulsar_model *m) {
     weights_bind_output(w, m);
 
     for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
-        weights_bind_layer(&w->layer[il.raw()], m, il);
+        weights_bind_layer(&w->layer[il], m, il);
     }
 
     weights_validate_layout(w, TrunkLayer{0u}, TrunkLayer{PULSAR_N_LAYER - 1u}, true, true);
@@ -1607,7 +1607,7 @@ static void dspark_weights_validate_layout(const pulsar_dspark_weights *w) {
     tensor_expect_f32_or_bf16(w->main_norm, 1, E, 0, 0);
 
     for (DraftLayer li{0u}; li.below(3); ++li) {
-        const pulsar_layer_weights *l = &w->layer[li.raw()];
+        const pulsar_layer_weights *l = &w->layer[li];
         tensor_expect_plain_layout(l->hc_attn_fn, 2, hc_dim, hc_mix_dim, 0);
         tensor_expect_layout(l->hc_attn_scale, PULSAR_TENSOR_F32, 1, 3, 0, 0);
         tensor_expect_layout(l->hc_attn_base, PULSAR_TENSOR_F32, 1, hc_mix_dim, 0, 0);
@@ -1696,7 +1696,7 @@ void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m) {
     w->main_norm = required_tensor(m, "dspark.main_norm.weight");
 
     for (DraftLayer li{0u}; li.below(3); ++li) {
-        pulsar_layer_weights *l = &w->layer[li.raw()];
+        pulsar_layer_weights *l = &w->layer[li];
         l->n_expert = PULSAR_N_DSPARK_EXPERT;
         l->n_expert_used = PULSAR_N_DSPARK_EXPERT_USED;
         l->n_expert_present = PULSAR_N_DSPARK_EXPERT;
@@ -1809,14 +1809,14 @@ bool vision_weights_bind(pulsar_vision_weights *w, const pulsar_model *m) {
     }
 
     for (VisLayer li{0u}; li.below(PULSAR_VISION_LAYERS); ++li) {
-        w->block[li.raw()].norm1     = required_tensorf(m, "vision.blocks.%u.norm1.weight", li.raw());
-        w->block[li.raw()].wqkv      = required_tensorf(m, "vision.blocks.%u.attn.wqkv.weight", li.raw());
-        w->block[li.raw()].wqkv_bias = required_tensorf(m, "vision.blocks.%u.attn.wqkv.bias", li.raw());
-        w->block[li.raw()].wo        = required_tensorf(m, "vision.blocks.%u.attn.wo.weight", li.raw());
-        w->block[li.raw()].wo_bias   = required_tensorf(m, "vision.blocks.%u.attn.wo.bias", li.raw());
-        w->block[li.raw()].norm2     = required_tensorf(m, "vision.blocks.%u.norm2.weight", li.raw());
-        w->block[li.raw()].w1        = required_tensorf(m, "vision.blocks.%u.mlp.w1.weight", li.raw());
-        w->block[li.raw()].w2        = required_tensorf(m, "vision.blocks.%u.mlp.w2.weight", li.raw());
+        w->block[li].norm1     = required_tensorf(m, "vision.blocks.%u.norm1.weight", li.raw());
+        w->block[li].wqkv      = required_tensorf(m, "vision.blocks.%u.attn.wqkv.weight", li.raw());
+        w->block[li].wqkv_bias = required_tensorf(m, "vision.blocks.%u.attn.wqkv.bias", li.raw());
+        w->block[li].wo        = required_tensorf(m, "vision.blocks.%u.attn.wo.weight", li.raw());
+        w->block[li].wo_bias   = required_tensorf(m, "vision.blocks.%u.attn.wo.bias", li.raw());
+        w->block[li].norm2     = required_tensorf(m, "vision.blocks.%u.norm2.weight", li.raw());
+        w->block[li].w1        = required_tensorf(m, "vision.blocks.%u.mlp.w1.weight", li.raw());
+        w->block[li].w2        = required_tensorf(m, "vision.blocks.%u.mlp.w2.weight", li.raw());
     }
     w->n_layers = PULSAR_VISION_LAYERS;
 
@@ -1833,14 +1833,14 @@ bool vision_weights_bind(pulsar_vision_weights *w, const pulsar_model *m) {
     if (w->image_pad) tensor_expect_f32_or_bf16(w->image_pad, 1, T, 0, 0);
 
     for (VisLayer li{0u}; li.below(PULSAR_VISION_LAYERS); ++li) {
-        tensor_expect_f32_or_bf16(w->block[li.raw()].norm1, 1, D, 0, 0);
-        tensor_expect_f32_or_bf16(w->block[li.raw()].wqkv, 2, D, 3u * D, 0);
-        tensor_expect_f32_or_bf16(w->block[li.raw()].wqkv_bias, 1, 3u * D, 0, 0);
-        tensor_expect_f32_or_bf16(w->block[li.raw()].wo, 2, D, D, 0);
-        tensor_expect_f32_or_bf16(w->block[li.raw()].wo_bias, 1, D, 0, 0);
-        tensor_expect_f32_or_bf16(w->block[li.raw()].norm2, 1, D, 0, 0);
-        tensor_expect_f32_or_bf16(w->block[li.raw()].w1, 2, D, 2u * I, 0);
-        tensor_expect_f32_or_bf16(w->block[li.raw()].w2, 2, I, D, 0);
+        tensor_expect_f32_or_bf16(w->block[li].norm1, 1, D, 0, 0);
+        tensor_expect_f32_or_bf16(w->block[li].wqkv, 2, D, 3u * D, 0);
+        tensor_expect_f32_or_bf16(w->block[li].wqkv_bias, 1, 3u * D, 0, 0);
+        tensor_expect_f32_or_bf16(w->block[li].wo, 2, D, D, 0);
+        tensor_expect_f32_or_bf16(w->block[li].wo_bias, 1, D, 0, 0);
+        tensor_expect_f32_or_bf16(w->block[li].norm2, 1, D, 0, 0);
+        tensor_expect_f32_or_bf16(w->block[li].w1, 2, D, 2u * I, 0);
+        tensor_expect_f32_or_bf16(w->block[li].w2, 2, I, D, 0);
     }
     /* The head count must divide the width; the tower asserts it here so the
      * forward can assume a whole head_dim. */

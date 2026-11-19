@@ -170,7 +170,7 @@ bool engram_bind(pulsar_weights *w, const pulsar_model *m, const char *model_pat
         snprintf(path, sizeof path, "%s%.*s", dir, (int)file.len, file.ptr);
         if (!pulsar_engram_table_open(&em->table[l], path, src, em->num_embeddings[l]))
             return engram_refuse("a row table does not open against this model");
-        pulsar_layer_weights *L = &w->layer[il.raw()];
+        pulsar_layer_weights *L = &w->layer[il];
         snprintf(name, sizeof name, "layers.%u.engram.wkv.weight", src);
         L->engram_wkv = model_find_tensor(m, name);
         snprintf(name, sizeof name, "layers.%u.engram.q_weight", src);
@@ -373,9 +373,9 @@ bool gpu_graph_engram_apply(pulsar_gpu_graph *g, const pulsar_model *model, cons
     const int got = pulsar_engram_gather_wait(g->engram.pending[l]);
     g->engram.pending[l] = NULL;
     if (!got) return engram_refuse("a row gather failed (message above)");
-    static bool announced[PULSAR_MAX_LAYER];
-    if (!announced[il.raw()]) {
-        announced[il.raw()] = true;
+    static pulsar_indexed<bool, TrunkLayer, PULSAR_MAX_LAYER> announced;
+    if (!announced[il]) {
+        announced[il] = true;
         fprintf(stderr, "pulsar: engram: block %u runs rows -> MX slot -> wkv -> gate + add (first step %u rows)\n",
                 il.raw(), n_tokens);
     }

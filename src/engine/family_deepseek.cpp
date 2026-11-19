@@ -40,9 +40,9 @@ static int ds4_quant_bits(pulsar_engine *e) {
     int bits = 0;
     for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         const pulsar_tensor *proj[3] = {
-            e->weights.layer[il.raw()].ffn_gate_exps,
-            e->weights.layer[il.raw()].ffn_up_exps,
-            e->weights.layer[il.raw()].ffn_down_exps,
+            e->weights.layer[il].ffn_gate_exps,
+            e->weights.layer[il].ffn_up_exps,
+            e->weights.layer[il].ffn_down_exps,
         };
         for (int k = 0; k < 3; k++) {
             const pulsar_tensor *t = proj[k];

@@ -124,7 +124,7 @@ int main(int argc, char **argv) {
     opt.backend = PULSAR_BACKEND_CUDA;
     pulsar_engine *e = NULL;
     if (pulsar_engine_open(&e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
-    const pulsar_layer_weights *L = &e->weights.layer[il];
+    const pulsar_layer_weights *L = &e->weights.layer[TrunkLayer{il}];
     if (il >= PULSAR_N_LAYER || !L->attn_q_b || !L->attn_output_b || !L->ffn_gate_shexp || !L->attn_q_a ||
         !L->ffn_gate_inp || !e->weights.output) {
         fprintf(stderr, "layer %u lacks a needed tensor\n", il);

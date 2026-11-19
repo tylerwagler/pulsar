@@ -272,7 +272,7 @@ bool tower(ctx &c, const pulsar_nemotron_parse_page &pg, uint32_t n_patch) {
         &hu};
     const pulsar_vit_dims dims = {D, s.vit_heads, HD, M, s.vit_depth, s.vit_eps};
     const pulsar_vit_bufs bufs = {res, xn, qkv, att, mlp, c.stage(), NULL, 0, NP_CHUNK};
-    if (!pulsar_vit_encode(&c.e->model, dims, w->vit, F16, bufs, N, &hooks, c.err, c.errlen)) return false;
+    if (!pulsar_vit_encode(&c.e->model, dims, {w->vit.data(), dims.depth}, F16, bufs, N, &hooks, c.err, c.errlen)) return false;
     ph.reset();
     ph.emplace();
     c.put("vit_out", r->t[B_RES], N, D);
@@ -344,8 +344,8 @@ bool decoder(ctx &c, uint32_t pos0, uint32_t n, bool prompt) {
                                        c.fp(w->embed_norm_b, "embed norm"), s.eps, NULL, 0, F16, h, E, 0) != 0)
         return fail(c.err, c.errlen, "the embedding LayerNorm refused");
     if (pos0 == 0) c.put("emb", r->t[B_H], n, E);
-    if (pulsar_rows_layernorm32_launch(h, true, E, NULL, n, E, c.fp(w->layer[0].attn_norm, "attn norm"),
-                                       c.fp(w->layer[0].attn_norm_b, "attn norm"), s.eps, xn, E, F16, NULL, 0, 0) != 0)
+    if (pulsar_rows_layernorm32_launch(h, true, E, NULL, n, E, c.fp(w->layer[TrunkLayer{0}].attn_norm, "attn norm"),
+                                       c.fp(w->layer[TrunkLayer{0}].attn_norm_b, "attn norm"), s.eps, xn, E, F16, NULL, 0, 0) != 0)
         return fail(c.err, c.errlen, "the first attention LayerNorm refused");
     std::vector<uint32_t> row_seq(n, 0u), row_pos(n);
     for (uint32_t i = 0; i < n; i++) row_pos[i] = pos0 + i;
@@ -358,7 +358,7 @@ bool decoder(ctx &c, uint32_t pos0, uint32_t n, bool prompt) {
     io.workspace = dp(r->t[B_DAWS]);
     io.workspace_bytes = r->bytes[B_DAWS];
     for (TrunkLayer il{0u}; il.below(s.n_layer); ++il) {
-        const pulsar_nemotron_parse_dec_layer &L = w->layer[il.raw()];
+        const pulsar_nemotron_parse_dec_layer &L = w->layer[il];
         for (uint32_t r0 = 0; r0 < n; r0 += NP_CHUNK) {
             const uint32_t m = n - r0 < NP_CHUNK ? n - r0 : NP_CHUNK;
             const uint16_t *xc = xn + (size_t)r0 * E;
@@ -380,8 +380,8 @@ bool decoder(ctx &c, uint32_t pos0, uint32_t n, bool prompt) {
         if (pulsar_gqa_forward(&r->dec, &seq, 1, row_seq.data(), row_pos.data(), n, &io, 0) != 0)
             return fail(c.err, c.errlen, "the decoder's attention refused");
         const bool last = il.last_of(s.n_layer);
-        const float *nn = last ? c.fp(w->output_norm, "output norm") : c.fp(w->layer[il.next().raw()].attn_norm, "attn norm");
-        const float *nb = last ? c.fp(w->output_norm_b, "output norm") : c.fp(w->layer[il.next().raw()].attn_norm_b, "attn norm");
+        const float *nn = last ? c.fp(w->output_norm, "output norm") : c.fp(w->layer[il.next()].attn_norm, "attn norm");
+        const float *nb = last ? c.fp(w->output_norm_b, "output norm") : c.fp(w->layer[il.next()].attn_norm_b, "attn norm");
         for (uint32_t r0 = 0; r0 < n; r0 += NP_CHUNK) {
             const uint32_t m = n - r0 < NP_CHUNK ? n - r0 : NP_CHUNK;
             float *hc = h + (size_t)r0 * E;

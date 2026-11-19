@@ -144,7 +144,7 @@ bool pulsar_nemotron_h_vision_bind(const pulsar_model *m, pulsar_role_binder *b,
     v->pos = pulsar_role_bind(b, top("vit_pos"), A_BF16, 2, D, G);
     for (VisLayer il{0u}; il.below(s.depth); ++il) {
         auto k = [&](const char *r) { return pulsar_role_in(r, "vit", (int32_t)il.raw()); };
-        pulsar_vit_block &B = v->vit[il.raw()];
+        pulsar_vit_block &B = v->vit[il];
         B.norm1 = pulsar_role_bind(b, k("vit_norm1"), A_F32, 1, D);
         B.norm1_b = pulsar_role_bind(b, k("vit_norm1_bias"), A_F32, 1, D);
         B.qkv = pulsar_role_bind(b, k("vit_qkv"), A_LINEAR, 2, D, 3u * D);
@@ -218,8 +218,8 @@ bool pulsar_nemotron_h_vision_run_create(const pulsar_model *m, pulsar_nemotron_
     uint64_t lws = 0;
     {
         const struct { const pulsar_tensor *t; int in, out, rows; } ls[] = {
-            {v->patch, (int)P, (int)D, (int)CHUNK}, {v->vit[0].qkv, (int)D, (int)(3 * D), (int)CHUNK},
-            {v->vit[0].fc1, (int)D, (int)s.mlp, (int)CHUNK}, {v->vit[0].fc2, (int)s.mlp, (int)D, (int)CHUNK},
+            {v->patch, (int)P, (int)D, (int)CHUNK}, {v->vit[VisLayer{0}].qkv, (int)D, (int)(3 * D), (int)CHUNK},
+            {v->vit[VisLayer{0}].fc1, (int)D, (int)s.mlp, (int)CHUNK}, {v->vit[VisLayer{0}].fc2, (int)s.mlp, (int)D, (int)CHUNK},
             {v->proj_fc1, (int)S, (int)s.proj_hidden, (int)PROJ_CHUNK},
             {v->proj_fc2, (int)s.proj_hidden, (int)LLM_WIDTH, (int)PROJ_CHUNK}};
         for (const auto &x : ls) {
@@ -337,7 +337,7 @@ bool pulsar_nemotron_h_vision_encode(const pulsar_model *m, const pulsar_nemotro
     }
     const pulsar_vit_dims dims = {D, s.heads, s.head_dim, s.mlp, s.depth, s.eps};
     const pulsar_vit_bufs bufs = {res, xn, qkv, att, mlp, stage, dp(r->t[V_LWS]), r->bytes[V_LWS], CHUNK};
-    if (!pulsar_vit_encode(m, dims, v->vit, PULSAR_ROWS_OUT_BF16, bufs, N, NULL, err, errlen)) return false;
+    if (!pulsar_vit_encode(m, dims, {v->vit.data(), dims.depth}, PULSAR_ROWS_OUT_BF16, bufs, N, NULL, err, errlen)) return false;
     if (dbg) {   /* the tower's residual, the patches back in raster order */
         std::vector<float> all((size_t)N * D);
         if (!pulsar_gpu_tensor_read(r->t[V_RES], TensorBytes{0}, all.data(), bytes_of<float>(all.size())))

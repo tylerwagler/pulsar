@@ -5496,7 +5496,7 @@ static void test_state_plan_overflow(void) {
     for (uint32_t i = 0; i < PULSAR_STATE_DECLS_MAX; i++) {
         const uint32_t id = pulsar_state_plan_add(&p, d);
         TEST_ASSERT(id == i);
-        p.slot[0] |= 1u << id;
+        p.slot[LayerSlot{0}] |= 1u << id;
     }
     TEST_ASSERT(p.n_decl == PULSAR_STATE_DECLS_MAX && p.n_overflow == 0u);
     for (uint32_t i = 0; i < 2u; i++) {
@@ -5515,7 +5515,7 @@ static void test_state_plan_overflow(void) {
     q.ckpt_slots = 1u;
     const uint32_t id = pulsar_state_plan_add(&q, d);
     q.n_trunk = q.n_slots = PULSAR_STATE_SLOTS_MAX - 2u;
-    for (uint32_t k = 0; k < q.n_trunk; k++) q.slot[k] = 1u << id;
+    for (uint32_t k = 0; k < q.n_trunk; k++) q.slot[LayerSlot{k}] = 1u << id;
     q.session = 0xA5A5A5A5u;   /* the word after slot[]: a write past the table would land here */
     TEST_ASSERT(pulsar_state_plan_add_slot(&q, 1u << id) == LayerSlot{PULSAR_STATE_SLOTS_MAX - 2u});
     TEST_ASSERT(pulsar_state_plan_add_slot(&q, 1u << id) == LayerSlot{PULSAR_STATE_SLOTS_MAX - 1u});

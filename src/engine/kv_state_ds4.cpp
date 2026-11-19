@@ -79,7 +79,7 @@ static bool ds4_walk(void *state, int dir, bool frontier, pulsar_gpu_tensor *sla
     const uint32_t first = n ? (G - n) % g->raw_cap : 0u;
     const uint32_t run = (g->raw_cap - first) < n ? (g->raw_cap - first) : n;
     for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER) && ok; ++il) {
-        pulsar_gpu_tensor *raw = g->layer_raw_cache[il.raw()];
+        pulsar_gpu_tensor *raw = g->layer_raw_cache[il];
         const TensorBytes at = off + raw_row.times(skip);
         if (dir == 0 && n) {
             ok = pulsar_gpu_tensor_copy_async(slab, at, raw, raw_row.times(first), raw_row.times(run)) != 0 &&
@@ -94,26 +94,26 @@ static bool ds4_walk(void *state, int dir, bool frontier, pulsar_gpu_tensor *sla
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (!frontier && (ratio <= 1u || pulsar_compress_coff(ratio) == 1u)) continue;
-        lane(g->layer_attn_state_kv[il.raw()]);
-        lane(g->layer_attn_state_score[il.raw()]);
-        lane(g->layer_index_state_kv[il.raw()]);
-        lane(g->layer_index_state_score[il.raw()]);
+        lane(g->layer_attn_state_kv[il]);
+        lane(g->layer_attn_state_score[il]);
+        lane(g->layer_index_state_kv[il]);
+        lane(g->layer_index_state_score[il]);
     }
     /* The frontier's drafter (DSpark, when loaded): its raw KV ring and prompt-window ring, the installed bank's
      * views, and their counters as a host tail -- the state the next speculative round drafts from (Qwen's MTP
      * stage and pending row are its slot's).  A grid checkpoint does not carry it: a resume re-captures the
      * prompt window as its prefill runs. */
-    if (frontier && g->dspark_raw_cache[0]) {
+    if (frontier && g->dspark_raw_cache[DraftLayer{0}]) {
         for (int i = 0; i < 3; i++) {
-            lane(g->dspark_raw_cache[i]);
+            lane(g->dspark_raw_cache[DraftLayer{i}]);
             lane(g->dspark_prompt_h[i]);
         }
-        uint32_t c[5] = { g->dspark_n_raw[0], g->dspark_n_raw[1], g->dspark_n_raw[2], g->dspark_prompt_n,
+        uint32_t c[5] = { g->dspark_n_raw[DraftLayer{0}], g->dspark_n_raw[DraftLayer{1}], g->dspark_n_raw[DraftLayer{2}], g->dspark_prompt_n,
                           g->dspark_prompt_lo };
         if (ok && dir == 0) ok = pulsar_gpu_tensor_write(slab, off, c, TensorBytes{sizeof(c)}) != 0;
         else if (ok && dir > 0) {
             ok = pulsar_gpu_tensor_read(slab, off, c, TensorBytes{sizeof(c)}) != 0;
-            for (int i = 0; ok && i < 3; i++) g->dspark_n_raw[i] = c[i];
+            for (int i = 0; ok && i < 3; i++) g->dspark_n_raw[DraftLayer{i}] = c[i];
             if (ok) { g->dspark_prompt_n = c[3]; g->dspark_prompt_lo = c[4]; }
         }
         off += TensorBytes{sizeof(c)};
@@ -214,7 +214,7 @@ static bool ds4_prepare_restore(void *state, TokPos G) {
 /** pulsar_kv_state_ops::history_replaced.  @param state the graph */
 static void ds4_history_replaced(void *state) {
     pulsar_gpu_graph *g = G_(state);
-    for (int i = 0; i < 3; i++) g->dspark_n_raw[i] = 0;
+    for (int i = 0; i < 3; i++) g->dspark_n_raw[DraftLayer{i}] = 0;
     g->dspark_prompt_n = 0;
 }
 
@@ -255,10 +255,10 @@ static uint32_t ds4_pools(void *state, pulsar_kv_pool *out, uint32_t cap) {
     for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const TokPerRow r{pulsar_layer_compress_ratio(il)};
-        if (n < cap) out[n] = { g->layer_attn_comp_cache[il.raw()], r, pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP), true };
+        if (n < cap) out[n] = { g->layer_attn_comp_cache[il], r, pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP), true };
         n++;
         if (!gpu_graph_layer_has_index_pool(il)) continue;
-        if (n < cap) out[n] = { g->layer_index_comp_cache[il.raw()], r, pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX), true };
+        if (n < cap) out[n] = { g->layer_index_comp_cache[il], r, pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX), true };
         n++;
     }
     return n;
@@ -281,10 +281,10 @@ static uint32_t ds4_bank_pools(void *state, BankId bank_id, pulsar_kv_pool *out,
     for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const TokPerRow r{pulsar_layer_compress_ratio(il)};
-        if (n < cap) out[n] = { b->comp[il.raw()][bank], r, pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP), true };
+        if (n < cap) out[n] = { b->comp[il][bank], r, pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP), true };
         n++;
         if (!gpu_graph_layer_has_index_pool(il)) continue;
-        if (n < cap) out[n] = { b->index[il.raw()][bank], r, pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX), true };
+        if (n < cap) out[n] = { b->index[il][bank], r, pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX), true };
         n++;
     }
     return n;

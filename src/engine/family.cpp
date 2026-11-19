@@ -18,7 +18,7 @@ const char *pulsar_layer_kind_name(pulsar_layer_kind k) {
 
 uint32_t pulsar_layer_plan_count(const pulsar_layer_plan *p, pulsar_layer_kind k) {
     uint32_t n = 0;
-    for (TrunkLayer il{0u}; il.below(p->n_layer); ++il) n += p->kind[il.raw()] == k;
+    for (TrunkLayer il{0u}; il.below(p->n_layer); ++il) n += p->kind[il] == k;
     return n;
 }
 
@@ -28,8 +28,8 @@ const char *pulsar_layer_plan_check(const pulsar_layer_plan *p, TrunkLayer *at_l
     static const pulsar_layer_desc zero = {};
     for (TrunkLayer il{0u}; il.below(p->n_layer); ++il) {
         *at_layer = il;
-        const pulsar_layer_kind k = p->kind[il.raw()];
-        const pulsar_layer_desc &d = p->desc[il.raw()];
+        const pulsar_layer_kind k = p->kind[il];
+        const pulsar_layer_desc &d = p->desc[il];
         if (k == PULSAR_LAYER_NONE || k >= PULSAR_LAYER_KIND_COUNT) return "a layer with no kind";
         if (k != PULSAR_LAYER_BLOCKS) {
             if (memcmp(&d, &zero, sizeof d) != 0) return "a block description on a layer that is not a blocks layer";

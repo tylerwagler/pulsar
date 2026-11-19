@@ -33,6 +33,7 @@
 #include "engine/step_driver.h"
 #include "families/gemma4/gemma4.h"
 #include "families/nemotron_h/nemotron_h.h"
+#include "families/nemotron_parse/nemotron_parse.h"
 #include "families/qwen/family_qwen.h"
 
 #include <stdarg.h>
@@ -175,6 +176,62 @@ static_assert(std::is_same_v<decltype(pulsar_layer_plan_check), const char *(con
               "the layer signatures are typed: a slot, a drafter's layer or a source block no longer passes for a "
               "trunk layer");
 
+/* ---- the indexed tables: each takes its own space's index and nothing else ------------------------------------- */
+/** Table type `A` subscripts with `Own` and with none of the other spaces' indices, nor a bare integer. */
+template <class A, class Own, class... Others>
+constexpr bool l436_only = l436_subscripts<A &, Own> && (!l436_subscripts<A &, Others> && ...) &&
+                           !l436_subscripts<A &, uint32_t> && !l436_subscripts<A &, int> && !l436_subscripts<A &, size_t>;
+
+static_assert(l436_only<decltype(pulsar_layer_plan::kind), TrunkLayer, LayerSlot, DraftLayer, SrcBlock, KindOrd, VisLayer, TpSlot> &&
+                  l436_only<decltype(pulsar_layer_plan::desc), TrunkLayer, LayerSlot, DraftLayer, SrcBlock, KindOrd, VisLayer, TpSlot>,
+              "the plan's tables take a trunk layer only");
+static_assert(l436_only<decltype(pulsar_state_plan::slot), LayerSlot, TrunkLayer, DraftLayer, SrcBlock, KindOrd, VisLayer, TpSlot> &&
+                  l436_only<decltype(pulsar_state_set::t), LayerSlot, TrunkLayer, DraftLayer, KindOrd> &&
+                  l436_only<decltype(pulsar_state_set::pool), LayerSlot, TrunkLayer, DraftLayer, KindOrd> &&
+                  l436_only<decltype(pulsar_state_set::ord), LayerSlot, TrunkLayer, DraftLayer, KindOrd>,
+              "the declared state's tables take a layer slot only: a trunk layer crosses by pulsar_layer_slot_of, a "
+              "drafter's by pulsar_drafter_slot");
+static_assert(l436_only<decltype(pulsar_qwen_weights::layer), LayerSlot, TrunkLayer, DraftLayer, KindOrd> &&
+                  l436_only<decltype(pulsar_nemotron_h_model::layer), TrunkLayer, LayerSlot, DraftLayer, SrcBlock, KindOrd> &&
+                  l436_only<decltype(pulsar_gemma4_model::layer), TrunkLayer, LayerSlot, DraftLayer, SrcBlock> &&
+                  l436_only<decltype(pulsar_weights::layer), TrunkLayer, LayerSlot, DraftLayer, SrcBlock> &&
+                  l436_only<decltype(pulsar_dspark_weights::layer), DraftLayer, TrunkLayer, LayerSlot> &&
+                  l436_only<decltype(pulsar_block_drafter::layer), DraftLayer, TrunkLayer, LayerSlot, VisLayer>,
+              "per-layer weights: Qwen's by the slot (its MTP layer sits past the trunk's), the other trunks' by the "
+              "trunk layer, a drafter's by the drafter's own layer (L236#2)");
+static_assert(l436_only<decltype(pulsar_nemotron_h_shape::block_layer), SrcBlock, TrunkLayer, LayerSlot, KindOrd> &&
+                  l436_only<decltype(pulsar_nemotron_h_vision::vit), VisLayer, TrunkLayer, LayerSlot, DraftLayer> &&
+                  l436_only<decltype(pulsar_nemotron_parse_model::vit), VisLayer, TrunkLayer> &&
+                  l436_only<decltype(pulsar_nemotron_parse_model::layer), TrunkLayer, VisLayer> &&
+                  l436_only<decltype(pulsar_vision_weights::block), VisLayer, TrunkLayer, DraftLayer>,
+              "Nemotron-H's block table takes a source block; a tower's blocks a tower layer (Parse holds a tower and "
+              "a decoder side by side)");
+static_assert(l436_only<decltype(pulsar_gpu_graph::layer_raw_cache), TrunkLayer, DraftLayer, LayerSlot> &&
+                  l436_only<decltype(pulsar_gpu_graph::dspark_raw_cache), DraftLayer, TrunkLayer, LayerSlot> &&
+                  l436_only<decltype(pulsar_gpu_graph::dspark_n_raw), DraftLayer, TrunkLayer> &&
+                  l436_only<decltype(pulsar_bank_slabs::comp), TrunkLayer, DraftLayer, LayerSlot> &&
+                  l436_only<decltype(pulsar_bank_slabs::dspark_raw), DraftLayer, TrunkLayer> &&
+                  l436_only<std::remove_extent_t<decltype(pulsar_gpu_graph::ms_n_comp)>, TrunkLayer, DraftLayer> &&
+                  l436_only<std::remove_extent_t<decltype(pulsar_gpu_graph::ms_dspark_n_raw)>, DraftLayer, TrunkLayer>,
+              "DeepSeek's graph: the trunk's pools by the trunk layer, the DSpark rings by the drafter's");
+static_assert(l436_only<pulsar_indexed_view<KindOrd, TrunkLayer>, TrunkLayer, KindOrd, LayerSlot, DraftLayer> &&
+                  l436_only<pulsar_indexed_view<int, KindOrd>, KindOrd, TrunkLayer, LayerSlot> &&
+                  l436_only<pulsar_indexed_view<const int, VisLayer>, VisLayer, TrunkLayer>,
+              "a view takes its own space only (Nemotron-H: layer -> attention ordinal, then ordinal -> call)");
+/* the tables are the arrays they replaced: a struct holding one is laid out as it was */
+static_assert(sizeof(pulsar_layer_plan::kind) == sizeof(pulsar_layer_kind[PULSAR_FAMILY_MAX_LAYER]) &&
+                  sizeof(pulsar_layer_plan::desc) == sizeof(pulsar_layer_desc[PULSAR_FAMILY_MAX_LAYER]) &&
+                  sizeof(pulsar_state_plan::slot) == sizeof(uint32_t[PULSAR_STATE_SLOTS_MAX]) &&
+                  sizeof(pulsar_state_set::t) == sizeof(void *[PULSAR_STATE_SLOTS_MAX][PULSAR_STATE_DECLS_MAX]) &&
+                  sizeof(pulsar_state_set::ord) == PULSAR_STATE_SLOTS_MAX * PULSAR_STATE_DECLS_MAX &&
+                  sizeof(pulsar_nemotron_h_shape::block_layer) == PULSAR_NEMOTRON_H_MAX_BLOCKS &&
+                  sizeof(pulsar_gpu_graph::ms_n_comp) == sizeof(uint32_t[PULSAR_MSEQ_MAX][PULSAR_MAX_LAYER]) &&
+                  sizeof(pulsar_gpu_graph::dspark_n_raw) == sizeof(uint32_t[3]) &&
+                  sizeof(pulsar_bank_slabs::comp) == sizeof(void *[PULSAR_MAX_LAYER][PULSAR_MSEQ_MAX]) &&
+                  std::is_standard_layout_v<pulsar_layer_plan> && std::is_trivial_v<pulsar_layer_plan> &&
+                  std::is_trivially_copyable_v<pulsar_nemotron_h_shape> && std::is_trivially_copyable_v<pulsar_state_plan>,
+              "an indexed table is laid out as the array it replaced (memset / calloc / struct copy as before)");
+
 /* ---- 2 / 3. run time ---------------------------------------------------------------------------------------------- */
 
 /// checks failed so far
@@ -241,8 +298,8 @@ static void model_free(void) {
     const uint8_t layer_of[6] = {0, 1, 1, 2, 3, 3}, sub_of[6] = {0, 0, 1, 0, 0, 1};
     bool nh_ok = true;
     for (uint32_t b = 0; b < 6u; b++) {
-        s.block_layer[b] = layer_of[b];
-        s.block_sub[b] = sub_of[b];
+        s.block_layer[SrcBlock{b}] = layer_of[b];
+        s.block_sub[SrcBlock{b}] = sub_of[b];
     }
     for (uint32_t b = 0; b < 6u; b++)
         nh_ok = nh_ok && pulsar_nemotron_h_block_layer(&s, SrcBlock{b}) == TrunkLayer{layer_of[b]} &&
@@ -294,11 +351,11 @@ static void block_drafter_checks(const pulsar_engine *e, uint32_t n_draft, TapOf
     bool ok = n_draft == d->n_layer;
     for (DraftLayer l{0u}; ok && l.below(d->n_layer); ++l) {
         const uint32_t decl = (d->full_layers >> l.raw() & 1u) ? d->decl_kv_full : d->decl_kv;
-        ok = decl < sp->n_decl && (sp->slot[pulsar_drafter_slot(sp, l).raw()] >> decl & 1u);
+        ok = decl < sp->n_decl && (sp->slot[pulsar_drafter_slot(sp, l)] >> decl & 1u);
     }
     check(ok, "   drafter layer l's context ring is declared on pulsar_drafter_slot(plan, l)");
     if (d->decl_anchor != UINT32_MAX)
-        check(sp->slot[pulsar_drafter_slot(sp, DraftLayer{0u}).raw()] >> d->decl_anchor & 1u,
+        check(sp->slot[pulsar_drafter_slot(sp, DraftLayer{0u})] >> d->decl_anchor & 1u,
               "   the anchor row is declared on the drafter's first slot");
     ok = d->n_taps > 0;
     for (uint32_t j = 0; ok && j < d->n_taps; j++) {
@@ -318,12 +375,12 @@ static void qwen_checks(const pulsar_engine *e, uint32_t n_draft) {
     check(s->ple_layer.below(e->plan.n_layer), "d. the PLE layer %u is a trunk layer", s->ple_layer.raw());
     bool ok = true;
     for (LayerSlot k{0u}; k.below(sp->n_slots); ++k)
-        ok = ok && ((sp->slot[k.raw()] >> PULSAR_QWEN_STATE_PLE_CONV & 1u) != 0) == (k == pulsar_layer_slot_of(s->ple_layer));
+        ok = ok && ((sp->slot[k] >> PULSAR_QWEN_STATE_PLE_CONV & 1u) != 0) == (k == pulsar_layer_slot_of(s->ple_layer));
     check(ok, "   and its slot alone carries the PLE state (the MTP layer's slot never equals it)");
     ok = true;
     for (TrunkLayer il{0u}; il.below(e->plan.n_layer); ++il)   /* was: w->layer[il] */
-        ok = ok && &pulsar_qwen_layer_w(w, pulsar_layer_slot_of(il)) == &w->layer[il.raw()];
-    check(ok && &pulsar_qwen_layer_w(w, pulsar_qwen_mtp_slot(&e->plan)) == &w->layer[e->plan.n_layer],
+        ok = ok && &pulsar_qwen_layer_w(w, pulsar_layer_slot_of(il)) == &w->layer.data()[il.raw()];
+    check(ok && &pulsar_qwen_layer_w(w, pulsar_qwen_mtp_slot(&e->plan)) == &w->layer.data()[e->plan.n_layer],
           "d. the weights array is indexed by the slot: trunk layers, then the MTP layer at n_layer");
     if (w->mtp.present) {
         check(n_draft == 1u && !e->block_drafter &&
@@ -350,7 +407,7 @@ static void nemotron_h_checks(const pulsar_engine *e, uint32_t n_draft) {
     uint32_t b = 0, n_attn = 0, n_kv = 0;
     bool ok = true;
     for (TrunkLayer il{0u}; il.below(lp->n_layer); ++il) {
-        const bool moe = lp->desc[il.raw()].ffn == PULSAR_FFN_MOE;
+        const bool moe = lp->desc[il].ffn == PULSAR_FFN_MOE;
         ok = ok && b < s->n_blocks && pulsar_nemotron_h_block_layer(s, SrcBlock{b}) == il &&
              pulsar_nemotron_h_block_sub(s, SrcBlock{b}) == PULSAR_BLOCK_TAP_MIXER;
         b++;
@@ -359,8 +416,8 @@ static void nemotron_h_checks(const pulsar_engine *e, uint32_t n_draft) {
                  pulsar_nemotron_h_block_sub(s, SrcBlock{b}) == PULSAR_BLOCK_TAP_FFN;
             b++;
         }
-        n_attn += lp->desc[il.raw()].mixer == PULSAR_MIXER_ATTN_FULL;
-        n_kv += e->state_plan.slot[pulsar_layer_slot_of(il).raw()] >> PULSAR_NEMOTRON_H_STATE_KV & 1u;
+        n_attn += lp->desc[il].mixer == PULSAR_MIXER_ATTN_FULL;
+        n_kv += e->state_plan.slot[pulsar_layer_slot_of(il)] >> PULSAR_NEMOTRON_H_STATE_KV & 1u;
     }
     check(ok && b == s->n_blocks, "c. the block -> layer table is the plan's grouping: %u blocks, %u layers", s->n_blocks,
           lp->n_layer);
@@ -371,7 +428,7 @@ static void nemotron_h_checks(const pulsar_engine *e, uint32_t n_draft) {
           n_attn, lp->n_layer);
     if (w->drafting) {
         check(n_draft == 1u && !e->block_drafter, "b. the MTP module's slot is the plan's one drafter slot");
-        check(e->state_plan.slot[pulsar_drafter_slot(&e->state_plan, DraftLayer{0u}).raw()] >>
+        check(e->state_plan.slot[pulsar_drafter_slot(&e->state_plan, DraftLayer{0u})] >>
                       PULSAR_NEMOTRON_H_STATE_MTP_PEND & 1u,
               "   and carries the parked row");
     }
@@ -381,7 +438,7 @@ static void nemotron_h_checks(const pulsar_engine *e, uint32_t n_draft) {
         block_drafter_checks(e, n_draft, [&](uint32_t blk) {
             uint32_t at = 0;
             for (uint32_t il = 0; il < lp->n_layer; il++) {
-                const uint32_t n = 1u + (lp->desc[il].ffn == PULSAR_FFN_MOE ? 1u : 0u);
+                const uint32_t n = 1u + (lp->desc[TrunkLayer{il}].ffn == PULSAR_FFN_MOE ? 1u : 0u);
                 if (blk < at + n) return il;
                 at += n;
             }
@@ -399,8 +456,8 @@ static void gemma4_checks(const pulsar_engine *e, uint32_t n_draft) {
         const bool full = pulsar_gemma4_is_full(s, il);
         n_full += full;
         ok = ok && full == ((s->full_layers >> il.raw() & 1u) != 0) &&                        /* was: the open-coded bit */
-             full == (e->plan.desc[il.raw()].mixer == PULSAR_MIXER_ATTN_FULL) &&
-             e->state_plan.slot[pulsar_layer_slot_of(il).raw()] ==
+             full == (e->plan.desc[il].mixer == PULSAR_MIXER_ATTN_FULL) &&
+             e->state_plan.slot[pulsar_layer_slot_of(il)] ==
                  1u << (full ? PULSAR_GEMMA4_STATE_KV_FULL : PULSAR_GEMMA4_STATE_KV_WIN);
     }
     check(ok && n_full > 0 && n_full < e->plan.n_layer,

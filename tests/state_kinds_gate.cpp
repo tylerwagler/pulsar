@@ -79,7 +79,7 @@ static void plan_inkling(pulsar_state_plan *p) {
                               0, 0, NULL, NULL, NULL});
     p->n_trunk = p->n_slots = 42;
     for (uint32_t il = 0; il < 42; il++)
-        p->slot[il] = 1u << A_SCONV | (il % 6 == 5 ? 1u << A_KV_GLOBAL : 1u << A_KV_WINDOW);
+        p->slot[LayerSlot{il}] = 1u << A_SCONV | (il % 6 == 5 ? 1u << A_KV_GLOBAL : 1u << A_KV_WINDOW);
 }
 
 static void plan_a(void) {
@@ -231,10 +231,10 @@ static void plan_others(pulsar_state_plan *p) {
                               NULL, NULL});
     p->n_trunk = 3;
     p->n_slots = 4;
-    p->slot[0] = 1u << B_DELTA;
-    p->slot[1] = 1u << B_STAGE | 1u << B_POOL;
-    p->slot[2] = 1u << B_DELTA;
-    p->slot[3] = 1u << B_STAGE | 1u << B_TRAIL;   /* the drafter slot: no capture, a trailing pool */
+    p->slot[LayerSlot{0}] = 1u << B_DELTA;
+    p->slot[LayerSlot{1}] = 1u << B_STAGE | 1u << B_POOL;
+    p->slot[LayerSlot{2}] = 1u << B_DELTA;
+    p->slot[LayerSlot{3}] = 1u << B_STAGE | 1u << B_TRAIL;   /* the drafter slot: no capture, a trailing pool */
     p->session = 1u << B_HOST;
 }
 
@@ -367,7 +367,7 @@ static void plan_b(void) {
     bad.decl[B_STAGE].capture_off = STAGE_REC;
     check(!pulsar_state_create(NULL, &bad, NULL, 1, 64, 0), "a STAGE record without room for its row: refused");
     plan_others(&bad);
-    bad.slot[0] |= 1u << B_HOST;
+    bad.slot[LayerSlot{0}] |= 1u << B_HOST;
     check(!pulsar_state_create(NULL, &bad, NULL, 1, 64, 0), "host state on a layer slot: refused");
     plan_others(&bad);
     bad.decl[B_DELTA].commit = NULL;

@@ -158,9 +158,9 @@ static bool gpu_graph_csa2_emit_rows(
     const uint32_t n_rows = (uint32_t)n_rows_c.raw(), cache_row0 = (uint32_t)cache_row0_at.before().raw(),
                    pos_first = pulsar_ckpt_raw(pos_first_at), ratio = ratio_r.raw();
     if (n_rows == 0) return true;
-    if (cache_row0 > g->layer_comp_cap[il.raw()] || n_rows > g->layer_comp_cap[il.raw()] - cache_row0) {
+    if (cache_row0 > g->layer_comp_cap[il] || n_rows > g->layer_comp_cap[il] - cache_row0) {
         fprintf(stderr, "pulsar: kv source %u: compressed rows %u+%u exceed the pool cap %u -- refusing\n",
-                il.raw(), cache_row0, n_rows, g->layer_comp_cap[il.raw()]);
+                il.raw(), cache_row0, n_rows, g->layer_comp_cap[il]);
         return false;
     }
     if (n_rows > g->attn_comp_stage_cap || n_rows > g->comp_cap) {
@@ -177,7 +177,7 @@ static bool gpu_graph_csa2_emit_rows(
     pulsar_gpu_tensor *latent = pulsar_gpu_tensor_view(g->attn_comp_stage, TensorBytes{0},
                                                        bytes_of<float>((uint64_t)n_rows * PULSAR_N_HEAD_DIM));
     pulsar_gpu_tensor *comp_dst =
-        banked ? gpu_graph_bank_attn_comp_view(g, il, BankId{bank}) : g->layer_attn_comp_cache[il.raw()];
+        banked ? gpu_graph_bank_attn_comp_view(g, il, BankId{bank}) : g->layer_attn_comp_cache[il];
     /* The POOL's output, before the rotation -- dev's `KVprelatent`.  This is
      * the only point at which it can be observed: everything below mutates
      * `latent` in place, first the tail rope and then the pack's f32 writeback
@@ -196,7 +196,7 @@ static bool gpu_graph_csa2_emit_rows(
                                                   bytes_of<float>((uint64_t)n_rows * PULSAR_N_INDEXER_HEAD_DIM));
     pulsar_gpu_tensor *idx_dst = g_pulsar_shape.indexer_own_compressor ? NULL
                               : (banked ? gpu_graph_bank_index_comp_view(g, il, BankId{bank})
-                                        : g->layer_index_comp_cache[il.raw()]);
+                                        : g->layer_index_comp_cache[il]);
     bool ok = latent && comp_dst && (g_pulsar_shape.indexer_own_compressor || (idx && idx_dst));
 
     /* index K: wk on the unrotated latent, k_norm, RoPE at the group position,
@@ -310,11 +310,11 @@ static bool gpu_graph_index_comp_prefill(
      * lane uses, and the reason this helper takes `bank` at all: a step that
      * mixes banks writes each row to ITS bank's pool. */
     pulsar_gpu_tensor *comp = banked ? gpu_graph_bank_index_comp_view(g, il, BankId{bank})
-                                     : g->layer_index_comp_cache[il.raw()];
+                                     : g->layer_index_comp_cache[il];
     pulsar_gpu_tensor *st_kv = banked ? gpu_graph_bank_index_state_kv_view(g, il, BankId{bank})
-                                      : g->layer_index_state_kv[il.raw()];
+                                      : g->layer_index_state_kv[il];
     pulsar_gpu_tensor *st_sc = banked ? gpu_graph_bank_index_state_score_view(g, il, BankId{bank})
-                                      : g->layer_index_state_score[il.raw()];
+                                      : g->layer_index_state_score[il];
     const bool lanes = kv && sc && latent && comp && st_kv && st_sc;
     if (!lanes) {
         fprintf(stderr, "pulsar: index source %u: %s index lane missing for bank %u "
@@ -397,11 +397,11 @@ static bool gpu_graph_index_comp_update(
      * and the row's own batch slot are per-bank, and the caller's `bank` may
      * differ from the installed one on every token of a mixed step. */
     pulsar_gpu_tensor *comp = banked ? gpu_graph_bank_index_comp_view(g, il, BankId{bank})
-                                     : g->layer_index_comp_cache[il.raw()];
+                                     : g->layer_index_comp_cache[il];
     pulsar_gpu_tensor *st_kv = banked ? gpu_graph_bank_index_state_kv_view(g, il, BankId{bank})
-                                      : g->layer_index_state_kv[il.raw()];
+                                      : g->layer_index_state_kv[il];
     pulsar_gpu_tensor *st_sc = banked ? gpu_graph_bank_index_state_score_view(g, il, BankId{bank})
-                                      : g->layer_index_state_score[il.raw()];
+                                      : g->layer_index_state_score[il];
     const bool lanes = kv && sc && latent && comp && st_kv && st_sc;
     if (!lanes) {
         fprintf(stderr, "pulsar: index source %u: %s index lane missing for bank %u "
@@ -542,15 +542,15 @@ static bool gpu_graph_csa2_produce(
      * transformer replay (gpu_graph_dspark_compressor_rollforward), and a
      * rewind inside the round can rebuild a pending slot.  Ratio 1 keeps no
      * state, so there is nothing to roll. */
-    if (has_state && g->spec_comp_save_n && g->spec_comp_kv_save[il.raw()]) {
+    if (has_state && g->spec_comp_save_n && g->spec_comp_kv_save[il]) {
         uint32_t sn = g->spec_comp_save_n;
         if (sn > n_tokens) sn = n_tokens;
         if (sn > PULSAR_SPEC_LOGITS_ROWS + 1u) sn = PULSAR_SPEC_LOGITS_ROWS + 1u;
         const TensorBytes sb = bytes_of<float>((uint64_t)sn * comp_width);
         /* ASYNC: read only by the rollforward's kernels on the same stream. */
-        if (pulsar_gpu_tensor_copy_async(g->spec_comp_kv_save[il.raw()], TensorBytes{0}, g->batch_comp_kv, TensorBytes{0},
+        if (pulsar_gpu_tensor_copy_async(g->spec_comp_kv_save[il], TensorBytes{0}, g->batch_comp_kv, TensorBytes{0},
                                          sb) == 0 ||
-            pulsar_gpu_tensor_copy_async(g->spec_comp_sc_save[il.raw()], TensorBytes{0}, g->batch_comp_sc, TensorBytes{0},
+            pulsar_gpu_tensor_copy_async(g->spec_comp_sc_save[il], TensorBytes{0}, g->batch_comp_sc, TensorBytes{0},
                                          sb) == 0)
             return false;
         /* V4's indexer owns a second lane over the same rows and needs its own
@@ -560,10 +560,10 @@ static bool gpu_graph_csa2_produce(
         if (own_index) {
             const uint32_t iw = pulsar_comp_row_width(ratio, PULSAR_N_INDEXER_HEAD_DIM);
             const TensorBytes ib = bytes_of<float>((uint64_t)sn * iw);
-            if (!g->spec_icomp_kv_save[il.raw()] || !g->spec_icomp_sc_save[il.raw()] ||
-                pulsar_gpu_tensor_copy_async(g->spec_icomp_kv_save[il.raw()], TensorBytes{0}, g->batch_index_comp_kv,
+            if (!g->spec_icomp_kv_save[il] || !g->spec_icomp_sc_save[il] ||
+                pulsar_gpu_tensor_copy_async(g->spec_icomp_kv_save[il], TensorBytes{0}, g->batch_index_comp_kv,
                                              TensorBytes{0}, ib) == 0 ||
-                pulsar_gpu_tensor_copy_async(g->spec_icomp_sc_save[il.raw()], TensorBytes{0}, g->batch_index_comp_sc,
+                pulsar_gpu_tensor_copy_async(g->spec_icomp_sc_save[il], TensorBytes{0}, g->batch_index_comp_sc,
                                              TensorBytes{0}, ib) == 0)
                 return false;
         }
@@ -582,11 +582,11 @@ static bool gpu_graph_csa2_produce(
                 st_sc = gpu_graph_bank_attn_state_score_view(g, il, BankId{run_bank});
                 ok = st_kv && st_sc;
             } else {
-                st_kv = g->layer_attn_state_kv[il.raw()];
-                st_sc = g->layer_attn_state_score[il.raw()];
+                st_kv = g->layer_attn_state_kv[il];
+                st_sc = g->layer_attn_state_score[il];
             }
         }
-        const uint32_t before = g->ms_n_comp[run_bank][il.raw()];
+        const uint32_t before = g->ms_n_comp[run_bank][il];
         const uint32_t n_groups = n / ratio;
         if (ok && g->ms_comp_state_stale[run_bank]) {
             fprintf(stderr, "pulsar: kv source %u bank %u: store at %u on a bank whose state is stale "
@@ -658,14 +658,14 @@ static bool gpu_graph_csa2_produce(
         for (uint32_t t = t0; ok && t < t1; t++) {
             const uint32_t pos = mseq ? (uint32_t)g->ms_positions[t] : pos0 + t;
             const uint32_t bank = mseq ? (uint32_t)g->ms_seq_id[t] : pulsar_bank_index(gpu_graph_cur_bank(g));
-            const uint32_t *const n_comp_slot = &g->ms_n_comp[bank][il.raw()];
+            const uint32_t *const n_comp_slot = &g->ms_n_comp[bank][il];
             pulsar_gpu_tensor *kv_view = gpu_graph_tensor_row_view(g->batch_comp_kv, t, comp_width);
             pulsar_gpu_tensor *sc_view = gpu_graph_tensor_row_view(g->batch_comp_sc, t, comp_width);
             pulsar_gpu_tensor *st_kv = NULL, *st_sc = NULL;
             if (has_state) {
-                st_kv = mseq ? gpu_graph_bank_attn_state_kv_view(g, il, BankId{bank}) : g->layer_attn_state_kv[il.raw()];
+                st_kv = mseq ? gpu_graph_bank_attn_state_kv_view(g, il, BankId{bank}) : g->layer_attn_state_kv[il];
                 st_sc = mseq ? gpu_graph_bank_attn_state_score_view(g, il, BankId{bank})
-                             : g->layer_attn_state_score[il.raw()];
+                             : g->layer_attn_state_score[il];
             }
             pulsar_gpu_tensor *latent_row = pulsar_gpu_tensor_view(g->attn_comp_stage, TensorBytes{0},
                                                                    bytes_of<float>(PULSAR_N_HEAD_DIM));
@@ -954,7 +954,7 @@ bool gpu_graph_warmup_prefill_kernels(
                                                       (uint32_t)hc_dim, n_tokens, PULSAR_RMS_EPS, 0) != 0;
     if (ok) pulsar_gpu_bf16_act_note(g->batch_flat_hc, n_tokens, hc_dim);
     if (ok) {
-        ok = pulsar_linear_slot(g->batch_hc_mix, model, weights->layer[0].hc_attn_fn, hc_dim, 0, mix_hc, g->batch_flat_hc, n_tokens);
+        ok = pulsar_linear_slot(g->batch_hc_mix, model, weights->layer[TrunkLayer{0}].hc_attn_fn, hc_dim, 0, mix_hc, g->batch_flat_hc, n_tokens);
     }
     if (ok) ok = pulsar_gpu_end_commands() != 0;
     if (!ok) {
@@ -1957,7 +1957,7 @@ bool gpu_graph_encode_layer_attention_batch(
      * sized to hold the current chunk plus the previous SWA window, while the
      * attention mask still enforces the 128-token logical window.
      */
-    if (ok && zero_prefix) ok = pulsar_gpu_store_raw_kv_batch_packed_tensor(g->layer_raw_cache[il.raw()],
+    if (ok && zero_prefix) ok = pulsar_gpu_store_raw_kv_batch_packed_tensor(g->layer_raw_cache[il],
                                                                     g->batch_kv_pack,
                                                                     g->raw_cap,
                                                                     pos0,
@@ -1997,7 +1997,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                   pos0 + n_tokens - 1u,
                                                                   n_raw);
         ok = pulsar_gpu_store_raw_kv_batch_packed_tensor(mseq ? gpu_graph_bank_raw_pool(g, il)
-                                                    : g->layer_raw_cache[il.raw()],
+                                                    : g->layer_raw_cache[il],
                                                  g->batch_kv_pack,
                                                  g->raw_cap,
                                                  pos0,
@@ -2013,7 +2013,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                    sinks_off,
                                                                    g->batch_q,
                                                                    mseq ? gpu_graph_bank_raw_pool(g, il)
-                                                                        : g->layer_raw_cache[il.raw()],
+                                                                        : g->layer_raw_cache[il],
                                                                    n_tokens,
                                                                    pos0,
                                                                    mseq ? 0 : n_raw,
@@ -2095,7 +2095,7 @@ bool gpu_graph_encode_layer_attention_batch(
          * WHOLE batch: banked, the step's superset computed and cap-checked
          * once in step_begin (L178); classic, the source's frontier. */
         uint32_t n_comp =
-            mseq ? g->batch_comp_sup[src.raw()] : (uint32_t)gpu_graph_n_comp(g, gpu_graph_cur_bank(g), src).raw();
+            mseq ? g->batch_comp_sup[src] : (uint32_t)gpu_graph_n_comp(g, gpu_graph_cur_bank(g), src).raw();
 
         /* The QUERY side belongs to the layers that run an indexer: FULL and
          * REINDEX publish a top-k, REUSE reads one it did not compute, and
@@ -2146,7 +2146,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                       n_raw);
 
             ok = pulsar_gpu_store_raw_kv_batch_packed_tensor(mseq ? gpu_graph_bank_raw_pool(g, il)
-                                                        : g->layer_raw_cache[il.raw()],
+                                                        : g->layer_raw_cache[il],
                                                      g->batch_kv_pack,
                                                      g->raw_cap,
                                                      pos0,
@@ -2196,15 +2196,15 @@ bool gpu_graph_encode_layer_attention_batch(
                  * only the redundant repeats are gone. */
                 pulsar_gpu_tensor *span_comp_src =
                     mseq ? gpu_graph_bank_attn_comp_pool(g, src)
-                         : g->layer_attn_comp_cache[src.raw()];
+                         : g->layer_attn_comp_cache[src];
                 struct gpu_graph_span_ops sop = {
                     /* comp_src   */ span_comp_src,
-                    /* raw_src    */ mseq ? gpu_graph_bank_raw_pool(g, il) : g->layer_raw_cache[il.raw()],
+                    /* raw_src    */ mseq ? gpu_graph_bank_raw_pool(g, il) : g->layer_raw_cache[il],
                     /* index_src  */ mseq ? gpu_graph_bank_index_comp_pool(g, src)
-                                          : g->layer_index_comp_cache[src.raw()],
+                                          : g->layer_index_comp_cache[src],
                     /* index_bases*/ mseq ? gpu_graph_bank_index_comp_bases(g, src) : NULL,
                     /* comp_bases */ mseq ? gpu_graph_bank_attn_comp_bases(g, src) : NULL,
-                    /* comp_cap   */ mseq ? g->layer_comp_cap[src.raw()] : 0u,
+                    /* comp_cap   */ mseq ? g->layer_comp_cap[src] : 0u,
                     /* n_banks    */ mseq ? nb : 1u,
                     /* mseq       */ mseq,
                 };
@@ -2237,9 +2237,9 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                          sinks_off,
                                                                          g->batch_q,
                                                                          mseq ? gpu_graph_bank_raw_pool(g, il)
-                                                                              : g->layer_raw_cache[il.raw()],
+                                                                              : g->layer_raw_cache[il],
                                                                          mseq ? gpu_graph_bank_attn_comp_pool(g, src)
-                                                                              : g->layer_attn_comp_cache[src.raw()],
+                                                                              : g->layer_attn_comp_cache[src],
                                                                          n_tokens,
                                                                          pos0,
                                                                          mseq ? 0 : n_raw,
@@ -2254,7 +2254,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                           mseq ? g->batch_positions : NULL,
                                                                           mseq ? g->batch_seq_id : NULL,
                                                                           mseq ? gpu_graph_bank_attn_comp_bases(g, src) : NULL,
-                                                                          mseq ? g->layer_comp_cap[src.raw()] : 0,
+                                                                          mseq ? g->layer_comp_cap[src] : 0,
                                                                           mseq ? nb : 1,
                                           g->q_prep_active ? &g->q_prep : NULL,
                                           vis_left_view, vis_right_view,
@@ -2279,11 +2279,11 @@ bool gpu_graph_encode_layer_attention_batch(
             /* The packed cache straight in, like every other span site. This
              * branch built the f32 shadow unconditionally and was the ONLY
              * source of comp-row dequant launches in production. */
-            pulsar_gpu_tensor *zspan_comp_src = g->layer_attn_comp_cache[src.raw()];
+            pulsar_gpu_tensor *zspan_comp_src = g->layer_attn_comp_cache[src];
             const struct gpu_graph_span_ops zsop = {
                 /* comp_src   */ zspan_comp_src,
-                /* raw_src    */ g->layer_raw_cache[il.raw()],
-                /* index_src  */ g->layer_index_comp_cache[src.raw()],
+                /* raw_src    */ g->layer_raw_cache[il],
+                /* index_src  */ g->layer_index_comp_cache[src],
                 /* index_bases*/ NULL,
                 /* comp_bases */ NULL,
                 /* comp_cap   */ 0u,
@@ -2334,7 +2334,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                         * the MAIN pool natively through comp_kv;
                                                                         * no shadow, no second kernel. */
                                                                        mseq ? gpu_graph_bank_attn_comp_pool(g, src)
-                                                                            : g->layer_attn_comp_cache[src.raw()],
+                                                                            : g->layer_attn_comp_cache[src],
                                                                        gact_data, gact_scale, gact_kbp,
                                                                        (uint32_t)gact_slab, n_groups,
                                                                        PULSAR_N_HEAD_DIM - PULSAR_N_ROT,
@@ -2443,7 +2443,7 @@ bool gpu_graph_encode_layer_attention_batch(
                          pulsar_gpu_indexer_score_one_tensor(g->indexer_scores,
                                                             indexer_q_view,
                                                             indexer_w_view,
-                                                            g->layer_index_comp_cache[src.raw()],
+                                                            g->layer_index_comp_cache[src],
                                                             cur_comp,
                                                             PULSAR_N_INDEXER_HEAD,
                                                             PULSAR_N_INDEXER_HEAD_DIM,
@@ -2499,7 +2499,7 @@ bool gpu_graph_encode_layer_attention_batch(
                 if (ok && !zero_prefix) {
                     /* n_tokens=1 with pos0=pos puts the row at pos % raw_cap --
                      * the same slot the f32 store targeted (pulsar_kv_ring_slot). */
-                    ok = pulsar_gpu_store_raw_kv_batch_packed_tensor(g->layer_raw_cache[il.raw()],
+                    ok = pulsar_gpu_store_raw_kv_batch_packed_tensor(g->layer_raw_cache[il],
                                                        kv_pack_view,
                                                        g->raw_cap,
                                                        pos,
@@ -2513,11 +2513,11 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                               tensor_map_size(model, layer->attn_sinks),
                                                                               sinks_off,
                                                                               q_view,
-                                                                              g->layer_raw_cache[il.raw()],
+                                                                              g->layer_raw_cache[il],
                                                                               /* Native packed read: this sits in a PER-TOKEN loop and
                                                                                * cur_comp grows per token, so the shadow was rebuilt
                                                                                * for every token. */
-                                                                              g->layer_attn_comp_cache[src.raw()],
+                                                                              g->layer_attn_comp_cache[src],
                                                                               sel_t,
                                                                               1,
                                                                               pos,
@@ -2544,8 +2544,8 @@ bool gpu_graph_encode_layer_attention_batch(
                      * parameter, L164.) */
                     ok = pulsar_gpu_attention_decode_mixed_batch_heads_tensor(heads_view,
                             tensor_map_base(model, layer->attn_sinks), tensor_map_size(model, layer->attn_sinks), sinks_off,
-                            q_view, g->layer_raw_cache[il.raw()],
-                            cur_comp ? g->layer_attn_comp_cache[src.raw()] : NULL,
+                            q_view, g->layer_raw_cache[il],
+                            cur_comp ? g->layer_attn_comp_cache[src] : NULL,
                             1, pos, n_raw, g->raw_cap, raw_start, cur_comp,
                             g->raw_window, ratio, n_head, PULSAR_N_HEAD_DIM,
                             0, NULL, NULL, NULL, 0, 1,
@@ -3361,7 +3361,7 @@ bool gpu_graph_dspark_compressor_rollforward(
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio > 1u) {
-            if (!g->spec_comp_kv_save[il.raw()] || !g->spec_comp_sc_save[il.raw()])
+            if (!g->spec_comp_kv_save[il] || !g->spec_comp_sc_save[il])
                 return rollforward_fail(il, pos0, "no saved compressor projections for this kv source");
             /* The saved rows are the compressor PROJECTIONS, so their width is
              * the layer's coff width (2*head_dim at ratio 4), NOT head_dim.  The
@@ -3379,15 +3379,15 @@ bool gpu_graph_dspark_compressor_rollforward(
             if (!latent_row) return rollforward_fail(il, pos0, "no latent-row scratch for the rollforward");
             for (uint32_t t = 0; t < n_positions; t++) {
                 const uint32_t pos = pos0 + t;
-                pulsar_gpu_tensor *kv_view = gpu_graph_tensor_row_view(g->spec_comp_kv_save[il.raw()], save_row0 + t, comp_width);
-                pulsar_gpu_tensor *sc_view = gpu_graph_tensor_row_view(g->spec_comp_sc_save[il.raw()], save_row0 + t, comp_width);
+                pulsar_gpu_tensor *kv_view = gpu_graph_tensor_row_view(g->spec_comp_kv_save[il], save_row0 + t, comp_width);
+                pulsar_gpu_tensor *sc_view = gpu_graph_tensor_row_view(g->spec_comp_sc_save[il], save_row0 + t, comp_width);
                 /* The reference adds the ape to a row BEFORE it stores it, so
                  * the saved (raw) score row is not what the lane holds.  Fold it
                  * here or the rolled-forward pending group is a different
                  * function of its own inputs than the live path's. */
                 int emitted = 0;
                 const bool ok = kv_view && sc_view &&
-                    gpu_graph_comp_ape_fold(model, &weights->layer[il.raw()], sc_view, comp_width, ratio, pos, 1u) &&
+                    gpu_graph_comp_ape_fold(model, &weights->layer[il], sc_view, comp_width, ratio, pos, 1u) &&
                     /* THE UPDATE KERNEL, not a bare store.  This function's own
                      * comment promises "same update kernels, same rows, same
                      * order", and the live path's per-token update is what stores
@@ -3399,10 +3399,10 @@ bool gpu_graph_dspark_compressor_rollforward(
                      * 28..31 came out ~80% off dev's while every one of its raw
                      * projections was bit-exact (L218 s121). */
                     pulsar_gpu_csa2_compressor_update_tensor(latent_row, NULL, kv_view, sc_view,
-                            g->layer_attn_state_kv[il.raw()], g->layer_attn_state_score[il.raw()],
-                            tensor_map_base(model, weights->layer[il.raw()].attn_compressor_norm), tensor_map_size(model, weights->layer[il.raw()].attn_compressor_norm),
-                            weights->layer[il.raw()].attn_compressor_norm->abs_offset,
-                            weights->layer[il.raw()].attn_compressor_norm->type,
+                            g->layer_attn_state_kv[il], g->layer_attn_state_score[il],
+                            tensor_map_base(model, weights->layer[il].attn_compressor_norm), tensor_map_size(model, weights->layer[il].attn_compressor_norm),
+                            weights->layer[il].attn_compressor_norm->abs_offset,
+                            weights->layer[il].attn_compressor_norm->type,
                             PULSAR_N_HEAD_DIM, ratio, pos, PULSAR_RMS_EPS, &emitted) != 0;
                 pulsar_gpu_tensor_free(sc_view);
                 pulsar_gpu_tensor_free(kv_view);
@@ -3420,9 +3420,9 @@ bool gpu_graph_dspark_compressor_rollforward(
              * group occupies (pos/ratio), whose row the live batch already wrote,
              * so the replay rewrites it with the same bytes. */
             if (g_pulsar_shape.indexer_own_compressor && pulsar_attn_runs_indexer(pulsar_layer_attn_layout(il)->mode)) {
-                if (!g->spec_icomp_kv_save[il.raw()] || !g->spec_icomp_sc_save[il.raw()])
+                if (!g->spec_icomp_kv_save[il] || !g->spec_icomp_sc_save[il])
                     return rollforward_fail(il, pos0, "no saved indexer-compressor projections for this kv source");
-                const pulsar_layer_weights *lw = &weights->layer[il.raw()];
+                const pulsar_layer_weights *lw = &weights->layer[il];
                 const uint32_t iw = pulsar_comp_row_width(ratio, PULSAR_N_INDEXER_HEAD_DIM);
                 const float idx_freq_base = layer_rope_freq_base(il);
                 const float idx_freq_scale = layer_rope_freq_scale(il);
@@ -3435,13 +3435,13 @@ bool gpu_graph_dspark_compressor_rollforward(
                 if (!idx_latent) return rollforward_fail(il, pos0, "no indexer latent scratch for the rollforward");
                 for (uint32_t t = 0; t < n_positions; t++) {
                     const uint32_t pos = pos0 + t;
-                    pulsar_gpu_tensor *kv_view = gpu_graph_tensor_row_view(g->spec_icomp_kv_save[il.raw()], save_row0 + t, iw);
-                    pulsar_gpu_tensor *sc_view = gpu_graph_tensor_row_view(g->spec_icomp_sc_save[il.raw()], save_row0 + t, iw);
+                    pulsar_gpu_tensor *kv_view = gpu_graph_tensor_row_view(g->spec_icomp_kv_save[il], save_row0 + t, iw);
+                    pulsar_gpu_tensor *sc_view = gpu_graph_tensor_row_view(g->spec_icomp_sc_save[il], save_row0 + t, iw);
                     int idx_emitted = 0;
                     const bool ok = kv_view && sc_view &&
                         pulsar_gpu_indexer_compressor_update_tensor(
-                                g->layer_index_comp_cache[il.raw()], idx_latent,
-                                g->layer_index_state_kv[il.raw()], g->layer_index_state_score[il.raw()],
+                                g->layer_index_comp_cache[il], idx_latent,
+                                g->layer_index_state_kv[il], g->layer_index_state_score[il],
                                 sc_view, kv_view,
                                 tensor_map_base(model, lw->indexer_compressor_ape), tensor_map_size(model, lw->indexer_compressor_ape),
                                 lw->indexer_compressor_ape->abs_offset, lw->indexer_compressor_ape->type,

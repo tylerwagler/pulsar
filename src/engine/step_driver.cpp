@@ -29,7 +29,7 @@ const char *pulsar_driver_first_missing(const pulsar_driver_ops *ops, const puls
     *at_layer = TrunkLayer::none();
     if (!ops->embed) return "embed";
     for (TrunkLayer il{0u}; il.below(plan->n_layer); ++il) {
-        if (plan->kind[il.raw()] >= PULSAR_LAYER_KIND_COUNT || !ops->block[plan->kind[il.raw()]]) {
+        if (plan->kind[il] >= PULSAR_LAYER_KIND_COUNT || !ops->block[plan->kind[il]]) {
             *at_layer = il;
             return "block";
         }
@@ -85,7 +85,7 @@ int pulsar_driver_session_create(pulsar_session *s, uint32_t n_banks) {
     if (const char *miss = pulsar_driver_first_missing(ops, &e->plan, &at)) {
         char where[48] = "";
         if (!at.is_none()) snprintf(where, sizeof(where), " for layer %u (%s)", at.raw(),
-                                    pulsar_layer_kind_name(e->plan.kind[at.raw()]));
+                                    pulsar_layer_kind_name(e->plan.kind[at]));
         fprintf(stderr, "pulsar: %s: the family supplies no %s%s -- refusing the session\n", ARCH(e), miss, where);
         return 1;
     }
@@ -155,7 +155,7 @@ int pulsar_driver_session_create(pulsar_session *s, uint32_t n_banks) {
         double fixed = 0, per_token = 0;
         for (uint32_t k = 0; k < p->n_slots; k++)
             for (uint32_t id = 0; id < p->n_decl; id++) {
-                if (!(p->slot[k] >> id & 1u)) continue;
+                if (!(p->slot[LayerSlot{k}] >> id & 1u)) continue;
                 if (p->decl[id].kind == PULSAR_STATE_POOL) per_token += (double)p->decl[id].bytes / p->decl[id].tokens;
                 else fixed += (double)pulsar_state_decl_bank_bytes(&p->decl[id]);
             }
@@ -387,7 +387,7 @@ static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const TokId
             }
         }
         for (TrunkLayer il{0u}; lok && il.below(e->plan.n_layer); ++il) {
-            lok = ops->block[e->plan.kind[il.raw()]](&st, il);
+            lok = ops->block[e->plan.kind[il]](&st, il);
             /* the diagnostic tap after layer il (PULSAR_CUDA_GRAPH_DUMP_PREFIX armed; the family's dump re-checks
              * its own arming, so an unarmed run does no work) */
             if (lok && ops->dump && gpu_graph_debug_dump_enabled()) ops->dump(&st, il);

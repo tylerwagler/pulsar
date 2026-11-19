@@ -71,7 +71,7 @@ bool pulsar_nemotron_enc_bind(const pulsar_model *m, pulsar_nemotron_enc_model *
     if (s->kind == PULSAR_ENCODER_RERANK) w->score = pulsar_role_bind(b, pulsar_role_top("score"), A_BF16, 2, E, 1);
     for (TrunkLayer il{0u}; il.below(s->n_layer); ++il) {
         auto k = [&](const char *role) { return pulsar_role_in(role, LAYERS, (int32_t)il.raw()); };
-        pulsar_nemotron_enc_layer *L = &w->layer[il.raw()];
+        pulsar_nemotron_enc_layer *L = &w->layer[il];
         L->attn_norm = pulsar_role_bind(b, k("attn_norm"), A_BF16, 1, E);
         L->attn_q = pulsar_role_bind(b, k("attn_q"), A_LINEAR, 2, E, Q);
         L->attn_k = pulsar_role_bind(b, k("attn_k"), A_LINEAR, 2, E, KV);

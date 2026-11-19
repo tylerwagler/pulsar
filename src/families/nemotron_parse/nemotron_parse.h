@@ -196,7 +196,7 @@ typedef struct {
      *  vit_pos: the learned position field, f32 [pos_grid * pos_grid][vit_width] (copied to pos_field at bind) */
     pulsar_tensor *patch, *cls, *pos;
     /// The ViT blocks (the shared encoder's, engine/vit_encoder.h); entries [0, shape.vit_depth) are bound.
-    pulsar_vit_block vit[PULSAR_NEMOTRON_PARSE_VIT_MAX];
+    pulsar_indexed<pulsar_vit_block, VisLayer, PULSAR_NEMOTRON_PARSE_VIT_MAX> vit;
     /** @var pulsar_nemotron_parse_model::neck_proj
      *  neck_proj (conv1, 1x1): [vit_width -> neck_width]
      *  @var pulsar_nemotron_parse_model::neck_proj_b
@@ -233,7 +233,7 @@ typedef struct {
      *  output_norm_bias [width] */
     pulsar_tensor *embed, *embed_norm, *embed_norm_b, *output_norm, *output_norm_b;
     /// The decoder layers; entries [0, shape.n_layer) are bound.
-    pulsar_nemotron_parse_dec_layer layer[PULSAR_NEMOTRON_PARSE_DEC_MAX];
+    pulsar_indexed<pulsar_nemotron_parse_dec_layer, TrunkLayer, PULSAR_NEMOTRON_PARSE_DEC_MAX> layer;
     /// What the binding priced (role_bind.h): every byte the core stages, by role.
     pulsar_role_census census;
     /// The decode table (pulsar_nemotron_parse_load_vocab); owned, deleted by unload.

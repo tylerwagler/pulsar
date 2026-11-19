@@ -50,20 +50,21 @@ struct vit_ctx {
 
 }  // namespace
 
-bool pulsar_vit_encode(const pulsar_model *m, const pulsar_vit_dims &d, const pulsar_vit_block *blocks,
+bool pulsar_vit_encode(const pulsar_model *m, const pulsar_vit_dims &d,
+                       pulsar_indexed_view<const pulsar_vit_block, VisLayer> blocks,
                        pulsar_rows_out fmt, const pulsar_vit_bufs &b, uint32_t n, const pulsar_vit_hooks *hooks,
                        char *err, size_t errlen) {
     vit_ctx c{m, fmt, b, err, errlen};
     const uint32_t D = d.width, HD = d.head_dim, HS = d.heads * HD, M = d.mlp, C = b.chunk;
     float *res = b.res;
     uint16_t *xn = b.xn, *qkv = b.qkv, *att = b.att, *mlp = b.mlp;
-    if (pulsar_rows_layernorm32_launch(res, true, D, NULL, n, D, c.fp(blocks[0].norm1, "vit norm1"),
-                                       c.fp(blocks[0].norm1_b, "vit norm1"), d.eps, xn, D, fmt, NULL, 0, 0) != 0)
+    if (pulsar_rows_layernorm32_launch(res, true, D, NULL, n, D, c.fp(blocks[VisLayer{0u}].norm1, "vit norm1"),
+                                       c.fp(blocks[VisLayer{0u}].norm1_b, "vit norm1"), d.eps, xn, D, fmt, NULL, 0, 0) != 0)
         return c.fail("the first LayerNorm refused");
     const float scale = 1.0f / sqrtf((float)HD);
     for (VisLayer il{0u}; il.below(d.depth); ++il) {
         if (hooks && hooks->before_block) hooks->before_block(hooks->ud, il);
-        const pulsar_vit_block &B = blocks[il.raw()];
+        const pulsar_vit_block &B = blocks[il];
         for (uint32_t r0 = 0; r0 < n; r0 += C) {
             const uint32_t rows = n - r0 < C ? n - r0 : C;
             if (!c.lin(B.qkv, (int)D, (int)(3u * HS), xn + (size_t)r0 * D, rows, "vit qkv") ||
@@ -78,8 +79,8 @@ bool pulsar_vit_encode(const pulsar_model *m, const pulsar_vit_dims &d, const pu
                                                       d.heads, HD, scale, att, HS, 0);
         if (arc != 0) return c.fail("the attention refused");
         const bool last = il.last_of(d.depth);
-        const float *n1 = last ? NULL : c.fp(blocks[il.next().raw()].norm1, "vit norm1");
-        const float *n1b = last ? NULL : c.fp(blocks[il.next().raw()].norm1_b, "vit norm1");
+        const float *n1 = last ? NULL : c.fp(blocks[il.next()].norm1, "vit norm1");
+        const float *n1b = last ? NULL : c.fp(blocks[il.next()].norm1_b, "vit norm1");
         for (uint32_t r0 = 0; r0 < n; r0 += C) {
             const uint32_t rows = n - r0 < C ? n - r0 : C;
             float *rc = res + (size_t)r0 * D;

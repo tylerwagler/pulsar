@@ -309,7 +309,7 @@ typedef struct {
     pulsar_qwen_gr_weights mixer;         ///< model.language_model.hyper_connection_mixer
     /** [0, n_layer) the trunk; [n_layer] the MTP layer when mtp.present (a QSA layer, split experts).  Indexed by the
      *  LAYER SLOT (L436): the array is laid out as the declared state's slots are (pulsar_qwen_layer_w). */
-    pulsar_qwen_layer_weights layer[PULSAR_FAMILY_MAX_LAYER];
+    pulsar_indexed<pulsar_qwen_layer_weights, LayerSlot, PULSAR_FAMILY_MAX_LAYER> layer;
     /// the MTP layer's own tensors (mtp.present says whether the artifact carries and the open loaded it)
     pulsar_qwen_mtp_weights mtp;
     /** L299: the block drafter (spec_block.h: DFlash2) when the open selected it -- then the MTP tensors are
@@ -367,14 +367,14 @@ static inline TrunkLayer pulsar_qwen_block_layer(SrcBlock b) { return TrunkLayer
  *  @param slot the layer slot */
 /// @return its tensors
 static inline pulsar_qwen_layer_weights &pulsar_qwen_layer_w(pulsar_qwen_weights *w, LayerSlot slot) {
-    return w->layer[slot.raw()];
+    return w->layer[slot];
 }
 /** The read-only form of pulsar_qwen_layer_w.
  *  @param w    the weights
  *  @param slot the layer slot */
 /// @return its tensors
 static inline const pulsar_qwen_layer_weights &pulsar_qwen_layer_w(const pulsar_qwen_weights *w, LayerSlot slot) {
-    return w->layer[slot.raw()];
+    return w->layer[slot];
 }
 
 /* ---- 4. Session state -------------------------------------------------------

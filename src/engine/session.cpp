@@ -473,7 +473,7 @@ bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt) 
     /* The layer plan: one kind for every layer.  The per-layer attention mode
      * (SWA / compressed / indexed) stays in pulsar_attn_layout, its authority. */
     e->plan.n_layer = PULSAR_N_LAYER;
-    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) e->plan.kind[il.raw()] = PULSAR_LAYER_DS4_BLOCK;
+    for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) e->plan.kind[il] = PULSAR_LAYER_DS4_BLOCK;
     return true;
 }
 
@@ -519,7 +519,7 @@ bool pulsar_ds4_tp_slices(pulsar_engine *e, pulsar_tp_plan *plan) {
                pulsar_tp_plan_add1(plan, m, L->attn_output_b, PULSAR_TP_AXIS_IN, a_lo, a_hi);
     };
     for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
-        const pulsar_layer_weights *L = &e->weights.layer[il.raw()];
+        const pulsar_layer_weights *L = &e->weights.layer[il];
         if (!attention(&e->model, L)) {
             fprintf(stderr, "pulsar: layer %u: the attention projections do not split -- refusing\n", il.raw());
             return false;
@@ -546,14 +546,14 @@ bool pulsar_ds4_tp_slices(pulsar_engine *e, pulsar_tp_plan *plan) {
     }
     /* 4g-1b: the drafter's blocks split exactly like a target layer's, over the drafter's own mapping */
     for (uint32_t dl = 0; e->dspark_ready && dl < 3u; dl++) {
-        const pulsar_layer_weights *DL = &e->dspark_weights.layer[dl];
+        const pulsar_layer_weights *DL = &e->dspark_weights.layer[DraftLayer{dl}];
         if (!tp_declare_expert_half(plan, &e->dspark_model, DL, tp_rk, tp_nr) ||
             !tp_declare_shared_split(plan, &e->dspark_model, DL, tp_rk, tp_nr) || !attention(&e->dspark_model, DL)) {
             fprintf(stderr, "pulsar: drafter block %u does not split -- refusing\n", dl);
             return false;
         }
     }
-    const pulsar_layer_weights *L0 = &e->weights.layer[0];
+    const pulsar_layer_weights *L0 = &e->weights.layer[TrunkLayer{0}];
     uint32_t sx_lo = 0, sx_hi = 0;
     (void)pulsar_tp_owned_range(tp_rk, tp_nr, (uint32_t)L0->ffn_gate_shexp->dim[1], &sx_lo, &sx_hi);
     fprintf(stderr, "pulsar: TP rank %d/%u owns attention output groups [%u,%u) of %u = heads [%u,%u) and "
@@ -583,7 +583,7 @@ bool pulsar_ds4_family_after_gpu(pulsar_engine *e) {
         uint32_t n_grouped = 0, n_tiled = 0, n_routed = 0;
         const pulsar_layer_weights *ml = NULL;
         for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
-            const pulsar_layer_weights *l = &e->weights.layer[il.raw()];
+            const pulsar_layer_weights *l = &e->weights.layer[il];
             if (!l->ffn_gate_exps || !l->ffn_down_exps) continue;
             if (!ml) ml = l;                    /* first routed layer, for the type sample */
             n_routed++;
@@ -1690,7 +1690,7 @@ void pulsar_session::trim_history(TokPos pos) {
     spec_lookahead_reset(s);
     /* Rewound positions' drafter rows are stale; empty the window (it refills
      * from the prompt capture on the next prefill, or from commits). */
-    for (int i = 0; i < 3; i++) s->graph->dspark_n_raw[i] = 0;
+    for (int i = 0; i < 3; i++) s->graph->dspark_n_raw[DraftLayer{i}] = 0;
     s->graph->dspark_prompt_n = 0;
     if (s->prefill_frontier > pos) s->prefill_frontier = pos;   /* L195: a prefill above the new frontier never happened */
 }

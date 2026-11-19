@@ -130,7 +130,7 @@ typedef struct pulsar_state_plan {
     /// layer slots belonging to the trunk; slots [n_trunk, n_slots) are a drafter's
     uint32_t n_trunk;
     /// [n_slots] per layer slot, the bitmask of decl ids it carries (bit i = decl[i])
-    uint32_t slot[PULSAR_STATE_SLOTS_MAX];
+    pulsar_indexed<uint32_t, LayerSlot, PULSAR_STATE_SLOTS_MAX> slot;
     /// bitmask of decl ids held once per bank outside any layer (host decls only)
     uint32_t session;
     /** The drafter lane's own counters the state walk must keep in step (NULL = no drafter lane): a restore or a
@@ -210,15 +210,15 @@ typedef struct pulsar_state_set {
     uint32_t n_banks;
     uint32_t ctx;                  ///< a POOL bank's capacity in tokens: the session's, rounded to whole rows / blocks
     uint32_t verify_rows;          ///< the captures' depth (0 = none: no drafter, no verify)
-    pulsar_gpu_tensor *t[PULSAR_STATE_SLOTS_MAX][PULSAR_STATE_DECLS_MAX];       ///< FIXED / STAGED / RING
-    pulsar_gpu_tensor **pool[PULSAR_STATE_SLOTS_MAX][PULSAR_STATE_DECLS_MAX];   ///< POOL: [n_banks], NULL = evicted
+    pulsar_indexed<pulsar_gpu_tensor *[PULSAR_STATE_DECLS_MAX], LayerSlot, PULSAR_STATE_SLOTS_MAX> t;       ///< FIXED / STAGED / RING
+    pulsar_indexed<pulsar_gpu_tensor **[PULSAR_STATE_DECLS_MAX], LayerSlot, PULSAR_STATE_SLOTS_MAX> pool;   ///< POOL: [n_banks], NULL = evicted
     uint8_t *host[PULSAR_STATE_DECLS_MAX];                                      ///< session host decls: [n_banks]
     /* the verify capture */
     pulsar_gpu_tensor *cap_rows[PULSAR_STATE_DECLS_MAX];   ///< SNAPSHOT / DELTA / STAGE rows
     pulsar_gpu_tensor *cap_runs[PULSAR_STATE_DECLS_MAX];   ///< STAGE: each run's block before the step
     uint8_t *cap_host[PULSAR_STATE_DECLS_MAX];             ///< REPLAY: each run's bank bytes before the step
     /// a trunk slot's index among the trunk slots carrying a decl (a KindOrd, stored as a byte; pulsar_state_slot_ord)
-    uint8_t ord[PULSAR_STATE_SLOTS_MAX][PULSAR_STATE_DECLS_MAX];
+    pulsar_indexed<uint8_t[PULSAR_STATE_DECLS_MAX], LayerSlot, PULSAR_STATE_SLOTS_MAX> ord;
     /* L339 the fold (the header's THE FOLD) */
     pulsar_gpu_tensor *fold_dev;   ///< int32 [1 + 2 n_banks]: the fold table the ops read; NULL = the set does not fold
     int32_t *fold_host;            ///< its host image, the authority: [0] capture row, [1 + 2 b] / [2 + 2 b] pending
@@ -278,7 +278,7 @@ static inline void pulsar_state_set_pos(pulsar_state_set *ss, BankId bank, TokPo
 /// @param id   the decl id
 /// @return the tensor (the set's), NULL when the slot does not carry the decl
 static inline pulsar_gpu_tensor *pulsar_state_tensor(const pulsar_state_set *ss, LayerSlot slot, uint32_t id) {
-    return ss->t[slot.raw()][id];
+    return ss->t[slot][id];
 }
 /** Bank `bank`'s tensor of a POOL decl on slot `slot` (NULL while the bank is evicted). */
 /// @param ss   the set
@@ -288,7 +288,7 @@ static inline pulsar_gpu_tensor *pulsar_state_tensor(const pulsar_state_set *ss,
 /// @return the bank's pool tensor (the set's), or NULL
 static inline pulsar_gpu_tensor *pulsar_state_pool(const pulsar_state_set *ss, LayerSlot slot, uint32_t id,
                                                    BankId bank) {
-    return ss->pool[slot.raw()][id] ? ss->pool[slot.raw()][id][pulsar_bank_index(bank)] : NULL;
+    return ss->pool[slot][id] ? ss->pool[slot][id][pulsar_bank_index(bank)] : NULL;
 }
 /** Bank `bank`'s bytes of a session host decl. */
 /// @param ss   the set

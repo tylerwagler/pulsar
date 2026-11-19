@@ -368,8 +368,8 @@ bool pulsar_nemotron_h_read_shape(const pulsar_model *m, pulsar_nemotron_h_shape
     char kinds[PULSAR_NEMOTRON_H_MAX_BLOCKS][12];
     uint32_t n = 0;
     if (read_kinds(m, "nemotron_h.layers_block_type", kinds, PULSAR_NEMOTRON_H_MAX_BLOCKS, &n) &&
-        group(kinds, n, "nemotron_h.layers_block_type", &s->n_layer, &s->mamba_layers, &s->moe_layers, s->block_layer,
-              s->block_sub)) {
+        group(kinds, n, "nemotron_h.layers_block_type", &s->n_layer, &s->mamba_layers, &s->moe_layers, s->block_layer.data(),
+              s->block_sub.data())) {
         s->n_blocks = n;
     } else {
         ok = false;
@@ -405,8 +405,8 @@ void pulsar_nemotron_h_plan(const pulsar_nemotron_h_shape *s, pulsar_layer_plan 
     memset(plan, 0, sizeof(*plan));
     plan->n_layer = s->n_layer;
     for (TrunkLayer il{0u}; il.below(s->n_layer); ++il) {
-        plan->kind[il.raw()] = PULSAR_LAYER_BLOCKS;
-        plan->desc[il.raw()].mixer = s->mamba_layers >> il.raw() & 1u ? PULSAR_MIXER_MAMBA2 : PULSAR_MIXER_ATTN_FULL;
-        plan->desc[il.raw()].ffn = s->moe_layers >> il.raw() & 1u ? PULSAR_FFN_MOE : PULSAR_FFN_NONE;
+        plan->kind[il] = PULSAR_LAYER_BLOCKS;
+        plan->desc[il].mixer = s->mamba_layers >> il.raw() & 1u ? PULSAR_MIXER_MAMBA2 : PULSAR_MIXER_ATTN_FULL;
+        plan->desc[il].ffn = s->moe_layers >> il.raw() & 1u ? PULSAR_FFN_MOE : PULSAR_FFN_NONE;
     }
 }

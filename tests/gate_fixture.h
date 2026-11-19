@@ -119,7 +119,7 @@ static inline std::vector<gate_state_piece> gate_bank_state(pulsar_session *s, u
     for (uint32_t k = k0; ok && k < k1; k++) {
         for (uint32_t id = 0; ok && id < p->n_decl; id++) {
             const pulsar_state_decl *d = &p->decl[id];
-            if (!(p->slot[k] >> id & 1u)) continue;
+            if (!(p->slot[LayerSlot{k}] >> id & 1u)) continue;
             const pulsar_gpu_tensor *t;
             uint64_t off, n;
             if (d->kind == PULSAR_STATE_POOL) {

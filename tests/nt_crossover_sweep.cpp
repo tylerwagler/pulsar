@@ -122,13 +122,13 @@ static bool attnout_launch(void *vctx, uint32_t n_tok) {
                (uint64_t)c->n_groups * c->rank, PULSAR_N_EMBD, c->low, n_tok) != 0;
 }
 
-static const pulsar_tensor *pick_q_a(const pulsar_engine *e, uint32_t il) { return e->weights.layer[il].attn_q_a; }
-static const pulsar_tensor *pick_q_b(const pulsar_engine *e, uint32_t il) { return e->weights.layer[il].attn_q_b; }
-static const pulsar_tensor *pick_kv(const pulsar_engine *e, uint32_t il) { return e->weights.layer[il].attn_kv; }
-static const pulsar_tensor *pick_out_b(const pulsar_engine *e, uint32_t il) { return e->weights.layer[il].attn_output_b; }
-static const pulsar_tensor *pick_gate_shexp(const pulsar_engine *e, uint32_t il) { return e->weights.layer[il].ffn_gate_shexp; }
-static const pulsar_tensor *pick_down_shexp(const pulsar_engine *e, uint32_t il) { return e->weights.layer[il].ffn_down_shexp; }
-static const pulsar_tensor *pick_router(const pulsar_engine *e, uint32_t il) { return e->weights.layer[il].ffn_gate_inp; }
+static const pulsar_tensor *pick_q_a(const pulsar_engine *e, uint32_t il) { return e->weights.layer[TrunkLayer{il}].attn_q_a; }
+static const pulsar_tensor *pick_q_b(const pulsar_engine *e, uint32_t il) { return e->weights.layer[TrunkLayer{il}].attn_q_b; }
+static const pulsar_tensor *pick_kv(const pulsar_engine *e, uint32_t il) { return e->weights.layer[TrunkLayer{il}].attn_kv; }
+static const pulsar_tensor *pick_out_b(const pulsar_engine *e, uint32_t il) { return e->weights.layer[TrunkLayer{il}].attn_output_b; }
+static const pulsar_tensor *pick_gate_shexp(const pulsar_engine *e, uint32_t il) { return e->weights.layer[TrunkLayer{il}].ffn_gate_shexp; }
+static const pulsar_tensor *pick_down_shexp(const pulsar_engine *e, uint32_t il) { return e->weights.layer[TrunkLayer{il}].ffn_down_shexp; }
+static const pulsar_tensor *pick_router(const pulsar_engine *e, uint32_t il) { return e->weights.layer[TrunkLayer{il}].ffn_gate_inp; }
 
 static const char *type_name(uint32_t t) {
     return t == PULSAR_TENSOR_BF16 ? "bf16" : "mxfp8";
@@ -143,7 +143,7 @@ int main(int argc, char **argv) {
     opt.backend = PULSAR_BACKEND_CUDA;
     pulsar_engine *e = NULL;
     if (pulsar_engine_open(&e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
-    const pulsar_layer_weights *L = &e->weights.layer[il];
+    const pulsar_layer_weights *L = &e->weights.layer[TrunkLayer{il}];
     if (il >= PULSAR_N_LAYER || !L->attn_q_a || !L->attn_q_b || !L->attn_kv || !L->attn_output_a ||
         !L->attn_output_b || !L->ffn_gate_shexp || !L->ffn_down_shexp || !L->ffn_gate_inp ||
         !e->weights.output) {

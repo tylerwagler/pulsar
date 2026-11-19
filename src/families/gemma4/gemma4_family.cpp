@@ -143,7 +143,7 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
     }
     const pulsar_gemma4_shape *s = &w->shape;
     uint32_t n_full = 0;
-    for (TrunkLayer il{0u}; il.below(e->plan.n_layer); ++il) n_full += e->plan.desc[il.raw()].mixer == PULSAR_MIXER_ATTN_FULL;
+    for (TrunkLayer il{0u}; il.below(e->plan.n_layer); ++il) n_full += e->plan.desc[il].mixer == PULSAR_MIXER_ATTN_FULL;
     fprintf(stderr, "pulsar: %s: %s, %u layers: %u window (%u keys, %uq/%ukv x %u) + %u global (%uq/%ukv x %u, K = V); "
                     "every layer a dense GeGLU MLP (%u, stored %u) + %u of %u experts (%u, stored %u); the pack's EXL3 head, "
                     "soft-cap %g; %.2f GiB bound\n",
@@ -211,7 +211,7 @@ int quant_bits(pulsar_engine *e) {
     const pulsar_gemma4_model *w = model_of(e);
     int bits = 0;
     for (TrunkLayer il{0u}; il.below(w->shape.n_layer); ++il)
-        for (const pulsar_tensor *t : {w->layer[il.raw()].exp_gate, w->layer[il.raw()].exp_up, w->layer[il.raw()].exp_down}) {
+        for (const pulsar_tensor *t : {w->layer[il].exp_gate, w->layer[il].exp_up, w->layer[il].exp_down}) {
             const int k2 = t ? exl3_type_k2(t->type) : 0;
             if (k2 && 20 + k2 > bits) bits = 20 + k2;
         }

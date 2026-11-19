@@ -171,7 +171,7 @@ pulsar_shape g_pulsar_shape = PULSAR_SHAPE_V41;
 
 
 
-uint32_t g_pulsar_layer_expert_count[PULSAR_MAX_LAYER] = {0};
+pulsar_indexed<uint32_t, TrunkLayer, PULSAR_MAX_LAYER> g_pulsar_layer_expert_count = {0};
 
 
 int g_pulsar_lock_fd = -1;

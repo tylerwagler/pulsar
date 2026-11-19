@@ -83,8 +83,8 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
     const pulsar_inkling_shape *s = &w->shape;
     uint32_t n_window = 0, n_dense = 0;
     for (TrunkLayer il{0u}; il.below(e->plan.n_layer); ++il) {
-        n_window += e->plan.desc[il.raw()].mixer == PULSAR_MIXER_ATTN_WINDOW;
-        n_dense += e->plan.desc[il.raw()].ffn == PULSAR_FFN_DENSE;
+        n_window += e->plan.desc[il].mixer == PULSAR_MIXER_ATTN_WINDOW;
+        n_dense += e->plan.desc[il].ffn == PULSAR_FFN_DENSE;
     }
     fprintf(stderr, "pulsar: %s: %s, %u layers: %u window (%u keys) + %u full attention, %u dense + %u MoE (%u of %u "
                     "experts + %u shared); drafter %s; tower %s\n",
@@ -144,7 +144,7 @@ int quant_bits(pulsar_engine *e) {
     const pulsar_inkling_model *w = model_of(e);
     int bits = 0;
     for (TrunkLayer il{0u}; il.below(w->shape.n_layer); ++il)
-        for (const pulsar_tensor *t : {w->layer[il.raw()].exp_gate, w->layer[il.raw()].exp_up, w->layer[il.raw()].exp_down}) {
+        for (const pulsar_tensor *t : {w->layer[il].exp_gate, w->layer[il].exp_up, w->layer[il].exp_down}) {
             const int k2 = t ? exl3_type_k2(t->type) : 0;
             if (k2 && 20 + k2 > bits) bits = 20 + k2;
         }

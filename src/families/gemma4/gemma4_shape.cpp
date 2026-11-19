@@ -274,9 +274,9 @@ void pulsar_gemma4_plan(const pulsar_gemma4_shape *s, pulsar_layer_plan *plan) {
     plan->n_layer = s->n_layer;
     for (TrunkLayer il{0u}; il.below(s->n_layer); ++il) {
         const bool full = pulsar_gemma4_is_full(s, il);
-        plan->kind[il.raw()] = PULSAR_LAYER_BLOCKS;
-        plan->desc[il.raw()].mixer = full ? PULSAR_MIXER_ATTN_FULL : PULSAR_MIXER_ATTN_WINDOW;
-        plan->desc[il.raw()].ffn = PULSAR_FFN_DENSE_MOE;
-        plan->desc[il.raw()].window = full ? 0u : s->window;
+        plan->kind[il] = PULSAR_LAYER_BLOCKS;
+        plan->desc[il].mixer = full ? PULSAR_MIXER_ATTN_FULL : PULSAR_MIXER_ATTN_WINDOW;
+        plan->desc[il].ffn = PULSAR_FFN_DENSE_MOE;
+        plan->desc[il].window = full ? 0u : s->window;
     }
 }

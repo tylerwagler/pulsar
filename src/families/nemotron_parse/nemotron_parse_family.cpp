@@ -60,9 +60,9 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
     memset(&e->plan, 0, sizeof(e->plan));
     e->plan.n_layer = w->shape.n_layer;
     for (TrunkLayer il{0u}; il.below(w->shape.n_layer); ++il) {
-        e->plan.kind[il.raw()] = PULSAR_LAYER_BLOCKS;
-        e->plan.desc[il.raw()].mixer = PULSAR_MIXER_ATTN_FULL;
-        e->plan.desc[il.raw()].ffn = PULSAR_FFN_DENSE;
+        e->plan.kind[il] = PULSAR_LAYER_BLOCKS;
+        e->plan.desc[il].mixer = PULSAR_MIXER_ATTN_FULL;
+        e->plan.desc[il].ffn = PULSAR_FFN_DENSE;
     }
     weights_reject_unsupported_types(&e->model);
     weights_reject_bad_e8m0(&e->model);

@@ -100,7 +100,7 @@ pulsar_mtp_lane *pulsar_mtp_lane_create(pulsar_session *s, const pulsar_mtp_ops 
     /* the declaration the lane runs on: a drafter slot per module, the pending decl FIXED on the first, its row the
      * conditioning row, the plan's hooks the lane's */
     const char *why = mods == 0 || p->n_slots != p->n_trunk + mods ? "a drafter slot per module"
-                      : ops->pend_decl >= p->n_decl || !(p->slot[p->n_trunk] >> ops->pend_decl & 1u)
+                      : ops->pend_decl >= p->n_decl || !(p->slot[pulsar_drafter_slot(p, DraftLayer{0u})] >> ops->pend_decl & 1u)
                           ? "the pending decl on the first drafter slot"
                       : p->decl[ops->pend_decl].kind != PULSAR_STATE_FIXED || p->decl[ops->pend_decl].host ||
                               p->decl[ops->pend_decl].capture != PULSAR_STATE_CAPTURE_NONE

@@ -47,7 +47,7 @@ LayerSlot pulsar_state_plan_add_slot(pulsar_state_plan *p, uint32_t mask) {
         p->slot_overflow++;
         return LayerSlot{PULSAR_STATE_SLOTS_MAX};
     }
-    p->slot[p->n_slots] = mask;
+    p->slot[LayerSlot{p->n_slots}] = mask;
     return LayerSlot{p->n_slots++};
 }
 
@@ -93,7 +93,7 @@ static const char *plan_refusal(const pulsar_state_plan *p) {
         return "the resume grid is 0 or the checkpoint slots are outside [1, PULSAR_CKPT_SLOTS_MAX]";
     for (uint32_t id = 0; id < p->n_decl; id++) {
         const pulsar_state_decl &d = p->decl[id];
-        const bool on_slot = [&] { for (uint32_t k = 0; k < p->n_slots; k++) if (has(p->slot[k], id)) return true; return false; }();
+        const bool on_slot = [&] { for (LayerSlot k{0u}; k.below(p->n_slots); ++k) if (has(p->slot[k], id)) return true; return false; }();
         const char *bad = NULL;
         if (d.bytes == 0u) bad = "has no bytes";
         else if ((d.kind == PULSAR_STATE_POOL || d.kind == PULSAR_STATE_STAGED || d.kind == PULSAR_STATE_RING) &&
@@ -116,7 +116,7 @@ static const char *plan_refusal(const pulsar_state_plan *p) {
             return why;
         }
     }
-    for (uint32_t k = 0; k < p->n_slots; k++)
+    for (LayerSlot k{0u}; k.below(p->n_slots); ++k)
         if (p->slot[k] >> p->n_decl) return "a slot names a decl past the table";
     if (p->session >> p->n_decl) return "the session set names a decl past the table";
     return NULL;
@@ -144,7 +144,7 @@ static uint32_t pool_capacity(const pulsar_state_plan *p, uint32_t ctx) {
 /// @param k  the layer slot
 /// @param b  the bank
 /// @return false when an allocation failed (what was made stays)
-static bool slot_bank_alloc(pulsar_state_set *ss, uint32_t k, uint32_t b) {
+static bool slot_bank_alloc(pulsar_state_set *ss, LayerSlot k, uint32_t b) {
     const pulsar_state_plan *p = ss->plan;
     bool ok = true;
     for (uint32_t id = 0; ok && id < p->n_decl; id++) {
@@ -161,7 +161,7 @@ static bool slot_bank_alloc(pulsar_state_set *ss, uint32_t k, uint32_t b) {
  *  @param ss the set
  *  @param k  the layer slot
  *  @param b  the bank */
-static void slot_bank_free(pulsar_state_set *ss, uint32_t k, uint32_t b) {
+static void slot_bank_free(pulsar_state_set *ss, LayerSlot k, uint32_t b) {
     for (uint32_t id = 0; id < ss->plan->n_decl; id++) {
         if (!ss->pool[k][id]) continue;
         pulsar_gpu_tensor_free(ss->pool[k][id][b]);
@@ -171,12 +171,12 @@ static void slot_bank_free(pulsar_state_set *ss, uint32_t k, uint32_t b) {
 
 void pulsar_state_bank_free(pulsar_state_set *ss, BankId bank) {
     const uint32_t b = pulsar_bank_index(bank);
-    for (uint32_t k = 0; k < ss->plan->n_trunk; k++) slot_bank_free(ss, k, b);
+    for (LayerSlot k{0u}; k.below(ss->plan->n_trunk); ++k) slot_bank_free(ss, k, b);
     ss->kv_hw[b] = TokCount{0};   /* its pages are gone; the restore's loads raise it again */
 }
 
 bool pulsar_state_bank_alloc(pulsar_state_set *ss, BankId bank) {
-    for (uint32_t k = 0; k < ss->plan->n_trunk; k++) {
+    for (LayerSlot k{0u}; k.below(ss->plan->n_trunk); ++k) {
         if (!slot_bank_alloc(ss, k, pulsar_bank_index(bank))) {
             pulsar_state_bank_free(ss, bank);   /* never half-backed */
             return false;
@@ -187,7 +187,7 @@ bool pulsar_state_bank_alloc(pulsar_state_set *ss, BankId bank) {
 
 bool pulsar_state_bank_evicted(const pulsar_state_set *ss, BankId bank) {
     const uint32_t b = pulsar_bank_index(bank);
-    for (uint32_t k = 0; k < ss->plan->n_trunk; k++)
+    for (LayerSlot k{0u}; k.below(ss->plan->n_trunk); ++k)
         for (uint32_t id = 0; id < ss->plan->n_decl; id++)
             if (ss->pool[k][id] && !ss->pool[k][id][b]) return true;
     return false;
@@ -196,7 +196,7 @@ bool pulsar_state_bank_evicted(const pulsar_state_set *ss, BankId bank) {
 KvBytes pulsar_state_pool_bytes_at(const pulsar_state_set *ss, KvRows rows) {
     const pulsar_state_plan *p = ss->plan;
     uint64_t bytes = 0;   /* each pool's rows times its row's bytes: the conversion itself, so raw inside */
-    for (uint32_t k = 0; k < p->n_slots; k++)
+    for (LayerSlot k{0u}; k.below(p->n_slots); ++k)
         for (uint32_t id = 0; id < p->n_decl; id++)
             if (has(p->slot[k], id) && p->decl[id].kind == PULSAR_STATE_POOL)
                 bytes += ceil_div(rows.raw(), p->decl[id].tokens) * p->decl[id].bytes;
@@ -205,7 +205,7 @@ KvBytes pulsar_state_pool_bytes_at(const pulsar_state_set *ss, KvRows rows) {
 
 void pulsar_state_destroy(pulsar_state_set *ss) {
     if (!ss) return;
-    for (uint32_t k = 0; k < PULSAR_STATE_SLOTS_MAX; k++) {
+    for (LayerSlot k{0u}; k.below(PULSAR_STATE_SLOTS_MAX); ++k) {
         for (uint32_t id = 0; id < PULSAR_STATE_DECLS_MAX; id++) {
             pulsar_gpu_tensor_free(ss->t[k][id]);
             if (!ss->pool[k][id]) continue;
@@ -233,7 +233,7 @@ bool pulsar_state_reset_bank(pulsar_state_set *ss, BankId bank) {
     const pulsar_state_plan *p = ss->plan;
     const uint32_t b = pulsar_bank_index(bank);
     bool ok = true;
-    for (uint32_t k = 0; ok && k < p->n_slots; k++) {
+    for (LayerSlot k{0u}; ok && k.below(p->n_slots); ++k) {
         for (uint32_t id = 0; ok && id < p->n_decl; id++) {
             if (!has(p->slot[k], id) || p->decl[id].kind == PULSAR_STATE_POOL || !ss->t[k][id]) continue;
             const TensorBytes bb{pulsar_state_decl_bank_bytes(&p->decl[id])};
@@ -263,7 +263,7 @@ bool pulsar_state_reset_bank(pulsar_state_set *ss, BankId bank) {
  *  @param id   the decl id */
 /// @return the ordinal (0 for a slot that does not carry the decl, as the table reads)
 static KindOrd pulsar_state_slot_ord(const pulsar_state_set *ss, LayerSlot slot, uint32_t id) {
-    return KindOrd{ss->ord[slot.raw()][id]};
+    return KindOrd{ss->ord[slot][id]};
 }
 
 uint64_t pulsar_state_capture_offset(const pulsar_state_set *ss, LayerSlot slot, uint32_t id) {
@@ -294,7 +294,7 @@ void pulsar_state_verify_begin(pulsar_state_set *ss, uint32_t n_runs, const uint
 bool pulsar_state_verify_capture(pulsar_state_set *ss) {
     const pulsar_state_plan *p = ss->plan;
     bool ok = true;
-    for (uint32_t k = 0; ok && k < p->n_trunk; k++) {
+    for (LayerSlot k{0u}; ok && k.below(p->n_trunk); ++k) {
         for (uint32_t id = 0; ok && id < p->n_decl; id++) {
             if (!has(p->slot[k], id) || p->decl[id].capture != PULSAR_STATE_CAPTURE_STAGE) continue;
             const TensorBytes blk{pulsar_state_decl_bank_bytes(&p->decl[id])};
@@ -321,11 +321,11 @@ bool pulsar_state_fold_flush(pulsar_state_set *ss, BankId bank) {
     if (keep <= 0) return true;
     const pulsar_state_plan *p = ss->plan;
     bool ok = true;
-    for (uint32_t k = 0; ok && k < p->n_trunk; k++)
+    for (LayerSlot k{0u}; ok && k.below(p->n_trunk); ++k)
         for (uint32_t id = 0; ok && id < p->n_decl; id++)
             if (has(p->slot[k], id) && p->decl[id].capture == PULSAR_STATE_CAPTURE_DELTA)
                 ok = p->decl[id].commit(dptr(ss->t[k][id]), bank,
-                                        (const uint8_t *)pulsar_state_capture_rows(ss, LayerSlot{k}, id) +
+                                        (const uint8_t *)pulsar_state_capture_rows(ss, k, id) +
                                             (uint64_t)row * p->decl[id].capture_bytes,
                                         (uint32_t)keep);
     if (!ok) {
@@ -398,7 +398,7 @@ bool pulsar_state_commit(pulsar_state_set *ss, BankId bank, const TokId *tokens,
     const pulsar_step_run vr{StepRow{(int)f}, TokPos{ss->run_pos0[run]}, StepRows{(int)R}};
     const uint32_t p0 = pulsar_ckpt_raw(vr.pos0), pnext = p0 + keep;
     const uint32_t last_kept = pulsar_row_index(vr.first + StepRows{(int)keep - 1});
-    for (uint32_t k = 0; ok && k < p->n_trunk; k++) {
+    for (LayerSlot k{0u}; ok && k.below(p->n_trunk); ++k) {
         for (uint32_t id = 0; ok && id < p->n_decl; id++) {
             const pulsar_state_decl &d = p->decl[id];
             if (!has(p->slot[k], id)) continue;
@@ -456,7 +456,7 @@ static bool decl_walk(void *state, int dir, bool, pulsar_gpu_tensor *slab, uint6
     /* L339: a walk out reads the state -- its pending rows go in first; a walk in replaces it -- they are dropped */
     if (dir == 0) ok = pulsar_state_fold_flush(ss, bank);
     else if (dir > 0 && ss->fold_host) ss->fold_host[2 + 2 * b] = 0;
-    for (uint32_t k = 0; k < p->n_slots; k++) {
+    for (LayerSlot k{0u}; k.below(p->n_slots); ++k) {
         for (uint32_t id = 0; id < p->n_decl; id++) {
             pulsar_gpu_tensor *t = ss->t[k][id];
             if (!has(p->slot[k], id) || p->decl[id].kind == PULSAR_STATE_POOL || !t || !ok) continue;
@@ -560,7 +560,7 @@ static uint32_t slot_pools(pulsar_state_set *ss, BankId bank, uint32_t k0, uint3
     const pulsar_state_plan *p = ss->plan;
     const uint32_t b = pulsar_bank_index(bank);
     uint32_t n = 0;
-    for (uint32_t k = k0; k < k1; k++) {
+    for (LayerSlot k{k0}; k.below(k1); ++k) {
         for (uint32_t id = 0; id < p->n_decl; id++) {
             const pulsar_state_decl &d = p->decl[id];
             if (!has(p->slot[k], id) || d.kind != PULSAR_STATE_POOL) continue;
@@ -679,7 +679,7 @@ pulsar_state_set *pulsar_state_create(const void *engine, const pulsar_state_pla
     ss->verify_rows = verify_rows;
     const uint64_t nb = n_banks;
     bool ok = true;
-    for (uint32_t k = 0; ok && k < plan->n_slots; k++) {
+    for (LayerSlot k{0u}; ok && k.below(plan->n_slots); ++k) {
         /* Demand-paged pools first, one tensor per bank (L284 #3: a bank's pages return only when its own tensors
          * go), each sized from ss->ctx -- the capacity the ops view; then the slot's resident state, bank-major. */
         for (uint32_t id = 0; id < plan->n_decl; id++)
@@ -703,7 +703,7 @@ pulsar_state_set *pulsar_state_create(const void *engine, const pulsar_state_pla
             continue;
         }
         uint32_t n_l = 0;
-        for (uint32_t k = 0; k < plan->n_trunk; k++)
+        for (LayerSlot k{0u}; k.below(plan->n_trunk); ++k)
             if (has(plan->slot[k], id)) ss->ord[k][id] = (uint8_t)n_l++;
         if (!n_l) continue;
         const uint64_t rows = (uint64_t)n_l * verify_rows;

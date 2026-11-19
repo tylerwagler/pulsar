@@ -513,7 +513,7 @@ bool constants(const pulsar_engine *e, g4_state *st) {
     std::vector<uint16_t> ones(s.head_dim, (uint16_t)0x3f80u);
     std::vector<float> es((size_t)s.n_layer * s.n_expert);
     for (TrunkLayer il{0u}; il.below(s.n_layer); ++il) {
-        const uint16_t *src = (const uint16_t *)tensor_data(&e->model, w->layer[il.raw()].router_expert_scale);
+        const uint16_t *src = (const uint16_t *)tensor_data(&e->model, w->layer[il].router_expert_scale);
         if (!src) return false;
         for (uint32_t x = 0; x < s.n_expert; x++) {
             const uint32_t u = (uint32_t)src[x] << 16;
@@ -747,7 +747,7 @@ uint32_t attn_call_of(TrunkLayer il, bool prompt) { return 2u * il.raw() + (prom
 bool plan_call(const g4_step *st, TrunkLayer il, uint32_t bound, uint64_t off, uint64_t stride) {
     g4_state *q = st->st;
     const bool full = pulsar_gemma4_is_full(&st->w->shape, il);
-    const pulsar_gemma4_block &L = st->w->layer[il.raw()];
+    const pulsar_gemma4_block &L = st->w->layer[il];
     const pulsar_gqa_layer G1 = gqa_decl(st->w->shape, full, (const uint16_t *)wp(st, L.attn_q_norm, "gemma4 q_norm"),
                                          (const uint16_t *)wp(st, L.attn_k_norm, "gemma4 k_norm"),
                                          (const float *)dptr(q->rope_tab));
@@ -877,7 +877,7 @@ bool lora_rows(const g4_step *st, const pulsar_gemma4_lora &l, const uint16_t *x
 bool attention(const g4_step *st, TrunkLayer il, uint8_t *base, const mix_scratch &M) {
     g4_state *q = st->st;
     const pulsar_gemma4_shape &s = st->w->shape;
-    const pulsar_gemma4_block &L = st->w->layer[il.raw()];
+    const pulsar_gemma4_block &L = st->w->layer[il];
     const bool full = pulsar_gemma4_is_full(&s, il);
     const uint32_t n = st->n_rows, E = s.n_embd, hd = full ? s.head_dim : s.swa_head_dim;
     const uint32_t nkv = full ? s.n_head_kv : s.swa_n_head_kv, Q = s.n_head * hd, KV = nkv * hd;
@@ -954,7 +954,7 @@ bool attention(const g4_step *st, TrunkLayer il, uint8_t *base, const mix_scratc
  *  @return the device weight, or NULL */
 const uint16_t *next_norm(const g4_step *st, TrunkLayer il) {
     if (il.next().below(st->plan->n_layer))
-        return (const uint16_t *)wp(st, st->w->layer[il.next().raw()].attn_norm, "gemma4 input_layernorm");
+        return (const uint16_t *)wp(st, st->w->layer[il.next()].attn_norm, "gemma4 input_layernorm");
     return (const uint16_t *)wp(st, st->w->output_norm, "gemma4 norm");
 }
 
@@ -970,7 +970,7 @@ const uint16_t *next_norm(const g4_step *st, TrunkLayer il) {
  *  @return true = launched (h updated, the next reader's norm of it in xa); false = refused (said) */
 bool ffn(const g4_step *st, TrunkLayer il, uint8_t *base, const ffn_scratch &F) {
     const pulsar_gemma4_shape &s = st->w->shape;
-    const pulsar_gemma4_block &L = st->w->layer[il.raw()];
+    const pulsar_gemma4_block &L = st->w->layer[il];
     const uint32_t n = st->n_rows, E = s.n_embd, K = s.n_expert_used;
     const int Fd = (int)pulsar_gemma4_ff_stored(&s);
     const uint16_t *xd = (const uint16_t *)(base + F.xd), *xm = (const uint16_t *)(base + F.xm),
@@ -1081,11 +1081,11 @@ bool ffn(const g4_step *st, TrunkLayer il, uint8_t *base, const ffn_scratch &F) 
 bool block(const pulsar_driver_step *st0, TrunkLayer il) {
     const g4_step *st = S(st0);
     g4_state *q = st->st;
-    const pulsar_layer_desc &d = st0->plan->desc[il.raw()];
+    const pulsar_layer_desc &d = st0->plan->desc[il];
     if ((d.mixer != PULSAR_MIXER_ATTN_FULL && d.mixer != PULSAR_MIXER_ATTN_WINDOW) || d.ffn != PULSAR_FFN_DENSE_MOE)
         return failf("a layer description that is not {window | full attention} x {dense MLP + MoE}", il);
     const pulsar_gemma4_shape &s = st->w->shape;
-    const pulsar_gemma4_block &L = st->w->layer[il.raw()];
+    const pulsar_gemma4_block &L = st->w->layer[il];
     const uint32_t n = st->n_rows, E = s.n_embd;
     uint16_t *h = (uint16_t *)dptr(q->h), *xa = (uint16_t *)dptr(q->xa);
     if (il == TrunkLayer{0u} && !norm(h, (const uint16_t *)wp(st, L.attn_norm, "gemma4 input_layernorm"), xa, n, E))
@@ -1229,7 +1229,7 @@ void pulsar_gemma4_state_plan(pulsar_engine *e) {
                                       pulsar_gqa_kv_token_bytes(&gf), 0, 0, NULL, NULL, NULL};
     for (uint32_t id = 0; id < PULSAR_GEMMA4_STATE_COUNT; id++) (void)pulsar_state_plan_add(p, d[id]);
     for (TrunkLayer il{0u}; il.below(lp->n_layer); ++il)
-        p->slot[pulsar_layer_slot_of(il).raw()] = 1u << (pulsar_gemma4_is_full(s, il) ? PULSAR_GEMMA4_STATE_KV_FULL : PULSAR_GEMMA4_STATE_KV_WIN);
+        p->slot[pulsar_layer_slot_of(il)] = 1u << (pulsar_gemma4_is_full(s, il) ? PULSAR_GEMMA4_STATE_KV_FULL : PULSAR_GEMMA4_STATE_KV_WIN);
     p->n_trunk = lp->n_layer;
     p->n_slots = lp->n_layer;
     p->session = 0;

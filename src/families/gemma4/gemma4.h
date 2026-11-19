@@ -171,7 +171,7 @@ typedef struct {
     pulsar_tensor *output_norm;         ///< output_norm [n_embd]
     pulsar_tensor *head;                ///< head [n_embd -> n_vocab]: the pack's EXL3 head (quantized from the tied embedding)
     /// The layers; entries [0, shape.n_layer) are bound, the rest stay zero.
-    pulsar_gemma4_block layer[PULSAR_FAMILY_MAX_LAYER];
+    pulsar_indexed<pulsar_gemma4_block, TrunkLayer, PULSAR_FAMILY_MAX_LAYER> layer;
     /** What the binding priced (role_bind.h): every byte the core stages, by role. */
     pulsar_role_census census;
     /** The digest a session's disk segments are keyed by: the directory's names, types and sizes (FNV-1a). */

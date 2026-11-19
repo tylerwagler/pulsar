@@ -121,7 +121,7 @@ bool pulsar_inkling_bind(const pulsar_model *m, pulsar_inkling_model *w) {
     w->output_norm = pulsar_role_bind(b, pulsar_role_top("output_norm"), A_BF16, 1, E);
     w->head = pulsar_role_bind(b, pulsar_role_top("head"), A_HEAD, 2, E, V);
     for (TrunkLayer il{0u}; il.below(s->n_layer); ++il)
-        bind_block(b, s, LAYERS, (int32_t)il.raw(), s->window_layers >> il.raw() & 1u, !il.below(s->n_dense), &w->layer[il.raw()]);
+        bind_block(b, s, LAYERS, (int32_t)il.raw(), s->window_layers >> il.raw() & 1u, !il.below(s->n_dense), &w->layer[il]);
     /* the drafter: n chained layers, each a dense block plus its input side -- all of them when the container says
      * it holds the drafter (the builder writes all or none) */
     for (uint32_t n = 0; s->mtp_written && n < s->n_mtp; n++) {

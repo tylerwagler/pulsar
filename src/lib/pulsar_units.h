@@ -66,6 +66,7 @@
  * replaced (value-initialise, KvBytes{}, for 0).  Header-only C++17 (nvcc's default, for pulsar.h's .cu host
  * includes); no exceptions, no RTTI. */
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -703,5 +704,88 @@ static_assert(sizeof(TrunkLayer) == sizeof(uint32_t) && sizeof(LayerSlot) == siz
                   std::is_standard_layout<LayerSlot>::value,
               "a layer index is as cheap as the uint32 it replaces (memset / calloc-safe; arrays of it are uint32 "
               "arrays)");
+
+/* ---- L436: tables indexed by one space ---------------------------------------------------------------------------
+ * A table that one index space subscripts, as a type that takes NO OTHER subscript: `plan.kind[il]` with a layer
+ * slot, a drafter's layer or a bare integer does not compile.  Two forms:
+ *
+ *   pulsar_indexed<T, Index, N>     a fixed array T[N] -- exactly the array it replaces (one member, standard layout,
+ *                                   an aggregate: memset / calloc / brace initialisation and its place in a struct are
+ *                                   what they were; T may itself be an array, for a table whose FIRST subscript is the
+ *                                   space's);
+ *   pulsar_indexed_view<T, Index>   a pointer and its count, for a heap table or a caller's array.
+ *
+ * operator[](Index) only, bounds checked (fatal: an index past the table, none() included, is a programmer error --
+ * rule 9); data() / size() are for where the table leaves the type system whole (memcpy, memset, a kernel launch, a
+ * digest, a walk by another counter in the owner's own module). */
+
+/** A subscript past an indexed table: fatal (rule 9).
+ *  @param i the raw index
+ *  @param n the table's entries */
+[[noreturn]] inline void pulsar_indexed_fail(uint64_t i, uint64_t n) {
+    fprintf(stderr, "pulsar: index %llu is outside a table of %llu -- refusing the subscript\n", (unsigned long long)i,
+            (unsigned long long)n);
+    abort();
+}
+
+/** The fixed array T[N], subscripted by `Index` and nothing else (L436). */
+template <class T, class Index, size_t N>
+struct pulsar_indexed {
+    T v_[N];  ///< the entries (public so the type stays an aggregate; use operator[] / data())
+
+    /** Entry `i` (fatal past the table).
+     *  @param i the index, in this table's space */
+    /// @return the entry
+    constexpr T &operator[](Index i) {
+        static_assert(sizeof(pulsar_indexed) == sizeof(T[N]) && alignof(pulsar_indexed) == alignof(T[N]),
+                      "an indexed table has the size and alignment of the array it replaces");
+        return i.raw() < N ? v_[i.raw()] : (pulsar_indexed_fail(i.raw(), N), v_[0]);
+    }
+    /** Entry `i`, read-only (fatal past the table).
+     *  @param i the index, in this table's space */
+    /// @return the entry
+    constexpr const T &operator[](Index i) const {
+        static_assert(sizeof(pulsar_indexed) == sizeof(T[N]) && alignof(pulsar_indexed) == alignof(T[N]),
+                      "an indexed table has the size and alignment of the array it replaces");
+        return i.raw() < N ? v_[i.raw()] : (pulsar_indexed_fail(i.raw(), N), v_[0]);
+    }
+    /** The array itself, where it leaves the type system whole. */
+    /// @return the first entry's address
+    constexpr T *data() { return v_; }
+    /** The array itself, read-only. */
+    /// @return the first entry's address
+    constexpr const T *data() const { return v_; }
+    /** The table's entries. */
+    /// @return N
+    static constexpr size_t size() { return N; }
+};
+
+/** A pointer to `n` entries of T, subscripted by `Index` and nothing else (L436). */
+template <class T, class Index>
+struct pulsar_indexed_view {
+    T *p_;        ///< the entries (borrowed, or the owner's heap block)
+    uint32_t n_;  ///< how many
+
+    /** Entry `i` (fatal past the table).
+     *  @param i the index, in this table's space */
+    /// @return the entry
+    constexpr T &operator[](Index i) const { return i.raw() < n_ ? p_[i.raw()] : (pulsar_indexed_fail(i.raw(), n_), p_[0]); }
+    /** The entries, where they leave the type system whole. */
+    /// @return the first entry's address
+    constexpr T *data() const { return p_; }
+    /** The table's entries. */
+    /// @return the count
+    constexpr uint32_t size() const { return n_; }
+};
+
+static_assert(sizeof(pulsar_indexed<uint32_t, TrunkLayer, 7>) == sizeof(uint32_t[7]) &&
+                  alignof(pulsar_indexed<uint32_t, TrunkLayer, 7>) == alignof(uint32_t) &&
+                  sizeof(pulsar_indexed<void *[3], LayerSlot, 5>) == sizeof(void *[5][3]) &&
+                  alignof(pulsar_indexed<void *[3], LayerSlot, 5>) == alignof(void *) &&
+                  sizeof(pulsar_indexed<uint8_t, SrcBlock, 9>) == 9 &&
+                  std::is_trivial<pulsar_indexed<uint32_t, TrunkLayer, 7>>::value &&
+                  std::is_standard_layout<pulsar_indexed<uint32_t, TrunkLayer, 7>>::value &&
+                  std::is_aggregate<pulsar_indexed<uint32_t, TrunkLayer, 7>>::value,
+              "an indexed table is the array it replaces: same size, alignment and layout (memset / calloc-safe)");
 
 #endif

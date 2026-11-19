@@ -318,9 +318,9 @@ void pulsar_inkling_plan(const pulsar_inkling_shape *s, pulsar_layer_plan *plan)
     plan->n_layer = s->n_layer;
     for (TrunkLayer il{0u}; il.below(s->n_layer); ++il) {
         const bool window = s->window_layers >> il.raw() & 1u;
-        plan->kind[il.raw()] = PULSAR_LAYER_BLOCKS;
-        plan->desc[il.raw()].mixer = window ? PULSAR_MIXER_ATTN_WINDOW : PULSAR_MIXER_ATTN_FULL;
-        plan->desc[il.raw()].ffn = il.below(s->n_dense) ? PULSAR_FFN_DENSE : PULSAR_FFN_MOE;
-        plan->desc[il.raw()].window = window ? s->window : 0u;
+        plan->kind[il] = PULSAR_LAYER_BLOCKS;
+        plan->desc[il].mixer = window ? PULSAR_MIXER_ATTN_WINDOW : PULSAR_MIXER_ATTN_FULL;
+        plan->desc[il].ffn = il.below(s->n_dense) ? PULSAR_FFN_DENSE : PULSAR_FFN_MOE;
+        plan->desc[il].window = window ? s->window : 0u;
     }
 }

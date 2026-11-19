@@ -373,9 +373,9 @@ static bool qwen_read_plan(const pulsar_model *m, uint32_t n_layer, pulsar_layer
             return false;
         }
         if (pulsar_streq(t, "linear_attention")) {
-            plan->kind[il.raw()] = PULSAR_LAYER_QWEN_GDN;
+            plan->kind[il] = PULSAR_LAYER_QWEN_GDN;
         } else if (pulsar_streq(t, "full_attention")) {
-            plan->kind[il.raw()] = PULSAR_LAYER_QWEN_QSA;
+            plan->kind[il] = PULSAR_LAYER_QWEN_QSA;
         } else {
             fprintf(stderr, "pulsar: %s: %s[%u] = '%.*s' is neither linear_attention nor full_attention\n",
                     PULSAR_QWEN_ARCH, key, il.raw(), (int)t.len, t.ptr);
@@ -654,7 +654,7 @@ static bool qwen_bind_weights(const pulsar_model *m, const pulsar_qwen_shape *s,
     for (TrunkLayer il{0u}; il.below(plan->n_layer); ++il) {
         char lp[128];
         snprintf(lp, sizeof(lp), QWEN_TEXT "layers.%u.", il.raw());   /* the container names a trunk layer by its number */
-        qwen_bind_layer(m, &ok, s, plan->kind[il.raw()], lp, il == s->ple_layer, split,
+        qwen_bind_layer(m, &ok, s, plan->kind[il], lp, il == s->ple_layer, split,
                         &pulsar_qwen_layer_w(w, pulsar_layer_slot_of(il)));
     }
     ok &= qwen_read_ple_tables(m, s, w);
@@ -915,7 +915,7 @@ static bool qwen_family_load(pulsar_engine *e, const pulsar_engine_options *opt)
     if (!qwen_read_rope(&e->model, opt, &s)) return false;
     g_qwen_shape = s;
     if (!qwen_read_plan(&e->model, s.n_layer, &e->plan)) return false;
-    if (e->plan.kind[s.ple_layer.raw()] == PULSAR_LAYER_NONE) return false;
+    if (e->plan.kind[s.ple_layer] == PULSAR_LAYER_NONE) return false;
     pulsar_qwen_of(e)->weights = (pulsar_qwen_weights *)xcalloc(1, sizeof(*pulsar_qwen_of(e)->weights));
     {
         uint64_t h = 1469598103934665603ull;
@@ -1190,7 +1190,7 @@ void qwen_state_plan(pulsar_engine *e) {
     const uint32_t gdn = 1u << PULSAR_QWEN_STATE_GDN_REC | 1u << PULSAR_QWEN_STATE_GDN_CONV;
     const uint32_t qsa = 1u << PULSAR_QWEN_STATE_KV | 1u << PULSAR_QWEN_STATE_IDX_KEYS | 1u << PULSAR_QWEN_STATE_IDX_TAIL;
     for (TrunkLayer il{0u}; il.below(lp->n_layer); ++il)
-        p->slot[pulsar_layer_slot_of(il).raw()] = (lp->kind[il.raw()] == PULSAR_LAYER_QWEN_GDN ? gdn : qsa) |
+        p->slot[pulsar_layer_slot_of(il)] = (lp->kind[il] == PULSAR_LAYER_QWEN_GDN ? gdn : qsa) |
                                                    (il == s->ple_layer ? 1u << PULSAR_QWEN_STATE_PLE_CONV : 0u);
     p->n_trunk = lp->n_layer;
     p->n_slots = lp->n_layer;

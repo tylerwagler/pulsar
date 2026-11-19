@@ -247,7 +247,7 @@ typedef struct pulsar_block_drafter {
     /// The head's output rows: vocab, or head_ids' length for a draft vocabulary.
     uint32_t head_rows;
     /// The drafter layers' tensors; [0, n_layer) bound.
-    pulsar_block_layer layer[PULSAR_BLOCK_MAX_LAYERS];
+    pulsar_indexed<pulsar_block_layer, DraftLayer, PULSAR_BLOCK_MAX_LAYERS> layer;
     pulsar_block_head head_lc;   ///< the LiLiCorr candidate head (bind block `lilicorr`), head_kind LILICORR
     pulsar_block_selector sel;   ///< the CandidateSelector (bind block `selector`), head_kind SELECTOR
     const pulsar_tensor *embed;  ///< the TARGET's input embedding, bf16 [vocab rows of hidden] (the family's)

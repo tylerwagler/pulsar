@@ -168,7 +168,7 @@ typedef struct {
     pulsar_tensor *output_norm;      ///< output_norm [n_embd]
     pulsar_tensor *head;             ///< head [n_embd -> n_vocab] (untied)
     /// The trunk blocks; entries [0, shape.n_layer) are bound, the rest stay zero.
-    pulsar_inkling_block layer[PULSAR_FAMILY_MAX_LAYER];
+    pulsar_indexed<pulsar_inkling_block, TrunkLayer, PULSAR_FAMILY_MAX_LAYER> layer;
     /// The drafter's chained layers; entries [0, shape.n_mtp) are bound when shape.mtp_written, else all NULL.
     pulsar_inkling_draft_layer mtp[PULSAR_INKLING_MTP_MAX];
     pulsar_tensor *vis_linear[PULSAR_INKLING_VISION_MAX];     ///< vision_linear, index i

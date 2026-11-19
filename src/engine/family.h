@@ -167,9 +167,9 @@ typedef struct {
     /// layers the loaded model runs (<= PULSAR_FAMILY_MAX_LAYER)
     uint32_t n_layer;
     /// kind[il]: which block op runs layer il; only [0, n_layer) is meaningful
-    pulsar_layer_kind kind[PULSAR_FAMILY_MAX_LAYER];
+    pulsar_indexed<pulsar_layer_kind, TrunkLayer, PULSAR_FAMILY_MAX_LAYER> kind;
     /** desc[il] is the layer's blocks when kind[il] is PULSAR_LAYER_BLOCKS, zero otherwise. */
-    pulsar_layer_desc desc[PULSAR_FAMILY_MAX_LAYER];
+    pulsar_indexed<pulsar_layer_desc, TrunkLayer, PULSAR_FAMILY_MAX_LAYER> desc;
 } pulsar_layer_plan;
 
 /** Count the layers of one kind. */
