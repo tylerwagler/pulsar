@@ -144,7 +144,7 @@ static void big_phase(pulsar_tp *tp, hook_ctx *c) {
     CHECK(out && in, "rank %d big alloc failed", c->rank);
     if (!out || !in) return;
     for (uint32_t i = 0; i < n; i++) out[i] = pat(c->rank, 777u, i);
-    CHECK(pulsar_tp_big_gate_exchange(tp, TpSlot{0}, 1, out, in, bytes) == 1,
+    CHECK(pulsar_tp_big_gate_exchange(tp, TpSlot{0u}, 1, out, in, bytes) == 1,
           "rank %d big 1MiB failed", c->rank);
     for (uint32_t i = 0; i < n; i++) {
         if (i % 4096 == 0 && in[i] != pat(1 - c->rank, 777u, i)) {

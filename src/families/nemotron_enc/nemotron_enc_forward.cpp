@@ -186,7 +186,7 @@ bool forward(pulsar_engine *e, const pulsar_tokens *in, uint32_t n, uint32_t row
             row_seq[o] = i;
             row_pos[o] = (uint32_t)t;
         }
-    if (!pulsar_gpu_tensor_write(r->sc->t[B_IDS], TensorBytes{0}, ids.data(), bytes_of<TokId>(rows)))
+    if (!pulsar_gpu_tensor_write(r->sc->t[B_IDS], TensorBytes{0u}, ids.data(), bytes_of<TokId>(rows)))
         return fail(err, errlen, "the ids upload failed");
     pulsar_head_decl hd = {};
     hd.n_embd = E;
@@ -200,7 +200,7 @@ bool forward(pulsar_engine *e, const pulsar_tokens *in, uint32_t n, uint32_t row
     const uint16_t *table = wp(w->embed, "nemotron_enc embed");
     if (!table || pulsar_head_embed_launch(&hd, table, s.n_vocab, dp<int32_t>(r->sc->t[B_IDS]), rows, h, E, 0) != 0)
         return fail(err, errlen, "the embedding refused");
-    if (pulsar_rows_rmsnorm_launch(h, E, rows, E, wp(w->layer[TrunkLayer{0}].attn_norm, "nemotron_enc attn_norm"), s.rms_eps, xn,
+    if (pulsar_rows_rmsnorm_launch(h, E, rows, E, wp(w->layer[TrunkLayer{0u}].attn_norm, "nemotron_enc attn_norm"), s.rms_eps, xn,
                                    E, 0) != 0)
         return fail(err, errlen, "layer 0's attention norm refused");
     pulsar_gqa_io io = {};
@@ -351,7 +351,7 @@ int encode(pulsar_engine *e, const pulsar_tokens *in, uint32_t n, float *out, ch
         {
             pulsar_group_gpu_phase ph;
             ok = forward(e, in + i0, i1 - i0, rows, err, errlen) &&
-                 (pulsar_gpu_tensor_read(r->sc->t[B_POOLED], TensorBytes{0}, pooled.data(),
+                 (pulsar_gpu_tensor_read(r->sc->t[B_POOLED], TensorBytes{0u}, pooled.data(),
                                          bytes_of<float>((uint64_t)(i1 - i0) * E)) ||
                   fail(err, errlen, "the pooled rows' read failed"));
         }
@@ -421,7 +421,7 @@ bool pulsar_nemotron_enc_run_create(pulsar_engine *e) {
     A.block = 1;   /* every row of a run attends the whole run; nothing is stored */
     const std::vector<float> inv = yarn_inv_freq(s);
     r->rope = pulsar_gpu_tensor_alloc(bytes_of<float>(inv.size()));
-    if (!r->rope || !pulsar_gpu_tensor_write(r->rope, TensorBytes{0}, inv.data(), bytes_of<float>(inv.size()))) {
+    if (!r->rope || !pulsar_gpu_tensor_write(r->rope, TensorBytes{0u}, inv.data(), bytes_of<float>(inv.size()))) {
         fprintf(stderr, "pulsar: %s: the rope table did not reach the device -- refusing\n", ARCH);
         return false;
     }

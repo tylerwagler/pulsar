@@ -80,7 +80,7 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
     pulsar_gpu_tensor_free(g->dspark_main_x);
     for (int i = 0; i < 3; i++) {
         pulsar_gpu_tensor_free(g->dspark_target_h[i]);
-        pulsar_gpu_tensor_free(g->dspark_raw_cache[DraftLayer{i}]);
+        pulsar_gpu_tensor_free(g->dspark_raw_cache[DraftLayer::from_raw_unchecked(i)]);
         pulsar_gpu_tensor_free(g->dspark_bulk_h[i]);
         if (i == 0) {
             pulsar_gpu_tensor_free(g->distill_top_ids);
@@ -168,7 +168,7 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
     /* Option F per-bank drafter-ring slabs (dspark_raw_cache[i]/dspark_prompt_h[i]
      * freed above were bank views into these). */
     for (int i = 0; i < 3; i++) {
-        pulsar_gpu_tensor_free(g->banks.dspark_raw[DraftLayer{i}]);
+        pulsar_gpu_tensor_free(g->banks.dspark_raw[DraftLayer::from_raw_unchecked(i)]);
         pulsar_gpu_tensor_free(g->banks.dspark_prompt[i]);
     }
     /* plan-33 inc C boundary-row stash (one pair for the whole pool, so outside
@@ -249,7 +249,7 @@ bool gpu_graph_load_directional_steering(
     if (ok) {
         g->directional_steering_dirs = pulsar_gpu_tensor_alloc(TensorBytes{sizeof(dirs[0])}.times(n));
         ok = g->directional_steering_dirs != NULL &&
-             pulsar_gpu_tensor_write(g->directional_steering_dirs, TensorBytes{0}, dirs,
+             pulsar_gpu_tensor_write(g->directional_steering_dirs, TensorBytes{0u}, dirs,
                                      TensorBytes{sizeof(dirs[0])}.times(n)) != 0;
     }
     free(dirs);

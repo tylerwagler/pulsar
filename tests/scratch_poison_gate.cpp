@@ -150,7 +150,7 @@ run_rec run(pulsar_engine *e, const std::vector<pulsar_tokens> &P, int n, bool p
             st[m].rng = &rngs[b];
             st[m].max_tokens = TokCount{n - (int)R.out[b].size()};
             st[m].k_alloc = TokCount{-1};
-            st[m].accepted_cap = TokCount{PULSAR_SPEC_LOGITS_ROWS + 1};
+            st[m].accepted_cap = TokCount::from_raw_unchecked(PULSAR_SPEC_LOGITS_ROWS + 1);
             bank_of[m++] = (uint32_t)b;
         }
         if (!ok) {
@@ -158,7 +158,7 @@ run_rec run(pulsar_engine *e, const std::vector<pulsar_tokens> &P, int n, bool p
             break;
         }
         StepRows step_rows{0};
-        ok = pulsar_session_spec_assemble_batch(s, st, m, StepRows{width}, reqs.data(), &step_rows) == 0;
+        ok = pulsar_session_spec_assemble_batch(s, st, m, StepRows::from_raw_unchecked(width), reqs.data(), &step_rows) == 0;
         const uint32_t rows = (uint32_t)step_rows.raw();   /* decode_mixed's row count */
         tick_rec T;
         int live = 0;
@@ -200,7 +200,7 @@ run_rec run(pulsar_engine *e, const std::vector<pulsar_tokens> &P, int n, bool p
         T.logits = gate_fnv1a(logits.data(), logits.size() * sizeof(float));
         for (int i = 0; i < m; i++) {
             st[i].accepted = acc[i];
-            st[i].accepted_cap = TokCount{PULSAR_SPEC_LOGITS_ROWS + 1};
+            st[i].accepted_cap = TokCount::from_raw_unchecked(PULSAR_SPEC_LOGITS_ROWS + 1);
             st[i].temperature = 0.0f;
             st[i].greedy_rows = 0u;
         }
@@ -230,7 +230,7 @@ run_rec run(pulsar_engine *e, const std::vector<pulsar_tokens> &P, int n, bool p
         for (int i = 0; i < m; i++) {
             rr[i] = rd[bank_of[i]];
             rp[i] = &rngs[bank_of[i]];
-            rb[i] = BankId{bank_of[i]};
+            rb[i] = BankId::from_raw_unchecked(bank_of[i]);
         }
         ok = pulsar_session_spec_redraft_batch(s, rr, rb, rp, m, err, sizeof err) == 0 &&
              pulsar_session_spec_redraft_commit_batch(s, st, m) == 0;

@@ -122,9 +122,9 @@ static bool routed(const void *map, uint64_t size, const uint64_t off[3], int gk
     bool good = ok != 0 && cudaDeviceSynchronize() == cudaSuccess;
     if (good && r) {
         r->gz.resize(pairs * mid); r->uz.resize(pairs * mid); r->out.resize((size_t)n_tok * H);
-        good = pulsar_gpu_tensor_read(up, TensorBytes{0}, r->gz.data(), bytes_of<float>(pairs * mid)) &&
-               pulsar_gpu_tensor_read(md, TensorBytes{0}, r->uz.data(), bytes_of<float>(pairs * mid)) &&
-               pulsar_gpu_tensor_read(out, TensorBytes{0}, r->out.data(), bytes_of<float>((uint64_t)n_tok * H));
+        good = pulsar_gpu_tensor_read(up, TensorBytes{0u}, r->gz.data(), bytes_of<float>(pairs * mid)) &&
+               pulsar_gpu_tensor_read(md, TensorBytes{0u}, r->uz.data(), bytes_of<float>(pairs * mid)) &&
+               pulsar_gpu_tensor_read(out, TensorBytes{0u}, r->out.data(), bytes_of<float>((uint64_t)n_tok * H));
         const void *q = NULL, *s = NULL;
         int kbp = 0;
         good = good && pulsar_gpu_mxfp8_act_cache_get_e4m3(md, pairs, mid, &q, &s, &kbp) && q && s;
@@ -224,9 +224,9 @@ int main(int argc, char **argv) {
             pulsar_gpu_tensor *x = pulsar_gpu_tensor_alloc(bytes_of<float>(xh.size())),
                               *sel = pulsar_gpu_tensor_alloc(bytes_of<int32_t>(pairs)),
                               *wts = pulsar_gpu_tensor_alloc(bytes_of<float>(pairs));
-            pulsar_gpu_tensor_write(x, TensorBytes{0}, xh.data(), bytes_of<float>(xh.size()));
-            pulsar_gpu_tensor_write(sel, TensorBytes{0}, sh.data(), bytes_of<int32_t>(pairs));
-            pulsar_gpu_tensor_write(wts, TensorBytes{0}, wh.data(), bytes_of<float>(pairs));
+            pulsar_gpu_tensor_write(x, TensorBytes{0u}, xh.data(), bytes_of<float>(xh.size()));
+            pulsar_gpu_tensor_write(sel, TensorBytes{0u}, sh.data(), bytes_of<int32_t>(pairs));
+            pulsar_gpu_tensor_write(wts, TensorBytes{0u}, wh.data(), bytes_of<float>(pairs));
             pulsar_gpu_matmul_set_batch_decode_rows(decode ? n_tok : 0);
             run_out whole, half[NR];
             bool ran = routed(map, fsize, off, gk2, dk2, MID, 0, x, sel, wts, n_tok, &whole);
@@ -292,9 +292,9 @@ int main(int argc, char **argv) {
             const int32_t s6[TOPK] = {0, 1, 2, 3, 4, 5};
             const float w6[TOPK] = {0.1f, 0.1f, 0.1f, 0.1f, 0.1f, 0.1f};
             std::vector<float> x1(H, 0.5f);
-            pulsar_gpu_tensor_write(x, TensorBytes{0}, x1.data(), bytes_of<float>(H));
-            pulsar_gpu_tensor_write(sel, TensorBytes{0}, s6, TensorBytes{sizeof(s6)});
-            pulsar_gpu_tensor_write(wts, TensorBytes{0}, w6, TensorBytes{sizeof(w6)});
+            pulsar_gpu_tensor_write(x, TensorBytes{0u}, x1.data(), bytes_of<float>(H));
+            pulsar_gpu_tensor_write(sel, TensorBytes{0u}, s6, TensorBytes{sizeof(s6)});
+            pulsar_gpu_tensor_write(wts, TensorBytes{0u}, w6, TensorBytes{sizeof(w6)});
             pulsar_gpu_mxfp8_act_cache_encode_f32(x, 1, H);
             auto split_call = [&](uint32_t gtype, uint32_t dtype, uint32_t mid) {
                 return pulsar_gpu_routed_moe_batch_tensor(o, u, m, d, &key, UINT64_MAX / 2u, MapOff{hoff[0][0]}, MapOff{hoff[0][1]},

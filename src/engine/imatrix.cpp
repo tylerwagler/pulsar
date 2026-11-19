@@ -94,9 +94,9 @@ static bool imatrix_collect_layer_batch(
     const TensorBytes mid_bytes = bytes_of<float>(mid_elems);
     const TensorBytes sel_bytes = bytes_of<int>((uint64_t)n_tokens * PULSAR_N_EXPERT_USED);
     void *mid_dst = (void *)c->routed_mid_buf;
-    if (pulsar_gpu_tensor_read(g->batch_ffn_norm, TensorBytes{0}, c->ffn_norm_buf, norm_bytes) == 0 ||
-        pulsar_gpu_tensor_read(g->batch_routed_mid, TensorBytes{0}, mid_dst, mid_bytes) == 0 ||
-        pulsar_gpu_tensor_read(g->batch_router_selected, TensorBytes{0}, c->selected_buf, sel_bytes) == 0)
+    if (pulsar_gpu_tensor_read(g->batch_ffn_norm, TensorBytes{0u}, c->ffn_norm_buf, norm_bytes) == 0 ||
+        pulsar_gpu_tensor_read(g->batch_routed_mid, TensorBytes{0u}, mid_dst, mid_bytes) == 0 ||
+        pulsar_gpu_tensor_read(g->batch_router_selected, TensorBytes{0u}, c->selected_buf, sel_bytes) == 0)
     {
         return false;
     }
@@ -361,11 +361,11 @@ static void dspark_bulk_drain_runs(pulsar_gpu_graph *g, const int32_t *pos, cons
         }
         if (start == 0 || start != g->ms_dspark_prompt_n[b]) g->ms_dspark_prompt_lo[b] = start;
         g->ms_dspark_prompt_n[b] = start + n;
-        for (int i2 = 0; i2 < 3; i2++) g->ms_dspark_n_raw[b][DraftLayer{i2}] = 0;
+        for (int i2 = 0; i2 < 3; i2++) g->ms_dspark_n_raw[b][DraftLayer::from_raw_unchecked(i2)] = 0;
         if (b == cur) {
             g->dspark_prompt_lo = g->ms_dspark_prompt_lo[b];
             g->dspark_prompt_n = g->ms_dspark_prompt_n[b];
-            for (int i2 = 0; i2 < 3; i2++) g->dspark_n_raw[DraftLayer{i2}] = 0;
+            for (int i2 = 0; i2 < 3; i2++) g->dspark_n_raw[DraftLayer::from_raw_unchecked(i2)] = 0;
         }
         r0 = r1;
     }
@@ -415,7 +415,7 @@ static void dspark_bulk_drain(pulsar_gpu_graph *g, const token_vec *prompt,
          * next generation start reseed from the prompt ring. (The server's
          * between-request reset does not go through invalidate/rewind, so
          * this is the invariant that catches every new prompt.) */
-        for (int i2 = 0; i2 < 3; i2++) g->dspark_n_raw[DraftLayer{i2}] = 0;
+        for (int i2 = 0; i2 < 3; i2++) g->dspark_n_raw[DraftLayer::from_raw_unchecked(i2)] = 0;
     }
     const char *path = getenv("PULSAR_DSPARK_PREFILL_DUMP");
     if (!path || !path[0] || !g->dspark_bulk_h[0]) return;
@@ -434,7 +434,7 @@ static void dspark_bulk_drain(pulsar_gpu_graph *g, const token_vec *prompt,
     fwrite(hdr, sizeof(uint32_t), 2, f);
     fwrite(prompt->v + start, sizeof(int32_t), cap_n, f);
     for (int s = 0; s < 3; s++) {
-        if (!pulsar_gpu_tensor_read(g->dspark_bulk_h[s], TensorBytes{0}, host,
+        if (!pulsar_gpu_tensor_read(g->dspark_bulk_h[s], TensorBytes{0u}, host,
                                  bytes_of<float>((uint64_t)cap_n * PULSAR_N_EMBD)))
             return;
         if (g->distill_top_ids) {
@@ -467,18 +467,18 @@ static void dspark_bulk_drain(pulsar_gpu_graph *g, const token_vec *prompt,
     if (g->distill_top_ids) {
         const uint32_t magic = 0x50445431u;
         int32_t inexact = 0;
-        (void)pulsar_gpu_tensor_read(g->distill_inexact, TensorBytes{0}, &inexact, TensorBytes{sizeof(inexact)});
+        (void)pulsar_gpu_tensor_read(g->distill_inexact, TensorBytes{0u}, &inexact, TensorBytes{sizeof(inexact)});
         fwrite(&magic, sizeof(magic), 1, f);
         fwrite(&inexact, sizeof(inexact), 1, f);
-        if (!pulsar_gpu_tensor_read(g->distill_top_ids, TensorBytes{0}, host,
+        if (!pulsar_gpu_tensor_read(g->distill_top_ids, TensorBytes{0u}, host,
                                  bytes_of<int32_t>((uint64_t)cap_n * 64)))
             return;
         fwrite(host, sizeof(int32_t), (size_t)cap_n * 64, f);
-        if (!pulsar_gpu_tensor_read(g->distill_top_vals, TensorBytes{0}, host,
+        if (!pulsar_gpu_tensor_read(g->distill_top_vals, TensorBytes{0u}, host,
                                  bytes_of<uint16_t>((uint64_t)cap_n * 64)))
             return;
         fwrite(host, sizeof(uint16_t), (size_t)cap_n * 64, f);
-        if (!pulsar_gpu_tensor_read(g->distill_tail_lse, TensorBytes{0}, host,
+        if (!pulsar_gpu_tensor_read(g->distill_tail_lse, TensorBytes{0u}, host,
                                  bytes_of<uint16_t>(cap_n)))
             return;
         fwrite(host, sizeof(uint16_t), (size_t)cap_n, f);
@@ -1187,7 +1187,7 @@ int gpu_graph_decode_multiseq_batch(
     /* L302: the rows stay in spec_logits (the session's step rows); a caller that wants them on the host passes
      * `logits` */
     if (logits)
-        ok = pulsar_gpu_tensor_read(g->spec_logits, TensorBytes{0}, logits,
+        ok = pulsar_gpu_tensor_read(g->spec_logits, TensorBytes{0u}, logits,
                                     bytes_of<float>((uint64_t)head_runs * PULSAR_N_VOCAB)) != 0;
     if (ok && logits && fused && fused_heads > 0)
         ok = pulsar_gpu_tensor_read(g->spec_logits, bytes_of<float>((uint64_t)fused_dec * PULSAR_N_VOCAB),
@@ -1294,7 +1294,7 @@ static void *ds4_imatrix_begin(pulsar_engine *e, const char *dataset_path, int c
     const uint32_t raw_cap = gpu_graph_raw_cap_for_context(ctx_size, prefill_cap);
     ds4_imatrix_run *r = new ds4_imatrix_run;
     r->prefill_cap = prefill_cap;
-    if (!gpu_graph_alloc_raw_cap(&r->g, &e->weights, &e->weights.layer[TrunkLayer{0}], raw_cap, (uint32_t)ctx_size, prefill_cap,
+    if (!gpu_graph_alloc_raw_cap(&r->g, &e->weights, &e->weights.layer[TrunkLayer{0u}], raw_cap, (uint32_t)ctx_size, prefill_cap,
                                  gpu_graph_bank_pool_n(), false)) {
         fprintf(stderr, "pulsar: failed to allocate imatrix GPU graph runtime\n");
         delete r;

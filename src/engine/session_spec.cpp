@@ -233,7 +233,7 @@ static bool spec_absorb_defer(pulsar_session *s, uint32_t row, TokId next) {
     if (s->seed_defer.n >= PULSAR_SPEC_LOGITS_ROWS + 1) return false;
     s->seed_defer.src_row[s->seed_defer.n] = row;
     /* fatal on none() */
-    s->seed_defer.bank[s->seed_defer.n] = BankId{pulsar_bank_index(pulsar_session_live_bank(s))};
+    s->seed_defer.bank[s->seed_defer.n] = BankId::from_raw_unchecked(pulsar_bank_index(pulsar_session_live_bank(s)));
     s->seed_defer.next_tok[s->seed_defer.n] = next;
     s->seed_defer.n++;
     return true;
@@ -259,7 +259,7 @@ static bool spec_absorb_rows(pulsar_session *s, uint32_t row0, const TokId *next
     }
     uint32_t rows[PULSAR_SPEC_LOGITS_ROWS + 1];
     BankId banks[PULSAR_SPEC_LOGITS_ROWS + 1];
-    const BankId bank = BankId{pulsar_bank_index(pulsar_session_live_bank(s))};   /* fatal on none() */
+    const BankId bank = BankId::from_raw_unchecked(pulsar_bank_index(pulsar_session_live_bank(s)));   /* fatal on none() */
     for (uint32_t m = 0; m < n; m++) { rows[m] = row0 + m; banks[m] = bank; }
     return spec_drafter(s)->absorb_banked(s, rows, banks, next, n);
 }
@@ -580,7 +580,7 @@ static bool spec_walk_rounds(pulsar_session *s, const spec_walk_round *w, uint32
     }
     const SlabOff walk_off = SlabOff::after(bytes_of<pulsar_gpu_sample_out>(PULSAR_GPU_SAMPLE_ROWS_MAX));
     if (!s->draw_rows_dev(s->dev.step_rows, rows, m, reqs, masks) ||
-        !pulsar_gpu_spec_walk(s->dev.out, TensorBytes{0}, m, runs, n, s->dev.out, walk_off.before()) ||
+        !pulsar_gpu_spec_walk(s->dev.out, TensorBytes{0u}, m, runs, n, s->dev.out, walk_off.before()) ||
         !pulsar_gpu_tensor_read(s->dev.out, walk_off.before(), out, TensorBytes{sizeof(*out)}.times(n))) {
         snprintf(err, errlen, "spec walk: the device sampler failed over %u rows", m);
         return false;
@@ -1287,7 +1287,7 @@ int pulsar_session_spec_round_begin_local(pulsar_session *s, pulsar_spec_round *
 }
 
 StepRows pulsar_spec_round_n_rows(const pulsar_spec_round *r) {
-    return StepRows{r->n_batch};   /* L443: one row a token of the round (base + drafts) */
+    return StepRows::from_raw_unchecked(r->n_batch);   /* L443: one row a token of the round (base + drafts) */
 }
 
 StepRows pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, BankId bank_id, pulsar_multiseq_req *out) {
@@ -1296,7 +1296,7 @@ StepRows pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, BankId bank_id,
         out[i].pos = r->saved_len + TokCount{(int)i};
         out[i].token = i == 0 ? r->base : TokId{r->pend[i - 1]};
     }
-    return StepRows{r->n_batch};
+    return StepRows::from_raw_unchecked(r->n_batch);
 }
 
 /* The batched lane's round end: the round's verdict from the step's walk (spec_walk_rounds), then the one
@@ -1469,7 +1469,7 @@ void pulsar_spec_redraft_stamp(pulsar_session *s, spec_redraft_req *q) {
  * the two crossings between a round's token counts (its drafts, an accepted[] capacity) and its step rows. */
 /// @param drafts the round's draft tokens (>= 0)
 /// @return its rows: the base's and one a draft
-static StepRows spec_round_rows(TokCount drafts) { return StepRows{1u + (uint32_t)drafts.raw()}; }
+static StepRows spec_round_rows(TokCount drafts) { return StepRows::from_raw_unchecked(1u + (uint32_t)drafts.raw()); }
 /// @param rows a round's rows
 /// @return the tokens they hold, one a row
 static TokCount spec_round_tokens(StepRows rows) { return TokCount{rows.raw()}; }
@@ -1735,7 +1735,7 @@ uint32_t pulsar_session_bank_pendings(const pulsar_session *s, BankId bank_id, T
 
 const pulsar_spec_carry_state *pulsar_spec_bank_shadow(pulsar_session *s, uint32_t bank) {
     if (!s) return NULL;
-    if (BankId{bank} == pulsar_session_live_bank(s)) return &s->spec;
+    if (BankId::from_raw_unchecked(bank) == pulsar_session_live_bank(s)) return &s->spec;
     /* a non-live bank's saved shadow: the core's carry, for every family (L272 P2) */
     return s->bank_carry && bank < s->bank_carry_n && s->bank_carry[bank].valid ? &s->bank_carry[bank].spec : NULL;
 }
@@ -1770,7 +1770,7 @@ StepRows pulsar_session_spec_next_rows_max(const pulsar_session *s) {
      * 1 + pending is safe to budget against before consuming anything. */
     uint32_t k = s->spec.n_pend;
     if (k > 16u) k = 16u;
-    return StepRows{1u + k};
+    return StepRows::from_raw_unchecked(1u + k);
 }
 
 

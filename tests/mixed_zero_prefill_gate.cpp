@@ -50,7 +50,7 @@ static bool decode_cont(pulsar_session *s, uint32_t bank, int F, int *out) {
     char e[256];
     bool ok = true;
     for (int i = 1; i < NGEN && ok; i++) {
-        pulsar_multiseq_req r = {.bank = BankId{bank}, .pos = TokPos{F + i - 1}, .token = TokId{out[i - 1]}};
+        pulsar_multiseq_req r = {.bank = BankId::from_raw_unchecked(bank), .pos = TokPos{F + i - 1}, .token = TokId{out[i - 1]}};
         uint32_t nr = 0;
         if (pulsar_session_decode_mixed(s, &r, 1, lg, vocab, &nr, 0u, e, sizeof e) != 0) {
             fprintf(stderr, "cont step %d: %s\n", i, e);

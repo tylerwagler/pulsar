@@ -120,7 +120,7 @@ static void run_worker_mode3(pulsar_tp *tp) {
     CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)) == 1, "C: worker recv step 1: %s", err);
     pulsar_tp_command_free(&cmd);
     fill_pat(out, 1, 1, MODE3_GATE_BYTES / 4);
-    CHECK(pulsar_tp_big_gate_exchange(tp, TpSlot{0}, 1, out, in, MODE3_GATE_BYTES) == 1, "C: worker step-1 gate");
+    CHECK(pulsar_tp_big_gate_exchange(tp, TpSlot{0u}, 1, out, in, MODE3_GATE_BYTES) == 1, "C: worker step-1 gate");
     verify_pat(in, 0, 1, MODE3_GATE_BYTES / 4);
     CHECK(pulsar_tp_send_command_ack_digest(tp, MODE3_SID, 0, mode3_digest()) == 1, "C: worker ack 1");
     /* Step 2: the leader refuses it before its gate; ours must fail on the abort, promptly. */
@@ -128,7 +128,7 @@ static void run_worker_mode3(pulsar_tp *tp) {
     CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)) == 1, "C: worker recv step 2: %s", err);
     pulsar_tp_command_free(&cmd);
     const double t0 = tp_now_sec();
-    const int rc = pulsar_tp_big_gate_exchange(tp, TpSlot{0}, 2, out, in, MODE3_GATE_BYTES);
+    const int rc = pulsar_tp_big_gate_exchange(tp, TpSlot{0u}, 2, out, in, MODE3_GATE_BYTES);
     const double dt = tp_now_sec() - t0;
     CHECK(rc == 0, "C: the worker's gate succeeded against a leader that refused the step");
     CHECK(dt < 10.0, "C: the worker's gate took %.1f s to fail (the leader never aborted: the "
@@ -208,7 +208,7 @@ static void run_leader(int port, int mode) {
         static float out[MODE3_GATE_BYTES / 4], in[MODE3_GATE_BYTES / 4];
         CHECK(pulsar_tp_send_eval(tp, MODE3_SID, 1, TokId{11}) == 1, "C: leader send_eval 1");
         fill_pat(out, 0, 1, MODE3_GATE_BYTES / 4);
-        CHECK(pulsar_tp_big_gate_exchange(tp, TpSlot{0}, 1, out, in, MODE3_GATE_BYTES) == 1, "C: leader step-1 gate");
+        CHECK(pulsar_tp_big_gate_exchange(tp, TpSlot{0u}, 1, out, in, MODE3_GATE_BYTES) == 1, "C: leader step-1 gate");
         verify_pat(in, 1, 1, MODE3_GATE_BYTES / 4);
         CHECK(pulsar_tp_defer_command_ack_digest(tp, MODE3_SID, "eval at position 1", mode3_digest()) == 1,
               "C: leader defer 1");
@@ -280,7 +280,7 @@ static void run_leader(int port, int mode) {
 
     /* The separate data socket is dead too: a 1 MiB big gate must return 0. */
     static float big_out[262144], big_in[262144];
-    CHECK(pulsar_tp_big_gate_exchange(tp, TpSlot{0}, 1, big_out, big_in,
+    CHECK(pulsar_tp_big_gate_exchange(tp, TpSlot{0u}, 1, big_out, big_in,
                                       sizeof(big_out)) == 0,
           "big_gate on dead data socket did not fail");
 

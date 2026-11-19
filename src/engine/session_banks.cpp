@@ -193,7 +193,7 @@ bool pulsar_bank_carry_saved(const pulsar_session *s, uint32_t bank) {
 }
 
 void pulsar_bank_view_invalidate(pulsar_session *s, uint32_t bank) {
-    if (BankId{bank} == pulsar_session_live_bank(s)) s->checkpoint_valid = false;
+    if (BankId::from_raw_unchecked(bank) == pulsar_session_live_bank(s)) s->checkpoint_valid = false;
     /* the carry too, also the live bank's: a caller that drops the live view (installs a bank without saving this one)
      * brings the carry back */
     if (pulsar_bank_carry_saved(s, bank)) s->bank_carry[bank].checkpoint_valid = false;
@@ -249,7 +249,7 @@ const pulsar_tokens *pulsar_bank_history(pulsar_session *s, uint32_t bank) {
  * banks, not installed, read the carries saved at their entry. */
 const pulsar_tokens *pulsar_bank_history_as(pulsar_session *s, uint32_t bank, pulsar_bank_view view) {
     if (!s || bank >= session_bank_n(s)) return NULL;
-    if (view == PULSAR_BANK_VIEW_CURRENT && BankId{bank} == pulsar_session_live_bank(s))
+    if (view == PULSAR_BANK_VIEW_CURRENT && BankId::from_raw_unchecked(bank) == pulsar_session_live_bank(s))
         return s->checkpoint_valid ? &s->checkpoint : NULL;
     if (pulsar_bank_carry_saved(s, bank) && s->bank_carry[bank].checkpoint_valid)
         return &s->bank_carry[bank].checkpoint;

@@ -749,7 +749,7 @@ bool server::kv_cache_anchor_due(prompt_view prompt, PromptToks cut) {
     memset(&head, 0, sizeof head);
     head.v = prompt.tokens()->v;
     head.len = head.cap = cut.raw();   /* a borrowed view of the prompt's first `cut` tokens */
-    TextBytes len{0};
+    TextBytes len{0u};
     char *text = pulsar_kvtext_render_tokens_text(engine, &head, &len);
     if (!text) return false;
     bool rp_at_cut = false;
@@ -768,7 +768,7 @@ bool server::kv_cache_pin_anchor(prompt_view prompt, PromptToks cut) {
     memset(&head, 0, sizeof head);
     head.v = prompt.tokens()->v;
     head.len = head.cap = cut.raw();   /* a borrowed view of the prompt's first `cut` tokens */
-    TextBytes len{0};
+    TextBytes len{0u};
     char *text = pulsar_kvtext_render_tokens_text(engine, &head, &len);
     if (!text) return false;
     /* the deepest stored chain with a restore point inside the anchor's text: one ending exactly at the cut is it */
@@ -865,7 +865,7 @@ bool server::kv_rp_writes_for_end(kv_persist_trigger why, unsigned kv_flags, uns
     /* the deepest restore point already stored on this history (an anchor, a periodic point, an earlier end) */
     pulsar_tokens head = *toks;
     head.len = E.raw();
-    TextBytes len{0};
+    TextBytes len{0u};
     char *text = pulsar_kvtext_render_tokens_text(s->engine, &head, &len);
     kv_chain_hit hit;
     /* L353: with the history's own images: without them an image history's chain stopped at its first block, which
@@ -1160,7 +1160,7 @@ TokPos server::kv_cache_find_req(const request *req, kv_chain_hit *hit) {
         !server_chain_ends_at_text_end(hit->chain[hit->n - 1].text_end, TextBytes{strlen(req->prompt_text)}))
         return G;
     const TextBytes cut = hit->chain[hit->n - 1].text_end;
-    if (cut == TextBytes{0}) return TokPos{0};
+    if (cut == TextBytes{0u}) return TokPos{0};
     std::string shorter(req->prompt_text, (size_t)cut.raw() - 1u);
     return kv_cache_find(shorter.c_str(), hashes, n_images, hit);
 }
@@ -1557,7 +1557,7 @@ int server::responses_live_visible_prefix_prompt(session_slot *sl,
     if (req->api != API_RESPONSES) return 0;
 
     const TextBytes prompt_len{strlen(req->prompt_text)};
-    TextBytes visible_len{0};
+    TextBytes visible_len{0u};
     pthread_mutex_lock(&s->tool_mu);
     bool ok = sl->responses_live.valid &&
               sl->responses_live.live_tokens == TokCount{live_pos} &&

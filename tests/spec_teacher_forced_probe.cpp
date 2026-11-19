@@ -128,7 +128,7 @@ int GATE_ENTRY(int argc, char **argv) {
         int pos = start;   /* committed prefix length; toks.v[pos] is the next true token */
         while (n_meas < n_pos) {
             if (pos + 20 > ctx) { fprintf(stderr, "context exhausted at pos %d after %d measured positions\n", pos, n_meas); break; }
-            if (!pulsar_session_bank_state_restore(s, BankId{bank0})) { fprintf(stderr,
+            if (!pulsar_session_bank_state_restore(s, BankId::from_raw_unchecked(bank0))) { fprintf(stderr,
                                                                                 "bank restore failed\n"); goto done; }
             /* the draft for the token at pos+1, drafted by the previous forced end (none before the first round);
              * harvest first: the chain may still be in flight */
@@ -159,16 +159,16 @@ int GATE_ENTRY(int argc, char **argv) {
                 goto done;
             }
             pulsar_multiseq_req reqs[17];
-            const StepRows step_rows = pulsar_spec_round_fill_reqs(r, BankId{bank0}, reqs);
+            const StepRows step_rows = pulsar_spec_round_fill_reqs(r, BankId::from_raw_unchecked(bank0), reqs);
             const uint32_t rows = (uint32_t)step_rows.raw();   /* decode_mixed's row count */
-            pulsar_session_bank_state_save(s, BankId{bank0});
+            pulsar_session_bank_state_save(s, BankId::from_raw_unchecked(bank0));
             pulsar_session_spec_arm_capture(s, step_rows);
             uint32_t out_rows = 0;
             const int drc = pulsar_session_decode_mixed(s, reqs, rows, logits, (int)(rows * (uint32_t)width),
                                                         &out_rows, PULSAR_MSEQ_HEAD_ALL_ROWS, err, sizeof err);
             pulsar_session_spec_arm_capture(s, StepRows{0});
             if (drc != 0 || out_rows != rows) {
-                pulsar_session_bank_state_restore(s, BankId{bank0});
+                pulsar_session_bank_state_restore(s, BankId::from_raw_unchecked(bank0));
                 pulsar_session_spec_round_abort(s, r);
                 fprintf(stderr, "decode_mixed at %d: rc=%d rows=%u/%u %s\n", pos, drc, out_rows, rows, err);
                 goto done;
@@ -199,7 +199,7 @@ int GATE_ENTRY(int argc, char **argv) {
                            n_meas, (double)accept / n_meas, (double)mode_hit / n_meas, (double)truth_hit / n_meas);
             }
             /* forced end: the corpus decides acceptance and the carry */
-            if (!pulsar_session_bank_state_restore(s, BankId{bank0})) { fprintf(stderr,
+            if (!pulsar_session_bank_state_restore(s, BankId::from_raw_unchecked(bank0))) { fprintf(stderr,
                                                                                 "bank restore failed\n"); goto done; }
             TokId accepted[17];
             const int na = pulsar_session_spec_round_end_forced(s, r, TokId{first}, temperature, top_k, top_p, min_p,
@@ -223,15 +223,15 @@ int GATE_ENTRY(int argc, char **argv) {
              * the measurement; re-arm it every round, as a request boundary
              * does.  The probe measures the drafter, not the controller. */
             spec_quench_reset(s);
-            pulsar_session_bank_state_save(s, BankId{bank0});
-            pulsar_spec_round *rr = r; const BankId bb{bank0};
+            pulsar_session_bank_state_save(s, BankId::from_raw_unchecked(bank0));
+            pulsar_spec_round *rr = r; const BankId bb = BankId::from_raw_unchecked(bank0);
             if (pulsar_session_spec_redraft_batch(s, &rr, &bb, &rngp, 1, err, sizeof err) != 0) {
                 fprintf(stderr, "redraft at %d: %s\n", pos, err); goto done;
             }
-            if (!pulsar_session_bank_state_restore(s, BankId{bank0})) { fprintf(stderr,
+            if (!pulsar_session_bank_state_restore(s, BankId::from_raw_unchecked(bank0))) { fprintf(stderr,
                                                                                 "bank restore failed\n"); goto done; }
             pulsar_session_spec_redraft_commit(s, r);
-            pulsar_session_bank_state_save(s, BankId{bank0});
+            pulsar_session_bank_state_save(s, BankId::from_raw_unchecked(bank0));
         }
         if (n_meas == 0) { fprintf(stderr, "nothing measured\n"); goto done; }
         printf("TEACHER-FORCED: positions=%d start=%d rounds=%d temp=%.2f top_k=%d top_p=%.2f min_p=%.2f | "

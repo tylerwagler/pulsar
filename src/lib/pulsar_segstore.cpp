@@ -913,8 +913,8 @@ int pulsar_segstore_lookup_images(pulsar_segstore *st, const char *text, TextByt
     std::vector<std::string> path(cap), best_path;
     int best_depth = 0;
     TokPos best_G{0};
-    TextBytes best_end{0};
-    stack.push_back({"", TextBytes{0}, 0, 0u});
+    TextBytes best_end{0u};
+    stack.push_back({"", TextBytes{0u}, 0, 0u});
     while (!stack.empty()) {
         const frame f = stack.back();
         stack.pop_back();
@@ -1220,7 +1220,7 @@ int pulsar_segstore_reserve_rp(pulsar_segstore *st, const char key[41], uint64_t
     memset(j->parent, 0, sizeof j->parent);
     j->G_prev = TokPos{0};
     j->G = pending ? TokPos{0} : it->second.G;
-    j->text_len = TextBytes{0};
+    j->text_len = TextBytes{0u};
     j->payload_off = RP_HDR;
     j->payload_bytes = rp_bytes;
     j->trailer_bytes = 0;
@@ -1416,7 +1416,7 @@ bool pulsar_segstore_commit(pulsar_segstore *st, pulsar_segstore_job *job, bool 
         e.trailer_bytes = job->trailer_bytes;
         e.file_bytes = job->need;
         e.last_used = (uint64_t)time(nullptr);
-        e.text_end = (parent.empty() ? TextBytes{0} : st->segs[parent].text_end) + job->text_len;
+        e.text_end = (parent.empty() ? TextBytes{0u} : st->segs[parent].text_end) + job->text_len;
         st->used -= rp.bytes;   /* link counts it again, on the entry */
         e.rp_bytes = rp.bytes;
         e.rp_flags = rp.bytes ? rp.flags : 0u;
@@ -1500,7 +1500,7 @@ bool pulsar_segstore_covers(pulsar_segstore *st, const char *text, TextBytes len
     /* the lookup's walk (children whose key the text's own bytes reproduce), plus, at each node it reaches, a child
      * that runs past `len` and starts with the rest of the text */
     struct frame { std::string key; TextBytes end; };
-    std::vector<frame> stack{{"", TextBytes{0}}};
+    std::vector<frame> stack{{"", TextBytes{0u}}};
     bool covered = false;
     while (!stack.empty()) {
         const frame f = stack.back();

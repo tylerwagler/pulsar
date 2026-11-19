@@ -855,7 +855,7 @@ std::string p3_compare(const std::string &out, const std::vector<size_t> &cuts, 
     for (size_t i = 0; i < live->calls().size(); i++)
         if (live->calls()[i].name != ref->calls()[i].name || live->calls()[i].arguments != ref->calls()[i].arguments)
             return "call " + std::to_string(i) + " differs";
-    StreamOff llo{0}, lhi{0}, rlo{0}, rhi{0};   /* L437: both parsers' stream offsets, compared as before */
+    StreamOff llo{0u}, lhi{0u}, rlo{0u}, rhi{0u};   /* L437: both parsers' stream offsets, compared as before */
     if (live->raw_span(&llo, &lhi) != ref->raw_span(&rlo, &rhi) || llo != rlo || lhi != rhi) return "the raw span differs";
     return "";
 }

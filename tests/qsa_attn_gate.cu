@@ -198,7 +198,7 @@ Dev g_dev;
 
 pulsar_gpu_tensor *upload(const void *p, uint64_t bytes) {
     pulsar_gpu_tensor *t = pulsar_gpu_tensor_alloc(TensorBytes{bytes});
-    if (!t || !pulsar_gpu_tensor_write(t, TensorBytes{0}, p,
+    if (!t || !pulsar_gpu_tensor_write(t, TensorBytes{0u}, p,
                                        TensorBytes{bytes})) { printf("alloc/write failed\n"); exit(2); }
     return t;
 }
@@ -276,10 +276,10 @@ void call(std::vector<Seq> &seqs, const std::vector<Piece> &pieces,
                     &idx[(size_t)r * IIN]);
         }
     }
-    pulsar_gpu_tensor_write(d.qg, TensorBytes{0}, qg.data(), bytes_of<float>(qg.size()));
-    pulsar_gpu_tensor_write(d.k, TensorBytes{0}, k.data(), bytes_of<float>(k.size()));
-    pulsar_gpu_tensor_write(d.v, TensorBytes{0}, v.data(), bytes_of<float>(v.size()));
-    pulsar_gpu_tensor_write(d.idx, TensorBytes{0}, idx.data(), bytes_of<float>(idx.size()));
+    pulsar_gpu_tensor_write(d.qg, TensorBytes{0u}, qg.data(), bytes_of<float>(qg.size()));
+    pulsar_gpu_tensor_write(d.k, TensorBytes{0u}, k.data(), bytes_of<float>(k.size()));
+    pulsar_gpu_tensor_write(d.v, TensorBytes{0u}, v.data(), bytes_of<float>(v.size()));
+    pulsar_gpu_tensor_write(d.idx, TensorBytes{0u}, idx.data(), bytes_of<float>(idx.size()));
     pulsar_gpu_tensor_fill_f32(d.slot_sc, 0.f, pulsar_gpu_tensor_bytes(d.slot_sc).raw() / 4);
     std::vector<pulsar_qsa_seq> sd;
     for (auto &s : seqs) sd.push_back(s.desc());
@@ -310,10 +310,10 @@ void call(std::vector<Seq> &seqs, const std::vector<Piece> &pieces,
     std::vector<float> tap((size_t)n * OUT);
     std::vector<uint32_t> sel((size_t)n * TOPB);
     std::vector<uint8_t> slot((size_t)n * OUT), sc(pulsar_gpu_tensor_bytes(d.slot_sc).raw());
-    pulsar_gpu_tensor_read(d.tap, TensorBytes{0}, tap.data(), bytes_of<float>(tap.size()));
-    pulsar_gpu_tensor_read(d.sel, TensorBytes{0}, sel.data(), bytes_of<uint32_t>(sel.size()));
-    pulsar_gpu_tensor_read(d.slot, TensorBytes{0}, slot.data(), TensorBytes{slot.size()});
-    pulsar_gpu_tensor_read(d.slot_sc, TensorBytes{0}, sc.data(), TensorBytes{sc.size()});
+    pulsar_gpu_tensor_read(d.tap, TensorBytes{0u}, tap.data(), bytes_of<float>(tap.size()));
+    pulsar_gpu_tensor_read(d.sel, TensorBytes{0u}, sel.data(), bytes_of<uint32_t>(sel.size()));
+    pulsar_gpu_tensor_read(d.slot, TensorBytes{0u}, slot.data(), TensorBytes{slot.size()});
+    pulsar_gpu_tensor_read(d.slot_sc, TensorBytes{0u}, sc.data(), TensorBytes{sc.size()});
     for (uint32_t i = 0; i < n; i++) {
         RowOut &o = outs[rs[i]][rp[i]];
         std::vector<uint8_t> srow(&slot[(size_t)i * OUT], &slot[(size_t)i * OUT] + OUT);
@@ -349,8 +349,8 @@ Run run(std::vector<Seq> &seqs, const std::vector<std::vector<Piece>> &schedule,
     for (size_t s = 0; s < seqs.size(); s++) {
         R.kv[s].resize((size_t)seqs[s].T * REC);
         R.bkey[s].resize((size_t)(seqs[s].T / 4) * PULSAR_QSA_BKEY_BYTES);
-        pulsar_gpu_tensor_read(seqs[s].kv, TensorBytes{0}, R.kv[s].data(), TensorBytes{R.kv[s].size()});
-        pulsar_gpu_tensor_read(seqs[s].bkey, TensorBytes{0}, R.bkey[s].data(), TensorBytes{R.bkey[s].size()});
+        pulsar_gpu_tensor_read(seqs[s].kv, TensorBytes{0u}, R.kv[s].data(), TensorBytes{R.kv[s].size()});
+        pulsar_gpu_tensor_read(seqs[s].bkey, TensorBytes{0u}, R.bkey[s].data(), TensorBytes{R.bkey[s].size()});
     }
     return R;
 }
@@ -932,10 +932,10 @@ int main() {
                     memcpy(&k2[(size_t)i * KVIN2], &k[(size_t)r * HD], HD * 4);
                     memcpy(&v2[(size_t)i * KVIN2], &v[(size_t)r * HD], HD * 4);
                 }
-                pulsar_gpu_tensor_write(d.qg, TensorBytes{0}, qg2.data(), bytes_of<float>(qg2.size()));
-                pulsar_gpu_tensor_write(d.k, TensorBytes{0}, k2.data(), bytes_of<float>(k2.size()));
-                pulsar_gpu_tensor_write(d.v, TensorBytes{0}, v2.data(), bytes_of<float>(v2.size()));
-                pulsar_gpu_tensor_write(d.idx, TensorBytes{0}, idx.data(), bytes_of<float>(idx.size()));
+                pulsar_gpu_tensor_write(d.qg, TensorBytes{0u}, qg2.data(), bytes_of<float>(qg2.size()));
+                pulsar_gpu_tensor_write(d.k, TensorBytes{0u}, k2.data(), bytes_of<float>(k2.size()));
+                pulsar_gpu_tensor_write(d.v, TensorBytes{0u}, v2.data(), bytes_of<float>(v2.size()));
+                pulsar_gpu_tensor_write(d.idx, TensorBytes{0u}, idx.data(), bytes_of<float>(idx.size()));
                 pulsar_gpu_tensor_fill_f32(d.slot_sc, 0.f, pulsar_gpu_tensor_bytes(d.slot_sc).raw() / 4);
                 pulsar_qsa_seq sd = s.desc();
                 pulsar_qsa_layer L{(const uint16_t *)pulsar_gpu_tensor_device_ptr(d.qn), (const uint16_t *)pulsar_gpu_tensor_device_ptr(d.kn),
@@ -953,12 +953,12 @@ int main() {
                     break;
                 }
                 std::vector<float> tap((size_t)n * OUT2);
-                pulsar_gpu_tensor_read(d.tap, TensorBytes{0}, tap.data(), bytes_of<float>(tap.size()));
+                pulsar_gpu_tensor_read(d.tap, TensorBytes{0u}, tap.data(), bytes_of<float>(tap.size()));
                 for (uint32_t i = 0; i < n; i++)
                     dout += memcmp(&tap[(size_t)i * OUT2], &A.outs[0][p0 + i].out[(size_t)r * OUT2], OUT2 * 4) != 0;
             }
             std::vector<uint8_t> kv((size_t)TA * REC2);
-            pulsar_gpu_tensor_read(s.kv, TensorBytes{0}, kv.data(), TensorBytes{kv.size()});
+            pulsar_gpu_tensor_read(s.kv, TensorBytes{0u}, kv.data(), TensorBytes{kv.size()});
             for (uint32_t p = 0; p < TA; p++) {
                 const uint8_t *mine = &kv[(size_t)p * REC2], *full = &A.kv[0][(size_t)p * REC];
                 dkv += memcmp(mine, full + r * HD, HD) != 0;                              /* K data */

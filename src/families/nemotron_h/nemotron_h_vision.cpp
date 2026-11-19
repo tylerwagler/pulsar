@@ -218,8 +218,8 @@ bool pulsar_nemotron_h_vision_run_create(const pulsar_model *m, pulsar_nemotron_
     uint64_t lws = 0;
     {
         const struct { const pulsar_tensor *t; int in, out, rows; } ls[] = {
-            {v->patch, (int)P, (int)D, (int)CHUNK}, {v->vit[VisLayer{0}].qkv, (int)D, (int)(3 * D), (int)CHUNK},
-            {v->vit[VisLayer{0}].fc1, (int)D, (int)s.mlp, (int)CHUNK}, {v->vit[VisLayer{0}].fc2, (int)s.mlp, (int)D, (int)CHUNK},
+            {v->patch, (int)P, (int)D, (int)CHUNK}, {v->vit[VisLayer{0u}].qkv, (int)D, (int)(3 * D), (int)CHUNK},
+            {v->vit[VisLayer{0u}].fc1, (int)D, (int)s.mlp, (int)CHUNK}, {v->vit[VisLayer{0u}].fc2, (int)s.mlp, (int)D, (int)CHUNK},
             {v->proj_fc1, (int)S, (int)s.proj_hidden, (int)PROJ_CHUNK},
             {v->proj_fc2, (int)s.proj_hidden, (int)LLM_WIDTH, (int)PROJ_CHUNK}};
         for (const auto &x : ls) {
@@ -315,10 +315,10 @@ bool pulsar_nemotron_h_vision_encode(const pulsar_model *m, const pulsar_nemotro
     uint16_t *patch = dp<uint16_t>(r->t[V_PATCH]), *xn = dp<uint16_t>(r->t[V_XN]), *qkv = dp<uint16_t>(r->t[V_QKV]),
              *att = dp<uint16_t>(r->t[V_ATT]), *mlp = dp<uint16_t>(r->t[V_MLP]);
     /* the seed: the prefix rows, the positions, then + the patch embedding */
-    if (!pulsar_gpu_tensor_write(r->t[V_RES], TensorBytes{0}, v->cls_rows.data(), bytes_of<float>((uint64_t)NC * D)) ||
+    if (!pulsar_gpu_tensor_write(r->t[V_RES], TensorBytes{0u}, v->cls_rows.data(), bytes_of<float>((uint64_t)NC * D)) ||
         !pulsar_gpu_tensor_write(r->t[V_RES], bytes_of<float>((uint64_t)NC * D), pos.data(),
                                  bytes_of<float>((uint64_t)np * D)) ||
-        !pulsar_gpu_tensor_write(r->t[V_PATCH], TensorBytes{0}, img.patches.data(),
+        !pulsar_gpu_tensor_write(r->t[V_PATCH], TensorBytes{0u}, img.patches.data(),
                                  bytes_of<uint16_t>((uint64_t)np * P)))
         return vfail(err, errlen, "the image's rows did not reach the device");
     for (uint32_t r0 = 0; r0 < np; r0 += CHUNK) {
@@ -333,7 +333,7 @@ bool pulsar_nemotron_h_vision_encode(const pulsar_model *m, const pulsar_nemotro
     if (!pulsar_vit_encode(m, dims, {v->vit.data(), dims.depth}, PULSAR_ROWS_OUT_BF16, bufs, N, NULL, err, errlen)) return false;
     if (dbg) {   /* the tower's residual, the patches back in raster order */
         std::vector<float> all((size_t)N * D);
-        if (!pulsar_gpu_tensor_read(r->t[V_RES], TensorBytes{0}, all.data(), bytes_of<float>(all.size())))
+        if (!pulsar_gpu_tensor_read(r->t[V_RES], TensorBytes{0u}, all.data(), bytes_of<float>(all.size())))
             return vfail(err, errlen, "the stage read failed");
         dbg->assign(all.begin(), all.begin() + (size_t)NC * D);
         dbg->resize(all.size());
@@ -361,7 +361,7 @@ bool pulsar_nemotron_h_vision_encode(const pulsar_model *m, const pulsar_nemotro
             return vfail(err, errlen, "the projector's mlp1 refused");
     }
     uint16_t *out = (uint16_t *)malloc((size_t)n_llm * LLM_WIDTH * 2u);
-    if (!out || !pulsar_gpu_tensor_read(r->t[V_QKV], TensorBytes{0}, out,
+    if (!out || !pulsar_gpu_tensor_read(r->t[V_QKV], TensorBytes{0u}, out,
                                         bytes_of<uint16_t>((uint64_t)n_llm * LLM_WIDTH))) {
         free(out);
         return vfail(err, errlen, "the rows' read failed");

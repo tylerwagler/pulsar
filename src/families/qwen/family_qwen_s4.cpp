@@ -241,7 +241,7 @@ struct moe_scratch { SlabOff nf, ws; TensorBytes ws_bytes, total; };
 moe_scratch moe_layout(const pulsar_qwen_shape *s, uint32_t rows) {
     moe_scratch m{};
     m.nf = SlabOff{};
-    m.ws = SlabOff{256};   /* past the flag's 256-byte slot */
+    m.ws = SlabOff{256u};   /* past the flag's 256-byte slot */
     const pulsar_moe_block_shape b = moe_block_shape(s);
     m.ws_bytes = TensorBytes{pulsar_moe_block_workspace_bytes(&b, (int)rows)};
     m.total = (m.ws + m.ws_bytes).before();
@@ -840,7 +840,7 @@ bool pulsar_qwen_s4_embed(const pulsar_qwen_step *st) {
     pulsar_gpu_tensor *tok = st->st->scratch[PULSAR_QWEN_OP_EMBED];
     const pulsar_tensor *te = st->w->token_embd;
     const uint16_t *table = (const uint16_t *)wptr(st, te, "qwen embed_tokens");
-    if (!tok || !table || !pulsar_gpu_tensor_write_async(tok, TensorBytes{0}, st->tokens,
+    if (!tok || !table || !pulsar_gpu_tensor_write_async(tok, TensorBytes{0u}, st->tokens,
                                                          bytes_of<int32_t>(n))) return false;
     if (pulsar_qwen_embed_launch(table, (const int32_t *)dptr(tok), (int)n, (uint16_t *)dptr(st->streams), 0))
         return false;
@@ -1233,7 +1233,7 @@ static bool build_draft_head(const pulsar_qwen_step *st, pulsar_qwen_weights *wm
     wm->draft_ids_dev = pulsar_gpu_tensor_alloc(bytes_of<int32_t>(nd));
     wm->draft_head_mx = hb && bytes != TensorBytes{} ? pulsar_gpu_tensor_alloc(bytes) : NULL;
     const bool ok = wm->draft_ids_dev && wm->draft_head_mx &&
-                    pulsar_gpu_tensor_write(wm->draft_ids_dev, TensorBytes{0}, wm->draft_ids, bytes_of<int32_t>(nd)) &&
+                    pulsar_gpu_tensor_write(wm->draft_ids_dev, TensorBytes{0u}, wm->draft_ids, bytes_of<int32_t>(nd)) &&
                     pulsar_bf16_to_mxfp8(hb, (const int32_t *)dptr(wm->draft_ids_dev), (int)nd, H,
                                               dptr(wm->draft_head_mx), 0) == 0;
     if (!ok) {
@@ -1353,7 +1353,7 @@ bool pulsar_qwen_s4_mtp_combine(const pulsar_qwen_step *st, const void *h) {
     if (!moe_sc || !pulsar_gpu_tensor_write_async(moe_sc, moe_layout(st->shape, st->st->max_rows).nf.before(),
                                                   &zero, TensorBytes{sizeof(zero)}))
         return fail("could not clear the MoE non-finite flag");
-    if (!pulsar_gpu_tensor_write_async(st->st->mtp_tok, TensorBytes{0}, st->tokens, bytes_of<int32_t>(n)))
+    if (!pulsar_gpu_tensor_write_async(st->st->mtp_tok, TensorBytes{0u}, st->tokens, bytes_of<int32_t>(n)))
         return fail("could not stage the MTP rows' tokens");
     const int H = (int)s->n_embd;
     pulsar_qwen_mtp_dev d{};
@@ -1387,7 +1387,7 @@ bool pulsar_qwen_s4_draft_top_read(const pulsar_qwen_state *q, const pulsar_qwen
                                    float *conf) {
     pulsar_draft_top rec[PULSAR_QWEN_HEAD_ROWS_MAX];
     if (n == 0 || n > PULSAR_QWEN_HEAD_ROWS_MAX) return fail("a draft pick of no rows or past the head's rows");
-    if (!q->mtp_top || !pulsar_gpu_tensor_read(q->mtp_top, TensorBytes{0}, rec, TensorBytes{sizeof(rec[0])}.times(n)))
+    if (!q->mtp_top || !pulsar_gpu_tensor_read(q->mtp_top, TensorBytes{0u}, rec, TensorBytes{sizeof(rec[0])}.times(n)))
         return fail("could not read the draft pick");
     for (uint32_t r = 0; r < n; r++) {
         if (rec[r].nan) return fail("the draft head's logits hold a NaN");
@@ -1583,8 +1583,8 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, LayerSlot il) {
     const TensorBytes itb = pulsar_qwen_index_tail_bytes(s);
     pulsar_qsa_seq seqs[64];
     for (uint32_t b = 0; ok && b < nb; b++) {
-        seqs[b].kv    = pulsar_state_pool(st->states, il, PULSAR_QWEN_STATE_KV, BankId{b});
-        seqs[b].bkey  = pulsar_state_pool(st->states, il, PULSAR_QWEN_STATE_IDX_KEYS, BankId{b});
+        seqs[b].kv    = pulsar_state_pool(st->states, il, PULSAR_QWEN_STATE_KV, BankId::from_raw_unchecked(b));
+        seqs[b].bkey  = pulsar_state_pool(st->states, il, PULSAR_QWEN_STATE_IDX_KEYS, BankId::from_raw_unchecked(b));
         seqs[b].stage = pulsar_gpu_tensor_view(pulsar_state_tensor(st->states, il, PULSAR_QWEN_STATE_IDX_TAIL),
                                                itb.times(b), itb);
         seqs[b].cap   = st->states->ctx;
@@ -1598,7 +1598,7 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, LayerSlot il) {
          * before the step (pulsar_state_verify_capture) and rebuilds it at the commit (pulsar_state_commit) */
         ok = pulsar_gpu_tensor_copy_async(pulsar_state_capture_tensor(st->states, PULSAR_QWEN_STATE_IDX_TAIL),
                                           pulsar_state_capture_offset(st->states, il, PULSAR_QWEN_STATE_IDX_TAIL).before(),
-                                          vi, TensorBytes{0},
+                                          vi, TensorBytes{0u},
                                           bytes_of<float>((uint64_t)st->n_dec * PULSAR_QSA_IDX_IN)) != 0;
         if (!ok) { drop(); return fail("the verify capture of a QSA layer failed"); }
     }

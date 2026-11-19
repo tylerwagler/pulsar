@@ -779,13 +779,13 @@ int main(int argc, char **argv) {
         {
             std::vector<float> h((size_t)kMaxRows * K);
             for (auto &v : h) v = ((float)(rnd() >> 8) / 16777216.0f - 0.5f) * 4.0f;
-            pulsar_gpu_tensor_write(x, TensorBytes{0}, h.data(), bytes_of<float>(h.size()));
+            pulsar_gpu_tensor_write(x, TensorBytes{0u}, h.data(), bytes_of<float>(h.size()));
             std::vector<uint16_t> hb(h.size());
             for (size_t i = 0; i < h.size(); i++) {
                 const __nv_bfloat16 b = __float2bfloat16(h[i]);
                 std::memcpy(&hb[i], &b, sizeof(uint16_t));
             }
-            pulsar_gpu_tensor_write(xb, TensorBytes{0}, hb.data(), bytes_of<uint16_t>(hb.size()));
+            pulsar_gpu_tensor_write(xb, TensorBytes{0u}, hb.data(), bytes_of<uint16_t>(hb.size()));
         }
         float *d_y = nullptr, *d_ws = nullptr;
         const size_t ws_bytes = ds4_exl3_dense_workspace_bytes(kMaxRows, K, N);
@@ -808,8 +808,8 @@ int main(int argc, char **argv) {
                 for (auto &b : hs) b = (uint8_t)(120 + rnd() % 8);
                 f8d[r] = pulsar_gpu_tensor_alloc(TensorBytes{f8_data});
                 f8s[r] = pulsar_gpu_tensor_alloc(TensorBytes{f8_scale});
-                pulsar_gpu_tensor_write(f8d[r], TensorBytes{0}, hd.data(), TensorBytes{f8_data});
-                pulsar_gpu_tensor_write(f8s[r], TensorBytes{0}, hs.data(), TensorBytes{f8_scale});
+                pulsar_gpu_tensor_write(f8d[r], TensorBytes{0u}, hd.data(), TensorBytes{f8_data});
+                pulsar_gpu_tensor_write(f8s[r], TensorBytes{0u}, hs.data(), TensorBytes{f8_scale});
                 if (!pulsar_gpu_register_fp8_lt_weight_resident(key, MapOff{(uint64_t)r * f8_span}, K, N, f8d[r], f8s[r])) {
                     fprintf(stderr, "resident MXFP8 registration refused\n"); return 2;
                 }

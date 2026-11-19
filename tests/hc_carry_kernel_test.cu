@@ -93,7 +93,7 @@ int main(void) {
     wbuf[0] = 0.7f; wbuf[1] = 0.9f; wbuf[2] = 1.1f;
     for (uint32_t i = 0; i < MIX_HC; i++) wbuf[3 + i] = 0.3f * nd(rng);
     for (uint32_t i = 0; i < N_EMBD; i++) wbuf[3 + MIX_HC + i] = 1.0f + 0.1f * nd(rng);
-    const MapOff scale_off{0}, base_off{3 * sizeof(float)}, norm_off{(3 + MIX_HC) * sizeof(float)};
+    const MapOff scale_off{0u}, base_off{3 * sizeof(float)}, norm_off{(3 + MIX_HC) * sizeof(float)};
     float *dw; cudaMalloc(&dw, wbuf.size() * sizeof(float));
     cudaMemcpy(dw, wbuf.data(), wbuf.size() * sizeof(float), cudaMemcpyHostToDevice);
 

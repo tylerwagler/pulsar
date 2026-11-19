@@ -116,7 +116,7 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
     for (uint64_t i = 0; i < nelt; i++)
         out[i] = (float)(1000 * rank + (int)(i % 7));
 
-    if (!pulsar_tp_allreduce_sum(tp, TpSlot{0}, 1, out, in, bytes)) {
+    if (!pulsar_tp_allreduce_sum(tp, TpSlot{0u}, 1, out, in, bytes)) {
         CHECK(0, "rank %d allreduce failed", rank);
         pulsar_tp_free(tp);
         std::free(slab);
@@ -165,7 +165,7 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
             for (uint32_t i = lo; i < hi; i++)
                 own[(size_t)r * stride + (i - lo)] =
                     (float)(1000 * rank + (int)(i % 7) + 10000 * (int)r);
-        if (!pulsar_tp_allgather_rows(tp, TpSlot{0}, 2 + (uint64_t)ci, full, own, scr, rows, V, 1u)) {
+        if (!pulsar_tp_allgather_rows(tp, TpSlot{0u}, 2 + (uint64_t)ci, full, own, scr, rows, V, 1u)) {
             CHECK(0, "rank %d vocab all-gather failed (V=%u)", rank, V);
         } else {
             int vbad = 0;
@@ -215,7 +215,7 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
             for (uint32_t i = ulo * unit; i < uhi * unit; i++)
                 own[(size_t)r * stride + (i - ulo * unit)] =
                     (float)(1000 * rank + (int)(i % 11) + 10000 * (int)r);
-        if (!pulsar_tp_allgather_rows(tp, TpSlot{0}, 4u, full, own, scr, rows, units, unit)) {
+        if (!pulsar_tp_allgather_rows(tp, TpSlot{0u}, 4u, full, own, scr, rows, units, unit)) {
             CHECK(0, "rank %d grouped all-gather failed (units=%u unit=%u)", rank, units, unit);
         } else {
             int gbad = 0;
@@ -281,7 +281,7 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
               "rank %d: an unrelated address read as in-slab", rank);
         CHECK(!pulsar_tp_in_slab(tp, NULL, 0), "rank %d: NULL read as in-slab", rank);
         /* Longer than the whole slab: the bound must hold, not just the base. */
-        CHECK(!pulsar_tp_in_slab(tp, pulsar_tp_slab_batch_out(tp, TpSlot{0}), slab_sz + 1),
+        CHECK(!pulsar_tp_in_slab(tp, pulsar_tp_slab_batch_out(tp, TpSlot{0u}), slab_sz + 1),
               "rank %d: a payload longer than the slab read as in-slab", rank);
         /* A layer past n_layer has no region at all. */
         CHECK(pulsar_tp_slab_batch_out(tp, TpSlot{pulsar_tp_n_layer(tp)}) == NULL &&
@@ -299,11 +299,11 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         pulsar_tp_slab_layout_init(MESH_N_LAYER, MESH_N_EMBD, &lay);
         const uint64_t vec = pulsar_tp_vec_bytes(tp);
         const uint64_t nelt = vec / sizeof(float);
-        float *op = (float *)((uint8_t *)slab + pulsar_tp_slab_out_offset(&lay, TpSlot{0}, 0, vec));
-        float *ip = (float *)((uint8_t *)slab + pulsar_tp_slab_in_offset(&lay, TpSlot{0}, 0, vec));
+        float *op = (float *)((uint8_t *)slab + pulsar_tp_slab_out_offset(&lay, TpSlot{0u}, 0, vec));
+        float *ip = (float *)((uint8_t *)slab + pulsar_tp_slab_in_offset(&lay, TpSlot{0u}, 0, vec));
         for (uint64_t k = 0; k < nelt; k++) op[k] = (float)(1000 * rank + (int)(k % 7));
         memset(ip, 0, (size_t)vec);
-        if (!pulsar_tp_gate_exchange(tp, TpSlot{0}, 0, 7)) {
+        if (!pulsar_tp_gate_exchange(tp, TpSlot{0u}, 0, 7)) {
             CHECK(0, "rank %d n-way gate_exchange failed", rank);
         } else {
             const float base = 1000.0f * (float)(n * (n - 1) / 2) - 1000.0f * (float)rank;
@@ -326,11 +326,11 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         const uint64_t vec = pulsar_tp_vec_bytes(tp);
         const uint32_t rws = 2u;
         const uint64_t nelt = (uint64_t)rws * vec / sizeof(float);
-        float *bo = (float *)((uint8_t *)slab + pulsar_tp_slab_batch_out_offset(&lay, TpSlot{0}, vec));
-        float *bi = (float *)((uint8_t *)slab + pulsar_tp_slab_batch_in_offset(&lay, TpSlot{0}, vec));
+        float *bo = (float *)((uint8_t *)slab + pulsar_tp_slab_batch_out_offset(&lay, TpSlot{0u}, vec));
+        float *bi = (float *)((uint8_t *)slab + pulsar_tp_slab_batch_in_offset(&lay, TpSlot{0u}, vec));
         for (uint64_t k = 0; k < nelt; k++) bo[k] = (float)(1000 * rank + (int)(k % 5));
         memset(bi, 0, (size_t)((uint64_t)rws * vec));
-        if (!pulsar_tp_batch_gate_exchange(tp, TpSlot{0}, rws, 11)) {
+        if (!pulsar_tp_batch_gate_exchange(tp, TpSlot{0u}, rws, 11)) {
             CHECK(0, "rank %d n-way batch gate failed", rank);
         } else {
             const float base = 1000.0f * (float)(n * (n - 1) / 2) - 1000.0f * (float)rank;
@@ -351,7 +351,7 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         const uint64_t nelt_bg = bytes / sizeof(float);
         for (uint64_t k = 0; k < nelt_bg; k++) bo[k] = (float)(1000 * rank + (int)(k % 3));
         memset(bi, 0, (size_t)bytes);
-        if (!pulsar_tp_big_gate_exchange(tp, TpSlot{0}, 13, bo, bi, bytes)) {
+        if (!pulsar_tp_big_gate_exchange(tp, TpSlot{0u}, 13, bo, bi, bytes)) {
             CHECK(0, "rank %d n-way big gate failed", rank);
         } else {
             const float base = 1000.0f * (float)(n * (n - 1) / 2) - 1000.0f * (float)rank;
@@ -741,13 +741,13 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         cerr[0] = 0;
         int status = -99;
         if (rank == 0) {
-            CHECK(pulsar_tp_send_bank_state_save(tp, sid, BankId{2u}) != 0, "rank 0 bank save send failed");
-            CHECK(pulsar_tp_send_bank_state_restore(tp, sid, BankId{2u}) != 0, "rank 0 bank restore send failed");
+            CHECK(pulsar_tp_send_bank_state_save(tp, sid, BankId{2}) != 0, "rank 0 bank save send failed");
+            CHECK(pulsar_tp_send_bank_state_restore(tp, sid, BankId{2}) != 0, "rank 0 bank restore send failed");
             CHECK(pulsar_tp_wait_command_status(tp, sid, "bank state restore", &status, cerr, sizeof(cerr)) &&
                   status == 0,
                   "rank 0 restore verdict: want agreed 0, got rc/status %d (%s)", status, cerr);
             /* split verdict (n>=3 only: with one worker there is nobody to disagree) */
-            CHECK(pulsar_tp_send_bank_repoint(tp, sid, BankId{1u}) != 0, "rank 0 repoint send failed");
+            CHECK(pulsar_tp_send_bank_repoint(tp, sid, BankId{1}) != 0, "rank 0 repoint send failed");
             status = -99;
             cerr[0] = 0;
             const int rc = pulsar_tp_wait_command_status(tp, sid, "bank repoint", &status, cerr, sizeof(cerr));
@@ -759,7 +759,7 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
                 CHECK(rc == 1 && status == 0, "rank 0: n=2 repoint verdict 0, got rc=%d status=%d (%s)", rc, status, cerr);
             }
             /* a negative status is a refusal */
-            CHECK(pulsar_tp_send_bank_repoint(tp, sid, BankId{9u}) != 0, "rank 0 repoint(9) send failed");
+            CHECK(pulsar_tp_send_bank_repoint(tp, sid, BankId{9}) != 0, "rank 0 repoint(9) send failed");
             status = -99;
             cerr[0] = 0;
             CHECK(!pulsar_tp_wait_command_status(tp, sid, "bank repoint", &status, cerr, sizeof(cerr)) &&
@@ -916,7 +916,7 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         cerr[0] = 0;
         if (rank == 0) {
             int status = -99;
-            CHECK(pulsar_tp_send_bank_free_physical(tp, sid, BankId{5u}) != 0, "rank 0 free-physical send failed");
+            CHECK(pulsar_tp_send_bank_free_physical(tp, sid, BankId{5}) != 0, "rank 0 free-physical send failed");
             CHECK(pulsar_tp_wait_command_status(tp, sid, "bank free physical", &status, cerr, sizeof(cerr)) && status == 0,
                   "rank 0 free-physical verdict: want 0, got %d (%s)", status, cerr);
         } else {

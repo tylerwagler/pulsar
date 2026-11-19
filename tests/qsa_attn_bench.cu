@@ -83,7 +83,7 @@ Layer make_layer(uint32_t rows, uint32_t max_ctx) {
         L.norm[i] = alloc(w[i] * 2);                 /* the container stores the norms bf16 */
         { std::vector<uint16_t> b16(w[i]);
           for (uint32_t j = 0; j < w[i]; j++) b16[j] = (uint16_t)((uint32_t)(float)(10 + i) >> 16);
-          pulsar_gpu_tensor_write(L.norm[i], TensorBytes{0}, b16.data(), bytes_of<uint16_t>(w[i])); }
+          pulsar_gpu_tensor_write(L.norm[i], TensorBytes{0u}, b16.data(), bytes_of<uint16_t>(w[i])); }
     }
     return L;
 }

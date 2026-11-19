@@ -156,7 +156,7 @@ bool agent_kv_open(agent_worker *w) {
  * matches, and sync rebuilds where it does not. */
 int agent_kv_load(agent_worker *w, const pulsar_tokens *tokens) {
     if (!w->kv || tokens->len <= 0) return 0;
-    TextBytes text_len{0};
+    TextBytes text_len{0u};
     char *text = pulsar_kvtext_render_tokens_text(w->engine, tokens, &text_len);
     if (!text) return 0;
     pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
@@ -214,7 +214,7 @@ void agent_kv_system_tip(agent_worker *w, char tip[41]) {
     if (!w->kv) return;
     pulsar_tokens sys = {0};
     agent_worker_build_system_tokens(w, &sys);
-    TextBytes text_len{0};
+    TextBytes text_len{0u};
     char *text = pulsar_kvtext_render_tokens_text(w->engine, &sys, &text_len);
     pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
     const int n = text ? pulsar_segstore_lookup(w->kv, text, text_len, NULL, chain, PULSAR_KVCHAIN_MAX) : 0;
@@ -576,7 +576,7 @@ bool agent_worker_save_session_now(agent_worker *w, char sha_out[41],
     if (agent_worker_sync_tokens(w, &w->transcript, false, err, err_len) != 0)
         return false;
     if (!w->session_title) {
-        TextBytes text_len{0};
+        TextBytes text_len{0u};
         char *text = pulsar_kvtext_render_tokens_text(w->engine, &w->transcript, &text_len);
         agent_turn_marks marks;
         agent_turn_marks_init(w->engine, &marks);

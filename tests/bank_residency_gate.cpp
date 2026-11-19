@@ -129,8 +129,8 @@ int GATE_ENTRY(int argc, char **argv) {
     }
     bool ok = true;
     for (uint32_t b : {1u, 2u}) {
-        ok = ok && pulsar_session_bank_state_restore(s, BankId{b}) && pulsar_session_sync(s, &P, err, sizeof(err)) == 0;
-        if (ok) pulsar_session_bank_state_save(s, BankId{b});
+        ok = ok && pulsar_session_bank_state_restore(s, BankId::from_raw_unchecked(b)) && pulsar_session_sync(s, &P, err, sizeof(err)) == 0;
+        if (ok) pulsar_session_bank_state_save(s, BankId::from_raw_unchecked(b));
     }
     CHECK(ok, "banks 1 and 2 prefilled G: %s", err);
 

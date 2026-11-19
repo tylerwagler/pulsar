@@ -278,7 +278,7 @@ static int dspark_markov_reduce_blocks(const pulsar_gpu_tensor *id_dev,
         grid_dim);
     if (!cuda_ok(cudaGetLastError(), "dspark markov reduce launch")) return 0;
     int32_t out;
-    if (!pulsar_gpu_tensor_read(out_dev, TensorBytes{0}, &out, TensorBytes{sizeof(out)})) return 0;
+    if (!pulsar_gpu_tensor_read(out_dev, TensorBytes{0u}, &out, TensorBytes{sizeof(out)})) return 0;
     *refined_id_dst = out;
     return 1;
 }
@@ -313,7 +313,7 @@ int pulsar_gpu_dspark_markov_step_model(
     if (!staged_id && !pulsar_gpu_seg_grow("the dspark staged id", 0)) return 0;   /* the one rule for a grow */
     if (!staged_id) staged_id = pulsar_gpu_tensor_alloc(bytes_of<int32_t>(1));
     if (!staged_id) return 0;
-    if (!pulsar_gpu_tensor_write(staged_id, TensorBytes{0}, &prev_token, bytes_of<int32_t>(1)))
+    if (!pulsar_gpu_tensor_write(staged_id, TensorBytes{0u}, &prev_token, bytes_of<int32_t>(1)))
         return 0;
 
     /* Sized by the STORAGE width, not sizeof(float): a bf16 markov head is half

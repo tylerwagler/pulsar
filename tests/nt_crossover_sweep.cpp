@@ -38,7 +38,7 @@ static void fill_rand(pulsar_gpu_tensor *t, uint64_t n_floats, uint32_t seed) {
         s = s * 1664525u + 1013904223u;
         h[i] = ((float)(s >> 8) / 16777216.0f - 0.5f) * 2.0f;
     }
-    pulsar_gpu_tensor_write(t, TensorBytes{0}, h, bytes_of<float>(n_floats));
+    pulsar_gpu_tensor_write(t, TensorBytes{0u}, h, bytes_of<float>(n_floats));
     free(h);
 }
 
@@ -250,7 +250,7 @@ int main(int argc, char **argv) {
             const uint64_t bytes = pulsar_gpu_tensor_bytes(a.heads).raw();
             uint8_t *h = (uint8_t *)calloc(1, bytes);
             for (uint64_t i = 0; i < bytes; i += 7) h[i] = (uint8_t)(i * 31u);
-            pulsar_gpu_tensor_write(a.heads, TensorBytes{0}, h, TensorBytes{bytes});
+            pulsar_gpu_tensor_write(a.heads, TensorBytes{0u}, h, TensorBytes{bytes});
             free(h);
         }
         const double wbytes = ((double)L->attn_output_a->elements + (double)L->attn_output_b->elements) * 1.03;

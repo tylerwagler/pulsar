@@ -162,8 +162,8 @@ public:
 
 private:
     bool began_ = false;       ///< TOOL_BEGIN sent
-    BodyOff args_lo_ = BodyOff{0};   ///< where the arguments start (past the "{" / "("); 0 = not yet
-    BodyOff scan_ = BodyOff{0};      ///< bytes of the arguments scanned for quotes
+    BodyOff args_lo_ = BodyOff{0u};   ///< where the arguments start (past the "{" / "("); 0 = not yet
+    BodyOff scan_ = BodyOff{0u};      ///< bytes of the arguments scanned for quotes
     bool in_str_ = false;      ///< inside a <|"|> string: the next byte is payload
 };
 

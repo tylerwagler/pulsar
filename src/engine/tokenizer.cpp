@@ -1035,7 +1035,7 @@ bool pulsar_tokenize_rendered_chat_spans(pulsar_engine *e, const char *text,
 pulsar_text_span *pulsar_text_spans_slice(const pulsar_text_span *spans, uint32_t n_spans,
                                           TextBytes skip_bytes, TextBytes len_bytes, uint32_t *n_out) {
     if (n_out) *n_out = 0;
-    if (!spans || !n_spans || len_bytes == TextBytes{0}) return NULL;
+    if (!spans || !n_spans || len_bytes == TextBytes{0u}) return NULL;
     pulsar_text_span *out = (pulsar_text_span *)xmalloc((size_t)n_spans * sizeof *out);
     uint32_t k = 0;
     for (uint32_t i = 0; i < n_spans; i++)

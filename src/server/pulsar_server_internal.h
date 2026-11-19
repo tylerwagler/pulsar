@@ -3022,7 +3022,7 @@ struct server {
                     PULSAR_SESSION_POOL_CAP);
             abort();
         }
-        const BankId b{i.raw()};   /* the identity's one entry from a slot */
+        const BankId b = BankId::from_raw_unchecked(i.raw());   /* the identity's one entry from a slot */
         if (slots[i].provisioned && slots[i].bank != b) {
             fprintf(stderr, "pulsar-server: slot %u does not hold bank %d (slot i == bank i broken) -- refusing\n",
                     i.raw(), b.raw());
@@ -4941,7 +4941,7 @@ typedef enum {
 struct kit_gen {
     out_parser *parser = nullptr;    ///< owned: the family's configured parser (its create's)
     std::vector<out_event> ev;       ///< scratch, reused per feed
-    GenOff fed = GenOff{0};          ///< bytes of g->text fed to the parser
+    GenOff fed = GenOff{0u};          ///< bytes of g->text fed to the parser
     tool_calls calls = {};           ///< completed calls, ids assigned, in emission order
     bool finished = false;           ///< the end of the turn was fed (the finish did it)
     bool stream_ok = true;           ///< no client write failed while projecting
@@ -4956,16 +4956,16 @@ struct kit_gen {
      *  a copy of `parser` fed every byte of g->text as it is generated, so the turn's end is known at the token that
      *  closes its first call and not `stops.max_len - 1` bytes later.  NULL until that turn's first feed. */
     out_parser *ahead = nullptr;
-    GenOff ahead_fed = GenOff{0};    ///< bytes of g->text `ahead` has read
+    GenOff ahead_fed = GenOff{0u};    ///< bytes of g->text `ahead` has read
     /** L428: the turn's first call closed -- well formed, naming a declared tool -- at `call_end`; the family's
      *  call_tail is read from there. */
     bool call_closed = false;
-    GenOff call_end = GenOff{0};     ///< one past that call's closing marker in g->text
-    GenBytes tail_at = GenBytes{0};  ///< bytes of the family's call_tail read after it (a length: ahead_fed - call_end)
+    GenOff call_end = GenOff{0u};     ///< one past that call's closing marker in g->text
+    GenBytes tail_at = GenBytes{0u};  ///< bytes of the family's call_tail read after it (a length: ahead_fed - call_end)
     /** L428: the turn ends at `cut_at`: past the call and the family's call_tail, or at the call's close when the
      *  model wrote something else there. */
     bool cut = false;
-    GenOff cut_at = GenOff{0};       ///< where the turn's text ends in g->text; `parser` reads no further
+    GenOff cut_at = GenOff{0u};       ///< where the turn's text ends in g->text; `parser` reads no further
     /** L430: this kit_gen is a probe (parser_kit_probe_new): the state it was taken from, whose parsers lent it
      *  their open call bodies (out_parser::probe).  NULL for an attempt's own state. */
     kit_gen *lender = nullptr;

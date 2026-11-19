@@ -3241,7 +3241,7 @@ bool server::bank_unspill(BankId bank, spilled_history *was) {
     /* the host view is the bank's history as it was spilled (its carry); its rows are gone with the physical */
     const pulsar_tokens *hist = pulsar_session_tokens(pool);
     if (was && hist && hist->len > 0) {
-        TextBytes len{0};
+        TextBytes len{0u};
         was->text = render_tokens_text(s->engine, hist, &len);
         /* L281: the bank's own image records are what its chain must carry back */
         const int n_img = pulsar_session_image_hashes(pool, was->hashes, PULSAR_IMAGE_BLOCKS_MAX);
@@ -3599,7 +3599,7 @@ bool server::worker_readmit_preempted() {
         /* L328 (5): its KV and the next quantum's growth of every decoder stepping once it is back */
         const KvBytes want = server_readmit_need(
                 v->preempt_bytes, n_decoding,
-                pulsar_session_quantum_growth_bytes_per_bank(pool, KvRows{PULSAR_SERVER_DECODE_QUANTUM_TOKENS}));
+                pulsar_session_quantum_growth_bytes_per_bank(pool, KvRows::from_raw_unchecked(PULSAR_SERVER_DECODE_QUANTUM_TOKENS)));
         const prompt_kv_verdict pv = server_prompt_kv_verdict(s->kv_reserved_bytes(v), want,
                                                               s->guard_budget(), drop, n_victims, busy, &n_spill);
         /* L372 (O12): no idle chat bank makes the room -- the judge bank's KV may; the next pass decides again */
@@ -5359,7 +5359,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             st->first_token = first_tok[q];
             st->row0 = row0s[q];
             st->accepted = accepted[q];
-            st->accepted_cap = TokCount{PULSAR_SPEC_LOGITS_ROWS + 1};
+            st->accepted_cap = TokCount::from_raw_unchecked(PULSAR_SPEC_LOGITS_ROWS + 1);
         }
         (void)pulsar_session_spec_round_end_batch(pool, steps, m);
         const double end_t1 = pulsar_mono_sec();
@@ -5474,7 +5474,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 session_slot *sl = dec[live_idx[q]];
                 if (!rounds[live_idx[q]] || !sl->gen || sl->gen->phase != GEN_DECODE) continue;
                 live_rounds[nl] = rounds[live_idx[q]];
-                live_banks[nl] = BankId{pulsar_bank_index(sl->bank)};   /* fatal on none(), as before */
+                live_banks[nl] = BankId::from_raw_unchecked(pulsar_bank_index(sl->bank));   /* fatal on none(), as before */
                 live_rngs[nl] = &sl->gen->rng;
                 live_slots[nl] = sl;
                 nl++;
@@ -6231,7 +6231,7 @@ void *server_worker_main(void *arg) {
         /* L284 lane cost: where the spec lane could carry every decoder, the faster lane by measured price takes
          * them (lane_price_pick, one rule for every family) */
         /* the verify width: the rows one verify step heads (the engine's uint32) */
-        const StepRows verify_rows{pulsar_engine_fused_heads_max(s->engine)};
+        const StepRows verify_rows = StepRows::from_raw_unchecked(pulsar_engine_fused_heads_max(s->engine));
         const bool spec_carries = s->pool_banks.any() &&
                                   server_spec_lane_carries(pulsar_engine_has_spec_rounds(s->engine), verify_rows,
                                                            dec, n_dec);

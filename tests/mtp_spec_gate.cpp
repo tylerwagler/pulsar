@@ -286,12 +286,12 @@ static void batched_lane(pulsar_engine *e, const std::vector<pulsar_tokens> &P, 
             st[m].rng = &rngs[b];
             st[m].max_tokens = TokCount{n - (int)got[b].size()};
             st[m].k_alloc = TokCount{-1};
-            st[m].accepted_cap = TokCount{PULSAR_SPEC_LOGITS_ROWS + 1};
+            st[m].accepted_cap = TokCount::from_raw_unchecked(PULSAR_SPEC_LOGITS_ROWS + 1);
             bank_of[m++] = (uint32_t)b;
         }
         if (m == 0) break;
         StepRows step_rows{0};
-        (void)pulsar_session_spec_assemble_batch(s, st, m, StepRows{width}, reqs.data(), &step_rows);
+        (void)pulsar_session_spec_assemble_batch(s, st, m, StepRows::from_raw_unchecked(width), reqs.data(), &step_rows);
         const uint32_t rows = (uint32_t)step_rows.raw();   /* decode_mixed's row count */
         /* as the server's lane: a bank whose base is a stop token emits it and ends (never evaluated); a bank
          * over the row budget sits the tick out untouched; the rest verify (a deep chain -- the drafter's cap 7,
@@ -322,7 +322,7 @@ static void batched_lane(pulsar_engine *e, const std::vector<pulsar_tokens> &P, 
         if (!ok) break;
         for (int i = 0; i < m; i++) {
             st[i].accepted = acc[i];
-            st[i].accepted_cap = TokCount{PULSAR_SPEC_LOGITS_ROWS + 1};
+            st[i].accepted_cap = TokCount::from_raw_unchecked(PULSAR_SPEC_LOGITS_ROWS + 1);
             /* row j: the token after the base (position got.size()) and j drafts */
             st[i].temperature = temp;
             st[i].greedy_rows = 0u;
@@ -347,7 +347,7 @@ static void batched_lane(pulsar_engine *e, const std::vector<pulsar_tokens> &P, 
         pulsar_spec_round *rr[NB];
         uint64_t *rp[NB];
         BankId rb[NB];
-        for (int i = 0; i < m; i++) { rr[i] = rd[bank_of[i]]; rp[i] = &rngs[bank_of[i]]; rb[i] = BankId{bank_of[i]}; }
+        for (int i = 0; i < m; i++) { rr[i] = rd[bank_of[i]]; rp[i] = &rngs[bank_of[i]]; rb[i] = BankId::from_raw_unchecked(bank_of[i]); }
         ok = pulsar_session_spec_redraft_batch(s, rr, rb, rp, m, err, sizeof(err)) == 0 &&
              pulsar_session_spec_redraft_commit_batch(s, st, m) == 0;
     }

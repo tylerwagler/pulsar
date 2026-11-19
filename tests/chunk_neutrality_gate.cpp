@@ -170,7 +170,7 @@ static int segment_round_trip(pulsar_engine *e, pulsar_session **sp, const pulsa
     if (!(st = pulsar_segstore_open(dir, 0, model, NULL, NULL))) { snprintf(err, errlen, "segment store reopen failed"); goto out; }
     if (pulsar_session_create(sp, e, GATE_CTX) != 0) { snprintf(err, errlen, "session create failed"); goto out; }
     {
-        TextBytes tl{0};
+        TextBytes tl{0u};
         char *full = pulsar_kvtext_render_tokens_text(e, prompt, &tl);
         pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
         int loaded = 0;

@@ -126,7 +126,7 @@ static_assert(!std::is_convertible_v<uint32_t, TrunkLayer> && !std::is_convertib
                   !std::is_convertible_v<uint32_t, TpSlot> && !std::is_convertible_v<TpSlot, uint64_t> &&
                   !std::is_convertible_v<TrunkLayer, bool>,
               "a layer index converts to and from no integer implicitly");
-static_assert(std::is_constructible_v<TrunkLayer, uint32_t> && std::is_constructible_v<LayerSlot, int> &&
+static_assert(std::is_constructible_v<TrunkLayer, uint32_t> && std::is_constructible_v<LayerSlot, unsigned> &&   /* L445: no int */
                   std::is_constructible_v<KindOrd, uint8_t> && !std::is_constructible_v<TrunkLayer, bool> &&
                   !std::is_constructible_v<LayerSlot, double> && !std::is_constructible_v<DraftLayer, float>,
               "a layer index enters from an integer, explicitly; bool and floating point are refused");
@@ -157,7 +157,7 @@ static_assert(TrunkLayer{5u}.raw() == 5u && TrunkLayer{5u}.next().raw() == 6u &&
               "below is <, last_of is + 1 ==, next is + 1");
 static_assert(TrunkLayer::none().raw() == UINT32_MAX && TrunkLayer::none().is_none() && !TrunkLayer{0u}.is_none() &&
                   !TrunkLayer::none().below(UINT32_MAX) && TrunkLayer{UINT32_MAX}.is_none() &&
-                  TrunkLayer{-1} == TrunkLayer::none() && TrunkLayer::none() == TrunkLayer::none(),
+                  TrunkLayer::from_raw_unchecked(-1) == TrunkLayer::none() && TrunkLayer::none() == TrunkLayer::none(),
               "none() is all ones -- the UINT32_MAX / PULSAR_NO_LAYER the fields carried -- and is below nothing");
 /* the typed signatures the series' hazards sat in */
 static_assert(std::is_same_v<decltype(pulsar_layer_plan_check), const char *(const pulsar_layer_plan *, TrunkLayer *)> &&

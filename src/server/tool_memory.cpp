@@ -311,7 +311,7 @@ static void live_tool_state_clear_locked(live_tool_state *st) {
     stop_list_clear(&st->call_ids);
     free(st->visible_text);
     st->visible_text = NULL;
-    st->visible_len = TextBytes{0};
+    st->visible_len = TextBytes{0u};
     st->valid = false;
     st->live_tokens = TokCount{0};
 }
@@ -335,7 +335,7 @@ static void visible_live_clear_locked(visible_live_state *st) {
     if (!st) return;
     free(st->visible_text);
     st->visible_text = NULL;
-    st->visible_len = TextBytes{0};
+    st->visible_len = TextBytes{0u};
     st->live_tokens = TokCount{0};
     st->valid = false;
 }

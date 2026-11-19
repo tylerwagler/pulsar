@@ -125,7 +125,7 @@ static inline bool gate_width_inexact(int rows) { return rows > pulsar_gpu_matmu
 static inline bool gate_bank_sync(pulsar_session *s, uint32_t bank, const TokId *v, int len, int *argtok,
                                   const char *what) {
     char err[256] = "";
-    if (pulsar_session_bank_repoint(s, BankId{bank}) != 0) {
+    if (pulsar_session_bank_repoint(s, BankId::from_raw_unchecked(bank)) != 0) {
         fprintf(stderr, "%s: bank %u repoint failed\n", what, bank);
         return false;
     }
@@ -135,7 +135,7 @@ static inline bool gate_bank_sync(pulsar_session *s, uint32_t bank, const TokId 
         fprintf(stderr, "%s: bank %u sync failed: %s\n", what, bank, err);
         return false;
     }
-    pulsar_session_bank_state_save(s, BankId{bank});
+    pulsar_session_bank_state_save(s, BankId::from_raw_unchecked(bank));
     if (argtok) *argtok = pulsar_session_argmax(s).raw();
     return true;
 }

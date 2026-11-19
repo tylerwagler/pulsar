@@ -370,12 +370,12 @@ bool pulsar_state_step_begin(pulsar_state_set *ss, bool verify) {
         const int32_t g0 = (int32_t)(ss->cap_gen * ss->verify_rows), g1 = g0 + (int32_t)ss->verify_rows;
         for (uint32_t b = 0; b < ss->n_banks; b++) {
             const int32_t row = ss->fold_host[1 + 2 * b];
-            if (ss->fold_host[2 + 2 * b] > 0 && row >= g0 && row < g1 && !pulsar_state_fold_flush(ss, BankId{b}))
+            if (ss->fold_host[2 + 2 * b] > 0 && row >= g0 && row < g1 && !pulsar_state_fold_flush(ss, BankId::from_raw_unchecked(b)))
                 return false;
         }
         ss->fold_host[0] = g0;
     }
-    if (!pulsar_gpu_tensor_write_async(ss->fold_dev, TensorBytes{0}, ss->fold_host,
+    if (!pulsar_gpu_tensor_write_async(ss->fold_dev, TensorBytes{0u}, ss->fold_host,
                                        bytes_of<int32_t>((uint64_t)(1u + 2u * ss->n_banks)))) {
         fprintf(stderr, "pulsar: %s: the fold table upload failed\n", ss->plan->name);
         return false;
@@ -770,7 +770,7 @@ pulsar_state_set *pulsar_state_create(const void *engine, const pulsar_state_pla
     /* the grid checkpoints, ckpt_slots x the walk's bytes a bank -- priced with the rest under the dry run */
     if (ok) ok = pulsar_ckpt_alloc(&ss->ckpt, &ss->ops, ss, n_banks);
     for (uint32_t b = 0; ok && b < n_banks; b++) {
-        ok = pulsar_state_reset_bank(ss, BankId{b});
+        ok = pulsar_state_reset_bank(ss, BankId::from_raw_unchecked(b));
         if (!ok) fprintf(stderr, "pulsar: %s: could not clear bank %u's state\n", plan->name, b);
     }
     if (!ok) {

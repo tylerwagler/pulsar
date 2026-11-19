@@ -68,7 +68,7 @@ int main(int argc, char **argv) {
         n_full += full;
     }
     check(plan_ok, "plan: %u layers (%s), %u window (%u keys) + %u full, every layer dense MLP + MoE, from layer_types",
-          p->n_layer, pulsar_layer_kind_name(p->kind[TrunkLayer{0}]), p->n_layer - n_full, s->window, n_full);
+          p->n_layer, pulsar_layer_kind_name(p->kind[TrunkLayer{0u}]), p->n_layer - n_full, s->window, n_full);
     TrunkLayer at{0u};
     check(pulsar_layer_plan_check(p, &at) == NULL, "the plan's invariants hold (PULSAR_FFN_DENSE_MOE admitted)");
 
@@ -95,7 +95,7 @@ int main(int argc, char **argv) {
     check(slots, "every slot bound: embed, output_norm, head (the pack's EXL3), and each layer's (no attn_v on a global "
                  "layer)");
     check(exl3_type_k2(w->head->type) > 0, "the head is EXL3 (rate K%d: the Turing build's head)", exl3_type_k2(w->head->type) / 2);
-    const pulsar_gemma4_block &L0 = w->layer[TrunkLayer{0}];
+    const pulsar_gemma4_block &L0 = w->layer[TrunkLayer{0u}];
     check(pulsar_gemma4_ff_stored(s) == 2176 && pulsar_gemma4_ff_exp_stored(s) == 768 &&
               L0.ffn_down->dim[0] == 2176 && L0.exp_down->dim[0] == 768 && L0.exp_gate->dim[1] == 768 &&
               L0.exp_gate->dim[2] == s->n_expert,

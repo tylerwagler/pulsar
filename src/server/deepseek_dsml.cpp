@@ -360,7 +360,7 @@ void dsml_decode_tracker_update(dsml_decode_tracker *dt,
                     dt->decode = DSML_DECODE_STRUCTURAL;
                     return;
                 }
-                dt->pos += GenBytes{1};
+                dt->pos += GenBytes{1u};
             }
             dt->decode = DSML_DECODE_STRING_BODY;
             return;
@@ -382,7 +382,7 @@ void dsml_decode_tracker_update(dsml_decode_tracker *dt,
                 }
 
                 unsigned char c = (unsigned char)raw[walk_ix(dt->pos)];
-                dt->pos += GenBytes{1};
+                dt->pos += GenBytes{1u};
                 if (dt->json_in_string) {
                     if (dt->json_escaped) {
                         dt->json_escaped = false;
@@ -403,7 +403,7 @@ void dsml_decode_tracker_update(dsml_decode_tracker *dt,
 structural:
         while (dt->mode == DSML_TRACK_STRUCTURAL) {
             while (walk_ix(dt->pos) < raw_len && isspace((unsigned char)raw[walk_ix(dt->pos)]))
-                dt->pos += GenBytes{1};
+                dt->pos += GenBytes{1u};
             if (walk_ix(dt->pos) >= raw_len) {
                 dt->decode = DSML_DECODE_STRUCTURAL;
                 return;
@@ -1453,7 +1453,7 @@ bool dsml_tool_stream_update(dsml_tool_stream *ts, chat_sink *k,
     while (ts->active && walk_ix(ts->parse_pos) < raw_len) {
         if (ts->state == DSML_TOOL_BETWEEN_INVOKES) {
             while (walk_ix(ts->parse_pos) < raw_len && isspace((unsigned char)raw[walk_ix(ts->parse_pos)]))
-                ts->parse_pos += GenBytes{1};
+                ts->parse_pos += GenBytes{1u};
             if (walk_ix(ts->parse_pos) >= raw_len) return true;
             if (raw_full_lit(raw, raw_len, walk_ix(ts->parse_pos), syn->tool_calls_end)) {
                 ts->parse_pos += GenBytes{strlen(syn->tool_calls_end)};
@@ -1475,7 +1475,7 @@ bool dsml_tool_stream_update(dsml_tool_stream *ts, chat_sink *k,
 
         if (ts->state == DSML_TOOL_BETWEEN_PARAMS) {
             while (walk_ix(ts->parse_pos) < raw_len && isspace((unsigned char)raw[walk_ix(ts->parse_pos)]))
-                ts->parse_pos += GenBytes{1};
+                ts->parse_pos += GenBytes{1u};
             if (walk_ix(ts->parse_pos) >= raw_len) return true;
             if (raw_full_lit(raw, raw_len, walk_ix(ts->parse_pos), syn->invoke_end)) {
                 if (!dsml_tool_close_invoke(ts, k)) return false;

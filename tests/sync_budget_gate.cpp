@@ -91,13 +91,13 @@ static void run(pulsar_engine *e, int NB, float temp, int rounds_max, bool repor
             st[m].rng = &rngs[b];
             st[m].max_tokens = TokCount{1 << 20};
             st[m].k_alloc = TokCount{-1};
-            st[m].accepted_cap = TokCount{PULSAR_SPEC_LOGITS_ROWS + 1};
+            st[m].accepted_cap = TokCount::from_raw_unchecked(PULSAR_SPEC_LOGITS_ROWS + 1);
             bank_of[m++] = (uint32_t)b;
         }
         pulsar_gpu_sync_stats c0, c1, c2, c3, c4;
         pulsar_gpu_sync_stats_get(&c0);
         StepRows step_rows{0};
-        (void)pulsar_session_spec_assemble_batch(s, st, m, StepRows{width}, reqs.data(), &step_rows);
+        (void)pulsar_session_spec_assemble_batch(s, st, m, StepRows::from_raw_unchecked(width), reqs.data(), &step_rows);
         const uint32_t rows = (uint32_t)step_rows.raw();   /* decode_mixed's row count */
         pulsar_gpu_sync_stats_get(&c1);
         int live = 0;
@@ -123,7 +123,7 @@ static void run(pulsar_engine *e, int NB, float temp, int rounds_max, bool repor
         if (!ok) break;
         for (int i = 0; i < m; i++) {
             st[i].accepted = acc[i];
-            st[i].accepted_cap = TokCount{PULSAR_SPEC_LOGITS_ROWS + 1};
+            st[i].accepted_cap = TokCount::from_raw_unchecked(PULSAR_SPEC_LOGITS_ROWS + 1);
         }
         ok = pulsar_session_spec_round_end_batch(s, st, m) == 0;
         pulsar_gpu_sync_stats_get(&c3);
@@ -135,7 +135,7 @@ static void run(pulsar_engine *e, int NB, float temp, int rounds_max, bool repor
         pulsar_spec_round *rr[32];
         uint64_t *rp[32];
         BankId rb[32];
-        for (int i = 0; i < m; i++) { rr[i] = rd[bank_of[i]]; rp[i] = &rngs[bank_of[i]]; rb[i] = BankId{bank_of[i]}; }
+        for (int i = 0; i < m; i++) { rr[i] = rd[bank_of[i]]; rp[i] = &rngs[bank_of[i]]; rb[i] = BankId::from_raw_unchecked(bank_of[i]); }
         ok = pulsar_session_spec_redraft_batch(s, rr, rb, rp, m, err, sizeof(err)) == 0 &&
              pulsar_session_spec_redraft_commit_batch(s, st, m) == 0;
         pulsar_gpu_sync_stats_get(&c4);

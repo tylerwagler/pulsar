@@ -298,7 +298,7 @@ static bool run_built(pulsar_tp_plan *p, const pulsar_tp_slice *s, const char *h
         return true;
     }
     pulsar_gpu_tensor *g = pulsar_gpu_tensor_alloc(TensorBytes{b.size()});
-    if (!g || !pulsar_gpu_tensor_write(g, TensorBytes{0}, b.data(), TensorBytes{b.size()})) {
+    if (!g || !pulsar_gpu_tensor_write(g, TensorBytes{0u}, b.data(), TensorBytes{b.size()})) {
         pulsar_gpu_tensor_free(g);
         return false;
     }

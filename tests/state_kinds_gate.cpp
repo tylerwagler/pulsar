@@ -72,11 +72,11 @@ static void plan_inkling(pulsar_state_plan *p) {
     p->split_invariant = true;
     p->ckpt_slots = 2;
     pulsar_state_plan_add(p, {"sconv", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_SNAPSHOT, false, false, 0, TensorBytes{SCONV_BYTES},
-                              TensorBytes{0}, SlabOff{0}, NULL, NULL, NULL});
+                              TensorBytes{0u}, SlabOff{0u}, NULL, NULL, NULL});
     pulsar_state_plan_add(p, {"kv_global", PULSAR_STATE_POOL, PULSAR_STATE_CAPTURE_NONE, false, false, 1, TensorBytes{KV_ROW},
                               TensorBytes{}, SlabOff{}, NULL, NULL, NULL});
     pulsar_state_plan_add(p, {"kv_window", PULSAR_STATE_RING, PULSAR_STATE_CAPTURE_NONE, false, false, WINDOW, TensorBytes{KV_ROW},
-                              TensorBytes{0}, SlabOff{0}, NULL, NULL, NULL});
+                              TensorBytes{0u}, SlabOff{0u}, NULL, NULL, NULL});
     p->n_trunk = p->n_slots = 42;
     for (uint32_t il = 0; il < 42; il++)
         p->slot[LayerSlot{il}] = 1u << A_SCONV | (il % 6 == 5 ? 1u << A_KV_GLOBAL : 1u << A_KV_WINDOW);
@@ -98,7 +98,7 @@ static void plan_a(void) {
     pulsar_gpu_tensor_dry_begin();
     pulsar_state_set *d = pulsar_state_create(NULL, &p, NULL, banks, ctx, PULSAR_STATE_VERIFY_ROWS);
     if (d) pulsar_state_destroy(d);
-    TensorBytes dry_b{0}, managed_b{0};
+    TensorBytes dry_b{0u}, managed_b{0u};
     pulsar_gpu_tensor_dry_end(&dry_b, &managed_b);
     dry = dry_b.raw();
     managed = managed_b.raw();
@@ -111,9 +111,9 @@ static void plan_a(void) {
           (unsigned long long)dry);
     check(managed == (uint64_t)banks * 7 * ctx * KV_ROW, "demand-paged %llu B == banks x 7 global layers x ctx x 4 KiB",
           (unsigned long long)managed);
-    check(pulsar_state_pool_bytes_at(ss, KvRows{1000}) == KvBytes{7ull * 1000 * KV_ROW},
+    check(pulsar_state_pool_bytes_at(ss, KvRows{1000u}) == KvBytes{7ull * 1000 * KV_ROW},
           "a bank's 1000 touched tokens: %llu B of pool",
-          (unsigned long long)pulsar_state_pool_bytes_at(ss, KvRows{1000}).raw());
+          (unsigned long long)pulsar_state_pool_bytes_at(ss, KvRows{1000u}).raw());
     const uint64_t slot = 42 * SCONV_BYTES + 35 * ring;
     check(ss->ckpt.slot_bytes.raw() == ((slot + 255u) & ~255ull), "a checkpoint slot: every SConv state and ring (%llu B)",
           (unsigned long long)ss->ckpt.slot_bytes.raw());
@@ -222,20 +222,20 @@ static void plan_others(pulsar_state_plan *p) {
     p->ckpt_slots = 1;
     pulsar_state_plan_add(p, {"stage", PULSAR_STATE_STAGED, PULSAR_STATE_CAPTURE_STAGE, false, false, 4, TensorBytes{STAGE_ROW},
                               TensorBytes{STAGE_REC}, SlabOff{STAGE_OFF}, NULL, NULL, NULL});
-    pulsar_state_plan_add(p, {"pool", PULSAR_STATE_POOL, PULSAR_STATE_CAPTURE_NONE, false, false, 4, TensorBytes{256}, TensorBytes{0}, SlabOff{0}, NULL,
+    pulsar_state_plan_add(p, {"pool", PULSAR_STATE_POOL, PULSAR_STATE_CAPTURE_NONE, false, false, 4, TensorBytes{256u}, TensorBytes{0u}, SlabOff{0u}, NULL,
                               NULL, NULL});
     pulsar_state_plan_add(p, {"delta", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_DELTA, false, false, 0, TensorBytes{DELTA_BYTES},
-                              TensorBytes{DELTA_UPD}, SlabOff{0}, delta_commit, NULL, NULL});
-    pulsar_state_plan_add(p, {"host", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_REPLAY, true, false, 0, TensorBytes{8}, TensorBytes{0}, SlabOff{0}, NULL,
+                              TensorBytes{DELTA_UPD}, SlabOff{0u}, delta_commit, NULL, NULL});
+    pulsar_state_plan_add(p, {"host", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_REPLAY, true, false, 0, TensorBytes{8u}, TensorBytes{0u}, SlabOff{0u}, NULL,
                               host_replay, host_init});
-    pulsar_state_plan_add(p, {"trail", PULSAR_STATE_POOL, PULSAR_STATE_CAPTURE_NONE, false, false, 1, TensorBytes{128}, TensorBytes{0}, SlabOff{0}, NULL,
+    pulsar_state_plan_add(p, {"trail", PULSAR_STATE_POOL, PULSAR_STATE_CAPTURE_NONE, false, false, 1, TensorBytes{128u}, TensorBytes{0u}, SlabOff{0u}, NULL,
                               NULL, NULL});
     p->n_trunk = 3;
     p->n_slots = 4;
-    p->slot[LayerSlot{0}] = 1u << B_DELTA;
-    p->slot[LayerSlot{1}] = 1u << B_STAGE | 1u << B_POOL;
-    p->slot[LayerSlot{2}] = 1u << B_DELTA;
-    p->slot[LayerSlot{3}] = 1u << B_STAGE | 1u << B_TRAIL;   /* the drafter slot: no capture, a trailing pool */
+    p->slot[LayerSlot{0u}] = 1u << B_DELTA;
+    p->slot[LayerSlot{1u}] = 1u << B_STAGE | 1u << B_POOL;
+    p->slot[LayerSlot{2u}] = 1u << B_DELTA;
+    p->slot[LayerSlot{3u}] = 1u << B_STAGE | 1u << B_TRAIL;   /* the drafter slot: no capture, a trailing pool */
     p->session = 1u << B_HOST;
 }
 
@@ -368,7 +368,7 @@ static void plan_b(void) {
     bad.decl[B_STAGE].capture_off = SlabOff{STAGE_REC};
     check(!pulsar_state_create(NULL, &bad, NULL, 1, 64, 0), "a STAGE record without room for its row: refused");
     plan_others(&bad);
-    bad.slot[LayerSlot{0}] |= 1u << B_HOST;
+    bad.slot[LayerSlot{0u}] |= 1u << B_HOST;
     check(!pulsar_state_create(NULL, &bad, NULL, 1, 64, 0), "host state on a layer slot: refused");
     plan_others(&bad);
     bad.decl[B_DELTA].commit = NULL;

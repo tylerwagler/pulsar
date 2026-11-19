@@ -458,7 +458,7 @@ static void part_banks(pulsar_engine *e, int W) {
         const uint64_t t0 = pulsar_session_bank_touched_kv_bytes(s, BankId{0}).raw();
         const uint64_t t1 = pulsar_session_bank_touched_kv_bytes(s, BankId{1}).raw();
         const uint64_t all = pulsar_session_touched_kv_bytes(s).raw();
-        const uint64_t q = pulsar_session_quantum_growth_bytes_per_bank(s, KvRows{8}).raw();
+        const uint64_t q = pulsar_session_quantum_growth_bytes_per_bank(s, KvRows{8u}).raw();
         CHECK(t0 > 0 && t1 > 0 && all >= t0 + t1 && q > 0,
               "B5 touched KV per bank %llu / %llu B, session %llu B, an 8-token quantum %llu B",
               (unsigned long long)t0, (unsigned long long)t1, (unsigned long long)all, (unsigned long long)q);
@@ -991,7 +991,7 @@ static std::vector<uint8_t> declared_bank_state(pulsar_session *s, uint32_t b, i
     if (!ss) return out;
     /* L339: the bank's state is its tensors with its pending delta rows applied (state_kinds.h THE FOLD) -- a reader
      * outside a trunk step flushes first */
-    if (!pulsar_state_fold_flush(s->states, BankId{b}) || !pulsar_gpu_synchronize()) return out;
+    if (!pulsar_state_fold_flush(s->states, BankId::from_raw_unchecked(b)) || !pulsar_gpu_synchronize()) return out;
     const pulsar_state_plan *p = ss->plan;
     bool ok = true;
     auto grab = [&](const pulsar_gpu_tensor *t, uint64_t off, uint64_t n) {
@@ -1008,7 +1008,7 @@ static std::vector<uint8_t> declared_bank_state(pulsar_session *s, uint32_t b, i
                 const uint64_t bb = pulsar_state_decl_bank_bytes(d).raw();
                 grab(pulsar_state_tensor(ss, LayerSlot{k}, id), b * bb, bb);
             } else if (d->tokens == 1u) {   /* the row the token at pos wrote (a one-token pool: the KV) */
-                grab(pulsar_state_pool(ss, LayerSlot{k}, id, BankId{b}), (uint64_t)pos / d->tokens * d->bytes.raw(), d->bytes.raw());
+                grab(pulsar_state_pool(ss, LayerSlot{k}, id, BankId::from_raw_unchecked(b)), (uint64_t)pos / d->tokens * d->bytes.raw(), d->bytes.raw());
             }
         }
     }
@@ -1028,7 +1028,7 @@ static bool spec_lane_round(pulsar_session *s, const uint32_t *banks, const int 
     std::vector<pulsar_multiseq_req> reqs(width);
     for (int i = 0; i < n; i++) {
         memset(&st[i], 0, sizeof st[i]);
-        st[i].bank = BankId{banks[i]};
+        st[i].bank = BankId::from_raw_unchecked(banks[i]);
         st[i].round = rounds[i];
         st[i].top_p = 1.0f;
         st[i].rng = &rngs[i];
@@ -1037,7 +1037,7 @@ static bool spec_lane_round(pulsar_session *s, const uint32_t *banks, const int 
         st[i].accepted_cap = TokCount{k_alloc[i] >= 0 ? k_alloc[i] + 1 : (int)(PULSAR_SPEC_LOGITS_ROWS + 1)};
     }
     StepRows step_rows{0};
-    const bool assembled = pulsar_session_spec_assemble_batch(s, st, n, StepRows{width}, reqs.data(), &step_rows) == 0;
+    const bool assembled = pulsar_session_spec_assemble_batch(s, st, n, StepRows::from_raw_unchecked(width), reqs.data(), &step_rows) == 0;
     const uint32_t rows = (uint32_t)step_rows.raw();   /* decode_mixed's row count */
     if (!assembled || rows == 0) {
         snprintf(err, errlen, "assemble refused (%u rows)", rows);
@@ -1059,14 +1059,14 @@ static bool spec_lane_round(pulsar_session *s, const uint32_t *banks, const int 
         const StepRow row0 = st[i].row0;
         const int first = st[i].first_token.raw();
         memset(&st[i], 0, sizeof st[i]);
-        st[i].bank = BankId{banks[i]};
+        st[i].bank = BankId::from_raw_unchecked(banks[i]);
         st[i].round = rounds[i];
         st[i].top_p = 1.0f;
         st[i].rng = &rngs[i];
         st[i].first_token = TokId{first};
         st[i].row0 = row0;
         st[i].accepted = acc[i];
-        st[i].accepted_cap = TokCount{PULSAR_SPEC_LOGITS_ROWS + 1};
+        st[i].accepted_cap = TokCount::from_raw_unchecked(PULSAR_SPEC_LOGITS_ROWS + 1);
     }
     if (pulsar_session_spec_round_end_batch(s, st, n) != 0) {
         snprintf(err, errlen, "round_end refused");
@@ -1085,13 +1085,13 @@ static bool spec_lane_round(pulsar_session *s, const uint32_t *banks, const int 
 /* `bank`'s logits as it stands, then after each of kDecode decoded plain */
 static std::vector<std::vector<float>> decode_after(pulsar_session *s, uint32_t bank, int W, char *err, size_t errlen) {
     std::vector<std::vector<float>> out;
-    if (!pulsar_session_bank_state_restore(s, BankId{bank})) return out;
+    if (!pulsar_session_bank_state_restore(s, BankId::from_raw_unchecked(bank))) return out;
     out.push_back(logits_of(s, W));
     for (int t = 0; t < 4; t++) {
         if (pulsar_session_eval(s, TokId{kDecode[t]}, err, errlen) != 0) { out.clear(); break; }
         out.push_back(logits_of(s, W));
     }
-    pulsar_session_bank_state_save(s, BankId{bank});
+    pulsar_session_bank_state_save(s, BankId::from_raw_unchecked(bank));
     return out;
 }
 
@@ -1113,11 +1113,11 @@ static pulsar_session *s2_session(pulsar_engine *e, const pulsar_tokens *const *
     pulsar_session *s = NULL;
     if (pulsar_session_create(&s, e, 4096) != 0 || !s) return NULL;
     for (uint32_t b = 0; b < pool; b++) {
-        if (!pulsar_session_bank_state_restore(s, BankId{b}) || pulsar_session_sync(s, prompts[b], err, errlen) != 0) {
+        if (!pulsar_session_bank_state_restore(s, BankId::from_raw_unchecked(b)) || pulsar_session_sync(s, prompts[b], err, errlen) != 0) {
             pulsar_session_free(s);
             return NULL;
         }
-        pulsar_session_bank_state_save(s, BankId{b});
+        pulsar_session_bank_state_save(s, BankId::from_raw_unchecked(b));
     }
     return s;
 }

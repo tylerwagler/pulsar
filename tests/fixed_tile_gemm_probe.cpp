@@ -50,7 +50,7 @@ static void fill_rand(pulsar_gpu_tensor *t, uint64_t n_floats, uint32_t seed) {
         s = s * 1664525u + 1013904223u;
         h[i] = ((float)(s >> 8) / 16777216.0f - 0.5f) * 2.0f;
     }
-    pulsar_gpu_tensor_write(t, TensorBytes{0}, h.data(), bytes_of<float>(n_floats));
+    pulsar_gpu_tensor_write(t, TensorBytes{0u}, h.data(), bytes_of<float>(n_floats));
 }
 
 typedef struct {
@@ -105,7 +105,7 @@ static double time_launches(launch_fn fn, void *ctx, uint32_t M, int reps) {
 
 static bool read_out(const pulsar_gpu_tensor *t, std::vector<float> &h, uint64_t n) {
     h.resize(n);
-    return pulsar_gpu_tensor_read(t, TensorBytes{0}, h.data(), bytes_of<float>(n)) != 0;
+    return pulsar_gpu_tensor_read(t, TensorBytes{0u}, h.data(), bytes_of<float>(n)) != 0;
 }
 
 static double max_abs_diff(const std::vector<float> &a, const std::vector<float> &b, uint64_t n) {

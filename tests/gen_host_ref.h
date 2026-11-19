@@ -321,7 +321,7 @@ inline int gen_turn_draft_prefix_text_ref(const gen_state *g, const char *const 
         if (!pieces[i]) break;
         buf_append(&text, pieces[i], piece_lens[i]);
         size_t stop_pos = 0, stop_len = 0;
-        GenOff end{0};   /* L437 plumbing: the typed hook's out-parameter (not read) */
+        GenOff end{0u};   /* L437 plumbing: the typed hook's out-parameter (not read) */
         bool hit_stop = false;
         const size_t upto = gen_release_ref(&req->stops, text.ptr, text.len, pieces[i], piece_lens[i],
                                             plain_stream_pos, &thinking, &stop_scan_from, &hit_stop, &stop_pos,

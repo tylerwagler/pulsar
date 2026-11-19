@@ -59,10 +59,10 @@ int main(void) {
         std::vector<uint16_t> back(carrier_bytes / 2, 0);
         pulsar_gpu_tensor *d = pulsar_gpu_tensor_alloc(TensorBytes{carrier_bytes});
         int bad = 0;
-        if (!d || !pulsar_gpu_tensor_write(d, TensorBytes{0}, carrier.data(), TensorBytes{carrier_bytes}) ||
+        if (!d || !pulsar_gpu_tensor_write(d, TensorBytes{0u}, carrier.data(), TensorBytes{carrier_bytes}) ||
             !gpu_graph_write_vision_span(d, rows.data(), n_rows, row0, n_tokens) ||
             !pulsar_gpu_end_commands() ||
-            !pulsar_gpu_tensor_read(d, TensorBytes{0}, back.data(), TensorBytes{carrier_bytes})) {
+            !pulsar_gpu_tensor_read(d, TensorBytes{0u}, back.data(), TensorBytes{carrier_bytes})) {
             printf("FAIL launch/copy failed\n");
             failures++;
         } else {
@@ -112,7 +112,7 @@ int main(void) {
         };
         int bad = 0;
         for (const Refuse &c : cases) {
-            if (!pulsar_gpu_tensor_write(d, TensorBytes{0}, carrier.data(),
+            if (!pulsar_gpu_tensor_write(d, TensorBytes{0u}, carrier.data(),
                                          TensorBytes{carrier_bytes})) { bad++; break; }
             const bool got = gpu_graph_write_vision_span(d, c.r, c.rows_n, c.at, c.ntok);
             pulsar_gpu_end_commands();
@@ -123,7 +123,7 @@ int main(void) {
             }
             if (!got) {
                 /* a refused call must not have touched the carrier */
-                if (!pulsar_gpu_tensor_read(d, TensorBytes{0}, back.data(),
+                if (!pulsar_gpu_tensor_read(d, TensorBytes{0u}, back.data(),
                                             TensorBytes{carrier_bytes})) { bad++; break; }
                 for (size_t i = 0; i < back.size(); i++) {
                     if (back[i] != FILL) {
@@ -133,7 +133,7 @@ int main(void) {
                     }
                 }
             } else {
-                if (!pulsar_gpu_tensor_read(d, TensorBytes{0}, back.data(),
+                if (!pulsar_gpu_tensor_read(d, TensorBytes{0u}, back.data(),
                                             TensorBytes{carrier_bytes})) { bad++; break; }
                 if (elem(back, c.at, 0, 0) != rows[0]) {
                     printf("FAIL %-24s did not write row %u\n", c.name, c.at);

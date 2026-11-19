@@ -123,7 +123,7 @@ static bool ckpt_out(pulsar_ckpt_store *st, const ckpt_place &p, bool frontier, 
     const uint32_t done[2] = {p.ticket, k};
     return pulsar_gpu_lane_order(st->lane, k) != 0 &&
            st->ops->walk(st->state, 0, frontier, st->stage[k], SlabOff{}, pulsar_ckpt_pos(G), NULL) &&
-           pulsar_gpu_lane_d2h(st->lane, st->stage[k], TensorBytes{0}, p.host, p.bytes, done, 2u) != 0;
+           pulsar_gpu_lane_d2h(st->lane, st->stage[k], TensorBytes{0u}, p.host, p.bytes, done, 2u) != 0;
 }
 
 /* `p` -> the installed bank's state at G.  Device tier: the walk from the slab.  Host tier: the session stream waits
@@ -142,7 +142,7 @@ static bool ckpt_in(pulsar_ckpt_store *st, const ckpt_place &p, bool frontier, u
     const uint32_t k = st->stage_next++ % PULSAR_CKPT_STAGES;
     *staged = k;
     return pulsar_gpu_lane_order(st->lane, k) != 0 &&
-           pulsar_gpu_lane_h2d(st->lane, st->stage[k], TensorBytes{0}, p.host, p.bytes, p.ticket) != 0 &&
+           pulsar_gpu_lane_h2d(st->lane, st->stage[k], TensorBytes{0u}, p.host, p.bytes, p.ticket) != 0 &&
            st->ops->walk(st->state, 1, frontier, st->stage[k], SlabOff{}, pulsar_ckpt_pos(G), NULL);
 }
 
@@ -157,7 +157,7 @@ static bool ckpt_copy(pulsar_ckpt_store *st, const ckpt_place &dst, const ckpt_p
     if (!st->host) return pulsar_gpu_tensor_copy_async(dst.slab, dst.off.before(), src.slab, src.off.before(),
                                                        src.bytes) != 0;
     const uint32_t done[2] = {dst.ticket, staged};
-    return pulsar_gpu_lane_d2h(st->lane, st->stage[staged], TensorBytes{0}, dst.host, src.bytes, done,
+    return pulsar_gpu_lane_d2h(st->lane, st->stage[staged], TensorBytes{0u}, dst.host, src.bytes, done,
                                2u) != 0;
 }
 
@@ -613,7 +613,7 @@ bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, BankId dst, BankId src, TokPos T_a
                  : st->ops->prepare_restore(st->state, pulsar_ckpt_pos(T));
     for (uint32_t i = 0; ok && i < n; i++) {
         const uint64_t rows = (uint64_t)pulsar_comp_rows_cover(TokCount{(int)T}, sp[i].tokens_per_row).raw();
-        ok = pulsar_gpu_tensor_copy_async(dp[i].rows, TensorBytes{0}, sp[i].rows, TensorBytes{0},
+        ok = pulsar_gpu_tensor_copy_async(dp[i].rows, TensorBytes{0u}, sp[i].rows, TensorBytes{0u},
                                           sp[i].row_bytes.times(rows)) != 0;
     }
     uint32_t staged = 0;

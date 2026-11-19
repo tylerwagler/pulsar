@@ -142,12 +142,12 @@ static int start_reset(pulsar_session *s, const start_state *st, char *err, size
  * a rewind-based reset came within 92% but not to identity (compressor state,
  * drafter window), so the payload load is the reset where the family has one. */
 static int bank_reset(pulsar_session *s, uint32_t b, const start_state *st, char *err, size_t errlen) {
-    if (pulsar_session_bank_repoint(s, BankId{b}) != 0) {
+    if (pulsar_session_bank_repoint(s, BankId::from_raw_unchecked(b)) != 0) {
         snprintf(err, errlen, "bank %u repoint failed", b);
         return -1;
     }
     if (start_reset(s, st, err, errlen) != 0) return -1;
-    pulsar_session_bank_state_save(s, BankId{b});
+    pulsar_session_bank_state_save(s, BankId::from_raw_unchecked(b));
     return 0;
 }
 
@@ -199,7 +199,7 @@ static int sampled_plain_batch(pulsar_session *s, const start_state *snap,
         pulsar_row_draw d[SAMPLED_BANKS_PLAIN];
         TokId drawn[SAMPLED_BANKS_PLAIN];
         for (uint32_t q = 0; q < m; q++) {
-            qrow[q] = HeadRow{q};
+            qrow[q] = HeadRow::from_raw_unchecked(q);
             d[q] = pulsar_row_draw{temp, 0, top_p, min_p, &rng[who[q]], false, NULL};
         }
         if (pulsar_session_draw_rows(s, qrow, d, m, drawn) != 0) {

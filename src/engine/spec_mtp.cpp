@@ -191,7 +191,7 @@ bool pulsar_mtp_absorb(pulsar_session *s, pulsar_step_mode mode, const TokId *to
     if (mode == PULSAR_STEP_PREFILL) {
         const uint32_t b = (uint32_t)bank[0].raw();   /* the driver's forward checked the step's banks */
         if (parked_before(l, b, TokPos{pos[0]})) {
-            ok = pulsar_gpu_tensor_copy_async(l->cond, TensorBytes{0}, pend, cb.times(b),
+            ok = pulsar_gpu_tensor_copy_async(l->cond, TensorBytes{0u}, pend, cb.times(b),
                                               cb) != 0;
             mt[k] = tokens[0]; mp[k] = pos[0] - 1; mb[k] = bank[0]; k++;
         }
@@ -523,7 +523,7 @@ uint32_t pulsar_mtp_draft(pulsar_session *s, TokId next_base, float temperature,
     pulsar_spec_draft_req_init(s, &rec, next_base, temperature, top_k, top_p, min_p);
     char err[200];
     spec_redraft_req *req = &rec;
-    const BankId b = BankId{pulsar_bank_index(s->states->live_bank)};   /* fatal on none(), before the chains */
+    const BankId b = BankId::from_raw_unchecked(pulsar_bank_index(s->states->live_bank));   /* fatal on none(), before the chains */
     if (!mtp_draft_chains(s, &b, &rng, &req, 1, err, sizeof err)) {
         /* L306 (the block drafter's rule, block_draft): the round refuses, as the batched lane's does
          * (pulsar_mtp_draft_batch) -- no plain round */

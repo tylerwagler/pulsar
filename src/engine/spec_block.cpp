@@ -804,7 +804,7 @@ draft_layout draft_of(const pulsar_block_drafter *d) {
     L.scores = o; o += a256(elt_bytes(NB * SL * d->topk * d->topk, 4u));
     L.chain_ids = o; o += a256(elt_bytes(NB * SL, 4u));
     L.chain_rows = o; o += a256(elt_bytes(NB * SL, 4u));
-    L.nf = o; o += TensorBytes{256};
+    L.nf = o; o += TensorBytes{256u};
     if (d->head_kind == PULSAR_BLOCK_HEAD_LILICORR) {
         L.pass = o; o += a256(elt_bytes(NB * SL * E, 2u));
         L.anchor = o; o += a256(elt_bytes(NB * E, 2u));
@@ -1760,7 +1760,7 @@ uint32_t block_draft(pulsar_session *s, TokId next_base, float temperature, int 
     pulsar_spec_draft_req_init(s, &rec, next_base, temperature, top_k, top_p, min_p);
     char err[200];
     spec_redraft_req *req = &rec;
-    const BankId b = BankId{pulsar_bank_index(s->states->live_bank)};   /* fatal on none(), before the chains */
+    const BankId b = BankId::from_raw_unchecked(pulsar_bank_index(s->states->live_bank));   /* fatal on none(), before the chains */
     if (!draft_chains(s, &b, &rng, &req, 1, err, sizeof err)) {
         /* L306: the round refuses, as the batched lane's does (block_draft_batch) -- no plain round */
         fprintf(stderr, "pulsar: block drafter: %s -- the round refuses\n", err);

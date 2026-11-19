@@ -444,7 +444,7 @@ void server::canonicalize_tool_checkpoint(session_slot *sl,
     if (common == live_len && canonical.len == live_len) goto done;
 
     TextBytes live_text_len;
-    live_text_len = TextBytes{0};
+    live_text_len = TextBytes{0u};
     char *live_text;
     live_text = render_tokens_text(s->engine, pulsar_session_tokens(s->sess), &live_text_len);
     if (live_text_len == TextBytes{rendered.len} &&
@@ -1931,8 +1931,8 @@ void server::gen_decode_init(session_slot *sl) {
     gen_state *g = sl->gen;
     job *j = g->j;
     buf_free(&g->text);
-    g->plain_stream_pos = GenOff{0};
-    g->stop_scan_from = GenOff{0};
+    g->plain_stream_pos = GenOff{0u};
+    g->stop_scan_from = GenOff{0u};
     g->finish = "length";
     g->abandoned = false;
     g->turn_cut_short = false;
@@ -2169,7 +2169,7 @@ struct gen_walk {
     /// @return false when a stop string ends the stream at this token (the probe was fed nothing)
     bool step(const char *piece, size_t n) {
         buf_append(&g->text, piece, n);
-        GenOff stop_pos{0};
+        GenOff stop_pos{0u};
         size_t stop_len = 0;
         bool hit_stop = false;
         const GenOff upto = gen_release(&g->j->req.stops, g->text.ptr, g->text.len, piece, n, plain_stream_pos,
@@ -2243,7 +2243,7 @@ TokCount gen_turn_draft_prefix_text(gen_state *g, const char *const *pieces, con
     if (n <= 0 || !req->single_tool_call || req->kind != REQ_CHAT || !req->has_tools || !g->parser_st) return n_drafts;
     gen_walk w(g);
     for (int i = 0; i <= n; i++) {   /* pieces[0] is the base, pieces[i] draft i - 1 */
-        GenOff end{0};
+        GenOff end{0u};
         if (!pieces[i] || !w.step(pieces[i], piece_lens[i])) break;
         if (g->parser->turn_complete(w.probe, g, &end)) return TokCount{i};   /* the drafts before piece i */
     }
@@ -2322,7 +2322,7 @@ bool server::gen_emit_piece(gen_state *g, TokId token, const char *piece, size_t
                    "distribution after %d tokens; logprobs dropped for this request",
                    g->ctx_span, g->completion.raw());
     }
-    GenOff stop_pos{0};
+    GenOff stop_pos{0u};
     size_t stop_len = 0;
     bool hit_stop = false;
     const bool was_inside = g->thinking.inside;   /* L344: the token's side of the block */

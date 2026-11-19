@@ -136,7 +136,7 @@ static bool bank_load(pulsar_session *s, uint32_t bank, int k, const char *what)
     if (!g_snapshots)
         return gate_bank_sync(s, bank, g_toks.v + g_prompt_off[k], g_prompt_len[k], NULL, what);
     char err[256];
-    if (pulsar_session_bank_repoint(s, BankId{bank}) != 0) {
+    if (pulsar_session_bank_repoint(s, BankId::from_raw_unchecked(bank)) != 0) {
         fprintf(stderr, "%s: bank %u repoint failed\n", what, bank);
         return false;
     }
@@ -145,7 +145,7 @@ static bool bank_load(pulsar_session *s, uint32_t bank, int k, const char *what)
         fprintf(stderr, "%s: bank %u load of prompt %d failed: %s\n", what, bank, k, err);
         return false;
     }
-    pulsar_session_bank_state_save(s, BankId{bank});
+    pulsar_session_bank_state_save(s, BankId::from_raw_unchecked(bank));
     return true;
 }
 

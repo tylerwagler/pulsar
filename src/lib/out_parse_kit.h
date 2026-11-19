@@ -254,11 +254,11 @@ private:
     /// @param ev      receives the fragment
     void stream_args(const std::string &b, bool closing, int index, std::vector<out_event> *ev);
 
-    BodyOff pos_ = BodyOff{0};  ///< bytes of the body scanned
+    BodyOff pos_ = BodyOff{0u};  ///< bytes of the body scanned
     int depth_ = 0;             ///< object / array depth at pos_
     bool in_str_ = false;       ///< inside a string literal
     bool esc_ = false;          ///< the previous byte was a backslash in it
-    BodyOff str_lo_ = BodyOff{0};   ///< where the open string literal starts (its quote)
+    BodyOff str_lo_ = BodyOff{0u};   ///< where the open string literal starts (its quote)
     std::string key_;           ///< the last depth-1 string closed (a member key until its value starts)
     bool want_value_ = false;   ///< a depth-1 ':' was seen: the next value is key_'s
     std::string value_key_;     ///< the member whose value is being read at depth 1
@@ -266,7 +266,7 @@ private:
     std::string name_;          ///< its decoded text
     BodyOff args_lo_ = BodyOff::none();   ///< where the "args" object starts (none(): not yet)
     BodyOff args_hi_ = BodyOff::none();   ///< one past its closing "}" (none(): not yet)
-    GenBytes args_sent_ = GenBytes{0};    ///< args bytes streamed (from args_lo_): a length
+    GenBytes args_sent_ = GenBytes{0u};    ///< args bytes streamed (from args_lo_): a length
     bool began_ = false;        ///< TOOL_BEGIN sent
     /// The next byte is inside a string at depth >= 2 (the args value), with no closer held: payload.
     bool payload_ = false;
@@ -421,14 +421,14 @@ private:
     /// The machine's current state.
     out_state state_ = OUT_CONTENT;
     std::string hold_;         ///< bytes not yet classified
-    StreamOff fed_ = StreamOff{0};   ///< the stream's end: bytes fed so far; hold_ is the stream's unclassified tail
+    StreamOff fed_ = StreamOff{0u};   ///< the stream's end: bytes fed so far; hold_ is the stream's unclassified tail
     std::string header_;       ///< HEADER's buffered text
-    StreamOff header_at_ = StreamOff{0};   ///< stream offset of the current header's text (past the marker that opened it)
+    StreamOff header_at_ = StreamOff{0u};   ///< stream offset of the current header's text (past the marker that opened it)
     bool block_seen_ = false;  ///< a call opened: raw_lo_ is set
-    StreamOff raw_lo_ = StreamOff{0};    ///< stream offset of the first call's bytes
-    StreamOff call_at_ = StreamOff{0};   ///< stream offset of the marker that opened the first call
+    StreamOff raw_lo_ = StreamOff{0u};    ///< stream offset of the first call's bytes
+    StreamOff call_at_ = StreamOff{0u};   ///< stream offset of the marker that opened the first call
     md_code_scan code_;        ///< L419: the current CONTENT / REASONING section's Markdown code state
-    StreamOff raw_hi_ = StreamOff{0};    ///< stream offset past the last call's closer
+    StreamOff raw_hi_ = StreamOff{0u};    ///< stream offset past the last call's closer
     section sec_[2];           ///< [0] content, [1] reasoning
     std::string block_;        ///< the open call's body
     /// The next call's index (counts malformed calls too).
@@ -451,7 +451,7 @@ private:
     };
     bool lent_out_ = false;     ///< L430: a probe() holds this parser's block_ until probe_end(); it is not fed meanwhile
     loan_t loan_ = LOAN_NONE;   ///< L430: this parser is a probe()
-    GenBytes loan_len_ = GenBytes{0};   ///< L430: the borrowed body's length when it was lent
+    GenBytes loan_len_ = GenBytes{0u};   ///< L430: the borrowed body's length when it was lent
     std::string parked_;        ///< L430: the borrowed body, set aside (LOAN_PARKED)
 };
 

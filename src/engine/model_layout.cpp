@@ -345,7 +345,7 @@ bool pulsar_attn_layout_install(const uint32_t *ratios_raw,
             pulsar_load_refuse();
             return false;
         }
-        if (a->uses_candidates && g_pulsar_attn_layout[TrunkLayer{candidate_source}].kv_source != a->kv_source) {
+        if (a->uses_candidates && g_pulsar_attn_layout[TrunkLayer::from_raw_unchecked(candidate_source)].kv_source != a->kv_source) {
             /* The mask is over the candidate source's compressed positions; it
              * only means something to an indexer scoring the same cache. */
             fprintf(stderr, "pulsar: layer %u would apply layer %d's candidate mask to a different KV cache\n",

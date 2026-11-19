@@ -264,8 +264,8 @@ int main(int argc, char **argv) {
         std::vector<float> w((size_t)rows * g.topk);
         const int launched =
             dlog && dtok && dsel && dw &&
-            pulsar_gpu_tensor_write(dlog, TensorBytes{0}, c.logits.data(), logits_bytes) &&
-            pulsar_gpu_tensor_write(dtok, TensorBytes{0}, c.tokens.data(), bytes_of<int32_t>(rows)) &&
+            pulsar_gpu_tensor_write(dlog, TensorBytes{0u}, c.logits.data(), logits_bytes) &&
+            pulsar_gpu_tensor_write(dtok, TensorBytes{0u}, c.tokens.data(), bytes_of<int32_t>(rows)) &&
             /* The merged signature: the branch's tid2eid arm makes "hash mode"
              * a ROW COUNT rather than a flag (0 = no table), and dev's image
              * bias rides at the end.  A hash case passes its table offset and row
@@ -280,8 +280,8 @@ int main(int argc, char **argv) {
                                                   MapOff{c.has_vl_bias ? stride * ci + VL_OFF : 0u},
                                                   g.n_vocab, c.has_vl_bias != 0) &&
             pulsar_gpu_end_commands() &&
-            pulsar_gpu_tensor_read(dsel, TensorBytes{0}, idx.data(), bytes_of<int32_t>(idx.size())) &&
-            pulsar_gpu_tensor_read(dw, TensorBytes{0}, w.data(), bytes_of<float>(w.size()));
+            pulsar_gpu_tensor_read(dsel, TensorBytes{0u}, idx.data(), bytes_of<int32_t>(idx.size())) &&
+            pulsar_gpu_tensor_read(dw, TensorBytes{0u}, w.data(), bytes_of<float>(w.size()));
         if (!launched) {
             printf("FAIL %-32s: launch/copy failed\n", c.name);
             failures++;

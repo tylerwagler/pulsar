@@ -45,7 +45,7 @@ bool pulsar_driver_tp_allreduce(const pulsar_driver_step *st, TpSlot slot, pulsa
     pulsar_driver_state *d = st->buf;
     if (!d->tp) return true;
     const pulsar_tp_rows x = {d->tp, d->tp_slab_dev, d->tp_bulk_dev, d->tp_ticket, &d->tp_seq, width};
-    pulsar_gpu_tensor *v = pulsar_gpu_tensor_view(y, TensorBytes{0}, bytes_of<float>((uint64_t)st->n_rows * width));
+    pulsar_gpu_tensor *v = pulsar_gpu_tensor_view(y, TensorBytes{0u}, bytes_of<float>((uint64_t)st->n_rows * width));
     const bool ok = v && pulsar_tp_allreduce_rows(&x, slot, st->n_rows, v, NULL, what);
     pulsar_gpu_tensor_free(v);
     return ok;
@@ -141,7 +141,7 @@ int pulsar_driver_session_create(pulsar_session *s, uint32_t n_banks) {
         d->tp = e->tp;
         d->tp_slab_dev = e->tp_slab_dev;
         d->tp_bulk_dev = e->tp_bulk_dev;
-        ok = d->tp_ticket && pulsar_gpu_tensor_write(d->tp_ticket, TensorBytes{0}, &zero, TensorBytes{sizeof(zero)});
+        ok = d->tp_ticket && pulsar_gpu_tensor_write(d->tp_ticket, TensorBytes{0u}, &zero, TensorBytes{sizeof(zero)});
         if (!ok) fprintf(stderr, "pulsar: %s: the TP stage ticket is missing\n", ARCH(e));
     }
     if (!ok) {
@@ -356,12 +356,12 @@ static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const TokId
      * every recurrent op of the step applies first -- before the uploads; L289: enqueued, not waited for -- the
      * step's uploads never drain the stream */
     bool ok = pulsar_state_step_begin(ss, st.verify) &&
-              pulsar_gpu_tensor_write_async(d->row_pos, TensorBytes{0}, pos, bytes_of<int32_t>(n_rows)) != 0 &&
-              pulsar_gpu_tensor_write_async(d->row_bank, TensorBytes{0}, bank, bytes_of<int32_t>(n_rows)) != 0;
+              pulsar_gpu_tensor_write_async(d->row_pos, TensorBytes{0u}, pos, bytes_of<int32_t>(n_rows)) != 0 &&
+              pulsar_gpu_tensor_write_async(d->row_bank, TensorBytes{0u}, bank, bytes_of<int32_t>(n_rows)) != 0;
     int32_t rf[PULSAR_DRIVER_HEADS_MAX + 1];
     if (ok && n_vruns > 1) {   /* a ragged verify's runs (the recurrent ops read them on the device) */
         for (uint32_t k = 0; k <= n_vruns; k++) rf[k] = (int32_t)run_first[k];
-        ok = pulsar_gpu_tensor_write_async(d->run_first_dev, TensorBytes{0}, rf,
+        ok = pulsar_gpu_tensor_write_async(d->run_first_dev, TensorBytes{0u}, rf,
                                            bytes_of<int32_t>((uint64_t)(n_vruns + 1u))) != 0;
     }
     /* L296 perf: the family's host half (every upload the launches read), and what its launches depend on */
@@ -459,7 +459,7 @@ static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const TokId
         }
     }
     if (ok && heads.n && logits_out)
-        ok = pulsar_gpu_tensor_read(d->logits, TensorBytes{0}, logits_out,
+        ok = pulsar_gpu_tensor_read(d->logits, TensorBytes{0u}, logits_out,
                                     bytes_of<float>((uint64_t)heads.n * e->logits_width())) != 0;
     return ok;
 }

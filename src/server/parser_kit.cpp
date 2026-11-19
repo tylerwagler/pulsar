@@ -77,7 +77,7 @@ static void kit_read_ahead(kit_gen *q, const gen_state *g, const char *text, siz
     }
     const char *tail = r->family->call_tail;
     const GenOff end = gen_text_end(len);
-    const GenBytes one{1};
+    const GenBytes one{1u};
     /* the next byte of the family's call_tail to match (tail_at is a length of the tail, not an offset of the text) */
     auto tail_next = [&]() { return tail[q->tail_at.raw()]; };
     std::vector<out_event> ev;
@@ -363,7 +363,7 @@ bool parser_kit_finish(void *st, server *s, session_slot *sl, gen_state *g, serv
     out->reasoning = p.reasoning().empty() ? NULL : server_xstrdup(p.reasoning().c_str());
     out->calls = q->calls;
     memset(&q->calls, 0, sizeof(q->calls));
-    StreamOff span_lo{0}, span_hi{0};
+    StreamOff span_lo{0u}, span_hi{0u};
     /* the sampled bytes are the tool memory's key only when they are exactly the kept calls: a dropped
      * undeclared call is in them, so that turn re-renders canonically (a prefix miss, never a wrong prompt) */
     if (out->calls.len && q->undeclared == 0 && p.raw_span(&span_lo, &span_hi)) {

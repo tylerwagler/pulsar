@@ -33,7 +33,7 @@ int main() {
                 pulsar_segstore_foreach_trailer(st, [](FILE *fp, uint64_t bytes, const char *text, TextBytes len,
                                                        void *ud) {
                     char b[5];
-                    if (bytes != 5 || fread(b, 1, 5, fp) != 5 || memcmp(b, "TRAIL", 5) != 0 || len == TextBytes{0} ||
+                    if (bytes != 5 || fread(b, 1, 5, fp) != 5 || memcmp(b, "TRAIL", 5) != 0 || len == TextBytes{0u} ||
                         text[0] != 'r') {
                         fprintf(stderr, "a walk read a wrong entry\n");
                         abort();
@@ -47,7 +47,7 @@ int main() {
 
     /* the worker: a root and leaves appear and go, as commit and eviction do */
     char err[256], root[41], key[41];
-    if (!pulsar_segstore_put(st, "", TokPos{0}, TokPos{128}, "root", TextBytes{4}, 256, write_payload, 5, write_trailer,
+    if (!pulsar_segstore_put(st, "", TokPos{0}, TokPos{128}, "root", TextBytes{4u}, 256, write_payload, 5, write_trailer,
                              NULL, root, err, sizeof err)) {
         fprintf(stderr, "put: %s\n", err);
         return 2;

@@ -710,7 +710,7 @@ bool agent_worker_show_history(agent_worker *w, int user_turns,
         snprintf(err, err_len, "model is busy");
         return false;
     }
-    TextBytes text_len{0};
+    TextBytes text_len{0u};
     char *text = pulsar_kvtext_render_tokens_text(w->engine, &w->transcript,
                                                 &text_len);
     if (!text) {
@@ -932,7 +932,7 @@ static bool agent_worker_find_session(agent_worker *w, const char *prefix,
 /// @return bytes released (pulsar_segstore_release); 0 with no store or nothing to release
 static uint64_t agent_session_release_kv(agent_worker *w, const agent_session_file *f) {
     if (!w->kv || f->tokens.len <= 0) return 0;
-    TextBytes text_len{0};
+    TextBytes text_len{0u};
     char *text = pulsar_kvtext_render_tokens_text(w->engine, &f->tokens, &text_len);
     pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
     const int n = text ? pulsar_segstore_lookup(w->kv, text, text_len, NULL, chain, PULSAR_KVCHAIN_MAX) : 0;

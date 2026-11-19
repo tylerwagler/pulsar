@@ -70,8 +70,8 @@ static bool ds4_walk(void *state, int dir, bool frontier, pulsar_gpu_tensor *sla
     auto lane = [&](pulsar_gpu_tensor *t) {
         if (!t || !ok) return;
         const TensorBytes lb = pulsar_gpu_tensor_bytes(t);
-        if (dir == 0) ok = pulsar_gpu_tensor_copy_async(slab, off.before(), t, TensorBytes{0}, lb) != 0;
-        else if (dir > 0) ok = pulsar_gpu_tensor_copy_async(t, TensorBytes{0}, slab, off.before(), lb) != 0;
+        if (dir == 0) ok = pulsar_gpu_tensor_copy_async(slab, off.before(), t, TensorBytes{0u}, lb) != 0;
+        else if (dir > 0) ok = pulsar_gpu_tensor_copy_async(t, TensorBytes{0u}, slab, off.before(), lb) != 0;
         off += lb;
     };
     /* The window's positions [G - n, G): the first one's slot in the ring, and how many run before the wrap. */
@@ -83,11 +83,11 @@ static bool ds4_walk(void *state, int dir, bool frontier, pulsar_gpu_tensor *sla
         const TensorBytes at = (off + raw_row.times(skip)).before();
         if (dir == 0 && n) {
             ok = pulsar_gpu_tensor_copy_async(slab, at, raw, raw_row.times(first), raw_row.times(run)) != 0 &&
-                 (run == n || pulsar_gpu_tensor_copy_async(slab, at + raw_row.times(run), raw, TensorBytes{0},
+                 (run == n || pulsar_gpu_tensor_copy_async(slab, at + raw_row.times(run), raw, TensorBytes{0u},
                                                            raw_row.times(n - run)) != 0);
         } else if (dir > 0 && n) {
             ok = pulsar_gpu_tensor_copy_async(raw, raw_row.times(first), slab, at, raw_row.times(run)) != 0 &&
-                 (run == n || pulsar_gpu_tensor_copy_async(raw, TensorBytes{0}, slab, at + raw_row.times(run),
+                 (run == n || pulsar_gpu_tensor_copy_async(raw, TensorBytes{0u}, slab, at + raw_row.times(run),
                                                            raw_row.times(n - run)) != 0);
         }
         off += raw_row.times(W);
@@ -103,17 +103,17 @@ static bool ds4_walk(void *state, int dir, bool frontier, pulsar_gpu_tensor *sla
      * views, and their counters as a host tail -- the state the next speculative round drafts from (Qwen's MTP
      * stage and pending row are its slot's).  A grid checkpoint does not carry it: a resume re-captures the
      * prompt window as its prefill runs. */
-    if (frontier && g->dspark_raw_cache[DraftLayer{0}]) {
+    if (frontier && g->dspark_raw_cache[DraftLayer{0u}]) {
         for (int i = 0; i < 3; i++) {
-            lane(g->dspark_raw_cache[DraftLayer{i}]);
+            lane(g->dspark_raw_cache[DraftLayer::from_raw_unchecked(i)]);
             lane(g->dspark_prompt_h[i]);
         }
-        uint32_t c[5] = { g->dspark_n_raw[DraftLayer{0}], g->dspark_n_raw[DraftLayer{1}], g->dspark_n_raw[DraftLayer{2}], g->dspark_prompt_n,
+        uint32_t c[5] = { g->dspark_n_raw[DraftLayer{0u}], g->dspark_n_raw[DraftLayer{1u}], g->dspark_n_raw[DraftLayer{2u}], g->dspark_prompt_n,
                           g->dspark_prompt_lo };
         if (ok && dir == 0) ok = pulsar_gpu_tensor_write(slab, off.before(), c, TensorBytes{sizeof(c)}) != 0;
         else if (ok && dir > 0) {
             ok = pulsar_gpu_tensor_read(slab, off.before(), c, TensorBytes{sizeof(c)}) != 0;
-            for (int i = 0; ok && i < 3; i++) g->dspark_n_raw[DraftLayer{i}] = c[i];
+            for (int i = 0; ok && i < 3; i++) g->dspark_n_raw[DraftLayer::from_raw_unchecked(i)] = c[i];
             if (ok) { g->dspark_prompt_n = c[3]; g->dspark_prompt_lo = c[4]; }
         }
         off += TensorBytes{sizeof(c)};
@@ -216,7 +216,7 @@ static bool ds4_prepare_restore(void *state, TokPos G) {
 /** pulsar_kv_state_ops::history_replaced.  @param state the graph */
 static void ds4_history_replaced(void *state) {
     pulsar_gpu_graph *g = G_(state);
-    for (int i = 0; i < 3; i++) g->dspark_n_raw[DraftLayer{i}] = 0;
+    for (int i = 0; i < 3; i++) g->dspark_n_raw[DraftLayer::from_raw_unchecked(i)] = 0;
     g->dspark_prompt_n = 0;
 }
 

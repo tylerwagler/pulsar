@@ -262,8 +262,8 @@ static dev_out route(const router_case &rc, const std::vector<float> &lg, const 
                           *tw = pulsar_gpu_tensor_alloc(bytes_of<float>((uint64_t)T * K)),
                           *tp = pulsar_gpu_tensor_alloc(bytes_of<float>((uint64_t)T * E)),
                           *tt = pulsar_gpu_tensor_alloc(bytes_of<int32_t>(T));
-        pulsar_gpu_tensor_write(tl, TensorBytes{0}, lg.data(), bytes_of<float>((uint64_t)T * E));
-        pulsar_gpu_tensor_write(tt, TensorBytes{0}, tok.data(), bytes_of<int32_t>(T));
+        pulsar_gpu_tensor_write(tl, TensorBytes{0u}, lg.data(), bytes_of<float>((uint64_t)T * E));
+        pulsar_gpu_tensor_write(tt, TensorBytes{0u}, tok.data(), bytes_of<int32_t>(T));
         const int ok = pulsar_gpu_router_select_batch_tensor(ts, tw, tp, g_map.data(), g_map.size(), MapOff{ob}, !l.bias.empty(),
                                                              MapOff{oh}, l.table.empty() ? 0 : (uint32_t)l.table_rows, tl, tt,
                                                              (uint32_t)E, (uint32_t)K, c.route_scale, (uint32_t)T, MapOff{ovl},
@@ -271,9 +271,9 @@ static dev_out route(const router_case &rc, const std::vector<float> &lg, const 
         o.rc = ok ? 0 : -1;
         o.sel.resize((size_t)T * K); o.w.resize((size_t)T * K); o.probs.resize((size_t)T * E);
         CK(cudaDeviceSynchronize());
-        pulsar_gpu_tensor_read(ts, TensorBytes{0}, o.sel.data(), bytes_of<int32_t>(o.sel.size()));
-        pulsar_gpu_tensor_read(tw, TensorBytes{0}, o.w.data(), bytes_of<float>(o.w.size()));
-        pulsar_gpu_tensor_read(tp, TensorBytes{0}, o.probs.data(), bytes_of<float>(o.probs.size()));
+        pulsar_gpu_tensor_read(ts, TensorBytes{0u}, o.sel.data(), bytes_of<int32_t>(o.sel.size()));
+        pulsar_gpu_tensor_read(tw, TensorBytes{0u}, o.w.data(), bytes_of<float>(o.w.size()));
+        pulsar_gpu_tensor_read(tp, TensorBytes{0u}, o.probs.data(), bytes_of<float>(o.probs.size()));
         pulsar_gpu_tensor_free(tl); pulsar_gpu_tensor_free(ts); pulsar_gpu_tensor_free(tw);
         pulsar_gpu_tensor_free(tp); pulsar_gpu_tensor_free(tt);
         return o;

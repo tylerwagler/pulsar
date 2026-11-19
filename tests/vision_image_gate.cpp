@@ -133,7 +133,7 @@ int main(int argc, char **argv) {
         pulsar_vision_request vreq = { &img, 1, e };
 
         int bad = 0;
-        if (!pulsar_gpu_tensor_write(sess->graph->batch_cur_hc, TensorBytes{0}, fill.data(),
+        if (!pulsar_gpu_tensor_write(sess->graph->batch_cur_hc, TensorBytes{0u}, fill.data(),
                                      bytes_of<uint16_t>((uint64_t)fill.size())))
             { printf("FAIL case %u: carrier write failed\n", c); failures++; continue; }
 
@@ -144,7 +144,7 @@ int main(int argc, char **argv) {
             continue;
         }
         if (!pulsar_gpu_end_commands() ||
-            !pulsar_gpu_tensor_read(sess->graph->batch_cur_hc, TensorBytes{0}, back.data(),
+            !pulsar_gpu_tensor_read(sess->graph->batch_cur_hc, TensorBytes{0u}, back.data(),
                                     bytes_of<uint16_t>((uint64_t)fill.size()))) {
             printf("  FAIL case %u: carrier read failed\n", c);
             failures++;

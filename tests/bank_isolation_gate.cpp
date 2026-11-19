@@ -63,7 +63,7 @@ static iso_run run_script(pulsar_engine *e, const pulsar_tokens *story, int len0
     const int len[N_BANKS] = {len0, bank_len[1], bank_len[2]};
     bool ok = gate_bank_pool_fits(s, (int)N_BANKS);
     for (uint32_t b = 0; ok && b < N_BANKS; b++) ok = gate_bank_sync(s, b, story->v + bank_off[b], len[b], NULL, what);
-    ok = ok && pulsar_session_bank_state_restore(s, BankId{IDLE_BANK});
+    ok = ok && pulsar_session_bank_state_restore(s, BankId::from_raw_unchecked(IDLE_BANK));
     const uint32_t slots = gate_state_slots(s);
     if (ok && slots == 0) {
         fprintf(stderr, "%s: %s has no declared state (state_kinds.h) -- this gate grades it\n", what,
@@ -77,7 +77,7 @@ static iso_run run_script(pulsar_engine *e, const pulsar_tokens *story, int len0
         pulsar_multiseq_req rq[2];
         for (int k = 0; k < 2; k++) {
             const uint32_t b = (uint32_t)(swap ? 1 - k : k);
-            rq[k] = {BankId{b}, TokPos{len[b] + t}, TokId{story->v[bank_off[b] + len[b] + t]}};
+            rq[k] = {BankId::from_raw_unchecked(b), TokPos{len[b] + t}, TokId{story->v[bank_off[b] + len[b] + t]}};
         }
         uint32_t n_out = 0;
         err[0] = '\0';

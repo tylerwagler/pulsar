@@ -97,11 +97,11 @@ static int check_topk_set_identity(void) {
             pulsar_gpu_tensor *scores = pulsar_gpu_tensor_alloc(bytes_of<float>((uint64_t)n_tokens * n_comp));
             pulsar_gpu_tensor *selected = pulsar_gpu_tensor_alloc(bytes_of<uint32_t>((uint64_t)n_tokens * top_k));
             int ok = scores && selected &&
-                     pulsar_gpu_tensor_write(scores, TensorBytes{0}, row2,
+                     pulsar_gpu_tensor_write(scores, TensorBytes{0u}, row2,
                                              bytes_of<float>((uint64_t)n_tokens * n_comp)) &&
                      pulsar_gpu_indexer_topk_tensor(selected, scores, n_comp, n_tokens, top_k) &&
                      pulsar_gpu_synchronize() &&
-                     pulsar_gpu_tensor_read(selected, TensorBytes{0}, got,
+                     pulsar_gpu_tensor_read(selected, TensorBytes{0u}, got,
                                             bytes_of<uint32_t>((uint64_t)n_tokens * top_k));
             pulsar_gpu_tensor_free(selected); pulsar_gpu_tensor_free(scores);
             if (!ok) { printf("topk set identity: n_comp=%u n_tokens=%u: launch FAILED\n", n_comp, n_tokens); rc = 1; continue; }
@@ -139,7 +139,7 @@ static int check_large_topk(void) {
     int rc = 1;
     double elapsed = 0.0;
     if (scores && selected &&
-        pulsar_gpu_tensor_write(scores, TensorBytes{0}, scores_host, bytes_of<float>(score_count))) {
+        pulsar_gpu_tensor_write(scores, TensorBytes{0u}, scores_host, bytes_of<float>(score_count))) {
         /* Exclude one-time CUDA module/kernel setup from the throughput guard. */
         if (!pulsar_gpu_indexer_topk_tensor(selected, scores, n_comp, n_tokens, top_k) ||
             !pulsar_gpu_synchronize()) {
@@ -150,7 +150,7 @@ static int check_large_topk(void) {
         if (pulsar_gpu_indexer_topk_tensor(selected, scores, n_comp, n_tokens, top_k) &&
             pulsar_gpu_synchronize()) {
             elapsed = monotonic_seconds() - t0;
-            rc = pulsar_gpu_tensor_read(selected, TensorBytes{0}, selected_host,
+            rc = pulsar_gpu_tensor_read(selected, TensorBytes{0u}, selected_host,
                                      bytes_of<uint32_t>((uint64_t)n_tokens * top_k)) ? 0 : 1;
         }
     }
@@ -234,12 +234,12 @@ static int check_decode_attention_one_row_long_comp(void) {
     int rc = 1;
     if (heads && q && raw && raw_f32 && comp && comp_f32 &&
         pulsar_gpu_tensor_write_q_f32(q, 0, q_host, q_count) &&
-        pulsar_gpu_tensor_write(raw_f32, TensorBytes{0}, raw_host, bytes_of<float>(raw_count)) &&
+        pulsar_gpu_tensor_write(raw_f32, TensorBytes{0u}, raw_host, bytes_of<float>(raw_count)) &&
         pulsar_gpu_store_raw_kv_batch_tensor(raw, raw_f32, n_raw, 0, n_raw,
                                             head_dim, NULL, NULL, 1) &&
-        pulsar_gpu_tensor_write(comp_f32, TensorBytes{0}, comp_host, bytes_of<float>(comp_count)) &&
+        pulsar_gpu_tensor_write(comp_f32, TensorBytes{0u}, comp_host, bytes_of<float>(comp_count)) &&
         pulsar_gpu_mainkv_pack_tensor(comp_f32, comp_f32, comp, 0, n_comp, head_dim) &&
-        pulsar_gpu_attention_decode_mixed_batch_heads_tensor(heads, sinks, n_head * sizeof(float), MapOff{0},
+        pulsar_gpu_attention_decode_mixed_batch_heads_tensor(heads, sinks, n_head * sizeof(float), MapOff{0u},
                                                              q, raw, comp,
                                                              1, pos0, n_raw, n_raw, 0, n_comp,
                                                              0, ratio, n_head, head_dim,
@@ -330,14 +330,14 @@ static int check_dspark_non_causal_attention(void) {
     int rc = 1;
     if (heads_c && heads_nc && q && raw && raw_f32 &&
         pulsar_gpu_tensor_write_q_f32(q, 0, q_host, (uint64_t)n_tokens * q_count) &&
-        pulsar_gpu_tensor_write(raw_f32, TensorBytes{0}, raw_host, bytes_of<float>(raw_count)) &&
+        pulsar_gpu_tensor_write(raw_f32, TensorBytes{0u}, raw_host, bytes_of<float>(raw_count)) &&
         pulsar_gpu_store_raw_kv_batch_tensor(raw, raw_f32, raw_cap, 0, n_raw,
                                             head_dim, NULL, NULL, 1)) {
 
         int ok_c = pulsar_gpu_attention_decode_raw_batch_heads_tensor(heads_c,
                                                                     sinks,
                                                                     n_head * sizeof(float),
-                                                                    MapOff{0},
+                                                                    MapOff{0u},
                                                                     q,
                                                                     raw,
                                                                     n_tokens, 0,
@@ -348,7 +348,7 @@ static int check_dspark_non_causal_attention(void) {
         int ok_nc = pulsar_gpu_attention_decode_raw_batch_heads_tensor(heads_nc,
                                                                      sinks,
                                                                      n_head * sizeof(float),
-                                                                     MapOff{0},
+                                                                     MapOff{0u},
                                                                      q,
                                                                      raw,
                                                                      n_tokens, 0,
@@ -525,7 +525,7 @@ static int check_dspark_markov_head(void) {
     pulsar_gpu_tensor *ref_logits = pulsar_gpu_tensor_alloc(bytes_of<float>(vocab_size));
     int rc = 1;
     if (!base || !ref_logits ||
-        !pulsar_gpu_tensor_write(base, TensorBytes{0}, base_host, bytes_of<float>(vocab_size))) goto cleanup;
+        !pulsar_gpu_tensor_write(base, TensorBytes{0u}, base_host, bytes_of<float>(vocab_size))) goto cleanup;
 
     for (int fi = 0; fi < 3; fi++) {
         const int fmt = fmts[fi];
@@ -542,7 +542,7 @@ static int check_dspark_markov_head(void) {
             int32_t gpu_id = 0;
             if (!pulsar_gpu_dspark_markov_step_model(ref_logits, &gpu_id, base,
                                                   map_host, map_bytes,
-                                                  MapOff{0}, MapOff{w2_off},
+                                                  MapOff{0u}, MapOff{w2_off},
                                                   id, vocab_size, embed_dim,
                                                   /*w1_bf16=*/0, fmt)) {
                 fprintf(stderr, "markov step %u (%s): launch failed\n", step, fmt_names[fi]);
@@ -566,7 +566,7 @@ static int check_dspark_markov_head(void) {
                  * decode shows as every v off by a scale; a wrong reduce shows the
                  * logits agreeing while the argmax does not.) */
                 float *gpu_ref = (float *)calloc((size_t)vocab_size, sizeof(float));
-                if (gpu_ref && pulsar_gpu_tensor_read(ref_logits, TensorBytes{0}, gpu_ref,
+                if (gpu_ref && pulsar_gpu_tensor_read(ref_logits, TensorBytes{0u}, gpu_ref,
                                                       bytes_of<float>(vocab_size))) {
                     int shown = 0, ndiff = 0; float gmax = -1e30f; int32_t gmax_id = 0;
                     for (uint32_t v = 0; v < vocab_size; v++) {
@@ -632,7 +632,7 @@ static int bench_dspark_markov_storages(void) {
     pulsar_gpu_tensor *base = pulsar_gpu_tensor_alloc(bytes_of<float>(V));
     pulsar_gpu_tensor *ref = pulsar_gpu_tensor_alloc(bytes_of<float>(V));
     int rc = 1;
-    if (!base || !ref || !pulsar_gpu_tensor_write(base, TensorBytes{0}, base_host, bytes_of<float>(V))) goto cleanup;
+    if (!base || !ref || !pulsar_gpu_tensor_write(base, TensorBytes{0u}, base_host, bytes_of<float>(V))) goto cleanup;
     printf("  markov step at %u x %u, one bank, 20 launches after 3 warm-ups (reduce + id readback included):\n", V, E);
     for (int fi = 0; fi < 3; fi++) {
         const int fmt = fmts[fi];
@@ -640,14 +640,14 @@ static int bench_dspark_markov_storages(void) {
         const uint64_t w2_bytes = smoke_w2_encode(fmt, t, V, E, map_host + w2_off);
         int32_t id = 42, out = 0;
         for (int k = 0; k < 3; k++)
-            if (!pulsar_gpu_dspark_markov_step_model(ref, &out, base, map_host, map_bytes, MapOff{0}, MapOff{w2_off}, id, V, E, 0, fmt)) {
+            if (!pulsar_gpu_dspark_markov_step_model(ref, &out, base, map_host, map_bytes, MapOff{0u}, MapOff{w2_off}, id, V, E, 0, fmt)) {
                 fprintf(stderr, "  markov bench (%s): launch failed\n", fmt_names[fi]); goto cleanup;
             }
         if (!pulsar_gpu_synchronize()) goto cleanup;
         const double t0 = monotonic_seconds();
         const int iters = 20;
         for (int k = 0; k < iters; k++)
-            if (!pulsar_gpu_dspark_markov_step_model(ref, &out, base, map_host, map_bytes, MapOff{0}, MapOff{w2_off}, id, V, E, 0, fmt)) goto cleanup;
+            if (!pulsar_gpu_dspark_markov_step_model(ref, &out, base, map_host, map_bytes, MapOff{0u}, MapOff{w2_off}, id, V, E, 0, fmt)) goto cleanup;
         if (!pulsar_gpu_synchronize()) goto cleanup;
         const double us = (monotonic_seconds() - t0) * 1e6 / iters;
         printf("    %-12s %8.1f us/launch   w2 %6.1f MB   %6.1f GB/s over the w2 stream   argmax %d\n",
@@ -702,18 +702,18 @@ static int check_dspark_confidence_head(void) {
     pulsar_gpu_tensor *token_ids = pulsar_gpu_tensor_alloc(bytes_of<int32_t>(n_positions));
     int rc = 1;
     if (scores && hidden && token_ids &&
-        pulsar_gpu_tensor_write(hidden, TensorBytes{0}, hidden_host,
+        pulsar_gpu_tensor_write(hidden, TensorBytes{0u}, hidden_host,
                                 bytes_of<float>((uint64_t)n_positions * hidden_dim)) &&
-        pulsar_gpu_tensor_write(token_ids, TensorBytes{0}, token_ids_host, bytes_of<int32_t>(n_positions)) &&
+        pulsar_gpu_tensor_write(token_ids, TensorBytes{0u}, token_ids_host, bytes_of<int32_t>(n_positions)) &&
         pulsar_gpu_dspark_confidence_score_model(scores, hidden, token_ids,
                                               map_host,
                                               proj_offset + total_dim * sizeof(float),
-                                              MapOff{0}, MapOff{proj_offset},
+                                              MapOff{0u}, MapOff{proj_offset},
                                               n_positions, hidden_dim, embed_dim,
                                               vocab_size,
                                               /*w1_bf16=*/0, /*proj_bf16=*/0) &&
         pulsar_gpu_synchronize() &&
-        pulsar_gpu_tensor_read(scores, TensorBytes{0}, scores_host, bytes_of<float>(n_positions))) {
+        pulsar_gpu_tensor_read(scores, TensorBytes{0u}, scores_host, bytes_of<float>(n_positions))) {
         rc = 0;
         for (uint32_t p = 0; p < n_positions; p++) {
             const float *emb = w1_host + (uint64_t)token_ids_host[p] * embed_dim;
@@ -851,11 +851,11 @@ static int mb_run_case(const char *label,
     int rc = 1;
     if (!q || !heads || !positions || !seq_id ||
         !pulsar_gpu_tensor_write_q_f32(q, 0, q_host, q_count) ||
-        !pulsar_gpu_tensor_write(positions, TensorBytes{0}, pos_host, bytes_of<int32_t>(n_rows)) ||
-        !pulsar_gpu_tensor_write(seq_id, TensorBytes{0}, sid_host, bytes_of<int32_t>(n_rows))) goto done;
+        !pulsar_gpu_tensor_write(positions, TensorBytes{0u}, pos_host, bytes_of<int32_t>(n_rows)) ||
+        !pulsar_gpu_tensor_write(seq_id, TensorBytes{0u}, sid_host, bytes_of<int32_t>(n_rows))) goto done;
     if (indexed) {
         topk = pulsar_gpu_tensor_alloc(bytes_of<int32_t>((uint64_t)n_rows * top_k));
-        if (!topk || !pulsar_gpu_tensor_write(topk, TensorBytes{0}, topk_host,
+        if (!topk || !pulsar_gpu_tensor_write(topk, TensorBytes{0u}, topk_host,
                                            bytes_of<int32_t>((uint64_t)n_rows * top_k))) goto done;
     }
 
@@ -864,7 +864,7 @@ static int mb_run_case(const char *label,
         int ok;
         if (indexed) {
             ok = pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
-                    heads, sinks, (uint64_t)n_head * sizeof(float), MapOff{0},
+                    heads, sinks, (uint64_t)n_head * sizeof(float), MapOff{0u},
                     q, raw_slab, comp_slab, topk,
                     n_rows, 0, window, raw_cap, 0,
                     n_comp_superset, top_k, window, ratio, n_head, head_dim,
@@ -872,7 +872,7 @@ static int mb_run_case(const char *label,
                                           NULL /* q pre-normed */, NULL, NULL /* no visibility */);
         } else {
             ok = pulsar_gpu_attention_decode_mixed_batch_heads_tensor(
-                    heads, sinks, (uint64_t)n_head * sizeof(float), MapOff{0},
+                    heads, sinks, (uint64_t)n_head * sizeof(float), MapOff{0u},
                     q, raw_slab, n_comp_superset ? comp_slab : NULL,
                     n_rows, 0, window, raw_cap, 0,
                     n_comp_superset, window, ratio, n_head, head_dim, 0,
@@ -934,7 +934,7 @@ static int mb_run_case(const char *label,
                 for (uint32_t rr = 0; rr < ref_rows; rr++)
                     memcpy(tk_ref_host + (uint64_t)rr * top_k,
                            topk_host + (uint64_t)r * top_k, top_k * sizeof(int32_t));
-                ok = pulsar_gpu_tensor_write(tk_ref, TensorBytes{0}, tk_ref_host,
+                ok = pulsar_gpu_tensor_write(tk_ref, TensorBytes{0u}, tk_ref_host,
                                           bytes_of<int32_t>((uint64_t)ref_rows * top_k));
             }
         }
@@ -944,7 +944,7 @@ static int mb_run_case(const char *label,
         if (ok) {
             if (indexed) {
                 ok = pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
-                        h_ref, sinks, (uint64_t)n_head * sizeof(float), MapOff{0},
+                        h_ref, sinks, (uint64_t)n_head * sizeof(float), MapOff{0u},
                         q_ref, raw_view, comp_view, tk_ref,
                         ref_rows, pos0, n_raw, raw_cap, raw_start,
                         row->ref_n_comp, top_k, window, ratio, n_head, head_dim,
@@ -952,7 +952,7 @@ static int mb_run_case(const char *label,
                                           NULL /* q pre-normed */, NULL, NULL /* no visibility */);
             } else {
                 ok = pulsar_gpu_attention_decode_mixed_batch_heads_tensor(
-                        h_ref, sinks, (uint64_t)n_head * sizeof(float), MapOff{0},
+                        h_ref, sinks, (uint64_t)n_head * sizeof(float), MapOff{0u},
                         q_ref, raw_view, row->ref_n_comp ? comp_view : NULL,
                         ref_rows, pos0, n_raw, raw_cap, raw_start,
                         row->ref_n_comp, window, ratio, n_head, head_dim, 0,
@@ -1027,8 +1027,8 @@ static int check_multibank_decode_attention(void) {
         pulsar_gpu_tensor_alloc(TensorBytes{(uint64_t)n_banks * comp_cap * SMOKE_MAIN_ROWBYTES(head_dim)});
     int rc = 1;
     if (!raw_slab || !raw_f32 || !comp_slab || !comp_f32 ||
-        !pulsar_gpu_tensor_write(raw_f32, TensorBytes{0}, raw_host, bytes_of<float>(raw_count)) ||
-        !pulsar_gpu_tensor_write(comp_f32, TensorBytes{0}, comp_host, bytes_of<float>(comp_count)) ||
+        !pulsar_gpu_tensor_write(raw_f32, TensorBytes{0u}, raw_host, bytes_of<float>(raw_count)) ||
+        !pulsar_gpu_tensor_write(comp_f32, TensorBytes{0u}, comp_host, bytes_of<float>(comp_count)) ||
         !pulsar_gpu_mainkv_pack_tensor(comp_f32, comp_f32, comp_slab, 0,
                                        (uint32_t)(n_banks * comp_cap), head_dim)) goto done;
     for (uint32_t b = 0; b < n_banks; b++) {
@@ -1109,7 +1109,7 @@ static int check_multibank_decode_attention(void) {
         if (big_host && big_f32 && big_slab) {
             mb_rng_state = 0x5eed5u;
             for (uint64_t i = 0; i < big_count; i++) big_host[i] = mb_rand();
-            if (pulsar_gpu_tensor_write(big_f32, TensorBytes{0}, big_host, bytes_of<float>(big_count)) &&
+            if (pulsar_gpu_tensor_write(big_f32, TensorBytes{0u}, big_host, bytes_of<float>(big_count)) &&
                 pulsar_gpu_mainkv_pack_tensor(big_f32, big_f32, big_slab, 0,
                                               (uint32_t)(n_banks * big_comp_cap), head_dim)) {
                 const mb_row rows[2] = { {0, 45999, big_n_comp}, {1, 20000, 5000} };
@@ -1147,10 +1147,10 @@ static int check_multibank_decode_attention(void) {
             mb_rng_state = 0xbeef1234u;
             for (uint64_t i = 0; i < 2 * row_f32; i++) q_host2[i] = mb_rand() * 0.25f;
             if (pulsar_gpu_tensor_write_q_f32(q2, 0, q_host2, 2 * row_f32) &&
-                pulsar_gpu_tensor_write(p2, TensorBytes{0}, pos_host2, TensorBytes{sizeof(pos_host2)}) &&
-                pulsar_gpu_tensor_write(s2, TensorBytes{0}, sid_host2, TensorBytes{sizeof(sid_host2)}) &&
+                pulsar_gpu_tensor_write(p2, TensorBytes{0u}, pos_host2, TensorBytes{sizeof(pos_host2)}) &&
+                pulsar_gpu_tensor_write(s2, TensorBytes{0u}, sid_host2, TensorBytes{sizeof(sid_host2)}) &&
                 pulsar_gpu_attention_decode_mixed_batch_heads_tensor(
-                        h2, sinks, (uint64_t)n_head * sizeof(float), MapOff{0},
+                        h2, sinks, (uint64_t)n_head * sizeof(float), MapOff{0u},
                         q2, raw_slab, comp_slab,
                         2, 0, window, raw_cap, 0,
                         25, window, ratio, n_head, head_dim, 0,
@@ -1234,8 +1234,8 @@ static int mb_idx_direct_one_case(pulsar_gpu_tensor *index_slab, uint32_t n_comp
     for (uint64_t i = 0; i < q_row; i++) q_host[i] = mb_rand() * 0.5f;
     for (uint32_t h = 0; h < n_head; h++) w_host[h] = mb_rand() * 0.5f + 0.75f;
     mb_pack_q_rows(q_host, qp_host, n_head);
-    if (!pulsar_gpu_tensor_write(q, TensorBytes{0}, qp_host, TensorBytes{qp_row}) ||
-        !pulsar_gpu_tensor_write(w, TensorBytes{0}, w_host, bytes_of<float>(n_head)) ||
+    if (!pulsar_gpu_tensor_write(q, TensorBytes{0u}, qp_host, TensorBytes{qp_row}) ||
+        !pulsar_gpu_tensor_write(w, TensorBytes{0u}, w_host, bytes_of<float>(n_head)) ||
         !pulsar_gpu_indexer_scores_decode_run_tensor(s_run, q, w, bank_view, n_comp_superset, 1, qpos,
                                                      n_head, head_dim, ratio, scale) ||
         !pulsar_gpu_indexer_score_one_tensor(s_one, q, w, bank_view, vis, n_head, head_dim, scale) ||
@@ -1291,7 +1291,7 @@ static int check_multibank_indexer(void) {
                 mb_rng_state = mb_rng_state * 1664525u + 1013904223u;
                 host[i] = in_row < 64 ? (uint8_t)r8 : (uint8_t)(115u + (r8 & 15u));
             }
-            if (pulsar_gpu_tensor_write(slab, TensorBytes{0}, host, TensorBytes{total})) {
+            if (pulsar_gpu_tensor_write(slab, TensorBytes{0u}, host, TensorBytes{total})) {
                 /* The one banked indexer shape production has: a one-row bank
                  * run through the tier on the bank's view, which must equal
                  * the classic one-row scorer (L173).  The descriptor-batch
@@ -1347,11 +1347,11 @@ static int check_multibank_raw_store(void) {
         memset(fill, 0x55, total);   /* poison: untouched slots must match */
         mb_rng_state = 0x5708eu;
         for (uint64_t i = 0; i < kv_count; i++) kv_host[i] = mb_rand();
-        ok = pulsar_gpu_tensor_write(slab, TensorBytes{0}, fill, TensorBytes{total}) &&
-             pulsar_gpu_tensor_write(slab_ref, TensorBytes{0}, fill, TensorBytes{total}) &&
-             pulsar_gpu_tensor_write(kv, TensorBytes{0}, kv_host, bytes_of<float>(kv_count)) &&
-             pulsar_gpu_tensor_write(positions, TensorBytes{0}, pos_host, TensorBytes{sizeof(pos_host)}) &&
-             pulsar_gpu_tensor_write(seq_id, TensorBytes{0}, sid_host, TensorBytes{sizeof(sid_host)});
+        ok = pulsar_gpu_tensor_write(slab, TensorBytes{0u}, fill, TensorBytes{total}) &&
+             pulsar_gpu_tensor_write(slab_ref, TensorBytes{0u}, fill, TensorBytes{total}) &&
+             pulsar_gpu_tensor_write(kv, TensorBytes{0u}, kv_host, bytes_of<float>(kv_count)) &&
+             pulsar_gpu_tensor_write(positions, TensorBytes{0u}, pos_host, TensorBytes{sizeof(pos_host)}) &&
+             pulsar_gpu_tensor_write(seq_id, TensorBytes{0u}, sid_host, TensorBytes{sizeof(sid_host)});
     }
     /* Banked scatter: one launch, all rows. */
     if (ok) ok = pulsar_gpu_store_raw_kv_batch_tensor(slab, kv, raw_cap, 0, n_rows,
@@ -1374,8 +1374,8 @@ static int check_multibank_raw_store(void) {
         pulsar_gpu_tensor_free(bank_view);
     }
     ok = ok && pulsar_gpu_synchronize() &&
-         pulsar_gpu_tensor_read(slab, TensorBytes{0}, got, TensorBytes{total}) &&
-         pulsar_gpu_tensor_read(slab_ref, TensorBytes{0}, want, TensorBytes{total});
+         pulsar_gpu_tensor_read(slab, TensorBytes{0u}, got, TensorBytes{total}) &&
+         pulsar_gpu_tensor_read(slab_ref, TensorBytes{0u}, want, TensorBytes{total});
     if (ok && memcmp(got, want, total) != 0) {
         fprintf(stderr, "multibank raw-store: banked scatter != per-bank stores\n");
         ok = 0;

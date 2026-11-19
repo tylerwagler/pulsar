@@ -181,7 +181,7 @@ static int run_leader(pulsar_tp *tp) {
      * NEGATIVE status and the verdict collector reads it as a refusal. */
     {
         int status = -99;
-        CHECK(pulsar_tp_send_bank_state_restore(tp, SID, BankId{1u}) != 0,
+        CHECK(pulsar_tp_send_bank_state_restore(tp, SID, BankId{1}) != 0,
               "send_bank_state_restore must report success");
         err[0] = 0;
         CHECK(!pulsar_tp_wait_command_status(tp, SID, "bank state restore", &status, err, sizeof(err)) &&
@@ -207,7 +207,7 @@ static int run_leader(pulsar_tp *tp) {
         CHECK(!pulsar_tp_wait_command_status(tp, SID, "spec_next_base", &status, err, sizeof(err)) &&
               std::strstr(err, "refused") != NULL,
               "an unknown-session spec_next_base must come back as a refusal: %s", err);
-        CHECK(pulsar_tp_send_bank_alloc_physical(tp, SID, BankId{2u}) != 0,
+        CHECK(pulsar_tp_send_bank_alloc_physical(tp, SID, BankId{2}) != 0,
               "send_bank_alloc_physical must report success");
         err[0] = 0;
         CHECK(!pulsar_tp_wait_command_status(tp, SID, "bank alloc physical", &status, err, sizeof(err)) &&

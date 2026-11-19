@@ -56,11 +56,11 @@ void out_parser::init(const out_grammar *g, out_call_body *body, out_state initi
     body_ = body;
     state_ = initial;
     hold_.clear();
-    fed_ = StreamOff{0};
+    fed_ = StreamOff{0u};
     header_.clear();
-    header_at_ = StreamOff{0};
+    header_at_ = StreamOff{0u};
     block_seen_ = false;
-    raw_lo_ = raw_hi_ = call_at_ = StreamOff{0};
+    raw_lo_ = raw_hi_ = call_at_ = StreamOff{0u};
     code_.reset();
     sec_[0] = sec_[1] = section();
     block_.clear();
@@ -72,7 +72,7 @@ void out_parser::init(const out_grammar *g, out_call_body *body, out_state initi
     prefix_done_ = !g->reasoning_prefix;
     lent_out_ = false;
     loan_ = LOAN_NONE;
-    loan_len_ = GenBytes{0};
+    loan_len_ = GenBytes{0u};
     parked_.clear();
 }
 
@@ -279,7 +279,7 @@ bool out_parser::quoted(const out_transition &tr) const {
 void out_parser::close_call(std::vector<out_event> *ev) {
     out_call call;
     const char *why = "";
-    BodyOff at{0};
+    BodyOff at{0u};
     if (body_->close(block_, index_, ev, &call, &why, &at)) {
         out_event e;
         e.kind = out_event::TOOL_END;
@@ -332,7 +332,7 @@ void out_parser::feed(const char *p, size_t n, std::vector<out_event> *ev) {
             const StreamOff marker_at = stream_at(at);
             raw_hi_ = marker_at + GenBytes{len};
             hold_.erase(0, at + len);
-            body_->grow(block_, GenBytes{0}, true, index_, ev);
+            body_->grow(block_, GenBytes{0u}, true, index_, ev);
             close_call(ev);
             if (tr->to == OUT_HEADER) header_at_ = marker_at + GenBytes{len};
             state_ = tr->to;
@@ -515,17 +515,17 @@ const char *out_tool_param_type(const out_tools &tools, const std::string &fn, c
 /* ---- the shared JSON call body ----------------------------------------------------------------- */
 
 void out_json_call_body::open() {
-    pos_ = BodyOff{0};
+    pos_ = BodyOff{0u};
     depth_ = 0;
     in_str_ = esc_ = false;
-    str_lo_ = BodyOff{0};
+    str_lo_ = BodyOff{0u};
     key_.clear();
     want_value_ = false;
     value_key_.clear();
     name_done_ = false;
     name_.clear();
     args_lo_ = args_hi_ = BodyOff::none();
-    args_sent_ = GenBytes{0};
+    args_sent_ = GenBytes{0u};
     began_ = payload_ = held_ = false;
 }
 
@@ -613,7 +613,7 @@ void out_json_call_body::stream_args(const std::string &b, bool closing, int ind
 void out_json_call_body::grow(const std::string &b, GenBytes held, bool closing, int index,
                               std::vector<out_event> *ev) {
     scan(b);
-    held_ = held > GenBytes{0};
+    held_ = held > GenBytes{0u};
     if (!began_ && name_done_ && !name_.empty()) {
         out_event e;
         e.kind = out_event::TOOL_BEGIN;
@@ -630,7 +630,7 @@ bool out_json_call_body::close(const std::string &b, int index, std::vector<out_
                                const char **why, BodyOff *at) {
     pyjson_value v;
     char jerr[160];
-    *at = BodyOff{0};
+    *at = BodyOff{0u};
     if (!pyjson_parse(b.data(), b.size(), &v, jerr, sizeof jerr) || v.kind != pyjson_value::OBJ) {
         *why = "the body is not one JSON object";
         return false;
@@ -643,7 +643,7 @@ bool out_json_call_body::close(const std::string &b, int index, std::vector<out_
     const pyjson_value *args = v.get("args");
     if (args && args->kind != pyjson_value::OBJ) {
         *why = "\"args\" is not an object";
-        *at = args_lo_.is_none() ? BodyOff{0} : args_lo_;
+        *at = args_lo_.is_none() ? BodyOff{0u} : args_lo_;
         return false;
     }
     if (!began_) {
@@ -678,7 +678,7 @@ const out_parser_family *out_parser_family_find(int chat_format) {
 
 void xml_call_body::open() {
     began_ = false;
-    head_ws_ = head_seen_ = BodyOff{0};
+    head_ws_ = head_seen_ = BodyOff{0u};
     fn_.clear();
     pay_ = closer_ = value_scan();
 }
@@ -835,7 +835,7 @@ void xml_call_body::scan_values(value_scan *vs, const std::string &b) const {
                     break;   /* a partial closer waits for its next bytes */
             }
             const char c = b[pos];
-            ps.pos += GenBytes{1};
+            ps.pos += GenBytes{1u};
             if (ps.is_string) continue;
             if (ps.json_str) {
                 if (ps.esc) ps.esc = false;
@@ -858,7 +858,7 @@ void xml_call_body::scan_payload(const std::string &b, GenBytes held) {
      * "</" of a closer (this block's or the held "</tool_call>") */
     const size_t pending = b.size() - std::min(body_ix(ps.pos), b.size());
     ps.payload = ps.value && (ps.is_string || ps.json_str) && b.size() > body_ix(ps.vstart) && pending < 2 &&
-                 held < GenBytes{2};
+                 held < GenBytes{2u};
 }
 
 /* L410: a "</tool_call>" found after `b` is a value's text when `b` ends inside a parameter value -- past a

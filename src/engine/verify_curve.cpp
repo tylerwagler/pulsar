@@ -684,7 +684,7 @@ bool pulsar_session_verify_profile_local(pulsar_session *s, uint32_t rows_max, d
             ok = spec_bank_restore(s, bank) && (!t->snapshot || t->snapshot(s, r, err, errlen));
             if (!ok) break;
             spec_bank_save(s, bank);
-            pulsar_session_spec_arm_capture_local(s, StepRows{rows});
+            pulsar_session_spec_arm_capture_local(s, StepRows::from_raw_unchecked(rows));
             uint32_t got = 0;
             const double t0 = pulsar_mono_sec();
             ok = fs->decode_mixed(s, reqs, rows, logits.data(), (int)((size_t)rows * V), &got,

@@ -3,7 +3,7 @@
  *  PromptToks, TokPos, the P2b index spaces, TokId, BankId, TensorBytes, TextBytes, the layer index spaces (L436),
  *  the output path's text offsets (L437), slab, file and model-map offsets (L438), the server's session slots, bank
  *  counts and job / trace ids (L441), host and device memory (L442), a fused step's headed prompt runs and a round's
- *  verify rows (L443) */
+ *  verify rows (L443); the constructors' no-narrowing rule and the pairwise apartness of every type (L445) */
 #ifndef PULSAR_UNITS_H
 #define PULSAR_UNITS_H
 
@@ -78,6 +78,38 @@
 #include <type_traits>
 #include <utility>
 
+/** L445: an integer of type I enters a quantity held as Rep without narrowing: the same signedness and no wider, or
+ *  an unsigned value into a wider signed Rep (bool is never a quantity). */
+template <class I, class Rep>
+inline constexpr bool pulsar_int_fits_v =
+        std::is_integral<I>::value && !std::is_same<I, bool>::value &&
+        ((std::is_signed<I>::value == std::is_signed<Rep>::value && sizeof(I) <= sizeof(Rep)) ||
+         (std::is_unsigned<I>::value && std::is_signed<Rep>::value && sizeof(I) < sizeof(Rep)));
+/** L445: `v` is below zero (false for an unsigned type, without a comparison the compiler calls always false).
+ *  @param v the value */
+/// @return v < 0
+template <class T>
+constexpr bool pulsar_int_negative(T v) {
+    if constexpr (std::is_signed<T>::value) return v < 0;
+    else return (void)v, false;
+}
+/** L445: a value that does not fit the quantity's integer: fatal (rule 9).
+ *  @param v the value, as the widest signed integer (for the message) */
+[[noreturn]] inline void pulsar_int_unrepresentable(long long v) {
+    fprintf(stderr, "pulsar: %lld does not fit the quantity's integer -- refusing it\n", v);
+    abort();
+}
+/** L445: `v` as `Rep`, fatal unless the conversion is exact (the same number, the same sign).
+ *  @param v the raw value */
+/// @return static_cast<Rep>(v)
+template <class Rep, class I>
+constexpr Rep pulsar_int_checked(I v) {
+    const Rep r = static_cast<Rep>(v);
+    return static_cast<I>(r) == v && pulsar_int_negative(v) == pulsar_int_negative(r)
+                   ? r
+                   : (pulsar_int_unrepresentable(static_cast<long long>(v)), r);
+}
+
 /** One quantity of the unit named by `Tag`, held as a `Rep`: an integer that converts to nothing and from nothing
  *  implicitly. */
 template <class Tag, class Rep = uint64_t>
@@ -89,8 +121,21 @@ public:
     pulsar_unit() = default;
     /** Enter the unit from a raw integer (explicit only; bool and floating point are refused at compile time).
      *  @param v the raw count, converted to `Rep` exactly as an assignment to the old field was */
-    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    template <class I, typename std::enable_if<pulsar_int_fits_v<I, Rep>, int>::type = 0>
     constexpr explicit pulsar_unit(I v) : v_(static_cast<Rep>(v)) {}
+    /** L445: enter from an integer the constructor refuses (wider than `Rep`, or of the other signedness), converted
+     *  exactly as the constructor once converted it -- the named escape for a legitimate crossing (an engine-internal
+     *  integer of another width, a test's literal).
+     *  @param v the raw value */
+    /// @return the value, `static_cast<Rep>(v)`
+    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    static constexpr pulsar_unit from_raw_unchecked(I v) { return pulsar_unit(static_cast<Rep>(v)); }
+    /** L445: enter from an integer of any width or signedness, checked: fatal unless `v` is exactly representable
+     *  (rule 9) -- for a value read from a wire, a file or a foreign API.
+     *  @param v the raw value */
+    /// @return the value
+    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    static constexpr pulsar_unit from_wire(I v) { return pulsar_unit(pulsar_int_checked<Rep>(v)); }
     /** The raw count, where the value leaves the type system (printf, /metrics, JSON, an index). */
     /// @return the count as `Rep`
     constexpr Rep raw() const { return v_; }
@@ -188,8 +233,21 @@ public:
     /** Enter from a raw integer (explicit only; bool and floating point are refused; -1 enters as none(), the value
      *  the int field carried).
      *  @param v the raw position */
-    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    template <class I, typename std::enable_if<pulsar_int_fits_v<I, Rep>, int>::type = 0>
     constexpr explicit pulsar_point(I v) : v_(static_cast<Rep>(v)) {}
+    /** L445: enter from an integer the constructor refuses (wider than `Rep`, or of the other signedness), converted
+     *  exactly as the constructor once converted it -- the named escape for a legitimate crossing (an engine-internal
+     *  integer of another width, a test's literal).
+     *  @param v the raw value */
+    /// @return the value, `static_cast<Rep>(v)`
+    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    static constexpr pulsar_point from_raw_unchecked(I v) { return pulsar_point(static_cast<Rep>(v)); }
+    /** L445: enter from an integer of any width or signedness, checked: fatal unless `v` is exactly representable
+     *  (rule 9) -- for a value read from a wire, a file or a foreign API.
+     *  @param v the raw value */
+    /// @return the value
+    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    static constexpr pulsar_point from_wire(I v) { return pulsar_point(pulsar_int_checked<Rep>(v)); }
     /** No position. */
     /// @return the none() sentinel (raw -1)
     static constexpr pulsar_point none() { return pulsar_point(kNone); }
@@ -318,8 +376,47 @@ typedef pulsar_point<HeadRows> HeadRow;
 typedef pulsar_unit<pulsar_comp_rows_tag, int> CompRows;
 /** A row of a compressed cache / multi-token pool (none() = no row). */
 typedef pulsar_point<CompRows> CompRow;
-/** Tokens a row of a compressed cache or pool holds: a compress ratio, a pool's tokens per row (nonzero). */
-typedef pulsar_unit<pulsar_tok_per_row_tag, uint32_t> TokPerRow;
+/** A ratio between two units (L445): explicit in, .raw() out, equality and order -- and no arithmetic, since a ratio
+ *  is "not a count of anything": two compress ratios do not add, and n of one is no quantity. */
+template <class Tag, class Rep>
+class pulsar_ratio {
+    static_assert(std::is_integral<Rep>::value && !std::is_same<Rep, bool>::value, "a ratio is held as an integer");
+
+public:
+    /** Uninitialised, as the integer it replaces. */
+    pulsar_ratio() = default;
+    /** Enter the ratio from a raw integer that fits `Rep` (explicit only).
+     *  @param v the raw ratio */
+    template <class I, typename std::enable_if<pulsar_int_fits_v<I, Rep>, int>::type = 0>
+    constexpr explicit pulsar_ratio(I v) : v_(static_cast<Rep>(v)) {}
+    /** L445: enter from an integer the constructor refuses, converted as it once was (see pulsar_unit).
+     *  @param v the raw value */
+    /// @return the ratio, `static_cast<Rep>(v)`
+    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    static constexpr pulsar_ratio from_raw_unchecked(I v) { return pulsar_ratio(static_cast<Rep>(v)); }
+    /** L445: enter from any integer, checked (fatal unless exactly representable).
+     *  @param v the raw value */
+    /// @return the ratio
+    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    static constexpr pulsar_ratio from_wire(I v) { return pulsar_ratio(pulsar_int_checked<Rep>(v)); }
+    /** The raw ratio (where it scales a raw count, in the named crossings below). */
+    /// @return the ratio as `Rep`
+    constexpr Rep raw() const { return v_; }
+    /** Equal. */
+    friend constexpr bool operator==(pulsar_ratio a, pulsar_ratio b) { return a.v_ == b.v_; }
+    /** Not equal. */
+    friend constexpr bool operator!=(pulsar_ratio a, pulsar_ratio b) { return a.v_ != b.v_; }
+    /** Less. */
+    friend constexpr bool operator<(pulsar_ratio a, pulsar_ratio b) { return a.v_ < b.v_; }
+    /** Greater. */
+    friend constexpr bool operator>(pulsar_ratio a, pulsar_ratio b) { return a.v_ > b.v_; }
+
+private:
+    Rep v_;  ///< the ratio
+};
+/** Tokens a row of a compressed cache or pool holds: a compress ratio, a pool's tokens per row (nonzero).  L445: a
+ *  pulsar_ratio -- no + / - / times (it had a pulsar_unit's). */
+typedef pulsar_ratio<pulsar_tok_per_row_tag, uint32_t> TokPerRow;
 
 /** A factor of 0 tokens a row is no factor (fatal): the crossings below divide by it.
  *  @param r the factor */
@@ -413,8 +510,21 @@ public:
     pulsar_id() = default;
     /** Enter from a raw integer (explicit only; bool and floating point are refused; -1 enters as none()).
      *  @param v the raw id */
-    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    template <class I, typename std::enable_if<pulsar_int_fits_v<I, Rep>, int>::type = 0>
     constexpr explicit pulsar_id(I v) : v_(static_cast<Rep>(v)) {}
+    /** L445: enter from an integer the constructor refuses (wider than `Rep`, or of the other signedness), converted
+     *  exactly as the constructor once converted it -- the named escape for a legitimate crossing (an engine-internal
+     *  integer of another width, a test's literal).
+     *  @param v the raw value */
+    /// @return the value, `static_cast<Rep>(v)`
+    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    static constexpr pulsar_id from_raw_unchecked(I v) { return pulsar_id(static_cast<Rep>(v)); }
+    /** L445: enter from an integer of any width or signedness, checked: fatal unless `v` is exactly representable
+     *  (rule 9) -- for a value read from a wire, a file or a foreign API.
+     *  @param v the raw value */
+    /// @return the value
+    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    static constexpr pulsar_id from_wire(I v) { return pulsar_id(pulsar_int_checked<Rep>(v)); }
     /** No token. */
     /// @return the none() sentinel (raw -1)
     static constexpr pulsar_id none() { return pulsar_id(kNone); }
@@ -618,8 +728,21 @@ public:
     pulsar_index() = default;
     /** Enter from a raw integer (explicit only; bool and floating point are refused; all ones enters as none()).
      *  @param v the raw index, converted to `Rep` exactly as an assignment to the old field was */
-    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    template <class I, typename std::enable_if<pulsar_int_fits_v<I, Rep>, int>::type = 0>
     constexpr explicit pulsar_index(I v) : v_(static_cast<Rep>(v)) {}
+    /** L445: enter from an integer the constructor refuses (wider than `Rep`, or of the other signedness), converted
+     *  exactly as the constructor once converted it -- the named escape for a legitimate crossing (an engine-internal
+     *  integer of another width, a test's literal).
+     *  @param v the raw value */
+    /// @return the value, `static_cast<Rep>(v)`
+    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    static constexpr pulsar_index from_raw_unchecked(I v) { return pulsar_index(static_cast<Rep>(v)); }
+    /** L445: enter from an integer of any width or signedness, checked: fatal unless `v` is exactly representable
+     *  (rule 9) -- for a value read from a wire, a file or a foreign API.
+     *  @param v the raw value */
+    /// @return the value
+    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    static constexpr pulsar_index from_wire(I v) { return pulsar_index(pulsar_int_checked<Rep>(v)); }
     /** No index (UINT32_MAX, the value the uint32 fields carried). */
     /// @return the none() sentinel
     static constexpr pulsar_index none() { return pulsar_index(kNone); }
@@ -867,8 +990,21 @@ public:
     /** Enter from a raw integer (explicit only; bool and floating point are refused; SIZE_MAX enters as none(), the
      *  value the size_t field carried).
      *  @param v the raw offset */
-    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    template <class I, typename std::enable_if<pulsar_int_fits_v<I, size_t>, int>::type = 0>
     constexpr explicit pulsar_text_off(I v) : v_(static_cast<size_t>(v)) {}
+    /** L445: enter from an integer the constructor refuses (wider than `size_t`, or of the other signedness), converted
+     *  exactly as the constructor once converted it -- the named escape for a legitimate crossing (an engine-internal
+     *  integer of another width, a test's literal).
+     *  @param v the raw value */
+    /// @return the value, `static_cast<size_t>(v)`
+    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    static constexpr pulsar_text_off from_raw_unchecked(I v) { return pulsar_text_off(static_cast<size_t>(v)); }
+    /** L445: enter from an integer of any width or signedness, checked: fatal unless `v` is exactly representable
+     *  (rule 9) -- for a value read from a wire, a file or a foreign API.
+     *  @param v the raw value */
+    /// @return the value
+    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    static constexpr pulsar_text_off from_wire(I v) { return pulsar_text_off(pulsar_int_checked<size_t>(v)); }
     /** No offset. */
     /// @return the none() sentinel (raw SIZE_MAX)
     static constexpr pulsar_text_off none() { return pulsar_text_off(kNone); }
@@ -1060,26 +1196,39 @@ public:
     /** Enter from a raw integer (explicit only; bool and floating point are refused), converted as the `(uint32_t)`
      *  cast at the old field was.
      *  @param v the raw offset */
-    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    template <class I, typename std::enable_if<pulsar_int_fits_v<I, uint32_t>, int>::type = 0>
     constexpr explicit pulsar_text_off32(I v) : v_(static_cast<uint32_t>(v)) {}
+    /** L445: enter from an integer the constructor refuses (wider than `uint32_t`, or of the other signedness), converted
+     *  exactly as the constructor once converted it -- the named escape for a legitimate crossing (an engine-internal
+     *  integer of another width, a test's literal).
+     *  @param v the raw value */
+    /// @return the value, `static_cast<uint32_t>(v)`
+    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    static constexpr pulsar_text_off32 from_raw_unchecked(I v) { return pulsar_text_off32(static_cast<uint32_t>(v)); }
+    /** L445: enter from an integer of any width or signedness, checked: fatal unless `v` is exactly representable
+     *  (rule 9) -- for a value read from a wire, a file or a foreign API.
+     *  @param v the raw value */
+    /// @return the value
+    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    static constexpr pulsar_text_off32 from_wire(I v) { return pulsar_text_off32(pulsar_int_checked<uint32_t>(v)); }
     /** The raw offset, where the value leaves the type system (a buffer index, printf, a golden file). */
     /// @return the offset as uint32_t
     constexpr uint32_t raw() const { return v_; }
     /** The offset past the first `n` bytes: where a text of that length ends, and where the next byte written lands.
      *  @param n the bytes before it */
     /// @return offset n (as uint32_t)
-    static constexpr pulsar_text_off32 after(TextBytes n) { return pulsar_text_off32(n.raw()); }
+    static constexpr pulsar_text_off32 after(TextBytes n) { return from_raw_unchecked(n.raw()); }
     /** The bytes before this offset (it minus offset 0). */
     /// @return the distance from offset 0
     constexpr TextBytes before() const { return TextBytes{v_}; }
 
     /** An offset moved forward by a length. */
     friend constexpr pulsar_text_off32 operator+(pulsar_text_off32 p, TextBytes d) {
-        return pulsar_text_off32(p.v_ + d.raw());
+        return from_raw_unchecked(p.v_ + d.raw());
     }
     /** An offset moved back by a length. */
     friend constexpr pulsar_text_off32 operator-(pulsar_text_off32 p, TextBytes d) {
-        return pulsar_text_off32(p.v_ - d.raw());
+        return from_raw_unchecked(p.v_ - d.raw());
     }
     /** The distance from b to a (uint32_t's: callers that must not wrap compare first, as before). */
     friend constexpr TextBytes operator-(pulsar_text_off32 a, pulsar_text_off32 b) {
@@ -1132,7 +1281,7 @@ struct pulsar_text_span {
      *  @param hi one past the last byte */
     /// @return the span {lo, hi}
     template <class I, class J>
-    static constexpr pulsar_text_span of(I lo, J hi) { return {PromptOff{lo}, PromptOff{hi}}; }
+    static constexpr pulsar_text_span of(I lo, J hi) { return {PromptOff::from_raw_unchecked(lo), PromptOff::from_raw_unchecked(hi)}; }
     /** The span's length (uint32_t's hi - lo: empty() first where it could wrap). */
     /// @return the bytes from lo to hi
     constexpr TextBytes len() const { return hi - lo; }
@@ -1378,7 +1527,10 @@ public:
         constexpr explicit iterator(uint32_t k) : k_(k) {}
         /** The index here. */
         /// @return Index{k}
-        constexpr Index operator*() const { return Index(k_); }
+        constexpr Index operator*() const {
+            if constexpr (std::is_integral<Index>::value) return static_cast<Index>(k_);
+            else return Index::from_raw_unchecked(k_);   /* the walk's uint32 cursor, as Index{k} took it */
+        }
         /** Step. */
         /// @return `*this`
         constexpr iterator &operator++() { ++k_; return *this; }
@@ -1409,13 +1561,26 @@ public:
     BankCount() = default;
     /** Enter from a raw integer (explicit only; bool and floating point are refused).
      *  @param v the count, converted to int exactly as an assignment to the old field was */
-    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    template <class I, typename std::enable_if<pulsar_int_fits_v<I, int>, int>::type = 0>
     constexpr explicit BankCount(I v) : v_(static_cast<int>(v)) {}
+    /** L445: enter from an integer the constructor refuses (wider than `int`, or of the other signedness), converted
+     *  exactly as the constructor once converted it -- the named escape for a legitimate crossing (an engine-internal
+     *  integer of another width, a test's literal).
+     *  @param v the raw value */
+    /// @return the value, `static_cast<int>(v)`
+    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    static constexpr BankCount from_raw_unchecked(I v) { return BankCount(static_cast<int>(v)); }
+    /** L445: enter from an integer of any width or signedness, checked: fatal unless `v` is exactly representable
+     *  (rule 9) -- for a value read from a wire, a file or a foreign API.
+     *  @param v the raw value */
+    /// @return the value
+    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    static constexpr BankCount from_wire(I v) { return BankCount(pulsar_int_checked<int>(v)); }
     /** The count that reaches slot `i`: i + 1 (the high-water a slot raises; fatal on none()).
      *  @param i the slot */
     /// @return i + 1 as a count
     static constexpr BankCount through(SlotIdx i) {
-        return i.is_none() ? (pulsar_index_fail("BankCount::through"), BankCount(0)) : BankCount(i.raw() + 1u);
+        return i.is_none() ? (pulsar_index_fail("BankCount::through"), BankCount(0)) : from_raw_unchecked(i.raw() + 1u);
     }
     /** The bank just past the first n: bank n -- the one count -> bank crossing (a pool's banks are 0 .. n-1, so the
      *  bank past a chat pool of n is n: the judge's reserved bank, cli_main).  (A negative count is no count: fatal.) */
@@ -1484,8 +1649,21 @@ public:
     pulsar_seq_id() = default;
     /** Enter from a raw integer (explicit only; bool and floating point are refused; 0 enters as none()).
      *  @param v the raw id */
-    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    template <class I, typename std::enable_if<pulsar_int_fits_v<I, Rep>, int>::type = 0>
     constexpr explicit pulsar_seq_id(I v) : v_(static_cast<Rep>(v)) {}
+    /** L445: enter from an integer the constructor refuses (wider than `Rep`, or of the other signedness), converted
+     *  exactly as the constructor once converted it -- the named escape for a legitimate crossing (an engine-internal
+     *  integer of another width, a test's literal).
+     *  @param v the raw value */
+    /// @return the value, `static_cast<Rep>(v)`
+    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    static constexpr pulsar_seq_id from_raw_unchecked(I v) { return pulsar_seq_id(static_cast<Rep>(v)); }
+    /** L445: enter from an integer of any width or signedness, checked: fatal unless `v` is exactly representable
+     *  (rule 9) -- for a value read from a wire, a file or a foreign API.
+     *  @param v the raw value */
+    /// @return the value
+    template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
+    static constexpr pulsar_seq_id from_wire(I v) { return pulsar_seq_id(pulsar_int_checked<Rep>(v)); }
     /** No id (0). */
     /// @return none()
     static constexpr pulsar_seq_id none() { return pulsar_seq_id(Rep(0)); }
@@ -1733,5 +1911,65 @@ static_assert(pulsar_verify_rows(TokCount{4}, true).raw() == 4 && pulsar_verify_
                   pulsar_verify_tokens_before(VerifyRow{2}, false).raw() == 2,
               "the base and K drafts are K + 1 rows; row i follows i + base_pending pending tokens");
 /* ==== L443 (end) ================================================================================================= */
+
+/* ==== L445: the series' enforcement, compiled (begin) ==============================================================
+ * Three rules the compiler now holds for every type above (the grep-level ones -- every .raw() tagged or printed, no
+ * Unit{x.raw()} outside this file, no new bare declaration named for a typed quantity -- are tests/units_gate.py):
+ *   - an integer enters a quantity only when it fits the representation: the same signedness and no wider, or an
+ *     unsigned value into a wider signed Rep (pulsar_int_fits_v).  A wider or differently-signed source is refused at
+ *     compile time; the legitimate cases say which they are: T::from_wire(v) (checked: fatal unless v is exactly
+ *     representable) or T::from_raw_unchecked(v) (converted as the constructor once did);
+ *   - no two of the types construct one another, in either direction (pulsar_units_apart, over the whole list);
+ *   - TokPerRow is a pulsar_ratio: no + / - / times. */
+
+/** `A` and every one of `Bs` construct one another in neither direction. */
+/// @return true when they are apart
+template <class A, class... Bs>
+constexpr bool pulsar_units_apart_from() {
+    return (true && ... && (!std::is_constructible<A, Bs>::value && !std::is_constructible<Bs, A>::value));
+}
+/** Every pair of `Ts` is apart (pulsar_units_apart_from). */
+template <class... Ts>
+struct pulsar_units_apart : std::true_type {};
+/** The recursion: the head apart from the rest, and the rest pairwise. */
+template <class A, class... Bs>
+struct pulsar_units_apart<A, Bs...>
+    : std::integral_constant<bool, pulsar_units_apart_from<A, Bs...>() && pulsar_units_apart<Bs...>::value> {};
+
+static_assert(pulsar_units_apart<KvRows, KvBytes, TokCount, PromptToks, TokPos, StepRows, StepRow, HeadRows, HeadRow, CompRows, CompRow,
+                                  TokPerRow, TokId, BankId, TensorBytes, TextBytes, TrunkLayer, LayerSlot,
+                                  DraftLayer, SrcBlock, KindOrd, VisLayer, TpSlot, GenBytes, GenOff, StreamOff,
+                                  BodyOff, ContentOff, PromptPos, PromptOff, StrippedOff, SlabOff, FileOff,
+                                  MapOff, SlotIdx, BankCount, JobId, TraceId, AgentJobId, HostBytes,
+                                  DeviceBytes, PromptHeads, PromptHead, VerifyRows, VerifyRow>::value,
+              "no unit, index, offset, id or count constructs another: a crossing is a named function");
+static_assert(std::is_constructible<TokCount, int>::value && std::is_constructible<TokCount, uint16_t>::value &&
+                  !std::is_constructible<TokCount, uint32_t>::value && !std::is_constructible<TokCount, int64_t>::value &&
+                  std::is_constructible<KvBytes, uint32_t>::value && !std::is_constructible<KvBytes, int>::value &&
+                  !std::is_constructible<BankId, uint32_t>::value && std::is_constructible<BankId, int32_t>::value &&
+                  !std::is_constructible<TextBytes, int64_t>::value && !std::is_constructible<PromptOff, uint64_t>::value &&
+                  !std::is_constructible<TrunkLayer, int>::value && !std::is_constructible<BankCount, size_t>::value &&
+                  !std::is_constructible<JobId, int>::value && !std::is_constructible<TokPerRow, int>::value,
+              "an integer enters a quantity only when it fits: no narrowing, no change of signedness");
+static_assert(TokCount::from_wire(uint64_t{4096}).raw() == 4096 && KvBytes::from_wire(7).raw() == 7u &&
+                  BankId::from_raw_unchecked(UINT32_MAX) == BankId::none() &&
+                  TokCount::from_raw_unchecked(uint32_t{5}).raw() == 5,
+              "from_wire is the value when it fits; from_raw_unchecked converts as the constructor once did");
+/** `a + b` compiles. */
+template <class A, class = void>
+struct pulsar_units_adds_ : std::false_type {};
+/** `a + b` compiles. */
+template <class A>
+struct pulsar_units_adds_<A, decltype((void)(std::declval<A>() + std::declval<A>()))> : std::true_type {};
+/** `a.times(n)` compiles. */
+template <class A, class = void>
+struct pulsar_units_scales_ : std::false_type {};
+/** `a.times(n)` compiles. */
+template <class A>
+struct pulsar_units_scales_<A, decltype((void)(std::declval<A>().times(2u)))> : std::true_type {};
+static_assert(!pulsar_units_adds_<TokPerRow>::value && !pulsar_units_scales_<TokPerRow>::value &&
+                  pulsar_units_adds_<CompRows>::value && pulsar_units_scales_<TensorBytes>::value,
+              "a ratio is not a count of anything: it neither adds nor scales");
+/* ==== L445 (end) ================================================================================================= */
 
 #endif

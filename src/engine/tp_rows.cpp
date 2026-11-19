@@ -125,14 +125,14 @@ bool pulsar_tp_allreduce_rows(const pulsar_tp_rows *g, TpSlot slot, uint32_t n_t
         }
         heap = true;
     }
-    bool ok = pulsar_gpu_tensor_read(t, TensorBytes{0}, out, TensorBytes{bytes}) != 0 &&
+    bool ok = pulsar_gpu_tensor_read(t, TensorBytes{0u}, out, TensorBytes{bytes}) != 0 &&
               pulsar_tp_row_lane_check(g->tp) != 0;   /* stream drained: every row-lane exchange done */
     if (ok) {
         ok = pulsar_tp_allreduce_sum(g->tp, slot, ++*g->seq,
                                      out, in, bytes) != 0;
     }
     if (ok) {
-        ok = pulsar_gpu_tensor_write(t, TensorBytes{0}, out, TensorBytes{bytes}) != 0;
+        ok = pulsar_gpu_tensor_write(t, TensorBytes{0u}, out, TensorBytes{bytes}) != 0;
     }
     if (heap) {
         free(out);
@@ -190,7 +190,7 @@ bool pulsar_tp_vocab_gather(const pulsar_tp_vocab *g, uint32_t n_rows, const pul
         uint8_t *slab = (uint8_t *)g->slab_dev;
         const uint64_t vf = L.vec_bytes.raw() / sizeof(float);   /* floats a slot carries */
         const uint32_t msgs = (uint32_t)(((uint64_t)n_rows * stride + vf - 1u) / vf);
-        pulsar_gpu_tensor *own = pulsar_gpu_tensor_view(g->vocab_own, TensorBytes{0},
+        pulsar_gpu_tensor *own = pulsar_gpu_tensor_view(g->vocab_own, TensorBytes{0u},
                                                         bytes_of<float>((uint64_t)n_rows * (hi - lo)));
         bool ok = own && head(lo, hi - lo, own) &&
                   pulsar_gpu_tp_scatter_cols(out, own, n_rows, hi - lo, n_vocab, lo) != 0;
@@ -213,7 +213,7 @@ bool pulsar_tp_vocab_gather(const pulsar_tp_vocab *g, uint32_t n_rows, const pul
     }
     const TensorBytes slice_bytes = bytes_of<float>((uint64_t)n_rows * stride);
     const TensorBytes full_bytes  = bytes_of<float>((uint64_t)n_rows * n_vocab);
-    pulsar_gpu_tensor *slice = pulsar_gpu_tensor_view(out, TensorBytes{0}, slice_bytes);
+    pulsar_gpu_tensor *slice = pulsar_gpu_tensor_view(out, TensorBytes{0u}, slice_bytes);
     if (!slice) {
         fprintf(stderr, "pulsar: tp vocab slice view refused (rows=%u stride=%u)\n",
                 n_rows, stride);
@@ -237,7 +237,7 @@ bool pulsar_tp_vocab_gather(const pulsar_tp_vocab *g, uint32_t n_rows, const pul
      * uneven split), and the tail zero-fill then overwrote the next row's head.
      * n=2 over 129280 is even, which is why the pair never showed it. */
     const TensorBytes packed_bytes = bytes_of<float>((uint64_t)n_rows * (hi - lo));
-    if (ok) ok = pulsar_gpu_tensor_read(slice, TensorBytes{0}, scratch, packed_bytes) != 0;
+    if (ok) ok = pulsar_gpu_tensor_read(slice, TensorBytes{0u}, scratch, packed_bytes) != 0;
     if (ok) {
         for (uint32_t r = 0; r < n_rows; r++) {
             memcpy(own + (uint64_t)r * stride,
@@ -252,7 +252,7 @@ bool pulsar_tp_vocab_gather(const pulsar_tp_vocab *g, uint32_t n_rows, const pul
                                        ++*g->seq, full, own, scratch,
                                        n_rows, n_vocab, 1u) != 0;
     }
-    if (ok) ok = pulsar_gpu_tensor_write(out, TensorBytes{0}, full, full_bytes) != 0;
+    if (ok) ok = pulsar_gpu_tensor_write(out, TensorBytes{0u}, full, full_bytes) != 0;
     pulsar_gpu_tensor_free(slice);
     free(own);
     free(scratch);

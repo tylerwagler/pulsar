@@ -248,7 +248,7 @@ rows_scratch rows_layout(uint32_t R) {
     rows_scratch r{};
     SlabOff o{};
     r.ids = o; o += a256(elt_bytes((uint64_t)R, 4u));
-    r.nf = o;  o += TensorBytes{256};
+    r.nf = o;  o += TensorBytes{256u};
     r.ad = o;  o += a256(bytes_of<uint8_t>(R));
     r.total = o.before();
     return r;
@@ -525,9 +525,9 @@ bool constants(const pulsar_engine *e, g4_state *st) {
             memcpy(&es[(size_t)il.raw() * s.n_expert + x], &u, 4);
         }
     }
-    return pulsar_gpu_tensor_write(st->rope_tab, TensorBytes{0}, tab.data(), bytes_of<float>(P)) &&
-           pulsar_gpu_tensor_write(st->ones, TensorBytes{0}, ones.data(), bytes_of<uint16_t>(s.head_dim)) &&
-           pulsar_gpu_tensor_write(st->escale, TensorBytes{0}, es.data(), bytes_of<float>((uint64_t)es.size()));
+    return pulsar_gpu_tensor_write(st->rope_tab, TensorBytes{0u}, tab.data(), bytes_of<float>(P)) &&
+           pulsar_gpu_tensor_write(st->ones, TensorBytes{0u}, ones.data(), bytes_of<uint16_t>(s.head_dim)) &&
+           pulsar_gpu_tensor_write(st->escale, TensorBytes{0u}, es.data(), bytes_of<float>((uint64_t)es.size()));
 }
 
 /** pulsar_driver_ops::create: the residual and normed rows, the device constants, the host tables, the attention
@@ -802,7 +802,7 @@ bool stage(const pulsar_driver_step *st0, uint64_t *graph_key) {
     const TensorBytes stride = a256(TensorBytes{pulsar_gqa_desc_bytes(st->n_rows)});
     for (TrunkLayer il{0u}; il.below(st->plan->n_layer); ++il)
         if (!plan_call(st, il, bound, SlabOff::after(stride.times((uint64_t)il.raw() * 2u)), stride)) return false;
-    if (pulsar_gpu_tensor_write_async(q->attn_desc, TensorBytes{0}, q->attn_desc_host,
+    if (pulsar_gpu_tensor_write_async(q->attn_desc, TensorBytes{0u}, q->attn_desc_host,
                                       stride.times((uint64_t)st->plan->n_layer * 2u)) == 0)
         return fail("could not upload the attention descriptors");
     /* L338 P2: the rows whose bank runs the runtime adapter (the LoRAs launch on them only): one u8 a row, so the upload
@@ -1147,7 +1147,7 @@ bool head(const pulsar_driver_step *st0, StepRow row0_at, StepRows n_rows, HeadR
     /* L338 P2: the last headed row's final-norm hidden, kept for the decision head (pulsar_session_copy_hidden; which
      * row it is, is the driver's record: pulsar_driver_state::hidden_bank / hidden_pos) */
     const TensorBytes rb = bytes_of<uint16_t>(s.n_embd);
-    if (pulsar_gpu_tensor_copy_async(st->st->last_hidden, TensorBytes{0}, st->st->xa, rb.times(row0 + n - 1),
+    if (pulsar_gpu_tensor_copy_async(st->st->last_hidden, TensorBytes{0u}, st->st->xa, rb.times(row0 + n - 1),
                                      rb) == 0)
         return fail("could not keep the last row's hidden");
     return true;
@@ -1167,7 +1167,7 @@ uint32_t hidden(pulsar_session *s, float *out, uint32_t cap) {
         return 0;
     }
     std::vector<uint16_t> h(E);
-    if (pulsar_gpu_synchronize() == 0 || !pulsar_gpu_tensor_read(q->last_hidden, TensorBytes{0}, h.data(),
+    if (pulsar_gpu_synchronize() == 0 || !pulsar_gpu_tensor_read(q->last_hidden, TensorBytes{0u}, h.data(),
                                                                  bytes_of<uint16_t>(E))) {
         fail("could not read the last row's hidden");
         return 0;

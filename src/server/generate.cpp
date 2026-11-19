@@ -371,7 +371,7 @@ bool turn_answers_with_reasoning(const gen_state *g, const server_turn *out, con
 
 bool turn_stream_reasoning_answer(gen_state *g, const server_turn *turn) {
     if (!turn->reasoning_answer || !g->sink.text) return true;
-    return g->sink.text(&g->sink, false, turn->content, strlen(turn->content), GenOff{0});   /* releases no entry */
+    return g->sink.text(&g->sink, false, turn->content, strlen(turn->content), GenOff{0u});   /* releases no entry */
 }
 
 bool parser_finish_turn(server *s, session_slot *sl, gen_state *g, server_turn *out, bool broken,

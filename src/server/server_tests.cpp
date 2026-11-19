@@ -131,7 +131,7 @@ static server_mem_reading test_mem_discrete(uint64_t dev_free, uint64_t dev_floo
 /// @param hi  receives its end (untouched on false)
 /// @return whether a call was read
 static bool test_raw_span(const out_parser &p, size_t *lo, size_t *hi) {
-    StreamOff l{0}, h{0};
+    StreamOff l{0u}, h{0u};
     if (!p.raw_span(&l, &h)) return false;
     *lo = l.raw();
     *hi = h.raw();
@@ -457,7 +457,7 @@ static void test_responses_input_tool_search_output_loads_tools(void) {
     TEST_ASSERT(!strcmp(msgs.v[0].calls.v[0].name, "tool_search"));
     /* L326: the item's message references the loaded tool (rendered there, chat_expand_tool_refs), not its JSON */
     TEST_ASSERT(msgs.v[1].content && !msgs.v[1].content[0]);
-    TEST_ASSERT(msgs.v[1].tool_refs_len == 1 && msgs.v[1].tool_ref_off[0] == ContentOff{0} &&
+    TEST_ASSERT(msgs.v[1].tool_refs_len == 1 && msgs.v[1].tool_ref_off[0] == ContentOff{0u} &&
                 !strcmp(msgs.v[1].tool_ref_name[0], "mcp__perplexity__perplexity_search"));
 
     buf_free(&loaded);
@@ -778,10 +778,10 @@ static void test_context_length_error_uses_protocol_standard_shape(void) {
  * double-emits or drops a token's logprobs across a chunk boundary. */
 static void test_logprob_stream_ready_watermark(void) {
     logprob_entry v[4] = {};
-    v[0].end_off = GenOff{3};
-    v[1].end_off = GenOff{7};
-    v[2].end_off = GenOff{7};   /* two entries share a watermark (a multi-token piece) */
-    v[3].end_off = GenOff{12};
+    v[0].end_off = GenOff{3u};
+    v[1].end_off = GenOff{7u};
+    v[2].end_off = GenOff{7u};   /* two entries share a watermark (a multi-token piece) */
+    v[3].end_off = GenOff{12u};
     logprob_ledger lg = {0};
     lg.enabled = true;
     lg.v = v;
@@ -794,21 +794,21 @@ static void test_logprob_stream_ready_watermark(void) {
     lg.enabled = true;
 
     /* watermark below the first entry: nothing ready */
-    TEST_ASSERT(logprob_stream_ready(&lg, GenOff{2}) == 0);
+    TEST_ASSERT(logprob_stream_ready(&lg, GenOff{2u}) == 0);
     /* exactly at an end_off releases that entry (<=, not <) */
-    TEST_ASSERT(logprob_stream_ready(&lg, GenOff{3}) == 1);
+    TEST_ASSERT(logprob_stream_ready(&lg, GenOff{3u}) == 1);
     /* between entries: only those fully covered */
-    TEST_ASSERT(logprob_stream_ready(&lg, GenOff{6}) == 1);
+    TEST_ASSERT(logprob_stream_ready(&lg, GenOff{6u}) == 1);
     /* both entries sharing end_off=7 release together, never split */
-    TEST_ASSERT(logprob_stream_ready(&lg, GenOff{7}) == 3);
-    TEST_ASSERT(logprob_stream_ready(&lg, GenOff{11}) == 3);
+    TEST_ASSERT(logprob_stream_ready(&lg, GenOff{7u}) == 3);
+    TEST_ASSERT(logprob_stream_ready(&lg, GenOff{11u}) == 3);
     /* the terminal chunk releases the remainder (L437: logprob_stream_all, once SIZE_MAX for the watermark) */
     TEST_ASSERT(logprob_stream_all(&lg) == 4);
 
     /* advancing streamed makes it resume, not re-release: entries [0,streamed)
      * are already on the wire and must not appear again. */
     lg.streamed = 3;
-    TEST_ASSERT(logprob_stream_ready(&lg, GenOff{7}) == 3);      /* nothing new at 7 */
+    TEST_ASSERT(logprob_stream_ready(&lg, GenOff{7u}) == 3);      /* nothing new at 7 */
     TEST_ASSERT(logprob_stream_all(&lg) == 4);
     lg.streamed = 4;
     TEST_ASSERT(logprob_stream_all(&lg) == 4); /* all streamed, none left */
@@ -2278,7 +2278,7 @@ static void greedy_rows_run(const greedy_rows_case &c, bool with_stop) {
     auto emit = [&](gen_state *g, int k) {
         buf_append(&g->text, pieces[(size_t)k].data(), pieces[(size_t)k].size());
         bool hit = false;
-        GenOff sp{0};
+        GenOff sp{0u};
         size_t sl = 0;
         const GenOff upto = gen_release(&j.req.stops, g->text.ptr, g->text.len, pieces[(size_t)k].data(),
                                         pieces[(size_t)k].size(), g->plain_stream_pos, &g->thinking,
@@ -5504,7 +5504,7 @@ static void test_l428_turn_ends_at_its_first_call(void) {
         const size_t lens2[3] = {pieces[11].size(), pieces[12].size(), pieces[13].size()};
         TEST_ASSERT(gen_turn_draft_prefix_text(g, chain2, lens2, TokCount{2}).raw() == 0);
         /* the walk left the attempt where it was: the call is still open, and its close still ends the turn */
-        GenOff end{0};
+        GenOff end{0u};
         TEST_ASSERT(!g->parser->turn_complete(g->parser_st, g, &end));
         TEST_ASSERT(srv.gen_emit_piece(g, TokId{0}, pieces[11].data(), pieces[11].size()));
         TEST_ASSERT(!strcmp(g->finish, "tool_calls") && g->completion == TokCount{12});
@@ -5864,7 +5864,7 @@ static l430_state l430_read(l430_side *s) {
     st.cut_short = g->turn_cut_short;
     st.thinking = g->thinking.inside;
     st.in_tool_call = g->parser->in_tool_call(g->parser_st, g);
-    GenOff end{0};
+    GenOff end{0u};
     st.turn_complete = g->parser->turn_complete(g->parser_st, g, &end);
     st.end = end.raw();
     st.wire = s->wire.size();
@@ -6448,7 +6448,7 @@ static void test_l440_prompt_offset_units(void) {
     }
     TEST_ASSERT(PromptOff{}.raw() == 0 && StrippedOff{}.raw() == 0);   /* value-initialised: zero */
     pulsar_text_span *z = (pulsar_text_span *)calloc(2, sizeof *z);     /* a zeroed array is spans at offset 0 */
-    TEST_ASSERT(z[1].lo == PromptOff{0} && z[1].hi == PromptOff{0} && z[1].empty());
+    TEST_ASSERT(z[1].lo == PromptOff{0u} && z[1].hi == PromptOff{0u} && z[1].empty());
     free(z);
 
     /* slice: the public pulsar_text_spans_slice and the kit's chat_piece::sub against the pre-L440 loop */
@@ -6495,7 +6495,7 @@ static void test_l440_prompt_offset_units(void) {
 /* The render buffers place a part's spans where the part lands: the kit's piece / writer and DeepSeek's buf, each
  * against the open-coded `base + lo`, and the end of what is written against the `(uint32_t)size` it was. */
 static void test_l440_parts_land_where_the_renderer_says(void) {
-    TEST_ASSERT(prompt_end(std::string()) == PromptOff{0} && prompt_end(std::string("abcde")) == PromptOff{5});
+    TEST_ASSERT(prompt_end(std::string()) == PromptOff{0u} && prompt_end(std::string("abcde")) == PromptOff{5u});
     chat_piece inner;
     inner.lit("<a>");
     inner.client("one");
@@ -6686,7 +6686,7 @@ static void test_l440_message_offsets_shift_by_where_the_message_lands(void) {
                     TEST_ASSERT(run != std::string::npos);
                     int exact = 0;
                     for (const pulsar_text_span &sp : spans)
-                        if (sp.lo == PromptOff{run} && sp.len() == TextBytes{s_hi - s_lo}) exact++;
+                        if (sp.lo == PromptOff::from_raw_unchecked(run) && sp.len() == TextBytes{s_hi - s_lo}) exact++;
                     TEST_ASSERT(exact == 1);
                 }
                 continue;
@@ -6707,7 +6707,7 @@ static void test_l440_message_offsets_shift_by_where_the_message_lands(void) {
                     const size_t img = prompt_at(k);
                     TEST_ASSERT(!text.compare(img, marker, family == 0 ? kLit : PULSAR_IMAGE_PLACEHOLDER));
                     for (const pulsar_text_span &sp : spans)   /* an image is the template's, never client data */
-                        for (size_t b = 0; b < marker; b++) TEST_ASSERT(!sp.contains(PromptOff{img + b}));
+                        for (size_t b = 0; b < marker; b++) TEST_ASSERT(!sp.contains(PromptOff::from_raw_unchecked(img + b)));
                 }
                 /* the text run before image k (or after the last): exactly one client span */
                 const size_t run_lo = k ? prompt_at(k - 1) + marker : shift[(size_t)u];
@@ -6721,7 +6721,7 @@ static void test_l440_message_offsets_shift_by_where_the_message_lands(void) {
                 }
                 int exact = 0;
                 for (const pulsar_text_span &sp : spans)
-                    if (sp.lo == PromptOff{run_lo} && sp.hi == PromptOff{run_hi}) exact++;
+                    if (sp.lo == PromptOff::from_raw_unchecked(run_lo) && sp.hi == PromptOff::from_raw_unchecked(run_hi)) exact++;
                 TEST_ASSERT(exact == 1);
                 const size_t s_lo = k ? mi.at[k - 1].raw() : 0, s_hi = s_hi_of(k);
                 TEST_ASSERT(!text.compare(run_lo, run_hi - run_lo, mi.content, s_lo, s_hi - s_lo));
@@ -6763,9 +6763,9 @@ static void test_l437_offset_units(void) {
     TEST_ASSERT(GenOff{}.raw() == 0 && StreamOff{}.raw() == 0 && GenBytes{}.raw() == 0);   /* value-initialised: zero */
     gen_state g;
     memset((void *)&g, 0, sizeof g);   /* a zeroed attempt's cursors are offset 0, as the size_t fields were */
-    TEST_ASSERT(g.plain_stream_pos == GenOff{0} && g.stop_scan_from == GenOff{0});
+    TEST_ASSERT(g.plain_stream_pos == GenOff{0u} && g.stop_scan_from == GenOff{0u});
     const char text[] = "0123456789";
-    TEST_ASSERT(gen_text_end(10) == GenOff{10} && gen_text_at(text, GenOff{4}) == text + 4);
+    TEST_ASSERT(gen_text_end(10) == GenOff{10u} && gen_text_at(text, GenOff{4u}) == text + 4);
 }
 
 /* L437: a parser's stream offsets are those of the bytes IT was fed -- the first call's marker and the calls' span,
@@ -6785,14 +6785,14 @@ static void test_l437_stream_offsets_and_conversion(void) {
         char err[200];
         TEST_ASSERT(p.init(false, tools, err, sizeof err));
         std::vector<out_event> ev;
-        TEST_ASSERT(p.first_call_at().is_none() && p.stream_end() == StreamOff{0});
+        TEST_ASSERT(p.first_call_at().is_none() && p.stream_end() == StreamOff{0u});
         for (size_t at = 0; at < turn.size(); at += chunk) {
             const size_t n = std::min(chunk, turn.size() - at);
             p.feed(turn.data() + at, n, &ev);
             TEST_ASSERT(p.stream_end() == StreamOff{at + n});   /* the stream's end: the bytes fed */
         }
         p.finish(&ev);
-        StreamOff lo{0}, hi{0};
+        StreamOff lo{0u}, hi{0u};
         TEST_ASSERT(p.calls().size() == 2 && p.raw_span(&lo, &hi));
         TEST_ASSERT(p.first_call_at() == StreamOff{first} && lo == StreamOff{first} && hi == StreamOff{last_end});
         TEST_ASSERT((hi - lo).raw() == last_end - first);
@@ -8473,7 +8473,7 @@ static void test_inkling_effort_map(void) {
     TEST_ASSERT(effort_case(PULSAR_CHAT_INKLING, EFFORT_BODY(""), &r, err, sizeof err));
     TEST_ASSERT(!strcmp(r.prompt_text, "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>"
                                        "<|message_user|><|content_text|>x<|end_message|><|message_model|>"));
-    TEST_ASSERT(r.prompt_n_spans == 1 && r.prompt_spans[0].len() == TextBytes{1});
+    TEST_ASSERT(r.prompt_n_spans == 1 && r.prompt_spans[0].len() == TextBytes{1u});
     request_free(&r);
 }
 
@@ -8725,7 +8725,7 @@ static void test_nemotron_effort_map(void) {
     TEST_ASSERT(effort_case(PULSAR_CHAT_NEMOTRON_H, EFFORT_BODY(""), &r, err, sizeof err));
     TEST_ASSERT(!strcmp(r.prompt_text, "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nx<|im_end|>\n"
                                        "<|im_start|>assistant\n<think>\n"));
-    TEST_ASSERT(r.prompt_n_spans == 1 && r.prompt_spans[0].len() == TextBytes{1});
+    TEST_ASSERT(r.prompt_n_spans == 1 && r.prompt_spans[0].len() == TextBytes{1u});
     request_free(&r);
 }
 
@@ -9009,7 +9009,7 @@ static void test_gemma4_effort_map(void) {
     TEST_ASSERT(effort_case(PULSAR_CHAT_GEMMA4, EFFORT_BODY(""), &r, err, sizeof err));
     TEST_ASSERT(r.family_effort == 1 && r.think_mode == PULSAR_THINK_DEFAULT);
     TEST_ASSERT(!strcmp(r.prompt_text, "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nx<turn|>\n<|turn>model\n"));
-    TEST_ASSERT(r.prompt_n_spans == 1 && r.prompt_spans[0].len() == TextBytes{1});
+    TEST_ASSERT(r.prompt_n_spans == 1 && r.prompt_spans[0].len() == TextBytes{1u});
     request_free(&r);
     static const char *const off[] = {",\"reasoning_effort\":\"none\"",
                                       ",\"chat_template_kwargs\":{\"enable_thinking\":false}"};
@@ -11899,7 +11899,7 @@ static bool test_seg_put(pulsar_segstore *st, const char *parent, uint32_t a, ui
                          uint64_t n, uint8_t fill, char key[41]) {
     test_seg_payload p = { n, fill };
     char err[256];
-    return pulsar_segstore_put(st, parent, TokPos{a}, TokPos{b}, text, TextBytes{strlen(text)}, n, test_seg_write, 0,
+    return pulsar_segstore_put(st, parent, TokPos::from_raw_unchecked(a), TokPos::from_raw_unchecked(b), text, TextBytes{strlen(text)}, n, test_seg_write, 0,
                                NULL, &p, key,
                                err, sizeof err);
 }
@@ -11918,22 +11918,22 @@ static void test_l338_segstore_reserve_commit(void) {
     TEST_ASSERT(st != NULL);
     char err[256], root[41], k[41];
     pulsar_segstore_job *jr = NULL, *jc = NULL, *again = NULL;
-    TEST_ASSERT(pulsar_segstore_reserve(st, "", TokPos{0}, TokPos{128}, "SYSTEM:", TextBytes{7}, 1000, 0, root, &jr,
+    TEST_ASSERT(pulsar_segstore_reserve(st, "", TokPos{0}, TokPos{128}, "SYSTEM:", TextBytes{7u}, 1000, 0, root, &jr,
                                         err, sizeof err) == 1);
     /* pending: a second reserve of the same text writes nothing, a lookup does not see it */
-    TEST_ASSERT(pulsar_segstore_reserve(st, "", TokPos{0}, TokPos{128}, "SYSTEM:", TextBytes{7}, 1000, 0, k, &again,
+    TEST_ASSERT(pulsar_segstore_reserve(st, "", TokPos{0}, TokPos{128}, "SYSTEM:", TextBytes{7u}, 1000, 0, k, &again,
                                         err, sizeof err) == 0);
     TEST_ASSERT(again == NULL && !strcmp(k, root));
     pulsar_segstore_seg chain[4];
-    TEST_ASSERT(pulsar_segstore_lookup(st, "SYSTEM: hi", TextBytes{10}, NULL, chain, 4) == 0);
+    TEST_ASSERT(pulsar_segstore_lookup(st, "SYSTEM: hi", TextBytes{10u}, NULL, chain, 4) == 0);
     /* a child may name the pending root */
     char child[41];
-    TEST_ASSERT(pulsar_segstore_reserve(st, root, TokPos{128}, TokPos{256}, " user", TextBytes{5}, 1000, 0, child, &jc,
+    TEST_ASSERT(pulsar_segstore_reserve(st, root, TokPos{128}, TokPos{256}, " user", TextBytes{5u}, 1000, 0, child, &jc,
                                         err, sizeof err) == 1);
     /* the budget counts both in flight: a third has no room (nothing stored to evict) */
     pulsar_segstore_job *j3 = NULL;
     char k3[41];
-    TEST_ASSERT(pulsar_segstore_reserve(st, "", TokPos{0}, TokPos{128}, "OTHER:", TextBytes{6}, 1000, 0, k3, &j3, err,
+    TEST_ASSERT(pulsar_segstore_reserve(st, "", TokPos{0}, TokPos{128}, "OTHER:", TextBytes{6u}, 1000, 0, k3, &j3, err,
                                         sizeof err) == -1);
     /* written off-thread, committed in order: both indexed, the chain found */
     test_seg_payload p = { 1000, 0x5a };
@@ -11941,15 +11941,15 @@ static void test_l338_segstore_reserve_commit(void) {
     TEST_ASSERT(test_job_write(jc, &p, err, sizeof err));
     TEST_ASSERT(pulsar_segstore_commit(st, jr, true));
     TEST_ASSERT(pulsar_segstore_commit(st, jc, true));
-    TEST_ASSERT(pulsar_segstore_lookup(st, "SYSTEM: user asks", TextBytes{17}, NULL, chain, 4) == 2);
+    TEST_ASSERT(pulsar_segstore_lookup(st, "SYSTEM: user asks", TextBytes{17u}, NULL, chain, 4) == 2);
     /* a parent's failed write drops its child at commit */
     char p2[41], c2[41];
     pulsar_segstore_job *jp2 = NULL, *jc2 = NULL;
     pulsar_segstore_close(st);
     st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);   /* unbounded from here */
-    TEST_ASSERT(pulsar_segstore_reserve(st, "", TokPos{0}, TokPos{128}, "B:", TextBytes{2}, 10, 0, p2, &jp2, err,
+    TEST_ASSERT(pulsar_segstore_reserve(st, "", TokPos{0}, TokPos{128}, "B:", TextBytes{2u}, 10, 0, p2, &jp2, err,
                                         sizeof err) == 1);
-    TEST_ASSERT(pulsar_segstore_reserve(st, p2, TokPos{128}, TokPos{256}, " b", TextBytes{2}, 10, 0, c2, &jc2, err,
+    TEST_ASSERT(pulsar_segstore_reserve(st, p2, TokPos{128}, TokPos{256}, " b", TextBytes{2u}, 10, 0, c2, &jc2, err,
                                         sizeof err) == 1);
     test_seg_payload small = { 10, 0x11 };
     TEST_ASSERT(test_job_write(jc2, &small, err, sizeof err));
@@ -11964,14 +11964,14 @@ static void test_l338_segstore_reserve_commit(void) {
     st = pulsar_segstore_open(dir, 3600, 7, NULL, NULL);   /* the root + child (2 x ~1.18 KB) stored */
     pulsar_segstore_job *jx = NULL, *jy = NULL;
     char kx[41], ky[41];
-    TEST_ASSERT(pulsar_segstore_reserve(st, child, TokPos{256}, TokPos{384}, " more", TextBytes{5}, 1000, 0, kx, &jx,
+    TEST_ASSERT(pulsar_segstore_reserve(st, child, TokPos{256}, TokPos{384}, " more", TextBytes{5u}, 1000, 0, kx, &jx,
                                         err, sizeof err) == 1);
     /* another root needs room: the only leaf is `child`, pinned by jx -- refused, nothing evicted */
-    TEST_ASSERT(pulsar_segstore_reserve(st, "", TokPos{0}, TokPos{128}, "NEW:", TextBytes{4}, 1200, 0, ky, &jy, err,
+    TEST_ASSERT(pulsar_segstore_reserve(st, "", TokPos{0}, TokPos{128}, "NEW:", TextBytes{4u}, 1200, 0, ky, &jy, err,
                                         sizeof err) == -1);
     TEST_ASSERT(pulsar_segstore_contains(st, child));
     (void)pulsar_segstore_commit(st, jx, false);   /* abandoned: unpinned, the room released */
-    TEST_ASSERT(pulsar_segstore_reserve(st, "", TokPos{0}, TokPos{128}, "NEW:", TextBytes{4}, 1200, 0, ky, &jy, err,
+    TEST_ASSERT(pulsar_segstore_reserve(st, "", TokPos{0}, TokPos{128}, "NEW:", TextBytes{4u}, 1200, 0, ky, &jy, err,
                                         sizeof err) == 1);
     TEST_ASSERT(!pulsar_segstore_contains(st, child));   /* now the leaf could go */
     (void)pulsar_segstore_commit(st, jy, false);
@@ -12019,7 +12019,7 @@ static void test_l264_segstore_chain_lookup(void) {
     TEST_ASSERT(test_seg_put(st, root, 128, 256, "user B asks", 200, 0x44, b1));
     /* the key rule: a key names the whole text from 0 */
     char k[41];
-    pulsar_segstore_child_key(root, "user A asks", TextBytes{11}, k);
+    pulsar_segstore_child_key(root, "user A asks", TextBytes{11u}, k);
     TEST_ASSERT(!strcmp(k, a1));
     /* the same text under the same parent is the same segment */
     char again[41];
@@ -12040,7 +12040,7 @@ static void test_l264_segstore_chain_lookup(void) {
     const char *other = "SYSTEM:user B asks something else";
     n = pulsar_segstore_lookup(st, other, TextBytes{strlen(other)}, NULL, chain, 8);
     TEST_ASSERT(n == 2 && !strcmp(chain[1].key, b1));
-    TEST_ASSERT(pulsar_segstore_lookup(st, "SYS", TextBytes{3}, NULL, chain, 8) == 0);
+    TEST_ASSERT(pulsar_segstore_lookup(st, "SYS", TextBytes{3u}, NULL, chain, 8) == 0);
 
     /* the payload round-trips */
     uint64_t pb = 0;
@@ -12085,9 +12085,9 @@ static void test_l264_segstore_chain_lookup(void) {
     char bad[41];
     char err[256];
     test_seg_payload p = { 10, 0 };
-    TEST_ASSERT(!pulsar_segstore_put(st, a1, TokPos{256}, TokPos{384}, "x", TextBytes{1}, 10, test_seg_write, 0, NULL,
+    TEST_ASSERT(!pulsar_segstore_put(st, a1, TokPos{256}, TokPos{384}, "x", TextBytes{1u}, 10, test_seg_write, 0, NULL,
                                      &p, bad, err, sizeof err));
-    TEST_ASSERT(!pulsar_segstore_put(st, "", TokPos{128}, TokPos{256}, "x", TextBytes{1}, 10, test_seg_write, 0, NULL,
+    TEST_ASSERT(!pulsar_segstore_put(st, "", TokPos{128}, TokPos{256}, "x", TextBytes{1u}, 10, test_seg_write, 0, NULL,
                                      &p, bad, err, sizeof err));
     pulsar_segstore_close(st);
     char cmd[512];
@@ -12243,7 +12243,7 @@ static void test_l426_kv_identity_weights(void) {
         pulsar_segstore *other = pulsar_segstore_open(dir, 0, o.id, l386_log, &lines);
         pulsar_segstore_seg chain[4];
         TEST_ASSERT(other && pulsar_segstore_count(other) == 0 && !pulsar_segstore_contains(other, root) &&
-                    pulsar_segstore_lookup(other, "SYSTEM: user, hello", TextBytes{19}, NULL, chain, 4) == 0);
+                    pulsar_segstore_lookup(other, "SYSTEM: user, hello", TextBytes{19u}, NULL, chain, 4) == 0);
         pulsar_segstore_close(other);
         TEST_ASSERT(access(seg_path, F_OK) == 0 && access(rp_path, F_OK) == 0);   /* left alone */
         int said = 0;
@@ -12270,7 +12270,7 @@ static void test_l426_kv_identity_weights(void) {
     st = pulsar_segstore_open(dir, 0, same, l386_log, &lines);
     pulsar_segstore_seg e, chain[4];
     TEST_ASSERT(st && pulsar_segstore_count(st) == 2 && pulsar_segstore_get(st, child, &e) && e.rp_bytes > 0);
-    TEST_ASSERT(pulsar_segstore_lookup(st, "SYSTEM: user, hello", TextBytes{19}, NULL, chain, 4) == 2 &&
+    TEST_ASSERT(pulsar_segstore_lookup(st, "SYSTEM: user, hello", TextBytes{19u}, NULL, chain, 4) == 2 &&
                 !strcmp(chain[1].key, child));
     for (const std::string &l : lines) TEST_ASSERT(l.find("another identity") == std::string::npos);
     pulsar_segstore_close(st);
@@ -12366,7 +12366,7 @@ static void l323_text(int from, int to, std::string *out) {
 static int l323_persist(pulsar_segstore *st, int deepest, int grid, bool close, char tip[41]) {
     std::string full;
     l323_text(0, deepest, &full);
-    const pulsar_segstore_end grid_end = { TokCount{(uint32_t)grid}, false };
+    const pulsar_segstore_end grid_end = { TokCount::from_raw_unchecked((uint32_t)grid), false };
     pulsar_segstore_seg chain[64];
     const int c = pulsar_segstore_lookup(st, full.data(), TextBytes{full.size()}, &grid_end, chain, 64);
     char parent[41] = "";
@@ -12383,7 +12383,7 @@ static int l323_persist(pulsar_segstore *st, int deepest, int grid, bool close, 
         char key[41], err[256];
         pulsar_segstore_child_key(parent, text.data(), TextBytes{text.size()}, key);
         const bool new_seg = !pulsar_segstore_contains(st, key);
-        TEST_ASSERT(pulsar_segstore_put(st, parent, TokPos{(uint32_t)prev}, TokPos{(uint32_t)G}, text.data(),
+        TEST_ASSERT(pulsar_segstore_put(st, parent, TokPos::from_raw_unchecked((uint32_t)prev), TokPos::from_raw_unchecked((uint32_t)G), text.data(),
                                         TextBytes{text.size()}, p.bytes,
                                         l323_payload_write, 0, NULL, &p, key, err, sizeof err));
         written += new_seg ? 1 : 0;
@@ -12428,7 +12428,7 @@ static void test_l323_grid_cut_dedupes_copies(void) {
     /* the grid segments of both copies carry the same keys */
     std::string text;
     l323_text(0, 13000, &text);
-    const pulsar_segstore_end grid_end = { TokCount{4096u}, false };
+    const pulsar_segstore_end grid_end = { TokCount{4096}, false };
     pulsar_segstore_seg ca[8], cb[8];
     const int na = pulsar_segstore_lookup(A, text.data(), TextBytes{text.size()}, &grid_end, ca, 8);
     const int nb = pulsar_segstore_lookup(B, text.data(), TextBytes{text.size()}, &grid_end, cb, 8);
@@ -12498,7 +12498,7 @@ static void test_l323_tail_supersession(void) {
     pulsar_segstore_seg grid0;
     std::string t0;
     l323_text(0, 4096, &t0);
-    const pulsar_segstore_end g_end = { TokCount{4096u}, false };
+    const pulsar_segstore_end g_end = { TokCount{4096}, false };
     TEST_ASSERT(pulsar_segstore_lookup(st, t0.data(), TextBytes{t0.size()}, &g_end, &grid0, 1) == 1);
     l323_payload p = { 4096, 4160, l323_rows_bytes(4096, 4160) };
     TEST_ASSERT(pulsar_segstore_put(st, grid0.key, TokPos{4096}, TokPos{4160}, btext.data(), TextBytes{btext.size()},
@@ -12586,7 +12586,7 @@ static void test_l323_state_restore_math(void) {
     /* a restore point added later at 12288 (a chain that ended there): same key, same child, no new segment */
     pulsar_segstore_seg before, after;
     l323_text(0, 12288, &req);
-    const pulsar_segstore_end g_end = { TokCount{4096u}, false };
+    const pulsar_segstore_end g_end = { TokCount{4096}, false };
     TEST_ASSERT(pulsar_segstore_lookup(st, req.data(), TextBytes{req.size()}, &g_end, chain, 8) == 3);
     TEST_ASSERT(pulsar_segstore_get(st, chain[2].key, &before) && before.rp_bytes == 0);
     const int count = pulsar_segstore_count(st);
@@ -12647,7 +12647,7 @@ static void test_l347_restore_points(void) {
     /* the lookup that wants a restore point finds none yet; any end finds the chain */
     const char *req = "SYSTEM:user A asks more";
     pulsar_segstore_seg chain[8];
-    const pulsar_segstore_end want = { TokCount{0u}, true };
+    const pulsar_segstore_end want = { TokCount{0}, true };
     TEST_ASSERT(pulsar_segstore_lookup(st, req, TextBytes{strlen(req)}, &want, chain, 8) == 0);
     TEST_ASSERT(pulsar_segstore_lookup(st, req, TextBytes{strlen(req)}, NULL, chain, 8) == 2);
     {
@@ -12697,7 +12697,7 @@ static void test_l347_restore_points(void) {
     {
         pulsar_segstore_job *j = NULL;
         char k[41];
-        TEST_ASSERT(pulsar_segstore_reserve(st, root, TokPos{128}, TokPos{256}, "user B asks", TextBytes{11}, 200, 0, k,
+        TEST_ASSERT(pulsar_segstore_reserve(st, root, TokPos{128}, TokPos{256}, "user B asks", TextBytes{11u}, 200, 0, k,
                                             &j, err, sizeof err) == 1);
         TEST_ASSERT(l323_put_rp(st, k, 256));
         TEST_ASSERT(!pulsar_segstore_contains(st, k));
@@ -12713,7 +12713,7 @@ static void test_l347_restore_points(void) {
         const uint64_t before = pulsar_segstore_used_bytes(st);
         pulsar_segstore_job *j = NULL;
         char k[41];
-        TEST_ASSERT(pulsar_segstore_reserve(st, root, TokPos{128}, TokPos{256}, "user C asks", TextBytes{11}, 200, 0, k,
+        TEST_ASSERT(pulsar_segstore_reserve(st, root, TokPos{128}, TokPos{256}, "user C asks", TextBytes{11u}, 200, 0, k,
                                             &j, err, sizeof err) == 1);
         TEST_ASSERT(l323_put_rp(st, k, 256));
         TEST_ASSERT(!pulsar_segstore_commit(st, j, false));
@@ -12792,7 +12792,7 @@ static int l347_persist(pulsar_segstore *st, int deepest, int grid, unsigned wha
                         pulsar_kvchain_persist_result *r, char tip[41]) {
     std::string full;
     l323_text(0, deepest, &full);
-    const pulsar_segstore_end grid_end = { TokCount{(uint32_t)grid}, false };
+    const pulsar_segstore_end grid_end = { TokCount::from_raw_unchecked((uint32_t)grid), false };
     pulsar_segstore_seg chain[64];
     const int c = pulsar_segstore_lookup(st, full.data(), TextBytes{full.size()}, &grid_end, chain, 64);
     char parent[41] = "";
@@ -12811,7 +12811,7 @@ static int l347_persist(pulsar_segstore *st, int deepest, int grid, unsigned wha
         char key[41], err[256];
         pulsar_segstore_child_key(parent, text.data(), TextBytes{text.size()}, key);
         written += !pulsar_segstore_contains(st, key);
-        TEST_ASSERT(pulsar_segstore_put(st, parent, TokPos{(uint32_t)prev}, TokPos{(uint32_t)G}, text.data(),
+        TEST_ASSERT(pulsar_segstore_put(st, parent, TokPos::from_raw_unchecked((uint32_t)prev), TokPos::from_raw_unchecked((uint32_t)G), text.data(),
                                         TextBytes{text.size()}, p.bytes,
                                         l323_payload_write, 0, NULL, &p, key, err, sizeof err));
         memcpy(parent, key, 41);
@@ -13067,7 +13067,7 @@ static void test_l347_i3a_odirect_roundtrip(void) {
     char path[600];
     snprintf(path, sizeof path, "%s/%s.seg", dir, k);
     struct stat sb;
-    TEST_ASSERT(stat(path, &sb) == 0 && sb.st_size == (off_t)pulsar_segstore_seg_file_bytes(TextBytes{3}, 5000, 0) &&
+    TEST_ASSERT(stat(path, &sb) == 0 && sb.st_size == (off_t)pulsar_segstore_seg_file_bytes(TextBytes{3u}, 5000, 0) &&
                 sb.st_size % PULSAR_KVPOOL_ALIGN != 0);
     {
         const uint8_t *pp = NULL;
@@ -13115,7 +13115,7 @@ static void test_l347_i3a_no_room(void) {
     char R[41], k[41], err[256];
     TEST_ASSERT(test_seg_put(st, "", 0, 128, "root", 1000, 1, R));
     pulsar_segstore_job *j = NULL;
-    TEST_ASSERT(pulsar_segstore_reserve(st, R, TokPos{128}, TokPos{256}, "big", TextBytes{3}, 20000, 0, k, &j, err,
+    TEST_ASSERT(pulsar_segstore_reserve(st, R, TokPos{128}, TokPos{256}, "big", TextBytes{3u}, 20000, 0, k, &j, err,
                                         sizeof err) == -2 && !j);
     TEST_ASSERT(!pulsar_segstore_contains(st, k) && strstr(err, "RAM pool"));
     /* a restore point too big for the pool: place_rps cannot copy it out, says no_room, writes nothing */
@@ -13154,15 +13154,15 @@ static void test_l347_i3a_copy_out(void) {
     }
     std::vector<uint8_t> src(n);
     for (uint64_t i = 0; i < n; i++) src[i] = (uint8_t)(i * 2654435761u >> 13);
-    TEST_ASSERT(pulsar_gpu_tensor_write_async(t, TensorBytes{0}, src.data(),
+    TEST_ASSERT(pulsar_gpu_tensor_write_async(t, TensorBytes{0u}, src.data(),
                                               TensorBytes{n}) == 1);   /* queued: the fence must cover it */
     memset(host, 0xee, n);
-    const pulsar_gpu_copy_span spans[2] = { { t, TensorBytes{0}, host + 10, TensorBytes{1000} },
-                                            { t, TensorBytes{(2u << 20) + 3}, host + 5000, TensorBytes{4097} } };
+    const pulsar_gpu_copy_span spans[2] = { { t, TensorBytes{0u}, host + 10, TensorBytes{1000u} },
+                                            { t, TensorBytes{(2u << 20) + 3}, host + 5000, TensorBytes{4097u} } };
     TEST_ASSERT(pulsar_gpu_copy_out(spans, 2) == 1);
     TEST_ASSERT(!memcmp(host + 10, src.data(), 1000) && !memcmp(host + 5000, src.data() + (2u << 20) + 3, 4097));
     TEST_ASSERT(host[9] == 0xee && host[1010] == 0xee && host[5000 + 4097] == 0xee);
-    const pulsar_gpu_copy_span bad = { t, TensorBytes{n - 10}, host, TensorBytes{11} };
+    const pulsar_gpu_copy_span bad = { t, TensorBytes{n - 10}, host, TensorBytes{11u} };
     TEST_ASSERT(pulsar_gpu_copy_out(&bad, 1) == 0);
     pulsar_gpu_tensor_free(t);
     pulsar_gpu_host_free(host);
@@ -13336,7 +13336,7 @@ static void test_l347_i2_older_ends_kept(void) {
     std::string branch;
     l323_text(0, 5061, &branch);
     branch += "an edited turn the conversation never said";
-    const pulsar_segstore_end want = { TokCount{0u}, true };
+    const pulsar_segstore_end want = { TokCount{0}, true };
     pulsar_segstore_seg chain[64];
     const int n = pulsar_segstore_lookup(st, branch.data(), TextBytes{branch.size()}, &want, chain, 64);
     TEST_ASSERT(n == 2 && chain[n > 0 ? n - 1 : 0].G == TokPos{5000} && !strcmp(chain[n > 0 ? n - 1 : 0].key, e1.key));
@@ -13500,7 +13500,7 @@ static void test_l353_parked_decoder_frees_nothing(void) {
     sl.provisioned = false;
     TEST_ASSERT(!server_slot_end_frees_kv(&sl));
     BankCount k{0};
-    const KvBytes t{10}, d{10}, b{15};   /* touched + growth past the budget; no victims */
+    const KvBytes t{10u}, d{10u}, b{15u};   /* touched + growth past the budget; no victims */
     TEST_ASSERT(server_prompt_kv_verdict(t, d, b, NULL, BankCount{0}, true, &k) == PROMPT_KV_WAIT);
     TEST_ASSERT(server_prompt_kv_verdict(t, d, b, NULL, BankCount{0}, false, &k) == PROMPT_KV_REFUSE);
 }
@@ -14085,7 +14085,7 @@ static void test_l378_token_hash_and_conversation_key(void) {
 static void test_l378_kv_req_line_format(void) {
     kv_req_line r;
     memset(&r, 0, sizeof r);
-    r.id = JobId{4711};
+    r.id = JobId{4711u};
     r.ep = "messages";
     r.cls = "subagent";
     r.ro = true;
@@ -14150,7 +14150,7 @@ static void test_l378_kv_req_line_format(void) {
     j.req.kind = REQ_COMPLETION;
     snprintf(j.req.hints.session, sizeof j.req.hints.session, "a-session-id-longer-than-sixteen-chars");
     s.kv_req_key(&j);
-    j.kvr.id = JobId{9};
+    j.kvr.id = JobId{9u};
     TEST_ASSERT(!strcmp(j.kvr.sess, "a-session-id-lon"));   /* as received, cut to 16 */
     j.kvr.finish = "gone-queued";
     kv_req_format(&j.kvr, line, sizeof line);
@@ -14323,8 +14323,8 @@ static void test_l378_kv_ledger_line(void) {
     s.m_dup.banks = 2;
     s.m_dup.pages_resident = 31;
     s.m_dup.pages_shared = 3;
-    s.m_dup.dup_bytes = KvBytes{4096};
-    s.m_dup_bytes_peak = KvBytes{8192};
+    s.m_dup.dup_bytes = KvBytes{4096u};
+    s.m_dup_bytes_peak = KvBytes{8192u};
     s.m_dup.pairs[1] = 1;
     s.m_dup.longest[1] = 24512;
     s.m_spills = 7;
@@ -14826,14 +14826,14 @@ static void test_l372_judge_bank_floor_and_release(void) {
         TEST_ASSERT(!server_judge_holds_kv(&s));   /* a freed bank holds nothing */
         J->released = false;
         /* (a) no box has this much free, and there is no chat bank to spill: refused busy, nothing installed */
-        (void)server_mem_floor_init(HostBytes{UINT64_MAX / 4}, HostBytes{0});
+        (void)server_mem_floor_init(HostBytes{UINT64_MAX / 4}, HostBytes{0u});
         char err[320] = "";
-        TEST_ASSERT(!s.floor_admits_chunk(KvRows{1024}, err, sizeof err) && strstr(err, "not enough memory") != NULL);
+        TEST_ASSERT(!s.floor_admits_chunk(KvRows{1024u}, err, sizeof err) && strstr(err, "not enough memory") != NULL);
         TEST_ASSERT(server_judge_step(&s));
-        (void)server_mem_floor_init(HostBytes{0}, HostBytes{0});
+        (void)server_mem_floor_init(HostBytes{0u}, HostBytes{0u});
         TEST_ASSERT(jb.done && jb.busy && !jb.started && jb.err.find("not enough memory") != std::string::npos);
         TEST_ASSERT(!server_judge_queued(&s) && !J->released && s.live_bank == BankId::none());
-        TEST_ASSERT(s.floor_admits_chunk(KvRows{1024}, err, sizeof err));   /* the real floor admits a chunk here */
+        TEST_ASSERT(s.floor_admits_chunk(KvRows{1024u}, err, sizeof err));   /* the real floor admits a chunk here */
         /* the budget's half prices the bank's growth by the session: a host-only server has none to hold */
         TEST_ASSERT(s.budget_admits_growth(BankId{1}, TokCount{1024}, err, sizeof err));
         pulsar_tokens_free(&jb.prompts[0]);
@@ -15065,7 +15065,7 @@ static void test_l353_disk_full_evicts(void) {
     TEST_ASSERT(pulsar_segstore_writes_failed(st) == 0);
     char key[41], err[256];
     pulsar_segstore_job *job = NULL;
-    const int rc = pulsar_segstore_reserve(st, "", TokPos{0}, TokPos{128}, "fails", TextBytes{5}, 64, 0, key, &job, err,
+    const int rc = pulsar_segstore_reserve(st, "", TokPos{0}, TokPos{128}, "fails", TextBytes{5u}, 64, 0, key, &job, err,
                                            sizeof err);
     TEST_ASSERT(rc > 0 && job);
     if (job) TEST_ASSERT(!pulsar_segstore_commit(st, job, false));
@@ -15172,14 +15172,14 @@ static void test_l264_segstore_eviction_and_hygiene(void) {
     char err[256];
     pulsar_segstore_close(st);
     st = pulsar_segstore_open(dir, 0, 1, NULL, NULL);
-    TEST_ASSERT(pulsar_segstore_put(st, d, TokPos{256}, TokPos{384}, "tool turn", TextBytes{9}, 10, test_seg_write, 5,
+    TEST_ASSERT(pulsar_segstore_put(st, d, TokPos{256}, TokPos{384}, "tool turn", TextBytes{9u}, 10, test_seg_write, 5,
                                     test_seg_trailer, &p, t,
                                     err, sizeof err));
     struct seen_t { int n; bool text_ok; bool bytes_ok; } seen = { 0, false, false };
     pulsar_segstore_foreach_trailer(st, [](FILE *fp, uint64_t bytes, const char *text, TextBytes len, void *ud) {
         seen_t *sn = (seen_t *)ud;
         sn->n++;
-        sn->text_ok = len == TextBytes{9} && !memcmp(text, "tool turn", 9);
+        sn->text_ok = len == TextBytes{9u} && !memcmp(text, "tool turn", 9);
         char b[5];
         sn->bytes_ok = bytes == 5 && fread(b, 1, 5, fp) == 5 && !memcmp(b, "TRAIL", 5);
         return true;
@@ -15193,7 +15193,7 @@ static void test_l264_segstore_eviction_and_hygiene(void) {
         for (const off_t cut : {(off_t)170}) {   /* inside its payload (a file with no header of ours is left alone) */
             char torn[41], tp[600];
             test_seg_payload tpay = { 10, 7 };
-            TEST_ASSERT(pulsar_segstore_put(o, "", TokPos{0}, TokPos{128}, "torn", TextBytes{4}, 10, test_seg_write, 0,
+            TEST_ASSERT(pulsar_segstore_put(o, "", TokPos{0}, TokPos{128}, "torn", TextBytes{4u}, 10, test_seg_write, 0,
                                             NULL, &tpay, torn, err,
                                             sizeof err));
             pulsar_segstore_close(o);
@@ -17529,14 +17529,14 @@ static void test_l391_ledger_sums_to_the_estimate(void) {
                                (uint64_t)47 << 30 | 12345};
     for (uint64_t price : prices)
         for (uint32_t n = 1; n <= PULSAR_SESSION_POOL_CAP; n++) {
-            TEST_ASSERT(server_bank_charges(kvb(price), BankCount{n}, BankCount{0}, BankCount{n}) == kvb(price));
+            TEST_ASSERT(server_bank_charges(kvb(price), BankCount::from_raw_unchecked(n), BankCount{0}, BankCount::from_raw_unchecked(n)) == kvb(price));
             /* an even split: no two banks differ by more than the remainder's one byte */
-            TEST_ASSERT(server_bank_charge(kvb(price), BankCount{n}, BankId{0}).raw() - server_bank_charge(kvb(price), BankCount{n}, BankId{n - 1}).raw() <= 1);
-            TEST_ASSERT(server_bank_charge(kvb(price), BankCount{n}, BankId{n}) == kvb(0));   /* no such bank: no charge */
+            TEST_ASSERT(server_bank_charge(kvb(price), BankCount::from_raw_unchecked(n), BankId{0}).raw() - server_bank_charge(kvb(price), BankCount::from_raw_unchecked(n), BankId::from_raw_unchecked(n - 1)).raw() <= 1);
+            TEST_ASSERT(server_bank_charge(kvb(price), BankCount::from_raw_unchecked(n), BankId::from_raw_unchecked(n)) == kvb(0));   /* no such bank: no charge */
             for (uint32_t chat = 1; chat <= n; chat++) {
                 char err[320] = "";
-                const KvBytes reserved = server_bank_charges(kvb(price), BankCount{n}, BankCount{chat}, BankCount{n});
-                TEST_ASSERT(server_ledger_self_check(kvb(price), BankCount{n}, BankCount{chat}, reserved, kvb(price), err, sizeof err));
+                const KvBytes reserved = server_bank_charges(kvb(price), BankCount::from_raw_unchecked(n), BankCount::from_raw_unchecked(chat), BankCount::from_raw_unchecked(n));
+                TEST_ASSERT(server_ledger_self_check(kvb(price), BankCount::from_raw_unchecked(n), BankCount::from_raw_unchecked(chat), reserved, kvb(price), err, sizeof err));
             }
         }
     TEST_ASSERT(server_bank_charge(kvb(100), BankCount{0}, BankId{0}) == kvb(0));
@@ -17642,7 +17642,7 @@ static void test_l391_provision_consults_the_ledger(void) {
     char err[320] = "";
     for (const auto &sh : shapes) {
         l391_pool_server(&s, sh.chat);
-        TEST_ASSERT(s.ledger_open_pool(sh.budget, kvb(sh.admitted), BankCount{sh.priced}, err, sizeof err));
+        TEST_ASSERT(s.ledger_open_pool(sh.budget, kvb(sh.admitted), BankCount::from_raw_unchecked(sh.priced), err, sizeof err));
         /* a churn of provisions and evictions: every bank the pool can hand out is admitted */
         uint32_t x = 12345;
         for (int step = 0; step < 4000; step++) {
@@ -19007,7 +19007,7 @@ static void test_l184_every_consumer_loops_the_syntax_table(void) {
         /* the stream projection opens on this row and binds to it */
         dsml_tool_stream ts;
         memset(&ts, 0, sizeof ts);
-        TEST_ASSERT(dsml_tool_stream_init(&ts, text.ptr, text.len, GenOff{4}));
+        TEST_ASSERT(dsml_tool_stream_init(&ts, text.ptr, text.len, GenOff{4u}));
         TEST_ASSERT(ts.syn == syn);
         TEST_ASSERT(ts.parse_pos.raw() == 4 + strlen(syn->tool_calls_start));
         dsml_tool_stream_free(&ts);
@@ -19098,7 +19098,7 @@ static void test_dsml_stream_never_announces_an_undeclared_tool(void) {
     chat_sink k = capture_sink(&r, &c);
     dsml_tool_stream ts;
     memset(&ts, 0, sizeof ts);
-    TEST_ASSERT(dsml_tool_stream_init(&ts, raw, n, GenOff{0}));
+    TEST_ASSERT(dsml_tool_stream_init(&ts, raw, n, GenOff{0u}));
     for (size_t len = 1; len <= n; len++) TEST_ASSERT(dsml_tool_stream_update(&ts, &k, raw, len));
     TEST_ASSERT(!ts.active && ts.state == DSML_TOOL_ERROR);
     TEST_ASSERT(c.begins == 0 && c.ends == 0 && !c.args.ptr);
@@ -19129,7 +19129,7 @@ static void test_l184_shared_tool_stream_drives_protocol_emitters(void) {
     chat_sink k = capture_sink(&r, &c);
     dsml_tool_stream ts;
     memset(&ts, 0, sizeof ts);
-    TEST_ASSERT(dsml_tool_stream_init(&ts, raw, n, GenOff{0}));
+    TEST_ASSERT(dsml_tool_stream_init(&ts, raw, n, GenOff{0u}));
     for (size_t len = 1; len <= n; len++) {
         TEST_ASSERT(dsml_tool_stream_update(&ts, &k, raw, len));
     }
@@ -19153,7 +19153,7 @@ static void test_l184_shared_tool_stream_drives_protocol_emitters(void) {
         PULSAR_PARAM_START " name=\"command\" string=\"true\">ls -la</";
     memset(&c, 0, sizeof c);
     memset(&ts, 0, sizeof ts);
-    TEST_ASSERT(dsml_tool_stream_init(&ts, cut, strlen(cut), GenOff{0}));
+    TEST_ASSERT(dsml_tool_stream_init(&ts, cut, strlen(cut), GenOff{0u}));
     TEST_ASSERT(dsml_tool_stream_update(&ts, &k, cut, strlen(cut)));
     TEST_ASSERT(ts.active && ts.state == DSML_TOOL_PARAM_VALUE);
     TEST_ASSERT(dsml_tool_stream_finalize(&ts, &k, cut, strlen(cut)));
@@ -19661,7 +19661,7 @@ static void l329_fanout(const l329_req *rq, int n, int wait_ms, l329_out *o) {
                     const int pick = wait_ms > 0 ? unseamed_wait_pick(have, rq[k].len, grid, G, leads, nl, &mark)
                                                  : -1;
                     if (pick >= 0) {
-                        r[k].pw = {true, JobId{lead_of[pick] + 1}, SlotIdx{(uint32_t)lead_of[pick]},
+                        r[k].pw = {true, JobId::from_raw_unchecked(lead_of[pick] + 1), SlotIdx{(uint32_t)lead_of[pick]},
                                    PromptPos{mark}, PromptToks{have}, t};
                         st *l = &r[lead_of[pick]];
                         l->mark = unseamed_mark_merge(l->mark, mark, l->pos);
@@ -22262,7 +22262,7 @@ static_assert(!std::is_constructible_v<KvBytes, KvRows> && !std::is_constructibl
 static_assert(!std::is_convertible_v<uint64_t, KvBytes> && !std::is_convertible_v<KvBytes, uint64_t> &&
                   !std::is_convertible_v<int, KvRows> && !std::is_convertible_v<KvRows, uint64_t>,
               "no implicit way in or out");
-static_assert(std::is_constructible_v<KvBytes, uint64_t> && std::is_constructible_v<KvRows, int>,
+static_assert(std::is_constructible_v<KvBytes, uint64_t> && std::is_constructible_v<KvRows, uint32_t>,   /* L445: int no more */
               "the explicit entry exists");
 static_assert(!std::is_constructible_v<KvBytes, double> && !std::is_constructible_v<KvBytes, bool>,
               "a float or a bool is no byte count");
@@ -22276,7 +22276,7 @@ static_assert(!l333_equates<KvRows, KvBytes> && !l333_equates<KvBytes, int> && l
 static_assert(!l333_assigns<KvBytes &, uint64_t> && !l333_assigns<KvBytes &, KvRows> && l333_assigns<KvBytes &,
               KvBytes>,
               "assignment only within a unit");
-static_assert((KvBytes{2} + KvBytes{3}).raw() == 5 && KvRows{7}.raw() == 7 && KvBytes::max().raw() == UINT64_MAX,
+static_assert((KvBytes{2u} + KvBytes{3u}).raw() == 5 && KvRows{7u}.raw() == 7 && KvBytes::max().raw() == UINT64_MAX,
               "constexpr, and raw() is the value that went in");
 
 /* L333: the units are the uint64_t they replaced -- a value round-trips through the type unchanged, and every
@@ -22300,7 +22300,7 @@ static void test_l333_kv_units(void) {
     }
     TEST_ASSERT(KvBytes{}.raw() == 0 && KvRows{}.raw() == 0);   /* value-initialised: zero */
     /* an int enters as the uint64_t it was assigned to before (a negative one wraps the same way) */
-    TEST_ASSERT(KvBytes{-1}.raw() == (uint64_t)-1 && KvRows{(uint32_t)8192}.raw() == 8192u);
+    TEST_ASSERT(KvBytes::from_raw_unchecked(-1).raw() == (uint64_t)-1 && KvRows{(uint32_t)8192}.raw() == 8192u);
 }
 
 /* L334: the token seam's two currencies (pulsar_units.h TokCount / PromptToks) refuse every mix at compile time, with
@@ -22314,7 +22314,7 @@ static_assert(!std::is_constructible_v<KvRows, TokCount> && !std::is_constructib
 static_assert(!std::is_convertible_v<int, TokCount> && !std::is_convertible_v<TokCount, int> &&
                   !std::is_convertible_v<int, PromptToks> && !std::is_convertible_v<PromptToks, int>,
               "no implicit way in or out");
-static_assert(std::is_constructible_v<TokCount, int> && std::is_constructible_v<PromptToks, uint32_t> &&
+static_assert(std::is_constructible_v<TokCount, int> && std::is_constructible_v<PromptToks, uint16_t> &&   /* L445: no uint32 */
                   !std::is_constructible_v<PromptToks, double> && !std::is_constructible_v<TokCount, bool>,
               "the explicit integer entry exists; a float or a bool is no token count");
 static_assert(std::is_same_v<decltype(TokCount{}.raw()), int> && std::is_same_v<decltype(KvBytes{}.raw()), uint64_t>,
@@ -22360,7 +22360,7 @@ static void test_l334_seam_currencies(void) {
         }
     }
     TEST_ASSERT(TokCount{}.raw() == 0 && PromptToks{}.raw() == 0);   /* value-initialised: zero */
-    TEST_ASSERT(TokCount{(uint32_t)4096}.raw() == 4096 && PromptToks{(int64_t)-1}.raw() == -1);
+    TEST_ASSERT(TokCount::from_raw_unchecked((uint32_t)4096).raw() == 4096 && PromptToks::from_raw_unchecked((int64_t)-1).raw() == -1);
     /* the stitch: live[0, live_cut) + prompt[prompt_cut, prompt_len) -- a seam that spends 3 live tokens on the bytes
      * of 2 prompt ones, and the seamless case where the currencies coincide */
     struct { int live_cut, prompt_cut, prompt_len; } cases[] = {{0, 0, 9}, {100, 99, 140}, {4096, 4093, 4093},
@@ -22410,7 +22410,7 @@ static_assert(!std::is_constructible_v<TokPos, TokCount> && !std::is_constructib
                   !std::is_constructible_v<TokPos, PromptToks> && !std::is_constructible_v<KvRows, TokPos> &&
                   !std::is_constructible_v<TokPos, KvRows>,
               "not even explicitly: a count becomes a position only by TokPos::after, a position a count by before()");
-static_assert(std::is_constructible_v<TokPos, int> && std::is_constructible_v<TokPos, uint32_t> &&
+static_assert(std::is_constructible_v<TokPos, int> && std::is_constructible_v<TokPos, uint16_t> &&   /* L445: no uint32 */
                   !std::is_constructible_v<TokPos, double> && !std::is_constructible_v<TokPos, bool>,
               "the explicit integer entry exists; a float or a bool is no position");
 static_assert(std::is_same_v<decltype(TokPos{}.raw()), int> && TokPos::none().raw() == -1 && TokPos::none().is_none() &&
@@ -22586,7 +22586,7 @@ static_assert(TokId::none().raw() == -1 && TokId{-1}.is_none() && !TokId{0}.is_n
 static_assert(!l334_passes<int, BankId> && !l334_passes<uint32_t, BankId> && !l334_passes<BankId, uint32_t> &&
                   !l334_passes<TokId, BankId> && !l334_passes<BankId, TokId> && !l334_passes<StepRow, BankId> &&
                   !l333_equates<BankId, TokId> && !l333_orders<BankId, BankId> && !l333_adds<BankId, int> &&
-                  !std::is_constructible_v<BankId, TokId> && std::is_constructible_v<BankId, uint32_t> &&
+                  !std::is_constructible_v<BankId, TokId> && std::is_constructible_v<BankId, int32_t> &&   /* L445: no uint32 */
                   BankId::none().is_none() && BankId{3}.below(16u) && !BankId{16}.below(16u),
               "a bank equates with a bank only; a layer index or a step row is never one (fae579f0)");
 
@@ -22642,7 +22642,7 @@ static void test_l334_positions_are_ints(void) {
         TEST_ASSERT(p != TokPos::none() && TokPos::none() != p && TokPos::none() == TokPos::none());
         if (a >= 0) TEST_ASSERT(pulsar_kv_rows(TokCount{a}) == KvRows{(uint32_t)a});
     }
-    TEST_ASSERT(TokPos{}.raw() == 0 && TokPos{(uint32_t)4096}.raw() == 4096);   /* value-initialised: position 0 */
+    TEST_ASSERT(TokPos{}.raw() == 0 && TokPos::from_raw_unchecked((uint32_t)4096).raw() == 4096);   /* value-initialised: position 0 */
     TEST_ASSERT(TokPos{-1}.is_none() && TokPos::none().raw() == -1);           /* the int field's -1 enters as none() */
 }
 
@@ -22823,7 +22823,7 @@ static void test_l353_image_keys(void) {
     char err[256] = "", kx[41], ky[41], kt[41], cx[41], cy[41];
     auto put = [&](const char *parent, uint32_t a, uint32_t b, const char *t, const uint64_t *h, uint32_t n, char *out) {
         pulsar_segstore_job *job = NULL;
-        const int rc = pulsar_segstore_reserve_images(st, parent, TokPos{a}, TokPos{b}, t, TextBytes{strlen(t)}, h, n,
+        const int rc = pulsar_segstore_reserve_images(st, parent, TokPos::from_raw_unchecked(a), TokPos::from_raw_unchecked(b), t, TextBytes{strlen(t)}, h, n,
                                                       16, 0, out, &job, err, sizeof err);
         if (rc > 0) TEST_ASSERT(pulsar_segstore_commit(st, job, pulsar_segstore_job_write(job, err, sizeof err)));
         return rc;
@@ -22882,7 +22882,7 @@ static_assert(!std::is_constructible_v<GenOff, StreamOff> && !std::is_constructi
                   !std::is_constructible_v<GenOff, TokId> && !std::is_constructible_v<StreamOff, TokCount> &&
                   !std::is_constructible_v<GenOff, KvBytes> && !std::is_constructible_v<GenBytes, TensorBytes>,
               "not even explicitly: a parser's stream offset becomes a text offset only through kit_gen::text_at");
-static_assert(std::is_constructible_v<GenOff, size_t> && std::is_constructible_v<StreamOff, int> &&
+static_assert(std::is_constructible_v<GenOff, size_t> && std::is_constructible_v<StreamOff, unsigned> &&   /* L445: no int */
                   std::is_constructible_v<GenBytes, size_t> && !std::is_constructible_v<GenOff, double> &&
                   !std::is_constructible_v<GenBytes, bool>,
               "the explicit integer entry exists; a float or a bool is no offset");
@@ -22912,10 +22912,10 @@ static_assert(l333_assigns<GenOff &, GenOff> && !l333_assigns<GenOff &, StreamOf
               "assignment within the type only");
 static_assert(std::is_same_v<decltype(GenOff{}.raw()), size_t> && std::is_same_v<decltype(GenBytes{}.raw()), size_t> &&
                   GenOff::none().raw() == SIZE_MAX && StreamOff::none().raw() == std::string::npos &&
-                  GenOff::none().is_none() && !GenOff{0}.is_none() && GenOff{SIZE_MAX} == GenOff::none() &&
-                  (GenOff{9} - GenOff{4}).raw() == 5 && (GenOff{9} + GenBytes{4}).raw() == 13 &&
-                  (StreamOff{9} - GenBytes{4}).raw() == 5 && GenOff::after(GenBytes{7}).raw() == 7 &&
-                  GenOff{7}.before().raw() == 7,
+                  GenOff::none().is_none() && !GenOff{0u}.is_none() && GenOff{SIZE_MAX} == GenOff::none() &&
+                  (GenOff{9u} - GenOff{4u}).raw() == 5 && (GenOff{9u} + GenBytes{4u}).raw() == 13 &&
+                  (StreamOff{9u} - GenBytes{4u}).raw() == 5 && GenOff::after(GenBytes{7u}).raw() == 7 &&
+                  GenOff{7u}.before().raw() == 7,
               "constexpr, size_t's arithmetic; none() is the SIZE_MAX / npos the size_t fields carried");
 static_assert(std::is_same_v<decltype(gen_state{}.plain_stream_pos), GenOff> &&
                   std::is_same_v<decltype(gen_state{}.stop_scan_from), GenOff> &&
@@ -22962,7 +22962,7 @@ static_assert(!l334_passes<ContentOff, GenOff> && !l334_passes<GenOff, ContentOf
                   std::is_same_v<decltype(ContentOff{}.before()), TextBytes> &&
                   std::is_same_v<decltype(chat_msg{}.image_ph_off), ContentOff *> &&
                   std::is_same_v<decltype(chat_msg{}.tool_ref_off), ContentOff *> &&
-                  (ContentOff{9} + TextBytes{4}).raw() == 13 && ContentOff::after(TextBytes{7}) == ContentOff{7},
+                  (ContentOff{9u} + TextBytes{4u}).raw() == 13 && ContentOff::after(TextBytes{7u}) == ContentOff{7u},
               "a message content's offset mixes with no other text's and moves by TextBytes; the message carries them");
 
 /* L334 fix: what a state at live position G serves of the request across a token seam -- the conversion both the
@@ -23200,14 +23200,14 @@ static void test_l434_text_position_on_each_spelling(void) {
     }
     TEST_ASSERT(last == 203);
     /* a chain cut inside a request token (a grid point falls mid-text): "Xab" holds X only -- abc straddles it */
-    TEST_ASSERT(pulsar_tokens_in_text_with(l434_piece, NULL, prompt.data(), 203, text.data(), TextBytes{3}) == 1);
+    TEST_ASSERT(pulsar_tokens_in_text_with(l434_piece, NULL, prompt.data(), 203, text.data(), TextBytes{3u}) == 1);
     /* tokens that do not render to the text there hold nothing past the difference */
     const TokId other[] = {l334_id(L334_X), l334_id(L334_ABC), l334_id(L334_Y)};
-    TEST_ASSERT(pulsar_tokens_in_text_with(l434_piece, NULL, other, 3, text.data(), TextBytes{20}) == 2);
+    TEST_ASSERT(pulsar_tokens_in_text_with(l434_piece, NULL, other, 3, text.data(), TextBytes{20u}) == 2);
     /* a control token (no bytes) counts strictly inside the text, not at its end (nothing says which side) */
     const TokId ctl[] = {l334_id(L334_X), l334_id(L334_CTL), l334_id(L334_ABC), l334_id(L334_CTL)};
-    TEST_ASSERT(pulsar_tokens_in_text_with(l434_piece, NULL, ctl, 4, "Xabc", TextBytes{4}) == 3);
-    TEST_ASSERT(pulsar_tokens_in_text_with(l434_piece, NULL, ctl, 4, "Xabc", TextBytes{1}) == 1);
+    TEST_ASSERT(pulsar_tokens_in_text_with(l434_piece, NULL, ctl, 4, "Xabc", TextBytes{4u}) == 3);
+    TEST_ASSERT(pulsar_tokens_in_text_with(l434_piece, NULL, ctl, 4, "Xabc", TextBytes{1u}) == 1);
     /* an image block is one piece (its placeholder) standing for its tokens: all of them or none */
     struct blocks {
         static char *piece(void *, const TokId *t, int len, int i, size_t *n, int *span) {
@@ -23220,14 +23220,14 @@ static void test_l434_text_position_on_each_spelling(void) {
         }
     };
     const TokId img[] = {l334_id(L334_X), l334_id(L334_Y), l334_id(L334_Y), l334_id(L334_Y), l334_id(L334_A)};
-    TEST_ASSERT(pulsar_tokens_in_text_with(blocks::piece, NULL, img, 5, "X<img>a", TextBytes{7}) == 5);
-    TEST_ASSERT(pulsar_tokens_in_text_with(blocks::piece, NULL, img, 5, "X<img>a", TextBytes{6}) == 4);
-    TEST_ASSERT(pulsar_tokens_in_text_with(blocks::piece, NULL, img, 5, "X<img>a", TextBytes{5}) == 1);
+    TEST_ASSERT(pulsar_tokens_in_text_with(blocks::piece, NULL, img, 5, "X<img>a", TextBytes{7u}) == 5);
+    TEST_ASSERT(pulsar_tokens_in_text_with(blocks::piece, NULL, img, 5, "X<img>a", TextBytes{6u}) == 4);
+    TEST_ASSERT(pulsar_tokens_in_text_with(blocks::piece, NULL, img, 5, "X<img>a", TextBytes{5u}) == 1);
     /* nothing to walk */
-    TEST_ASSERT(pulsar_tokens_in_text_with(NULL, NULL, img, 5, "X", TextBytes{1}) == 0);
-    TEST_ASSERT(pulsar_tokens_in_text_with(l434_piece, NULL, img, 0, "X", TextBytes{1}) == 0);
-    TEST_ASSERT(pulsar_prompt_held_by_text(NULL, NULL, "X", TextBytes{1}) == PromptToks{0});
-    TEST_ASSERT(pulsar_history_pos_at_text(NULL, NULL, "X", TextBytes{1}) == TokPos{0});
+    TEST_ASSERT(pulsar_tokens_in_text_with(NULL, NULL, img, 5, "X", TextBytes{1u}) == 0);
+    TEST_ASSERT(pulsar_tokens_in_text_with(l434_piece, NULL, img, 0, "X", TextBytes{1u}) == 0);
+    TEST_ASSERT(pulsar_prompt_held_by_text(NULL, NULL, "X", TextBytes{1u}) == PromptToks{0});
+    TEST_ASSERT(pulsar_history_pos_at_text(NULL, NULL, "X", TextBytes{1u}) == TokPos{0});
 }
 
 /* L434: the pick ranks the request's tokens.  The differing case against a bank whose own state serves 250 of a
@@ -23272,8 +23272,8 @@ static void test_l434_pick_ranks_the_requests_tokens(void) {
         free(hit);
     }
     /* "the chain ends at the prompt's end" is asked of the text: equal token counts say nothing either way */
-    TEST_ASSERT(server_chain_ends_at_text_end(TextBytes{403}, TextBytes{403}));
-    TEST_ASSERT(!server_chain_ends_at_text_end(TextBytes{402}, TextBytes{403}));
+    TEST_ASSERT(server_chain_ends_at_text_end(TextBytes{403u}, TextBytes{403u}));
+    TEST_ASSERT(!server_chain_ends_at_text_end(TextBytes{402u}, TextBytes{403u}));
 }
 
 /* L434: usage is counted on one prompt.  The differing case as a byte-only disk match: the sync runs the chain's 302
@@ -23769,7 +23769,7 @@ static void test_l441_trivial_ceiling_is_the_jobs(void) {
 static void test_l441_admission_prices_the_stitch(void) {
     const int z[] = {L334_Z};
     const uint64_t row = 1000;
-    const KvBytes budget{250000};
+    const KvBytes budget{250000u};
     const auto price = [&](TokCount rows) { return KvBytes{row * pulsar_kv_rows(rows).raw()}; };
     BankCount k{-1};
     {
@@ -23931,13 +23931,13 @@ static void test_l441_pool_spaces(void) {
     }
     /* the ids: 0 is none(), the counter steps by one from it (enqueue's ++job_seq, trace_begin's ++trace_seq) */
     JobId jid{};
-    TEST_ASSERT(jid.is_none() && jid == JobId::none() && jid.next() == JobId{1} && JobId{1}.next().raw() == 2u);
+    TEST_ASSERT(jid.is_none() && jid == JobId::none() && jid.next() == JobId{1u} && JobId{1u}.next().raw() == 2u);
     TraceId tid = TraceId::none();
     tid = tid.next();
     TEST_ASSERT(!tid.is_none() && tid.raw() == 1u);
     kv_req_line kl;
     memset(&kl, 0, sizeof kl);
-    kl.id = JobId{4711};
+    kl.id = JobId{4711u};
     char kline[KV_REQ_LINE_MAX];
     kv_req_format(&kl, kline, sizeof kline);
     TEST_ASSERT(!strncmp(kline, "id=4711 ", 8));   /* printed as the integer it was */

@@ -2027,7 +2027,7 @@ void gpu_graph_engram_release(pulsar_gpu_graph *g);
 /// @param g  the graph
 /// @return the bank the installed device views address (0 without a pool).
 static inline BankId gpu_graph_cur_bank(const pulsar_gpu_graph *g) {
-    return BankId{g->banks.n_banks ? g->banks.cur_bank : 0u};
+    return BankId::from_raw_unchecked(g->banks.n_banks ? g->banks.cur_bank : 0u);
 }
 /* THE BANK IS EXPLICIT.  These used to take (g, il) and resolve through
  * gpu_graph_cur_bank(), which reads `banks.cur_bank` -- documented as "bank the

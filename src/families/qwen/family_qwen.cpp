@@ -1516,8 +1516,8 @@ static bool qwen_mtp_forward(pulsar_session *s, pulsar_step_mode mode, const pul
     st.mixer = &pulsar_qwen_of(e)->weights->mtp.mixer;
     st.draft_head = true;                               /* the drafter's head: n_draft logits a row */
     /* L289: enqueued, not waited for -- the step's uploads never drain the stream */
-    bool ok = pulsar_gpu_tensor_write_async(q->row_pos, TensorBytes{0}, pos, bytes_of<int32_t>(n_rows)) != 0 &&
-              pulsar_gpu_tensor_write_async(q->row_bank, TensorBytes{0}, bank, bytes_of<int32_t>(n_rows)) != 0;
+    bool ok = pulsar_gpu_tensor_write_async(q->row_pos, TensorBytes{0u}, pos, bytes_of<int32_t>(n_rows)) != 0 &&
+              pulsar_gpu_tensor_write_async(q->row_bank, TensorBytes{0u}, bank, bytes_of<int32_t>(n_rows)) != 0;
     if (ok) ok = pulsar_gpu_begin_commands() != 0;
     if (ok) ok = pulsar_qwen_s4_mtp_combine(&st, pulsar_gpu_tensor_device_ptr(cond));
     if (ok) ok = qwen_layer(&st, il, pulsar_qwen_s3_qsa);
@@ -1539,7 +1539,7 @@ static bool qwen_mtp_forward(pulsar_session *s, pulsar_step_mode mode, const pul
     }
     if (!ok) return false;
     if (head_n && logits_out)
-        ok = pulsar_gpu_tensor_read(q->logits, TensorBytes{0}, logits_out,
+        ok = pulsar_gpu_tensor_read(q->logits, TensorBytes{0u}, logits_out,
                                     bytes_of<float>((uint64_t)head_n * pulsar_qwen_of(e)->weights->n_draft)) != 0;
     return ok;
 }
@@ -1633,7 +1633,7 @@ static bool qwen_mtp_stage_restore(pulsar_session *s, uint32_t bank) {
 static void qwen_mtp_prefetch(pulsar_session *s, uint32_t bank, const TokId *ids, uint32_t n, bool chain_start) {
     int32_t *ctx = qwen_st(s)->mtp_pctx + 2u * bank;
     if (chain_start) {
-        const int32_t *ngram = (const int32_t *)pulsar_state_host(s->states, PULSAR_QWEN_STATE_NGRAM, BankId{bank});
+        const int32_t *ngram = (const int32_t *)pulsar_state_host(s->states, PULSAR_QWEN_STATE_NGRAM, BankId::from_raw_unchecked(bank));
         ctx[0] = ngram[0];
         ctx[1] = ngram[1];
     }

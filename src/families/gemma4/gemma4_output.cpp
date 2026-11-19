@@ -218,7 +218,7 @@ const out_grammar &gemma4_output_grammar(void) {
 
 void gemma4_call_body::open() {
     began_ = false;
-    args_lo_ = scan_ = BodyOff{0};
+    args_lo_ = scan_ = BodyOff{0u};
     in_str_ = false;
 }
 
@@ -255,7 +255,7 @@ void gemma4_call_body::grow(const std::string &b, GenBytes, bool, int index, std
 bool gemma4_call_body::close(const std::string &b, int index, std::vector<out_event> *ev, out_call *call,
                              const char **why, BodyOff *at) {
     const size_t ns = name_start(b);
-    *at = BodyOff{0};
+    *at = BodyOff{0u};
     if (ns == std::string::npos) {
         *why = "expected call:NAME";
         return false;

@@ -273,7 +273,7 @@ rows_scratch rows_layout(uint32_t R) {
     r.slot_a = o;  o += a256(elt_bytes((uint64_t)R, 4u));
     r.first_b = o; o += a256(elt_bytes((uint64_t)(R + 1u), 4u));
     r.slot_b = o;  o += a256(elt_bytes((uint64_t)R, 4u));
-    r.nf = o;      o += TensorBytes{256};
+    r.nf = o;      o += TensorBytes{256u};
     r.total = o.before();
     return r;
 }
@@ -812,7 +812,7 @@ bool plan_attention(const nh_step *st, uint32_t *bound_out) {
             return false;
     }
     *bound_out = bound;
-    return pulsar_gpu_tensor_write_async(q->attn_desc, TensorBytes{0}, q->attn_desc_host,
+    return pulsar_gpu_tensor_write_async(q->attn_desc, TensorBytes{0u}, q->attn_desc_host,
                                          stride.times(q->n_attn)) != 0 ||
            fail("could not upload the attention descriptors");
 }
@@ -1509,7 +1509,7 @@ bool mtp_forward(pulsar_session *s, const pulsar_mtp_step *m) {
     ok = step_end(&st, ok);
     if (ok && m->pick) {
         pulsar_draft_top rec[PULSAR_DRIVER_HEADS_MAX];
-        ok = pulsar_gpu_tensor_read(q->mtop, TensorBytes{0}, rec, TensorBytes{sizeof(rec[0])}.times(m->head_n)) != 0 ||
+        ok = pulsar_gpu_tensor_read(q->mtop, TensorBytes{0u}, rec, TensorBytes{sizeof(rec[0])}.times(m->head_n)) != 0 ||
              fail("could not read the pick");
         for (uint32_t r = 0; ok && r < m->head_n; r++) {
             if (rec[r].nan || rec[r].index < 0 || (uint32_t)rec[r].index >= V) return fail("the MTP head's row holds a NaN");
@@ -1517,7 +1517,7 @@ bool mtp_forward(pulsar_session *s, const pulsar_mtp_step *m) {
         }
     }
     if (ok && m->head_n && m->logits)
-        ok = pulsar_gpu_tensor_read(q->logits, TensorBytes{0}, m->logits,
+        ok = pulsar_gpu_tensor_read(q->logits, TensorBytes{0u}, m->logits,
                                     bytes_of<float>((uint64_t)m->head_n * V)) != 0 ||
              fail("could not read the MTP logits");
     return ok;

@@ -89,8 +89,8 @@ static void test_slab_layout(void) {
         }
     }
     /* Monotonic in slot index: FFN(after ATTN) sits after it. */
-    CHECK(pulsar_tp_slab_out_offset(&s, TpSlot{0}, PULSAR_TP_GATE_ATTN, vec) <
-          pulsar_tp_slab_out_offset(&s, TpSlot{0}, PULSAR_TP_GATE_FFN, vec),
+    CHECK(pulsar_tp_slab_out_offset(&s, TpSlot{0u}, PULSAR_TP_GATE_ATTN, vec) <
+          pulsar_tp_slab_out_offset(&s, TpSlot{0u}, PULSAR_TP_GATE_FFN, vec),
           "ATTN slot must precede FFN slot");
 
     /* The gate ring (v26): one slot per gate, never fewer than the row lane's

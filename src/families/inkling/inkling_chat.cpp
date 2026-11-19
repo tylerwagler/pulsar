@@ -364,7 +364,7 @@ bool inkling_chat_tool_defs(const char *tools_json, inkling_render_out *out, cha
     std::string declare;
     if (!tool_declare_json(tools_json, &declare, err, errlen)) return false;
     out->text = declare;
-    out->spans.push_back({PromptOff{0}, prompt_end(declare)});
+    out->spans.push_back({PromptOff{0u}, prompt_end(declare)});
     return true;
 }
 

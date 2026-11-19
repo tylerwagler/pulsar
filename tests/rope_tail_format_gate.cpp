@@ -84,9 +84,9 @@ int main(void) {
         pulsar_gpu_tensor *tb = pulsar_gpu_tensor_alloc_elt(n, 2u, PULSAR_ELT_BF16);
         CHECK(tf && th && tb, "alloc");
         if (!tf || !th || !tb) return 1;
-        CHECK(pulsar_gpu_tensor_write(tf, TensorBytes{0}, x.data(), bytes_of<float>(n)), "write f32");
-        CHECK(pulsar_gpu_tensor_write(th, TensorBytes{0}, xh.data(), bytes_of<uint16_t>(n)), "write f16");
-        CHECK(pulsar_gpu_tensor_write(tb, TensorBytes{0}, xb.data(), bytes_of<uint16_t>(n)), "write bf16");
+        CHECK(pulsar_gpu_tensor_write(tf, TensorBytes{0u}, x.data(), bytes_of<float>(n)), "write f32");
+        CHECK(pulsar_gpu_tensor_write(th, TensorBytes{0u}, xh.data(), bytes_of<uint16_t>(n)), "write f16");
+        CHECK(pulsar_gpu_tensor_write(tb, TensorBytes{0u}, xb.data(), bytes_of<uint16_t>(n)), "write bf16");
         CHECK(run_one(tf, pos0, a) && run_one(th, pos0, a) && run_one(tb, pos0, a), "%s: rope launch", a.name);
         pulsar_gpu_synchronize();
         std::vector<float> rf(n), rh(n), rb(n);
@@ -143,7 +143,7 @@ int main(void) {
         CHECK(t[0] && t[1] && t[2] && t[3], "alloc head-norm operands");
         const std::vector<uint8_t> zero(n * sizeof(float), 0u);
         for (int k = 0; k < 4 && t[0] && t[1] && t[2] && t[3]; k++) {
-            CHECK(pulsar_gpu_tensor_write(t[k], TensorBytes{0}, zero.data(), TensorBytes{n * (k ? 2u : 4u)}), "zero %s",
+            CHECK(pulsar_gpu_tensor_write(t[k], TensorBytes{0u}, zero.data(), TensorBytes{n * (k ? 2u : 4u)}), "zero %s",
                   nm[k]);
             const bool ran = pulsar_gpu_head_rms_norm_rope_tail_tensor(t[k], N_TOK, N_HEAD, HEAD_DIM, N_ROT, 0u, 0u,
                                                                        false, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f,

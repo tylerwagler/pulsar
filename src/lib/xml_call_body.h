@@ -67,8 +67,8 @@ private:
     /// Where the stream's reading of the one parameter it waits on stands (L429): what read_param found so far, so
     /// its next reading of the same parameter in a longer body starts there.
     struct param_resume {
-        BodyOff key_end = BodyOff{0};   ///< the offset of the key's '>', once found (0: not yet; a key never ends at 0)
-        BodyOff seen = BodyOff{0};      ///< no key end (before key_end is known) or value closer (after) starts before it
+        BodyOff key_end = BodyOff{0u};   ///< the offset of the key's '>', once found (0: not yet; a key never ends at 0)
+        BodyOff seen = BodyOff{0u};      ///< no key end (before key_end is known) or value closer (after) starts before it
     };
     /// Read one "<parameter=KEY>\nVALUE\n</parameter>" of function `fn` at b[*i] (the reading close() and the
     /// stream share).
@@ -90,19 +90,19 @@ private:
     void stream_params(const std::string &b, int index, std::vector<out_event> *ev);
 
     bool began_ = false;       ///< TOOL_BEGIN sent for the open call
-    BodyOff head_ws_ = BodyOff{0};     ///< leading whitespace of the body skipped so far (before began_)
-    BodyOff head_seen_ = BodyOff{0};   ///< no '>' or newline of "<function=NAME>" before this offset (before began_)
+    BodyOff head_ws_ = BodyOff{0u};     ///< leading whitespace of the body skipped so far (before began_)
+    BodyOff head_seen_ = BodyOff{0u};   ///< no '>' or newline of "<function=NAME>" before this offset (before began_)
     std::string fn_;           ///< the open call's function name, once complete
-    BodyOff arg_pos_ = BodyOff{0};   ///< body offset past the last parameter streamed (TOOL_ARGS) and the whitespace after it
+    BodyOff arg_pos_ = BodyOff{0u};   ///< body offset past the last parameter streamed (TOOL_ARGS) and the whitespace after it
     param_resume arg_resume_;  ///< the reading of the parameter at arg_pos_ so far
     int arg_n_ = 0;            ///< parameters streamed for the open call
     bool arg_stop_ = false;    ///< the open call stopped streaming: its next bytes are not a parameter
     /// An incremental scan of the open call's parameter values (scan_values).
     struct value_scan {
-        BodyOff pos = BodyOff{0};        ///< bytes of the body classified
-        BodyOff key_seen = BodyOff{0};   ///< an open "<parameter=" tag at pos has no '>' before this offset
+        BodyOff pos = BodyOff{0u};        ///< bytes of the body classified
+        BodyOff key_seen = BodyOff{0u};   ///< an open "<parameter=" tag at pos has no '>' before this offset
         bool value = false;    ///< inside a parameter value
-        BodyOff vstart = BodyOff{0};     ///< where its text starts (past the tag)
+        BodyOff vstart = BodyOff{0u};     ///< where its text starts (past the tag)
         bool is_string = false;///< the schema declares it a string
         bool json_str = false; ///< inside a JSON string literal of a non-string value
         bool esc = false;      ///< the previous byte was a backslash in that literal

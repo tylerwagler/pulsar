@@ -189,7 +189,7 @@ static int run_leg(const char *name, const float *src) {
      * and leaves the DECODED values behind, which is what makes the device
      * decode checkable from the host. */
     if (!x || !packed ||
-        !pulsar_gpu_tensor_write(x, TensorBytes{0}, src, bytes_of<float>((uint64_t)ROWS * HD)) ||
+        !pulsar_gpu_tensor_write(x, TensorBytes{0u}, src, bytes_of<float>((uint64_t)ROWS * HD)) ||
         !pulsar_gpu_attn_pack_store_tensor(x, x, packed, 0, ROWS, HD) ||
         !pulsar_gpu_synchronize()) {
         fprintf(stderr, "attn-pack-gate: %s: GPU pack FAILED to run\n", name);
@@ -197,8 +197,8 @@ static int run_leg(const char *name, const float *src) {
     }
     uint8_t *gpu_rows = (uint8_t *)malloc((size_t)ROWS * rowb);
     float *gpu_dec = (float *)malloc((size_t)ROWS * HD * sizeof(float));
-    if (!pulsar_gpu_tensor_read(packed, TensorBytes{0}, gpu_rows, TensorBytes{(uint64_t)ROWS * rowb}) ||
-        !pulsar_gpu_tensor_read(x, TensorBytes{0}, gpu_dec, bytes_of<float>((uint64_t)ROWS * HD))) {
+    if (!pulsar_gpu_tensor_read(packed, TensorBytes{0u}, gpu_rows, TensorBytes{(uint64_t)ROWS * rowb}) ||
+        !pulsar_gpu_tensor_read(x, TensorBytes{0u}, gpu_dec, bytes_of<float>((uint64_t)ROWS * HD))) {
         fprintf(stderr, "attn-pack-gate: %s: readback FAILED\n", name);
         return 1;
     }

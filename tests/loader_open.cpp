@@ -49,7 +49,7 @@ static bool store_probe(pulsar_engine *e, const char *dir, bool write) {
     bool wrote = false;
     if (write) {
         char key[41], err[256] = "";
-        wrote = pulsar_segstore_put(st, "", TokPos{0}, TokPos{128}, "SYSTEM:", TextBytes{7}, 256, write_payload, 0, NULL,
+        wrote = pulsar_segstore_put(st, "", TokPos{0}, TokPos{128}, "SYSTEM:", TextBytes{7u}, 256, write_payload, 0, NULL,
                                     NULL, key, err, sizeof err) &&
                 pulsar_segstore_put_rp(st, key, 256, 0, write_payload, NULL, err, sizeof err);
         if (!wrote) fprintf(stderr, "loader_open: the store took no segment: %s\n", err);

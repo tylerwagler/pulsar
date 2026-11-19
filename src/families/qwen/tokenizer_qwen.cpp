@@ -46,7 +46,7 @@ static bool qwen_encode_into(const pulsar_engine *e, const char *text, const pul
 /// @param[in,out] out ids appended
 /// @return false when the tokenizer refused the text
 static bool qwen_tok_encode_text(pulsar_engine *e, const char *text, pulsar_tokens *out) {
-    const pulsar_text_span all = {PromptOff{0}, PromptOff::after(TextBytes{text ? strlen(text) : 0})};
+    const pulsar_text_span all = {PromptOff{0u}, PromptOff::after(TextBytes{text ? strlen(text) : 0})};
     return qwen_encode_into(e, text, all.empty() ? NULL : &all, all.empty() ? 0u : 1u, out);
 }
 

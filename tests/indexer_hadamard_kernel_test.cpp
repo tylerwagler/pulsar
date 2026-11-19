@@ -140,13 +140,13 @@ int main(void) {
     pulsar_gpu_tensor *pd = pulsar_gpu_tensor_alloc(TensorBytes{(size_t)N_ROWS * HAD_ROWBYTES});
     CHECK(xd && pd, "tensor alloc failed");
     if (!xd || !pd) return 1;
-    CHECK(pulsar_gpu_tensor_write(xd, TensorBytes{0}, x.data(), bytes_of<float>(x.size())), "input write");
+    CHECK(pulsar_gpu_tensor_write(xd, TensorBytes{0u}, x.data(), bytes_of<float>(x.size())), "input write");
 
     /* ---- A. the Hadamard pack vs the host oracle, byte for byte ---------- */
     CHECK(pulsar_gpu_dsv4_indexer_qat_pack_tensor(xd, pd, 0, N_ROWS, 128u, false), "qat pack launch");
     pulsar_gpu_synchronize();
     std::vector<uint8_t> got((size_t)N_ROWS * HAD_ROWBYTES), want((size_t)N_ROWS * HAD_ROWBYTES);
-    CHECK(pulsar_gpu_tensor_read(pd, TensorBytes{0}, got.data(), TensorBytes{got.size()}), "packed read");
+    CHECK(pulsar_gpu_tensor_read(pd, TensorBytes{0u}, got.data(), TensorBytes{got.size()}), "packed read");
 
     uint32_t row_mismatch = 0, byte_mismatch = 0;
     for (uint32_t r = 0; r < N_ROWS; r++) {
@@ -209,8 +209,8 @@ int main(void) {
         pulsar_gpu_tensor *pf = pulsar_gpu_tensor_alloc(TensorBytes{(size_t)n_rows * HAD_ROWBYTES});
         CHECK(a && b && pr && pf, "q-path alloc failed");
         if (!a || !b || !pr || !pf) return 1;
-        CHECK(pulsar_gpu_tensor_write(a, TensorBytes{0}, xq.data(), bytes_of<float>(xq.size())), "q write a");
-        CHECK(pulsar_gpu_tensor_write(b, TensorBytes{0}, xq.data(), bytes_of<float>(xq.size())), "q write b");
+        CHECK(pulsar_gpu_tensor_write(a, TensorBytes{0u}, xq.data(), bytes_of<float>(xq.size())), "q write a");
+        CHECK(pulsar_gpu_tensor_write(b, TensorBytes{0u}, xq.data(), bytes_of<float>(xq.size())), "q write b");
 
         const float fb = 10000.0f, fs = 1.0f, ef = 0.0f, af = 1.0f, bf = 32.0f, bs = 1.0f;
         const uint32_t pos0 = 7u, n_ctx = 4096u;
@@ -221,8 +221,8 @@ int main(void) {
                                                       fb, fs, ef, af, bf, bs, NULL), "fused rope+qat launch");
         pulsar_gpu_synchronize();
         std::vector<uint8_t> r1((size_t)n_rows * HAD_ROWBYTES), r2((size_t)n_rows * HAD_ROWBYTES);
-        CHECK(pulsar_gpu_tensor_read(pr, TensorBytes{0}, r1.data(), TensorBytes{r1.size()}), "read r1");
-        CHECK(pulsar_gpu_tensor_read(pf, TensorBytes{0}, r2.data(), TensorBytes{r2.size()}), "read r2");
+        CHECK(pulsar_gpu_tensor_read(pr, TensorBytes{0u}, r1.data(), TensorBytes{r1.size()}), "read r1");
+        CHECK(pulsar_gpu_tensor_read(pf, TensorBytes{0u}, r2.data(), TensorBytes{r2.size()}), "read r2");
         uint32_t d2 = 0;
         for (size_t i = 0; i < r1.size(); i++) d2 += (r1[i] != r2[i]);
         CHECK(d2 == 0, "fused rope+hadamard+pack differs from rope-then-pack: %u/%zu bytes", d2, r1.size());
@@ -274,9 +274,9 @@ int main(void) {
         CHECK(kvA && scA && scB && latA && latB && sA_kv && sA_sc && sB_kv && sB_sc && pkA && pkB,
               "compressor alloc failed");
         if (g_fail) return 1;
-        CHECK(pulsar_gpu_tensor_write(kvA, TensorBytes{0}, kv.data(), bytes_of<float>(kv.size())), "kv write");
-        CHECK(pulsar_gpu_tensor_write(scA, TensorBytes{0}, sc.data(), bytes_of<float>(sc.size())), "sc write A");
-        CHECK(pulsar_gpu_tensor_write(scB, TensorBytes{0}, sc.data(), bytes_of<float>(sc.size())), "sc write B");
+        CHECK(pulsar_gpu_tensor_write(kvA, TensorBytes{0u}, kv.data(), bytes_of<float>(kv.size())), "kv write");
+        CHECK(pulsar_gpu_tensor_write(scA, TensorBytes{0u}, sc.data(), bytes_of<float>(sc.size())), "sc write A");
+        CHECK(pulsar_gpu_tensor_write(scB, TensorBytes{0u}, sc.data(), bytes_of<float>(sc.size())), "sc write B");
         
         /* pos0 != 0 means the lane is LIVE: the reference reads the incoming
          * carry for group 0 rather than padding, and the csa2 prefill
@@ -286,10 +286,10 @@ int main(void) {
         {
             std::vector<float> z(lane_bytes / sizeof(float), 0.0f);
             std::vector<float> ninf(lane_bytes / sizeof(float), -INFINITY);
-            CHECK(pulsar_gpu_tensor_write(sA_kv, TensorBytes{0}, z.data(), TensorBytes{lane_bytes}), "init sA_kv");
-            CHECK(pulsar_gpu_tensor_write(sB_kv, TensorBytes{0}, z.data(), TensorBytes{lane_bytes}), "init sB_kv");
-            CHECK(pulsar_gpu_tensor_write(sA_sc, TensorBytes{0}, ninf.data(), TensorBytes{lane_bytes}), "init sA_sc");
-            CHECK(pulsar_gpu_tensor_write(sB_sc, TensorBytes{0}, ninf.data(), TensorBytes{lane_bytes}), "init sB_sc");
+            CHECK(pulsar_gpu_tensor_write(sA_kv, TensorBytes{0u}, z.data(), TensorBytes{lane_bytes}), "init sA_kv");
+            CHECK(pulsar_gpu_tensor_write(sB_kv, TensorBytes{0u}, z.data(), TensorBytes{lane_bytes}), "init sB_kv");
+            CHECK(pulsar_gpu_tensor_write(sA_sc, TensorBytes{0u}, ninf.data(), TensorBytes{lane_bytes}), "init sA_sc");
+            CHECK(pulsar_gpu_tensor_write(sB_sc, TensorBytes{0u}, ninf.data(), TensorBytes{lane_bytes}), "init sB_sc");
         }
 
         const float fb = 10000.0f, fs = 1.0f, ef = 0.0f, af = 1.0f, bf = 32.0f, bs = 1.0f;
@@ -328,17 +328,17 @@ int main(void) {
         pulsar_gpu_synchronize();
 
         std::vector<uint8_t> ra((size_t)n_groups * HAD_ROWBYTES), rb((size_t)n_groups * HAD_ROWBYTES);
-        CHECK(pulsar_gpu_tensor_read(pkA, TensorBytes{0}, ra.data(), TensorBytes{ra.size()}), "read pkA");
-        CHECK(pulsar_gpu_tensor_read(pkB, TensorBytes{0}, rb.data(), TensorBytes{rb.size()}), "read pkB");
+        CHECK(pulsar_gpu_tensor_read(pkA, TensorBytes{0u}, ra.data(), TensorBytes{ra.size()}), "read pkA");
+        CHECK(pulsar_gpu_tensor_read(pkB, TensorBytes{0u}, rb.data(), TensorBytes{rb.size()}), "read pkB");
         uint32_t dd = 0;
         for (size_t i = 0; i < ra.size(); i++) dd += (ra[i] != rb[i]);
         CHECK(dd == 0, "indexer compressor composite vs its parts: %u/%zu row bytes differ", dd, ra.size());
 
         std::vector<float> sa_kv(lane_bytes / 4), sb_kv(lane_bytes / 4), sa_sc(lane_bytes / 4), sb_sc(lane_bytes / 4);
-        CHECK(pulsar_gpu_tensor_read(sA_kv, TensorBytes{0}, sa_kv.data(), TensorBytes{lane_bytes}), "read sA_kv");
-        CHECK(pulsar_gpu_tensor_read(sB_kv, TensorBytes{0}, sb_kv.data(), TensorBytes{lane_bytes}), "read sB_kv");
-        CHECK(pulsar_gpu_tensor_read(sA_sc, TensorBytes{0}, sa_sc.data(), TensorBytes{lane_bytes}), "read sA_sc");
-        CHECK(pulsar_gpu_tensor_read(sB_sc, TensorBytes{0}, sb_sc.data(), TensorBytes{lane_bytes}), "read sB_sc");
+        CHECK(pulsar_gpu_tensor_read(sA_kv, TensorBytes{0u}, sa_kv.data(), TensorBytes{lane_bytes}), "read sA_kv");
+        CHECK(pulsar_gpu_tensor_read(sB_kv, TensorBytes{0u}, sb_kv.data(), TensorBytes{lane_bytes}), "read sB_kv");
+        CHECK(pulsar_gpu_tensor_read(sA_sc, TensorBytes{0u}, sa_sc.data(), TensorBytes{lane_bytes}), "read sA_sc");
+        CHECK(pulsar_gpu_tensor_read(sB_sc, TensorBytes{0u}, sb_sc.data(), TensorBytes{lane_bytes}), "read sB_sc");
         uint32_t sd = 0;
         for (size_t i = 0; i < sa_kv.size(); i++) {
             sd += (memcmp(&sa_kv[i], &sb_kv[i], 4) != 0);
@@ -361,13 +361,13 @@ int main(void) {
         {
             const uint32_t r_tok = 3u;   /* < ratio: no complete group */
             std::vector<float> z(lane_bytes / 4, 0.0f), ninf(lane_bytes / 4, -INFINITY);
-            CHECK(pulsar_gpu_tensor_write(sA_kv, TensorBytes{0}, z.data(), TensorBytes{lane_bytes}), "reset sA_kv");
-            CHECK(pulsar_gpu_tensor_write(sB_kv, TensorBytes{0}, z.data(), TensorBytes{lane_bytes}), "reset sB_kv");
-            CHECK(pulsar_gpu_tensor_write(sA_sc, TensorBytes{0}, ninf.data(), TensorBytes{lane_bytes}), "reset sA_sc");
-            CHECK(pulsar_gpu_tensor_write(sB_sc, TensorBytes{0}, ninf.data(), TensorBytes{lane_bytes}), "reset sB_sc");
-            CHECK(pulsar_gpu_tensor_write(scA, TensorBytes{0}, sc.data(), bytes_of<float>((size_t)r_tok * width)),
+            CHECK(pulsar_gpu_tensor_write(sA_kv, TensorBytes{0u}, z.data(), TensorBytes{lane_bytes}), "reset sA_kv");
+            CHECK(pulsar_gpu_tensor_write(sB_kv, TensorBytes{0u}, z.data(), TensorBytes{lane_bytes}), "reset sB_kv");
+            CHECK(pulsar_gpu_tensor_write(sA_sc, TensorBytes{0u}, ninf.data(), TensorBytes{lane_bytes}), "reset sA_sc");
+            CHECK(pulsar_gpu_tensor_write(sB_sc, TensorBytes{0u}, ninf.data(), TensorBytes{lane_bytes}), "reset sB_sc");
+            CHECK(pulsar_gpu_tensor_write(scA, TensorBytes{0u}, sc.data(), bytes_of<float>((size_t)r_tok * width)),
                   "sc write A");
-            CHECK(pulsar_gpu_tensor_write(scB, TensorBytes{0}, sc.data(), bytes_of<float>((size_t)r_tok * width)),
+            CHECK(pulsar_gpu_tensor_write(scB, TensorBytes{0u}, sc.data(), bytes_of<float>((size_t)r_tok * width)),
                   "sc write B");
 
             CHECK(pulsar_gpu_indexer_compressor_prefill_tensor(pkA, latA, sA_kv, sA_sc, scA, kvA,
@@ -385,10 +385,10 @@ int main(void) {
             pulsar_gpu_synchronize();
 
             std::vector<float> ra_kv(lane_bytes / 4), rb_kv(lane_bytes / 4), ra_sc(lane_bytes / 4), rb_sc(lane_bytes / 4);
-            CHECK(pulsar_gpu_tensor_read(sA_kv, TensorBytes{0}, ra_kv.data(), TensorBytes{lane_bytes}), "read sA_kv");
-            CHECK(pulsar_gpu_tensor_read(sB_kv, TensorBytes{0}, rb_kv.data(), TensorBytes{lane_bytes}), "read sB_kv");
-            CHECK(pulsar_gpu_tensor_read(sA_sc, TensorBytes{0}, ra_sc.data(), TensorBytes{lane_bytes}), "read sA_sc");
-            CHECK(pulsar_gpu_tensor_read(sB_sc, TensorBytes{0}, rb_sc.data(), TensorBytes{lane_bytes}), "read sB_sc");
+            CHECK(pulsar_gpu_tensor_read(sA_kv, TensorBytes{0u}, ra_kv.data(), TensorBytes{lane_bytes}), "read sA_kv");
+            CHECK(pulsar_gpu_tensor_read(sB_kv, TensorBytes{0u}, rb_kv.data(), TensorBytes{lane_bytes}), "read sB_kv");
+            CHECK(pulsar_gpu_tensor_read(sA_sc, TensorBytes{0u}, ra_sc.data(), TensorBytes{lane_bytes}), "read sA_sc");
+            CHECK(pulsar_gpu_tensor_read(sB_sc, TensorBytes{0u}, rb_sc.data(), TensorBytes{lane_bytes}), "read sB_sc");
             uint32_t rd = 0;
             for (size_t i = 0; i < ra_kv.size(); i++) {
                 rd += (memcmp(&ra_kv[i], &rb_kv[i], 4) != 0);

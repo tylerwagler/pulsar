@@ -553,7 +553,7 @@ bool pulsar_ds4_tp_slices(pulsar_engine *e, pulsar_tp_plan *plan) {
             return false;
         }
     }
-    const pulsar_layer_weights *L0 = &e->weights.layer[TrunkLayer{0}];
+    const pulsar_layer_weights *L0 = &e->weights.layer[TrunkLayer{0u}];
     uint32_t sx_lo = 0, sx_hi = 0;
     (void)pulsar_tp_owned_range(tp_rk, tp_nr, (uint32_t)L0->ffn_gate_shexp->dim[1], &sx_lo, &sx_hi);
     fprintf(stderr, "pulsar: TP rank %d/%u owns attention output groups [%u,%u) of %u = heads [%u,%u) and "
@@ -1232,7 +1232,7 @@ static bool session_alloc_tp_scratch(pulsar_gpu_graph *g, pulsar_tp *tp) {
     }
     const uint32_t zero = 0u;
     g->tp_stage_ticket = pulsar_gpu_tensor_alloc(TensorBytes{sizeof(zero)});
-    if (!g->tp_stage_ticket || !pulsar_gpu_tensor_write(g->tp_stage_ticket, TensorBytes{0}, &zero,
+    if (!g->tp_stage_ticket || !pulsar_gpu_tensor_write(g->tp_stage_ticket, TensorBytes{0u}, &zero,
                                                         TensorBytes{sizeof(zero)})) {
         fprintf(stderr, "pulsar: tp row-lane stage ticket allocation failed\n");
         return false;
@@ -1372,7 +1372,7 @@ KvBytes pulsar_engine::session_cost_bytes_banked(int ctx_size, int n_banks, KvBy
     pulsar_session *s = session_build(e, ctx_size, (uint32_t)n_banks);
     const bool ok = s != NULL;
     if (s) s->destroy();
-    TensorBytes bytes{0}, managed{0};
+    TensorBytes bytes{0u}, managed{0u};
     pulsar_gpu_tensor_dry_end(&bytes, &managed);
     if (managed_bytes && ok) *managed_bytes = kv_bytes_of(managed);
     return ok ? kv_bytes_of(bytes) : KvBytes{};
@@ -1711,7 +1711,7 @@ void pulsar_session::trim_history(TokPos pos) {
     spec_lookahead_reset(s);
     /* Rewound positions' drafter rows are stale; empty the window (it refills
      * from the prompt capture on the next prefill, or from commits). */
-    for (int i = 0; i < 3; i++) s->graph->dspark_n_raw[DraftLayer{i}] = 0;
+    for (int i = 0; i < 3; i++) s->graph->dspark_n_raw[DraftLayer::from_raw_unchecked(i)] = 0;
     s->graph->dspark_prompt_n = 0;
     if (s->prefill_frontier > pos) s->prefill_frontier = pos;   /* L195: a prefill above the new frontier never happened */
 }

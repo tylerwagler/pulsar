@@ -52,13 +52,13 @@ static double now_us() {
 }
 static void timed_save(pulsar_session *s, uint32_t b) {
     const double t0 = now_us();
-    pulsar_session_bank_state_save(s, BankId{b});
+    pulsar_session_bank_state_save(s, BankId::from_raw_unchecked(b));
     g_save_us += now_us() - t0;
     g_saves++;
 }
 static bool timed_restore(pulsar_session *s, uint32_t b) {
     const double t0 = now_us();
-    const bool ok = pulsar_session_bank_state_restore(s, BankId{b});
+    const bool ok = pulsar_session_bank_state_restore(s, BankId::from_raw_unchecked(b));
     g_restore_us += now_us() - t0;
     g_restores++;
     return ok;

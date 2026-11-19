@@ -61,7 +61,7 @@ put_rc kvchain_put(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, con
     const uint64_t payload = pulsar_session_segment_bytes(s, G_prev, G, NULL);
     if (payload == 0) return PUT_NO_CUT;
     const pulsar_tokens span = view(toks, G_prev.raw(), G.raw());
-    TextBytes text_len{0};
+    TextBytes text_len{0u};
     char *text = pulsar_kvtext_render_tokens_text(e, &span, &text_len);
     if (!text) {
         snprintf(r->err, sizeof(r->err), "segment [%d,%d) could not be rendered", G_prev.raw(), G.raw());
@@ -255,7 +255,7 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
     TokPos prev{0};
     {
         const pulsar_tokens head = view(toks, 0, deepest.raw());
-        TextBytes full_len{0};
+        TextBytes full_len{0u};
         char *full = pulsar_kvtext_render_tokens_text(e, &head, &full_len);
         const pulsar_segstore_end grid_end = { grid, false };
         pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
@@ -268,7 +268,7 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
         free(full);
         if (c > 0 && chain[c - 1].G <= deepest) {
             const pulsar_tokens upto = view(toks, 0, chain[c - 1].G.raw());
-            TextBytes upto_len{0};
+            TextBytes upto_len{0u};
             free(pulsar_kvtext_render_tokens_text(e, &upto, &upto_len));
             if (upto_len == chain[c - 1].text_end) {
                 memcpy(parent, chain[c - 1].key, 41);
