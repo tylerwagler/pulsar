@@ -686,7 +686,7 @@ static void dir_push(st_dir *d, const char *gguf_name, uint32_t type,
     for (uint32_t i = 0; i < nd; i++) t->dim[i] = dim[i];
     t->type = type;
     t->rel_offset = 0;
-    t->abs_offset = at.raw();   /* L438: the shard is mapped whole (st_shard::map): its file offset is its map offset */
+    t->abs_offset = pulsar_map_off_of_file(at);   /* the shard is mapped whole (st_shard::map) */
     t->elements = 1;
     for (uint32_t i = 0; i < nd; i++) t->elements = st_mul(t->elements, dim[i]);
     t->bytes = bytes.raw();   /* pulsar_tensor::bytes stays a bare count (read in ~90 places, L438's left-raw list) */
@@ -1212,7 +1212,7 @@ static void st_open(pulsar_model *m, const char *path, bool gpu_mapping) {
             const pulsar_tensor *t = &m->tensors[i];
             if (t->name.len < plen || memcmp(t->name.ptr, vfypfx, plen) != 0) continue;
             const uint8_t *base = (const uint8_t *)tensor_map_base(m, t);
-            const uint8_t *p = base + t->abs_offset;
+            const uint8_t *p = pulsar_map_at(base, t->abs_offset);
             uint64_t h = 0xcbf29ce484222325ull;
             for (uint64_t b = 0; b < t->bytes; b++) {
                 h ^= (uint64_t)p[b];

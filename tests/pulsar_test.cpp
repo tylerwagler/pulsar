@@ -4365,6 +4365,8 @@ static void test_l426_content_digest(void) {
  * did -- and a slab offset meets a pointer, and bytes round up, by name only. */
 static_assert(!std::is_constructible_v<SlabOff, TensorBytes> && !std::is_constructible_v<TensorBytes, SlabOff> &&
                   !std::is_constructible_v<FileOff, SlabOff> && !std::is_constructible_v<SlabOff, FileOff> &&
+                  !std::is_constructible_v<MapOff, FileOff> && !std::is_constructible_v<FileOff, MapOff> &&
+                  !std::is_constructible_v<MapOff, SlabOff> && !std::is_convertible_v<MapOff, uint64_t> &&
                   !std::is_constructible_v<FileOff, TensorBytes> && !std::is_convertible_v<uint64_t, SlabOff> &&
                   !std::is_convertible_v<FileOff, uint64_t> && !std::is_constructible_v<SlabOff, double> &&
                   !std::is_constructible_v<FileOff, bool>,
@@ -4400,6 +4402,25 @@ static void test_l438_byte_offsets(void) {
     const uint8_t *ro = slab;
     TEST_ASSERT(pulsar_slab_at<const uint16_t>(ro, SlabOff{6}) == (const uint16_t *)(slab + 6));
     TEST_ASSERT(kv_bytes_of(TensorBytes{12345}) == KvBytes{12345});   /* the one crossing into the KV price */
+    /* a model map's offsets: a mapped file's are its file offsets (the model layer's crossing, both ways), a
+     * weight's address is map + off, a stored tensor's span ends at off + bytes */
+    for (uint64_t a : vals) {
+        TEST_ASSERT(pulsar_map_off_of_file(FileOff{a}) == MapOff{a} && pulsar_file_off_of_map(MapOff{a}) == FileOff{a});
+        TEST_ASSERT((MapOff{a} + bytes_of<float>(3)).raw() == a + 12u && MapOff{a}.before().raw() == a);
+    }
+    TEST_ASSERT(pulsar_map_at(slab, MapOff{40}) == slab + 40);
+    pulsar_tensor t;
+    memset((void *)&t, 0, sizeof t);
+    TEST_ASSERT(t.abs_offset == MapOff{0});                 /* a zeroed directory entry: offset 0, as before */
+    t.abs_offset = MapOff{4096};
+    t.bytes = 300;
+    TEST_ASSERT(pulsar_tensor_file_off(&t) == FileOff{4096} && pulsar_tensor_stored_bytes(&t) == TensorBytes{300});
+    TEST_ASSERT(pulsar_tp_kslice_key_offset(&t).raw() == (uint64_t)(uintptr_t)&t);   /* the TP keys, as before */
+    pulsar_model m;
+    memset((void *)&m, 0, sizeof m);
+    pulsar_tensor dir[3];
+    m.tensors = dir;
+    TEST_ASSERT(pulsar_tp_expert_half_offset(&m, &dir[2]).raw() == 3ull << 32);
 }
 
 /** The vocabulary of the L426 identity test's tokenizer: the engine under test reads it through its hooks. */

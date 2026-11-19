@@ -761,7 +761,7 @@ bool gpu_graph_dspark_draft_forward_banks(
                 ok = pulsar_gpu_attention_decode_raw_batch_heads_tensor(
                     g->batch_heads,
                     tensor_map_base(dspark_model, layer->attn_sinks), tensor_map_size(dspark_model, layer->attn_sinks),
-                    layer->attn_sinks->abs_offset + (uint64_t)h_lo * sizeof(float),
+                    layer->attn_sinks->abs_offset + bytes_of<float>(h_lo),
                     g->batch_q, g->banks.dspark_raw[li],
                     n_draft, 0u,
                     0u, raw_cap, 0u,
@@ -774,7 +774,7 @@ bool gpu_graph_dspark_draft_forward_banks(
                 ok = pulsar_gpu_attention_decode_raw_batch_heads_tensor(
                     g->batch_heads,
                     tensor_map_base(dspark_model, layer->attn_sinks), tensor_map_size(dspark_model, layer->attn_sinks),
-                    layer->attn_sinks->abs_offset + (uint64_t)h_lo * sizeof(float),
+                    layer->attn_sinks->abs_offset + bytes_of<float>(h_lo),
                     g->batch_q, g->dspark_raw_cache[li],
                     n_draft, saved_n_raw,
                     cap_raw, raw_cap, raw_start,
@@ -817,7 +817,7 @@ bool gpu_graph_dspark_draft_forward_banks(
         if (ok) ok = pulsar_gpu_attention_output_a_tensor(
             g->batch_attn_low,
             tensor_map_base(dspark_model, layer->attn_output_a), tensor_map_size(dspark_model, layer->attn_output_a),
-            layer->attn_output_a->abs_offset + (uint64_t)g_lo * rank * group_dim,
+            layer->attn_output_a->abs_offset + bytes_of<uint8_t>((uint64_t)g_lo * rank * group_dim),   /* E4M3 rows */
             group_dim, rank, own_groups,
             g->batch_heads, n_draft) != 0;
         if (ok && own_groups != n_groups) {

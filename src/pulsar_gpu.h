@@ -583,7 +583,7 @@ int pulsar_gpu_set_model_fd_for_map(int fd, const void *model_map);
  *  @param bytes      the span's size in bytes
  *  @param label      a name for diagnostics, or NULL
  *  @return 1 when the span is device-ready, 0 on a bad range or failure */
-int pulsar_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
+int pulsar_gpu_cache_model_range(const void *model_map, uint64_t model_size, MapOff offset, uint64_t bytes, const char *label);
 /** @brief Device-cache a span of a second GGUF (the --expert-overlay donor): pread from `fd` into device memory,
  *  registered under `host_base_key` so lookups resolve it like a model span.  Startup only, synchronous.
  *  @param host_base_key the donor's host mapping (the lookup key)
@@ -592,7 +592,7 @@ int pulsar_gpu_cache_model_range(const void *model_map, uint64_t model_size, uin
  *  @param bytes         the span's size in bytes
  *  @param label         a name for diagnostics, or NULL
  *  @return 1 on success, 0 on failure or when it would pass the weight-cache limit (said) */
-int pulsar_gpu_cache_external_range(const void *host_base_key, int fd, uint64_t offset, uint64_t bytes, const char *label);
+int pulsar_gpu_cache_external_range(const void *host_base_key, int fd, FileOff offset, uint64_t bytes, const char *label);
 /** @brief Whether the KV cache should be managed memory: always at >= 8 GiB, else when an >= 8 GiB context would
  *  leave free memory under the reserve (a quarter of total, clamped to 8..40 GiB).
  *  @param kv_cache_bytes the KV cache's size in bytes
@@ -742,7 +742,7 @@ int pulsar_gpu_embed_tokens_hc_tensor(
         const pulsar_gpu_tensor *tokens,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                weight_offset,
+        MapOff                  weight_offset,
         uint32_t                n_vocab,
         uint32_t                n_tokens,
         uint32_t                n_embd,
@@ -1225,7 +1225,7 @@ int pulsar_gpu_matmul_mxfp8_tensor(
         pulsar_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                weight_offset,
+        MapOff                  weight_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
         const pulsar_gpu_tensor *x,
@@ -1235,7 +1235,7 @@ int pulsar_gpu_matmul_mxfp8_tensor(
  * output head) by offset so the matmul above executes it; done once at load. */
 /** @param model_map     the mapping the weight lives in
  *  @param weight_offset its byte offset (the weight's key) */
-void pulsar_gpu_register_fp8_weight(const void *model_map, uint64_t weight_offset);
+void pulsar_gpu_register_fp8_weight(const void *model_map, MapOff weight_offset);
 
 /** Mark an already-fp8-registered offset as a pre-stored MXFP8_LT weight: the
  * device layout (de-interleaved E4M3 data + swizzled E8M0 scale) is already in
@@ -1243,7 +1243,7 @@ void pulsar_gpu_register_fp8_weight(const void *model_map, uint64_t weight_offse
  * cuBLASLt directly at the range's device pointer. Done once at load. */
 /** @param model_map     the mapping the weight lives in
  *  @param weight_offset its byte offset, already registered with pulsar_gpu_register_fp8_weight */
-void pulsar_gpu_register_fp8_lt_weight(const void *model_map, uint64_t weight_offset);
+void pulsar_gpu_register_fp8_lt_weight(const void *model_map, MapOff weight_offset);
 /* Slice 4g (L241): register the OUTPUT-ROW slice [row_lo, row_hi) of a
  * pre-stored MXFP8_LT weight as a weight of its own, addressed by its data
  * offset `parent_offset + row_lo * in_dim` with out_dim = row_hi - row_lo.
@@ -1258,7 +1258,7 @@ void pulsar_gpu_register_fp8_lt_weight(const void *model_map, uint64_t weight_of
  *  @param row_lo        first output row, on a 128-row scale band
  *  @param row_hi        one past the last output row (<= out_full)
  *  @return 1, or 0 with the reason printed */
-int pulsar_gpu_register_fp8_lt_row_slice(const void *model_map, uint64_t parent_offset,
+int pulsar_gpu_register_fp8_lt_row_slice(const void *model_map, MapOff parent_offset,
                                          uint64_t in_dim, uint64_t out_full,
                                          uint64_t row_lo, uint64_t row_hi);
 /* L241 4g-2 expert tensor-parallel: build this rank's half of every expert of
@@ -1283,8 +1283,8 @@ int pulsar_gpu_register_fp8_lt_row_slice(const void *model_map, uint64_t parent_
  *  @param dst_stride bytes per expert in the half layout
  *  @param dst_data   bytes of an expert's data blob in the half layout
  *  @return 1, or 0 with the reason printed */
-int pulsar_gpu_register_mxfp4_expert_half(const void *key_map, uint64_t key_offset,
-                                          const void *model_map, uint64_t src_offset,
+int pulsar_gpu_register_mxfp4_expert_half(const void *key_map, MapOff key_offset,
+                                          const void *model_map, MapOff src_offset,
                                           uint32_t n_expert, uint64_t k, uint64_t n, int k_half,
                                           uint64_t lo, uint64_t hi,
                                           uint64_t src_stride, uint64_t src_data,
@@ -1308,8 +1308,8 @@ int pulsar_gpu_register_mxfp4_expert_half(const void *key_map, uint64_t key_offs
  *  @param lo         first row / column of this rank's half
  *  @param hi         one past the last
  *  @return 1, or 0 with the reason printed */
-int pulsar_gpu_register_exl3_expert_half(const void *key_map, uint64_t key_offset,
-                                         const void *model_map, uint64_t src_offset,
+int pulsar_gpu_register_exl3_expert_half(const void *key_map, MapOff key_offset,
+                                         const void *model_map, MapOff src_offset,
                                          uint32_t n_expert, uint64_t k, uint64_t n, int k2, int k_half,
                                          uint64_t lo, uint64_t hi);
 /* L241 4g-2: register the INPUT-COLUMN half [k_lo, k_hi) of a pre-stored
@@ -1329,10 +1329,10 @@ int pulsar_gpu_register_exl3_expert_half(const void *key_map, uint64_t key_offse
  *  @param key_map       the mapping the slice is registered under
  *  @param key_offset    the key offset
  *  @return 1, or 0 with the reason printed */
-int pulsar_gpu_register_fp8_lt_kslice(const void *model_map, uint64_t parent_offset,
+int pulsar_gpu_register_fp8_lt_kslice(const void *model_map, MapOff parent_offset,
                                       uint64_t in_full, uint64_t out_dim,
                                       uint64_t k_lo, uint64_t k_hi,
-                                      const void *key_map, uint64_t key_offset);
+                                      const void *key_map, MapOff key_offset);
 /* L242: a pre-stored MXFP8_LT weight already resident in device buffers (data
  * plane, then the swizzled scale plane as separate tensors) enters the resolved
  * cache under (map_key, offset); the GEMMs then find it by offset.  For gates
@@ -1345,7 +1345,7 @@ int pulsar_gpu_register_fp8_lt_kslice(const void *model_map, uint64_t parent_off
  *  @param data    the E4M3 data plane (borrowed; must outlive the registration)
  *  @param scale   the swizzled E8M0 scale plane (borrowed)
  *  @return 1 on success, 0 on failure */
-int pulsar_gpu_register_fp8_lt_weight_resident(const void *map_key, uint64_t offset,
+int pulsar_gpu_register_fp8_lt_weight_resident(const void *map_key, MapOff offset,
                                                uint64_t in_dim, uint64_t out_dim,
                                                const pulsar_gpu_tensor *data,
                                                const pulsar_gpu_tensor *scale);
@@ -1464,7 +1464,7 @@ int pulsar_gpu_matmul_bf16_tensor(
         pulsar_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                weight_offset,
+        MapOff                  weight_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
         const pulsar_gpu_tensor *x,
@@ -1487,7 +1487,7 @@ int pulsar_gpu_matmul_f32_tensor(
         pulsar_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                weight_offset,
+        MapOff                  weight_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
         const pulsar_gpu_tensor *x,
@@ -1832,7 +1832,7 @@ void pulsar_gpu_act_note_f32_skipped_for(const pulsar_gpu_tensor *x, uint64_t n_
  */
 int pulsar_gpu_rms_norm_weight_mx_tensor(
         pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x, const void *model_map,
-        uint64_t model_size, uint64_t weight_offset, uint32_t n, float eps,
+        uint64_t model_size, MapOff weight_offset, uint32_t n, float eps,
         void *out_q, void *out_sf, int out_kbp,
         void *out_b,
         int w_bf16);
@@ -1852,7 +1852,7 @@ int pulsar_gpu_rms_norm_weight_tensor(
         const pulsar_gpu_tensor *x,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                weight_offset,
+        MapOff                  weight_offset,
         uint32_t                n,
         float                   eps,
         int                     w_bf16);
@@ -1878,7 +1878,7 @@ int pulsar_gpu_rms_norm_weight_tensor(
  *  @param w_bf16        1 when the weight is stored bf16 */
 int pulsar_gpu_rms_norm_weight_rows_mx_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x,
                                               const void *model_map, uint64_t model_size,
-                                              uint64_t weight_offset, uint32_t n, uint32_t rows, float eps,
+                                              MapOff weight_offset, uint32_t n, uint32_t rows, float eps,
                                               void *out_q, void *out_sf, int out_kbp, void *out_b, int w_bf16);
 
 /** @brief `rows` rows of RMS norm with one learned weight.
@@ -1898,7 +1898,7 @@ int pulsar_gpu_rms_norm_weight_rows_tensor(
         const pulsar_gpu_tensor *x,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                weight_offset,
+        MapOff                  weight_offset,
         uint32_t                n,
         uint32_t                rows,
         float                   eps,
@@ -1945,11 +1945,11 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
         const pulsar_gpu_tensor *q,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                q_weight_offset,
+        MapOff                  q_weight_offset,
         uint32_t                q_n,
         pulsar_gpu_tensor       *kv_out,
         const pulsar_gpu_tensor *kv,
-        uint64_t                kv_weight_offset,
+        MapOff                  kv_weight_offset,
         uint32_t                kv_n,
         uint32_t                rows,
         float                   eps,
@@ -2352,9 +2352,9 @@ int pulsar_gpu_indexer_compressor_prefill_tensor(
         const pulsar_gpu_tensor *kv,
         const void              *model_map,
         uint64_t                 model_size,
-        uint64_t                 ape_offset,
+        MapOff                   ape_offset,
         uint32_t                 ape_type,
-        uint64_t                 norm_offset,
+        MapOff                   norm_offset,
         uint32_t                 norm_type,
         uint32_t                 out_row0,
         uint32_t                 head_dim,
@@ -2421,9 +2421,9 @@ int pulsar_gpu_indexer_compressor_update_tensor(
         const pulsar_gpu_tensor *kv,
         const void              *model_map,
         uint64_t                 model_size,
-        uint64_t                 ape_offset,
+        MapOff                   ape_offset,
         uint32_t                 ape_type,
-        uint64_t                 norm_offset,
+        MapOff                   norm_offset,
         uint32_t                 norm_type,
         uint32_t                 out_row,
         uint32_t                 head_dim,
@@ -2699,7 +2699,7 @@ int pulsar_gpu_csa2_comp_ape_add_tensor(
         pulsar_gpu_tensor       *sc,           /* [n_tokens][coff * head_dim] f32, in/out */
         const void              *model_map,    /* the model's mapped weights */
         uint64_t                 model_size,
-        uint64_t                 ape_offset,   /* the ape table inside that map */
+        MapOff                   ape_offset,   /* the ape table inside that map */
         uint32_t                 ape_type,     /* PULSAR_TENSOR_F32 or _BF16 */
         uint32_t                 width,
         uint32_t                 ratio,
@@ -2753,7 +2753,7 @@ int pulsar_gpu_csa2_compressor_prefill_tensor(
         pulsar_gpu_tensor       *state_score,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                norm_offset,
+        MapOff                  norm_offset,
         uint32_t                norm_type,
         uint32_t                head_dim,
         uint32_t                ratio,
@@ -2787,7 +2787,7 @@ int pulsar_gpu_csa2_compressor_update_tensor(
         pulsar_gpu_tensor       *state_score,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                norm_offset,
+        MapOff                  norm_offset,
         uint32_t                norm_type,
         uint32_t                head_dim,
         uint32_t                ratio,
@@ -2863,7 +2863,7 @@ int pulsar_gpu_csa2_compressor_shift_tensor(
  *  @return 1 on success, 0 on refusal or failure */
 int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(
         pulsar_gpu_tensor *heads, const void *model_map, uint64_t model_size,
-        uint64_t sinks_offset, const pulsar_gpu_tensor *q,
+        MapOff sinks_offset, const pulsar_gpu_tensor *q,
         const pulsar_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window,
         uint32_t n_head, uint32_t head_dim,
         void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab,
@@ -2895,7 +2895,7 @@ int pulsar_gpu_attention_prefill_raw_heads_tensor(
         pulsar_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                sinks_offset,
+        MapOff                  sinks_offset,
         const pulsar_gpu_tensor *q,
         const pulsar_gpu_tensor *raw_kv,
         uint32_t                n_tokens,
@@ -2967,7 +2967,7 @@ int pulsar_gpu_attention_decode_raw_batch_heads_tensor(
         pulsar_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                sinks_offset,
+        MapOff                  sinks_offset,
         const pulsar_gpu_tensor *q,
         const pulsar_gpu_tensor *raw_kv,
         uint32_t                n_tokens,
@@ -3017,7 +3017,7 @@ int pulsar_gpu_attention_decode_mixed_batch_heads_tensor(
         pulsar_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                sinks_offset,
+        MapOff                  sinks_offset,
         const pulsar_gpu_tensor *q,
         const pulsar_gpu_tensor *raw_kv,
         const pulsar_gpu_tensor *comp_kv,
@@ -3079,7 +3079,7 @@ int pulsar_gpu_attention_decode_mixed_batch_heads_mx_tensor(
         pulsar_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                sinks_offset,
+        MapOff                  sinks_offset,
         const pulsar_gpu_tensor *q,
         const pulsar_gpu_tensor *raw_kv,
         const pulsar_gpu_tensor *comp_kv,
@@ -3139,7 +3139,7 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
         pulsar_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                sinks_offset,
+        MapOff                  sinks_offset,
         const pulsar_gpu_tensor *q,
         const pulsar_gpu_tensor *raw_kv,
         const pulsar_gpu_tensor *comp_kv,
@@ -3207,7 +3207,7 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_mx_tensor(
         pulsar_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                sinks_offset,
+        MapOff                  sinks_offset,
         const pulsar_gpu_tensor *q,
         const pulsar_gpu_tensor *raw_kv,
         const pulsar_gpu_tensor *comp_kv,
@@ -3263,7 +3263,7 @@ int pulsar_gpu_attention_prefill_static_mixed_heads_tensor(
         pulsar_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                sinks_offset,
+        MapOff                  sinks_offset,
         const pulsar_gpu_tensor *q,
         const pulsar_gpu_tensor *raw_kv,
         const pulsar_gpu_tensor *comp_kv,
@@ -3305,7 +3305,7 @@ int pulsar_gpu_attention_output_a_tensor(
         pulsar_gpu_tensor       *low,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                out_a_offset,
+        MapOff                  out_a_offset,
         uint64_t                group_dim,
         uint64_t                rank,
         uint32_t                n_groups,
@@ -3326,7 +3326,7 @@ int pulsar_gpu_attention_output_b_tensor(
         pulsar_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                out_b_offset,
+        MapOff                  out_b_offset,
         uint64_t                low_dim,
         uint64_t                out_dim,
         pulsar_gpu_tensor       *low,
@@ -3433,9 +3433,9 @@ int pulsar_gpu_router_select_batch_tensor(
         pulsar_gpu_tensor       *probs,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                bias_offset,
+        MapOff                  bias_offset,
         bool                    has_bias,
-        uint64_t                tid2eid_offset,
+        MapOff                  tid2eid_offset,
         uint32_t                tid2eid_rows,
         const pulsar_gpu_tensor *logits,
         const pulsar_gpu_tensor *tokens,
@@ -3443,7 +3443,7 @@ int pulsar_gpu_router_select_batch_tensor(
         uint32_t                n_expert_used,
         float                   expert_weight_scale,
         uint32_t                n_tokens,
-        uint64_t                vl_bias_offset,
+        MapOff                  vl_bias_offset,
         uint32_t                n_vocab,
         bool                    has_vl_bias);
 
@@ -3485,9 +3485,9 @@ int pulsar_gpu_routed_moe_batch_tensor(
         pulsar_gpu_tensor       *down,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                gate_offset,
-        uint64_t                up_offset,
-        uint64_t                down_offset,
+        MapOff                  gate_offset,
+        MapOff                  up_offset,
+        MapOff                  down_offset,
         uint32_t                gate_type,
         uint32_t                down_type,
         uint64_t                gate_expert_bytes,
@@ -3803,7 +3803,7 @@ int pulsar_gpu_hc_norm_mix_tensor(
         pulsar_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                weight_offset,
+        MapOff                  weight_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
         const pulsar_gpu_tensor *x,
@@ -3826,8 +3826,8 @@ int pulsar_gpu_output_hc_weights_tensor(
         const pulsar_gpu_tensor *pre,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                scale_offset,
-        uint64_t                base_offset,
+        MapOff                  scale_offset,
+        MapOff                  base_offset,
         uint32_t                n_hc,
         float                   eps,
         uint32_t                n_tokens);
@@ -3889,9 +3889,9 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
         const pulsar_gpu_tensor *residual_hc,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                scale_offset,
-        uint64_t                base_offset,
-        uint64_t                norm_weight_offset,
+        MapOff                  scale_offset,
+        MapOff                  base_offset,
+        MapOff                  norm_weight_offset,
         uint32_t                n_rows,
         uint32_t                n_embd,
         uint32_t                n_hc,
@@ -4244,7 +4244,7 @@ int pulsar_gpu_dspark_markov_chain_banks_model(
         const pulsar_gpu_tensor *base_logits, uint64_t base_row_stride_bytes,
         const pulsar_gpu_tensor *base_row_dev,
         const void *dspark_model_map, uint64_t dspark_model_size,
-        uint64_t markov_w1_offset, uint64_t markov_w2_offset,
+        MapOff markov_w1_offset, MapOff markov_w2_offset,
         uint32_t n_banks, uint32_t n_draft, uint32_t vocab_size, uint32_t embed_dim,
         int w1_bf16, int w2_fmt);
 /** @brief One Markov refine position for every bank, previous tokens from prev_dev.
@@ -4271,7 +4271,7 @@ int pulsar_gpu_dspark_markov_step_banks_model(
         const pulsar_gpu_tensor *base_logits, uint64_t base_row_stride_bytes,
         const pulsar_gpu_tensor *base_row_dev, const pulsar_gpu_tensor *prev_dev,
         const void *dspark_model_map, uint64_t dspark_model_size,
-        uint64_t markov_w1_offset, uint64_t markov_w2_offset,
+        MapOff markov_w1_offset, MapOff markov_w2_offset,
         uint32_t n_banks, uint32_t pos, uint32_t vocab_size, uint32_t embed_dim,
         int w1_bf16, int w2_fmt);
 
@@ -4297,8 +4297,8 @@ int pulsar_gpu_dspark_markov_step_model(
         const pulsar_gpu_tensor *base_logits,
         const void             *dspark_model_map,
         uint64_t                dspark_model_size,
-        uint64_t                markov_w1_offset,
-        uint64_t                markov_w2_offset,
+        MapOff                  markov_w1_offset,
+        MapOff                  markov_w2_offset,
         int32_t                prev_token,
         uint32_t               vocab_size,
         uint32_t               embed_dim,
@@ -4371,8 +4371,8 @@ int pulsar_gpu_dspark_confidence_score_model(
         const pulsar_gpu_tensor *token_ids,
         const void             *dspark_model_map,
         uint64_t                dspark_model_size,
-        uint64_t                markov_w1_offset,
-        uint64_t                proj_offset,
+        MapOff                  markov_w1_offset,
+        MapOff                  proj_offset,
         uint32_t                n_positions,
         uint32_t                hidden_dim,
         uint32_t                embed_dim,
@@ -4465,22 +4465,22 @@ __attribute__((constructor)) void pulsar_tu_archs_register_(void) {
 /** The widest aspect ratio accepted (vision_max_wh_ratio). */
 #define PULSAR_VISION_MAX_WH_RATIO 8.0f
 
-/** One vision-tower tensor as a file offset into the model mapping.  The CUDA
+/** One vision-tower tensor as an offset into the model mapping (L438: MapOff).  The CUDA
  * forward reads every weight through these; the engine fills them from the
  * bound pulsar_vision_weights. */
 typedef struct {
-    uint64_t patch_proj, patch_bias, norm;
-    uint64_t aligner_w1, aligner_b1, aligner_w2, aligner_b2;
+    MapOff patch_proj, patch_bias, norm;
+    MapOff aligner_w1, aligner_b1, aligner_w2, aligner_b2;
     /** Per transformer block: its norm1, attn.wqkv (+ bias), attn.wo (+ bias), norm2 and MLP w1 / w2 tensors. */
     struct {
-        uint64_t norm1;       ///< pre-attention norm
-        uint64_t wqkv;        ///< fused QKV
-        uint64_t wqkv_bias;   ///< its bias
-        uint64_t wo;          ///< attention output
-        uint64_t wo_bias;     ///< its bias
-        uint64_t norm2;       ///< pre-MLP norm
-        uint64_t w1;          ///< MLP gate and up
-        uint64_t w2;          ///< MLP down
+        MapOff norm1;         ///< pre-attention norm
+        MapOff wqkv;          ///< fused QKV
+        MapOff wqkv_bias;     ///< its bias
+        MapOff wo;            ///< attention output
+        MapOff wo_bias;       ///< its bias
+        MapOff norm2;         ///< pre-MLP norm
+        MapOff w1;            ///< MLP gate and up
+        MapOff w2;            ///< MLP down
     } block[PULSAR_VISION_LAYERS];   ///< per transformer block
     uint32_t n_layers;              ///< must be PULSAR_VISION_LAYERS
     uint32_t text_dim;              ///< the aligner's output width (the text model's n_embd)

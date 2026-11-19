@@ -254,8 +254,8 @@ int main(void) {
         std::vector<float> wmap((size_t)ratio * width + head_dim);
         for (uint32_t i = 0; i < (uint32_t)((size_t)ratio * width); i++) wmap[i] = ape[i];
         for (uint32_t i = 0; i < head_dim; i++) wmap[(size_t)ratio * width + i] = 0.5f + frand(&s) * 0.5f;
-        const uint64_t ape_offset = 0ull;
-        const uint64_t norm_offset = (uint64_t)ratio * width * sizeof(float);
+        const MapOff ape_offset{0ull};
+        const MapOff norm_offset{(uint64_t)ratio * width * sizeof(float)};
         const uint64_t map_bytes = (uint64_t)wmap.size() * sizeof(float);
         const void *model_map = wmap.data();
 

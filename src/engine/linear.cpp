@@ -33,7 +33,8 @@ static void say_no_arm(const pulsar_tensor *w, const char *against) {
 
 const void *pulsar_weight_device_ptr(const pulsar_model *m, const pulsar_tensor *t, const char *what) {
     if (const void *slice = pulsar_tp_built_ptr(m, t)) return slice;   /* the rank's TP slice (tp_slice.cpp) */
-    const void *p = pulsar_gpu_weight_range_ptr(tensor_map_base(m, t), t->abs_offset, t->bytes, what);
+    /* the kernel modules' lookup (pulsar_cuda_rows.h) takes the raw map offset */
+    const void *p = pulsar_gpu_weight_range_ptr(tensor_map_base(m, t), t->abs_offset.raw(), t->bytes, what);
     if (!p) fprintf(stderr, "pulsar: no device copy of %.*s (%s) -- refusing\n", (int)t->name.len, t->name.ptr, what);
     return p;
 }
@@ -64,13 +65,13 @@ bool pulsar_linear_slot(pulsar_gpu_tensor *out, const pulsar_model *m, const pul
                                                   x, n_tok) != 0;
         /* a whole tensor is its own offset; a row slice is the offset registered at open, parent + row_lo * in
          * (the scale plane is not row-addressable, so an unregistered slice refuses in the backend) */
-        return pulsar_gpu_matmul_mxfp8_tensor(out, map, size, w->abs_offset + row_lo * in_dim, in_dim, rows, x,
-                                              n_tok) != 0;
+        return pulsar_gpu_matmul_mxfp8_tensor(out, map, size, w->abs_offset + bytes_of<uint8_t>(row_lo * in_dim), in_dim,
+                                              rows, x, n_tok) != 0;   /* E4M3 rows: a byte an element */
     case PULSAR_DENSE_ARM_BF16_PLANE:
-        return pulsar_gpu_matmul_bf16_tensor(out, map, size, w->abs_offset + row_lo * in_dim * sizeof(uint16_t),
+        return pulsar_gpu_matmul_bf16_tensor(out, map, size, w->abs_offset + bytes_of<uint16_t>(row_lo * in_dim),
                                              in_dim, rows, x, n_tok) != 0;
     case PULSAR_DENSE_ARM_F32_PLANE:
-        return pulsar_gpu_matmul_f32_tensor(out, map, size, w->abs_offset + row_lo * in_dim * sizeof(float), in_dim,
+        return pulsar_gpu_matmul_f32_tensor(out, map, size, w->abs_offset + bytes_of<float>(row_lo * in_dim), in_dim,
                                             rows, x, n_tok) != 0;
     default:
         say_no_arm(w, "the MX slot (E4M3 / bf16 plane)");

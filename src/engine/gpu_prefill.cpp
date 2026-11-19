@@ -1085,7 +1085,7 @@ static bool gpu_graph_indexed_attention_span(
         uint32_t                    spos0,
         uint64_t                    q_dim,
         uint32_t                    n_head,      // the OWNED heads (slice 4g)
-        uint64_t                    sinks_off,   // the first owned head's sink
+        MapOff                      sinks_off,   // the first owned head's sink
         uint32_t                    n_comp,
         uint32_t                    ratio,
         float                       index_scale,
@@ -1476,7 +1476,7 @@ bool gpu_graph_encode_layer_attention_batch(
     const uint32_t n_head = n_groups * group_heads;
     const uint32_t h_lo = g_lo * group_heads;
     const uint64_t q_dim = (uint64_t)n_head * PULSAR_N_HEAD_DIM;
-    const uint64_t sinks_off = layer->attn_sinks->abs_offset + (uint64_t)h_lo * sizeof(float);
+    const MapOff sinks_off = layer->attn_sinks->abs_offset + bytes_of<float>(h_lo);
     const uint32_t ratio = pulsar_layer_compress_ratio(il);
     const bool compressed = ratio != 0;
     /* CSA2 (L218): the pools this layer attends over live at its kv source. */
@@ -2644,7 +2644,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                   tensor_map_base(model, layer->attn_output_a),
                                                   tensor_map_size(model, layer->attn_output_a),
                                                   layer->attn_output_a->abs_offset +
-                                                      (uint64_t)g_lo * rank * group_dim,
+                                                      bytes_of<uint8_t>((uint64_t)g_lo * rank * group_dim),
                                                   group_dim,
                                                   rank,
                                                   n_groups,
@@ -2906,10 +2906,10 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                       router_map,
                                                       router_map_size,
                                                       layer->ffn_exp_probs_b
-                                                          ? layer->ffn_exp_probs_b->abs_offset : 0,
+                                                          ? layer->ffn_exp_probs_b->abs_offset : MapOff{},
                                                       layer->ffn_exp_probs_b != NULL,
                                                       layer->ffn_gate_tid2eid
-                                                          ? layer->ffn_gate_tid2eid->abs_offset : 0,
+                                                          ? layer->ffn_gate_tid2eid->abs_offset : MapOff{},
                                                       layer->ffn_gate_tid2eid
                                                           ? (uint32_t)layer->ffn_gate_tid2eid->dim[1] : 0,
                                                       g->batch_router_logits,
@@ -2918,7 +2918,7 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                       layer->n_expert_used,
                                                       PULSAR_EXPERT_WEIGHT_SCALE,
                                                       n_tokens,
-                                                      layer->ffn_exp_probs_b_vl ? layer->ffn_exp_probs_b_vl->abs_offset : 0,
+                                                      layer->ffn_exp_probs_b_vl ? layer->ffn_exp_probs_b_vl->abs_offset : MapOff{},
                                                       PULSAR_N_VOCAB,
                                                       layer->ffn_exp_probs_b_vl != NULL) != 0;
     if (ok) {

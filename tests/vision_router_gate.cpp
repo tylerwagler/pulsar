@@ -271,13 +271,13 @@ int main(int argc, char **argv) {
              * bias rides at the end.  A hash case passes its table offset and row
              * count; a text case passes 0/0. */
             pulsar_gpu_router_select_batch_tensor(dsel, dw, NULL, map.data(), map.size(),
-                                                  stride * ci + BIAS_OFF,
+                                                  MapOff{stride * ci + BIAS_OFF},
                                                   c.has_text_bias != 0,
-                                                  c.hash_mode ? stride * ci + HASH_OFF : 0,
+                                                  MapOff{c.hash_mode ? stride * ci + HASH_OFF : 0},
                                                   c.hash_mode ? g.hash_rows : 0,
                                                   dlog, dtok, g.n_expert, g.topk, 1.5f,
                                                   (uint32_t)rows,
-                                                  c.has_vl_bias ? stride * ci + VL_OFF : 0u,
+                                                  MapOff{c.has_vl_bias ? stride * ci + VL_OFF : 0u},
                                                   g.n_vocab, c.has_vl_bias != 0) &&
             pulsar_gpu_end_commands() &&
             pulsar_gpu_tensor_read(dsel, TensorBytes{0}, idx.data(), bytes_of<int32_t>(idx.size())) &&

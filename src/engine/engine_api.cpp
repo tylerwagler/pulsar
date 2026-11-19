@@ -1297,8 +1297,8 @@ uint32_t pulsar_engine_decision_head(pulsar_engine *e, const float **w, const fl
         if (slots) fprintf(stderr, "pulsar: the decision head is not f32 [%u][hidden] + [%u] -- refusing\n", slots, slots);
         return 0;
     }
-    *w = (const float *)((const uint8_t *)tensor_map_base(&e->model, tw) + tw->abs_offset);
-    *b = (const float *)((const uint8_t *)tensor_map_base(&e->model, tb) + tb->abs_offset);
+    *w = (const float *)pulsar_map_at(tensor_map_base(&e->model, tw), tw->abs_offset);
+    *b = (const float *)pulsar_map_at(tensor_map_base(&e->model, tb), tb->abs_offset);
     *width = (uint32_t)tw->dim[0];
     return slots;
 }

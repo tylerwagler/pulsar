@@ -197,7 +197,7 @@ int main(int argc, char **argv) {
             pulsar_gpu_bf16_act_note(c.x, MMAX, c.in_dim);
         }
         /* LT slabs straight from the mmap: [data N*K][scale rup(N,128)*rup(K/32,4)] */
-        const uint8_t *host = (const uint8_t *)e->model.map + w->abs_offset;
+        const uint8_t *host = pulsar_map_at(e->model.map, w->abs_offset);
         const size_t data_bytes = (size_t)N * K;
         unsigned long long sfb_mismatch = 0;
         double wbytes;

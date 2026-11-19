@@ -115,7 +115,7 @@ static bool routed(const void *map, uint64_t size, const uint64_t off[3], int gk
                          : gk2 == 8 ? PULSAR_TENSOR_EXL3M_K4 : gk2 == 10 ? PULSAR_TENSOR_EXL3M_K5 : PULSAR_TENSOR_EXL3M_K6;
     const uint32_t dtype = dk2 == 4 ? PULSAR_TENSOR_EXL3M_K2 : dk2 == 5 ? PULSAR_TENSOR_EXL3M_K2H : dk2 == 6 ? PULSAR_TENSOR_EXL3M_K3
                          : dk2 == 8 ? PULSAR_TENSOR_EXL3M_K4 : dk2 == 10 ? PULSAR_TENSOR_EXL3M_K5 : PULSAR_TENSOR_EXL3M_K6;
-    const int ok = pulsar_gpu_routed_moe_batch_tensor(out, up, md, down, map, size, off[0], off[1], off[2], gtype, dtype,
+    const int ok = pulsar_gpu_routed_moe_batch_tensor(out, up, md, down, map, size, MapOff{off[0]}, MapOff{off[1]}, MapOff{off[2]}, gtype, dtype,
                                                       gs, gt, ds, dt, H, (uint32_t)mid, H, sel, wts, E, TOPK, 10.0f, x,
                                                       0, (uint32_t)n_tok, (uint32_t)split);
     bool good = ok != 0 && cudaDeviceSynchronize() == cudaSuccess;
@@ -181,7 +181,7 @@ int main(int argc, char **argv) {
                 const int k = in_axis ? MID : H, n = in_axis ? H : MID, k2 = in_axis ? dk2 : gk2;
                 const std::vector<uint8_t> &W = s == 0 ? G : s == 1 ? U : D;
                 hoff[r][s] = (key_next++) << 32;
-                const int built = pulsar_gpu_register_exl3_expert_half(&key, hoff[r][s], map, off[s], E, k, n, k2,
+                const int built = pulsar_gpu_register_exl3_expert_half(&key, MapOff{hoff[r][s]}, map, MapOff{off[s]}, E, k, n, k2,
                                                                        in_axis, lo, hi);
                 CHECK(built, "rank %d stack %d: the builder refused", r, s);
                 exl3_cut c;
@@ -277,9 +277,9 @@ int main(int argc, char **argv) {
             exl3_cut c;
             CHECK(!exl3_expert_cut(H, MID, gk2, false, 64, 64 + HALF, 0, HALF, &c), "host cut took a cut off the 128 block");
             CHECK(!exl3_expert_cut(MID, H, dk2, true, HALF, MID + 128, 0, HALF + 128, &c), "host cut took a range past the dim");
-            CHECK(!pulsar_gpu_register_exl3_expert_half(&key, (key_next++) << 32, map, off[0], E, H, MID, gk2, 0, 64,
+            CHECK(!pulsar_gpu_register_exl3_expert_half(&key, MapOff{(key_next++) << 32}, map, MapOff{off[0]}, E, H, MID, gk2, 0, 64,
                                                         64 + HALF), "the builder took a cut off the 128 block");
-            CHECK(!pulsar_gpu_register_exl3_expert_half(&key, (key_next++) << 32, map, off[2], E, MID, H, dk2, 1, HALF,
+            CHECK(!pulsar_gpu_register_exl3_expert_half(&key, MapOff{(key_next++) << 32}, map, MapOff{off[2]}, E, MID, H, dk2, 1, HALF,
                                                         MID + 128), "the builder took a range past the dim");
             pulsar_gpu_tensor *x = pulsar_gpu_tensor_alloc(bytes_of<float>(H)),
                               *sel = pulsar_gpu_tensor_alloc(bytes_of<int32_t>(TOPK)),
@@ -296,8 +296,8 @@ int main(int argc, char **argv) {
             pulsar_gpu_tensor_write(wts, TensorBytes{0}, w6, TensorBytes{sizeof(w6)});
             pulsar_gpu_mxfp8_act_cache_encode_f32(x, 1, H);
             auto split_call = [&](uint32_t gtype, uint32_t dtype, uint32_t mid) {
-                return pulsar_gpu_routed_moe_batch_tensor(o, u, m, d, &key, UINT64_MAX / 2u, hoff[0][0], hoff[0][1],
-                                                          hoff[0][2], gtype, dtype, gs, gt, ds, dt, H, mid, H, sel, wts,
+                return pulsar_gpu_routed_moe_batch_tensor(o, u, m, d, &key, UINT64_MAX / 2u, MapOff{hoff[0][0]}, MapOff{hoff[0][1]},
+                                                          MapOff{hoff[0][2]}, gtype, dtype, gs, gt, ds, dt, H, mid, H, sel, wts,
                                                           E, TOPK, 10.0f, x, 0, 1, 1);
             };
             pulsar_gpu_matmul_set_batch_decode_rows(1);

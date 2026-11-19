@@ -1,7 +1,7 @@
 /** @file
  *  Typed quantities that share a raw integer type but must never mix (L333, L334): KvRows, KvBytes, TokCount,
  *  PromptToks, TokPos, the P2b index spaces, TokId, BankId, TensorBytes, TextBytes, the layer index spaces (L436),
- *  the output path's text offsets (L437), slab and file offsets (L438) */
+ *  the output path's text offsets (L437), slab, file and model-map offsets (L438) */
 #ifndef PULSAR_UNITS_H
 #define PULSAR_UNITS_H
 
@@ -985,7 +985,7 @@ static_assert(sizeof(ContentOff) == sizeof(size_t) && std::is_trivial<ContentOff
               "a message content's offset is no offset of generated text and no length, and enters by name only");
 /* ==== L437: offsets into the texts of the OUTPUT path (end) ======================================================== */
 
-/* ==== L438: byte offsets -- into a slab, into a file (begin) ========================================================
+/* ==== L438: byte offsets -- into a slab, into a file, into a model map (begin) =====================================
  * L334 P5 gave tensor BYTES one unit, TensorBytes, for a size and for an offset alike ("a distance from the tensor's
  * base"), and that is what the GPU host API takes.  It left the structs that HOLD such numbers raw, so every use wrapped
  * them (`TensorBytes{L.ids}`, ~400 constructions), and in those structs an offset and a size sit side by side, passed
@@ -996,8 +996,15 @@ static_assert(sizeof(ContentOff) == sizeof(size_t) && std::is_trivial<ContentOff
  *             buffer, where a checkpoint slot or a capture block sits, a walk's cursor.
  *   FileOff   a byte offset into ONE file, from its first byte: where a shard's tensor data starts, where a row
  *             table's rows start, the position a pread takes.
- *   Both measure in TensorBytes: the bytes a file stores for a tensor ARE the tensor's bytes (weights are mapped or
- *   read in place, never converted), so a tensor's extent is the one length either offset moves by.
+ *   MapOff    a byte offset into ONE model map the GPU host API resolves weights in (pulsar_gpu_set_model_map,
+ *             pulsar_gpu_cache_model_range, the register_* keys): a mapped file's (a shard, an overlay donor) -- what
+ *             pulsar_tensor::abs_offset holds and every weight-offset parameter of pulsar_gpu.h takes -- or a key
+ *             under a map the engine registers built weights by (a TP half's, pulsar_tp_*_key_offset), which no file
+ *             holds.  ~90 parameters of pulsar_gpu.h took it as a bare uint64_t beside sizes, widths and counts.
+ *   All three measure in TensorBytes: the bytes a file stores for a tensor ARE the tensor's bytes (weights are mapped
+ *   or read in place, never converted), so a tensor's extent is the one length every offset moves by.  A file mapped
+ *   whole from its first byte has one number for both of its offsets; the model layer, which maps it, owns that
+ *   crossing (pulsar_engine_internal.h pulsar_map_off_of_file / pulsar_file_off_of_map).
  *
  * off + bytes -> off, off - bytes -> off, off - off -> bytes, ordering and equality within one space; an offset is no
  * size and no offset of the other space, not even explicitly (pulsar_text_off's rules: the same affine pair as a
@@ -1023,6 +1030,10 @@ struct pulsar_file_off_tag;
 typedef pulsar_text_off<pulsar_slab_off_tag, TensorBytes> SlabOff;
 /** A byte offset into one file, with TensorBytes distances (L438). */
 typedef pulsar_text_off<pulsar_file_off_tag, TensorBytes> FileOff;
+/** Tag of MapOff (never instantiated). */
+struct pulsar_map_off_tag;
+/** A byte offset into one model map the GPU host API resolves weights in, with TensorBytes distances (L438). */
+typedef pulsar_text_off<pulsar_map_off_tag, TensorBytes> MapOff;
 
 /** The address a slab offset names in a mapped slab: `base + off`, as a `T *` -- the one crossing from a slab offset to
  *  a pointer (a launch's carve of its scratch arena; fatal on none()).
@@ -1053,7 +1064,9 @@ constexpr TensorBytes pulsar_bytes_align(TensorBytes b, uint64_t align) {
 
 static_assert(sizeof(size_t) == sizeof(uint64_t) && sizeof(SlabOff) == sizeof(uint64_t) &&
                   sizeof(FileOff) == sizeof(uint64_t) && alignof(SlabOff) == alignof(uint64_t) &&
-                  alignof(FileOff) == alignof(uint64_t) && std::is_trivial<SlabOff>::value &&
+                  alignof(FileOff) == alignof(uint64_t) && sizeof(MapOff) == sizeof(uint64_t) &&
+                  alignof(MapOff) == alignof(uint64_t) && std::is_trivial<MapOff>::value &&
+                  std::is_standard_layout<MapOff>::value && std::is_trivial<SlabOff>::value &&
                   std::is_standard_layout<SlabOff>::value && std::is_trivial<FileOff>::value &&
                   std::is_standard_layout<FileOff>::value,
               "a slab or file offset is as cheap as the uint64_t it replaces (memset / calloc-safe)");
@@ -1065,11 +1078,16 @@ static_assert(!std::is_constructible<SlabOff, FileOff>::value && !std::is_constr
                   !std::is_constructible<SlabOff, KvBytes>::value && !std::is_constructible<FileOff, KvBytes>::value &&
                   !std::is_constructible<SlabOff, TextBytes>::value && !std::is_constructible<FileOff, TextBytes>::value &&
                   !std::is_constructible<SlabOff, GenOff>::value && !std::is_constructible<FileOff, ContentOff>::value &&
-                  !std::is_constructible<GenOff, SlabOff>::value && !std::is_constructible<ContentOff, FileOff>::value,
+                  !std::is_constructible<GenOff, SlabOff>::value && !std::is_constructible<ContentOff, FileOff>::value &&
+                  !std::is_constructible<MapOff, FileOff>::value && !std::is_constructible<FileOff, MapOff>::value &&
+                  !std::is_constructible<MapOff, SlabOff>::value && !std::is_constructible<SlabOff, MapOff>::value &&
+                  !std::is_constructible<MapOff, TensorBytes>::value &&
+                  !std::is_constructible<TensorBytes, MapOff>::value,
               "an offset of one space is no offset of another and no size, not even explicitly");
 static_assert(!std::is_convertible<uint64_t, SlabOff>::value && !std::is_convertible<SlabOff, uint64_t>::value &&
                   !std::is_convertible<uint64_t, FileOff>::value && !std::is_convertible<FileOff, uint64_t>::value &&
-                  !std::is_convertible<int, SlabOff>::value && !std::is_convertible<int, FileOff>::value,
+                  !std::is_convertible<int, SlabOff>::value && !std::is_convertible<int, FileOff>::value &&
+                  !std::is_convertible<uint64_t, MapOff>::value && !std::is_convertible<MapOff, uint64_t>::value,
               "no implicit way in or out of a bare integer");
 /* P5 / P7 closed with no such assert for the byte units themselves (L435: "TensorBytes / TextBytes have no
  * non-convertibility assert"): the three byte units never convert to one another or to a row count, even explicitly --
@@ -1085,6 +1103,6 @@ static_assert(!std::is_constructible<TensorBytes, KvBytes>::value && !std::is_co
                   !std::is_convertible<uint64_t, TensorBytes>::value && !std::is_convertible<TensorBytes, uint64_t>::value &&
                   !std::is_convertible<uint64_t, TextBytes>::value && !std::is_convertible<TextBytes, uint64_t>::value,
               "tensor, KV and text bytes are three units: none converts to another, to a row count or to an integer");
-/* ==== L438: byte offsets -- into a slab, into a file (end) ========================================================== */
+/* ==== L438: byte offsets -- into a slab, into a file, into a model map (end) ======================================= */
 
 #endif

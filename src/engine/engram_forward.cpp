@@ -212,8 +212,8 @@ bool engram_upload(pulsar_weights *w, const pulsar_model *m) {
         const pulsar_tensor *q = model_find_tensor(m, name);
         snprintf(name, sizeof name, "layers.%u.engram.k_weight", src);
         const pulsar_tensor *k = model_find_tensor(m, name);
-        const unsigned char *qp = (const unsigned char *)tensor_map_base(m, q) + q->abs_offset;
-        const unsigned char *kp = (const unsigned char *)tensor_map_base(m, k) + k->abs_offset;
+        const unsigned char *qp = pulsar_map_at(tensor_map_base(m, q), q->abs_offset);
+        const unsigned char *kp = pulsar_map_at(tensor_map_base(m, k), k->abs_offset);
         /* the reference's `q_weight.float() * k_weight.float()` -- only ever used as the product */
         for (uint64_t i = 0; i < hd; i++) qk[i] = engram_elt_f32(q, qp, i) * engram_elt_f32(k, kp, i);
         em->qk[l] = pulsar_gpu_tensor_alloc(bytes_of<float>(hd));

@@ -871,7 +871,7 @@ typedef struct {
     uint64_t dim[PULSAR_MAX_DIMS];  ///< extents, fastest-varying first
     uint32_t type;        ///< storage type (see the PULSAR_TENSOR_* family)
     uint64_t rel_offset;  ///< offset from the file's tensor-data section start
-    uint64_t abs_offset;  ///< offset from the start of the mapping -- what the kernels take
+    MapOff abs_offset;    ///< offset from the start of the mapping -- what the kernels take (L438: a map offset)
     uint64_t elements;    ///< product of dim[0..ndim)
     uint64_t bytes;       ///< on-disk size, quantisation included
     /** Set only when this entry was swapped in from an overlay GGUF
@@ -895,12 +895,30 @@ typedef struct {
     bool has_bind_layer, has_bind_index;
 } pulsar_tensor;
 
-/** L438: where tensor t's stored bytes start in the file they are read from -- a shard or an overlay donor, mapped
- *  whole from its first byte, so its offset in the mapping (abs_offset) is its offset in the file: the model layer's
- *  crossing, for the readers that pread instead of mapping (the content sample).
+/** L438: a file's offset as an offset into its mapping -- the model layer maps every file it reads weights from (a
+ *  shard, an overlay donor) whole, from its first byte, so the two are one number; the one crossing from a file's
+ *  offsets into the GPU API's model map (the loader's directory entries).
+ *  @param off the offset in the file */
+/// @return the same offset in the file's mapping
+static inline MapOff pulsar_map_off_of_file(FileOff off) { return MapOff{off.raw()}; }
+/** L438: the reverse of pulsar_map_off_of_file, for a map offset into a mapped FILE (never a key a TP half is
+ *  registered under, which no file holds).
+ *  @param off the offset in the file's mapping */
+/// @return the same offset in the file
+static inline FileOff pulsar_file_off_of_map(MapOff off) { return FileOff{off.raw()}; }
+/** L438: where tensor t's stored bytes start in the file they are read from (a shard or an overlay donor): the
+ *  readers that pread instead of mapping (the content sample).
  *  @param t the directory entry */
 /// @return its file offset
-static inline FileOff pulsar_tensor_file_off(const pulsar_tensor *t) { return FileOff{t->abs_offset}; }
+static inline FileOff pulsar_tensor_file_off(const pulsar_tensor *t) { return pulsar_file_off_of_map(t->abs_offset); }
+/** L438: the host address of a map offset: `map + off` -- where an offset into a model map meets a pointer (a
+ *  host-side read of a weight, a bounds check against the mapping).
+ *  @param map the mapping's first byte (tensor_map_base)
+ *  @param off the offset into it */
+/// @return the address
+static inline const uint8_t *pulsar_map_at(const void *map, MapOff off) {
+    return static_cast<const uint8_t *>(map) + off.before().raw();
+}
 /** L438: tensor t's stored bytes, as the one byte unit (pulsar_tensor::bytes is a bare count, read in ~90 places).
  *  @param t the directory entry */
 /// @return its bytes on disk, quantisation included
@@ -1038,8 +1056,8 @@ typedef struct {
      * layer 6's offset. */
     const uint8_t *base;
     uint64_t map_size;  ///< that mapping's length, for the bounds check
-    uint64_t off;       ///< first byte, offset into that mapping
-    uint64_t end;       ///< one past the last byte
+    MapOff off;         ///< first byte, offset into that mapping
+    MapOff end;         ///< one past the last byte
 } accelerator_tensor_span;
 
 /** Every weight tensor for ONE transformer layer, resolved from the GGUF at
@@ -6456,11 +6474,11 @@ uint32_t pulsar_spec_depth_start(const pulsar_engine *e);
 /* The K-half registry key's offset for one tensor (L241 4g-2): the tensor
  * object's address, unique per tensor per engine -- abs_offsets repeat across
  * safetensors shards.  One authority for registration and lookup. */
-/// The K-half registry key's offset for one tensor: its address.
+/// The K-half registry key's offset for one tensor: its address (L438: a key offset under the engine's map).
 /// @param t the tensor
 /// @return the offset
-static inline uint64_t pulsar_tp_kslice_key_offset(const pulsar_tensor *t) {
-    return (uint64_t)(uintptr_t)t;
+static inline MapOff pulsar_tp_kslice_key_offset(const pulsar_tensor *t) {
+    return MapOff{(uint64_t)(uintptr_t)t};
 }
 
 /* The expert tensor-parallel half-stack key's offset for one routed stack
@@ -6468,12 +6486,12 @@ static inline uint64_t pulsar_tp_kslice_key_offset(const pulsar_tensor *t) {
  * no two half-stacks' ranges overlap under the one engine key.  The drafter
  * aliases the target's table, so indices are unique across both.  One
  * authority for registration (open) and lookup (the FFN encoder). */
-/// The expert half-stack key's offset: (index + 1) << 32.
+/// The expert half-stack key's offset: (index + 1) << 32 (L438: a key offset under the engine's map).
 /// @param m the model
 /// @param t one of its tensors
 /// @return the offset
-static inline uint64_t pulsar_tp_expert_half_offset(const pulsar_model *m, const pulsar_tensor *t) {
-    return ((uint64_t)(t - m->tensors) + 1u) << 32;
+static inline MapOff pulsar_tp_expert_half_offset(const pulsar_model *m, const pulsar_tensor *t) {
+    return MapOff{((uint64_t)(t - m->tensors) + 1u) << 32};
 }
 
 #endif /* PULSAR_ENGINE_INTERNAL_H */
