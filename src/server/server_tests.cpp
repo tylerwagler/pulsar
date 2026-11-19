@@ -14278,7 +14278,7 @@ static void test_l378_kv_ledger_line(void) {
     server s;
     memset(&s, 0, sizeof s);
     pthread_mutex_init(&s.mu, NULL);
-    s.started = time(NULL) - 7200;
+    s.started_sec = pulsar_mono_sec() - 7200;
     s.m_kvl.requests = 309;
     s.m_kvl.routes[KV_ROUTE_IN_PLACE] = 65;
     s.m_kvl.routes[KV_ROUTE_FRESH] = 193;
@@ -21427,7 +21427,7 @@ static void test_health_reports_pool_capacity_apart_from_provisioned(void) {
     s.n_slots = BankCount{1};      /* one bank provisioned so far */
     s.pool_banks = BankCount{8};   /* sized for eight this run */
     s.n_generating = 1;
-    s.started = time(NULL);
+    s.started_sec = pulsar_mono_sec();
 
     int fds[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
@@ -21454,7 +21454,7 @@ static void test_health_capacity_is_one_in_classic_mode(void) {
     pthread_mutex_init(&s.mu, NULL);
     s.n_slots = BankCount{1};
     s.pool_banks = BankCount{0};
-    s.started = time(NULL);
+    s.started_sec = pulsar_mono_sec();
 
     int fds[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
@@ -22143,6 +22143,45 @@ static void test_stall_watchdog_rules(void) {
     TEST_ASSERT(server_stall_seconds(1000, 2000, true, 1) == 0);          /* a beat after now: not a stall */
 }
 
+/* L444 (L442's finding 3): http_server.cpp's request-read deadline and /health's uptime were intervals on the WALL
+ * clock (time(NULL)): a forward step of the system time cut a slow client's read short, a backward one held a stalled
+ * read past its deadline, and the uptime jumped with the step (negative after a backward one).  They read
+ * CLOCK_MONOTONIC now: the deadline falls between two monotonic readings plus the deadline's seconds, expires on the
+ * same clock, and an origin set on the monotonic clock two hours back reads as two hours of uptime. */
+static void test_l444_request_deadline_and_uptime_are_monotonic(void) {
+    const double before = pulsar_mono_sec();
+    const double deadline = server_request_read_deadline();
+    const double after = pulsar_mono_sec();
+    TEST_ASSERT(deadline >= before + PULSAR_SERVER_REQUEST_READ_DEADLINE_SEC &&
+                deadline <= after + PULSAR_SERVER_REQUEST_READ_DEADLINE_SEC);
+    TEST_ASSERT(!server_request_read_expired(deadline));
+    TEST_ASSERT(server_request_read_expired(pulsar_mono_sec() - 1.0));   /* a deadline passed on the same clock */
+    /* the uptime: whole seconds from the monotonic origin; 0 before the listener is up */
+    TEST_ASSERT(server_uptime_sec(0.0, pulsar_mono_sec()) == 0);
+    TEST_ASSERT(server_uptime_sec(100.0, 7300.9) == 7200);
+    server s;
+    memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.mu, NULL);
+    s.n_slots = BankCount{1};
+    s.pool_banks = BankCount{1};
+    s.started_sec = pulsar_mono_sec() - 7200.0;   /* up two hours, on the monotonic clock */
+    int fds[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    TEST_ASSERT(s.send_health(fds[0]) == true);
+    char buf[2048];
+    const int n = stream_read_within(fds[1], buf, sizeof buf - 1, 2000);
+    TEST_ASSERT(n > 0);
+    buf[n > 0 ? n : 0] = '\0';
+    TEST_ASSERT(strstr(buf, "\"uptime_s\":7200,") != NULL || strstr(buf, "\"uptime_s\":7201,") != NULL);
+    close(fds[0]);
+    close(fds[1]);
+    /* the kv ledger line's uptime reads the same origin */
+    kv_ledger_view v;
+    TEST_ASSERT(s.kv_ledger_read(&v, true));
+    TEST_ASSERT(v.uptime_s >= 7200.0 && v.uptime_s < 7202.0);
+    pthread_mutex_destroy(&s.mu);
+}
+
 /* /health under a stall: status "stalled", the seconds, and a 503 -- and "stalled":0 with 200 when progressing. */
 static void test_health_reports_a_stall(void) {
     for (int stalled = 0; stalled < 2; stalled++) {
@@ -22152,7 +22191,7 @@ static void test_health_reports_a_stall(void) {
         s.n_slots = BankCount{4};
         s.pool_banks = BankCount{4};
         s.n_generating = 1;
-        s.started = time(NULL);
+        s.started_sec = pulsar_mono_sec();
         s.stall_s = stalled ? 2160 : 0;
         int fds[2];
         TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
@@ -24298,6 +24337,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l442_discrete_floor_step_holds_no_device_kv();
     test_l442_one_memavailable_reading();
     test_l442_stream_writer_is_monotonic();
+    test_l444_request_deadline_and_uptime_are_monotonic();
     test_bank_pick_prefers_resident_hole();
     test_refusal_evictable();
     test_l179_park_live_bank_only_when_not_in_quantum();

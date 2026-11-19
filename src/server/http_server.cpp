@@ -164,6 +164,14 @@ static void kv_header_scan(const char *h, size_t n, http_request *r) {
     }
 }
 
+double server_request_read_deadline(void) { return pulsar_mono_sec() + PULSAR_SERVER_REQUEST_READ_DEADLINE_SEC; }
+
+bool server_request_read_expired(double deadline) { return pulsar_mono_sec() > deadline; }
+
+long server_uptime_sec(double started_sec, double now_sec) {
+    return started_sec > 0.0 ? (long)(now_sec - started_sec) : 0;
+}
+
 bool read_http_request(int fd, http_request *r) {
     buf b = {0};
     ssize_t hend = -1;
@@ -171,15 +179,16 @@ bool read_http_request(int fd, http_request *r) {
     const size_t max_body = 64 * 1024 * 1024;
     /* Whole-request read deadline: SO_RCVTIMEO only bounds a single recv, so
      * a client trickling one byte per interval could hold this thread
-     * forever. The deadline bounds total arrival time for headers + body. */
-    const time_t deadline = time(NULL) + PULSAR_SERVER_REQUEST_READ_DEADLINE_SEC;
+     * forever. The deadline bounds total arrival time for headers + body
+     * (L444: an interval, on the monotonic clock). */
+    const double deadline = server_request_read_deadline();
 
     while (hend < 0 && b.len < max_header) {
         char tmp[4096];
         ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) goto fail;
-        if (time(NULL) > deadline) goto fail;
+        if (server_request_read_expired(deadline)) goto fail;
         buf_append(&b, tmp, (size_t)n);
         hend = header_end(b.ptr, b.len);
     }
@@ -222,7 +231,7 @@ bool read_http_request(int fd, http_request *r) {
         ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) goto fail;
-        if (time(NULL) > deadline) goto fail;
+        if (server_request_read_expired(deadline)) goto fail;
         buf_append(&b, tmp, (size_t)n);
     }
 
@@ -401,7 +410,7 @@ bool server::send_health(int fd) {
     const char *model = model_json.c_str();
     bool draining;
     int n_slots, running, waiting, capacity;
-    time_t started;
+    double started_sec;
     double kv = 0.0; /* max KV utilization across provisioned slots */
     pthread_mutex_lock(&s->mu);
     draining = s->stopping;
@@ -415,7 +424,7 @@ bool server::send_health(int fd) {
     capacity = s->pool_banks.any() ? s->pool_banks.raw() : 1;
     running  = s->n_generating;
     waiting  = s->n_queued;
-    started  = s->started;
+    started_sec = s->started_sec;
     for (SlotIdx i : s->n_slots.slots()) {   /* L444: the published slot tables */
         const int pos = s->m_slot_pos[i];
         const int ctx = s->m_slot_ctx[i];
@@ -426,7 +435,7 @@ bool server::send_health(int fd) {
     pthread_mutex_unlock(&s->mu);
     if (running < 0) running = 0;
     if (waiting < 0) waiting = 0;
-    const long uptime = started ? (long)(time(NULL) - started) : 0;
+    const long uptime = server_uptime_sec(started_sec, pulsar_mono_sec());   /* L444: monotonic */
     /* the stall watchdog's verdict (watchdog.cpp): a stalled worker is not serving, whatever the queue says */
     const long long stalled = (long long)__atomic_load_n(&s->stall_s, __ATOMIC_RELAXED);
 
@@ -1413,7 +1422,7 @@ bool server::send_metrics(int fd) {
         static bool base_set = false;
         const HostBytes avail = pulsar_mem_available();   /* L442: the one reading */
         const uint64_t census = pulsar_gpu_tensor_alloc_bytes_current().raw();
-        if (!base_set && s->started && time(NULL) - s->started >= 60 &&
+        if (!base_set && server_uptime_sec(s->started_sec, pulsar_mono_sec()) >= 60 &&
             avail > HostBytes{}) {
             base_avail = avail;
             base_census = census;

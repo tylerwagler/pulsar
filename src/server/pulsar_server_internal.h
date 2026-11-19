@@ -3172,7 +3172,10 @@ struct server {
     int prefix_wait_ms;
     int restore_slice_ms;   ///< L330: PULSAR_SERVER_KV_RESTORE_SLICE_MS (0: one prefill chunk's priced time a slice)
     bool stopping;              ///< shutdown in progress; stop accepting and drain
-    time_t started;  ///< wall-clock when the listener came up (uptime for /health)
+    /** When the listener came up, on the MONOTONIC clock (pulsar_mono_sec; 0 = not up): the origin of every uptime
+     *  (/health's uptime_s, the kv ledger line's, the memory-drift baseline's 60 s).  L444: it was the wall clock's
+     *  time(NULL), so a system-time step (NTP, a manual set) moved every uptime, negative after a backward step. */
+    double started_sec;
     int clients;                 ///< connected clients, for the shutdown drain
     int stream_clients;          ///< live /metrics/stream subscribers (under mu)
     /** The /metrics/stream feed (lib/pulsar_metrics_stream.h): bumped by
@@ -6857,6 +6860,20 @@ void *client_main(void *arg);
 /// @param r  receives the request (release with http_request_free)
 /// @return false on a malformed, oversized or late request
 bool read_http_request(int fd, http_request *r);
+/** L444: a request read's whole-request deadline, PULSAR_SERVER_REQUEST_READ_DEADLINE_SEC from now on the MONOTONIC
+ *  clock (it was time(NULL): a forward step of the system time cut a slow client's read short, a backward one held a
+ *  stalled read past its deadline). */
+/// @return the deadline, in pulsar_mono_sec's seconds
+double server_request_read_deadline(void);
+/** L444: has a request read run past `deadline` (server_request_read_deadline)?  Read on the same clock. */
+/// @param deadline the read's deadline
+/// @return true once the monotonic clock is past it
+bool server_request_read_expired(double deadline);
+/** L444: seconds since the listener came up (server::started_sec), on the monotonic clock; 0 before it is up. */
+/// @param started_sec server::started_sec
+/// @param now_sec     pulsar_mono_sec() now
+/// @return the whole seconds, as /health's uptime_s
+long server_uptime_sec(double started_sec, double now_sec);
 void http_request_free(http_request *r);
 /** L321: serve ENCODER engines (pulsar_engine_encoder != NONE; one group, several models) on cfg's host and port until
  *  a stop signal: /v1/embeddings and / or /v1/rerank, /v1/models, /health (encode_server.cpp).  The exit code. */

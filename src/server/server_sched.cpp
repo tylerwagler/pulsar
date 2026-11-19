@@ -2538,7 +2538,7 @@ bool server::kv_ledger_read(kv_ledger_view *v, bool wait) {
     auto *s = this;
     if (wait) pthread_mutex_lock(&s->mu);
     else if (pthread_mutex_trylock(&s->mu) != 0) return false;
-    v->uptime_s = difftime(time(NULL), s->started);
+    v->uptime_s = pulsar_mono_sec() - s->started_sec;   /* L444: an interval, on the monotonic clock */
     v->c = s->m_kvl;
     v->evictions = s->m_evictions;
     v->disk = s->m_kv_disk_enabled;

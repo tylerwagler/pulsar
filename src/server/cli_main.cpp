@@ -1365,7 +1365,7 @@ int main(int argc, char **argv) {
     server s;
     memset(&s, 0, sizeof(s));
     s.engine = engine;
-    s.started = time(NULL);          /* uptime origin reported by /health */
+    s.started_sec = pulsar_mono_sec();   /* uptime origin (/health, the kv ledger line): monotonic (L444) */
     /* L357: the /test/ routes (http_server.cpp) answer only when the test harness asks for them; said, so a
      * production log shows it if they were ever on */
     {
