@@ -359,6 +359,14 @@ static uint32_t first_diff(const std::vector<Out> &a, const std::vector<Out> &b,
  * within 2^-12 of the row's largest |value| (f32 accumulation in another order: ~1e-6), and the decode rows are graded
  * against the reference on the prefill's bars.  Every other head width keeps its bit-exact checks. */
 static bool g_flashdec = false;
+/* L446 (Tyler 2026-11-19: "ship A first"): on a widening (sm_75) build the prompt rows of a head-512 FULL BF16 layer
+ * run the f16 arm (CUTLASS's fused attention), whose output is rounded to fp16 before bf16: measured on the RTX 5000
+ * fro 1.9e-4 / 2.6e-4, max 1.7e-3 / 3.3e-4, bf16 == bf16(ref) 0.952 / 0.879 (scale 1 / 1 over sqrt(512)) -- about a
+ * tenth of a bf16 step.  Its prefill grade uses the f16 arm's bars and close_rows 2^-9 of the row's max (a quarter of
+ * a bf16 step) in place of 2^-12; every bit-exact check (chunking, store, pools) is unchanged.  An interim until the
+ * purpose-built kernel (L446 B) writes f32 into bf16 in one rounding. */
+static bool g_f16arm = false;
+static const double BAR_F16_FRO = 5e-4, BAR_F16_MAX = 4e-3, BAR_F16_EQ = 0.85;
 static bool close_rows(const Out &a, const Out &b) {
     if (a.tap.size() != b.tap.size()) return false;
     float mx = 0.f, d = 0.f;
@@ -366,7 +374,7 @@ static bool close_rows(const Out &a, const Out &b) {
         mx = std::max(mx, std::fabs(a.tap[i]));
         d = std::max(d, std::fabs(a.tap[i] - b.tap[i]));
     }
-    return d <= mx * (1.0f / 4096.0f);
+    return d <= mx * (g_f16arm ? 1.0f / 512.0f : 1.0f / 4096.0f);
 }
 /* the decode arm's rows against the MMA tile's: bit-exact, or (g_flashdec) close_rows */
 static bool dec_match(const Out &a, const Out &b) { return g_flashdec ? close_rows(a, b) : same(a, b); }
@@ -513,6 +521,7 @@ static void run_case(Case &C) {
            (unsigned long long)pulsar_gqa_kv_token_bytes(&C.L), C.N);
     const uint32_t N = C.N;
     g_flashdec = C.R.hd > 128u;
+    g_f16arm = pulsar_gqa_widens() && C.R.hd == 512u && !C.R.window && !C.R.e4m3;   /* L446: the f16 prompt arm */
     History H;
     history_build(C, 1, N, H);
 
@@ -525,9 +534,13 @@ static void run_case(Case &C) {
     for (uint32_t p = 0; p < N; p++) { all[p] = p; gp[p] = &pre[p]; }
     const Grade G = grade(C, H, all, gp);
     printf("  reference rms %.4f, mean peak attention weight %.3f\n", G.rms, mean_peak(C, H, all));
-    check(G.fro <= bar_fro(C) && G.max <= bar_max(C) && G.eq >= BAR_EQ,
-          "fidelity (prefill, %u rows, graded): fro %.2e (bar %.0e), max %.2e (bar %.0e), bf16 out == bf16(ref) %.4f (bar %.2f)",
-          N, G.fro, bar_fro(C), G.max, bar_max(C), G.eq, BAR_EQ);
+    {
+        const double bf = g_f16arm ? BAR_F16_FRO : bar_fro(C), bm = g_f16arm ? BAR_F16_MAX : bar_max(C),
+                     be = g_f16arm ? BAR_F16_EQ : BAR_EQ;
+        check(G.fro <= bf && G.max <= bm && G.eq >= be,
+              "fidelity (prefill, %u rows, graded%s): fro %.2e (bar %.0e), max %.2e (bar %.0e), bf16 out == bf16(ref) %.4f "
+              "(bar %.2f)", N, g_f16arm ? ", the f16 arm's bars (L446)" : "", G.fro, bf, G.max, bm, G.eq, be);
+    }
 
     /* 2. decode */
     {
@@ -1356,6 +1369,7 @@ static void run_bounded_tile() {
     printf("\n=== %s: 16q/8kv/256, window %u, %u tokens: calls of 1024 then 37 rows, forward vs planned at ctx_bound %u\n",
            C.name, W, N, BOUND);
     g_flashdec = false;   /* prompt calls only: one arm, bit-exact */
+    g_f16arm = false;
     Seq A = seq_new(C, 1), B = seq_new(C, 1);
     const std::vector<Out> fwd = run_schedule(C, A, 0, N, {1024, 37});
     g_bound = BOUND;
