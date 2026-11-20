@@ -250,6 +250,16 @@ int pulsar_gqa_forward(const pulsar_gqa_layer *layer,
  * step's launches as a captured CUDA graph plans every attention call of the step first (its host half), uploads
  * the descriptors itself, and launches from them: a launch reads nothing from the host but the plan's shape. */
 
+/** L446: the most sequence runs a planned call records (pulsar_gqa_call::runs). */
+#define PULSAR_GQA_MAX_RUNS 16u
+/** L446: one sequence's run of rows in a planned call. */
+typedef struct {
+    void    *cache;   /**< the sequence's pool (device) */
+    uint32_t row0;    /**< the run's first call row */
+    uint32_t n;       /**< rows in the run */
+    uint32_t p0;      /**< the run's first position (keys below it are the pool's) */
+    uint32_t pad;     /**< zero */
+} pulsar_gqa_run;
 /** A planned call: what its launches depend on. */
 typedef struct {
     /** Rows in the call (<= 65535). */
@@ -259,7 +269,18 @@ typedef struct {
     uint32_t grid_chunks;   /**< the split schedule's chunk CTAs per (KV head, tile) */
     uint32_t ctx_bound;     /**< the workspace's context: the call's bound, else its own last position + 1 */
     int      fold;          /**< 1: the folded schedule (n_rows >= 64) */
+    /** L446: the call's sequence runs, in row order (the Turing f16 prompt arm launches one fused attention a run);
+     *  0 when the call has more than PULSAR_GQA_MAX_RUNS of them (that call takes the MMA tile). */
+    uint32_t n_runs;
+    pulsar_gqa_run runs[PULSAR_GQA_MAX_RUNS];   /**< [n_runs] */
 } pulsar_gqa_call;
+
+/** L446: an instrument's forced prompt arm for a layer the Turing f16 arm serves (head 512, FULL, BF16 rows, a build
+ *  that widens): 0 the launch's pick (the f16 arm), 1 the MMA tile (gqa_attn_wide_kernel), 2 the f16 arm.  The
+ *  engine never calls it.
+ *  @param arm 0, 1 or 2
+ *  @return 0, -1 out of range */
+int pulsar_gqa_prompt_arm_force(int arm);
 
 /** Bytes of a call's descriptors at n_rows rows (pulsar_gqa_plan's `desc`). */
 /// @param n_rows rows in the call.

@@ -25,6 +25,7 @@
 #include "pulsar_cuda_internal.h"
 #include "pulsar_cuda_rope.cuh"   /* the NeoX bf16 rotation: ONE authority (rope_neox_bf16_cs_dev / _rotate_dev) */
 #include "pulsar_cuda_arch.cuh"
+#include "pulsar_cuda_fmha.h"   /* L446: the Turing f16 prompt arm (CUTLASS's fused attention) */
 
 #include <type_traits>
 
@@ -1686,6 +1687,80 @@ __global__ void __launch_bounds__(128) gqa_commit_kernel(const gqa_row *rows, co
     for (uint32_t i = threadIdx.x; i < token_bytes / 16u; i += blockDim.x) dst[i] = src[i];
 }
 
+/* ---- L446: the Turing f16 prompt arm's staging (gqa_f16_arm) ----------------------------------------------------
+ * CUTLASS's fused attention (pulsar_fmha_f16_gqa_causal512_launch) reads f16 rows; the block's are bf16.  The staging
+ * widens them with gqa_opc -- the MMA tile's own widening, the same bits, and the same O59 check: an operand outside
+ * fp16's range CASes the call's code into the step's flag. */
+/// q (prepped, bf16) widened to f16, 8 elements a thread.
+/// @param q the prepped q, bf16 [n][n_q][HD].
+/// @param q16 its f16 copy.
+/// @param n8 elements / 8.
+/// @param nf the step's non-finite flag.
+/// @param code the code a flagged call records.
+__global__ void __launch_bounds__(256) gqa_f16_q_kernel(const uint4 *q, uint4 *q16, uint64_t n8, uint32_t *nf,
+                                                        uint32_t code) {
+    uint32_t bad = 0u;
+    for (uint64_t i = blockIdx.x * 256ull + threadIdx.x; i < n8; i += (uint64_t)gridDim.x * 256u) q16[i] = gqa_opc4(q[i], bad);
+    if (bad) atomicCAS(nf, 0u, code);
+}
+
+/// One run's keys and values widened to f16: a CTA a position x in 0 .. end - 1, its row from the pool below the run's
+/// first position p0 and from the call's fresh rows from p0 on.  K head g lands at kv16[(g * end + x) * HD], V head g at
+/// kv16[((n_kv + g) * end + x) * HD] (the token row's own order: K heads then V heads).
+/// @tparam HD head_dim.
+/// @param cache the run's pool (slot = position).
+/// @param fresh the call's KV rows.
+/// @param row0 the run's first call row (its fresh row for position p0).
+/// @param p0 the run's first position.
+/// @param end the run's last position + 1.
+/// @param heads 2 * n_kv.
+/// @param tb bytes of a token row.
+/// @param kv16 the f16 K then V.
+/// @param nf the step's non-finite flag.
+/// @param code the code a flagged call records.
+template <int HD>
+__global__ void __launch_bounds__(256) gqa_f16_kv_kernel(const uint8_t *cache, const uint8_t *fresh, uint32_t row0,
+                                                         uint32_t p0, uint32_t end, uint32_t heads, uint32_t tb,
+                                                         uint4 *kv16, uint32_t *nf, uint32_t code) {
+    const uint32_t x = blockIdx.x;
+    const uint4 *src = reinterpret_cast<const uint4 *>(x < p0 ? cache + (uint64_t)x * tb
+                                                              : fresh + (uint64_t)(row0 + x - p0) * tb);
+    constexpr uint32_t V8 = HD / 8u;   /* uint4 vectors a head */
+    uint32_t bad = 0u;
+    for (uint32_t i = threadIdx.x; i < heads * V8; i += blockDim.x) {
+        const uint32_t hh = i / V8, e = i % V8;
+        kv16[((uint64_t)hh * end + x) * V8 + e] = gqa_opc4(src[i], bad);
+    }
+    if (bad) atomicCAS(nf, 0u, code);
+}
+
+/// The fused attention's f16 output of one run, [n_kv][np][G][HD] with the run's row i at padded row pad + i, into the
+/// call's bf16 output (head h = g * G + j at columns h * HD of row row0 + i) and, when given, the f32 tap: a CTA a run
+/// row.
+/// @tparam HD head_dim.
+/// @param o16 the run's output.
+/// @param np the run's padded rows (the output's row count).
+/// @param pad the padding rows in front of the run's first.
+/// @param n_kv KV heads.
+/// @param G query heads a KV head.
+/// @param row0 the run's first call row.
+/// @param out the call's bf16 output.
+/// @param ld_out its row stride, elements.
+/// @param tap the f32 tap [rows][n_q * HD], or NULL.
+template <int HD>
+__global__ void __launch_bounds__(256) gqa_f16_out_kernel(const __half2 *o16, uint32_t np, uint32_t pad, uint32_t n_kv,
+                                                          uint32_t G, uint32_t row0, __nv_bfloat16 *out, uint64_t ld_out,
+                                                          float *tap) {
+    const uint32_t i = blockIdx.x, nq = n_kv * G;
+    for (uint32_t t = threadIdx.x; t < nq * (HD / 2u); t += blockDim.x) {
+        const uint32_t h = t / (HD / 2u), d2 = t % (HD / 2u), g = h / G, j = h % G;
+        const float2 y = __half22float2(o16[(((uint64_t)g * np + pad + i) * G + j) * (HD / 2u) + d2]);
+        const uint64_t col = (uint64_t)h * HD + 2u * d2;
+        *reinterpret_cast<__nv_bfloat162 *>(&out[(uint64_t)(row0 + i) * ld_out + col]) = __floats2bfloat162_rn(y.x, y.y);
+        if (tap) *reinterpret_cast<float2 *>(&tap[(uint64_t)(row0 + i) * nq * HD + col]) = y;
+    }
+}
+
 /* ---- workspace geometry: ONE function sizes it and carves it ---------------------- */
 /// The workspace carve (gqa_ws_layout); every region 256-byte aligned.
 struct gqa_ws {
@@ -1701,6 +1776,15 @@ struct gqa_ws {
     float         *part;
     /// Split-schedule (max, denominator), [n_rows][n_q][max_chunks].
     float2        *ml;
+    /// L446, the Turing f16 prompt arm (gqa_f16_arm; carved over part / ml, which that arm never uses): q widened to
+    /// f16, [n_rows][n_q][head_dim].
+    uint16_t      *q16;
+    /// L446: one run's keys and values widened to f16, K [n_kv][ctx][head_dim] then V the same.
+    uint16_t      *kv16;
+    /// L446: the fused attention's f16 output, [n_kv][n_rows][G][head_dim] (a run's rows at its row0).
+    uint16_t      *o16;
+    /// L446: its f32 accumulator, the same shape.
+    float         *acc;
     /// pulsar_gqa_forward's own non-finite flag: the word it hands the launch when the caller gave none (O59).
     uint32_t      *nf;
     /// Chunks a row can span at the layout's context (gqa_max_chunks).
@@ -1727,6 +1811,27 @@ bool gqa_build_widens() {
 /// @param x a byte count.
 /// @return x rounded up to a multiple of 256.
 uint64_t gqa_up(uint64_t x) { return (x + 255u) & ~255ull; }
+
+/// L446: whether a layer's prompt rows can take the Turing f16 arm (CUTLASS's fused attention on the fp16 tensor cores,
+/// pulsar_fmha_f16_gqa_causal512_launch) -- Gemma 4's global layers on sm_75: head 512, FULL span, BF16 rows, no block
+/// run (no bias or gate: the wide heads refuse them), on a build whose arms widen bf16 to fp16.  A function of the
+/// layer and the build alone, so a prompt row's arm -- its bytes -- never depends on its call.
+/// @param L the layer.
+/// @return true when the arm serves the layer's prompt rows.
+bool gqa_f16_arm(const pulsar_gqa_layer *L) {
+    return L->head_dim == 512u && L->span == PULSAR_GQA_FULL && L->kv_fmt == PULSAR_GQA_KV_BF16 && !L->block &&
+           !L->rel_extent && !L->out_gate && gqa_build_widens();
+}
+
+/// L446: an instrument's forced prompt arm (pulsar_gqa_prompt_arm_force): 0 the pick, 1 the MMA tile, 2 the f16 arm.
+int g_prompt_arm_force = 0;
+
+/// L446: the fused attention's query block (pulsar_fmha_f16_gqa_causal512_launch: 32 queries x 128 keys).  A block walks
+/// keys up to its LAST row, and the kernel's final key block fuses the softmax division into the rescale, so a row's
+/// bytes depend on how many key blocks its query block walks.  A run is padded in front so that its query blocks start
+/// at absolute positions that are multiples of 32: every row of a block then lies in one 128-key block, and walks
+/// exactly the key blocks up to its own -- a function of its position alone, whatever its call.
+constexpr uint32_t GQA_F16_QBLOCK = 32u;
 
 /// @param L the layer.
 /// @param max_ctx a bound on the call's positions (all < max_ctx).
@@ -1770,8 +1875,20 @@ gqa_ws gqa_ws_layout(uint8_t *base, const pulsar_gqa_layer *L, uint32_t n_rows, 
     w.tiles = (gqa_tile *)take((uint64_t)n_rows * sizeof(gqa_tile));
     w.q     = (__nv_bfloat16 *)take((uint64_t)n_rows * L->n_q * L->head_dim * 2u);
     w.fresh = (uint8_t *)take((uint64_t)n_rows * tb);
+    const uint64_t shared0 = off;   /* L446: the split partials and the f16 arm's scratch share one region */
     w.part  = (float *)take(part_rows * L->n_q * w.max_chunks * L->head_dim * sizeof(float));
     w.ml    = (float2 *)take(part_rows * L->n_q * w.max_chunks * sizeof(float2));
+    if (gqa_f16_arm(L)) {
+        /* every run is padded in front to a 32-row query block boundary (gqa_launch_f16): up to 31 rows a run */
+        const uint64_t split_end = off, qhd = (uint64_t)L->n_q * L->head_dim;
+        const uint64_t qrows = (uint64_t)n_rows + (GQA_F16_QBLOCK - 1u) * std::min<uint64_t>(n_rows, PULSAR_GQA_MAX_RUNS);
+        off = shared0;
+        w.q16  = (uint16_t *)take(qrows * qhd * 2u);
+        w.kv16 = (uint16_t *)take(2ull * L->n_kv * max_ctx * L->head_dim * 2u);
+        w.o16  = (uint16_t *)take(qrows * qhd * 2u);
+        w.acc  = (float *)take(qrows * qhd * 4u);
+        off = std::max(off, split_end);
+    }
     w.nf    = (uint32_t *)take(sizeof(uint32_t));
     w.bytes = off;
     return w;
@@ -2024,6 +2141,75 @@ int pulsar_gqa_plan(const pulsar_gqa_layer *L, const pulsar_gqa_seq *seqs, uint3
     out->grid_chunks = grid_chunks;
     out->ctx_bound = ctx_bound ? ctx_bound : max_ctx;
     out->fold = n_rows >= GQA_FOLD_ROWS ? 1 : 0;
+    /* L446: the sequence runs, in row order (each sequence's rows are one run: checked above) */
+    out->n_runs = 0;
+    memset(out->runs, 0, sizeof(out->runs));
+    for (uint32_t r = 0, k = 0; r < n_rows; r = run_last[row_seq[r]] + 1u, k++) {
+        if (k == PULSAR_GQA_MAX_RUNS) { out->n_runs = 0; break; }
+        const uint32_t sq = row_seq[r];
+        out->runs[k] = {seqs[sq].kv, r, run_last[sq] - r + 1u, row_pos[r], 0u};
+        out->n_runs = k + 1u;
+    }
+    return 0;
+}
+
+/// L446: a planned call's prompt rows on the Turing f16 arm (gqa_f16_arm): the prep (as gqa_launch), q widened to f16,
+/// then per sequence run its keys and values widened to f16 (pool below the run, fresh rows from it), CUTLASS's fused
+/// causal attention, its output into the call's bf16 output; then the commit.  Runs share the K / V scratch in stream
+/// order.
+/// @param L the layer (gqa_f16_arm).
+/// @param pa the prep arguments.
+/// @param aa the attention arguments (q, fresh, out, tap, scale, the flag).
+/// @param call the plan (its runs).
+/// @param st the stream.
+/// @param ws the workspace carve (q16, kv16, o16, acc; rows, fresh).
+/// @return 0, -1 refused, -3 on a launch failure.
+static int gqa_launch_f16(const pulsar_gqa_layer *L, const gqa_prep_args &pa, const gqa_args &aa,
+                          const pulsar_gqa_call *call, cudaStream_t st, const gqa_ws &ws) {
+    constexpr uint32_t HD = 512u;
+    const uint32_t n_rows = call->n_rows, G = L->n_q / L->n_kv, jobs = L->n_q + 2u * L->n_kv;
+    static bool announced = false;
+    if (!announced) {
+        announced = true;
+        fprintf(stderr, "pulsar: gqa attention: %uq/%ukv/%u prompt rows on the Turing f16 arm (L446: CUTLASS fused "
+                        "attention, 32 x 128, f16 operands widened from bf16)\n", L->n_q, L->n_kv, HD);
+    }
+    if (L->rope_inv_freq) {
+        gqa_prep_table_args ta;
+        static_cast<gqa_prep_args &>(ta) = pa;
+        ta.rope_inv = L->rope_inv_freq;
+        gqa_prep_kernel<HD, gqa_prep_table_args><<<dim3(n_rows, (jobs + 7u) / 8u), 256, 0, st>>>(ta);
+    } else {
+        gqa_prep_kernel<HD, gqa_prep_args><<<dim3(n_rows, (jobs + 7u) / 8u), 256, 0, st>>>(pa);
+    }
+    const uint64_t qhd = (uint64_t)L->n_q * HD;
+    uint64_t base = 0;   /* the run's first row in the padded scratch */
+    for (uint32_t k = 0; k < call->n_runs; k++) {
+        const pulsar_gqa_run &R = call->runs[k];
+        const uint32_t end = R.p0 + R.n, pad = R.p0 % GQA_F16_QBLOCK, np = R.n + pad;
+        if (end > call->ctx_bound || !R.cache) return gqa_refuse("an f16-arm run past the call's bound or with no pool");
+        uint16_t *q16 = ws.q16 + base * qhd;
+        if (pad && cudaMemsetAsync(q16, 0, (uint64_t)pad * qhd * 2u, st) != cudaSuccess) return -3;
+        const uint64_t qn8 = (uint64_t)R.n * qhd / 8u;
+        gqa_f16_q_kernel<<<(uint32_t)std::min<uint64_t>((qn8 + 255u) / 256u, 4096u), 256, 0, st>>>(
+            reinterpret_cast<const uint4 *>(ws.q + (uint64_t)R.row0 * qhd), reinterpret_cast<uint4 *>(q16 + pad * qhd),
+            qn8, aa.nf, aa.nf_code);
+        gqa_f16_kv_kernel<HD><<<end, 256, 0, st>>>((const uint8_t *)R.cache, ws.fresh, R.row0, R.p0, end, 2u * L->n_kv,
+                                                   aa.token_bytes, reinterpret_cast<uint4 *>(ws.kv16), aa.nf, aa.nf_code);
+        if (const int rc = pulsar_fmha_f16_gqa_causal512_launch(q16, ws.kv16, ws.kv16 + (uint64_t)L->n_kv * end * HD,
+                                                                L->n_kv, G, np, end, L->scale, ws.o16 + base * qhd,
+                                                                ws.acc + base * qhd, st))
+            return rc;
+        gqa_f16_out_kernel<HD><<<R.n, 256, 0, st>>>(reinterpret_cast<const __half2 *>(ws.o16 + base * qhd), np, pad,
+                                                    L->n_kv, G, R.row0, aa.out, aa.ld_out, aa.tap);
+        base += np;
+    }
+    gqa_commit_kernel<<<n_rows, 128, 0, st>>>(ws.rows, ws.fresh, aa.token_bytes);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        fprintf(stderr, "pulsar: gqa attention (f16 arm) launch failed: %s\n", cudaGetErrorString(e));
+        return -3;
+    }
     return 0;
 }
 
@@ -2130,6 +2316,21 @@ int pulsar_gqa_launch(const pulsar_gqa_layer *L, const pulsar_gqa_call *call, co
     /* its rows a CTA (the caller's most, by the row count: a (row, head)'s bytes are the same at any) */
     const uint32_t dmma_rb = io->decode_group >= 4 && n_rows >= 3u ? 4u : io->decode_group >= 2 && n_rows >= 2u ? 2u : 1u;
     if (mma_dec) shape = {dmma_rb, GQA_DMMA_NV};
+    /* L446: prompt rows of a layer the Turing f16 arm serves take it -- every such call, whatever its row count, so a
+     * prompt row's bytes never depend on where its prompt was cut.  A call with more sequence runs than the plan
+     * records (none in the served families: Gemma's banks are fewer) takes the MMA tile, said once. */
+    if (io->decode_rows == 0 && g_prompt_arm_force != 1 && gqa_f16_arm(L)) {
+        if (call->n_runs > 0) return gqa_launch_f16(L, pa, aa, call, st, ws);
+        if (g_prompt_arm_force == 2) return gqa_refuse("the f16 prompt arm forced on a call with too many sequence runs");
+        static bool said = false;
+        if (!said) {
+            said = true;
+            fprintf(stderr, "pulsar: gqa attention: a prompt call with more than %u sequence runs takes the MMA tile, "
+                            "not the f16 arm (its rows' bytes differ from the f16 arm's)\n", PULSAR_GQA_MAX_RUNS);
+        }
+    } else if (g_prompt_arm_force == 2 && io->decode_rows == 0) {
+        return gqa_refuse("the f16 prompt arm forced on a layer it does not serve (head 512, FULL, BF16, sm_75)");
+    }
     switch (HD) {
     case 512u: return gqa_launch<512>(L, pa, aa, n_rows, call->n_tiles, call->grid_chunks, fold, io->decode_rows != 0, shape, mma_dec, st, ws);
     case 256u: return gqa_launch<256>(L, pa, aa, n_rows, call->n_tiles, call->grid_chunks, fold, io->decode_rows != 0, shape, mma_dec, st, ws);
@@ -2188,6 +2389,16 @@ int pulsar_gqa_forward(const pulsar_gqa_layer *L, const pulsar_gqa_seq *seqs, ui
 }
 
 int pulsar_gqa_widens(void) { return gqa_build_widens() ? 1 : 0; }
+
+int pulsar_gqa_prompt_arm_force(int arm) {
+    if (arm < 0 || arm > 2) {
+        fprintf(stderr, "pulsar: gqa prompt arm force: %d is not 0 (the pick), 1 (the MMA tile) or 2 (the f16 arm) -- "
+                        "refusing\n", arm);
+        return -1;
+    }
+    g_prompt_arm_force = arm;
+    return 0;
+}
 
 /* ---- the KV rows alone (L298): gqa_prep's K / V jobs and gqa_commit, nothing between --------------------------- */
 

@@ -179,6 +179,7 @@ static double time_gemma(bool window, uint32_t ctx, uint32_t rows, int group) {
     io.out_bf16 = out; io.ld_out = NQ * HD; io.workspace = ws; io.workspace_bytes = wsb;
     io.decode_rows = getenv("GQA_BENCH_MMA") ? 0 : 1;   /* GQA_BENCH_MMA: the MMA tile arm (the prompt rows') instead */
     if (const char *arm = getenv("GQA_BENCH_ARM")) pulsar_gqa_decode_arm_force(atoi(arm));   /* 1 flash, 2 MMA decode */
+    if (const char *arm = getenv("GQA_BENCH_PROMPT_ARM")) pulsar_gqa_prompt_arm_force(atoi(arm));   /* L446: 1 MMA tile, 2 f16 */
     io.decode_group = group;
     cudaEvent_t e0, e1;
     CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
