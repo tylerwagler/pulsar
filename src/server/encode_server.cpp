@@ -192,6 +192,8 @@ struct enc_server {
     pthread_cond_t idle = PTHREAD_COND_INITIALIZER;
     /// Connection threads in flight, under `mu`.
     int clients = 0;
+    /// L252 P3: --api-key-file's key (NULL: none, every route open); fixed before the first accept.
+    const char *api_key = NULL;
 };
 
 /** A connection thread's argument: malloc'd by the accept loop, freed by client(). */
@@ -655,6 +657,7 @@ void *client(void *arg) {
     for (const enc_ctx &c : srv->m) has[c.kind] = true;
     if (!read_http_request(fd, &hr)) {
         http_error(fd, 400, "bad HTTP request");
+    } else if (server_auth_refuse(fd, &hr, srv->api_key)) {   /* L252 P3: --api-key-file guards every POST */
     } else if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/health")) {
         health(srv, fd);
     } else if (!strcmp(hr.method, "GET") && (!strcmp(hr.path, "/healthz") || !strcmp(hr.path, "/ping"))) {
@@ -707,6 +710,7 @@ void stop_executors(enc_server *srv) {
 
 int encode_serve(pulsar_engine *const *engines, int n, const server_config *cfg) {
     enc_server srv;
+    srv.api_key = cfg->api_key;   /* L252 P3 */
     for (int i = 0; i < n; i++) {
         pulsar_engine *e = engines[i];
         srv.m.push_back({e, NULL, pulsar_engine_is_parser(e) ? K_PARSE : (srv_kind)pulsar_engine_encoder(e),
@@ -737,7 +741,7 @@ int encode_serve(pulsar_engine *const *engines, int n, const server_config *cfg)
         else
             server_log(PULSAR_LOG_DEFAULT, "pulsar-server: %s: %s, POST %s (%u floats an input, inputs up to %u tokens)",
                        c.id, c.kind == K_EMBED ? "embedder" : "reranker", kind_path(c.kind), c.dim, c.cap);
-    server_warn_if_exposed(cfg->host);
+    server_warn_if_exposed(cfg->host, cfg->api_key != NULL);
     server_log(PULSAR_LOG_DEFAULT, "pulsar-server: listening on http://%s:%d (pulsar %s)", cfg->host, cfg->port,
                PULSAR_VERSION_STR);
     while (!g_stop_requested) {

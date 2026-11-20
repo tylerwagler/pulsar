@@ -350,6 +350,7 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     title(fp, c, "HTTP API");
     opt(fp, c, "--host HOST", "Bind address. Default: 127.0.0.1 (loopback; 0.0.0.0 exposes it, with no auth)");
     opt(fp, c, "--port N", "Bind port. Default: 8000");
+    opt(fp, c, "--api-key-file FILE", "Require this file's key (Authorization: Bearer or x-api-key) on every request but GET. Default: none");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
     para(fp, c, "Also /v1/messages/count_tokens, /v1/models, /health, /version, /metrics and /metrics/stream.");

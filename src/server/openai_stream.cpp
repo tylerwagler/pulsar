@@ -5,7 +5,7 @@
 
 
 
-/* L335: the reason phrase of every status the server sends (200, 204, 400, 404, 409, 429, 500, 503 --
+/* L335: the reason phrase of every status the server sends (200, 204, 400, 401, 404, 409, 429, 500, 503 --
  * 429 is in the table for the admission paths that may send it, no path does today).  A status outside
  * the table is a server bug, not a client's: http_write dies on it rather than send "<code> Error". */
 /// The RFC 9110 reason phrase of an HTTP status the server sends.
@@ -16,6 +16,7 @@ static const char *http_reason(int code) {
     case 200: return "OK";
     case 204: return "No Content";
     case 400: return "Bad Request";
+    case 401: return "Unauthorized";   /* L252 P3: a missing or wrong API key */
     case 404: return "Not Found";
     case 409: return "Conflict";
     case 429: return "Too Many Requests";
@@ -169,6 +170,20 @@ bool http_error_anthropic(int fd, int code, const char *msg) {
     const bool retry = code == 429 || code == 503 || code == 529;
     bool ok = retry ? http_response_retry(fd, code, "application/json", b.ptr, HTTP_RETRY_GOING_AWAY_S)
                     : http_response(fd, code, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+bool http_error_unauthorized(int fd, bool anthropic, const char *msg) {
+    buf b = {0};
+    if (anthropic) {
+        anthropic_error_body(&b, 401, msg);
+    } else {
+        buf_puts(&b, "{\"error\":{\"message\":");
+        json_escape(&b, msg);
+        buf_puts(&b, ",\"type\":\"authentication_error\",\"code\":\"invalid_api_key\"}}\n");
+    }
+    const bool ok = http_write(fd, 401, "application/json", b.ptr, "WWW-Authenticate: Bearer\r\n");
     buf_free(&b);
     return ok;
 }

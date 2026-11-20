@@ -9,6 +9,7 @@
 #include "pulsar_gpu.h"   /* tensor census for the reconciliation gauge */
 #include "tp/pulsar_tp.h" /* the /health tp block reads the NODE records */
 
+#include <atomic>
 #include <string>
 
 /// L354: a model id's bytes inside a JSON string (it is operator-set, and a quote or a newline would break the document).
@@ -164,6 +165,111 @@ static void kv_header_scan(const char *h, size_t n, http_request *r) {
     }
 }
 
+/* ===== L252 P3: the API key ===== */
+
+/// L252 P3: copy one credential value into its slot: whole or not at all (a value longer than the slot is "", so no
+/// prefix of a long value can ever match), surrounding spaces and tabs trimmed; a later header line replaces it.
+/// @param v    the value (not NUL-terminated)
+/// @param len  its bytes
+/// @param out  the slot (SERVER_API_KEY_MAX + 1 bytes)
+static void auth_credential_set(const char *v, size_t len, char *out) {
+    while (len && (*v == ' ' || *v == '\t')) v++, len--;
+    while (len && (v[len - 1] == ' ' || v[len - 1] == '\t')) len--;
+    if (len > SERVER_API_KEY_MAX) len = 0;
+    memcpy(out, v, len);
+    out[len] = '\0';
+}
+
+/// L252 P3: read one request-head line's credential, if it is `Authorization: Bearer <v>` or `x-api-key: <v>` (names
+/// and the scheme in any case).  Another scheme (Basic, ...) presents nothing.
+/// @param r     the request being read
+/// @param line  the line (not NUL-terminated, no CR / LF)
+/// @param len   its bytes
+static void auth_header_read_line(http_request *r, const char *line, size_t len) {
+    static const char authz[] = "Authorization:", xkey[] = "x-api-key:", bearer[] = "Bearer ";
+    const size_t al = sizeof authz - 1, xl = sizeof xkey - 1, bl = sizeof bearer - 1;
+    if (len >= xl && !strncasecmp(line, xkey, xl)) {
+        auth_credential_set(line + xl, len - xl, r->x_api_key);
+    } else if (len >= al && !strncasecmp(line, authz, al)) {
+        const char *v = line + al;
+        size_t vl = len - al;
+        while (vl && (*v == ' ' || *v == '\t')) v++, vl--;
+        if (vl > bl && !strncasecmp(v, bearer, bl)) auth_credential_set(v + bl, vl - bl, r->bearer);
+        else r->bearer[0] = '\0';
+    }
+}
+
+/// L252 P3: equal strings, in time that depends on the lengths only (not on where the bytes differ).
+/// @param a  a NUL-terminated string
+/// @param b  another
+/// @return true when they are equal
+static bool auth_equal(const char *a, const char *b) {
+    const size_t la = strlen(a), lb = strlen(b);
+    unsigned char d = la == lb ? 0u : 1u;
+    for (size_t i = 0; i < la; i++) d |= (unsigned char)(a[i] ^ b[i % (lb ? lb : 1)]);
+    return d == 0u;
+}
+
+bool server_api_key_load(const char *path, char **out, char *err, size_t errlen) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        snprintf(err, errlen, "cannot open the API key file %s: %s", path, strerror(errno));
+        return false;
+    }
+    char buf[SERVER_API_KEY_MAX + 64];
+    const size_t n = fread(buf, 1, sizeof buf, f);
+    const bool read_err = ferror(f) != 0;
+    fclose(f);
+    if (read_err) {
+        snprintf(err, errlen, "cannot read the API key file %s", path);
+        return false;
+    }
+    size_t len = n;
+    while (len && isspace((unsigned char)buf[len - 1])) len--;
+    if (n == sizeof buf || len > SERVER_API_KEY_MAX) {
+        snprintf(err, errlen, "the API key in %s is longer than %d bytes", path, SERVER_API_KEY_MAX);
+        return false;
+    }
+    if (len < SERVER_API_KEY_MIN) {
+        snprintf(err, errlen, "the API key in %s is shorter than %d bytes", path, SERVER_API_KEY_MIN);
+        return false;
+    }
+    for (size_t i = 0; i < len; i++)
+        if (buf[i] <= ' ' || buf[i] > '~') {
+            snprintf(err, errlen, "the API key in %s holds a space or a byte outside printable ASCII", path);
+            return false;
+        }
+    *out = server_xstrndup(buf, len);
+    return true;
+}
+
+bool server_method_needs_key(const char *method) {
+    return strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0 && strcmp(method, "OPTIONS") != 0;
+}
+
+bool server_request_has_key(const http_request *r, const char *key) {
+    if (!key) return true;
+    /* both compared, whichever is present: the time says nothing about which one was tried */
+    const bool by_bearer = auth_equal(r->bearer, key);
+    const bool by_xkey = auth_equal(r->x_api_key, key);
+    return by_bearer || by_xkey;
+}
+
+bool server_auth_refuse(int fd, const http_request *r, const char *key) {
+    if (!key || !server_method_needs_key(r->method) || server_request_has_key(r, key)) return false;
+    static std::atomic<unsigned long long> refused{0};
+    const unsigned long long n = refused.fetch_add(1) + 1;
+    if ((n & (n - 1)) == 0)   /* the first refusal, then at powers of two: a scan cannot flood the log */
+        server_log(PULSAR_LOG_WARNING, "pulsar-server: refused %s %s without the API key (%llu refusal%s so far)",
+                   r->method, r->path, n, n == 1 ? "" : "s");
+    const bool anthropic = !strncmp(r->path, "/v1/messages", 12);
+    http_error_unauthorized(fd, anthropic,
+                            r->bearer[0] || r->x_api_key[0]
+                                ? "invalid API key"
+                                : "this server requires an API key: send Authorization: Bearer <key> or x-api-key: <key>");
+    return true;
+}
+
 double server_request_read_deadline(void) { return pulsar_mono_sec() + PULSAR_SERVER_REQUEST_READ_DEADLINE_SEC; }
 
 bool server_request_read_expired(double deadline) { return pulsar_mono_sec() > deadline; }
@@ -220,6 +326,7 @@ bool read_http_request(int fd, http_request *r) {
         const char *nl = (const char *)memchr(hl, '\n', (size_t)(he - hl));
         const size_t ll = nl ? (size_t)(nl - hl) : (size_t)(he - hl);
         client_hints_read_line(&r->hints, hl, ll);
+        auth_header_read_line(r, hl, ll && hl[ll - 1] == '\r' ? ll - 1 : ll);   /* L252 P3 */
         if (!nl) break;
         hl = nl + 1;
     }
@@ -1579,6 +1686,11 @@ void *client_main(void *arg) {
         goto done;
     }
     posted = !strcmp(hr.method, "POST");
+    /* L252 P3: with --api-key-file, everything but the read-only GETs needs the key (before any route reads the body) */
+    if (server_auth_refuse(fd, &hr, s->api_key)) {
+        http_request_free(&hr);
+        goto done;
+    }
 
     if (!strcmp(hr.method, "OPTIONS")) {
         http_response(fd, 204, NULL, "");

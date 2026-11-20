@@ -21694,6 +21694,191 @@ static void test_l347_i3b_kv_header(void) {
     }
 }
 
+/* ===== L252 P3: the API key (--api-key-file); off unless configured ===== */
+
+/** L252 P3: write `text` to a fresh temp file and return its path (the caller unlinks it). */
+/// @param text the file's bytes
+/// @return the path (static storage, overwritten by the next call)
+static const char *l252_key_file(const char *text) {
+    static char path[64];
+    snprintf(path, sizeof path, "/tmp/l252-key-XXXXXX");
+    const int fd = mkstemp(path);
+    TEST_ASSERT(fd >= 0);
+    if (fd >= 0) {
+        TEST_ASSERT(write(fd, text, strlen(text)) == (ssize_t)strlen(text));
+        close(fd);
+    }
+    return path;
+}
+
+/** L252 P3: read one request (head lines `head`, a 2-byte body) through read_http_request over a socket pair. */
+/// @param method the request method
+/// @param path   the request path
+/// @param head   extra head lines, each ending CRLF
+/// @param hr     receives the request (the caller frees it)
+static void l252_read_request(const char *method, const char *path, const char *head, http_request *hr) {
+    int fds[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    std::string req = std::string(method) + " " + path + " HTTP/1.1\r\nHost: t\r\n" + head + "Content-Length: 2\r\n\r\n{}";
+    TEST_ASSERT(write(fds[1], req.data(), req.size()) == (ssize_t)req.size());
+    shutdown(fds[1], SHUT_WR);
+    *hr = http_request{};
+    TEST_ASSERT(read_http_request(fds[0], hr));
+    close(fds[0]);
+    close(fds[1]);
+}
+
+/* (1) The key file: trailing whitespace dropped; 16..256 printable bytes with no space inside, else refused with a
+ * reason that never echoes the key; a missing file is refused.  Without --api-key-file the config holds no key (the
+ * default: today's open server), and with it the file's key. */
+static void test_l252_api_key_file(void) {
+    char err[256] = "";
+    char *key = NULL;
+    const char *p = l252_key_file("0123456789abcdef-key\n\r\n  ");
+    TEST_ASSERT(server_api_key_load(p, &key, err, sizeof err) && key && !strcmp(key, "0123456789abcdef-key"));
+    free(key);
+    key = NULL;
+    unlink(p);
+    const struct { const char *text; const char *why; } bad[] = {
+        { "short-key\n", "shorter than 16 bytes" },
+        { "0123456789 abcdef-key\n", "space or a byte outside printable ASCII" },
+        { "0123456789abcdef\x01key", "space or a byte outside printable ASCII" },
+        { "", "shorter than 16 bytes" },
+    };
+    for (const auto &b : bad) {
+        p = l252_key_file(b.text);
+        err[0] = '\0';
+        TEST_ASSERT(!server_api_key_load(p, &key, err, sizeof err) && key == NULL);
+        TEST_ASSERT(strstr(err, b.why) != NULL);
+        TEST_ASSERT(!strstr(err, "abcdef"));   /* the key's bytes never reach the log */
+        unlink(p);
+    }
+    const std::string long_key(SERVER_API_KEY_MAX + 1, 'k');
+    p = l252_key_file(long_key.c_str());
+    TEST_ASSERT(!server_api_key_load(p, &key, err, sizeof err) && strstr(err, "longer than 256 bytes"));
+    unlink(p);
+    const std::string max_key(SERVER_API_KEY_MAX, 'k');
+    p = l252_key_file((max_key + "\n").c_str());
+    TEST_ASSERT(server_api_key_load(p, &key, err, sizeof err) && key && strlen(key) == SERVER_API_KEY_MAX);
+    free(key);
+    key = NULL;
+    unlink(p);
+    TEST_ASSERT(!server_api_key_load("/tmp/l252-no-such-key-file", &key, err, sizeof err) &&
+                strstr(err, "cannot open"));
+    {
+        char *argv[] = {(char *)"pulsar-server", (char *)"-m", (char *)"/tmp/l252-model"};
+        const server_config c = server_parse_options(3, argv);
+        TEST_ASSERT(c.api_key_file == NULL && c.api_key == NULL);   /* the default: no key, nothing refused */
+    }
+    {
+        p = l252_key_file("0123456789abcdef-key\n");
+        char path[64];
+        snprintf(path, sizeof path, "%s", p);
+        char *argv[] = {(char *)"pulsar-server", (char *)"-m", (char *)"/tmp/l252-model", (char *)"--api-key-file",
+                        path};
+        const server_config c = server_parse_options(5, argv);
+        TEST_ASSERT(c.api_key_file && !strcmp(c.api_key_file, path) && c.api_key &&
+                    !strcmp(c.api_key, "0123456789abcdef-key"));
+        free((char *)c.api_key);
+        unlink(path);
+    }
+}
+
+/* (2) The head scan reads `Authorization: Bearer <v>` and `x-api-key: <v>` in any case, trims the value, ignores
+ * another scheme, and keeps an overlong value as "" (never a truncated prefix); the method rule and the comparison:
+ * no key configured passes everything, a configured key passes an exact credential only, through either header. */
+static void test_l252_api_key_headers(void) {
+    const char *key = "0123456789abcdef-key";
+    struct { const char *head; const char *bearer; const char *xkey; bool pass; } cases[] = {
+        { "Authorization: Bearer 0123456789abcdef-key\r\n", "0123456789abcdef-key", "", true },
+        { "authorization:bearer  0123456789abcdef-key \r\n", "0123456789abcdef-key", "", true },
+        { "AUTHORIZATION: BEARER 0123456789abcdef-key\r\n", "0123456789abcdef-key", "", true },
+        { "x-api-key: 0123456789abcdef-key\r\n", "", "0123456789abcdef-key", true },
+        { "X-Api-Key:0123456789abcdef-key\r\n", "", "0123456789abcdef-key", true },
+        { "Authorization: Bearer wrong\r\nx-api-key: 0123456789abcdef-key\r\n", "wrong", "0123456789abcdef-key", true },
+        { "Authorization: Basic 0123456789abcdef-key\r\n", "", "", false },
+        { "Authorization: Bearer 0123456789abcdef-ke\r\n", "0123456789abcdef-ke", "", false },   /* a prefix */
+        { "Authorization: Bearer 0123456789abcdef-keyy\r\n", "0123456789abcdef-keyy", "", false },
+        { "x-api-keys: 0123456789abcdef-key\r\n", "", "", false },   /* another header's name */
+        { "", "", "", false },
+    };
+    for (const auto &c : cases) {
+        http_request hr;
+        l252_read_request("POST", "/v1/messages", c.head, &hr);
+        TEST_ASSERT(!strcmp(hr.bearer, c.bearer) && !strcmp(hr.x_api_key, c.xkey));
+        TEST_ASSERT(server_request_has_key(&hr, key) == c.pass);
+        TEST_ASSERT(server_request_has_key(&hr, NULL));   /* no key configured: every request passes */
+        TEST_ASSERT(hr.body_len == 2 && !strcmp(hr.body, "{}"));
+        http_request_free(&hr);
+    }
+    /* an overlong value is never cut down to a prefix that could match */
+    const std::string over(SERVER_API_KEY_MAX + 1, 'k');
+    const std::string head = "Authorization: Bearer " + over + "\r\nx-api-key: " + over + "\r\n";
+    http_request hr;
+    l252_read_request("POST", "/v1/messages", head.c_str(), &hr);
+    TEST_ASSERT(hr.bearer[0] == '\0' && hr.x_api_key[0] == '\0');
+    TEST_ASSERT(!server_request_has_key(&hr, std::string(SERVER_API_KEY_MAX, 'k').c_str()));
+    http_request_free(&hr);
+    TEST_ASSERT(!server_method_needs_key("GET") && !server_method_needs_key("HEAD") &&
+                !server_method_needs_key("OPTIONS"));
+    TEST_ASSERT(server_method_needs_key("POST") && server_method_needs_key("PUT") &&
+                server_method_needs_key("DELETE") && server_method_needs_key("PATCH"));
+}
+
+/* (3) The gate both servers run: with a key, a POST without it gets a 401 in its surface's envelope with
+ * `WWW-Authenticate: Bearer` (Anthropic's authentication_error on /v1/messages*, OpenAI's elsewhere, and "invalid API
+ * key" when a wrong one came); a GET passes without it; with the key it passes; with no key configured nothing is
+ * refused and nothing is written. */
+static void test_l252_api_key_gate(void) {
+    const char *key = "0123456789abcdef-key";
+    const struct {
+        const char *method, *path, *head;
+        const char *keyed;   /* the configured key */
+        bool refused;
+        const char *want[3];
+    } cases[] = {
+        { "POST", "/v1/messages", "", key, true,
+          { "HTTP/1.1 401 Unauthorized\r\n", "WWW-Authenticate: Bearer\r\n",
+            "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"this server requires an API "
+            "key: send Authorization: Bearer <key> or x-api-key: <key>\"}}" } },
+        { "POST", "/v1/messages/count_tokens", "x-api-key: nope\r\n", key, true,
+          { "HTTP/1.1 401 Unauthorized\r\n", "\"type\":\"authentication_error\",\"message\":\"invalid API key\"",
+            "{\"type\":\"error\"" } },
+        { "POST", "/v1/chat/completions", "Authorization: Bearer nope\r\n", key, true,
+          { "HTTP/1.1 401 Unauthorized\r\n",
+            "{\"error\":{\"message\":\"invalid API key\",\"type\":\"authentication_error\",\"code\":\"invalid_api_key\"}}",
+            "WWW-Authenticate: Bearer\r\n" } },
+        { "POST", "/v1/systemone", "", key, true, { "HTTP/1.1 401 Unauthorized\r\n", "invalid_api_key", "" } },
+        { "POST", "/v1/embeddings", "", key, true, { "HTTP/1.1 401 Unauthorized\r\n", "invalid_api_key", "" } },
+        { "POST", "/v1/messages", "x-api-key: 0123456789abcdef-key\r\n", key, false, { "", "", "" } },
+        { "GET", "/health", "", key, false, { "", "", "" } },
+        { "GET", "/metrics", "", key, false, { "", "", "" } },
+        { "GET", "/v1/models", "", key, false, { "", "", "" } },
+        { "OPTIONS", "/v1/messages", "", key, false, { "", "", "" } },
+        { "POST", "/v1/messages", "", NULL, false, { "", "", "" } },   /* the default: no key, today's server */
+        { "POST", "/v1/systemone", "", NULL, false, { "", "", "" } },
+    };
+    for (const auto &c : cases) {
+        http_request hr;
+        l252_read_request(c.method, c.path, c.head, &hr);
+        int out[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, out) == 0);
+        TEST_ASSERT(server_auth_refuse(out[0], &hr, c.keyed) == c.refused);
+        shutdown(out[0], SHUT_WR);
+        char *text = read_socket_text(out[1]);
+        TEST_ASSERT(text != NULL);
+        if (text) {
+            if (!c.refused) TEST_ASSERT(text[0] == '\0');   /* a pass writes nothing: the route answers */
+            for (const char *w : c.want)
+                if (w[0]) TEST_ASSERT(strstr(text, w) != NULL);
+        }
+        free(text);
+        http_request_free(&hr);
+        close(out[0]);
+        close(out[1]);
+    }
+}
+
 /* (2) read-only writes nothing, for every trigger -- but its pinned anchor -- and its BANK's history writes nothing at
  * a later loss (evict, spill, abandon, shutdown: the slot's mark, kv_cache_persist) until a request without the token
  * takes the bank; a spill of it may free the bank (nothing to keep).  pin-anchor alone writes as without it, its
@@ -24448,6 +24633,9 @@ static void pulsar_server_unit_tests_run(void) {
     test_l347_i3a_no_room();
     test_l347_i3a_copy_out();
     test_l347_i3b_kv_header();
+    test_l252_api_key_file();
+    test_l252_api_key_headers();
+    test_l252_api_key_gate();
     test_l347_i3b_read_only_writes_nothing();
     test_l347_i3b_pinned_anchor();
     test_l347_i3b_pinned_ram();

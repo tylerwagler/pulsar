@@ -3124,6 +3124,9 @@ struct server {
     void set_test_guard_budget(KvBytes b) { __atomic_store_n(&guard_test_budget_raw, b.raw(), __ATOMIC_RELAXED); }   /* raw: into __atomic_store_n()'s bare parameter */
     /** L357: PULSAR_SERVER_TEST_ROUTES=1 at startup -- the /test/ routes answer; otherwise they are unknown paths. */
     bool         test_routes;
+    /** L252 P3: --api-key-file's key -- every request but GET / HEAD / OPTIONS must present it (server_auth_refuse);
+     *  NULL (the default): no key, today's open server.  Owned by the process, read-only after startup. */
+    const char  *api_key;
     /** L362: when spill_bank last said "nowhere to park the pool" for each bank (pulsar_mono_sec; once per 10 s) */
     pulsar_indexed<double, BankId, PULSAR_SESSION_POOL_CAP> park_refused_said;
     /** The stall watchdog (watchdog.cpp).  `stall_s` is written by the watchdog and read by /health (__atomic);
@@ -5229,6 +5232,11 @@ static inline GenOff gen_text_end(size_t len) { return GenOff::after(GenBytes{le
 /// @return `text` at that offset
 static inline const char *gen_text_at(const char *text, GenOff at) { return text + at.raw(); }   /* raw: a bare operand */
 
+/** L252 P3: the longest API key --api-key-file may hold, bytes (a longer presented credential matches nothing). */
+#define SERVER_API_KEY_MAX 256
+/** L252 P3: the shortest API key --api-key-file may hold, bytes (a guessable key is refused at startup). */
+#define SERVER_API_KEY_MIN 16
+
 /** A parsed HTTP request line and body. Method and path are fixed-size because
  * anything longer than these bounds is rejected rather than allocated for. */
 typedef struct {
@@ -5239,6 +5247,10 @@ typedef struct {
     unsigned kv_flags; ///< L347 I3b: the X-Pulsar-KV tokens (KV_HDR_*), every such header line joined
     char kv_err[160];  ///< L347 I3b: why an X-Pulsar-KV header was refused ("" when it was not): the 400's text
     client_hints hints;  ///< L249 D: the x-claude-code-* hint headers
+    /** L252 P3: the `Authorization: Bearer` credential ("" when absent, malformed or longer than SERVER_API_KEY_MAX:
+     *  never truncated, so a prefix of a long value cannot match) */
+    char bearer[SERVER_API_KEY_MAX + 1];
+    char x_api_key[SERVER_API_KEY_MAX + 1];   ///< L252 P3: the `x-api-key` credential (same rules as `bearer`)
 } http_request;
 
 /** Argument handed to a client thread at spawn: the server and the socket it
@@ -5247,6 +5259,36 @@ typedef struct {
     server *srv;  ///< the server
     int fd;       ///< the accepted socket this thread owns
 } client_arg;
+
+/* ===== L252 P3: the API key (--api-key-file) ===== */
+/** L252 P3: read an API key file: its bytes with trailing whitespace dropped; printable ASCII with no space inside,
+ *  SERVER_API_KEY_MIN .. SERVER_API_KEY_MAX bytes.
+ *  @param path   the file
+ *  @param out    receives the key (heap) on success
+ *  @param err    receives why on failure (never the key's bytes)
+ *  @param errlen bytes at err
+ *  @return false when the file cannot be read or does not hold a usable key */
+bool server_api_key_load(const char *path, char **out, char *err, size_t errlen);
+/** L252 P3: does a request with this method need the key?  Every method but GET, HEAD and OPTIONS: the GET routes
+ *  (health, version, models, metrics) only report, every POST runs the model or changes state.  A new GET route
+ *  must stay read-only.
+ *  @param method the request method
+ *  @return true when the key is required */
+bool server_method_needs_key(const char *method);
+/** L252 P3: does the request present `key` (as `Authorization: Bearer <key>` or `x-api-key: <key>`)?  Compared in
+ *  time independent of where the bytes differ.
+ *  @param r   the request read by read_http_request
+ *  @param key the configured key; NULL = none configured (every request passes)
+ *  @return true when no key is configured or a presented credential equals it */
+bool server_request_has_key(const http_request *r, const char *key);
+/** L252 P3: the gate both servers run after reading a request: when a key is configured, the method needs it and the
+ *  request does not present it, answer 401 (Anthropic's authentication_error on /v1/messages*, OpenAI's shape
+ *  elsewhere; `WWW-Authenticate: Bearer`) and say so in the log (the first refusal, then at powers of two).
+ *  @param fd  the client socket
+ *  @param r   the request
+ *  @param key the configured key (NULL: nothing is refused)
+ *  @return true when the request was refused (the caller answers nothing more) */
+bool server_auth_refuse(int fd, const http_request *r, const char *key);
 
 /** L321: the most models one server process opens (-m given that many times). */
 #define SERVER_MODELS_MAX 8
@@ -5276,6 +5318,10 @@ typedef struct {
     int judge_banks;
     /** L338 P4: --reasoning on|off -- thinking when a request sends no control; -1 = unset (the family's default) */
     int reasoning_default;
+    /** L252 P3: --api-key-file PATH, the file holding the API key; NULL = no key (every route open, the default) */
+    const char *api_key_file;
+    /** L252 P3: the key read from api_key_file (heap, lives for the process); NULL = none */
+    const char *api_key;
 } server_config;
 
 /* ---- shared globals ---- */
@@ -5301,8 +5347,9 @@ void buf_putc(buf *b, char c);
 void buf_puts(buf *b, const char *s);
 void buf_printf(buf *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 char *buf_take(buf *b);
-/** L354: say so at startup when a server with no authentication binds past loopback.  @param host the bind address */
-void server_warn_if_exposed(const char *host);
+/** L354: say so at startup when a server with no authentication binds past loopback (L252 P3: or that a key guards
+ *  it).  @param host the bind address  @param keyed an API key is configured (--api-key-file) */
+void server_warn_if_exposed(const char *host, bool keyed);
 void buf_free(buf *b);
 /* json_ws / json_lit / json_string[_n] / json_number / json_int / json_bool /
  * json_skip_value / json_raw_value are declared in pulsar_json.h (included
@@ -5982,6 +6029,13 @@ bool http_response_retry(int fd, int code, const char *type, const char *body,
                          int retry_after_s);
 bool http_error_retry(int fd, int code, const char *msg, int retry_after_s);
 bool http_error_anthropic(int fd, int code, const char *msg);
+/** L252 P3: a 401 for a missing or wrong API key, with `WWW-Authenticate: Bearer`: Anthropic's envelope
+ *  (authentication_error) or OpenAI's (type authentication_error, code invalid_api_key).
+ *  @param fd        the client socket
+ *  @param anthropic the request came to an Anthropic surface (/v1/messages*)
+ *  @param msg       the message
+ *  @return false when a write failed */
+bool http_error_unauthorized(int fd, bool anthropic, const char *msg);
 /** The Messages API's error type for an HTTP status (overloaded_error for 503 / 529, rate_limit_error for 429,
  *  invalid_request_error for other 4xx, api_error for 5xx). */
 /// @param code  the HTTP status

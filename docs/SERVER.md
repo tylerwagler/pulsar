@@ -28,8 +28,9 @@ The topics are `runtime`, `steering`, `api`, `kv-cache`, `thinking` and `all`.
 | `-m, --model PATH` | `./model`, `./model.safetensors`, then the same names under `$PULSAR_MODEL_DIR` | The container: a shard directory or one file. It can be given up to 8 times, but only for encoder and Parse models; a chat model serves alone. |
 | `-c, --ctx N` | 1048576 | Context per session (bank). A context past the model's trained positions is refused (`pulsar_session_create`). |
 | `--rope-yarn F` | off | YaRN scaling at factor F (1..64) over a container whose rope is native. Qwen: `4` gives 1M positions. A container that declares YaRN accepts only its own factor. Refused by families without a rope and under TP. The default disk KV directory gets a `-rope-yarnF` suffix. |
-| `--host HOST` | `127.0.0.1` | Bind address. There is no authentication, so exposing it is a choice. |
+| `--host HOST` | `127.0.0.1` | Bind address. Without `--api-key-file` there is no authentication, so exposing it is a choice. |
 | `--port N` | 8000 | |
+| `--api-key-file FILE` | none: no key | The API key (16..256 printable bytes, no spaces; trailing newline ignored). Every request but `GET` / `HEAD` / `OPTIONS` must then carry it as `Authorization: Bearer <key>` or `x-api-key: <key>`, or gets a 401 (Anthropic's `authentication_error` on `/v1/messages*`). The GETs (`/health`, `/version`, `/v1/models`, `/metrics`, `/metrics/stream`) stay open for probes and dashboards. An unreadable or unusable file refuses to start. A file, not a flag value: the command line is readable by every local user. |
 | `--kv-disk-dir DIR` | see [Disk KV cache](#disk-kv-cache) | `""` disables the cache. The last disk-KV flag on the line wins. |
 | `--no-kv-disk` | | Disable the disk KV cache. |
 | `--kv-disk-space-mb N` | unset: no budget | Disk budget in MiB. When the store is over budget it evicts leaves (see below). |

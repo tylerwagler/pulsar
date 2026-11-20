@@ -187,8 +187,11 @@ static bool server_warmup_generation(pulsar_engine *engine, pulsar_session *sess
 
 
 
-void server_warn_if_exposed(const char *host) {
-    if (strcmp(host, "127.0.0.1") != 0 && strcmp(host, "localhost") != 0 && strcmp(host, "::1") != 0)
+void server_warn_if_exposed(const char *host, bool keyed) {
+    if (keyed)
+        server_log(PULSAR_LOG_DEFAULT, "pulsar-server: API key required (--api-key-file) on every request but GET "
+                   "(health, version, models, metrics)");
+    else if (strcmp(host, "127.0.0.1") != 0 && strcmp(host, "localhost") != 0 && strcmp(host, "::1") != 0)
         server_log(PULSAR_LOG_WARNING, "pulsar-server: bound to %s with no authentication: anyone who can reach it can use it",
                    host);
 }
@@ -849,6 +852,8 @@ server_config server_parse_options(int argc, char **argv) {
             c.host = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--port")) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--api-key-file")) {
+            c.api_key_file = need_arg(&i, argc, argv, arg);   /* L252 P3 */
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--capture-requests")) {
@@ -896,6 +901,17 @@ server_config server_parse_options(int argc, char **argv) {
             server_log(PULSAR_LOG_DEFAULT, "pulsar-server: default model %s", m);
         }
         c.models[c.n_models++] = c.engine.model_path;
+    }
+    /* L252 P3: the key is read here, once (a file, never argv: /proc/<pid>/cmdline is readable by every user); an
+     * unusable file stops the start rather than serve open by accident */
+    if (c.api_key_file) {
+        char kerr[PATH_MAX + 96];
+        char *key = NULL;
+        if (!server_api_key_load(c.api_key_file, &key, kerr, sizeof kerr)) {
+            server_log(PULSAR_LOG_DEFAULT, "pulsar-server: --api-key-file: %s", kerr);
+            exit(2);
+        }
+        c.api_key = key;
     }
     return c;
 }
@@ -1371,6 +1387,7 @@ int main(int argc, char **argv) {
     {
         const char *tr = getenv("PULSAR_SERVER_TEST_ROUTES");
         s.test_routes = tr && !strcmp(tr, "1");
+        s.api_key = cfg.api_key;   /* L252 P3 */
         if (s.test_routes)
             server_log(PULSAR_LOG_WARNING, "pulsar-server: test routes ON (PULSAR_SERVER_TEST_ROUTES=1): "
                        "POST /test/guard-budget answers -- never set this in production");
@@ -1788,7 +1805,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     g_listen_fd = lfd;
-    server_warn_if_exposed(cfg.host);
+    server_warn_if_exposed(cfg.host, cfg.api_key != NULL);
     server_log(PULSAR_LOG_DEFAULT, "pulsar-server: listening on http://%s:%d (pulsar %s)",
                cfg.host, cfg.port, PULSAR_VERSION_STR);
 
