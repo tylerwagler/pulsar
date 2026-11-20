@@ -728,12 +728,16 @@ tests/grammar_admit_test: tests/grammar_admit_test.cpp src/lib/pulsar_grammar_ad
                           $(GRAMMAR_OBJS) Makefile
 	$(CXX) $(filter-out -ffast-math,$(CXXFLAGS)) -DGRAMMAR_ADMIT_REAL -Isrc -o $@ tests/grammar_admit_test.cpp \
 	  $(GRAMMAR_OBJS) -lpthread
+# L447: run a ThreadSanitizer program, except on aarch64, where libtsan's pthread_cond_clockwait interceptor enters
+# glibc's __sigsetjmp at a BTI landing pad and dies with SIGILL (GB10 enforces BTI; gdb 2026-11-19) -- a toolchain
+# fault, not ours.  Those programs still run on x86 in the check tier on every push.
+TSAN_RUN = if [ "$$(uname -m)" = aarch64 ]; then echo "$(1): ThreadSanitizer half skipped on aarch64 (libtsan cond-clockwait interceptor faults under BTI; runs on x86 in the check tier)"; else TSAN_OPTIONS=halt_on_error=1 $(1); fi
 tests/grammar_admit_tsan: tests/grammar_admit_test.cpp src/lib/pulsar_grammar_admit.h src/lib/pulsar_grammar.h Makefile
 	$(CXX) -std=c++23 -O1 -g -Wall -Wextra -fsanitize=thread -D_GNU_SOURCE -Isrc -o $@ tests/grammar_admit_test.cpp -lpthread
 .PHONY: grammar-admit-gate
 grammar-admit-gate: tests/grammar_admit_test tests/grammar_admit_tsan
 	./tests/grammar_admit_test
-	TSAN_OPTIONS=halt_on_error=1 ./tests/grammar_admit_tsan
+	$(call TSAN_RUN,./tests/grammar_admit_tsan)
 # L432: the /metrics/stream change feed (src/lib/pulsar_metrics_stream.h): the rule's two bounds -- frames a second,
 # and how long a mark waits for its frame -- on a clock the test owns, then marks racing subscribers' waits with real
 # threads.  Host only, seconds.  Two programs from one source, plain and under ThreadSanitizer, each built from source
@@ -745,7 +749,7 @@ tests/metrics_stream_tsan: tests/metrics_stream_test.cpp src/lib/pulsar_metrics_
 .PHONY: metrics-stream-gate
 metrics-stream-gate: tests/metrics_stream_test tests/metrics_stream_tsan
 	./tests/metrics_stream_test
-	TSAN_OPTIONS=halt_on_error=1 ./tests/metrics_stream_tsan
+	$(call TSAN_RUN,./tests/metrics_stream_tsan)
 tests/lt_picks: tests/lt_picks.cu src/cuda/pulsar_cuda_lt_fixed.o src/cuda/pulsar_cuda_lt_fixed.h Makefile
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/lt_picks.cu src/cuda/pulsar_cuda_lt_fixed.o $(CUDA_LDLIBS)
 # L381: does the fixed cuBLASLt GEMM still follow the accumulation order the EXL3 dense arm's in-place prompt kernel

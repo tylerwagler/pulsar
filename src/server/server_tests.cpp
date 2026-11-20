@@ -15190,7 +15190,9 @@ static void test_l264_segstore_eviction_and_hygiene(void) {
     /* L354: a segment whose size disagrees with its header (a torn write) is removed at open, not left outside `used` */
     {
         pulsar_segstore *o = pulsar_segstore_open(dir, 0, 1, NULL, NULL);
-        for (const off_t cut : {(off_t)170}) {   /* inside its payload (a file with no header of ours is left alone) */
+        for (const off_t back : {(off_t)2}) {   /* L447: cut inside its payload, counted from the file's end -- a fixed
+                                                   offset (170) fell inside the header once L426 grew it to 176, and a
+                                                   file with no header of ours is left alone by design */
             char torn[41], tp[600];
             test_seg_payload tpay = { 10, 7 };
             TEST_ASSERT(pulsar_segstore_put(o, "", TokPos{0}, TokPos{128}, "torn", TextBytes{4u}, 10, test_seg_write, 0,
@@ -15198,6 +15200,9 @@ static void test_l264_segstore_eviction_and_hygiene(void) {
                                             sizeof err));
             pulsar_segstore_close(o);
             snprintf(tp, sizeof tp, "%s/%.40s.seg", dir, torn);
+            struct stat tsb;
+            TEST_ASSERT(stat(tp, &tsb) == 0 && tsb.st_size > back);   /* no trailer: the last bytes are payload */
+            const off_t cut = tsb.st_size - back;
             TEST_ASSERT(truncate(tp, cut) == 0);
             o = pulsar_segstore_open(dir, 0, 1, NULL, NULL);
             TEST_ASSERT(!pulsar_segstore_contains(o, torn) && access(tp, F_OK) != 0);
