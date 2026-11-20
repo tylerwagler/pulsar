@@ -106,6 +106,70 @@ int launch(const char *what, const uint16_t *q, uint64_t ld_q, const uint16_t *k
 
 }  // namespace
 
+/* L446: the Turing prompt arm of Gemma 4's global layers (16 q / 2 kv / 512): the same kernel at head 512 -- more than one
+ * value iteration, the output accumulated in an f32 buffer.  32 x 128 measured best on the RTX 5000 (tests/
+ * l446_attn_ref_bench: 12-14 TFLOP/s against 64 x 64's 7). */
+/// CUTLASS example 41's AttentionKernel: f16, Sm75, aligned, 32 queries x 128 keys a block, head_dim <= 512.
+using AttentionF16W = AttentionKernel<cutlass::half_t, cutlass::arch::Sm75, true, 32, 128, 512, false, false>;
+static_assert(AttentionF16W::kNeedsOutputAccumulatorBuffer, "head 512 accumulates its output in an f32 buffer");
+
+extern "C" int pulsar_fmha_f16_gqa_causal512_launch(const uint16_t *q, const uint16_t *k, const uint16_t *v,
+                                                    uint32_t n_kv, uint32_t G, uint32_t n_rows, uint32_t n_keys,
+                                                    float scale, uint16_t *y, float *acc, cudaStream_t stream) {
+    using A = AttentionF16W;
+    constexpr uint32_t HD = 512u;
+    if (!q || !k || !v || !y || !acc || n_kv == 0 || G == 0 || n_rows == 0 || n_keys < n_rows ||
+        n_keys > 0x7fffffffu / HD || (uint64_t)n_rows * n_kv * G * HD > 0x7fffffffull || !aligned16(q) ||
+        !aligned16(k) || !aligned16(v) || !aligned16(y) || !aligned16(acc) || !(scale > 0.f)) {
+        fprintf(stderr, "pulsar: fmha f16 gqa causal 512: %u rows, %u keys, %u kv x %u -- refusing (16-byte aligned "
+                        "operands, keys >= rows, a positive scale)\n", n_rows, n_keys, n_kv, G);
+        return -1;
+    }
+    typename A::Params p;
+    p.query_ptr = (cutlass::half_t *)q;
+    p.key_ptr = (cutlass::half_t *)k;
+    p.value_ptr = (cutlass::half_t *)v;
+    p.output_ptr = (cutlass::half_t *)y;
+    p.output_accum_ptr = acc;
+    p.logsumexp_ptr = nullptr;
+    p.scale = scale;
+    p.num_batches = (int32_t)n_kv;   /* a batch is a KV head ... */
+    p.num_heads = (int32_t)G;        /* ... and its heads are the query heads that read it */
+    p.head_dim = p.head_dim_value = (int32_t)HD;
+    p.num_queries = (int32_t)n_rows;
+    p.num_keys = (int32_t)n_keys;
+    p.custom_mask_type = A::CausalFromBottomRight;
+    p.q_strideM = (int32_t)(n_kv * G * HD);
+    p.q_strideH = (int32_t)HD;
+    p.q_strideB = (int64_t)G * HD;
+    p.k_strideM = p.v_strideM = (int32_t)HD;
+    p.k_strideH = p.v_strideH = 0;   /* every query head of the group reads the one KV head */
+    p.k_strideB = p.v_strideB = (int64_t)n_keys * HD;
+    p.o_strideM = (int32_t)(G * HD);  /* y / acc: [n_kv][n_rows][G][HD] (the kernel offsets a batch by num_queries rows) */
+    if (!A::check_supported(p)) {
+        fprintf(stderr, "pulsar: fmha f16 gqa causal 512: the kernel does not support this call -- refusing\n");
+        return -1;
+    }
+    constexpr auto kernel = attention_kernel_batched_impl<A>;
+    constexpr int smem = (int)sizeof(typename A::SharedStorage);
+    static bool smem_set = false;
+    if (smem > 0xc000 && !smem_set) {
+        if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem) != cudaSuccess) {
+            (void)cudaGetLastError();
+            fprintf(stderr, "pulsar: fmha f16 gqa causal 512: %d B of shared memory refused -- refusing\n", smem);
+            return -1;
+        }
+        smem_set = true;
+    }
+    kernel<<<p.getBlocksGrid(), p.getThreadsGrid(), smem, stream>>>(p);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        fprintf(stderr, "pulsar: fmha f16 gqa causal 512: launch failed: %s\n", cudaGetErrorString(e));
+        return -3;
+    }
+    return 0;
+}
+
 extern "C" int pulsar_fmha_f16_launch(const uint16_t *q, uint64_t ld_q, const uint16_t *k, uint64_t ld_k,
                                       const uint16_t *v, uint64_t ld_v, uint32_t n_rows, uint32_t n_heads,
                                       uint32_t head_dim, float scale, uint16_t *y, uint64_t ld_y, cudaStream_t stream) {

@@ -63,6 +63,32 @@ int pulsar_fmha_bf16_launch(const uint16_t *q, uint64_t ld_q, const uint16_t *k,
                             uint64_t ld_v, uint32_t n_rows, uint32_t n_heads, uint32_t head_dim, float scale, uint16_t *y,
                             uint64_t ld_y, cudaStream_t stream);
 
+/** L446: causal grouped-query attention at head_dim 512 over f16 rows, on the fp16 tensor cores (the Sm75 instance of the
+ *  same kernel at kMaxK 512, 32 queries x 128 keys a block: the output accumulates in an f32 buffer across its value
+ *  iterations).  The Turing prompt arm of the GQA block's global layers (pulsar_cuda_attn_gqa.cu): one sequence's run
+ *  of n_rows query rows at positions n_keys - n_rows .. n_keys - 1, each attending keys 0 .. its own position (the
+ *  bottom-right causal mask).  A row's keys are walked in 128-key blocks from position 0, so its bytes do not depend on
+ *  which other rows share the call.
+ *  Layouts (f16, elements):
+ *    q    [n_rows][n_kv * G][512]  query head h = g * G + j of KV head g
+ *    k, v [n_kv][n_keys][512]      one KV head's rows contiguous (read by all G of its query heads: stride 0)
+ *    y    [n_kv][n_rows][G][512]   f16 output;  acc the same shape in f32 (the kernel's accumulator)
+ *  @return 0, -1 refused (named on stderr), -3 launch failure. */
+/// @param q      device f16 query rows
+/// @param k      device f16 key rows
+/// @param v      device f16 value rows
+/// @param n_kv   KV heads
+/// @param G      query heads per KV head
+/// @param n_rows query rows (the run's last n_rows positions)
+/// @param n_keys keys (the run's last position + 1)
+/// @param scale  softmax scale on q . k
+/// @param y      device f16 output
+/// @param acc    device f32 accumulator, as y
+/// @param stream stream to launch on
+int pulsar_fmha_f16_gqa_causal512_launch(const uint16_t *q, const uint16_t *k, const uint16_t *v, uint32_t n_kv,
+                                         uint32_t G, uint32_t n_rows, uint32_t n_keys, float scale, uint16_t *y,
+                                         float *acc, cudaStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

@@ -738,8 +738,8 @@ tests/blockdraft_gate: tests/blockdraft_gate.cu src/cuda/pulsar_cuda_blockdraft.
 blockdraft-gate: tests/blockdraft_gate
 	./tests/blockdraft_gate
 src/cuda/pulsar_cuda_attn_gqa.o: src/cuda/pulsar_cuda_attn_gqa.h
-tests/gqa_attn_gate: tests/gqa_attn_gate.cu tests/gqa_ref.h src/cuda/pulsar_cuda_attn_gqa.o src/cuda/pulsar_cuda_attn_gqa.h src/lib/pulsar_yarn.h Makefile
-	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/gqa_attn_gate.cu src/cuda/pulsar_cuda_attn_gqa.o
+tests/gqa_attn_gate: tests/gqa_attn_gate.cu tests/gqa_ref.h src/cuda/pulsar_cuda_attn_gqa.o src/cuda/pulsar_cuda_fmha.o src/cuda/pulsar_cuda_attn_gqa.h src/lib/pulsar_yarn.h Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/gqa_attn_gate.cu src/cuda/pulsar_cuda_attn_gqa.o src/cuda/pulsar_cuda_fmha.o
 
 .PHONY: gqa-attn-gate
 gqa-attn-gate: tests/gqa_attn_gate
@@ -747,8 +747,8 @@ gqa-attn-gate: tests/gqa_attn_gate
 
 # The block's decode / verify / prefill timings at Inkling's shapes against a measured read-bandwidth and
 # mma.sync roofline (L295 F1).  Not a gate.
-tests/gqa_attn_bench: tests/gqa_attn_bench.cu src/cuda/pulsar_cuda_attn_gqa.o src/cuda/pulsar_cuda_attn_gqa.h Makefile
-	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/gqa_attn_bench.cu src/cuda/pulsar_cuda_attn_gqa.o
+tests/gqa_attn_bench: tests/gqa_attn_bench.cu src/cuda/pulsar_cuda_attn_gqa.o src/cuda/pulsar_cuda_fmha.o src/cuda/pulsar_cuda_attn_gqa.h Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/gqa_attn_bench.cu src/cuda/pulsar_cuda_attn_gqa.o src/cuda/pulsar_cuda_fmha.o
 
 
 # L251: the GDN microbenchmark -- decode steps at 1/4/8/16 sequences, DRAM-cold
