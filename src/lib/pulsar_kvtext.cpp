@@ -145,20 +145,20 @@ char *pulsar_kvtext_render_tokens_text(pulsar_engine *engine,
 bool pulsar_kvtext_byte_prefix_match(const char *text, TextBytes text_len,
                                    const char *prefix, TextBytes prefix_len) {
     return prefix_len <= text_len &&
-           (prefix_len.raw() == 0 || memcmp(text, prefix, (size_t)prefix_len.raw()) == 0);
+           (prefix_len.raw() == 0 || memcmp(text, prefix, (size_t)prefix_len.raw()) == 0);   /* raw: a bare operand */
 }
 
 void pulsar_kvtext_tokens_copy_prefix(pulsar_tokens *dst, const pulsar_tokens *src, TokCount n) {
     dst->len = 0;
     if (!src) return;
-    int m = n.raw();
+    int m = n.raw();   /* raw: a bare local for the arithmetic below */
     if (m > src->len) m = src->len;
     for (int i = 0; i < m; i++) pulsar_tokens_push(dst, src->v[i]);
 }
 
 bool pulsar_kvtext_text_ends_with_live(pulsar_engine *engine, const char *text,
                                      TextBytes text_len, const pulsar_tokens *tokens) {
-    const size_t len = (size_t)text_len.raw();
+    const size_t len = (size_t)text_len.raw();   /* raw: a bare local for the arithmetic below */
     const TokId eos = pulsar_token_eos(engine);
     size_t eos_len = 0;
     char *eos_text = pulsar_token_text(engine, eos, &eos_len);

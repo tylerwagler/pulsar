@@ -1237,9 +1237,9 @@ int pulsar_gpu_register_mxfp4_expert_half(const void *key_map, MapOff key_offset
                                           TensorBytes src_stride_b, TensorBytes src_data_b,
                                           TensorBytes dst_stride_b, TensorBytes dst_data_b) {
     /* L438: the four byte counts beside the counts and indices end at the launch */
-    const uint64_t src_stride = src_stride_b.raw(), src_data = src_data_b.raw(), dst_stride = dst_stride_b.raw(),
-                   dst_data = dst_data_b.raw();
-    const uint64_t key_offset = key_offset_m.raw(), src_offset = src_offset_m.raw();   /* L438: MapOff ends at the launch */
+    const uint64_t src_stride = src_stride_b.raw(), src_data = src_data_b.raw(), dst_stride = dst_stride_b.raw(),   /* raw: a bare local for the arithmetic below */
+                   dst_data = dst_data_b.raw();   /* raw: into a bare variable */
+    const uint64_t key_offset = key_offset_m.raw(), src_offset = src_offset_m.raw();   /* raw: L438: MapOff ends at the launch */
     if (!key_map || !model_map || n_expert == 0 || hi <= lo || lo % 128 || hi % 128 ||
         (k_half ? hi > k : hi > n) || dst_data >= dst_stride || src_data >= src_stride) {
         fprintf(stderr, "pulsar: expert half refused: %s [%llu,%llu) of k=%llu n=%llu\n",
@@ -1284,7 +1284,7 @@ int pulsar_gpu_register_exl3_expert_half(const void *key_map, MapOff key_offset_
                                          const void *model_map, MapOff src_offset_m,
                                          uint32_t n_expert, uint64_t k, uint64_t n, int k2, int k_half,
                                          uint64_t lo, uint64_t hi) {
-    const uint64_t key_offset = key_offset_m.raw(), src_offset = src_offset_m.raw();   /* L438: MapOff ends at the launch */
+    const uint64_t key_offset = key_offset_m.raw(), src_offset = src_offset_m.raw();   /* raw: L438: MapOff ends at the launch */
     exl3_cut c;
     if (!key_map || !model_map || n_expert == 0 || !exl3_expert_cut(k, n, k2, k_half != 0, lo, hi, 0, hi - lo, &c)) {
         fprintf(stderr, "pulsar: EXL3 expert half refused: %s [%llu,%llu) of k=%llu n=%llu at K=%g (a 128-aligned "
@@ -1571,7 +1571,7 @@ pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_elt(uint64_t n_elems, uint32_t esz,
 }
 
 pulsar_gpu_tensor *pulsar_gpu_tensor_alloc(TensorBytes size) {
-    uint64_t bytes = size.raw();
+    uint64_t bytes = size.raw();   /* raw: a bare local for the arithmetic below */
     if (bytes == 0) bytes = 1;
     if (g_dry.active) return dry_alloc(bytes, 0);
     pulsar_gpu_tensor *t = (pulsar_gpu_tensor *)calloc(1, sizeof(*t));
@@ -1589,7 +1589,7 @@ pulsar_gpu_tensor *pulsar_gpu_tensor_alloc(TensorBytes size) {
 
 
 pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_managed(TensorBytes size) {
-    uint64_t bytes = size.raw();
+    uint64_t bytes = size.raw();   /* raw: a bare local for the arithmetic below */
     if (bytes == 0) bytes = 1;
     if (g_dry.active) return dry_alloc(bytes, 1);
     pulsar_gpu_tensor *t = (pulsar_gpu_tensor *)calloc(1, sizeof(*t));
@@ -1620,7 +1620,7 @@ static uint64_t cuda_managed_kv_reserve_bytes(uint64_t total_bytes) {
 
 
 int pulsar_gpu_should_use_managed_kv_cache(TensorBytes kv_cache_b, TensorBytes context_b) {
-    const uint64_t kv_cache_bytes = kv_cache_b.raw(), context_bytes = context_b.raw();   /* L445: raw at the policy */
+    const uint64_t kv_cache_bytes = kv_cache_b.raw(), context_bytes = context_b.raw();   /* raw: L445: raw at the policy */
     if (kv_cache_bytes == 0) return 0;
 
     /* Very large KV caches are where device-only cudaMalloc() can make a
@@ -1650,7 +1650,7 @@ int pulsar_gpu_should_use_managed_kv_cache(TensorBytes kv_cache_b, TensorBytes c
 
 
 pulsar_gpu_tensor *pulsar_gpu_tensor_view(const pulsar_gpu_tensor *base, TensorBytes offset_b, TensorBytes bytes_b) {
-    const uint64_t offset = offset_b.raw(), bytes = bytes_b.raw();
+    const uint64_t offset = offset_b.raw(), bytes = bytes_b.raw();   /* raw: a bare local for the arithmetic below */
     if (!base || offset > base->bytes || bytes > base->bytes - offset) return NULL;
     pulsar_gpu_tensor *t = (pulsar_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
@@ -1728,7 +1728,7 @@ void pulsar_gpu_sync_stats_get(pulsar_gpu_sync_stats *out) {
 }
 
 int pulsar_gpu_tensor_write(pulsar_gpu_tensor *tensor, TensorBytes offset_b, const void *data, TensorBytes bytes_b) {
-    const uint64_t offset = offset_b.raw(), bytes = bytes_b.raw();
+    const uint64_t offset = offset_b.raw(), bytes = bytes_b.raw();   /* raw: a bare local for the arithmetic below */
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     if (tensor->dry) return 1;
     pulsar_cuda_sync_note(3, bytes);
@@ -1739,7 +1739,7 @@ int pulsar_gpu_tensor_write(pulsar_gpu_tensor *tensor, TensorBytes offset_b, con
 
 int pulsar_gpu_tensor_write_async(pulsar_gpu_tensor *tensor, TensorBytes offset_b, const void *data,
                                   TensorBytes bytes_b) {
-    const uint64_t offset = offset_b.raw(), bytes = bytes_b.raw();
+    const uint64_t offset = offset_b.raw(), bytes = bytes_b.raw();   /* raw: a bare local for the arithmetic below */
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     if (tensor->dry || bytes == 0) return 1;
     return cuda_ok(cudaMemcpyAsync((char *)tensor->ptr + offset, data, (size_t)bytes, cudaMemcpyHostToDevice,
@@ -1747,7 +1747,7 @@ int pulsar_gpu_tensor_write_async(pulsar_gpu_tensor *tensor, TensorBytes offset_
 }
 
 void *pulsar_gpu_host_alloc(TensorBytes bytes_b) {
-    const uint64_t bytes = bytes_b.raw();
+    const uint64_t bytes = bytes_b.raw();   /* raw: a bare local for the arithmetic below */
     void *p = NULL;
     if (bytes == 0 || !cuda_ok(cudaMallocHost(&p, (size_t)bytes), "pinned host alloc")) return NULL;
     return p;
@@ -1770,7 +1770,7 @@ int pulsar_gpu_copy_out(const pulsar_gpu_copy_span *spans, uint32_t n) {
     uint64_t total = 0;
     for (uint32_t i = 0; i < n; i++) {
         const pulsar_gpu_copy_span &c = spans[i];
-        const uint64_t off = c.offset.raw(), bytes = c.bytes.raw();
+        const uint64_t off = c.offset.raw(), bytes = c.bytes.raw();   /* raw: a bare local for the arithmetic below */
         if (!c.src || !c.dst || off > c.src->bytes || bytes > c.src->bytes - off) {
             fprintf(stderr, "pulsar: copy-out span %u out of range (offset %llu + %llu > %llu bytes)\n", i,
                     (unsigned long long)off, (unsigned long long)bytes,
@@ -1790,8 +1790,8 @@ int pulsar_gpu_copy_out(const pulsar_gpu_copy_span *spans, uint32_t n) {
         return 0;
     for (uint32_t i = 0; i < n; i++) {
         const pulsar_gpu_copy_span &c = spans[i];
-        if (c.bytes.raw() == 0 || c.src->dry) continue;
-        if (!cuda_ok(cudaMemcpyAsync(c.dst, (const char *)c.src->ptr + c.offset.raw(), (size_t)c.bytes.raw(),
+        if (c.bytes.raw() == 0 || c.src->dry) continue;   /* raw: compared with a bare value */
+        if (!cuda_ok(cudaMemcpyAsync(c.dst, (const char *)c.src->ptr + c.offset.raw(), (size_t)c.bytes.raw(),   /* raw: a device-API argument (cudaMemcpyAsync) */
                                      cudaMemcpyDeviceToHost, t_copy_stream), "copy-out"))
             return 0;
     }
@@ -1952,7 +1952,7 @@ static bool lane_wait_copy(pulsar_gpu_lane *lane, uint32_t ticket) {
 
 int pulsar_gpu_lane_d2h(pulsar_gpu_lane *lane, const pulsar_gpu_tensor *src, TensorBytes offset_b, void *dst,
                         TensorBytes bytes_b, const uint32_t *done, uint32_t n_done) {
-    const uint64_t offset = offset_b.raw(), bytes = bytes_b.raw();
+    const uint64_t offset = offset_b.raw(), bytes = bytes_b.raw();   /* raw: a bare local for the arithmetic below */
     for (uint32_t i = 0; i < n_done; i++)
         if (!lane_ticket_ok(lane, done[i])) return 0;
     if (!lane || !src || !dst || offset > src->bytes || bytes > src->bytes - offset) {
@@ -1982,7 +1982,7 @@ int pulsar_gpu_lane_order(pulsar_gpu_lane *lane, uint32_t ticket) {
 
 int pulsar_gpu_lane_h2d(pulsar_gpu_lane *lane, pulsar_gpu_tensor *dst, TensorBytes offset_b, const void *src,
                         TensorBytes bytes_b, uint32_t ticket) {
-    const uint64_t offset = offset_b.raw(), bytes = bytes_b.raw();
+    const uint64_t offset = offset_b.raw(), bytes = bytes_b.raw();   /* raw: a bare local for the arithmetic below */
     if (!lane_ticket_ok(lane, ticket)) return 0;
     if (!dst || !src || offset > dst->bytes || bytes > dst->bytes - offset) {
         fprintf(stderr, "pulsar: copy lane: host -> device span out of range\n");
@@ -2038,7 +2038,7 @@ int pulsar_gpu_tensor_write_q_f32(pulsar_gpu_tensor *tensor, uint64_t off_elems,
 
 int pulsar_gpu_tensor_read(const pulsar_gpu_tensor *tensor, TensorBytes offset_b, void *data,
                            TensorBytes bytes_b) {
-    const uint64_t offset = offset_b.raw(), bytes = bytes_b.raw();
+    const uint64_t offset = offset_b.raw(), bytes = bytes_b.raw();   /* raw: a bare local for the arithmetic below */
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     if (tensor->dry) return 1;
     pulsar_cuda_sync_note(2, bytes);
@@ -2049,7 +2049,7 @@ int pulsar_gpu_tensor_read(const pulsar_gpu_tensor *tensor, TensorBytes offset_b
 
 
 int pulsar_gpu_device_read(const void *device, void *host, TensorBytes bytes_b) {
-    const uint64_t bytes = bytes_b.raw();
+    const uint64_t bytes = bytes_b.raw();   /* raw: a bare local for the arithmetic below */
     if (!device || !host) return 0;
     pulsar_cuda_sync_note(2, bytes);
     return cuda_ok(cudaMemcpy(host, device, (size_t)bytes, cudaMemcpyDeviceToHost), "device read");
@@ -2061,7 +2061,7 @@ int pulsar_gpu_device_read(const void *device, void *host, TensorBytes bytes_b) 
 int pulsar_gpu_tensor_copy(pulsar_gpu_tensor *dst, TensorBytes dst_off,
                                      const pulsar_gpu_tensor *src, TensorBytes src_off,
                                      TensorBytes bytes_b) {
-    const uint64_t dst_offset = dst_off.raw(), src_offset = src_off.raw(), bytes = bytes_b.raw();
+    const uint64_t dst_offset = dst_off.raw(), src_offset = src_off.raw(), bytes = bytes_b.raw();   /* raw: a bare local for the arithmetic below */
     if (!dst || !src || dst_offset > dst->bytes || src_offset > src->bytes ||
         bytes > dst->bytes - dst_offset || bytes > src->bytes - src_offset) {
         return 0;
@@ -2090,7 +2090,7 @@ int pulsar_gpu_tensor_copy(pulsar_gpu_tensor *dst, TensorBytes dst_off,
 int pulsar_gpu_tensor_copy_async(pulsar_gpu_tensor *dst, TensorBytes dst_off,
                                  const pulsar_gpu_tensor *src, TensorBytes src_off,
                                  TensorBytes bytes_b) {
-    const uint64_t dst_offset = dst_off.raw(), src_offset = src_off.raw(), bytes = bytes_b.raw();
+    const uint64_t dst_offset = dst_off.raw(), src_offset = src_off.raw(), bytes = bytes_b.raw();   /* raw: a bare local for the arithmetic below */
     if (!dst || !src || dst_offset > dst->bytes || src_offset > src->bytes ||
         bytes > dst->bytes - dst_offset || bytes > src->bytes - src_offset) {
         return 0;
@@ -2145,7 +2145,7 @@ void *pulsar_gpu_batched_copy_prepare(
     pulsar_copy_desc *h = (pulsar_copy_desc *)malloc(n * sizeof(pulsar_copy_desc));
     if (!h) return NULL;
     for (uint32_t i = 0; i < n; i++) {
-        const uint64_t bytes = bytes_b[i].raw();
+        const uint64_t bytes = bytes_b[i].raw();   /* raw: a bare local for the arithmetic below */
         if (!dst[i] || !src[i] || !dst[i]->ptr || !src[i]->ptr ||
             bytes == 0 || (bytes & 15u) ||
             bytes > dst[i]->bytes || bytes > src[i]->bytes) {
@@ -2173,7 +2173,7 @@ void pulsar_gpu_batched_copy_free(void *handle) {
 }
 
 int pulsar_gpu_batched_copy_run(void *handle, uint32_t n_descs, TensorBytes max_bytes_b) {
-    const uint64_t max_bytes = max_bytes_b.raw();
+    const uint64_t max_bytes = max_bytes_b.raw();   /* raw: a bare local for the arithmetic below */
     if (!handle || n_descs == 0) return 0;
     uint32_t chunks = (uint32_t)(((max_bytes >> 4) + 255) / 256);
     if (chunks < 1u) chunks = 1u;
@@ -2856,7 +2856,7 @@ static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {
 
 
 int pulsar_gpu_set_model_map(const void *model_map, TensorBytes model_size_b) {
-    const uint64_t model_size = model_size_b.raw();   /* L445: the mapping's size, raw at the runtime */
+    const uint64_t model_size = model_size_b.raw();   /* raw: L445: the mapping's size, raw at the runtime */
     if (!cuda_model_set_host_map(model_map, model_size)) return 0;
 
     /* One load strategy (L030, 2026-08-13): register the mapping if the platform
@@ -2987,8 +2987,8 @@ int pulsar_gpu_set_model_fd_for_map(int fd, const void *model_map) {
 
 int pulsar_gpu_cache_model_range(const void *model_map, TensorBytes model_size_b, MapOff offset_m, TensorBytes bytes_b,
                                  const char *label) {
-    const uint64_t offset = offset_m.raw();   /* L438: MapOff ends at the launch */
-    const uint64_t model_size = model_size_b.raw(), bytes = bytes_b.raw();   /* L445: likewise the sizes */
+    const uint64_t offset = offset_m.raw();   /* raw: L438: MapOff ends at the launch */
+    const uint64_t model_size = model_size_b.raw(), bytes = bytes_b.raw();   /* raw: L445: likewise the sizes */
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
     if (cuda_model_range_is_cached(model_map, offset, bytes)) return 1;
@@ -3017,8 +3017,8 @@ int pulsar_gpu_cache_external_range(const void *host_base_key, int fd,
                                             FileOff offset_f, TensorBytes bytes_b,
                                             const char *label) {
     /* L438: a FileOff ends here -- the donor is mapped whole, so it is the span's key offset too */
-    const uint64_t offset = offset_f.raw();
-    const uint64_t bytes = bytes_b.raw();   /* L445: likewise the span's size */
+    const uint64_t offset = offset_f.raw();   /* raw: a bare local for the arithmetic below */
+    const uint64_t bytes = bytes_b.raw();   /* raw: L445: likewise the span's size */
     if (!host_base_key || fd < 0 || bytes == 0) return 0;
 
     /* L217 / PLAN 94 s2.5: the overlay is a SECOND allocation route into the

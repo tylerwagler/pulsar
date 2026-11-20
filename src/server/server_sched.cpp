@@ -93,7 +93,7 @@ int server::job_needed_ctx(const job *j) const {
     const auto *s = this; (void)s;
     /* L439: the request's own tokens (the stitch a bank's history makes of them is known only once it is bound: the
      * plan's context check, gen_begin_plan, is the one that reads it) */
-    int64_t need = (int64_t)request_prompt_toks(&j->req).raw() +
+    int64_t need = (int64_t)request_prompt_toks(&j->req).raw() +   /* raw: a bare local for the arithmetic below */
                    (int64_t)(j->req.max_tokens > 0 ? j->req.max_tokens
                                                    : s->default_tokens) +
                    64;
@@ -1017,7 +1017,7 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
     /* L275: the bank's last-turn anchor, from the history it prefilled; L311: or its generation header's; L322: the
      * shallower of the two */
     const TokPos anchor = best && s->sess
-        ? TokPos{server_route_anchor(pulsar_session_bank_tokens(s->sess, best->bank), prefilled.raw(),
+        ? TokPos{server_route_anchor(pulsar_session_bank_tokens(s->sess, best->bank), prefilled.raw(),   /* raw: server_route_anchor works on raw positions */
                                      &s->turn_markers)}
         : TokPos::none();
     const bool in_place = best && server_route_in_place(best_common, best_at, frontier, prefilled,
@@ -1036,8 +1036,8 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
      * where the bank's last turn starts (a head that waits re-routes every quantum; its line repeats only when the
      * decision changes). */
     const uint64_t route_key = best ? 1u + (((uint64_t)pulsar_bank_index(best->bank) << 1 | (in_place ? 1u : 0u)) ^
-                                            ((uint64_t)(uint32_t)best_common.raw() << 17) ^
-                                            ((uint64_t)(uint32_t)best_score.raw() << 40))
+                                            ((uint64_t)(uint32_t)best_common.raw() << 17) ^   /* raw: a bare operand */
+                                            ((uint64_t)(uint32_t)best_score.raw() << 40))   /* raw: a bare operand */
                                     : 0u;
     /* L379: the same decision ended "in place (the only bank to free is the matched one)" -- its own key, so a head
      * that re-routes every quantum says neither line twice */
@@ -1354,7 +1354,7 @@ void server::worker_protect_queued_warm_matches(slot_flags &protect) {
             if (!sl->provisioned) continue;
             /* L325: the route's score (pulsar_session_bank_resume_at, choose_slot_for_job); L380: a decoder in the
              * batch scores by the history it entered with, whichever bank is installed (slot_resume_at) */
-            const int score = s->slot_resume_at(sl, &q->req.prompt, q->req.images, q->req.n_images).served.raw();
+            const int score = s->slot_resume_at(sl, &q->req.prompt, q->req.images, q->req.n_images).served.raw();   /* raw: a bare local for the arithmetic below */
             if (score > best_score) { best_score = score; best_i = k; }
         }
         if (!best_i.is_none()) protect[best_i] = true;
@@ -1711,7 +1711,7 @@ void server::kv_dup_census_update() {
     for (SlotIdx i : s->n_slots.slots()) {
         resident[i] = s->slots[i].provisioned && !pulsar_session_bank_is_evicted(s->sess, s->slots[i].bank);
     }
-    const int grid = pulsar_kvchain_grid(s->sess).raw();   /* a page's rows: KvRows below */
+    const int grid = pulsar_kvchain_grid(s->sess).raw();   /* raw: a page's rows: KvRows below */
     const KvBytes page_bytes = grid > 0 ? pulsar_session_quantum_growth_bytes_per_bank(s->sess, KvRows{(uint32_t)grid})
                                         : KvBytes{};
     kv_dup_census c;
@@ -1768,7 +1768,7 @@ int server_prefix_wait_pick(PromptToks have, PromptToks prompt_len, TokCount gri
         if (cut > prompt_len - one) cut = prompt_len - one;   /* the request's sync evaluates at least its last token */
         if (cut > l->len - one) cut = l->len - one;           /* inside the leader's prompt: its prefill stops there */
         /* L439: the bank's grid applied to an index of the prompt -- one number on an unseamed leader */
-        cut = PromptToks{cut.raw() / grid.raw() * grid.raw()};
+        cut = PromptToks{cut.raw() / grid.raw() * grid.raw()};   /* raw: the cut rounded down to the grid, in the prompt's own tokens */
         if (cut <= PromptToks{0}) continue;   /* no cut: every leader stands at or past position 0 (as before) */
         /* a cut the leader stands at or past is served now (have), and one the adopt would not take is not waited
          * for (server_resume_memory_depth: more than min_gain past what serves it) */
@@ -1828,7 +1828,7 @@ void server::prefix_wait_release(job *const *queued, int n) {
         s->m_prefix_waits[v]++;
         /* L439: both the waiter's own tokens -- the cut is an index of its prompt (shared with the leader's by id), and
          * an unseamed leader's checkpoint there holds that many of them */
-        if (v == PREFIX_WAIT_REACHED) s->m_prefix_wait_gain += (uint64_t)(w->mark.before() - w->have).raw();
+        if (v == PREFIX_WAIT_REACHED) s->m_prefix_wait_gain += (uint64_t)(w->mark.before() - w->have).raw();   /* raw: into the bare field m_prefix_wait_gain */
         pthread_mutex_unlock(&s->mu);
         w->leader = JobId::none();
     }
@@ -2014,11 +2014,11 @@ bool server::worker_try_bind() {
         s->queue_unlink(j);
         bool dead = false;
         if (!job_claim_writes(j, &dead)) {
-            http_error_context_length_exceeded(j->fd, &j->req, request_prompt_toks(&j->req).raw(), reject_ctx);
+            http_error_context_length_exceeded(j->fd, &j->req, request_prompt_toks(&j->req).raw(), reject_ctx);   /* raw: into http_error_context_length_exceeded()'s bare parameter */
         } else if (!dead) {
             /* L249 D: the stream opened while it waited -- the same message, as an error event */
             char msg[160];
-            context_length_message(msg, sizeof msg, &j->req, request_prompt_toks(&j->req).raw(), reject_ctx);
+            context_length_message(msg, sizeof msg, &j->req, request_prompt_toks(&j->req).raw(), reject_ctx);   /* raw: into context_length_message()'s bare parameter */
             sse_error_event(j->fd, &j->req, 400, msg);
         }
         s->kv_req_log(j, NULL, "refused-context");   /* L378 */
@@ -2102,7 +2102,7 @@ void server::publish_metrics_snapshot() {
         /* Bank-aware: a non-live bank's pos is its saved carry, never the pool's
          * live cursor, and a decoder in the plain batch reads its feed position
          * (server::slot_frontier_pos). Pure host read, no CUDA. */
-        s->m_slot_pos[i] = s->slot_frontier_pos(&s->slots[i]).raw();
+        s->m_slot_pos[i] = s->slot_frontier_pos(&s->slots[i]).raw();   /* raw: into the bare field m_slot_pos */
         s->m_slot_ctx[i] = s->slots[i].ctx_size;
         /* Phase + prefill progress: pure host reads of the slot's gen_state,
          * published here because send_metrics runs on a client thread and must
@@ -2208,7 +2208,7 @@ const char *const server_503_cause_names[SERVER_503_CAUSES] = {"admission", "ima
 uint64_t server_kv_token_hash(const TokId *v, int n) {
     uint64_t h = UINT64_C(0xcbf29ce484222325);
     for (int i = 0; i < n; i++) {
-        const uint32_t id = (uint32_t)v[i].raw();
+        const uint32_t id = (uint32_t)v[i].raw();   /* raw: a bare local for the arithmetic below */
         for (int b = 0; b < 4; b++) {
             h ^= (id >> (8 * b)) & 0xffu;
             h *= UINT64_C(0x100000001b3);
@@ -2546,7 +2546,7 @@ bool server::kv_ledger_read(kv_ledger_view *v, bool wait) {
     memcpy(v->restores, s->kv.meter.restores, sizeof v->restores);
     v->restored_tokens = s->kv.meter.restored_tokens;
     v->dup = s->m_dup;
-    v->dup_bytes_peak = s->m_dup_bytes_peak.raw();
+    v->dup_bytes_peak = s->m_dup_bytes_peak.raw();   /* raw: into the bare field dup_bytes_peak */
     v->spills = s->m_spills;
     v->preemptions = s->m_preemptions;
     v->readmissions = s->m_readmissions;
@@ -2711,7 +2711,7 @@ VerifyRow think_close_row(TokCount budget, bool open, TokCount think_tokens, Tok
     const VerifyRows rows = pulsar_verify_rows(n, base_pending);
     for (VerifyRow i{0}; i < VerifyRow::after(rows); i += VerifyRows{1}) {
         const TokCount pre = pulsar_verify_tokens_before(i, base_pending);   /* the round's tokens before row i */
-        if (pre > TokCount{0} && toks[pre.raw() - 1] == close) return VerifyRow::none();
+        if (pre > TokCount{0} && toks[pre.raw() - 1] == close) return VerifyRow::none();   /* raw: an index into a bare array */
         if (think_tokens + pre >= budget) return i;
     }
     return VerifyRow::none();
@@ -2742,13 +2742,13 @@ VerifyRow gen_think_close_row(server *s, const gen_state *g, const TokId *toks, 
 /// @param gram_rows  rows in `gram`
 void think_masks_lay(uint32_t *out, size_t W, VerifyRow row, VerifyRows rows, TokId close, const uint32_t *gram,
                      VerifyRows gram_rows) {
-    const uint32_t bit = (uint32_t)close.raw();   /* its bit (the caller bounded it by W * 32) */
-    for (int i = 0; i < rows.raw(); i++) {   /* the rows' memory, indexed by row */
+    const uint32_t bit = (uint32_t)close.raw();   /* raw: its bit (the caller bounded it by W * 32) */
+    for (int i = 0; i < rows.raw(); i++) {   /* raw: the rows' memory, indexed by row */
         uint32_t *r = out + (size_t)i * W;
-        if (gram && i < gram_rows.raw()) memcpy(r, gram + (size_t)i * W, W * sizeof(uint32_t));
+        if (gram && i < gram_rows.raw()) memcpy(r, gram + (size_t)i * W, W * sizeof(uint32_t));   /* raw: compared with a bare value */
         else memset(r, 0xff, W * sizeof(uint32_t));
     }
-    uint32_t *f = out + (size_t)row.raw() * W;
+    uint32_t *f = out + (size_t)row.raw() * W;   /* raw: a bare local for the arithmetic below */
     memset(f, 0, W * sizeof(uint32_t));
     f[bit >> 5] = 1u << (bit & 31u);
 }
@@ -2778,7 +2778,7 @@ const uint32_t *gen_think_masks(server *s, gen_state *g, VerifyRow row, VerifyRo
                  (unsigned)gen_constrain_words(s), W);
         return NULL;
     }
-    const size_t need = (size_t)rows.raw() * W;
+    const size_t need = (size_t)rows.raw() * W;   /* raw: a bare local for the arithmetic below */
     if (g->think_rows_cap < need) {
         g->think_rows = (uint32_t *)server_xrealloc(g->think_rows, need * sizeof(uint32_t));
         g->think_rows_cap = need;
@@ -2977,7 +2977,7 @@ static void lane_price_measure(lane_price *lp, int li, int n, TokCount tokens, d
     if (n <= 0 || tokens < TokCount{0} || !(ms > 0.0)) return;
     if (n != lp->meas_n) lane_price_rekey(lp, n, lp->meas_depth);
     const double a = lp->meas_steps[li] ? (double)LANE_PRICE_ALPHA : 1.0;
-    lp->meas_tok[li] += a * ((double)tokens.raw() - lp->meas_tok[li]);
+    lp->meas_tok[li] += a * ((double)tokens.raw() - lp->meas_tok[li]);   /* raw: into the bare field meas_tok */
     lp->meas_ms[li] += a * (ms - lp->meas_ms[li]);
     lp->meas_steps[li]++;
 }
@@ -3001,7 +3001,7 @@ static void lane_price_observe_spec(lane_price *lp, TokCount tokens, StepRows ro
     if (banks <= 0 || rows <= StepRows{0} || tokens < TokCount{0}) return;
     lane_price_measure(lp, PULSAR_LANE_SPEC, banks, tokens, ms);
     /* the yield per bank (tokens) and the rows per bank (the verify's): two ratios, never mixed */
-    const float tau = (float)tokens.raw() / (float)banks, rho = (float)rows.raw() / (float)banks;
+    const float tau = (float)tokens.raw() / (float)banks, rho = (float)rows.raw() / (float)banks;   /* raw: a bare local for the arithmetic below */
     if (lp->tau <= 0.0f) {
         lp->tau = tau;
         lp->rho = rho;
@@ -3030,7 +3030,7 @@ static double lane_price_spec(const pulsar_lane_cost *c, const lane_price *lp, i
     if (!(lp->tau > 0.0f) || !(lp->rho >= 1.0f)) return 0.0;
     /* the cost model in doubles: rows (n * rho, the verify width) and tokens (n * tau); n decoders are n base rows
      * (lane_base_rows) and n base tokens, so the drafts past the width are prorated in both */
-    const double width = (double)verify_rows.raw(), base = (double)lane_base_rows(n).raw();
+    const double width = (double)verify_rows.raw(), base = (double)lane_base_rows(n).raw();   /* raw: a bare local for the arithmetic below */
     double rows = (double)n * lp->rho, toks = (double)n * lp->tau;
     if (rows > width) {
         const double drafts = rows - base, kept = width - base;
@@ -3776,7 +3776,7 @@ static BankCount guard_spill_plan(KvBytes touched, KvBytes delta, KvBytes bound,
                                   const KvBytes *per_victim_drop, BankCount n_victims) {
     BankCount k{0};
     while (touched + delta > bound && k < n_victims) {
-        const KvBytes drop = per_victim_drop[k.raw()];   /* the plan's next victim: its position is the count so far */
+        const KvBytes drop = per_victim_drop[k.raw()];   /* raw: the plan's next victim: its position is the count so far */
         ++k;
         touched = drop >= touched ? KvBytes{} : touched - drop;
     }
@@ -3835,9 +3835,9 @@ static BankCount guard_spill_victims(server *s, session_slot **dec, int n, SlotI
     for (int k : all.positions()) {
         const KvBytes frees = pulsar_session_bank_touched_kv_bytes(s->sess, s->slots[order[k]].bank);
         if (frees == KvBytes{}) continue;
-        order[m.raw()] = order[k];   /* (the kept victims' list, compacted in place: its next position) */
-        banks[m.raw()] = s->slots[order[k]].bank;
-        if (drop) drop[m.raw()] = frees;
+        order[m.raw()] = order[k];   /* raw: (the kept victims' list, compacted in place: its next position) */
+        banks[m.raw()] = s->slots[order[k]].bank;   /* raw: an index into a bare array */
+        if (drop) drop[m.raw()] = frees;   /* raw: an index into a bare array */
         ++m;
     }
     /* L394: and only the victims a spill can take -- the last resident bank cannot be (spill_bank: nowhere to park) */
@@ -4810,7 +4810,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
      * while every decode bank keeps at least its base row.  The landing buffers here hold
      * PULSAR_SPEC_LOGITS_ROWS rows; startup refused a family past them (cli_main). */
     const uint32_t heads_max = pulsar_engine_fused_heads_max(s->engine);
-    const uint32_t prefill_cap = (uint32_t)pulsar_session_prefill_cap(pool).raw();
+    const uint32_t prefill_cap = (uint32_t)pulsar_session_prefill_cap(pool).raw();   /* raw: a bare local for the arithmetic below */
     const uint32_t fuse_rows = prefill_cap > heads_max ? prefill_cap - heads_max : 0u;
     const sched_prefs *prefs = server_sched_prefs();
     pulsar_multiseq_req *fused_reqs = NULL;
@@ -4861,7 +4861,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             /* L439: from here the prompt is read at the bank's position, through the witness fuse_prepare made:
              * its end is where the bank stands with the whole prompt in */
             const TokPos p0_at = server_bank_pos(pool, c->bank);
-            const int p0 = p0_at.raw();
+            const int p0 = p0_at.raw();   /* raw: a bare local for the arithmetic below */
             if (pg->fuse.end() <= p0_at) {
                 /* L372: the bank already stands at the prompt's end (a re-send of a prompt whose first attempt ended
                  * before a token): no chunk to ride, and the handoff to decode is the classic sync's.  Left fusable
@@ -4872,7 +4872,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             }
             ps[n_ps] = c;
             pgs[n_ps] = pg;
-            sp[n_ps] = {(uint32_t)p0, (uint32_t)pg->fuse.end().raw(), pulsar_session_resume_grid(pool),
+            sp[n_ps] = {(uint32_t)p0, (uint32_t)pg->fuse.end().raw(), pulsar_session_resume_grid(pool),   /* raw: a bare operand */
                         pg->sched_inv_ms, pg->sched_last_ride};
             n_ps++;
         }
@@ -4901,7 +4901,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             /* L309: a chain under a grammar ends before its first draft the grammar refuses */
             if (np > 0 && ag->gate) {
                 /* L443: the engine's pending count (uint32) in and out of the walk as a token count */
-                const int legal = gen_constrain_draft_prefix(s, ag, pbase, ptok, TokCount{(int)np}).raw();
+                const int legal = gen_constrain_draft_prefix(s, ag, pbase, ptok, TokCount{(int)np}).raw();   /* raw: a bare local for the arithmetic below */
                 if (legal < 0) {
                     ag->finish = "error";
                     ag->phase = GEN_FINISH;
@@ -4915,7 +4915,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             }
             /* L428: a chain in a turn that may make one call ends with the token that closes that call */
             if (np > 0) {
-                const int usable = gen_turn_draft_prefix(s, ag, pbase, ptok, TokCount{(int)np}).raw();
+                const int usable = gen_turn_draft_prefix(s, ag, pbase, ptok, TokCount{(int)np}).raw();   /* raw: a bare local for the arithmetic below */
                 if ((uint32_t)usable < np && !s->w_spec_turn_cut_said) {   /* rule 5: the cut ran */
                     s->w_spec_turn_cut_said = true;
                     server_log(PULSAR_LOG_DEFAULT, "pulsar-server: a turn limited to one tool call cut a pending "
@@ -4937,7 +4937,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             uint32_t dn = 0;
             for (int i = 0; i < n; i++)
                 if (dec[i]->gen && dec[i]->gen->phase == GEN_DECODE) {
-                    dsum += (uint64_t)server_bank_pos(pool, dec[i]->bank).raw();
+                    dsum += (uint64_t)server_bank_pos(pool, dec[i]->bank).raw();   /* raw: into a bare variable */
                     dn++;
                 }
             pulsar_engine_verify_curve_depth(s->engine, TokCount{dn ? (int)(dsum / dn) : 0});   /* a mean of positions < 2^31 */
@@ -4994,7 +4994,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
              * so 128-aligned and captured: note_prefilled's grid rule); it cannot finish the prompt, which ends past
              * the cut */
             /* L439: the cut is an index of the prompt; a rider's bank position is that index (its witness) */
-            const int mk = pgs[i]->fuse.live_at(pgs[i]->share_mark).raw();
+            const int mk = pgs[i]->fuse.live_at(pgs[i]->share_mark).raw();   /* raw: a bare local for the arithmetic below */
             if (ch.q[i] > 0u && mk > (int)sp[i].p0 && sp[i].p0 + ch.q[i] > (uint32_t)mk) {
                 ch.q[i] = (uint32_t)mk - sp[i].p0;
                 ch.fin[i] = false;
@@ -5102,7 +5102,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             (void)pulsar_session_spec_assemble_batch(pool, steps, ns, StepRows{(int)(heads_max - (uint32_t)n_fin)},
                                                      reqs, &step_rows);
         /* the uint32 the forward's shape, the decode_mixed row count and the cost fit take */
-        const uint32_t rows = (uint32_t)step_rows.raw();
+        const uint32_t rows = (uint32_t)step_rows.raw();   /* raw: a bare local for the arithmetic below */
         int m = 0;
         for (int j = 0; j < ns; j++) {
             const pulsar_spec_step *st = &steps[j];
@@ -5187,7 +5187,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 const fuse_witness &w = fr[r].sl->gen->fuse;
                 /* L329 (b2): the rider's next chunk of PLE rows, read while this round computes */
                 (void)pulsar_session_prompt_read_ahead(pool, fr[r].sl->bank, w.prompt().tokens(),
-                                                       w.at(TokPos{fr[r].p0 + fr[r].k}).raw());
+                                                       w.at(TokPos{fr[r].p0 + fr[r].k}).raw());   /* raw: into pulsar_session_prompt_read_ahead()'s bare parameter */
                 for (int j = 0; j < fr[r].k; j++) {
                     fused_reqs[at].bank = fr[r].sl->bank;
                     fused_reqs[at].pos = TokPos{fr[r].p0 + j};
@@ -5323,8 +5323,8 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             {
                 TokId toks[PULSAR_SPEC_LOGITS_ROWS];
                 int nt = 0;
-                for (int i = base_sent[q] ? 1 : 0; i < row_nb[q].raw(); i++)
-                    toks[nt++] = reqs[(row0s[q] + StepRows{i}).raw()].token;   /* reqs is indexed by step row */
+                for (int i = base_sent[q] ? 1 : 0; i < row_nb[q].raw(); i++)   /* raw: into a bare variable */
+                    toks[nt++] = reqs[(row0s[q] + StepRows{i}).raw()].token;   /* raw: reqs is indexed by step row */
                 st->greedy_rows = gen_spec_greedy_rows(s, g, toks, TokCount{nt}, base_sent[q]);
                 /* L303: each verify row's mask -- the gate walked through the round's tokens and back */
                 const VerifyRows mr = gen_constrain_round(s, g, toks, TokCount{nt}, base_sent[q], &st->masks);
@@ -5381,7 +5381,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 g->phase = GEN_FINISH;
                 continue;
             }
-            const int na = st->n_accepted.raw();
+            const int na = st->n_accepted.raw();   /* raw: a bare local for the arithmetic below */
             /* L155 tripwire: the round must hand back exactly the positions it
              * committed (the engine clamps commit at EOS and trims to the
              * accepted count).  The ghost rewind below counts na - emitted and
@@ -5449,7 +5449,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
              * accumulated here where it is unambiguous (row_nb = base+K rows
              * this bank contributed; na = base + accepted drafts). */
             g->req_spec_rounds++;
-            if (row_nb[q] > StepRows{1}) g->req_spec_draft += (uint64_t)(row_nb[q] - StepRows{1}).raw();
+            if (row_nb[q] > StepRows{1}) g->req_spec_draft += (uint64_t)(row_nb[q] - StepRows{1}).raw();   /* raw: into the bare field req_spec_draft */
             if (na > 1) g->req_spec_accepted += (uint64_t)(na - 1);
             g->req_spec_gen += (uint64_t)done;
             emitted_total += done;
@@ -5577,7 +5577,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
         const session_slot *c = &s->slots[k];
         /* L439: the total of the bank's position is where it stands with the prompt in (it printed the prompt's own
          * length: across a seam, a bank "at 401/401" with rows left) */
-        const int len = c->gen && c->gen->prompt_for_sync ? c->gen->sync_end.raw() : -1;
+        const int len = c->gen && c->gen->prompt_for_sync ? c->gen->sync_end.raw() : -1;   /* raw: a bare local for the arithmetic below */
         server_log(PULSAR_LOG_PREFILL, "pulsar-server: fuse: bank %d at %d/%d rode %d rows in %d of %d rounds%s%s",
                    c->bank.raw(), server_bank_pos(pool, c->bank).raw(), len, rv[k].rows, rv[k].rounds,
                    round_ix, rv[k].why ? "; last miss: " : "", rv[k].why ? rv[k].why : "");
@@ -5654,7 +5654,7 @@ static bool mixed_deep_guard_blocks(const slot_table &slots, BankCount n_slots, 
     for (SlotIdx i : n_slots.slots()) {
         const session_slot *dl = &slots[i];
         if (dl->provisioned && dl->active_job && dl->state == SLOT_DECODING) {
-            deep += dl->committed_pos.before().raw();   /* the bank's tokens */
+            deep += dl->committed_pos.before().raw();   /* raw: the bank's tokens */
             n_dec++;
         }
     }
@@ -5671,9 +5671,9 @@ static bool mixed_deep_guard_blocks(const slot_table &slots, BankCount n_slots, 
  * Its bank is necessarily DISTINCT from every decode bank (different phase). NULL
  * when the flag is off, not in pool mode, or nothing qualifies. */
 fuse_witness fuse_witness_of_history(const slot_tokens &h, prompt_view p, TokPos pos) {
-    if (!p || pos.is_none() || pos <= TokPos{0} || TokPos::after(TokCount{p.len().raw()}) < pos) return fuse_witness{};
+    if (!p || pos.is_none() || pos <= TokPos{0} || TokPos::after(TokCount{p.len().raw()}) < pos) return fuse_witness{};   /* raw: the named crossing fuse_witness_of_history() */
     /* the prompt's first `pos` tokens, borrowed, against the history's */
-    const pulsar_tokens head = {const_cast<TokId *>(p.tokens()->v), pos.raw(), pos.raw()};
+    const pulsar_tokens head = {const_cast<TokId *>(p.tokens()->v), pos.raw(), pos.raw()};   /* raw: into a bare variable */
     const slot_tokens ph = {&head, NULL};
     return fuse_witness::when_history_is_prefix(p, TokCount{slot_tokens_common(h, ph)}, pos);
 }
@@ -5823,7 +5823,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
         s->gen_prefill_fail(pf);   /* L372: no decode attempt yet, so no GEN_FINISH (released by the next pick, L282) */
         return;
     }
-    const int P0 = pulsar_session_pos(pool).raw();
+    const int P0 = pulsar_session_pos(pool).raw();   /* raw: a bare local for the arithmetic below */
     pulsar_session_bank_state_save(pool, pf->bank);
     {   /* one-shot observability: confirm the fused lane actually engaged. */
         static int logged = 0;
@@ -5836,12 +5836,12 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
     }
 
     int kstep = s->mixed_chunk_tokens;
-    const int cap = pulsar_session_prefill_cap(pool).raw();   /* mixed-step row ceiling */
+    const int cap = pulsar_session_prefill_cap(pool).raw();   /* raw: mixed-step row ceiling */
     if (kstep > cap - PULSAR_SESSION_POOL_CAP) kstep = cap - PULSAR_SESSION_POOL_CAP;
     if (kstep < 1) kstep = 1;
     /* L439: the prompt read at the bank's positions, by the witness worker_find_fuse_prefill made: its end is where
      * the bank stands with the whole prompt in */
-    const int len = w.end().raw();
+    const int len = w.end().raw();   /* raw: a bare local for the arithmetic below */
     int pf_done = 0;
     bool reached_end = false;                     /* prefill reached len this quantum */
     bool pf_giveup = false;                        /* prefill rejected -> stop folding it */
@@ -6003,7 +6003,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
 /// @param s the server (worker thread)
 /// @return tokens of decode this iteration: 1 while a prompt is within one chunk of its end, else a full quantum
 static int worker_decode_budget(server *s) {
-    const int cap = pulsar_session_prefill_cap(s->sess).raw();
+    const int cap = pulsar_session_prefill_cap(s->sess).raw();   /* raw: a bare local for the arithmetic below */
     for (SlotIdx i : s->n_slots.slots()) {
         const session_slot *c = &s->slots[i];
         if (!slot_prefilling(c)) continue;
@@ -6032,7 +6032,7 @@ static session_slot *worker_pick_step(server *s, SlotIdx *rr, const session_slot
     for (int pass = 0; pass < 2; pass++) {
         for (SlotIdx k : s->n_slots.slots()) {
             /* L441: the k-th slot from the cursor, wrapping (the cursor may stand one past the last slot) */
-            session_slot *c = &s->slots[SlotIdx{(rr->raw() + k.raw()) % (uint32_t)s->n_slots.raw()}];
+            session_slot *c = &s->slots[SlotIdx{(rr->raw() + k.raw()) % (uint32_t)s->n_slots.raw()}];   /* raw: the round-robin start, modulo the slots */
             if (c == skip || !eligible(c)) continue;
             /* L330: a restore slice costs what a prompt chunk does */
             if (pass == 0 && (slot_prefilling(c) || (c->gen && c->gen->phase == GEN_RESTORE))) continue;
@@ -6242,7 +6242,7 @@ void *server_worker_main(void *arg) {
             const pulsar_lane_cost plain_cost = pulsar_engine_lane_cost(s->engine, PULSAR_LANE_PLAIN);
             const pulsar_lane_cost spec_cost = pulsar_engine_lane_cost(s->engine, PULSAR_LANE_SPEC);
             uint64_t dsum = 0;   /* L338: the decoders' mean depth: the depth band the prices are measured in */
-            for (int i = 0; i < n_dec; i++) dsum += (uint64_t)s->slot_frontier_pos(dec[i]).raw();
+            for (int i = 0; i < n_dec; i++) dsum += (uint64_t)s->slot_frontier_pos(dec[i]).raw();   /* raw: into a bare variable */
             priced = lane_price_pick(&s->w_lane_price, &plain_cost, &spec_cost, n_dec, verify_rows,
                                      TokCount{(int)(dsum / (uint64_t)n_dec)});   /* a mean of positions < 2^31 */
         }

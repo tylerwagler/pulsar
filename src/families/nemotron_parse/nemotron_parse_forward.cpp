@@ -181,7 +181,7 @@ struct ctx {
                   const char *what) {
         pulsar_rows_linear l;
         if (!pulsar_linear_rows_ref(&e->model, t, in, out, prompt, what, &l)) return fail(err, errlen, what);
-        return pulsar_rows_linear_launch(&l, x_bf16, (int)rows, stage(), dp(r->t[B_LWS]), r->bytes[B_LWS].raw(), 0) == 0 ||
+        return pulsar_rows_linear_launch(&l, x_bf16, (int)rows, stage(), dp(r->t[B_LWS]), r->bytes[B_LWS].raw(), 0) == 0 ||   /* raw: a device-API argument (pulsar_rows_linear_launch) */
                fail(err, errlen, what);
     }
     /* a stage for the grade: f32 rows of a buffer */
@@ -349,7 +349,7 @@ bool decoder(ctx &c, uint32_t pos0, uint32_t n, bool prompt) {
     io.out_bf16 = att;
     io.ld_out = E;
     io.workspace = dp(r->t[B_DAWS]);
-    io.workspace_bytes = r->bytes[B_DAWS].raw();
+    io.workspace_bytes = r->bytes[B_DAWS].raw();   /* raw: into the bare field workspace_bytes */
     for (TrunkLayer il{0u}; il.below(s.n_layer); ++il) {
         const pulsar_nemotron_parse_dec_layer &L = w->layer[il];
         for (uint32_t r0 = 0; r0 < n; r0 += NP_CHUNK) {
@@ -367,8 +367,8 @@ bool decoder(ctx &c, uint32_t pos0, uint32_t n, bool prompt) {
                 return fail(c.err, c.errlen, "the decoder's q / k / v refused");
         }
         pulsar_gqa_seq seq = {};
-        seq.kv = (uint8_t *)dp(r->t[B_POOLS]) + r->pool_bytes.times(il.raw()).raw();
-        seq.bytes = r->pool_bytes.raw();
+        seq.kv = (uint8_t *)dp(r->t[B_POOLS]) + r->pool_bytes.times(il.raw()).raw();   /* raw: a scale factor */
+        seq.bytes = r->pool_bytes.raw();   /* raw: into the bare field bytes */
         seq.cap = s.max_seq;
         if (pulsar_gqa_forward(&r->dec, &seq, 1, row_seq.data(), row_pos.data(), n, &io, 0) != 0)
             return fail(c.err, c.errlen, "the decoder's attention refused");

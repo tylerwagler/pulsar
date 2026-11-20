@@ -84,7 +84,7 @@ bool gpu_graph_upload_prompt_tokens(
 
     int32_t *tokens = (int32_t *)xmalloc((size_t)n_tokens * sizeof(tokens[0]));
     for (uint32_t i = 0; i < n_tokens; i++) {
-        tokens[i] = prompt->v[pos0 + i].raw();
+        tokens[i] = prompt->v[pos0 + i].raw();   /* raw: a bare operand */
         /* L188: the embed kernel clamps a negative id to 0 -- refuse it here.
          *
          * L216: an image block's slots carry `vocab_size + role` sentinel ids,
@@ -155,8 +155,8 @@ static bool gpu_graph_csa2_emit_rows(
         TokPerRow                   ratio_r) {
     /* L334 P2b S8: the three spaces typed at the call (f7e05077 / c9dd9499 passed one for another); the kernels'
      * raw indices from here */
-    const uint32_t n_rows = (uint32_t)n_rows_c.raw(), cache_row0 = (uint32_t)cache_row0_at.before().raw(),
-                   pos_first = pulsar_ckpt_raw(pos_first_at), ratio = ratio_r.raw();
+    const uint32_t n_rows = (uint32_t)n_rows_c.raw(), cache_row0 = (uint32_t)cache_row0_at.before().raw(),   /* raw: a bare local for the arithmetic below */
+                   pos_first = pulsar_ckpt_raw(pos_first_at), ratio = ratio_r.raw();   /* raw: into a bare variable */
     if (n_rows == 0) return true;
     if (cache_row0 > g->layer_comp_cap[il] || n_rows > g->layer_comp_cap[il] - cache_row0) {
         fprintf(stderr, "pulsar: kv source %u: compressed rows %u+%u exceed the pool cap %u -- refusing\n",
@@ -387,7 +387,7 @@ static bool gpu_graph_index_comp_update(
         int                        *emitted) {
     /* L334 P2b S8: a batch row, a position and a compressed row -- three spaces, typed at the call */
     const uint32_t row = pulsar_row_index(row_at), pos = pulsar_ckpt_raw(pos_at),
-                   out_row = (uint32_t)out_row_at.before().raw(), ratio = ratio_r.raw();
+                   out_row = (uint32_t)out_row_at.before().raw(), ratio = ratio_r.raw();   /* raw: into a bare variable */
     const uint32_t width = pulsar_comp_row_width(ratio, PULSAR_N_INDEXER_HEAD_DIM);
     pulsar_gpu_tensor *kv = gpu_graph_tensor_row_view(g->batch_index_comp_kv, row, width);
     pulsar_gpu_tensor *sc = gpu_graph_tensor_row_view(g->batch_index_comp_sc, row, width);
@@ -872,7 +872,7 @@ bool gpu_graph_upload_vision_visible(pulsar_gpu_graph *g, const TokId *ids,
     const TokId *chunk = ids + start;
     int has_span = 0;
     for (uint32_t i = 0; i < n_tokens; i++) {
-        if (chunk[i].raw() >= (int32_t)PULSAR_N_VOCAB) { has_span = 1; break; }
+        if (chunk[i].raw() >= (int32_t)PULSAR_N_VOCAB) { has_span = 1; break; }   /* raw: compared with a bare value */
     }
     if (!has_span) return true;   /* this chunk owns no sentinel: NULL path */
 
@@ -1400,7 +1400,7 @@ static bool tp_attn_input_split(pulsar_gpu_graph *g, const pulsar_model *model,
     }
     pulsar_tp_row_lane_layout_t L;
     pulsar_tp_row_lane_layout(g->tp, &L);
-    const uint64_t vf = L.vec_bytes.raw() / sizeof(float);   /* floats a slot carries */
+    const uint64_t vf = L.vec_bytes.raw() / sizeof(float);   /* raw: floats a slot carries */
     const uint32_t msgs = (uint32_t)((elem0 + vf - 1u) / vf);
     if (ok && (msgs == 0 || msgs > PULSAR_TP_BATCH_MAX_ROWS)) {
         fprintf(stderr, "pulsar: layer %u: attention-input gather of %llu floats needs %u row-lane messages "
@@ -2095,7 +2095,7 @@ bool gpu_graph_encode_layer_attention_batch(
          * WHOLE batch: banked, the step's superset computed and cap-checked
          * once in step_begin (L178); classic, the source's frontier. */
         uint32_t n_comp =
-            mseq ? g->batch_comp_sup[src] : (uint32_t)gpu_graph_n_comp(g, gpu_graph_cur_bank(g), src).raw();
+            mseq ? g->batch_comp_sup[src] : (uint32_t)gpu_graph_n_comp(g, gpu_graph_cur_bank(g), src).raw();   /* raw: a bare operand */
 
         /* The QUERY side belongs to the layers that run an indexer: FULL and
          * REINDEX publish a top-k, REUSE reads one it did not compute, and
@@ -3044,7 +3044,7 @@ bool gpu_graph_encode_layer_ffn_batch(
         mc.n_expert_used = layer->n_expert_used;
         mc.clamp = PULSAR_SWIGLU_CLAMP_EXP;
         mc.x = g->batch_ffn_norm;
-        mc.layer = il.raw();   /* the kernel call's layer label (its non-finite code) */
+        mc.layer = il.raw();   /* raw: the kernel call's layer label (its non-finite code) */
         mc.n_tokens = n_tokens;
         ok = pulsar_moe_routed_slot(&mc);
     }
@@ -3342,7 +3342,7 @@ bool gpu_graph_dspark_compressor_rollforward(
         TokCount          n_positions_c,
         StepRow           save_row0_at) {
     /* L334 P2b S8: a position, a count and a step row, typed at the call; the replay's raw indices from here */
-    const uint32_t pos0 = pulsar_ckpt_raw(pos0_at), n_positions = (uint32_t)n_positions_c.raw(),
+    const uint32_t pos0 = pulsar_ckpt_raw(pos0_at), n_positions = (uint32_t)n_positions_c.raw(),   /* raw: a bare local for the arithmetic below */
                    save_row0 = pulsar_row_index(save_row0_at);
     (void)model;
     (void)weights;

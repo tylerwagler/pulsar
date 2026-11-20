@@ -1297,7 +1297,7 @@ static void e8m0_scan_blocks(
         uint64_t         nblocks,
         const char      *what) {
     if (nblocks == 0 || block_len == 0) return;
-    const uint64_t base = t->abs_offset.raw();   /* the checks below are raw: against the mapping's size */
+    const uint64_t base = t->abs_offset.raw();   /* raw: the checks below are raw: against the mapping's size */
     const uint64_t tb = t->bytes.raw();          /* raw: checked with the raw block offsets below */
     /* off + (nblocks-1)*stride + block_len, overflow-checked. */
     if (off > tb || block_len > tb - off) return;
@@ -1344,7 +1344,7 @@ static void exl3_scan_scales(const pulsar_model *m, const pulsar_tensor *t) {
     if (n_exp == 0 || stride > tb / n_exp) return;
     const uint8_t *map = t->ext_map ? t->ext_map : m->map;
     const uint64_t map_size = t->ext_map ? t->ext_size : m->size;
-    const uint64_t at = t->abs_offset.raw();   /* the checks below are raw: against the mapping's size */
+    const uint64_t at = t->abs_offset.raw();   /* raw: the checks below are raw: against the mapping's size */
     if (at > map_size || tb > map_size - at) return;
     for (uint64_t e = 0; e < n_exp; e++) {
         const uint16_t *p = (const uint16_t *)(map + at + e * stride + trellis);

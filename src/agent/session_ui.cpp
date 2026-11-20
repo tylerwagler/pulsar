@@ -717,7 +717,7 @@ bool agent_worker_show_history(agent_worker *w, int user_turns,
         snprintf(err, err_len, "failed to render session text");
         return false;
     }
-    agent_history_render_text(w, text, (size_t)text_len.raw(), user_turns);   /* the UI's own byte math */
+    agent_history_render_text(w, text, (size_t)text_len.raw(), user_turns);   /* raw: the UI's own byte math */
     free(text);
     return true;
 }

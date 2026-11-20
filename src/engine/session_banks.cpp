@@ -14,22 +14,22 @@
 /** pulsar_family_bank_ops::free_physical (DeepSeek: the graph's).  @param s the session  @param bank the bank
  *  @return the graph's verdict */
 static bool ds4_bank_free_physical(pulsar_session *s, BankId bank) {
-    return gpu_graph_bank_free_physical(s->graph, (uint32_t)bank.raw());   /* the graph's range check refuses none() */
+    return gpu_graph_bank_free_physical(s->graph, (uint32_t)bank.raw());   /* raw: the graph's range check refuses none() */
 }
 /** pulsar_family_bank_ops::alloc_physical (the graph's).  @param s the session  @param bank the bank
  *  @return the graph's verdict */
 static bool ds4_bank_alloc_physical(pulsar_session *s, BankId bank) {
-    return gpu_graph_bank_alloc_physical(s->graph, (uint32_t)bank.raw());   /* the graph's range check refuses none() */
+    return gpu_graph_bank_alloc_physical(s->graph, (uint32_t)bank.raw());   /* raw: the graph's range check refuses none() */
 }
 /** pulsar_family_bank_ops::is_evicted (the graph's).  @param s the session  @param bank the bank
  *  @return true while the bank's pools are freed */
 static bool ds4_bank_is_evicted(const pulsar_session *s, BankId bank) {
-    return gpu_graph_bank_is_evicted(s->graph, (uint32_t)bank.raw());   /* the graph's range check: none() is out */
+    return gpu_graph_bank_is_evicted(s->graph, (uint32_t)bank.raw());   /* raw: the graph's range check: none() is out */
 }
 /** pulsar_family_bank_ops::touched_kv_bytes (the graph's).  @param s the session  @param bank the bank
  *  @return the bank's touched KV bytes */
 static KvBytes ds4_bank_touched_kv_bytes(pulsar_session *s, BankId bank) {
-    return gpu_graph_bank_touched_kv_bytes(s->graph, (uint32_t)bank.raw());   /* its range check: none() is out */
+    return gpu_graph_bank_touched_kv_bytes(s->graph, (uint32_t)bank.raw());   /* raw: its range check: none() is out */
 }
 /** pulsar_family_bank_ops::growth_bytes: the per-bank growth of a quantum (the session is unused).
  *  @param q the quantum, in positions  @return bytes */
@@ -272,8 +272,8 @@ int pulsar_session::note_prefilled(const TokId *toks, int n, PromptHead head) {
     auto *s = this;
     if (!toks || n <= 0) return 1;
     /* L443: any negative is no headed run, as `head >= 0` read it (none() is -1) */
-    const bool headed = head.raw() >= 0;
-    if (headed && (!s->fused_valid || (uint32_t)head.raw() >= s->fused_heads)) {
+    const bool headed = head.raw() >= 0;   /* raw: a bare local for the arithmetic below */
+    if (headed && (!s->fused_valid || (uint32_t)head.raw() >= s->fused_heads)) {   /* raw: compared with a bare value */
         fprintf(stderr, "pulsar: note_prefilled: head row %d of a fused step that headed %u -- refusing\n",
                 head.raw(), s->fused_valid ? s->fused_heads : 0u);
         return 1;
@@ -313,10 +313,10 @@ int pulsar_session::note_prefilled(const TokId *toks, int n, PromptHead head) {
 /// @param view the host view asked (L380: the saved one reads the carry's, also for the installed bank)
 /// @return the bank's prefill frontier, position 0 when it holds no valid history
 static TokPos ds4_bank_prefill_frontier(pulsar_session *s, BankId bank, pulsar_bank_view view) {
-    if (!pulsar_bank_history_as(s, (uint32_t)bank.raw(), view)) return TokPos{0};   /* its range check: none() out */
+    if (!pulsar_bank_history_as(s, (uint32_t)bank.raw(), view)) return TokPos{0};   /* raw: its range check: none() out */
     const bool live = view == PULSAR_BANK_VIEW_CURRENT && bank == pulsar_session_live_bank(s);
     const TokPos pf = live ? s->prefill_frontier : s->bank_carry[pulsar_bank_index(bank)].prefill_frontier;
-    return pf.raw() > 0 ? pf : TokPos{0};
+    return pf.raw() > 0 ? pf : TokPos{0};   /* raw: returned bare to its caller */
 }
 
 /** pulsar_family_bank_ops::kv_store.  @param s the session  @return the graph's checkpoint store (borrowed) */

@@ -736,8 +736,8 @@ int kv_cache_preamble_pos(const kv_disk_cache *kc, const pulsar_tokens *prompt, 
 }
 
 PromptToks kv_cache_anchor_cut(const kv_disk_cache *kc, int anchor, TokCount grid) {
-    if (grid.raw() <= 0 || anchor < kc->opt.min_tokens) return PromptToks{0};
-    const int cut = anchor - anchor % grid.raw();
+    if (grid.raw() <= 0 || anchor < kc->opt.min_tokens) return PromptToks{0};   /* raw: compared with a bare value */
+    const int cut = anchor - anchor % grid.raw();   /* raw: a bare local for the arithmetic below */
     return PromptToks{cut >= kc->opt.min_tokens ? cut : 0};
 }
 
@@ -748,7 +748,7 @@ bool server::kv_cache_anchor_due(prompt_view prompt, PromptToks cut) {
     pulsar_tokens head;
     memset(&head, 0, sizeof head);
     head.v = prompt.tokens()->v;
-    head.len = head.cap = cut.raw();   /* a borrowed view of the prompt's first `cut` tokens */
+    head.len = head.cap = cut.raw();   /* raw: a borrowed view of the prompt's first `cut` tokens */
     TextBytes len{0u};
     char *text = pulsar_kvtext_render_tokens_text(engine, &head, &len);
     if (!text) return false;
@@ -767,7 +767,7 @@ bool server::kv_cache_pin_anchor(prompt_view prompt, PromptToks cut) {
     pulsar_tokens head;
     memset(&head, 0, sizeof head);
     head.v = prompt.tokens()->v;
-    head.len = head.cap = cut.raw();   /* a borrowed view of the prompt's first `cut` tokens */
+    head.len = head.cap = cut.raw();   /* raw: a borrowed view of the prompt's first `cut` tokens */
     TextBytes len{0u};
     char *text = pulsar_kvtext_render_tokens_text(engine, &head, &len);
     if (!text) return false;
@@ -778,7 +778,7 @@ bool server::kv_cache_pin_anchor(prompt_view prompt, PromptToks cut) {
     free(text);
     /* the cut is a position on the prompt's tokens; the anchor's chain was written by a cold prefill of that prompt,
      * whose live history is the prompt from position 0, so the cut is the chain's live end (L334 P7) */
-    if (n == 0 || chain[n - 1].text_end != len || chain[n - 1].G != TokPos::after(TokCount{cut.raw()})) return false;
+    if (n == 0 || chain[n - 1].text_end != len || chain[n - 1].G != TokPos::after(TokCount{cut.raw()})) return false;   /* raw: the anchor's cut is the chain's live end (comment above) */
     if (!(chain[n - 1].rp_flags & PULSAR_SEGSTORE_RP_PINNED)) {
         const bool ok = pulsar_segstore_flag_rp(kv.st, chain[n - 1].key, PULSAR_SEGSTORE_RP_PINNED);
         server_log(ok ? PULSAR_LOG_KVCACHE : PULSAR_LOG_WARNING, "pulsar-server: kv cache anchor at %d (%.12s) %s "
@@ -859,12 +859,12 @@ bool server::kv_rp_writes_for_end(kv_persist_trigger why, unsigned kv_flags, uns
     if (!(*what & PULSAR_KVCHAIN_RP) || (*what & PULSAR_KVCHAIN_ANCHOR)) return true;
     const pulsar_tokens *toks = pulsar_session_tokens(s->sess);
     const TokPos end_pos = toks ? pulsar_session_persist_end(s->sess) : TokPos{0};
-    if (end_pos.is_none() || end_pos.raw() <= 0) return true;
+    if (end_pos.is_none() || end_pos.raw() <= 0) return true;   /* raw: compared with a bare value */
     const TokPos E = pulsar_session_checkpoint_best(s->sess, end_pos);
-    if (E.raw() <= 0) return true;
+    if (E.raw() <= 0) return true;   /* raw: compared with a bare value */
     /* the deepest restore point already stored on this history (an anchor, a periodic point, an earlier end) */
     pulsar_tokens head = *toks;
-    head.len = E.raw();
+    head.len = E.raw();   /* raw: into the bare field len */
     TextBytes len{0u};
     char *text = pulsar_kvtext_render_tokens_text(s->engine, &head, &len);
     kv_chain_hit hit;
@@ -879,7 +879,7 @@ bool server::kv_rp_writes_for_end(kv_persist_trigger why, unsigned kv_flags, uns
     const TokPos D = text && hit.n > 0 ? pulsar_history_pos_at_text(s->engine, &head, text, hit.chain[hit.n - 1].text_end)
                                        : TokPos{0};
     free(text);
-    const uint32_t gain = E > D ? (uint32_t)(E - D).raw() : 0u;
+    const uint32_t gain = E > D ? (uint32_t)(E - D).raw() : 0u;   /* raw: a bare local for the arithmetic below */
     uint64_t rp = pulsar_session_restore_point_bytes(s->sess, E);
     uint64_t state = 0;
     const uint64_t rows = gain ? pulsar_session_segment_bytes(s->sess, D, E, &state) : 0u;
@@ -887,8 +887,8 @@ bool server::kv_rp_writes_for_end(kv_persist_trigger why, unsigned kv_flags, uns
     pthread_mutex_lock(&s->mu);
     const bool measured = kv_read_cost_ms(&s->kv.meter.read, rp + rows, 0, pulsar_mono_sec(), &read_ms);
     pthread_mutex_unlock(&s->mu);
-    const int cap = pulsar_session_prefill_cap(s->sess).raw();
-    const bool priced = gain && pulsar_engine_prefill_ms(s->engine, gain, (uint32_t)D.raw(),
+    const int cap = pulsar_session_prefill_cap(s->sess).raw();   /* raw: a bare local for the arithmetic below */
+    const bool priced = gain && pulsar_engine_prefill_ms(s->engine, gain, (uint32_t)D.raw(),   /* raw: into pulsar_engine_prefill_ms()'s bare parameter */
                                                          cap > 0 ? (uint32_t)cap : 0u, &prefill_ms);
     if (kv_rp_worth(gain, measured, read_ms, priced, prefill_ms)) return true;
     server_log(PULSAR_LOG_KVCACHE,
@@ -998,7 +998,7 @@ int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chai
         pthread_mutex_unlock(&s->mu);
         s->kv_cache_publish_store();   /* L347 I3b: a write may have made room by a pin */
     }
-    if (chain_end) *chain_end = r.end.raw();
+    if (chain_end) *chain_end = r.end.raw();   /* raw: into a bare variable */
     /* L347: a spill frees its bank only when the history is stored: no host pool room, or any persist error (the
      * store full, a write refused), keeps the bank resident */
     if (no_room) *no_room = r.no_room || r.err[0] != '\0';
@@ -1161,7 +1161,7 @@ TokPos server::kv_cache_find_req(const request *req, kv_chain_hit *hit) {
         return G;
     const TextBytes cut = hit->chain[hit->n - 1].text_end;
     if (cut == TextBytes{0u}) return TokPos{0};
-    std::string shorter(req->prompt_text, (size_t)cut.raw() - 1u);
+    std::string shorter(req->prompt_text, (size_t)cut.raw() - 1u);   /* raw: into shorter()'s bare parameter */
     return kv_cache_find(shorter.c_str(), hashes, n_images, hit);
 }
 
@@ -1173,11 +1173,11 @@ kv_restore_verdict server::kv_cache_price(const kv_chain_hit *hit, PromptToks ga
     const TokPos chain_G = hit->chain[hit->n - 1].G;
     const uint64_t bytes = hit->bytes;
     const int n = hit->n;
-    const TokPos base = base_at.raw() < 0 ? TokPos{0} : base_at;
-    const uint32_t gained = gained_toks > PromptToks{0} ? (uint32_t)gained_toks.raw() : 0u;
+    const TokPos base = base_at.raw() < 0 ? TokPos{0} : base_at;   /* raw: into a bare variable */
+    const uint32_t gained = gained_toks > PromptToks{0} ? (uint32_t)gained_toks.raw() : 0u;   /* raw: a bare local for the arithmetic below */
     double prefill_ms = 0.0, transfer_ms = 0.0;
-    const int cap = s->sess ? pulsar_session_prefill_cap(s->sess).raw() : 0;
-    const bool priced = pulsar_engine_prefill_ms(s->engine, gained, (uint32_t)base.raw(), cap > 0 ? (uint32_t)cap : 0u,
+    const int cap = s->sess ? pulsar_session_prefill_cap(s->sess).raw() : 0;   /* raw: a bare local for the arithmetic below */
+    const bool priced = pulsar_engine_prefill_ms(s->engine, gained, (uint32_t)base.raw(), cap > 0 ? (uint32_t)cap : 0u,   /* raw: into pulsar_engine_prefill_ms()'s bare parameter */
                                                  &prefill_ms);
     pthread_mutex_lock(&s->mu);
     const bool measured = kv_read_cost_ms(&s->kv.meter.read, bytes, hit->cached, pulsar_mono_sec(), &transfer_ms);
@@ -1344,8 +1344,8 @@ int server::kv_restore_next(kv_restore *r) {
     /* the slice: one prefill chunk's priced time at the depth the restore stands at (the test hook's, when set) */
     double target_ms = (double)s->restore_slice_ms;
     if (s->restore_slice_ms <= 0) {
-        const int cap = pulsar_session_prefill_cap(s->sess).raw();
-        const uint32_t depth = (uint32_t)r->hit->chain[kv_restore_at(r)].G_prev.raw();
+        const int cap = pulsar_session_prefill_cap(s->sess).raw();   /* raw: a bare local for the arithmetic below */
+        const uint32_t depth = (uint32_t)r->hit->chain[kv_restore_at(r)].G_prev.raw();   /* raw: a bare local for the arithmetic below */
         if (cap <= 0 || !pulsar_engine_prefill_ms(s->engine, (uint32_t)cap, depth, (uint32_t)cap, &target_ms))
             target_ms = 0.0;
     }
@@ -1370,7 +1370,7 @@ TokPos server::kv_restore_finish(kv_restore *r, const char *text, const pulsar_t
     /* L353 no. 16: a checked restore read the chain twice unless the check's read stayed as the RAM copy; the time is both */
     const uint64_t reads = kv_restore_reads(r->verify, pulsar_segstore_retains(s->kv.st));
     kv_read_cost_observe(&s->kv.meter.read, r->hit->bytes * reads, r->hit->cached * reads, r->read_ms, pulsar_mono_sec());
-    s->kv.meter.restored_tokens += (uint64_t)r->gained.raw();   /* L434: the tokens the verdict priced */
+    s->kv.meter.restored_tokens += (uint64_t)r->gained.raw();   /* raw: L434: the tokens the verdict priced */
     pthread_mutex_unlock(&s->mu);
     const pulsar_tokens *loaded = pulsar_session_tokens(s->sess);
     const TextBytes text_end = chain[n - 1].text_end;
@@ -1388,9 +1388,9 @@ TokPos server::kv_restore_finish(kv_restore *r, const char *text, const pulsar_t
          * so client bytes stay plain text there too (L223). */
         uint32_t tail_n = 0;
         /* L334 P7: the old call narrowed both to uint32_t; so does this (a rendered prompt is far below 4 GiB) */
-        pulsar_text_span *tail = pulsar_text_spans_slice(spans, n_spans, TextBytes{(uint32_t)text_end.raw()},
-                                                         TextBytes{(uint32_t)(text_bytes - text_end).raw()}, &tail_n);
-        const bool built = build_prompt_from_exact_prefix_and_text_suffix(s->engine, loaded, text + text_end.raw(),
+        pulsar_text_span *tail = pulsar_text_spans_slice(spans, n_spans, TextBytes{(uint32_t)text_end.raw()},   /* raw: a prompt offset as the length up to it, narrowed to uint32 as the old call did */
+                                                         TextBytes{(uint32_t)(text_bytes - text_end).raw()}, &tail_n);   /* raw: likewise the tail's length */
+        const bool built = build_prompt_from_exact_prefix_and_text_suffix(s->engine, loaded, text + text_end.raw(),   /* raw: into build_prompt_from_exact_prefix_and_text_suffix()'s bare parameter */
                                                                           tail, tail_n, effective_prompt);
         free(tail);
         if (!built) {   /* a failed restore: the request's own prompt is synced (the bank was touched) */
@@ -1584,7 +1584,7 @@ int server::responses_live_visible_prefix_prompt(session_slot *sl,
         pulsar_text_spans_slice(req->prompt_spans, req->prompt_n_spans, visible_len,
                                 prompt_len - visible_len, &tail_n);
     const bool built = build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->prompt_text + visible_len.raw(),
+        s->engine, live_tokens, req->prompt_text + visible_len.raw(),   /* raw: into build_prompt_from_exact_prefix_and_text_suffix()'s bare parameter */
         tail_spans, tail_n, effective_prompt);
     free(tail_spans);
     return built ? live_tokens->len : 0;

@@ -39,8 +39,8 @@ void trace_cache_capture(
     if (d->count > TRACE_CACHE_WINDOW) d->count = TRACE_CACHE_WINDOW;
     for (int i = 0; i < d->count; i++) {
         int pos = start + i;
-        d->live_id[i] = live && pos < live->len ? live->v[pos].raw() : -1;   /* the trace's JSON ints */
-        d->prompt_id[i] = prompt && pos < prompt->len ? prompt->v[pos].raw() : -1;
+        d->live_id[i] = live && pos < live->len ? live->v[pos].raw() : -1;   /* raw: the trace's JSON ints */
+        d->prompt_id[i] = prompt && pos < prompt->len ? prompt->v[pos].raw() : -1;   /* raw: into the bare field prompt_id */
     }
 }
 
@@ -221,8 +221,8 @@ TraceId server::trace_begin(
             (unsigned long long)j->req.seed);
     fprintf(s->trace, "stream_include_usage: %d\n",
             j->req.stream_include_usage ? 1 : 0);
-    s->trace_write_cache_diag(cache_diag, &j->req.tool_replay, cached.raw(),
-                           cache_source, disk_cached.raw(), disk_path);
+    s->trace_write_cache_diag(cache_diag, &j->req.tool_replay, cached.raw(),   /* raw: into trace_write_cache_diag()'s bare parameter */
+                           cache_source, disk_cached.raw(), disk_path);   /* raw: into trace_write_cache_diag()'s bare parameter */
     if (j->req.raw_body) {
         fputs("\n--- raw request json ---\n", s->trace);
         fputs(j->req.raw_body, s->trace);
@@ -385,8 +385,8 @@ void log_decode_progress(req_kind kind, int prompt_tokens, TokCount completion,
     const double elapsed = now - decode_t0;
     const double interval_s = now - *last_t;
     const TokCount interval_tokens = completion - *last_completion;
-    const double chunk_tps = interval_s > 0.0 ? (double)interval_tokens.raw() / interval_s : 0.0;
-    const double avg_tps = elapsed > 0.0 ? (double)completion.raw() / elapsed : 0.0;
+    const double chunk_tps = interval_s > 0.0 ? (double)interval_tokens.raw() / interval_s : 0.0;   /* raw: a bare local for the arithmetic below */
+    const double avg_tps = elapsed > 0.0 ? (double)completion.raw() / elapsed : 0.0;   /* raw: a bare local for the arithmetic below */
     char ctx[48];
     request_ctx_span(ctx, sizeof(ctx),
                      prompt_tokens + last_completion->raw(),   /* raw: the log's ctx span, printed */

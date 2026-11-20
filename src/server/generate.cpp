@@ -442,7 +442,7 @@ bool parser_finish_turn(server *s, session_slot *sl, gen_state *g, server_turn *
         if (!tail_from.is_none() && tail_from < text_end) {
             /* the stream stopped at the call; the rest goes out as text at the finish */
             out->tail = gen_text_at(g->text.ptr, tail_from);
-            out->tail_len = (text_end - tail_from).raw();
+            out->tail_len = (text_end - tail_from).raw();   /* raw: into the bare field tail_len */
         }
         return ok;
     }

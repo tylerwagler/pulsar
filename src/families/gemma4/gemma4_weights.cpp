@@ -46,8 +46,8 @@ void bind_lora(pulsar_role_binder *b, const char *target, TrunkLayer il, uint64_
     char ra[48], rb[48];
     snprintf(ra, sizeof(ra), "%s_lora_a", target);
     snprintf(rb, sizeof(rb), "%s_lora_b", target);
-    L->a = pulsar_role_bind(b, pulsar_role_in(ra, LAYERS, (int32_t)il.raw()), A_F16, 2, in, r);
-    L->b = pulsar_role_bind(b, pulsar_role_in(rb, LAYERS, (int32_t)il.raw()), A_F16, 2, r, out);
+    L->a = pulsar_role_bind(b, pulsar_role_in(ra, LAYERS, (int32_t)il.raw()), A_F16, 2, in, r);   /* raw: into pulsar_role_in()'s bare parameter */
+    L->b = pulsar_role_bind(b, pulsar_role_in(rb, LAYERS, (int32_t)il.raw()), A_F16, 2, r, out);   /* raw: into pulsar_role_in()'s bare parameter */
 }
 
 /** L338 P2: the adapter, when the container carries one (pulsar.adapter): its rank and scale from the kv, every
@@ -105,7 +105,7 @@ void bind_layer(pulsar_role_binder *b, const pulsar_gemma4_shape *s, TrunkLayer 
     const bool full = pulsar_gemma4_is_full(s, il);
     const uint64_t E = s->n_embd, nq = s->n_head;
     const uint64_t nkv = full ? s->n_head_kv : s->swa_n_head_kv, hd = full ? s->head_dim : s->swa_head_dim;
-    auto k = [&](const char *role) { return pulsar_role_in(role, LAYERS, (int32_t)il.raw()); };   /* the name's number */
+    auto k = [&](const char *role) { return pulsar_role_in(role, LAYERS, (int32_t)il.raw()); };   /* raw: the name's number */
     L->attn_norm = pulsar_role_bind(b, k("attn_norm"), A_BF16, 1, E);
     L->attn_q = pulsar_role_bind(b, k("attn_q"), A_LINEAR, 2, E, nq * hd);
     L->attn_k = pulsar_role_bind(b, k("attn_k"), A_LINEAR, 2, E, nkv * hd);

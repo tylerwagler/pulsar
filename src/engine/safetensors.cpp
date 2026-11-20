@@ -531,7 +531,7 @@ static void st_parse_header(st_shard *s) {
             if (!st_obj_key(&q, "data_offsets") || !st_u64_array(&q, off, &no, 2) || no != 2) {
                 st_die("safetensors: %s: %s has bad data_offsets", s->name, key);
             }
-            if (off[1] < off[0] || off[1] > s->size - s->buf_off.raw()) {
+            if (off[1] < off[0] || off[1] > s->size - s->buf_off.raw()) {   /* raw: compared with a bare value */
                 st_die("safetensors: %s: %s data_offsets are outside the file", s->name, key);
             }
             t->off0 = TensorBytes{off[0]};   /* the header's data_offsets: distances from the data buffer */
@@ -1121,7 +1121,7 @@ static void st_open(pulsar_model *m, const char *path, bool gpu_mapping) {
             }
         };
         mix((const uint8_t *)shards[i].name, strlen(shards[i].name) + 1u);
-        mix(shards[i].map, shards[i].buf_off.before().raw());   /* the shard's first bytes: its length word and header */
+        mix(shards[i].map, shards[i].buf_off.before().raw());   /* raw: the shard's first bytes: its length word and header */
     }
 
     /* The primary shard is the one carrying the full KV block; it is also the

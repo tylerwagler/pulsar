@@ -78,7 +78,7 @@ bool pulsar_session::live_from_rows(const pulsar_gpu_tensor *rows, uint32_t row)
 
 bool pulsar_session::live_from_host(const float *row) {
     const TensorBytes rb = bytes_of<float>((uint64_t)engine->logits_width());
-    if (row != logits) memcpy(logits, row, rb.raw());
+    if (row != logits) memcpy(logits, row, rb.raw());   /* raw: a memcpy length / offset */
     if (!pulsar_gpu_tensor_write(dev.live, TensorBytes{0u}, logits, rb)) return false;
     dev.host_stale = false;
     dev.live_valid = true;
@@ -270,7 +270,7 @@ int pulsar_session::draw(const pulsar_row_draw *d) {
     const uint32_t zero = 0;
     TokId tok = TokId{PULSAR_SAMPLE_REFUSED};
     const pulsar_gpu_tensor *live = live_dev();
-    return live && session_draw(this, live, &zero, d, 1, &tok) == 0 ? tok.raw() : PULSAR_SAMPLE_REFUSED;
+    return live && session_draw(this, live, &zero, d, 1, &tok) == 0 ? tok.raw() : PULSAR_SAMPLE_REFUSED;   /* raw: returned bare to its caller */
 }
 
 int pulsar_session::sample(float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
@@ -297,13 +297,13 @@ int pulsar_session::draw_step_rows(const HeadRow *rows, const pulsar_row_draw *d
     /* L443: the head rows as the logits-row indices the launch takes (raw: none() is past every step's rows) */
     uint32_t idx[PULSAR_GPU_SAMPLE_ROWS_MAX];
     for (uint32_t k = 0; k < n; k++)
-        if (!dev.step_rows || (uint32_t)rows[k].raw() >= dev.step_n) {
+        if (!dev.step_rows || (uint32_t)rows[k].raw() >= dev.step_n) {   /* raw: compared with a bare value */
             fprintf(stderr, "pulsar: session: a draw of row %u of a step that headed %u -- refusing\n",
                     (uint32_t)rows[k].raw(), dev.step_rows ? dev.step_n : 0u);
             return 1;
         }
     if (n > PULSAR_GPU_SAMPLE_ROWS_MAX) return 1;   /* session_draw's own refusal, before the copy */
-    for (uint32_t k = 0; k < n; k++) idx[k] = (uint32_t)rows[k].raw();
+    for (uint32_t k = 0; k < n; k++) idx[k] = (uint32_t)rows[k].raw();   /* raw: into a bare variable */
     return session_draw(this, dev.step_rows, idx, d, n, tokens);
 }
 

@@ -1248,7 +1248,7 @@ typedef struct {
  *  @param prompt_len the request prompt's length */
 /** @return the stitched prompt's length, live-side tokens */
 static inline TokCount pulsar_prefix_match_stitched_len(const pulsar_prefix_match *m, PromptToks prompt_len) {
-    return m->live_cut + TokCount{(prompt_len - m->prompt_cut).raw()};
+    return m->live_cut + TokCount{(prompt_len - m->prompt_cut).raw()};   /* raw: the named crossing pulsar_prefix_match_stitched_len() */
 }
 
 /** A token's text for the seam walks: a malloc'd copy the caller frees (NULL = none), its length in *len

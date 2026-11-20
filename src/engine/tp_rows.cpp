@@ -63,14 +63,14 @@ bool pulsar_tp_allreduce_rows(const pulsar_tp_rows *g, TpSlot slot, uint32_t n_t
         uint8_t *slab = (uint8_t *)g->slab_dev;
         uint8_t *bulk = (uint8_t *)g->bulk_dev;
         const TensorBytes row_bytes = bytes_of<float>(g->n_embd);
-        const uint64_t piece_rows = BL.cap_bytes.raw() / row_bytes.raw();   /* whole rows a region holds */
+        const uint64_t piece_rows = BL.cap_bytes.raw() / row_bytes.raw();   /* raw: whole rows a region holds */
         bool ok = piece_rows > 0;
         for (uint64_t r0 = 0; ok && r0 < n_tokens; r0 += piece_rows) {
             const uint64_t rows = n_tokens - r0 < piece_rows ? n_tokens - r0 : piece_rows;
             const TensorBytes off = row_bytes.times(r0), len = row_bytes.times(rows);
             uint64_t exch = 0;
             uint32_t buf = 0;
-            ok = pulsar_tp_bulk_begin(g->tp, len.raw(), &exch, &buf) != 0 &&   /* the transport's API is raw */
+            ok = pulsar_tp_bulk_begin(g->tp, len.raw(), &exch, &buf) != 0 &&   /* raw: the transport's API is raw */
                  pulsar_gpu_tp_bulk_stage(t, addend, off, pulsar_slab_at(bulk, BL.out_off), len) != 0 &&
                  pulsar_gpu_tp_publish_bulk(pulsar_slab_at(slab, L.desc_off), exch, len,
                                             PULSAR_TP_DESC_BULK_FLAG | (uint64_t)buf) != 0 &&
@@ -188,7 +188,7 @@ bool pulsar_tp_vocab_gather(const pulsar_tp_vocab *g, uint32_t n_rows, const pul
         pulsar_tp_row_lane_layout_t L;
         pulsar_tp_row_lane_layout(g->tp, &L);
         uint8_t *slab = (uint8_t *)g->slab_dev;
-        const uint64_t vf = L.vec_bytes.raw() / sizeof(float);   /* floats a slot carries */
+        const uint64_t vf = L.vec_bytes.raw() / sizeof(float);   /* raw: floats a slot carries */
         const uint32_t msgs = (uint32_t)(((uint64_t)n_rows * stride + vf - 1u) / vf);
         pulsar_gpu_tensor *own = pulsar_gpu_tensor_view(g->vocab_own, TensorBytes{0u},
                                                         bytes_of<float>((uint64_t)n_rows * (hi - lo)));
@@ -219,9 +219,9 @@ bool pulsar_tp_vocab_gather(const pulsar_tp_vocab *g, uint32_t n_rows, const pul
                 n_rows, stride);
         return false;
     }
-    float *own     = (float *)xmalloc(slice_bytes.raw());   /* host staging of the same bytes */
-    float *scratch = (float *)xmalloc(slice_bytes.raw());
-    float *full    = (float *)xmalloc(full_bytes.raw());
+    float *own     = (float *)xmalloc(slice_bytes.raw());   /* raw: host staging of the same bytes */
+    float *scratch = (float *)xmalloc(slice_bytes.raw());   /* raw: an allocation / copy size */
+    float *full    = (float *)xmalloc(full_bytes.raw());   /* raw: an allocation / copy size */
     bool ok = own && scratch && full;
     if (!ok) fprintf(stderr, "pulsar: tp vocab staging out of memory (%llu + %llu bytes)\n",
                       (unsigned long long)slice_bytes.raw(), (unsigned long long)full_bytes.raw());

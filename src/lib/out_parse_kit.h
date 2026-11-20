@@ -183,7 +183,7 @@ const char *out_tool_param_type(const out_tools &tools, const std::string &fn, c
  *  BodyOff{index}. */
 /// @param at  an offset into the open call's body
 /// @return it as the byte index into the body's string
-inline size_t body_ix(BodyOff at) { return at.raw(); }
+inline size_t body_ix(BodyOff at) { return at.raw(); }   /* raw: a bare operand */
 
 /** The reader of a call's body: the bytes between the marker that opened the call and the marker that
  * closes it.  The kit owns the call's index, the events' order and the call list; the reader owns the

@@ -189,7 +189,7 @@ bool pulsar_mtp_absorb(pulsar_session *s, pulsar_step_mode mode, const TokId *to
     }
     bool ok = true;
     if (mode == PULSAR_STEP_PREFILL) {
-        const uint32_t b = (uint32_t)bank[0].raw();   /* the driver's forward checked the step's banks */
+        const uint32_t b = (uint32_t)bank[0].raw();   /* raw: the driver's forward checked the step's banks */
         if (parked_before(l, b, TokPos{pos[0]})) {
             ok = pulsar_gpu_tensor_copy_async(l->cond, TensorBytes{0u}, pend, cb.times(b),
                                               cb) != 0;
@@ -201,7 +201,7 @@ bool pulsar_mtp_absorb(pulsar_session *s, pulsar_step_mode mode, const TokId *to
         if (ok) l->pend_pos[b] = TokPos{pos[n - 1]};
     } else {
         for (uint32_t j = 0; ok && j < n; j++) {
-            const uint32_t b = (uint32_t)bank[j].raw();   /* the driver's forward checked the step's banks */
+            const uint32_t b = (uint32_t)bank[j].raw();   /* raw: the driver's forward checked the step's banks */
             if (parked_before(l, b, TokPos{pos[j]})) {
                 ok = pulsar_gpu_tensor_copy_async(l->cond, cb.times(k), pend,
                                                   cb.times(b), cb) != 0;
@@ -249,7 +249,7 @@ bool pulsar_mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const Ban
     uint32_t m = 0;   /* the step's rows */
     bool ok = n <= PULSAR_DRIVER_HEADS_MAX && pend;
     for (uint32_t i = 0; ok && i < n;) {
-        const uint32_t b = (uint32_t)banks[i].raw();   /* refused below when outside the pool (none() included) */
+        const uint32_t b = (uint32_t)banks[i].raw();   /* raw: refused below when outside the pool (none() included) */
         uint32_t j = i + 1;
         while (j < n && banks[j] == banks[i]) j++;
         const uint32_t k = j - i;
@@ -274,20 +274,20 @@ bool pulsar_mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const Ban
             ok = pulsar_gpu_tensor_copy_async(l->cond, cb.times(m), pend,
                                               cb.times(b), cb) != 0;
             tok[m] = l->vtok[rows[i]];
-            pos[m] = (kept.pos0 - TokCount{1}).raw();
+            pos[m] = (kept.pos0 - TokCount{1}).raw();   /* raw: a bare operand */
             bank[m++] = banks[i];
         }
         if (ok && k > 1) ok = ops->trunk_rows(s, rows[i], k - 1u, l->cond, cb.times(m));
         for (uint32_t r = 0; r + 1 < k; r++, m++) {
             tok[m] = next[i + r];
-            pos[m] = kept.pos_of(kept.first + StepRows{(int)r}).raw();
+            pos[m] = kept.pos_of(kept.first + StepRows{(int)r}).raw();   /* raw: a bare operand */
             bank[m] = banks[i];
         }
         i = j;
     }
     if (ok && m > 0) ok = step(s, step_of(DraftLayer{0u}, PULSAR_STEP_PREFILL, true, tok, pos, bank, m, l->cond));
     for (uint32_t i = 0; i < n;) {
-        const uint32_t b = (uint32_t)banks[i].raw();   /* read below only inside the pool (none() included) */
+        const uint32_t b = (uint32_t)banks[i].raw();   /* raw: read below only inside the pool (none() included) */
         uint32_t j = i + 1;
         while (j < n && banks[j] == banks[i]) j++;
         bool parked = ok && b < ss->n_banks && ss->bank_pos[b] >= TokPos::after(TokCount{(int)(j - i)});

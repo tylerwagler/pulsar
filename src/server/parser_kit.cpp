@@ -47,7 +47,7 @@ GenOff kit_gen::text_at(StreamOff at) const {
 /// @param ev    receives the parser's events
 static void kit_feed_text(kit_gen *q, const char *text, GenOff upto, std::vector<out_event> *ev) {
     if (upto <= q->fed) return;
-    q->parser->feed(gen_text_at(text, q->fed), (upto - q->fed).raw(), ev);
+    q->parser->feed(gen_text_at(text, q->fed), (upto - q->fed).raw(), ev);   /* raw: into feed()'s bare parameter */
     q->fed = upto;
 }
 
@@ -79,7 +79,7 @@ static void kit_read_ahead(kit_gen *q, const gen_state *g, const char *text, siz
     const GenOff end = gen_text_end(len);
     const GenBytes one{1u};
     /* the next byte of the family's call_tail to match (tail_at is a length of the tail, not an offset of the text) */
-    auto tail_next = [&]() { return tail[q->tail_at.raw()]; };
+    auto tail_next = [&]() { return tail[q->tail_at.raw()]; };   /* raw: an index into a bare array */
     std::vector<out_event> ev;
     while (!q->cut && (q->ahead_fed < end || (q->call_closed && !tail_next()))) {
         if (q->call_closed) {
@@ -371,7 +371,7 @@ bool parser_kit_finish(void *st, server *s, session_slot *sl, gen_state *g, serv
         const GenOff raw_lo = q->text_at(span_lo), raw_hi = q->text_at(span_hi);
         if (raw_hi > gen_text_end(g->text.len) || raw_lo >= raw_hi)
             pulsar_die("output parser: raw span outside the turn's text");
-        out->calls.raw_calls = server_xstrndup(gen_text_at(g->text.ptr, raw_lo), (raw_hi - raw_lo).raw());
+        out->calls.raw_calls = server_xstrndup(gen_text_at(g->text.ptr, raw_lo), (raw_hi - raw_lo).raw());   /* raw: an allocation / copy size */
     }
     /* as text, the stream stopped at the first call's marker: the rest goes out at the finish.  The parser says
      * where that was (L419: a marker quoted in Markdown code before it was text, and streamed as text) */

@@ -143,7 +143,7 @@ bool pulsar_nemotron_h_vision_bind(const pulsar_model *m, pulsar_role_binder *b,
     v->cls = pulsar_role_bind(b, top("vit_cls"), A_BF16, 2, D, s.prefix);
     v->pos = pulsar_role_bind(b, top("vit_pos"), A_BF16, 2, D, G);
     for (VisLayer il{0u}; il.below(s.depth); ++il) {
-        auto k = [&](const char *r) { return pulsar_role_in(r, "vit", (int32_t)il.raw()); };
+        auto k = [&](const char *r) { return pulsar_role_in(r, "vit", (int32_t)il.raw()); };   /* raw: into pulsar_role_in()'s bare parameter */
         pulsar_vit_block &B = v->vit[il];
         B.norm1 = pulsar_role_bind(b, k("vit_norm1"), A_F32, 1, D);
         B.norm1_b = pulsar_role_bind(b, k("vit_norm1_bias"), A_F32, 1, D);
@@ -289,7 +289,7 @@ bool lin(const pulsar_model *m, const pulsar_nemotron_h_vision_run *r, const pul
          const uint16_t *x, uint32_t rows, const char *what) {
     pulsar_rows_linear l;
     return pulsar_linear_rows_ref(m, t, in, out, true, what, &l) &&
-           pulsar_rows_linear_launch(&l, x, (int)rows, dp<float>(r->t[V_STAGE]), dp(r->t[V_LWS]), r->bytes[V_LWS].raw(), 0) ==
+           pulsar_rows_linear_launch(&l, x, (int)rows, dp<float>(r->t[V_STAGE]), dp(r->t[V_LWS]), r->bytes[V_LWS].raw(), 0) ==   /* raw: a device-API argument (pulsar_rows_linear_launch) */
                0;
 }
 
@@ -329,7 +329,7 @@ bool pulsar_nemotron_h_vision_encode(const pulsar_model *m, const pulsar_nemotro
             return vfail(err, errlen, "the patch embedding refused");
     }
     const pulsar_vit_dims dims = {D, s.heads, s.head_dim, s.mlp, s.depth, s.eps};
-    const pulsar_vit_bufs bufs = {res, xn, qkv, att, mlp, stage, dp(r->t[V_LWS]), r->bytes[V_LWS].raw(), CHUNK};
+    const pulsar_vit_bufs bufs = {res, xn, qkv, att, mlp, stage, dp(r->t[V_LWS]), r->bytes[V_LWS].raw(), CHUNK};   /* raw: into a bare variable */
     if (!pulsar_vit_encode(m, dims, {v->vit.data(), dims.depth}, PULSAR_ROWS_OUT_BF16, bufs, N, NULL, err, errlen)) return false;
     if (dbg) {   /* the tower's residual, the patches back in raster order */
         std::vector<float> all((size_t)N * D);

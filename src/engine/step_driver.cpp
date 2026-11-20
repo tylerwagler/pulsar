@@ -19,7 +19,7 @@ static const char *ARCH(const pulsar_engine *e) { return e->family->arch; }
 
 pulsar_driver_heads pulsar_driver_heads_span(StepRow row0, StepRows n) {
     pulsar_driver_heads h;
-    h.n = (uint32_t)n.raw();
+    h.n = (uint32_t)n.raw();   /* raw: into the bare field n */
     for (uint32_t i = 0; i < h.n && i < PULSAR_DRIVER_HEADS_MAX; i++) h.row[i] = row0 + StepRows{(int)i};
     return h;
 }
@@ -156,8 +156,8 @@ int pulsar_driver_session_create(pulsar_session *s, uint32_t n_banks) {
         for (uint32_t k = 0; k < p->n_slots; k++)
             for (uint32_t id = 0; id < p->n_decl; id++) {
                 if (!(p->slot[LayerSlot{k}] >> id & 1u)) continue;
-                if (p->decl[id].kind == PULSAR_STATE_POOL) per_token += (double)p->decl[id].bytes.raw() / p->decl[id].tokens;
-                else fixed += (double)pulsar_state_decl_bank_bytes(&p->decl[id]).raw();
+                if (p->decl[id].kind == PULSAR_STATE_POOL) per_token += (double)p->decl[id].bytes.raw() / p->decl[id].tokens;   /* raw: into a bare variable */
+                else fixed += (double)pulsar_state_decl_bank_bytes(&p->decl[id]).raw();   /* raw: into a bare variable */
             }
         fprintf(stderr, "pulsar: %s session: %u bank(s) x %d tokens, %u-row steps "
                         "(%.1f MiB fixed per bank + %.1f KiB per token)\n",
@@ -496,13 +496,13 @@ static bool driver_prefill_chunk(pulsar_session *s, const pulsar_tokens *prompt,
     const pulsar_driver_ops *ops = DOPS(s->engine);
     /* the chunk is one run of the step: rows [0, rows) at positions [pos0, pos0 + rows) */
     const pulsar_step_run chunk{StepRow{0}, pulsar_ckpt_pos(pos0), StepRows{(int)rows}};
-    for (uint32_t r = 0; r < rows; r++) c->pos[r] = chunk.pos_of(StepRow{(int)r}).raw();
+    for (uint32_t r = 0; r < rows; r++) c->pos[r] = chunk.pos_of(StepRow{(int)r}).raw();   /* raw: into the bare field pos */
     bool ok = driver_forward(s, PULSAR_STEP_PREFILL, prompt->v + pos0, c->pos, c->bank, rows,
                                     pulsar_driver_heads_span(StepRow{(int)(rows - 1u)}, StepRows{last ? 1 : 0}), NULL);
     if (ok && last) ok = s->live_from_rows(s->driver->logits, 0);
     if (ok && ops->absorb)
         ok = ops->absorb(s, PULSAR_STEP_PREFILL, prompt->v + pos0, c->pos, c->bank, rows, 0, false);
-    const TokPos end = chunk.pos0 + TokCount{chunk.n.raw()};
+    const TokPos end = chunk.pos0 + TokCount{chunk.n.raw()};   /* raw: a run of rows at consecutive positions: its rows are as many tokens */
     if (ok) pulsar_state_set_pos(s->states, c->live, end);
     if (ok && c->canonical) s->states->prefill_pos[pulsar_bank_index(c->live)] = end;
     return ok;
@@ -645,7 +645,7 @@ int pulsar_driver_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *
             }
         }
         tok[i] = reqs[i].token;
-        pos[i] = reqs[i].pos.raw();
+        pos[i] = reqs[i].pos.raw();   /* raw: a bare operand */
         bank[i] = reqs[i].bank;
     }
     const pulsar_driver_ops *ops = DOPS(e);
@@ -683,7 +683,7 @@ static bool driver_verify_rows(pulsar_session *s, const pulsar_multiseq_req *req
                                int32_t *pos, BankId *bk, char *err, size_t errlen) {
     const pulsar_state_set *ss = s->states;
     for (uint32_t i = 0; i < n; i++) {
-        const uint32_t b = (uint32_t)reqs[i].bank.raw();   /* refused below when outside the pool (none() included) */
+        const uint32_t b = (uint32_t)reqs[i].bank.raw();   /* raw: refused below when outside the pool (none() included) */
         const bool run_start = i == 0 || reqs[i - 1].bank != reqs[i].bank;
         const TokPos want = run_start ? (b < ss->n_banks ? ss->bank_pos[b] : TokPos{0}) : reqs[i - 1].pos + TokCount{1};
         if (b >= ss->n_banks || reqs[i].pos != want) {
@@ -693,7 +693,7 @@ static bool driver_verify_rows(pulsar_session *s, const pulsar_multiseq_req *req
         }
         if (run_start && driver_bank_stale(s, b, "verify", err, errlen)) return false;
         tok[i] = reqs[i].token;
-        pos[i] = reqs[i].pos.raw();
+        pos[i] = reqs[i].pos.raw();   /* raw: a bare operand */
         bk[i] = reqs[i].bank;
     }
     return true;
@@ -810,7 +810,7 @@ int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *req
     uint32_t n_pf = 0;
     const pulsar_family_vision *vis = e->family->vision;
     for (uint32_t i = n_dec; i < n_rows; i++) {
-        const uint32_t b = (uint32_t)reqs[i].bank.raw();   /* refused below when outside the pool (none() included) */
+        const uint32_t b = (uint32_t)reqs[i].bank.raw();   /* raw: refused below when outside the pool (none() included) */
         const bool starts = i == n_dec || reqs[i].bank != reqs[i - 1].bank;
         bool taken = false;
         for (uint32_t j = 0; starts && j < i; j++) taken |= reqs[j].bank == reqs[i].bank;
@@ -818,9 +818,9 @@ int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *req
         n_pf += starts ? 1u : 0u;
         const char *why = n_pf > shape->n_pf                                       ? "starts a run past the shape's"
                           : taken                                                 ? "is on a bank the step already carries"
-                          : !starts && reqs[i].pos.raw() != reqs[i - 1].pos.raw() + 1         ? "does not follow its run"
-                          : !pulsar_session_token_is_id(s, reqs[i].token.raw(), NULL, 0) ? "is not a token id"
-                          : vis && vis->is_sentinel(e, reqs[i].token.raw())         ? "is an image block's (a sync's)"
+                          : !starts && reqs[i].pos.raw() != reqs[i - 1].pos.raw() + 1         ? "does not follow its run"   /* raw: a bare operand */
+                          : !pulsar_session_token_is_id(s, reqs[i].token.raw(), NULL, 0) ? "is not a token id"   /* raw: into pulsar_session_token_is_id()'s bare parameter */
+                          : vis && vis->is_sentinel(e, reqs[i].token.raw())         ? "is an image block's (a sync's)"   /* raw: into is_sentinel()'s bare parameter */
                                                                                   : NULL;
         if (why) {
             if (err) snprintf(err, errlen, "%s: fused prompt row %u (bank %u pos %d) %s", ARCH(e), i, b, reqs[i].pos.raw(),
@@ -828,7 +828,7 @@ int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *req
             return 1;
         }
         tok[i] = reqs[i].token;
-        pos[i] = reqs[i].pos.raw();
+        pos[i] = reqs[i].pos.raw();   /* raw: a bare operand */
         bk[i] = reqs[i].bank;
     }
     if (n_pf != shape->n_pf) {
@@ -840,8 +840,8 @@ int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *req
      * records: its rope would read them) */
     for (uint32_t r = 0; r < n_pf; r++) {
         /* refused below when outside the pool (none() included) */
-        const uint32_t b = (uint32_t)reqs[first[r]].bank.raw(), m = first[r + 1] - first[r];
-        const int32_t p0 = reqs[first[r]].pos.raw();
+        const uint32_t b = (uint32_t)reqs[first[r]].bank.raw(), m = first[r + 1] - first[r];   /* raw: a bare local for the arithmetic below */
+        const int32_t p0 = reqs[first[r]].pos.raw();   /* raw: a bare local for the arithmetic below */
         const pulsar_image_identity *img =
             b < ss->n_banks ? pulsar_session_bank_images(s, b, pulsar_bank_index(ss->live_bank)) : NULL;
         const char *why = b >= ss->n_banks                            ? "is outside the pool"
@@ -862,7 +862,7 @@ int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *req
     bool canonical[PULSAR_FUSED_PF_MAX];
     for (uint32_t r = 0; r < n_pf; r++) {
         const uint32_t b = pulsar_bank_index(reqs[first[r]].bank);
-        if (reqs[first[r]].pos.raw() == 0 && !pulsar_state_reset_bank(ss, reqs[first[r]].bank)) {
+        if (reqs[first[r]].pos.raw() == 0 && !pulsar_state_reset_bank(ss, reqs[first[r]].bank)) {   /* raw: compared with a bare value */
             if (err) snprintf(err, errlen, "%s: fused step: bank %u could not be reset", ARCH(e), b);
             return -1;
         }

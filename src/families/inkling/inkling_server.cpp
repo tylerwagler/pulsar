@@ -192,7 +192,7 @@ int inkling_trivial_header_tokens(pulsar_engine *e) {
         char err[200];
         if (!inkling_chat_render(in, &out, err, sizeof err) || out.spans.empty())
             pulsar_die("inkling: the trivial header's render refused");
-        const std::string hdr = out.text.substr(0, out.spans[0].lo.before().raw());
+        const std::string hdr = out.text.substr(0, out.spans[0].lo.before().raw());   /* raw: into substr()'s bare parameter */
         pulsar_tokens t = {0};
         if (!pulsar_tokenize_rendered_chat(e, hdr.c_str(), &t))
             pulsar_die("inkling: the tokenizer refused the trivial header");

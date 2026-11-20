@@ -1996,8 +1996,8 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
 }
 
 int pulsar_gpu_routed_moe_batch_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, MapOff gate_offset_m, MapOff up_offset_m, MapOff down_offset_m, uint32_t gate_type, uint32_t down_type, TensorBytes gate_expert_bytes_b, TensorBytes gate_row_bytes_b, TensorBytes down_expert_bytes_b, TensorBytes down_row_bytes_b, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, uint32_t expert_split) {
-    const uint64_t gate_expert_bytes = gate_expert_bytes_b.raw(), gate_row_bytes = gate_row_bytes_b.raw(), down_expert_bytes = down_expert_bytes_b.raw(), down_row_bytes = down_row_bytes_b.raw();   /* L438: the typed bytes end at the launch */
-    const uint64_t gate_offset = gate_offset_m.raw(), up_offset = up_offset_m.raw(), down_offset = down_offset_m.raw();   /* L438: MapOff ends at the launch */
+    const uint64_t gate_expert_bytes = gate_expert_bytes_b.raw(), gate_row_bytes = gate_row_bytes_b.raw(), down_expert_bytes = down_expert_bytes_b.raw(), down_row_bytes = down_row_bytes_b.raw();   /* raw: L438: the typed bytes end at the launch */
+    const uint64_t gate_offset = gate_offset_m.raw(), up_offset = up_offset_m.raw(), down_offset = down_offset_m.raw();   /* raw: L438: MapOff ends at the launch */
     /* Nothing below this line consults esz: every scratch/output cast in the
      * MoE lane is (float *) over a tensor the graph allocates f32.  That was
      * TRUE-BY-ACCIDENT rather than checked (types sweep 2026-08-22): if any

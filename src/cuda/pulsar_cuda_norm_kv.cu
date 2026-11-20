@@ -735,7 +735,7 @@ int pulsar_gpu_rms_norm_plain_rows_tensor(pulsar_gpu_tensor *out, void *out_b, c
 
 int pulsar_gpu_rms_norm_weight_mx_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x, const void *model_map, uint64_t model_size, MapOff weight_offset_m, uint32_t n, float eps,
         void *out_q, void *out_sf, int out_kbp, void *out_b, int w_bf16) {
-    const uint64_t weight_offset = weight_offset_m.raw();   /* L438: MapOff ends at the launch */
+    const uint64_t weight_offset = weight_offset_m.raw();   /* raw: L438: MapOff ends at the launch */
     /* The weight is sized by ITS storage; x is an f32 buffer.  out may be NULL
      * when an E4M3 or bf16 plane is requested: the f32 row is then not stored
      * (its only readers are dumps, and the caller passes out only for them). */
@@ -777,7 +777,7 @@ int pulsar_gpu_rms_norm_weight_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_t
 
 
 int pulsar_gpu_rms_norm_weight_rows_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x, const void *model_map, uint64_t model_size, MapOff weight_offset_m, uint32_t n, uint32_t rows, float eps, void *out_b, int w_bf16) {
-    const uint64_t weight_offset = weight_offset_m.raw();   /* L438: MapOff ends at the launch */
+    const uint64_t weight_offset = weight_offset_m.raw();   /* raw: L438: MapOff ends at the launch */
     const uint64_t w_bytes = (uint64_t)n * pulsar_w_elt_bytes(w_bf16);
     if (!out || !x || !model_map || weight_offset > model_size ||
         model_size - weight_offset < w_bytes ||
@@ -805,7 +805,7 @@ int pulsar_gpu_rms_norm_weight_rows_mx_tensor(pulsar_gpu_tensor *out, const puls
                                               const void *model_map, uint64_t model_size,
                                               MapOff weight_offset_m, uint32_t n, uint32_t rows, float eps,
                                               void *out_q, void *out_sf, int out_kbp, void *out_b, int w_bf16) {
-    const uint64_t weight_offset = weight_offset_m.raw();   /* L438: MapOff ends at the launch */
+    const uint64_t weight_offset = weight_offset_m.raw();   /* raw: L438: MapOff ends at the launch */
     /* L158: the rows twin of pulsar_gpu_rms_norm_weight_mx_tensor -- the same
      * kernel, `rows` blocks, with the E4M3 epilogue the drafter's per-row
      * norms (attn_norm, q_a_norm) needed so their GEMVs read a slot instead
@@ -859,7 +859,7 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
         int                     q_w_bf16,
         int                     kv_w_bf16,
         int                     q_skip_f32) {
-    const uint64_t q_weight_offset = q_weight_offset_m.raw(), kv_weight_offset = kv_weight_offset_m.raw();   /* L438: MapOff ends at the launch */
+    const uint64_t q_weight_offset = q_weight_offset_m.raw(), kv_weight_offset = kv_weight_offset_m.raw();   /* raw: L438: MapOff ends at the launch */
     const uint64_t q_w_bytes = (uint64_t)q_n * pulsar_w_elt_bytes(q_w_bf16);
     const uint64_t kv_w_bytes = (uint64_t)kv_n * pulsar_w_elt_bytes(kv_w_bf16);
     if (!q_out || !q || !kv_out || !kv || !model_map ||

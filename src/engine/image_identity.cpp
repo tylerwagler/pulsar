@@ -160,7 +160,7 @@ int pulsar_image_persist_end(const pulsar_family_vision *v, const pulsar_engine 
                              const pulsar_image_identity *id) {
     uint32_t k = 0;   /* the next record the walk expects */
     for (int i = 0; i < n; i++) {
-        if (!is_sentinel(v, e, ids[i].raw())) continue;
+        if (!is_sentinel(v, e, ids[i].raw())) continue;   /* raw: into is_sentinel()'s bare parameter */
         int len = 0;
         if (!block_extent(v, e, ids, n, i, &len)) return -1;   /* a malformed block: persist nothing */
         /* a block the identity records (in order, at this place) may be persisted; the first one it does not --

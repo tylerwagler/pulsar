@@ -1577,16 +1577,16 @@ void pulsar_tokens_prefix_match(pulsar_engine *e,
 PromptToks pulsar_tokens_prompt_held_with(pulsar_token_text_fn text, void *ud, const TokId *live, TokPos at,
                                           const TokId *prompt, int prompt_len) {
     pulsar_prefix_match m;
-    pulsar_tokens_prefix_match_with(text, ud, live, at.raw(), prompt, prompt_len, &m);
+    pulsar_tokens_prefix_match_with(text, ud, live, at.raw(), prompt, prompt_len, &m);   /* raw: into pulsar_tokens_prefix_match_with()'s bare parameter */
     if (TokPos::after(m.live_cut) == at) return m.prompt_cut;
     std::string bytes;   /* live[m.live_cut, at) */
-    for (int i = m.live_cut.raw(); i < at.raw(); i++) {
+    for (int i = m.live_cut.raw(); i < at.raw(); i++) {   /* raw: compared with a bare value */
         size_t n = 0;
         char *t = text(ud, live[i], &n);
         if (t) bytes.append(t, n);
         free(t);
     }
-    int j = m.prompt_cut.raw();
+    int j = m.prompt_cut.raw();   /* raw: a bare local for the arithmetic below */
     size_t off = 0;
     while (j < prompt_len) {
         size_t n = 0;
@@ -1603,7 +1603,7 @@ PromptToks pulsar_tokens_prompt_held_with(pulsar_token_text_fn text, void *ud, c
 int pulsar_tokens_in_text_with(pulsar_token_piece_fn piece, void *ud, const TokId *tokens, int len, const char *text,
                                TextBytes end) {
     if (!piece || !tokens || !text) return 0;
-    const size_t lim = (size_t)end.raw();
+    const size_t lim = (size_t)end.raw();   /* raw: a bare local for the arithmetic below */
     size_t off = 0;
     int i = 0;
     while (i < len && off < lim) {   /* at `end` the count stops: a piece there would lie past it, or have no bytes */
@@ -1651,7 +1651,7 @@ void pulsar_session::rewind(TokPos at) {
     /* none() or a negative raw (a TP frame's value) rewinds to 0 and a position past the history to its end, as
      * the int did */
     const TokPos end = s->hist_end();
-    const TokPos pos = at.is_none() || at.raw() < 0 ? TokPos{0} : at > end ? end : at;
+    const TokPos pos = at.is_none() || at.raw() < 0 ? TokPos{0} : at > end ? end : at;   /* raw: into a bare variable */
     s->trim_history(pos);
     s->logits_stale = true;
     /* The compressed frontier of every kv source follows the position law on
@@ -1706,8 +1706,8 @@ void pulsar_session::trim_history(TokPos pos) {
     /* The image blocks above the new end are gone from the live KV: their records go with them or a later request
      * could reuse rows that no longer exist (L226).  L281: the blocks BELOW it survive, records and all -- before,
      * one cut block dropped the whole identity and the next image request rebuilt every block from 0. */
-    pulsar_image_identity_trim(&s->live_images, (uint32_t)pos.before().raw());
-    s->checkpoint.len = pos.before().raw();   /* the token_vec's int length (hist_end() reads it back) */
+    pulsar_image_identity_trim(&s->live_images, (uint32_t)pos.before().raw());   /* raw: into pulsar_image_identity_trim()'s bare parameter */
+    s->checkpoint.len = pos.before().raw();   /* raw: the token_vec's int length (hist_end() reads it back) */
     spec_lookahead_reset(s);
     /* Rewound positions' drafter rows are stale; empty the window (it refills
      * from the prompt capture on the next prefill, or from commits). */

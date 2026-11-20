@@ -157,7 +157,7 @@ typedef struct {
  *  this is the ONE place a cursor becomes the index they take. */
 /// @param at  a cursor of the walk
 /// @return it as the byte index into the walk's text
-static inline size_t walk_ix(GenOff at) { return at.raw(); }
+static inline size_t walk_ix(GenOff at) { return at.raw(); }   /* raw: a bare operand */
 
 size_t trim_truncated_dsml_close_tail(const char *raw, size_t start, size_t len);
 

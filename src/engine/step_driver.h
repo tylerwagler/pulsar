@@ -69,11 +69,11 @@ pulsar_driver_heads pulsar_driver_heads_span(StepRow row0, StepRows n);
 /** L334 P2b S7b: a step row as the index the step's arrays and kernels take (fatal on none()).
  *  @param r the row */
 /// @return its index
-static inline uint32_t pulsar_row_index(StepRow r) { return (uint32_t)r.before().raw(); }
+static inline uint32_t pulsar_row_index(StepRow r) { return (uint32_t)r.before().raw(); }   /* raw: a bare operand */
 /** A head row as the index of its logits row (fatal on none()).
  *  @param h the row */
 /// @return its index
-static inline uint32_t pulsar_row_index(HeadRow h) { return (uint32_t)h.before().raw(); }
+static inline uint32_t pulsar_row_index(HeadRow h) { return (uint32_t)h.before().raw(); }   /* raw: a bare operand */
 /** Hazard (b), named: a verify's head row as a step row.  A verify's rows lead the step and every one is headed
  *  (pulsar_driver_heads_span(0, n_dec)), so head row h IS step row h -- for h inside the verify, and only there; a
  *  head row past it (a fused step's prompt-run heads) is no verify row, and is fatal here.
@@ -81,12 +81,12 @@ static inline uint32_t pulsar_row_index(HeadRow h) { return (uint32_t)h.before()
  *  @param n_dec the step's decode / verify rows */
 /// @return the step row it heads
 static inline StepRow pulsar_verify_step_row(HeadRow h, uint32_t n_dec) {
-    if (h.is_none() || (uint32_t)h.raw() >= n_dec) {
+    if (h.is_none() || (uint32_t)h.raw() >= n_dec) {   /* raw: compared with a bare value */
         fprintf(stderr, "pulsar: head row %d is not a verify row (the verify has %u): no step row by identity\n",
                 h.raw(), n_dec);
         abort();
     }
-    return StepRow{h.raw()};
+    return StepRow{h.raw()};   /* raw: the named crossing pulsar_verify_step_row() */
 }
 
 struct pulsar_state_set;
@@ -296,7 +296,7 @@ const char *pulsar_driver_first_missing(const pulsar_driver_ops *ops, const puls
  *  from the declared state's slot space to the transport's.
  *  @param slot the layer slot whose block exchanges */
 /// @return its exchange slot
-static inline TpSlot pulsar_tp_slot_of(LayerSlot slot) { return TpSlot{slot.raw()}; }
+static inline TpSlot pulsar_tp_slot_of(LayerSlot slot) { return TpSlot{slot.raw()}; }   /* raw: the named crossing pulsar_tp_slot_of() */
 /** L266 step 7: a block's tensor-parallel exchange -- the group's sum of the step's partial output rows `y` (f32
  *  [n_rows][width]) in exchange slot `slot` (the layer's; a drafter layer's after the trunk's).  One GPU: nothing. */
 /// @param st    the step (its n_rows rows; its driver buffers carry the transport)

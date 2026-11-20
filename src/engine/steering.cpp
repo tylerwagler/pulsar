@@ -36,7 +36,7 @@ static bool gpu_graph_apply_directional_steering(
     if (!g || !g->directional_steering_dirs || scale == 0.0f) return true;
     return pulsar_gpu_directional_steering_project_tensor(x,
                                             g->directional_steering_dirs,
-                                            il.raw(),   /* the launch: the direction table's row */
+                                            il.raw(),   /* raw: the launch: the direction table's row */
                                             PULSAR_N_EMBD,
                                             rows,
                                             scale) != 0;
@@ -134,7 +134,7 @@ uint64_t gpu_graph_context_bytes_for_kv_policy(
     const uint64_t comp_cap = gpu_graph_comp_cap_max(ctx_size);
     /* the policy's total is raw: KV tensors plus scratch formulas, one number for the sizing and the boot line */
     const uint64_t kv_cache_bytes = (gpu_graph_raw_ring_bytes_for_context(raw_cap) +
-                                     gpu_graph_comp_index_bytes_for_context(ctx_size)).raw();
+                                     gpu_graph_comp_index_bytes_for_context(ctx_size)).raw();   /* raw: a bare operand */
     if (kv_cache_bytes_out) *kv_cache_bytes_out = kv_cache_bytes;
     /* indexer_scores token rows shrink to the slice size under
      * PULSAR_PREFILL_SLICE (see gpu_graph_prefill_slice / the gpu_diag alloc). */

@@ -62,10 +62,10 @@ bool pulsar_session_seam_stitch(pulsar_session *s, const pulsar_tokens *prompt, 
     pulsar_prefix_match m;
     s->prefix_match(prompt, &m);
     if (m.live_cut <= TokCount{past}) return false;
-    const int live_n = m.live_cut.raw(), prompt_n = m.prompt_cut.raw();
+    const int live_n = m.live_cut.raw(), prompt_n = m.prompt_cut.raw();   /* raw: a bare local for the arithmetic below */
     pulsar_tokens *st = &out->tokens;
     free(st->v);
-    st->cap = pulsar_prefix_match_stitched_len(&m, PromptToks{prompt->len}).raw();
+    st->cap = pulsar_prefix_match_stitched_len(&m, PromptToks{prompt->len}).raw();   /* raw: into the bare field cap */
     st->v = (TokId *)xmalloc((size_t)st->cap * sizeof(TokId));
     memcpy(st->v, s->checkpoint.v, (size_t)live_n * sizeof(TokId));
     memcpy(st->v + live_n, prompt->v + prompt_n, (size_t)(prompt->len - prompt_n) * sizeof(TokId));

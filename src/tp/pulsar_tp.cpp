@@ -1815,7 +1815,7 @@ static int tp_rdma_armed_handshake(pulsar_tp *tp, int data_fd);
 static int tp_rdma_gate_exchange(pulsar_tp *tp, TpSlot layer, uint32_t gate,
                                  uint64_t seq) {
     pulsar_tp_rdma_link *r = tp_pair_link(tp);
-    const uint32_t slot = layer.raw() * PULSAR_TP_GATES_PER_LAYER + gate;
+    const uint32_t slot = layer.raw() * PULSAR_TP_GATES_PER_LAYER + gate;   /* raw: a bare local for the arithmetic below */
     if (slot != tp_gate_slot(tp, seq)) {
         fprintf(stderr, "pulsar-tp: gate order broke: layer %u gate %u vs seq %llu\n",
                 layer.raw(), gate, (unsigned long long)seq);
@@ -2696,7 +2696,7 @@ uint64_t pulsar_tp_slab_bytes(uint32_t n_layer, uint32_t n_embd) {
 /// @param gate  gate index
 /// @return layer * GATES_PER_LAYER + gate
 static uint64_t tp_slot(TpSlot layer, uint32_t gate) {
-    return (uint64_t)layer.raw() * PULSAR_TP_GATES_PER_LAYER + gate;
+    return (uint64_t)layer.raw() * PULSAR_TP_GATES_PER_LAYER + gate;   /* raw: returned bare to its caller */
 }
 
 uint64_t pulsar_tp_slab_out_offset(const pulsar_tp_slab *s, TpSlot layer, uint32_t gate, uint64_t vec_bytes) {
@@ -2708,11 +2708,11 @@ uint64_t pulsar_tp_slab_in_offset(const pulsar_tp_slab *s, TpSlot layer, uint32_
 }
 
 uint64_t pulsar_tp_slab_batch_out_offset(const pulsar_tp_slab *s, TpSlot layer, uint64_t vec_bytes) {
-    return s->batch_out_off + (uint64_t)layer.raw() * PULSAR_TP_BATCH_MAX_ROWS * vec_bytes;
+    return s->batch_out_off + (uint64_t)layer.raw() * PULSAR_TP_BATCH_MAX_ROWS * vec_bytes;   /* raw: returned bare to its caller */
 }
 
 uint64_t pulsar_tp_slab_batch_in_offset(const pulsar_tp_slab *s, TpSlot layer, uint64_t vec_bytes) {
-    return s->batch_in_off + (uint64_t)layer.raw() * PULSAR_TP_BATCH_MAX_ROWS * vec_bytes;
+    return s->batch_in_off + (uint64_t)layer.raw() * PULSAR_TP_BATCH_MAX_ROWS * vec_bytes;   /* raw: returned bare to its caller */
 }
 
 int pulsar_tp_identity_check(const pulsar_tp_identity *mine,
@@ -3649,7 +3649,7 @@ static int tp_gate_exchange_fd(int fd, TpSlot layer, uint32_t gate, uint64_t seq
      * direction fits comfortably in the socket buffers, so the symmetric
      * write-then-read cannot deadlock.  Header and payload go out in one
      * writev so NODELAY does not split them into two segments. */
-    pulsar_tp_gate_header h = { PULSAR_TP_MAGIC, (uint16_t)layer.raw(), (uint16_t)gate, seq };
+    pulsar_tp_gate_header h = { PULSAR_TP_MAGIC, (uint16_t)layer.raw(), (uint16_t)gate, seq };   /* raw: into a bare variable */
     struct iovec iov[2] = {
         { &h, sizeof(h) },
         { slab + out_off, vec_bytes },
@@ -3684,7 +3684,7 @@ static int tp_gate_exchange_fd(int fd, TpSlot layer, uint32_t gate, uint64_t seq
     }
     pulsar_tp_gate_header ph;
     if (!tp_read_gate_header(fd, &ph)) return 0;
-    if (ph.magic != PULSAR_TP_MAGIC || ph.layer != layer.raw() || ph.gate != gate || ph.seq != seq) {
+    if (ph.magic != PULSAR_TP_MAGIC || ph.layer != layer.raw() || ph.gate != gate || ph.seq != seq) {   /* raw: compared with a bare value */
         fprintf(stderr,
                 "pulsar-tp: gate desync: got l=%u g=%u seq=%llu, want l=%u g=%u seq=%llu\n",
                 ph.layer, ph.gate, (unsigned long long)ph.seq,
@@ -3759,7 +3759,7 @@ static int tp_batch_gate_exchange_fd(int fd, TpSlot layer, uint32_t rows,
                                      uint64_t batch_out, uint64_t batch_in,
                                      uint64_t vec_bytes) {
     const uint64_t bytes = (uint64_t)rows * vec_bytes;
-    pulsar_tp_gate_header h = { PULSAR_TP_BATCH_MAGIC, (uint16_t)layer.raw(),
+    pulsar_tp_gate_header h = { PULSAR_TP_BATCH_MAGIC, (uint16_t)layer.raw(),   /* raw: into a bare variable */
                                 (uint16_t)rows, seq };
     /* TCP fallback: header first, then alternate small write/read rounds.  A
      * single 2 MiB writev round deadlocked on the pair hosts: the kernel clamps
@@ -3769,7 +3769,7 @@ static int tp_batch_gate_exchange_fd(int fd, TpSlot layer, uint32_t rows,
     if (!tp_write_full(fd, &h, sizeof(h))) return 0;
     pulsar_tp_gate_header ph;
     if (!tp_read_gate_header(fd, &ph)) return 0;
-    if (ph.magic != PULSAR_TP_BATCH_MAGIC || ph.layer != layer.raw() ||
+    if (ph.magic != PULSAR_TP_BATCH_MAGIC || ph.layer != layer.raw() ||   /* raw: compared with a bare value */
         ph.gate != rows || ph.seq != seq) {
         fprintf(stderr,
                 "pulsar-tp: batch gate desync: got l=%u rows=%u seq=%llu, "
@@ -3799,13 +3799,13 @@ int pulsar_tp_batch_gate_exchange(pulsar_tp *tp, TpSlot layer, uint32_t rows,
         pulsar_tp_slab_batch_in_offset(&tp->layout, layer, tp->vec_bytes);
     if (tp->n_ranks <= 2) {
         /* The pair is UNCHANGED. */
-        pulsar_tp_gate_header h = { PULSAR_TP_BATCH_MAGIC, (uint16_t)layer.raw(),
+        pulsar_tp_gate_header h = { PULSAR_TP_BATCH_MAGIC, (uint16_t)layer.raw(),   /* raw: into a bare variable */
                                     (uint16_t)rows, seq };
         if (tp->rdma_active && tp_rdma_big_gate_capable(tp, tp_pair_link(tp))) {
             if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
             pulsar_tp_gate_header ph;
             if (!tp_read_gate_header(tp->data_fd, &ph)) return 0;
-            if (ph.magic != PULSAR_TP_BATCH_MAGIC || ph.layer != layer.raw() ||
+            if (ph.magic != PULSAR_TP_BATCH_MAGIC || ph.layer != layer.raw() ||   /* raw: compared with a bare value */
                 ph.gate != rows || ph.seq != seq) {
                 fprintf(stderr,
                         "pulsar-tp: batch gate desync: got l=%u rows=%u seq=%llu, "
@@ -3889,11 +3889,11 @@ int pulsar_tp_big_gate_exchange(pulsar_tp *tp, TpSlot layer, uint64_t seq,
         return 1;
     }
     if (tp->data_fd < 0) return 0;
-    pulsar_tp_gate_header h = { PULSAR_TP_BATCH_MAGIC, (uint16_t)layer.raw(), 0xB16u, seq };
+    pulsar_tp_gate_header h = { PULSAR_TP_BATCH_MAGIC, (uint16_t)layer.raw(), 0xB16u, seq };   /* raw: into a bare variable */
     if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
     pulsar_tp_gate_header ph;
     if (!tp_read_gate_header(tp->data_fd, &ph)) return 0;
-    if (ph.magic != PULSAR_TP_BATCH_MAGIC || ph.layer != layer.raw() ||
+    if (ph.magic != PULSAR_TP_BATCH_MAGIC || ph.layer != layer.raw() ||   /* raw: compared with a bare value */
         ph.gate != 0xB16u || ph.seq != seq) {
         fprintf(stderr,
                 "pulsar-tp: big gate desync: got l=%u tag=%x seq=%llu, want l=%u seq=%llu\n",
@@ -3930,11 +3930,11 @@ static int tp_big_gate_exchange_fd(int fd, TpSlot layer,
                                    uint64_t seq, const void *out, void *in,
                                    uint64_t bytes) {
     if (fd < 0 || !out || !in || bytes == 0) return 0;
-    pulsar_tp_gate_header h = { PULSAR_TP_BATCH_MAGIC, (uint16_t)layer.raw(), 0xB16u, seq };
+    pulsar_tp_gate_header h = { PULSAR_TP_BATCH_MAGIC, (uint16_t)layer.raw(), 0xB16u, seq };   /* raw: into a bare variable */
     if (!tp_write_full(fd, &h, sizeof(h))) return 0;
     pulsar_tp_gate_header ph;
     if (!tp_read_gate_header(fd, &ph)) return 0;
-    if (ph.magic != PULSAR_TP_BATCH_MAGIC || ph.layer != layer.raw() ||
+    if (ph.magic != PULSAR_TP_BATCH_MAGIC || ph.layer != layer.raw() ||   /* raw: compared with a bare value */
         ph.gate != 0xB16u || ph.seq != seq) {
         fprintf(stderr,
                 "pulsar-tp: big gate desync: got l=%u tag=%x seq=%llu, want l=%u seq=%llu\n",
@@ -3979,11 +3979,11 @@ static int tp_big_gate_exchange_peer(pulsar_tp *tp, pulsar_tp_peer *pp,
      * is group-consistent by construction (see create_mesh's all_rdma). */
     if (!(tp->rdma_active && tp_rdma_big_gate_capable(tp, &pp->rdma)))
         return tp_big_gate_exchange_fd(pp->data_fd, layer, seq, out, in, bytes);
-    pulsar_tp_gate_header h = { PULSAR_TP_BATCH_MAGIC, (uint16_t)layer.raw(), 0xB16u, seq };
+    pulsar_tp_gate_header h = { PULSAR_TP_BATCH_MAGIC, (uint16_t)layer.raw(), 0xB16u, seq };   /* raw: into a bare variable */
     if (!tp_write_full(pp->data_fd, &h, sizeof(h))) return 0;
     pulsar_tp_gate_header ph;
     if (!tp_read_gate_header(pp->data_fd, &ph)) return 0;
-    if (ph.magic != PULSAR_TP_BATCH_MAGIC || ph.layer != layer.raw() ||
+    if (ph.magic != PULSAR_TP_BATCH_MAGIC || ph.layer != layer.raw() ||   /* raw: compared with a bare value */
         ph.gate != 0xB16u || ph.seq != seq) {
         fprintf(stderr, "pulsar-tp: peer big gate desync with rank %d: got l=%u tag=%x "
                         "seq=%llu, want l=%u seq=%llu\n",
@@ -4235,7 +4235,7 @@ int pulsar_tp_send_sync(pulsar_tp *tp, uint64_t session_id,
 
 int pulsar_tp_send_eval(pulsar_tp *tp, uint64_t session_id,
                         uint64_t seq, TokId token) {
-    pulsar_tp_eval_command msg = { session_id, seq, token.raw(), 0 };   /* the wire's int32 */
+    pulsar_tp_eval_command msg = { session_id, seq, token.raw(), 0 };   /* raw: the wire's int32 */
     return tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_EVAL, &msg, sizeof(msg));
 }
 
@@ -4282,7 +4282,7 @@ int pulsar_tp_recv_chunk_verdict(pulsar_tp *tp, uint64_t session_id, int *stop,
 }
 
 int pulsar_tp_send_rewind(pulsar_tp *tp, uint64_t session_id, TokPos pos) {
-    pulsar_tp_value_command msg = { session_id, (int32_t)pos.raw(), 0 };   /* the wire's int32 */
+    pulsar_tp_value_command msg = { session_id, (int32_t)pos.raw(), 0 };   /* raw: the wire's int32 */
     return tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_REWIND,
                          &msg, sizeof(msg));
 }
@@ -4365,13 +4365,13 @@ static int tp_send_bank_value(pulsar_tp *tp, uint32_t type, uint64_t session_id,
     return tp_send_frame_to_peers(tp, type, &msg, sizeof(msg));
 }
 int pulsar_tp_send_bank_state_save(pulsar_tp *tp, uint64_t session_id, BankId bank) {
-    return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_STATE_SAVE, session_id, (uint32_t)bank.raw());
+    return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_STATE_SAVE, session_id, (uint32_t)bank.raw());   /* raw: into tp_send_bank_value()'s bare parameter */
 }
 int pulsar_tp_send_bank_state_restore(pulsar_tp *tp, uint64_t session_id, BankId bank) {
-    return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_STATE_RESTORE, session_id, (uint32_t)bank.raw());
+    return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_STATE_RESTORE, session_id, (uint32_t)bank.raw());   /* raw: into tp_send_bank_value()'s bare parameter */
 }
 int pulsar_tp_send_bank_repoint(pulsar_tp *tp, uint64_t session_id, BankId bank) {
-    return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_REPOINT, session_id, (uint32_t)bank.raw());
+    return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_REPOINT, session_id, (uint32_t)bank.raw());   /* raw: into tp_send_bank_value()'s bare parameter */
 }
 
 /* The verdict collector behind pulsar_tp_wait_command_status (want_digest 0)
@@ -4597,10 +4597,10 @@ int pulsar_tp_send_segment_reconcile(pulsar_tp *tp, const char *keys, uint32_t n
 }
 
 int pulsar_tp_send_bank_free_physical(pulsar_tp *tp, uint64_t session_id, BankId bank) {
-    return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_FREE_PHYSICAL, session_id, (uint32_t)bank.raw());
+    return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_FREE_PHYSICAL, session_id, (uint32_t)bank.raw());   /* raw: into tp_send_bank_value()'s bare parameter */
 }
 int pulsar_tp_send_bank_alloc_physical(pulsar_tp *tp, uint64_t session_id, BankId bank) {
-    return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_ALLOC_PHYSICAL, session_id, (uint32_t)bank.raw());
+    return tp_send_bank_value(tp, PULSAR_TP_FRAME_BANK_ALLOC_PHYSICAL, session_id, (uint32_t)bank.raw());   /* raw: into tp_send_bank_value()'s bare parameter */
 }
 
 /// Payload prefix of FRAME_SYNC_MM: tokens, then the image table, then the image bytes follow.

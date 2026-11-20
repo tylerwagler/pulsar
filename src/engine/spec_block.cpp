@@ -159,7 +159,7 @@ bool get_layer_types(const pulsar_model *m, const char *key, uint32_t n, uint32_
     for (DraftLayer l{0u}; l.below(n); ++l) {
         pulsar_str t = {NULL, 0};
         if (!cursor_string(&c, &t)) return refuse("%s is unreadable%s", key);
-        if (pulsar_streq(t, "full_attention")) *mask |= 1u << l.raw();
+        if (pulsar_streq(t, "full_attention")) *mask |= 1u << l.raw();   /* raw: a bare operand */
         else if (!pulsar_streq(t, "sliding_attention")) return refuse("%s: sliding_attention or full_attention%s", key);
     }
     return true;
@@ -418,7 +418,7 @@ bool pulsar_block_drafter_bind(pulsar_role_binder *b, pulsar_block_drafter *d) {
     if (d->head_kind != PULSAR_BLOCK_HEAD_PLAIN) d->head = pulsar_role_bind(b, top("head"), A_LINEAR, 2, E, d->head_rows);
     for (DraftLayer l{0u}; l.below(d->n_layer); ++l) {
         pulsar_block_layer &L = d->layer[l];
-        auto k = [&](const char *role) { return pulsar_role_in(role, BLOCK, (int32_t)l.raw()); };
+        auto k = [&](const char *role) { return pulsar_role_in(role, BLOCK, (int32_t)l.raw()); };   /* raw: into pulsar_role_in()'s bare parameter */
         L.in_norm = pulsar_role_bind(b, k("in_norm"), A_BF16, 1, E);
         L.post_norm = pulsar_role_bind(b, k("post_norm"), A_BF16, 1, E);
         L.q = pulsar_role_bind(b, k("attn_q"), A_LINEAR, 2, E, Q);
@@ -523,7 +523,7 @@ pulsar_gqa_layer gqa_decl(const pulsar_block_drafter *d, DraftLayer li, const ui
     L.kv_fmt = PULSAR_GQA_KV_E4M3;
     L.span = PULSAR_GQA_WINDOW;
     /* L338: a full layer is a PULSAR_BLOCK_FULL_KEYS window (spec_block.h); li past the layers = the widest */
-    const bool full = li.below(d->n_layer) ? ((d->full_layers >> li.raw()) & 1u) != 0 : d->full_layers != 0;
+    const bool full = li.below(d->n_layer) ? ((d->full_layers >> li.raw()) & 1u) != 0 : d->full_layers != 0;   /* raw: a bare local for the arithmetic below */
     L.window = full ? std::max(d->window, PULSAR_BLOCK_FULL_KEYS) : d->window;
     L.scale = (float)(1.0 / sqrt((double)d->head_dim));
     L.qk_norm = 1;
@@ -557,7 +557,7 @@ void pulsar_block_drafter_plan(pulsar_engine *e, pulsar_state_plan *p) {
      * past the table and the family's load refuses the model (pulsar_state_plan_slots_fit) */
     const uint32_t first = p->n_slots;
     for (DraftLayer l{0u}; l.below(d->n_layer); ++l)
-        (void)pulsar_state_plan_add_slot(p, 1u << (((d->full_layers >> l.raw()) & 1u) ? d->decl_kv_full : d->decl_kv));
+        (void)pulsar_state_plan_add_slot(p, 1u << (((d->full_layers >> l.raw()) & 1u) ? d->decl_kv_full : d->decl_kv));   /* raw: into pulsar_state_plan_add_slot()'s bare parameter */
     d->decl_anchor = UINT32_MAX;
     if (d->head_kind == PULSAR_BLOCK_HEAD_LILICORR) {   /* the candidate head reads cn of the last committed row */
         pulsar_state_decl anchor{"draft_anchor", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_NONE, false, false, 0,
@@ -1097,7 +1097,7 @@ bool linears(pulsar_session *s, int n, const pulsar_tensor *const *t, int in, co
         st[j] = stage + off;
         off += (uint64_t)rows * (uint64_t)out[j];
     }
-    return pulsar_rows_linear_multi_bf16_launch(lp, n, x, (int)rows, st, yb, ws, ws_bytes.raw(), 0) == 0 || fail(what);
+    return pulsar_rows_linear_multi_bf16_launch(lp, n, x, (int)rows, st, yb, ws, ws_bytes.raw(), 0) == 0 || fail(what);   /* raw: a device-API argument (pulsar_rows_linear_multi_bf16_launch) */
 }
 
 /* bank b's ring of drafter layer l, as a GQA sequence */
@@ -1108,15 +1108,15 @@ bool linears(pulsar_session *s, int n, const pulsar_tensor *const *t, int in, co
 /// @return the ring (zeroed when its state tensor is missing)
 pulsar_gqa_seq ring_of(const pulsar_session *s, const pulsar_block_drafter *d, DraftLayer l, uint32_t b) {
     const pulsar_state_set *ss = s->states;
-    const uint32_t dc = ((d->full_layers >> l.raw()) & 1u) ? d->decl_kv_full : d->decl_kv;   /* L338: a full layer's ring */
+    const uint32_t dc = ((d->full_layers >> l.raw()) & 1u) ? d->decl_kv_full : d->decl_kv;   /* raw: L338: a full layer's ring */
     pulsar_gpu_tensor *t = pulsar_state_tensor(ss, pulsar_drafter_slot(ss->plan, l), dc);
     const pulsar_state_decl &dk = ss->plan->decl[dc];
     const TensorBytes bb = pulsar_state_decl_bank_bytes(&dk);
     pulsar_gqa_seq q{};   /* the kernel's descriptor: raw bytes and a row count (the launch boundary) */
     if (!t) return q;
-    q.kv = (uint8_t *)dptr(t) + bb.times(b).raw();
-    q.bytes = bb.raw();
-    q.cap = (uint32_t)(bb.raw() / dk.bytes.raw());
+    q.kv = (uint8_t *)dptr(t) + bb.times(b).raw();   /* raw: into the bare field kv */
+    q.bytes = bb.raw();   /* raw: into the bare field bytes */
+    q.cap = (uint32_t)(bb.raw() / dk.bytes.raw());   /* raw: into the bare field cap */
     return q;
 }
 
@@ -1185,7 +1185,7 @@ bool absorb_rows(pulsar_session *s, uint32_t row0, const int32_t *pos, const Ban
             io.k = {kb, KV, d->head_dim};
             io.v = {vb, KV, d->head_dim};
             io.workspace = pulsar_slab_at(base, A.gqa);
-            io.workspace_bytes = A.gqa_bytes.raw();
+            io.workspace_bytes = A.gqa_bytes.raw();   /* raw: into the bare field workspace_bytes */
             if (!G.q_norm_w || !G.k_norm_w ||
                 pulsar_gqa_store(&G, l->seqs.data(), ns, l->row_seq.data(), l->row_pos.data(), m, &io, 0) != 0)
                 return fail("the context store refused");
@@ -1277,8 +1277,8 @@ bool draft_pass(pulsar_session *s, const BankId *banks, const uint32_t *pos, con
         for (uint32_t i = 0; i < nb; i++) l->seqs[i] = ring_of(s, d, li, pulsar_bank_index(banks[i]));
         ok = G[li].q_norm_w && G[li].k_norm_w &&
              pulsar_gqa_plan(&G[li], l->seqs.data(), nb, l->row_seq.data(), l->row_pos.data(), R, bound,
-                             pulsar_slab_at(l->h_desc, SlabOff::after(D.desc_stride.times(li.raw()))),
-                             D.desc_stride.raw(), &l->call[li]) == 0;
+                             pulsar_slab_at(l->h_desc, SlabOff::after(D.desc_stride.times(li.raw()))),   /* raw: a scale factor */
+                             D.desc_stride.raw(), &l->call[li]) == 0;   /* raw: into pulsar_gqa_plan()'s bare parameter */
     }
     ok = ok && pulsar_gpu_tensor_write_async(l->arena, D.desc.before(), l->h_desc,
                                              D.desc_stride.times(d->n_layer)) != 0;
@@ -1345,10 +1345,10 @@ bool draft_pass(pulsar_session *s, const BankId *banks, const uint32_t *pos, con
             io.out_bf16 = a;
             io.ld_out = Q;
             io.workspace = pulsar_slab_at(base, D.gqa);
-            io.workspace_bytes = D.gqa_bytes.raw();
+            io.workspace_bytes = D.gqa_bytes.raw();   /* raw: into the bare field workspace_bytes */
             io.nf_flag = pulsar_slab_at<uint32_t>(base, D.nf);   /* O59: read back after the pass, on a widening build */
-            io.nf_code = 0x42000000u | li.raw();
-            if (pulsar_gqa_launch(&G[li], &l->call[li], pulsar_slab_at(base, D.desc + D.desc_stride.times(li.raw())), &io, 0) != 0)
+            io.nf_code = 0x42000000u | li.raw();   /* raw: into the bare field nf_code */
+            if (pulsar_gqa_launch(&G[li], &l->call[li], pulsar_slab_at(base, D.desc + D.desc_stride.times(li.raw())), &io, 0) != 0)   /* raw: a scale factor */
                 return fail("the block attention refused");
             {
                 const pulsar_tensor *w[1] = {L.o};
@@ -1417,7 +1417,7 @@ bool draft_pass(pulsar_session *s, const BankId *banks, const uint32_t *pos, con
                                                pulsar_slab_at<const float>(base, D.cand_lp), table, pulsar_slab_at<const uint16_t>(base, D.pass),
                                                pulsar_slab_at<const uint16_t>(base, D.anchor), pulsar_slab_at<const uint8_t>(base, D.valid),
                                                pulsar_slab_at<float>(base, D.scores), pulsar_slab_at<int32_t>(base, D.chain_ids),
-                                               pulsar_slab_at<int32_t>(base, D.chain_rows), pulsar_slab_at(base, D.head_ws), D.head_ws_bytes.raw(),
+                                               pulsar_slab_at<int32_t>(base, D.chain_rows), pulsar_slab_at(base, D.head_ws), D.head_ws_bytes.raw(),   /* raw: a device-API argument (pulsar_lilicorr_head_launch) */
                                                0) == 0 ||
                    fail("the candidate head refused");
         if (!sel) return true;
@@ -1517,7 +1517,7 @@ bool draft_pass(pulsar_session *s, const BankId *banks, const uint32_t *pos, con
             passes--;
             int32_t bk[kDraftRows], P[kDraftRows];
             for (uint32_t i = 0; i < nb; i++) {
-                bk[i] = banks[i].raw();
+                bk[i] = banks[i].raw();   /* raw: a bare operand */
                 P[i] = (int32_t)pos[i];
             }
             const uint32_t hdr[4] = {nb, B, E, K};
@@ -1579,7 +1579,7 @@ bool draft_chains(pulsar_session *s, const BankId *banks, uint64_t *const *rngs,
             }
             pb[nb] = banks[i];
             pp[nb] = P;
-            pc[nb] = q->next_base.raw();
+            pc[nb] = q->next_base.raw();   /* raw: a bare operand */
             pi[nb++] = i;
         }
         i0 = i;
@@ -1658,7 +1658,7 @@ bool draft_chains(pulsar_session *s, const BankId *banks, uint64_t *const *rngs,
                 uint32_t pick = 0;
                 if (q->temperature <= 0.0f) {
                     q->refined[j] = TokId{l->chain_ids[(size_t)b * SL + j - 1]};   /* the device walk's int32 */
-                    while (pick < TK && cand[(j - 1) * TK + pick] != q->refined[j].raw()) pick++;
+                    while (pick < TK && cand[(j - 1) * TK + pick] != q->refined[j].raw()) pick++;   /* raw: compared with a bare value */
                 } else {
                     const int dt = drawn[(size_t)chain_of[b] * SL + j - 1];   /* THE sampler's draw over the slot's candidates */
                     if (dt < 0) {
@@ -1724,7 +1724,7 @@ bool block_absorb_banked(pulsar_session *s, const uint32_t *rows, const BankId *
     if (n > PULSAR_DRIVER_HEADS_MAX) return fail("an absorb wider than the verify");
     /* one call a bank's run of consecutive step rows (the taps are addressed by the step row) */
     for (uint32_t i = 0; i < n;) {
-        const uint32_t b = (uint32_t)banks[i].raw();   /* refused below when outside the pool (none() included) */
+        const uint32_t b = (uint32_t)banks[i].raw();   /* raw: refused below when outside the pool (none() included) */
         uint32_t j = i + 1;
         while (j < n && banks[j] == banks[i]) j++;
         bool run = b < ss->n_banks && ss->bank_pos[b] >= TokPos::after(TokCount{(int)(j - i)});
@@ -1735,7 +1735,7 @@ bool block_absorb_banked(pulsar_session *s, const uint32_t *rows, const BankId *
         const pulsar_step_run kept{StepRow{(int)rows[i]}, ss->bank_pos[b] - TokCount{(int)(j - i)},
                                    StepRows{(int)(j - i)}};
         for (uint32_t r = i; r < j; r++) {
-            pos[r] = kept.pos_of(StepRow{(int)rows[r]}).raw();
+            pos[r] = kept.pos_of(StepRow{(int)rows[r]}).raw();   /* raw: a bare operand */
             bank[r] = banks[i];
         }
         if (!absorb_rows(s, rows[i], pos + i, bank + i, j - i, false)) return false;

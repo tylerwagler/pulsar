@@ -400,7 +400,7 @@ int worker_force_generated_text(agent_worker *w,
         return 1;
     }
     for (int i = 0; i < tokens.len && *generated < max_tokens; i++) {
-        if (worker_accept_generated_token(w, tokens.v[i].raw(), generated, t0,
+        if (worker_accept_generated_token(w, tokens.v[i].raw(), generated, t0,   /* raw: into worker_accept_generated_token()'s bare parameter */
                                           stream, err, err_len) != 0) {
             pulsar_tokens_free(&tokens);
             return 1;

@@ -365,7 +365,7 @@ void server::responses_live_remember(session_slot *sl, const char *visible_text,
             id_list_push_unique(&sl->responses_live.call_ids, calls->v[i].id);
         }
     }
-    sl->responses_live.live_tokens = TokCount{s->slot_frontier_pos(sl).raw()};   /* the tokens before the frontier */
+    sl->responses_live.live_tokens = TokCount{s->slot_frontier_pos(sl).raw()};   /* raw: the tokens before the frontier */
     sl->responses_live.valid = true;
 }
 
@@ -379,7 +379,7 @@ void server::anthropic_live_remember(session_slot *sl, const tool_calls *calls) 
     for (int i = 0; i < calls->len; i++) {
         id_list_push_unique(&sl->anthropic_live.call_ids, calls->v[i].id);
     }
-    sl->anthropic_live.live_tokens = TokCount{s->slot_frontier_pos(sl).raw()};   /* the tokens before the frontier */
+    sl->anthropic_live.live_tokens = TokCount{s->slot_frontier_pos(sl).raw()};   /* raw: the tokens before the frontier */
     sl->anthropic_live.valid = sl->anthropic_live.call_ids.len > 0;
 }
 
@@ -511,7 +511,7 @@ session_slot *server::live_slot_for_ids(const stop_list *ids,
         /* L380: a yielded terminal checkpoint left the bank inside its turn; the binding stands at the turn's end,
          * and the continuation is built from the kept turn (anthropic_live_continuation_prompt) */
         const pulsar_tokens *turn = s->slot_interrupted_turn(sl);
-        const int pos = !sl->provisioned ? -1 : turn ? turn->len : s->slot_frontier_pos(sl).raw();
+        const int pos = !sl->provisioned ? -1 : turn ? turn->len : s->slot_frontier_pos(sl).raw();   /* raw: a bare local for the arithmetic below */
         if (live_state_matches_ids_locked(st, ids, pos)) found = sl;
     }
     pthread_mutex_unlock(&s->tool_mu);

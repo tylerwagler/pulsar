@@ -60,7 +60,7 @@ void imatrix_collector_free(pulsar_imatrix_collector *c) {
 /// @param expert the expert
 /// @return its gate / up input sum of squares, [PULSAR_N_EMBD] floats
 static float *imatrix_gate_up_ptr(pulsar_imatrix_collector *c, TrunkLayer il, uint32_t expert) {
-    return c->gate_up_sum2 + ((size_t)il.raw() * PULSAR_N_EXPERT + expert) * PULSAR_N_EMBD;
+    return c->gate_up_sum2 + ((size_t)il.raw() * PULSAR_N_EXPERT + expert) * PULSAR_N_EMBD;   /* raw: returned bare to its caller */
 }
 
 
@@ -70,7 +70,7 @@ static float *imatrix_gate_up_ptr(pulsar_imatrix_collector *c, TrunkLayer il, ui
 /// @param expert the expert
 /// @return its down input sum of squares, [PULSAR_N_FF_EXP] floats
 static float *imatrix_down_ptr(pulsar_imatrix_collector *c, TrunkLayer il, uint32_t expert) {
-    return c->down_sum2 + ((size_t)il.raw() * PULSAR_N_EXPERT + expert) * PULSAR_N_FF_EXP;
+    return c->down_sum2 + ((size_t)il.raw() * PULSAR_N_EXPERT + expert) * PULSAR_N_FF_EXP;   /* raw: returned bare to its caller */
 }
 
 
@@ -234,19 +234,19 @@ bool imatrix_collector_save(
         char name[256];
         snprintf(name, sizeof(name), "%.*s", (int)layer->ffn_gate_exps->name.len, layer->ffn_gate_exps->name.ptr);
         imatrix_write_entry(fp, name,
-                            c->gate_up_sum2 + (size_t)il.raw() * PULSAR_N_EXPERT * PULSAR_N_EMBD,
+                            c->gate_up_sum2 + (size_t)il.raw() * PULSAR_N_EXPERT * PULSAR_N_EMBD,   /* raw: into imatrix_write_entry()'s bare parameter */
                             c->gate_up_count[il],
                             PULSAR_N_EXPERT,
                             PULSAR_N_EMBD);
         snprintf(name, sizeof(name), "%.*s", (int)layer->ffn_up_exps->name.len, layer->ffn_up_exps->name.ptr);
         imatrix_write_entry(fp, name,
-                            c->gate_up_sum2 + (size_t)il.raw() * PULSAR_N_EXPERT * PULSAR_N_EMBD,
+                            c->gate_up_sum2 + (size_t)il.raw() * PULSAR_N_EXPERT * PULSAR_N_EMBD,   /* raw: into imatrix_write_entry()'s bare parameter */
                             c->gate_up_count[il],
                             PULSAR_N_EXPERT,
                             PULSAR_N_EMBD);
         snprintf(name, sizeof(name), "%.*s", (int)layer->ffn_down_exps->name.len, layer->ffn_down_exps->name.ptr);
         imatrix_write_entry(fp, name,
-                            c->down_sum2 + (size_t)il.raw() * PULSAR_N_EXPERT * PULSAR_N_FF_EXP,
+                            c->down_sum2 + (size_t)il.raw() * PULSAR_N_EXPERT * PULSAR_N_FF_EXP,   /* raw: into imatrix_write_entry()'s bare parameter */
                             c->down_count[il],
                             PULSAR_N_EXPERT,
                             PULSAR_N_FF_EXP);
@@ -724,7 +724,7 @@ static bool gpu_graph_prefill_layer_major_inner(
          * GPU by however far the host has run ahead, and the chunk driver's
          * end-of-chunk report covers whatever is still in flight when the loop
          * ends -- so a client sees true progress and the GPU never waits for it. */
-        while (layers_reported <= il.raw() &&
+        while (layers_reported <= il.raw() &&   /* raw: compared with a bare value */
                pulsar_gpu_marker_done(layer_marker[TrunkLayer{layers_reported}])) {
             layers_reported++;
             gpu_graph_report_prefill_display_progress(display_progress,
@@ -1262,8 +1262,8 @@ pulsar_context_memory pulsar_context_memory_estimate(
     m.prefill_cap = gpu_graph_prefill_cap_for_prompt((int)ctx, prefill_chunk);
     m.raw_cap = gpu_graph_raw_cap_for_context((int)ctx, m.prefill_cap);
     m.comp_cap = gpu_graph_comp_cap_max(ctx);
-    m.raw_bytes = gpu_graph_raw_ring_bytes_for_context(m.raw_cap).raw();   /* pulsar.h's estimate struct: printed */
-    m.comp_index_bytes = gpu_graph_comp_index_bytes_for_context(ctx).raw();
+    m.raw_bytes = gpu_graph_raw_ring_bytes_for_context(m.raw_cap).raw();   /* raw: pulsar.h's estimate struct: printed */
+    m.comp_index_bytes = gpu_graph_comp_index_bytes_for_context(ctx).raw();   /* raw: into the bare field comp_index_bytes */
     uint64_t kv_bytes = 0;
     m.total_bytes = gpu_graph_context_bytes_for_kv_policy(ctx, m.raw_cap, m.prefill_cap, &kv_bytes);
     m.scratch_bytes = m.total_bytes - kv_bytes;

@@ -151,7 +151,7 @@ bool read_layer_types(const pulsar_model *m, uint32_t n, uint64_t *mask) {
         pulsar_str t = {NULL, 0};
         if (!cursor_string(&c, &t)) return refuse("%s is unreadable%s", key);
         if (pulsar_streq(t, "full_attention")) {
-            *mask |= 1ull << il.raw();
+            *mask |= 1ull << il.raw();   /* raw: a bare operand */
         } else if (!pulsar_streq(t, "sliding_attention")) {
             char why[96];
             snprintf(why, sizeof(why), "[%u] = '%.*s': sliding_attention or full_attention", il.raw(), (int)(t.len < 40 ? t.len : 40),

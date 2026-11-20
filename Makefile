@@ -2130,7 +2130,16 @@ KV_HEADROOM_MODEL ?= $(call need_path,KV_HEADROOM_MODEL)
 # warning, and greps the log for both formats (gcc's `: warning:`, nvcc's front-end `: warning #NNN-D:`).  CUTLASS is
 # -isystem: its own headers raise about 16,000 under -Wextra and aren't ours.  Both run before the runner: a build's memory
 # beside the accounting gate would fail it.
-.PHONY: warnings-gate doxygen-gate
+.PHONY: warnings-gate doxygen-gate units-gate
+# L445: the strong-types series' grep-level enforcement (tests/units_gate.py; the compiled half is pulsar_units.h's L445
+# section): every .raw() in src outside the units header, src/cuda's .cu files and the test sources is a log / format
+# argument or tagged `/* raw: <reason> */`; no unit built from another value's .raw() but a tagged named crossing; no
+# new bare int / uint32_t / size_t declaration named for a token, position, bank, slot, layer, row, job id or byte count
+# in the src/server, src/engine, src/lib and src/families headers beyond tests/units_decl_allow.txt (which only shrinks).
+# --self-test plants one violation of each kind and checks the gate fails on it.
+units-gate:
+	python3 tests/units_gate.py --self-test > /dev/null || { python3 tests/units_gate.py --self-test; echo "UNITS GATE: FAIL (self-test)"; exit 1; }
+	python3 tests/units_gate.py raw wrap decl
 warnings-gate:
 	@d=$$(mktemp -d $${TMPDIR:-/var/tmp}/pulsar-warnings-XXXXXX) || exit 1; \
 	trap 'rm -rf "$$d"' EXIT; \

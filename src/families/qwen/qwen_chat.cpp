@@ -223,7 +223,7 @@ void content_with_images(writer &w, const qwen_msg_in &m) {
     std::vector<std::pair<size_t, size_t>> lits;   /* the literals' ranges in r */
     size_t at = 0;
     for (int k = 0; k < m.n_images; k++) {
-        const size_t at_k = m.image_at[k].raw();   /* L440: an index into `c`, the content this renderer was handed */
+        const size_t at_k = m.image_at[k].raw();   /* raw: L440: an index into `c`, the content this renderer was handed */
         const size_t off = at_k < n ? at_k : n;
         r.append(c + at, off - at);
         lits.push_back({r.size(), r.size() + sizeof kVisionLiteral - 1});

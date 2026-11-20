@@ -168,7 +168,7 @@ bool qwen_vision_bind(const pulsar_model *m, pulsar_qwen_vision_weights_dev *w, 
     QV1(w->patch_b, "model.visual.patch_embed.proj.bias", D);
     QV2(w->pos_embed, "model.visual.pos_embed.weight", D, S);
     for (VisLayer l{0u}; l.below(PULSAR_QWEN_VISION_LAYERS); ++l) {
-        pulsar_qwen_vision_block_dev *b = &w->block[l.raw()];
+        pulsar_qwen_vision_block_dev *b = &w->block[l.raw()];   /* raw: an index into a bare array */
 #define QVB1(field, suffix, n0) do { snprintf(name, sizeof name, "model.visual.blocks.%u.%s", l.raw(), (suffix)); QV1(field, name, n0); } while (0)
 #define QVB2(field, suffix, n0, n1) do { snprintf(name, sizeof name, "model.visual.blocks.%u.%s", l.raw(), (suffix)); QV2(field, name, n0, n1); } while (0)
         QVB1(b->norm1_w, "norm1.weight", D);

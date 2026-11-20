@@ -388,7 +388,7 @@ bool step_linear(const pulsar_qwen_step *st, const pulsar_tensor *t, int in, int
     return arm_segments(st, 0, st->n_rows, [&](bool prompt, uint32_t r0, uint32_t m) {
         pulsar_rows_linear l;
         return linear_dev(st, t, in, out, prompt, what, &l) &&
-               pulsar_rows_linear_launch(&l, x + (size_t)r0 * in, (int)m, y + (size_t)r0 * out, ws, ws_bytes.raw(), 0) == 0;
+               pulsar_rows_linear_launch(&l, x + (size_t)r0 * in, (int)m, y + (size_t)r0 * out, ws, ws_bytes.raw(), 0) == 0;   /* raw: a device-API argument (pulsar_rows_linear_launch) */
     });
 }
 
@@ -419,7 +419,7 @@ bool step_linear_multi(const pulsar_qwen_step *st, int n, const pulsar_tensor *c
             lp[j] = &l[j];
             yr[j] = y[j] + (size_t)r0 * (size_t)out[j];
         }
-        return pulsar_rows_linear_multi_launch(lp, n, x + (size_t)r0 * in, (int)m, yr, ws, ws_bytes.raw(), 0) == 0;
+        return pulsar_rows_linear_multi_launch(lp, n, x + (size_t)r0 * in, (int)m, yr, ws, ws_bytes.raw(), 0) == 0;   /* raw: a device-API argument (pulsar_rows_linear_multi_launch) */
     });
 }
 
@@ -897,8 +897,8 @@ uint32_t pulsar_qwen_s4_ple_read_ahead(const pulsar_qwen_weights *w, uint64_t ta
         if (!prompt[i].below(io->layout.vocab)) return 0;   /* the embed refuses it by name */
     pulsar_qwen_ngram_ctx c;
     pulsar_qwen_ngram_ctx_init(&io->layout, &c);
-    if (from >= 2u) c.prev[0] = prompt[from - 2u].raw();
-    if (from >= 1u) c.prev[1] = prompt[from - 1u].raw();
+    if (from >= 2u) c.prev[0] = prompt[from - 2u].raw();   /* raw: into the bare field prev */
+    if (from >= 1u) c.prev[1] = prompt[from - 1u].raw();   /* raw: into the bare field prev */
     const uint32_t n = to - from;
     std::vector<uint64_t> ids((size_t)n * PULSAR_QWEN_NGRAM_COLS);
     pulsar_qwen_ngram_rows(&io->layout, &c, pulsar_tok_ids_raw(prompt + from), n, ids.data());
@@ -959,7 +959,7 @@ bool pulsar_qwen_s4_ple(const pulsar_qwen_step *st, LayerSlot il) {
         const uint32_t e = decode ? q + 1u : (st->n_runs ? st->run_first[q + 1] : n);
         seq_first[q] = (int32_t)f;
         seq_rows[q] = (int32_t)(e - f);
-        seq_bank[q] = st->bank[f].raw();   /* the uploaded map is int32 */
+        seq_bank[q] = st->bank[f].raw();   /* raw: the uploaded map is int32 */
         for (uint32_t r = f; r < e; r++) { row_seq[r] = (int32_t)q; row_j[r] = (int32_t)(r - f); }
     }
     /* L289: enqueued behind layer 0, not waited for -- the host goes on queueing the step */
@@ -997,7 +997,7 @@ bool pulsar_qwen_s4_ple(const pulsar_qwen_step *st, LayerSlot il) {
                                    st->verify ? (int)st->n_dec : 0};
     return pulsar_qwen_ple_launch(&w, key, value, (uint16_t *)dptr(st->streams), (int)n,
                                   &rows, (float *)dptr(pulsar_state_tensor(st->states, il, PULSAR_QWEN_STATE_PLE_CONV)),
-                                  pulsar_slab_at(base, p.ws), p.ws_bytes.raw(), 0) == 0;
+                                  pulsar_slab_at(base, p.ws), p.ws_bytes.raw(), 0) == 0;   /* raw: a device-API argument (pulsar_qwen_ple_launch) */
 }
 
 bool pulsar_qwen_s4_gr_read(const pulsar_qwen_step *st, LayerSlot il, pulsar_qwen_gr_side side) {
@@ -1020,7 +1020,7 @@ bool pulsar_qwen_s4_gr_read(const pulsar_qwen_step *st, LayerSlot il, pulsar_qwe
         pulsar_qwen_gr_dev w;
         return gr_dev(st, gw, prompt, &w) &&
                pulsar_qwen_gr_read_launch(&w, streams + r0 * HC, (int)m, x + r0 * H, inj + (size_t)r0 * PULSAR_QWEN_HC,
-                                          pulsar_slab_at(base, g.ws), g.ws_bytes.raw(), 0) == 0;
+                                          pulsar_slab_at(base, g.ws), g.ws_bytes.raw(), 0) == 0;   /* raw: a device-API argument (pulsar_qwen_gr_read_launch) */
     });
 }
 
@@ -1080,7 +1080,7 @@ static bool moe_block(const pulsar_qwen_step *st, LayerSlot il) {
     uint8_t *base = (uint8_t *)dptr(sc);
     const pulsar_moe_block_shape bs = moe_block_shape(s);
     pulsar_moe_block_parts parts;
-    if (pulsar_moe_block_carve(&bs, (int)n, pulsar_slab_at(base, m.ws), m.ws_bytes.raw(), &parts) != 0) return false;
+    if (pulsar_moe_block_carve(&bs, (int)n, pulsar_slab_at(base, m.ws), m.ws_bytes.raw(), &parts) != 0) return false;   /* raw: into pulsar_moe_block_carve()'s bare parameter */
     /* the shared expert, sigmoid-gated, added after the routed sum -- under expert parallelism rank 0's alone.
      * Keyed on its FORMAT (task #44): three EXL3 dense slices ride the EXL3 routed launches (mmq/exl3_moe.cuh);
      * any other format, or a Tessera routed arm, runs its own launches after the routed sum.  L288 exl3-dense: a
@@ -1141,7 +1141,7 @@ static bool moe_block(const pulsar_qwen_step *st, LayerSlot il) {
     rc.ws = parts.routed;
     rc.ws_bytes = parts.routed_bytes;
     rc.nf_flag = pulsar_slab_at<uint32_t>(base, m.nf);
-    rc.nf_code = 0x51000000u | il.raw();
+    rc.nf_code = 0x51000000u | il.raw();   /* raw: into the bare field nf_code */
     pulsar_tessera_proj tp[PULSAR_QWEN_TESS_PROJS];
     if (L.moe_tess[PULSAR_QWEN_TESS_GATE][PULSAR_QWEN_TESS_WORDS]) {
         /* L255: the layer's experts are Tessera planes; the front door reads them through tp, built once here and
@@ -1267,7 +1267,7 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n, 
         pulsar_qwen_gr_dev w;
         return gr_dev(st, *st->mixer, prompt, &w) &&
                pulsar_qwen_gr_read_launch(&w, streams + r0 * HC, (int)m, (uint16_t *)xb + (size_t)(r0 - row0) * H, NULL,
-                                          pulsar_slab_at(base, h.ws), h.ws_bytes.raw(), 0) == 0;
+                                          pulsar_slab_at(base, h.ws), h.ws_bytes.raw(), 0) == 0;   /* raw: a device-API argument (pulsar_qwen_gr_read_launch) */
     });
     if (ok) {
         /* The head is a dense Linear of the mixer's bf16 rows, through the core's bf16-rows front door
@@ -1316,7 +1316,7 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n, 
             auto head = [&](uint32_t lo, uint32_t width, pulsar_gpu_tensor *dst) {
                 if (!dh && tp > 1 && (lo != v_lo || width != Vl)) return false;
                 return pulsar_rows_linear_launch(&l, (const uint16_t *)xb, (int)n, (float *)dptr(dst), pulsar_slab_at(base, h.lin_ws),
-                                                 h.lin_ws_bytes.raw(), 0) == 0;
+                                                 h.lin_ws_bytes.raw(), 0) == 0;   /* raw: a device-API argument (pulsar_rows_linear_launch) */
             };
             if (ok && (tp == 1 || dh)) {
                 ok = head(0, rows, dst);
@@ -1368,7 +1368,7 @@ bool pulsar_qwen_s4_mtp_combine(const pulsar_qwen_step *st, const void *h) {
     d.fc_hidden = {fh, fh + (uint64_t)H * H, H, H};
     return pulsar_qwen_mtp_combine_launch(&d, (const uint16_t *)h, (const int32_t *)dptr(st->st->mtp_tok), (int)n,
                                           (uint16_t *)dptr(st->streams), dptr(st->st->mtp_ws),
-                                          pulsar_gpu_tensor_bytes(st->st->mtp_ws).raw(), 0) == 0 ||
+                                          pulsar_gpu_tensor_bytes(st->st->mtp_ws).raw(), 0) == 0 ||   /* raw: a device-API argument (pulsar_qwen_mtp_combine_launch) */
            fail("the MTP combine failed");
 }
 
@@ -1478,7 +1478,7 @@ bool pulsar_qwen_s2_gdn(const pulsar_qwen_step *st, LayerSlot il) {
     c.rec_fold_rows = c.rec_fold ? (const float *)pulsar_state_capture_rows(st->states, il, PULSAR_QWEN_STATE_GDN_REC)
                                  : NULL;
     if (c.rec_fold && !c.rec_fold_rows) return fail("a folding state with no GDN delta records");
-    c.scratch = pulsar_slab_at(base, g.ws); c.scratch_bytes = g.ws_bytes.raw();
+    c.scratch = pulsar_slab_at(base, g.ws); c.scratch_bytes = g.ws_bytes.raw();   /* raw: into the bare field scratch */
     c.out_f32 = NULL;                               /* the bf16 row is the consumer's input, not f32 */
     c.out_bf16 = pulsar_slab_at(base, g.obf16);                    /* L251 / ac69748f: no E4M3 slot in this family */
     if (st->mode == PULSAR_STEP_DECODE) {      /* one row per bank */

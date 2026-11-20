@@ -1024,11 +1024,11 @@ struct prompt_view {
     /** The token at `i` (fatal on none(); the caller keeps i below end()).
      *  @param i a position of this prompt */
     /// @return its id
-    TokId at(PromptPos i) const { return t->v[i.before().raw()]; }
+    TokId at(PromptPos i) const { return t->v[i.before().raw()]; }   /* raw: an index into a bare array */
     /** The tokens from `i` on, for a run the engine reads in place.
      *  @param i a position of this prompt */
     /// @return the array at i
-    const TokId *from(PromptPos i) const { return t->v + i.before().raw(); }
+    const TokId *from(PromptPos i) const { return t->v + i.before().raw(); }   /* raw: named crossing into const */
     /** The array itself, for the engine's API (which takes pulsar_tokens and stitches or matches it itself). */
     /// @return the borrowed tokens
     const pulsar_tokens *tokens() const { return t; }
@@ -1082,11 +1082,11 @@ public:
     /** The prompt index a position on the bank is -- the identity the witness proves.
      *  @param live a position on the bank, at or past where the gate found it */
     /// @return the same token's index in the prompt
-    PromptPos at(TokPos live) const { return require(), PromptPos::after(PromptToks{live.before().raw()}); }
+    PromptPos at(TokPos live) const { return require(), PromptPos::after(PromptToks{live.before().raw()}); }   /* raw: the named crossing at() */
     /** The position on the bank a prompt index is -- the same identity, read the other way.
      *  @param i an index of the prompt */
     /// @return the bank position
-    TokPos live_at(PromptPos i) const { return require(), TokPos::after(TokCount{i.before().raw()}); }
+    TokPos live_at(PromptPos i) const { return require(), TokPos::after(TokCount{i.before().raw()}); }   /* raw: the named crossing live_at() */
     /** The prompt's token that goes at a position on the bank.
      *  @param live the position (below end()) */
     /// @return its id
@@ -1097,7 +1097,7 @@ public:
     const TokId *run(TokPos live) const { return prompt_view{p_}.from(at(live)); }
     /** Where the bank stands when the whole prompt is in: the prompt's length, as a position on the bank. */
     /// @return the end
-    TokPos end() const { return require(), TokPos::after(TokCount{prompt_view{p_}.len().raw()}); }
+    TokPos end() const { return require(), TokPos::after(TokCount{prompt_view{p_}.len().raw()}); }   /* raw: the named crossing end() */
     /** The prompt proven, for the engine calls that take it whole. */
     /// @return the view
     prompt_view prompt() const { return require(), prompt_view{p_}; }
@@ -1508,7 +1508,7 @@ inline PromptToks request_prompt_toks(const request *r) { return PromptToks{r->p
  *  length a sync runs on a bank that holds a history is the stitch's (server::slot_sync_len).
  *  @param own the prompt's tokens */
 /// @return the same number as rows of a bank
-inline TokCount prompt_rows_cold(PromptToks own) { return TokCount{own.raw()}; }
+inline TokCount prompt_rows_cold(PromptToks own) { return TokCount{own.raw()}; }   /* raw: the named crossing prompt_rows_cold() */
 
 /** L439: context admission on the length a sync RUNS (the engine's cap, sync_driver.cpp: a prompt at or past the
  *  context is refused there, and so is a token-seam stitch).  The front door admits on the request's own tokens; once
@@ -1534,7 +1534,7 @@ sync_admit server_sync_admit(TokCount ctx, TokCount sync_len, PromptToks own, bo
  *  pulsar_tokens_common_prefix; never a byte match's live_cut).
  *  @param common_by_id tokens a history and a prompt share from 0 by id */
 /// @return the same tokens as a length of the prompt
-inline PromptToks id_prefix_as_prompt(TokCount common_by_id) { return PromptToks{common_by_id.raw()}; }
+inline PromptToks id_prefix_as_prompt(TokCount common_by_id) { return PromptToks{common_by_id.raw()}; }   /* raw: the named crossing id_prefix_as_prompt() */
 
 /* L439: the MARKED crossings.  A typing commit changes no value: where the code it types reads a count or a position
  * of one side of a token seam as the other's, the read goes through one of these four, unconverted, and is fixed in
@@ -1544,19 +1544,19 @@ inline PromptToks id_prefix_as_prompt(TokCount common_by_id) { return PromptToks
 /** A prompt-side count read as a live-side one, unconverted (a marked crossing: see above).
  *  @param n the prompt's tokens */
 /// @return the same number as live tokens
-inline TokCount seam_unconverted_live(PromptToks n) { return TokCount{n.raw()}; }
+inline TokCount seam_unconverted_live(PromptToks n) { return TokCount{n.raw()}; }   /* raw: the named crossing seam_unconverted_live() */
 /** A prompt position read as a live one, unconverted (a marked crossing).
  *  @param p the prompt position (none() stays none()) */
 /// @return the same number as a live position
-inline TokPos seam_unconverted_live(PromptPos p) { return TokPos{p.raw()}; }
+inline TokPos seam_unconverted_live(PromptPos p) { return TokPos{p.raw()}; }   /* raw: the named crossing seam_unconverted_live() */
 /** A live-side count read as a prompt-side one, unconverted (a marked crossing).
  *  @param n the live tokens */
 /// @return the same number as prompt tokens
-inline PromptToks seam_unconverted_prompt(TokCount n) { return PromptToks{n.raw()}; }
+inline PromptToks seam_unconverted_prompt(TokCount n) { return PromptToks{n.raw()}; }   /* raw: the named crossing seam_unconverted_prompt() */
 /** A live position read as a prompt one, unconverted (a marked crossing).
  *  @param p the live position (none() stays none()) */
 /// @return the same number as a prompt position
-inline PromptPos seam_unconverted_prompt(TokPos p) { return PromptPos{p.raw()}; }
+inline PromptPos seam_unconverted_prompt(TokPos p) { return PromptPos{p.raw()}; }   /* raw: the named crossing seam_unconverted_prompt() */
 
 /** One key/value pair from a parsed JSON object. */
 typedef struct {
@@ -2054,7 +2054,7 @@ typedef struct {
  *  (the release check, the leader's cut, the fused lanes' stop).
  *  @param mark the cut (position 0: none) */
 /// @return the position on the leader's bank
-inline TokPos prefix_mark_on_bank(PromptPos mark) { return TokPos{mark.raw()}; }
+inline TokPos prefix_mark_on_bank(PromptPos mark) { return TokPos{mark.raw()}; }   /* raw: the named crossing prefix_mark_on_bank() */
 
 /** The wait's decision, pure: the lead (index into `leads`, -1 for none) whose prefill a request of `prompt_len`
  *  tokens waits on, and the cut `*mark` -- the deepest resume-grid point both prompts share, short of either's end,
@@ -2409,7 +2409,7 @@ typedef pulsar_indexed<uint32_t, SlotIdx, PULSAR_SESSION_POOL_CAP> slot_bits;
 /** L441: the bit of slot `b` in a slot_bits word.  @param b the slot (fatal past 31 or none())  @return 1 << b */
 inline uint32_t slot_bit(SlotIdx b) {
     if (!b.below(32u)) pulsar_index_fail("slot_bit");
-    return 1u << b.raw();
+    return 1u << b.raw();   /* raw: returned bare to its caller */
 }
 static_assert(PULSAR_SESSION_POOL_CAP <= 32, "a slot_bits word holds a bit for every slot");
 /** L441: the pool's hard bound as a count (every slot a slot table holds). */
@@ -3022,7 +3022,7 @@ struct server {
                     PULSAR_SESSION_POOL_CAP);
             abort();
         }
-        const BankId b = BankId::from_raw_unchecked(i.raw());   /* the identity's one entry from a slot */
+        const BankId b = BankId::from_raw_unchecked(i.raw());   /* raw: the identity's one entry from a slot */
         if (slots[i].provisioned && slots[i].bank != b) {
             fprintf(stderr, "pulsar-server: slot %u does not hold bank %d (slot i == bank i broken) -- refusing\n",
                     i.raw(), b.raw());
@@ -3121,7 +3121,7 @@ struct server {
     KvBytes test_guard_budget() const { return KvBytes{__atomic_load_n(&guard_test_budget_raw, __ATOMIC_RELAXED)}; }
     /// Set the test route's ledger budget (0 = none), an atomic write.
     /// @param b the budget
-    void set_test_guard_budget(KvBytes b) { __atomic_store_n(&guard_test_budget_raw, b.raw(), __ATOMIC_RELAXED); }
+    void set_test_guard_budget(KvBytes b) { __atomic_store_n(&guard_test_budget_raw, b.raw(), __ATOMIC_RELAXED); }   /* raw: into __atomic_store_n()'s bare parameter */
     /** L357: PULSAR_SERVER_TEST_ROUTES=1 at startup -- the /test/ routes answer; otherwise they are unknown paths. */
     bool         test_routes;
     /** L362: when spill_bank last said "nowhere to park the pool" for each bank (pulsar_mono_sec; once per 10 s) */
@@ -5227,7 +5227,7 @@ static inline GenOff gen_text_end(size_t len) { return GenOff::after(GenBytes{le
 /// @param text  the generated text (gen_state::text's bytes, or a look ahead's view of them)
 /// @param at    an offset into it
 /// @return `text` at that offset
-static inline const char *gen_text_at(const char *text, GenOff at) { return text + at.raw(); }
+static inline const char *gen_text_at(const char *text, GenOff at) { return text + at.raw(); }   /* raw: a bare operand */
 
 /** A parsed HTTP request line and body. Method and path are fixed-size because
  * anything longer than these bounds is rejected rather than allocated for. */
@@ -5365,7 +5365,7 @@ static inline ContentOff content_end(size_t len) { return ContentOff::after(Text
 /** L437: a content offset as the index the string functions under a reader take -- the ONE place it leaves its type. */
 /// @param at  an offset into a message's content
 /// @return it as a byte index
-static inline size_t content_ix(ContentOff at) { return at.raw(); }
+static inline size_t content_ix(ContentOff at) { return at.raw(); }   /* raw: a bare operand */
 /** L325: drop the message's tool_reference records (chat_expand_tool_refs has written them). */
 /// @param m  the message
 void chat_msg_clear_tool_refs(chat_msg *m);
@@ -6254,7 +6254,7 @@ void tokens_copy_prefix(pulsar_tokens *dst, const pulsar_tokens *src, TokCount n
  *  @param src the prompt
  *  @param n   how many of its tokens */
 inline void prompt_copy_prefix(pulsar_tokens *dst, prompt_view src, PromptToks n) {
-    tokens_copy_prefix(dst, src.tokens(), TokCount{n.raw()});
+    tokens_copy_prefix(dst, src.tokens(), TokCount{n.raw()});   /* raw: the named crossing prompt_copy_prefix() */
 }
 /// @param a  a token vector
 /// @param b  another

@@ -60,7 +60,7 @@ int pulsar_qwen_ngram_table_open(pulsar_engram_table *t, const char *path, Trunk
     }
     const uint64_t want = PULSAR_ENGRAM_HDR_BYTES + L->n_rows * PULSAR_QWEN_NGRAM_ROW_BYTES;
     if (!got || !sized || memcmp(hdr, "PENGRAM1", 8) != 0 || version != PULSAR_QWEN_NGRAM_FILE_VERSION ||
-        file_layer != layer.raw() || n_rows != L->n_rows || row_bytes != PULSAR_QWEN_NGRAM_ROW_BYTES ||
+        file_layer != layer.raw() || n_rows != L->n_rows || row_bytes != PULSAR_QWEN_NGRAM_ROW_BYTES ||   /* raw: compared with a bare value */
         dim * 2u != PULSAR_QWEN_NGRAM_ROW_BYTES || n_scale != 0 || dtype != PULSAR_QWEN_NGRAM_DTYPE_BF16 ||
         n_heads != PULSAR_QWEN_NGRAM_COLS || (uint64_t)st.st_size != want) {
         fprintf(stderr, "pulsar: qwen n-gram rows %s: header says %.8s v%u layer %u rows %llu record %u (dim %u, "
@@ -73,7 +73,7 @@ int pulsar_qwen_ngram_table_open(pulsar_engram_table *t, const char *path, Trunk
         return 0;
     }
     const FileOff base{PULSAR_ENGRAM_HDR_BYTES};   /* the rows start past the header */
-    return pulsar_engram_table_open_parts(t, layer.raw(), 1, &path, &base, L->n_rows, PULSAR_QWEN_NGRAM_ROW_BYTES, L->n_rows);
+    return pulsar_engram_table_open_parts(t, layer.raw(), 1, &path, &base, L->n_rows, PULSAR_QWEN_NGRAM_ROW_BYTES, L->n_rows);   /* raw: into pulsar_engram_table_open_parts()'s bare parameter */
 }
 
 void pulsar_qwen_ngram_ctx_init(const pulsar_qwen_ngram_layout *L, pulsar_qwen_ngram_ctx *ctx) {

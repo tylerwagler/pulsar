@@ -64,7 +64,7 @@ static bool server_warmup_generation(pulsar_engine *engine, pulsar_session *sess
     /* One full prefill-cap chunk plus a tail: exercises the widened chunk
      * prefill shape AND the sub-chunk tail shape.  The session's resolved
      * cap is used (the config value can be 0 = engine default). */
-    const int prefill_cap = pulsar_session_prefill_cap(session).raw();
+    const int prefill_cap = pulsar_session_prefill_cap(session).raw();   /* raw: a bare local for the arithmetic below */
     int want = prefill_cap + 64;
     if (want < 64) want = 64;
     if (want > ctx_size - 256) want = ctx_size - 256;
@@ -422,8 +422,8 @@ KvBytes server_bank_charge(KvBytes admitted, BankCount priced_banks, BankId bank
     if (!priced_banks.covers(bank)) return KvBytes{};   /* no pool, or no such bank */
     /* the split: bytes divided by the bank count, the remainder a byte each on the banks below it (the count and
      * the bank leave their types here, as the divisor and the remainder's rank) */
-    const uint64_t n = (uint64_t)priced_banks.raw();
-    return KvBytes{admitted.raw() / n + ((uint64_t)bank.raw() < admitted.raw() % n ? 1u : 0u)};
+    const uint64_t n = (uint64_t)priced_banks.raw();   /* raw: a bare local for the arithmetic below */
+    return KvBytes{admitted.raw() / n + ((uint64_t)bank.raw() < admitted.raw() % n ? 1u : 0u)};   /* raw: the even split of the admitted bytes over the banks, remainder first */
 }
 
 KvBytes server_bank_charges(KvBytes admitted, BankCount priced_banks, BankCount from, BankCount to) {

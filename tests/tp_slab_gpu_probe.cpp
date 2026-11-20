@@ -145,15 +145,15 @@ static int run_rank(pulsar_tp *tp, int rank) {
     }
     /* batch gate (3 rows) + big gate (256 KiB) spot checks. */
     float *bout = (float *)((uint8_t *)base +
-        pulsar_tp_slab_batch_out_offset(&s, TpSlot{10}, VEC_BYTES));
+        pulsar_tp_slab_batch_out_offset(&s, TpSlot{10u}, VEC_BYTES));
     const uint32_t bn = (uint32_t)(3u * VEC_BYTES / sizeof(float));
     for (uint32_t i = 0; i < bn; i++) bout[i] = pat(rank, 1000, i);
-    CHECK(pulsar_tp_batch_gate_exchange(tp, TpSlot{10}, 3, 1) == 1,
+    CHECK(pulsar_tp_batch_gate_exchange(tp, TpSlot{10u}, 3, 1) == 1,
           "rank %d: batch_gate failed", rank);
 
     static float big_out[65536], big_in[65536];   /* 256 KiB f32 partials */
     for (uint32_t i = 0; i < 65536; i++) big_out[i] = pat(rank, 1001, i);
-    CHECK(pulsar_tp_big_gate_exchange(tp, TpSlot{0}, 1, big_out, big_in,
+    CHECK(pulsar_tp_big_gate_exchange(tp, TpSlot{0u}, 1, big_out, big_in,
                                       sizeof(big_out)) == 1,
           "rank %d: big_gate failed", rank);
     for (uint32_t i = 0; i < 65536; i += 4096) {

@@ -1358,7 +1358,7 @@ static bool qwen_embed(const pulsar_driver_step *st) { return pulsar_qwen_s4_emb
 /// @param out0 first logits row
 /// @return pulsar_qwen_s4_head's
 static bool qwen_head(const pulsar_driver_step *st, StepRow row0, StepRows n, HeadRow out0) {
-    return pulsar_qwen_s4_head(QS(st), pulsar_row_index(row0), (uint32_t)n.raw(), pulsar_row_index(out0));
+    return pulsar_qwen_s4_head(QS(st), pulsar_row_index(row0), (uint32_t)n.raw(), pulsar_row_index(out0));   /* raw: into pulsar_qwen_s4_head()'s bare parameter */
 }
 /// pulsar_driver_ops::step_end.
 /// @param st the core driver's step (a pulsar_qwen_step)
@@ -1388,7 +1388,7 @@ static uint64_t qwen_artifact(const pulsar_engine *e) { return pulsar_qwen_of(e)
 /// @param il the layer just run
 static void qwen_dump(const pulsar_driver_step *st, TrunkLayer il) {
     gpu_graph_debug_dump_hc_tensor("qwen_h", QS(st)->streams, (uint64_t)st->n_rows * pulsar_qwen_hc_dim(&g_qwen_shape),
-                                   il.raw(), (uint32_t)st->pos[st->n_rows - 1]);
+                                   il.raw(), (uint32_t)st->pos[st->n_rows - 1]);   /* raw: a device-API argument (gpu_graph_debug_dump_hc_tensor) */
 }
 
 /* L268: the step's multi-axis rope positions (pulsar_image_rope3 over each row's bank's image records) -- NULL when

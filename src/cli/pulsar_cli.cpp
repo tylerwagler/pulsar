@@ -139,7 +139,7 @@ static void cli_prefill_progress_cb(void *ud, const char *event, TokPos current,
     if (strcmp(event, "prefill_chunk") && !is_display) return;
     if (is_display && !p->use_color) return;
 
-    int processed = current.raw() - p->base_tokens;
+    int processed = current.raw() - p->base_tokens;   /* raw: a bare local for the arithmetic below */
     if (processed < 0) processed = 0;
     if (processed > p->input_tokens) processed = p->input_tokens;
     double pct = 100.0 * (double)processed / (double)p->input_tokens;
@@ -355,7 +355,7 @@ static int run_session_generation(pulsar_engine *engine, const cli_config *cfg, 
     const double t_prefill1 = pulsar_mono_sec();
 
     int max_tokens = cfg->gen.n_predict;
-    int room = (pulsar_session_ctx(session) - pulsar_session_pos(session).before()).raw();
+    int room = (pulsar_session_ctx(session) - pulsar_session_pos(session).before()).raw();   /* raw: a bare local for the arithmetic below */
     if (room <= 1) max_tokens = 0;
     else if (max_tokens > room - 1) max_tokens = room - 1;
 
@@ -655,7 +655,7 @@ static int run_logprob_dump(pulsar_engine *engine, const cli_config *cfg, const 
             prompt->len, cfg->gen.ctx_size, k);
     int generated = 0;
     int max_tokens = cfg->gen.n_predict;
-    int room = (pulsar_session_ctx(session) - pulsar_session_pos(session).before()).raw();
+    int room = (pulsar_session_ctx(session) - pulsar_session_pos(session).before()).raw();   /* raw: a bare local for the arithmetic below */
     if (room <= 1) max_tokens = 0;
     else if (max_tokens > room - 1) max_tokens = room - 1;
     for (; generated < max_tokens; generated++) {
@@ -841,7 +841,7 @@ static int run_kl_file(pulsar_engine *engine, const cli_config *cfg) {
         }
         const int vocab_n = pulsar_engine_vocab_size(engine);
         for (long k = 0; k < n_read; k++) {
-            if (tokens.v[k].raw() < 0 || tokens.v[k].raw() >= vocab_n) {
+            if (tokens.v[k].raw() < 0 || tokens.v[k].raw() >= vocab_n) {   /* raw: compared with a bare value */
                 fprintf(stderr, "pulsar: --kl-tokens id %d at index %ld is "
                                 "outside vocab [0,%d)\n",
                         tokens.v[k].raw(), k, vocab_n);
@@ -1308,7 +1308,7 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
 
     const TokPos old_pos = pulsar_session_pos(chat->session);
     const TokCount common = pulsar_session_common_prefix(chat->session, &chat->transcript);
-    const int cached = TokPos::after(common) == old_pos && TokPos{chat->transcript.len} >= old_pos ? common.raw() : 0;
+    const int cached = TokPos::after(common) == old_pos && TokPos{chat->transcript.len} >= old_pos ? common.raw() : 0;   /* raw: a bare local for the arithmetic below */
     const int suffix = chat->transcript.len - cached;
 
     char err[160];
@@ -1344,7 +1344,7 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
     };
 
     int max_tokens = cfg->gen.n_predict;
-    int room = (pulsar_session_ctx(chat->session) - pulsar_session_pos(chat->session).before()).raw();
+    int room = (pulsar_session_ctx(chat->session) - pulsar_session_pos(chat->session).before()).raw();   /* raw: a bare local for the arithmetic below */
     if (room <= 1) max_tokens = 0;
     else if (max_tokens > room - 1) max_tokens = room - 1;
 

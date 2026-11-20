@@ -282,7 +282,7 @@ bool pulsar_image_refuse_orphans(const pulsar_engine *e, const pulsar_tokens *pr
     const TokId placeholder{v->placeholder_id(e)};
     for (int i = 0; i < prompt->len; i++) {
         const TokId t = prompt->v[i];
-        if (pulsar_image_is_sentinel(e, t.raw()) || (placeholder.is_token() && t == placeholder)) {
+        if (pulsar_image_is_sentinel(e, t.raw()) || (placeholder.is_token() && t == placeholder)) {   /* raw: into pulsar_image_is_sentinel()'s bare parameter */
             snprintf(err, errlen, "prompt token %d is image sentinel id %d, but the request carries no images", i,
                      prompt->v[i].raw());
             return false;

@@ -506,7 +506,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
                          "the ranks are out of lockstep, refusing to decode",
                          (unsigned long long)c->seq, (unsigned long long)pos);
             } else {
-                rc = pulsar_session_family_eval(slot->s, pulsar_tp_command_token(c).raw(), ferr, sizeof(ferr));
+                rc = pulsar_session_family_eval(slot->s, pulsar_tp_command_token(c).raw(), ferr, sizeof(ferr));   /* raw: into pulsar_session_family_eval()'s bare parameter */
             }
         }
         if (rc != 0) {
@@ -797,7 +797,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
                 if (!st->round) ok = 0;
                 if (c->type == PULSAR_TP_FRAME_SPEC_ROUND_END_BATCH &&
                     (r->i3 < 0 ||
-                     (uint64_t)r->i3 + (uint64_t)pulsar_spec_round_n_rows(st->round).raw() > (uint64_t)slot->s->dev.step_n))
+                     (uint64_t)r->i3 + (uint64_t)pulsar_spec_round_n_rows(st->round).raw() > (uint64_t)slot->s->dev.step_n))   /* raw: compared with a bare value */
                     ok = 0;
             }
             if (!ok) {

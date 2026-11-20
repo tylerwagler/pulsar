@@ -156,7 +156,7 @@ int pulsar_engram_table_open_parts(pulsar_engram_table *t, uint32_t layer, uint3
         const uint64_t rows = i + 1 < n_parts ? rows_per_part : n_rows - (uint64_t)i * rows_per_part;
         struct stat st;
         if (fstat(t->parts[i].fd, &st) != 0 ||
-            (uint64_t)st.st_size < (bases[i] + elt_bytes(rows, row_bytes)).raw()) {   /* the part's end, in the file */
+            (uint64_t)st.st_size < (bases[i] + elt_bytes(rows, row_bytes)).raw()) {   /* raw: the part's end, in the file */
             fprintf(stderr, "pulsar: row table part %u %s: %llu rows of %u B at offset %llu run past the file "
                             "(%lld B) -- refusing\n", i, paths[i], (unsigned long long)rows, row_bytes,
                     (unsigned long long)bases[i].raw(), (long long)st.st_size);
@@ -286,7 +286,7 @@ static bool engram_read_row(const pulsar_engram_table *tb, uint64_t r, unsigned 
     if (r >= tb->n_rows) { errno = 0; return false; }
     const uint32_t rb = tb->row_bytes;
     const pulsar_engram_part *pt = &tb->parts[r / tb->rows_per_part];
-    const off_t off = (off_t)(pt->base + elt_bytes(r % tb->rows_per_part, rb)).raw();   /* the row, in its file */
+    const off_t off = (off_t)(pt->base + elt_bytes(r % tb->rows_per_part, rb)).raw();   /* raw: the row, in its file */
     size_t got = 0;
     while (got < rb) {
         const ssize_t n = pread(pt->fd, d + got, rb - got, off + (off_t)got);

@@ -1096,14 +1096,14 @@ int vision_forward(const pulsar_vision_weights *w, const pulsar_model *m,
     o.aligner_w2 = w->aligner_w2->abs_offset;
     o.aligner_b2 = w->aligner_b2->abs_offset;
     for (VisLayer i{0u}; i.below(w->n_layers); ++i) {   /* the kernel's offset table keeps the raw subscript */
-        o.block[i.raw()].norm1     = w->block[i].norm1->abs_offset;
-        o.block[i.raw()].wqkv      = w->block[i].wqkv->abs_offset;
-        o.block[i.raw()].wqkv_bias = w->block[i].wqkv_bias->abs_offset;
-        o.block[i.raw()].wo        = w->block[i].wo->abs_offset;
-        o.block[i.raw()].wo_bias   = w->block[i].wo_bias->abs_offset;
-        o.block[i.raw()].norm2     = w->block[i].norm2->abs_offset;
-        o.block[i.raw()].w1        = w->block[i].w1->abs_offset;
-        o.block[i.raw()].w2        = w->block[i].w2->abs_offset;
+        o.block[i.raw()].norm1     = w->block[i].norm1->abs_offset;   /* raw: an index into a bare array */
+        o.block[i.raw()].wqkv      = w->block[i].wqkv->abs_offset;   /* raw: an index into a bare array */
+        o.block[i.raw()].wqkv_bias = w->block[i].wqkv_bias->abs_offset;   /* raw: an index into a bare array */
+        o.block[i.raw()].wo        = w->block[i].wo->abs_offset;   /* raw: an index into a bare array */
+        o.block[i.raw()].wo_bias   = w->block[i].wo_bias->abs_offset;   /* raw: an index into a bare array */
+        o.block[i.raw()].norm2     = w->block[i].norm2->abs_offset;   /* raw: an index into a bare array */
+        o.block[i.raw()].w1        = w->block[i].w1->abs_offset;   /* raw: an index into a bare array */
+        o.block[i.raw()].w2        = w->block[i].w2->abs_offset;   /* raw: an index into a bare array */
     }
     return pulsar_cuda_vision_forward(&o, m->map, patches, n_h, n_w,
                                       out, out_cap, out_rows, dbg, dbg_blocks);

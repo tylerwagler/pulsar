@@ -28,8 +28,8 @@ void worker_progress_cb(void *ud, const char *event, TokPos current, TokCount to
     pthread_mutex_lock(&w->mu);
     /* the session's prompt length is the authority for the bar's end (the worker's pre-sync estimate only
      * seeds it before the first report) */
-    w->status.prefill_total = total.raw() > w->progress_base ? total.raw() - w->progress_base : 0;
-    int done = current.raw() - w->progress_base;
+    w->status.prefill_total = total.raw() > w->progress_base ? total.raw() - w->progress_base : 0;   /* raw: into the bare field prefill_total */
+    int done = current.raw() - w->progress_base;   /* raw: a bare local for the arithmetic below */
     if (done < 0) done = 0;
     if (done > w->status.prefill_total) done = w->status.prefill_total;
     w->status.prefill_done = done;

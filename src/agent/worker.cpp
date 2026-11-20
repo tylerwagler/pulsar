@@ -204,7 +204,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         const pulsar_tokens *prompt_for_sync = &w->transcript;
         const TokPos old_pos = pulsar_session_pos(w->session);
         const TokCount common = pulsar_session_common_prefix(w->session, &w->transcript);
-        int cached = TokPos::after(common) == old_pos && TokPos{w->transcript.len} >= old_pos ? common.raw() : 0;
+        int cached = TokPos::after(common) == old_pos && TokPos{w->transcript.len} >= old_pos ? common.raw() : 0;   /* raw: a bare local for the arithmetic below */
 
         int suffix = prompt_for_sync->len - cached;
         agent_trace(w, "prefill tool_round=%d transcript=%d prompt=%d cached=%d suffix=%d think=%s",
@@ -254,7 +254,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         }
 
         int max_tokens = cfg->gen.n_predict;
-        int room = (pulsar_session_ctx(w->session) - pulsar_session_pos(w->session).before()).raw();
+        int room = (pulsar_session_ctx(w->session) - pulsar_session_pos(w->session).before()).raw();   /* raw: a bare local for the arithmetic below */
         if (room <= 1) max_tokens = 0;
         else if (max_tokens > room - 1) max_tokens = room - 1;
 
@@ -332,7 +332,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 }
             } else {
                 free(text);
-                if (worker_accept_generated_token(w, token.raw(), &generated, t0,
+                if (worker_accept_generated_token(w, token.raw(), &generated, t0,   /* raw: into worker_accept_generated_token()'s bare parameter */
                                                   &stream, err, sizeof(err)) != 0) {
                     agent_dsml_parser_free(&dsml);
                     agent_set_error(w, err);

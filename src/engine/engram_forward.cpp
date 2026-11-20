@@ -163,7 +163,7 @@ bool engram_bind(pulsar_weights *w, const pulsar_model *m, const char *model_pat
         const TrunkLayer il{(uint32_t)blocks[at]};   /* the artifact names its Engram layers by block */
         if (blocks[at] < 0 || !il.below(PULSAR_N_LAYER) || (at && blocks[at] <= blocks[at - 1]))
             return engram_refuse("deepseek4.engram.layers is not ascending blocks of this model");
-        const uint32_t src = pulsar_layer_source(il).raw();   /* the row table and its tensors are named by the source layer */
+        const uint32_t src = pulsar_layer_source(il).raw();   /* raw: the row table and its tensors are named by the source layer */
         em->block[l] = il;
         char key[96], name[128], path[4096 + 256];
         pulsar_str file = {NULL, 0};
@@ -208,7 +208,7 @@ bool engram_upload(pulsar_weights *w, const pulsar_model *m) {
     float *qk = (float *)xmalloc(hd * sizeof(float));
     bool ok = true;
     for (KindOrd l{0u}; ok && l.below(em->n_layers); ++l) {
-        const uint32_t src = pulsar_layer_source(em->block[l]).raw();
+        const uint32_t src = pulsar_layer_source(em->block[l]).raw();   /* raw: a bare local for the arithmetic below */
         char name[128];
         snprintf(name, sizeof name, "layers.%u.engram.q_weight", src);
         const pulsar_tensor *q = model_find_tensor(m, name);
@@ -256,7 +256,7 @@ bool gpu_graph_engram_alloc(pulsar_gpu_graph *g, const pulsar_weights *w, uint32
     g->engram.x_key = pulsar_gpu_tensor_alloc(bytes_of<float>((uint64_t)cap * ENGRAM_IN));
     g->engram.kv = pulsar_gpu_tensor_alloc(bytes_of<float>((uint64_t)cap * (PULSAR_N_HC + 1u) * PULSAR_N_EMBD));
     for (KindOrd l{0u}; l.below(em->n_layers); ++l) {
-        g->engram.host_rows[l] = (unsigned char *)xmalloc(rec.times(cap).raw());
+        g->engram.host_rows[l] = (unsigned char *)xmalloc(rec.times(cap).raw());   /* raw: an allocation / copy size */
         g->engram.ids[l] = (uint64_t *)xmalloc((size_t)cap * PULSAR_ENGRAM_N_COLS * sizeof(uint64_t));
     }
     const size_t ring = (size_t)g->engram.n_banks * PULSAR_ENGRAM_RING;
@@ -314,21 +314,21 @@ bool gpu_graph_engram_stage(pulsar_gpu_graph *g, const TokId *tok, const int32_t
     if (n == 0 || n > g->engram.cap) return engram_refuse("a step's rows do not fit the Engram scratch");
     const uint32_t cur = pulsar_bank_index(gpu_graph_cur_bank(g));
     if (hist) {   /* the prompt is authoritative for the positions before the step */
-        const uint32_t b = bank ? (uint32_t)bank[0].raw() : cur;   /* refused below when outside the pool */
+        const uint32_t b = bank ? (uint32_t)bank[0].raw() : cur;   /* raw: refused below when outside the pool */
         if (b >= g->engram.n_banks || pos[0] < 0 || (uint32_t)pos[0] > hist_len)
             return engram_refuse("the step's history is out of range");
         const uint32_t p0 = (uint32_t)pos[0];
         for (uint32_t q = p0 > PULSAR_ENGRAM_MAX_NGRAM - 1u ? p0 - (PULSAR_ENGRAM_MAX_NGRAM - 1u) : 0u; q < p0; q++)
-            engram_ring_put(g, b, q, hist[q].raw());   /* the n-gram hash's ring holds raw ids */
+            engram_ring_put(g, b, q, hist[q].raw());   /* raw: the n-gram hash's ring holds raw ids */
     }
     for (uint32_t r = 0; r < n; r++) {
-        const uint32_t b = bank ? (uint32_t)bank[r].raw() : cur;   /* refused below when outside the pool */
+        const uint32_t b = bank ? (uint32_t)bank[r].raw() : cur;   /* raw: refused below when outside the pool */
         if (b >= g->engram.n_banks || pos[r] < 0) return engram_refuse("a row's bank or position is out of range");
         const uint32_t p = (uint32_t)pos[r];
         if (!tok[r].below(em->layout.n_vocab))
             return engram_refuse("a token outside the text vocabulary reached the n-gram hash (image spans are not "
                                  "an Engram input on this layout)");
-        engram_ring_put(g, b, p, tok[r].raw());
+        engram_ring_put(g, b, p, tok[r].raw());   /* raw: into engram_ring_put()'s bare parameter */
         /* the n-gram ending at p: oldest first, as much as the sequence has (pulsar_engram_hash_pos pads the rest) */
         int32_t win[PULSAR_ENGRAM_MAX_NGRAM];
         const uint32_t back = p < PULSAR_ENGRAM_MAX_NGRAM - 1u ? p : PULSAR_ENGRAM_MAX_NGRAM - 1u;

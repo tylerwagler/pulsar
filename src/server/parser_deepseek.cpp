@@ -130,7 +130,7 @@ static bool ds_parser_feed(void *st, server *s, gen_state *g, GenOff upto, bool 
         dsml_decode_tracker_update(&ps->tracker, g->text.ptr, g->text.len);
     /* DeepSeek's one walk over its raw text (L267) */
     /* L437: the walk reads (raw, raw_len): the released bytes are the text's first upto.before() */
-    if (ps->walk_on && !deepseek_stream_update(&ps->walk, &g->sink, g->text.ptr, upto.before().raw(), false))
+    if (ps->walk_on && !deepseek_stream_update(&ps->walk, &g->sink, g->text.ptr, upto.before().raw(), false))   /* raw: into deepseek_stream_update()'s bare parameter */
         return false;
 
     if (j->req.kind != REQ_CHAT || !j->req.has_tools) return true;

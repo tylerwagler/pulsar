@@ -212,7 +212,7 @@ static bool spec_frontier_snapshot(pulsar_spec_frontier *f, pulsar_session *s) {
     bool ok = pulsar_gpu_begin_commands() != 0;
     for (TrunkLayer il{0u}; il.below(PULSAR_N_LAYER); ++il) {
         /* the snapshot's raw copy */
-        f->n_comp[il] = (uint32_t)gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il).raw();
+        f->n_comp[il] = (uint32_t)gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il).raw();   /* raw: into the bare field n_comp */
     }
     if (ok && g->spec_frontier_copy_n)
         ok = pulsar_gpu_batched_copy_run(g->spec_snap_copies,
@@ -503,7 +503,7 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
     }
     /* the offline-validation / confidence-training dump (single lane): after the markov refine, while
      * batch_ffn_cur still holds the post-hc_head rows the confidence kernel consumes */
-    if (!banks && !defer) dspark_dump_step(g, (int)s->checkpoint.len, qs[0]->next_base.raw(), qs[0]->refined,
+    if (!banks && !defer) dspark_dump_step(g, (int)s->checkpoint.len, qs[0]->next_base.raw(), qs[0]->refined,   /* raw: into dspark_dump_step()'s bare parameter */
                                            (int)qs[0]->n_draft);
     /* the confidence head over every row: tok row (j, k) = refined_j[k] -- the draft BEFORE position k, so
      * conf[k] is scored without the draft it judges (the stop is a stopping time) -- then the stop rule */

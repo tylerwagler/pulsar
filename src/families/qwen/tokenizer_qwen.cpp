@@ -249,7 +249,7 @@ static void qwen_tok_dump(pulsar_engine *e, FILE *fp, const pulsar_tokens *token
     fprintf(fp, "]\n");
     for (int i = 0; i < tokens->len; i++) {
         size_t n = 0;
-        char *piece = qwen_tok_token_text(e, tokens->v[i].raw(), &n);
+        char *piece = qwen_tok_token_text(e, tokens->v[i].raw(), &n);   /* raw: into qwen_tok_token_text()'s bare parameter */
         fprintf(fp, "%6d  ", tokens->v[i].raw());
         pulsar_dump_piece_quoted(fp, piece, n);
         fputc('\n', fp);
@@ -264,13 +264,13 @@ static int qwen_tok_n_tokens(pulsar_engine *e) { return bpe_tokenizer_n_tokens(p
 
 /* L334 P3: the family's ids leave the tokenizer here, typed (its internals stay raw). */
 /** pulsar_family_tokenizer::is_stop, typed.  @param e the engine  @param t the token  @return qwen_tok_is_stop's */
-static bool qwen_tok_is_stop_op(pulsar_engine *e, TokId t) { return qwen_tok_is_stop(e, t.raw()); }
+static bool qwen_tok_is_stop_op(pulsar_engine *e, TokId t) { return qwen_tok_is_stop(e, t.raw()); }   /* raw: into qwen_tok_is_stop()'s bare parameter */
 /** pulsar_family_tokenizer::eos, typed.  @param e the engine  @return qwen_tok_eos's (-1 enters as none()) */
 static TokId qwen_tok_eos_op(pulsar_engine *e) { return TokId{qwen_tok_eos(e)}; }
 /** pulsar_family_tokenizer::token_text, typed.  @param e the engine  @param t the token  @param len its length
  *  @return qwen_tok_token_text's */
 static char *qwen_tok_token_text_op(pulsar_engine *e, TokId t, size_t *len) {
-    return qwen_tok_token_text(e, t.raw(), len);
+    return qwen_tok_token_text(e, t.raw(), len);   /* raw: into qwen_tok_token_text()'s bare parameter */
 }
 /** pulsar_family_tokenizer::think_close, typed.  @param e the engine  @return qwen_tok_think_close's (-1: none()) */
 static TokId qwen_tok_think_close_op(pulsar_engine *e) { return TokId{qwen_tok_think_close(e)}; }

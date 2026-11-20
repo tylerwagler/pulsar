@@ -78,7 +78,7 @@ static inline TokPos pulsar_ckpt_pos(uint32_t g) { return TokPos::after(TokCount
 /** The raw uint32 the store keeps for position `p` (fatal on none(): the store holds no "no position").
  *  @param p the position */
 /// @return its token count from position 0
-static inline uint32_t pulsar_ckpt_raw(TokPos p) { return (uint32_t)p.before().raw(); }
+static inline uint32_t pulsar_ckpt_raw(TokPos p) { return (uint32_t)p.before().raw(); }   /* raw: a bare operand */
 
 /** A model's kv-state answer: the slot layout, the frontier tests and the pool lists the checkpoint store
  *  (checkpoint.cpp), the segments and the session payload (session_payload.cpp) read.  Every hook takes the
@@ -357,7 +357,7 @@ TensorBytes pulsar_ckpt_host_bytes(const pulsar_ckpt_store *st);
 /// @param pos the prefilled history's end (not none())
 /// @return the grid point
 static inline TokPos pulsar_ckpt_grid_floor(const pulsar_ckpt_store *st, TokPos pos) {
-    return TokPos{(int)((uint32_t)pos.before().raw() / st->ops->resume_grid * st->ops->resume_grid)};
+    return TokPos{(int)((uint32_t)pos.before().raw() / st->ops->resume_grid * st->ops->resume_grid)};   /* raw: the position rounded down to the resume grid (pulsar_ckpt_grid_floor) */
 }
 /** L311: how many records a store of n_banks pools -- a prompt end and a message endpoint for most banks: n_banks
  *  plus half as many again (at least two, so a one-bank session keeps both of its own). */

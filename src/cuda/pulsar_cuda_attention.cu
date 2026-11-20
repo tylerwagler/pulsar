@@ -103,7 +103,7 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
         void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab, uint32_t n_groups, uint32_t n_nope, int *mx_out,
         const pulsar_gpu_tensor *positions, const pulsar_gpu_q_prep *q_prep,
         const pulsar_gpu_tensor *vis_left, const pulsar_gpu_tensor *vis_right) {
-    const uint64_t sinks_offset = sinks_offset_m.raw();   /* L438: MapOff ends at the launch */
+    const uint64_t sinks_offset = sinks_offset_m.raw();   /* raw: L438: MapOff ends at the launch */
     if (mx_out) *mx_out = 0;
     {
         const char *aw = "prefill raw attention";
@@ -433,7 +433,7 @@ int pulsar_gpu_attention_decode_raw_batch_heads_tensor(
         const pulsar_gpu_q_prep *q_prep,
         const pulsar_gpu_tensor *vis_left,
         const pulsar_gpu_tensor *vis_right) {
-    const uint64_t sinks_offset = sinks_offset_m.raw();   /* L438: MapOff ends at the launch */
+    const uint64_t sinks_offset = sinks_offset_m.raw();   /* raw: L438: MapOff ends at the launch */
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
                                       q, raw_kv, NULL, non_causal, n_tokens, pos0,
                                       n_raw, raw_cap, raw_start, 0, window, 1,
@@ -503,7 +503,7 @@ int pulsar_gpu_attention_decode_mixed_batch_heads_mx_tensor(
         const pulsar_gpu_tensor *vis_right,
         void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab,
         uint32_t n_groups, uint32_t n_nope) {
-    const uint64_t sinks_offset = sinks_offset_m.raw();   /* L438: MapOff ends at the launch */
+    const uint64_t sinks_offset = sinks_offset_m.raw();   /* raw: L438: MapOff ends at the launch */
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
                                       q, raw_kv, comp_kv, non_causal,
                                       n_tokens, pos0, n_raw, raw_cap, raw_start,
@@ -577,7 +577,7 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_mx_tensor(
         const pulsar_gpu_tensor *vis_right,
         void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab,
         uint32_t n_groups, uint32_t n_nope, uint32_t gact_tok0, uint32_t gact_ntok) {
-    const uint64_t sinks_offset = sinks_offset_m.raw();   /* L438: MapOff ends at the launch */
+    const uint64_t sinks_offset = sinks_offset_m.raw();   /* raw: L438: MapOff ends at the launch */
     /* Descriptor (banked) mode: same contract as attention_decode_batch_launch
      * (scalar n_raw/raw_start ignored and unvalidated, raw_cap must be the true
      * per-bank ring capacity, rejections fail-loud).  Banked rows take the same
@@ -898,7 +898,7 @@ int pulsar_gpu_attention_prefill_static_mixed_heads_tensor(
         const pulsar_gpu_q_prep *q_prep,
         const pulsar_gpu_tensor *vis_left,
         const pulsar_gpu_tensor *vis_right) {
-    const uint64_t sinks_offset = sinks_offset_m.raw();   /* L438: MapOff ends at the launch */
+    const uint64_t sinks_offset = sinks_offset_m.raw();   /* raw: L438: MapOff ends at the launch */
     return attention_prefill_mixed_launch(heads, model_map, model_size, sinks_offset,
                                        q, raw_kv, comp_kv,
                                        gact_data, gact_scale, gact_kbp,

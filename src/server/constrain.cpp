@@ -827,7 +827,7 @@ static bool gate_feed(constrain_gate *gt, TokId token, const char *b, size_t n) 
             pulsar_grammar_matcher *m = gt->matchers[(size_t)gt->cur];
             const bool whole = token.is_token() && i == 0;
             /* the matcher takes the raw id: its vocabulary IS the token id space (constrain_compiler: id t at t) */
-            const bool acc = whole ? pulsar_grammar_matcher_accept(m, token.raw(), gt->err, sizeof gt->err)
+            const bool acc = whole ? pulsar_grammar_matcher_accept(m, token.raw(), gt->err, sizeof gt->err)   /* raw: into pulsar_grammar_matcher_accept()'s bare parameter */
                                    : pulsar_grammar_matcher_accept_bytes(m, b + i, n - i, gt->err, sizeof gt->err);
             if (!acc) {
                 if (!gt->err[0])
@@ -1049,7 +1049,7 @@ bool gen_constrain_accept(server *s, gen_state *g, TokId token) {
     if (!gt) return true;
     if (gate_injected(g)) return false;
     const bool live = gt->phase == GATE_REGION;
-    const std::string &b = (*s->token_bytes)[(size_t)token.raw()];   /* the table is indexed by id */
+    const std::string &b = (*s->token_bytes)[(size_t)token.raw()];   /* raw: the table is indexed by id */
     if (!gate_feed(gt, token, b.data(), b.size())) {
         gate_fail(g, "grammar");
         return false;
@@ -1071,7 +1071,7 @@ const uint32_t *gen_constrain_base_mask(server *s, gen_state *g) {
 /// @param tok  a token id (bit i of a mask row is token id i)
 /// @return whether token `tok` is allowed
 static bool mask_bit(const uint32_t *row, TokId tok) {
-    const uint32_t t = (uint32_t)tok.raw();
+    const uint32_t t = (uint32_t)tok.raw();   /* raw: a bare local for the arithmetic below */
     return (row[t >> 5] >> (t & 31u)) & 1u;
 }
 
@@ -1082,7 +1082,7 @@ VerifyRows gen_constrain_round(server *s, gen_state *g, const TokId *toks, TokCo
     if (!gt) return VerifyRows{0};
     if (gate_injected(g)) return VerifyRows{-1};
     const int off = base_emitted ? 0 : 1;
-    const int rows = pulsar_verify_rows(n_toks, !base_emitted).raw();   /* L443: the masks' memory, row by row */
+    const int rows = pulsar_verify_rows(n_toks, !base_emitted).raw();   /* raw: L443: the masks' memory, row by row */
     const uint32_t W = gt->words;
     gt->rows.resize((size_t)rows * W);
     /* A token the gate refuses (a draft, or a base the gate cannot take) ends the walk through the round: the rows
@@ -1092,7 +1092,7 @@ VerifyRows gen_constrain_round(server *s, gen_state *g, const TokId *toks, TokCo
     bool any_live = false, ok = true, walking = true;
     if (!base_emitted) {
         const TokId t0 = toks[0];
-        const std::string &b = (*s->token_bytes)[(size_t)t0.raw()];   /* the table is indexed by id */
+        const std::string &b = (*s->token_bytes)[(size_t)t0.raw()];   /* raw: the table is indexed by id */
         walking = gate_feed(gt, t0, b.data(), b.size());
         fed += walking;
     }
@@ -1108,11 +1108,11 @@ VerifyRows gen_constrain_round(server *s, gen_state *g, const TokId *toks, TokCo
         if (!ok || !walking || i == rows - 1) continue;
         const TokId t = toks[off + i];
         /* the walk never reads past a draft its row refuses; a stop ends the round (it clamps there) */
-        if ((live && !mask_bit(row, t)) || pulsar_grammar_compiler_is_stop(s->grammar, t.raw())) {
+        if ((live && !mask_bit(row, t)) || pulsar_grammar_compiler_is_stop(s->grammar, t.raw())) {   /* raw: into pulsar_grammar_compiler_is_stop()'s bare parameter */
             walking = false;
             continue;
         }
-        const std::string &b = (*s->token_bytes)[(size_t)t.raw()];
+        const std::string &b = (*s->token_bytes)[(size_t)t.raw()];   /* raw: an index into a bare array */
         walking = gate_feed(gt, t, b.data(), b.size());
         fed += walking;
     }
@@ -1136,24 +1136,24 @@ VerifyRows gen_constrain_round(server *s, gen_state *g, const TokId *toks, TokCo
  * by the same rule. */
 TokCount gen_constrain_draft_prefix(server *s, gen_state *g, TokId base_id, const TokId *drafts, TokCount n_drafts) {
     constrain_gate *gt = g->gate;
-    const int n = n_drafts.raw();   /* L443: typed at the boundary, the walk's index inside */
+    const int n = n_drafts.raw();   /* raw: L443: typed at the boundary, the walk's index inside */
     if (n <= 0) return TokCount{0};
     const int V = (int)s->token_bytes->size();
     /* the grammar's token table is this check's vocab authority (L334 P3); the round's walk decides (and fails) */
     if (!gt || gate_injected(g) || !base_id.below((uint32_t)V)) return n_drafts;
     int fed = 0, keep = 0;
-    const std::string &bb = (*s->token_bytes)[(size_t)base_id.raw()];   /* the table is indexed by id */
+    const std::string &bb = (*s->token_bytes)[(size_t)base_id.raw()];   /* raw: the table is indexed by id */
     if (gate_feed(gt, base_id, bb.data(), bb.size())) {
         fed++;
         for (; keep < n; keep++) {
             if (!drafts[keep].below((uint32_t)V)) break;
             const TokId t = drafts[keep];
             /* the walk ends at a stop (the round clamps there): nothing after it is ever committed */
-            if (pulsar_grammar_compiler_is_stop(s->grammar, t.raw())) {
+            if (pulsar_grammar_compiler_is_stop(s->grammar, t.raw())) {   /* raw: into pulsar_grammar_compiler_is_stop()'s bare parameter */
                 keep++;
                 break;
             }
-            const std::string &b = (*s->token_bytes)[(size_t)t.raw()];   /* the table is indexed by id */
+            const std::string &b = (*s->token_bytes)[(size_t)t.raw()];   /* raw: the table is indexed by id */
             if (!gate_feed(gt, t, b.data(), b.size())) break;
             fed++;
         }

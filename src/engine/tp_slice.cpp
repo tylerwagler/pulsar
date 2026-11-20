@@ -316,7 +316,7 @@ static bool run_built(pulsar_tp_plan *p, const pulsar_tp_slice *s, const char *h
 static bool run_slice(pulsar_engine *e, pulsar_tp_plan *p, const pulsar_tp_slice *s, pulsar_tp_op op, uint64_t *bytes) {
     const pulsar_model *m = s->m;
     const pulsar_tensor *t = s->t;
-    const unsigned long long off = (unsigned long long)t->abs_offset.raw(), lo = s->lo[0], hi = s->hi[0];   /* printed */
+    const unsigned long long off = (unsigned long long)t->abs_offset.raw(), lo = s->lo[0], hi = s->hi[0];   /* raw: printed */
     char nm[256];
     tname(t, nm, sizeof(nm));
     switch (op) {
@@ -415,7 +415,7 @@ static bool run_slice(pulsar_engine *e, pulsar_tp_plan *p, const pulsar_tp_slice
                     (unsigned long long)n);
             return true;
         }
-        return pulsar_gpu_weight_range_ptr(tensor_map_base(m, t), t->abs_offset.raw() + rel, n, "TP expert range") != NULL;
+        return pulsar_gpu_weight_range_ptr(tensor_map_base(m, t), t->abs_offset.raw() + rel, n, "TP expert range") != NULL;   /* raw: a device-API argument (pulsar_gpu_weight_range_ptr) */
     }
     case PULSAR_TP_OP_NONE: break;
     }

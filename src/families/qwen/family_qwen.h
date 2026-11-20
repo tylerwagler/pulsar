@@ -361,7 +361,7 @@ static inline LayerSlot pulsar_qwen_mtp_slot(const pulsar_layer_plan *plan) { re
  *  the trunk's layer i -- the plan has one layer per checkpoint layer.
  *  @param b the checkpoint's block */
 /// @return the trunk layer
-static inline TrunkLayer pulsar_qwen_block_layer(SrcBlock b) { return TrunkLayer{b.raw()}; }
+static inline TrunkLayer pulsar_qwen_block_layer(SrcBlock b) { return TrunkLayer{b.raw()}; }   /* raw: the named crossing pulsar_qwen_block_layer() */
 /** L436: the tensors of the layer at slot `slot` (a trunk layer's, or the MTP layer's at pulsar_qwen_mtp_slot).
  *  @param w    the weights
  *  @param slot the layer slot */

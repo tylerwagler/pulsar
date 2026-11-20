@@ -456,7 +456,7 @@ struct pulsar_segstore {
         if (it == segs.end()) return false;
         FILE *fp = fopen(path(key.c_str()).c_str(), "rb");
         if (!fp) return false;
-        out->assign((size_t)it->second.text_len.raw(), '\0');
+        out->assign((size_t)it->second.text_len.raw(), '\0');   /* raw: an allocation / copy size */
         const bool ok = fseek(fp, (long)HDR, SEEK_SET) == 0 &&
                         fread(out->empty() ? nullptr : &(*out)[0], 1, out->size(), fp) == out->size();
         fclose(fp);
@@ -780,8 +780,8 @@ pulsar_segstore *pulsar_segstore_open(const char *dir, uint64_t budget_bytes, co
         struct stat sb;
         const bool stat_ok = fstat(fileno(fp), &sb) == 0;
         const bool sized = ok && stat_ok &&
-                           (uint64_t)sb.st_size == HDR + e.text_len.raw() + e.payload_bytes + e.trailer_bytes;
-        std::string head(sized ? (e.text_len.raw() < HEAD_BYTES ? e.text_len.raw() : HEAD_BYTES) : 0u, '\0');
+                           (uint64_t)sb.st_size == HDR + e.text_len.raw() + e.payload_bytes + e.trailer_bytes;   /* raw: a bare operand */
+        std::string head(sized ? (e.text_len.raw() < HEAD_BYTES ? e.text_len.raw() : HEAD_BYTES) : 0u, '\0');   /* raw: into head()'s bare parameter */
         const bool head_ok = head.empty() || fread(&head[0], 1, head.size(), fp) == head.size();
         /* L323: a segment of an OLDER store version can never load again (on-disk KV carries no back-compat, Tyler
          * 2026-10-13) and its bytes sit outside the budget: removed, whatever model wrote it */
@@ -887,7 +887,7 @@ void pulsar_segstore_child_key_images(const char *parent, const char *text, Text
                                       uint32_t n, char out[41]) {
     pulsar::Sha1 h;
     if (parent && parent[0]) h.update(parent, 40);
-    h.update(text, (size_t)len.raw());
+    h.update(text, (size_t)len.raw());   /* raw: into update()'s bare parameter */
     for (uint32_t i = 0; i < n; i++) h.update(&hashes[i], sizeof hashes[i]);   /* L353 */
     uint8_t d[20];
     h.final(d);
@@ -920,7 +920,7 @@ int pulsar_segstore_lookup_images(pulsar_segstore *st, const char *text, TextByt
         stack.pop_back();
         if (f.depth > 0) path[f.depth - 1] = f.key;
         const pulsar_segstore_seg *s = f.depth > 0 ? &st->segs[f.key] : nullptr;
-        const bool accepted = s && (!want || ((want->grid.raw() == 0 || s->G.raw() % want->grid.raw() == 0) &&
+        const bool accepted = s && (!want || ((want->grid.raw() == 0 || s->G.raw() % want->grid.raw() == 0) &&   /* raw: a bare local for the arithmetic below */
                                               (!want->state || s->rp_bytes > 0u)));
         if (accepted && (s->G > best_G || (s->G == best_G && f.end > best_end))) {
             best_depth = f.depth;
@@ -937,7 +937,7 @@ int pulsar_segstore_lookup_images(pulsar_segstore *st, const char *text, TextByt
             /* L353: the span holds some run of the request's next images (none for a text span): the key says which */
             for (uint32_t m = 0; f.used + m <= n; m++) {
                 char k[41];
-                pulsar_segstore_child_key_images(f.key.c_str(), text + f.end.raw(), cs.text_len,
+                pulsar_segstore_child_key_images(f.key.c_str(), text + f.end.raw(), cs.text_len,   /* raw: into pulsar_segstore_child_key_images()'s bare parameter */
                                                  hashes ? hashes + f.used : nullptr, m, k);
                 if (c == k) {
                     stack.push_back({c, f.end + cs.text_len, f.depth + 1, f.used + m});
@@ -1095,7 +1095,7 @@ int pulsar_segstore_reserve_images(pulsar_segstore *st, const char *parent, TokP
                                    pulsar_segstore_job **job_out, char *err, size_t errlen) {
     *job_out = nullptr;
     /* L334 P7: a span is two live-side positions, neither negative (none() included: the file holds a uint32) */
-    if (!st || G_prev.raw() < 0 || G <= G_prev || (G_prev == TokPos{0}) != (!parent || !parent[0])) {
+    if (!st || G_prev.raw() < 0 || G <= G_prev || (G_prev == TokPos{0}) != (!parent || !parent[0])) {   /* raw: compared with a bare value */
         snprintf(err, errlen, "segment put: a root starts at 0 and only a root has no parent");
         return -1;
     }
@@ -1137,7 +1137,7 @@ int pulsar_segstore_reserve_images(pulsar_segstore *st, const char *parent, TokP
     j->G_prev = G_prev;
     j->G = G;
     j->text_len = text_len;
-    j->payload_off = HDR + text_len.raw();
+    j->payload_off = HDR + text_len.raw();   /* raw: into the bare field payload_off */
     j->payload_bytes = payload_bytes;
     j->trailer_bytes = trailer_bytes;
     j->flags = 0;
@@ -1154,14 +1154,14 @@ int pulsar_segstore_reserve_images(pulsar_segstore *st, const char *parent, TokP
     put32(h + 12, trailer_bytes ? PULSAR_SEGSTORE_FLAG_TRAILER : 0u);
     memcpy(h + 16, key, 40);
     if (j->parent[0]) memcpy(h + 56, j->parent, 40);
-    put32(h + 96, (uint32_t)G_prev.raw());
-    put32(h + 100, (uint32_t)G.raw());
-    put64(h + 104, text_len.raw());
+    put32(h + 96, (uint32_t)G_prev.raw());   /* raw: into put32()'s bare parameter */
+    put32(h + 100, (uint32_t)G.raw());   /* raw: into put32()'s bare parameter */
+    put64(h + 104, text_len.raw());   /* raw: into put64()'s bare parameter */
     put64(h + 112, payload_bytes);
     put64(h + 120, trailer_bytes);
     put64(h + 136, now);
     put64(h + 144, now);
-    if (text_len.raw()) memcpy(h + HDR, text, (size_t)text_len.raw());
+    if (text_len.raw()) memcpy(h + HDR, text, (size_t)text_len.raw());   /* raw: compared with a bare value */
     memset(img.p + need, 0, (size_t)(img.cap - need));   /* the O_DIRECT pad */
     st->reserved += need;
     st->pending.insert(std::string(key, 40));
@@ -1257,7 +1257,7 @@ uint8_t *pulsar_segstore_job_trailer(pulsar_segstore_job *job) {
 }
 
 uint64_t pulsar_segstore_seg_file_bytes(TextBytes text_len, uint64_t payload_bytes, uint64_t trailer_bytes) {
-    return HDR + text_len.raw() + payload_bytes + trailer_bytes;
+    return HDR + text_len.raw() + payload_bytes + trailer_bytes;   /* raw: returned bare to its caller */
 }
 
 uint64_t pulsar_segstore_rp_file_bytes(uint64_t rp_bytes) { return RP_HDR + rp_bytes; }
@@ -1424,7 +1424,7 @@ bool pulsar_segstore_commit(pulsar_segstore *st, pulsar_segstore_job *job, bool 
         st->io.rows_bytes_written += job->need;
         st->link(e);
         st->heads[e.key] = std::string((const char *)job->img.p + HDR,
-                                       (size_t)(job->text_len.raw() < HEAD_BYTES ? job->text_len.raw() : HEAD_BYTES));
+                                       (size_t)(job->text_len.raw() < HEAD_BYTES ? job->text_len.raw() : HEAD_BYTES));   /* raw: into string()'s bare parameter */
         st->refresh_dominated(e.parent);
         st->img_keep(st->ram_rows, key, job->img);
         if (rp.bytes) st->img_keep(st->ram_rp, key, rp.img);
@@ -1496,7 +1496,7 @@ bool pulsar_segstore_flag_rp(pulsar_segstore *st, const char key[41], uint32_t f
 
 bool pulsar_segstore_covers(pulsar_segstore *st, const char *text, TextBytes len, bool *rp_at_len) {
     *rp_at_len = false;
-    if (!st || !text || len.raw() == 0u) return false;
+    if (!st || !text || len.raw() == 0u) return false;   /* raw: compared with a bare value */
     /* the lookup's walk (children whose key the text's own bytes reproduce), plus, at each node it reaches, a child
      * that runs past `len` and starts with the rest of the text */
     struct frame { std::string key; TextBytes end; };
@@ -1516,13 +1516,13 @@ bool pulsar_segstore_covers(pulsar_segstore *st, const char *text, TextBytes len
             const pulsar_segstore_seg &cs = st->segs[c];
             if (f.end + cs.text_len <= len) {
                 char k[41];
-                pulsar_segstore_child_key(f.key.c_str(), text + f.end.raw(), cs.text_len, k);
+                pulsar_segstore_child_key(f.key.c_str(), text + f.end.raw(), cs.text_len, k);   /* raw: into pulsar_segstore_child_key()'s bare parameter */
                 if (c == k) stack.push_back({c, f.end + cs.text_len});
                 continue;
             }
             if (covered) continue;
-            const size_t rest = (size_t)(len - f.end).raw();
-            const char *at = text + f.end.raw();
+            const size_t rest = (size_t)(len - f.end).raw();   /* raw: a bare local for the arithmetic below */
+            const char *at = text + f.end.raw();   /* raw: a bare local for the arithmetic below */
             const std::string &head = st->heads[c];
             if (memcmp(head.data(), at, rest < head.size() ? rest : head.size()) != 0) continue;
             std::string t;
@@ -1550,7 +1550,7 @@ int pulsar_segstore_map_part(pulsar_segstore *st, const char key[41], int part, 
         return 1;
     }
     pulsar_segstore_seg &e = it->second;
-    const uint64_t off = rp ? RP_HDR : HDR + e.text_len.raw();
+    const uint64_t off = rp ? RP_HDR : HDR + e.text_len.raw();   /* raw: a bare local for the arithmetic below */
     const uint64_t pbytes = rp ? e.rp_bytes - RP_HDR : e.payload_bytes;
     /* L378: a part a load mapped is read -- its entry's bit (consulted when the file is removed) and the ledger */
     const auto note_read = [&]() {
@@ -1696,7 +1696,7 @@ FILE *pulsar_segstore_open_payload(pulsar_segstore *st, const char key[41], uint
     if (!fp) return nullptr;
     pulsar_segstore_seg e;
     uint32_t flags = 0;
-    if (!st->read_header(fp, &e, &flags) || fseek(fp, (long)(HDR + e.text_len.raw()), SEEK_SET) != 0) {
+    if (!st->read_header(fp, &e, &flags) || fseek(fp, (long)(HDR + e.text_len.raw()), SEEK_SET) != 0) {   /* raw: into fseek()'s bare parameter */
         fclose(fp);
         return nullptr;
     }
@@ -1711,7 +1711,7 @@ FILE *pulsar_segstore_open_trailer(pulsar_segstore *st, const char key[41], uint
     FILE *fp = fopen(st->path(it->first.c_str()).c_str(), "rb");
     if (!fp) return nullptr;
     const pulsar_segstore_seg &e = it->second;
-    if (fseek(fp, (long)(HDR + e.text_len.raw() + e.payload_bytes), SEEK_SET) != 0) { fclose(fp); return nullptr; }
+    if (fseek(fp, (long)(HDR + e.text_len.raw() + e.payload_bytes), SEEK_SET) != 0) { fclose(fp); return nullptr; }   /* raw: into fseek()'s bare parameter */
     if (trailer_bytes) *trailer_bytes = e.trailer_bytes;
     return fp;
 }
@@ -1783,7 +1783,7 @@ void pulsar_segstore_foreach_trailer(pulsar_segstore *st, pulsar_segstore_traile
         std::lock_guard<std::mutex> lk(st->segs_mu);
         for (auto &kv : st->segs)
             if (kv.second.trailer_bytes)
-                entries.push_back({kv.first, kv.second.text_len.raw(), kv.second.payload_bytes,
+                entries.push_back({kv.first, kv.second.text_len.raw(), kv.second.payload_bytes,   /* raw: a bare operand */
                                    kv.second.trailer_bytes});
     }
     for (const walk_entry &e : entries) {

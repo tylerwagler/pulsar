@@ -377,7 +377,7 @@ int pulsar_gpu_tp_stage_publish(pulsar_gpu_tensor *src, pulsar_gpu_tensor *adden
                                 uint64_t first_msg, uint32_t n_slots, uint32_t rows,
                                 void *desc_dev, uint64_t exch, pulsar_gpu_tensor *ticket) {
     /* L438: the typed slot / offsets end at the launch */
-    const uint64_t out_off = out_off_s.raw(), vec_bytes = vec_bytes_t.raw();
+    const uint64_t out_off = out_off_s.raw(), vec_bytes = vec_bytes_t.raw();   /* raw: a bare local for the arithmetic below */
     const uint64_t vf = vec_bytes / sizeof(float);
     if (!src || !slab_dev || !desc_dev || exch == 0 || !ticket ||
         ticket->bytes < sizeof(unsigned int) || rows == 0 || n_slots == 0 || vf == 0 ||
@@ -400,7 +400,7 @@ int pulsar_gpu_tp_combine_sum(pulsar_gpu_tensor *dst, const void *slab_dev,
                               uint32_t n_slots, uint32_t rows, const void *done_dev,
                               uint64_t exch, const void *err_dev) {
     /* L438: the typed slot / offsets end at the launch */
-    const uint64_t in_off = in_off_s.raw(), vec_bytes = vec_bytes_t.raw();
+    const uint64_t in_off = in_off_s.raw(), vec_bytes = vec_bytes_t.raw();   /* raw: a bare local for the arithmetic below */
     const uint64_t vf = vec_bytes / sizeof(float);
     if (!dst || !slab_dev || !done_dev || !err_dev || rows == 0 || n_slots == 0 || vf == 0 ||
         (uint64_t)rows * vec_bytes > dst->bytes) return 0;
@@ -417,7 +417,7 @@ int pulsar_gpu_tp_combine_scatter(pulsar_gpu_tensor *dst, const void *slab_dev,
                                   uint32_t rows, uint64_t width, uint64_t pitch, uint64_t col0,
                                   const void *done_dev, uint64_t exch, const void *err_dev) {
     /* L438: the typed slot / offsets end at the launch */
-    const uint64_t in_off = in_off_s.raw(), vec_bytes = vec_bytes_t.raw();
+    const uint64_t in_off = in_off_s.raw(), vec_bytes = vec_bytes_t.raw();   /* raw: a bare local for the arithmetic below */
     const uint64_t vf = vec_bytes / sizeof(float);
     const uint64_t n_elem = (uint64_t)rows * width;
     if (!dst || !slab_dev || !done_dev || !err_dev || msgs == 0 || n_slots == 0 || vf == 0 ||
@@ -444,7 +444,7 @@ int pulsar_gpu_tp_scatter_cols(pulsar_gpu_tensor *dst, const pulsar_gpu_tensor *
 int pulsar_gpu_tp_bulk_stage(const pulsar_gpu_tensor *src, pulsar_gpu_tensor *addend, TensorBytes off_b,
                              void *out_dev, TensorBytes bytes_b) {
     /* L438: the typed slot / offsets end at the launch */
-    const uint64_t off = off_b.raw(), bytes = bytes_b.raw();
+    const uint64_t off = off_b.raw(), bytes = bytes_b.raw();   /* raw: a bare local for the arithmetic below */
     if (!src || !out_dev || bytes == 0 || bytes % sizeof(float) != 0 || off % sizeof(float) != 0 ||
         off > src->bytes || bytes > src->bytes - off ||
         (addend && (off > addend->bytes || bytes > addend->bytes - off))) return 0;
@@ -459,7 +459,7 @@ int pulsar_gpu_tp_bulk_stage(const pulsar_gpu_tensor *src, pulsar_gpu_tensor *ad
 }
 
 int pulsar_gpu_tp_publish_bulk(void *desc_dev, uint64_t exch, TensorBytes bytes_b, uint64_t word2) {
-    const uint64_t bytes = bytes_b.raw();   /* L438: the descriptor's word is raw (the peer reads it) */
+    const uint64_t bytes = bytes_b.raw();   /* raw: L438: the descriptor's word is raw (the peer reads it) */
     if (!desc_dev || exch == 0 || bytes == 0) return 0;
     tp_publish_bulk_kernel<<<1, 1>>>((uint64_t *)desc_dev, exch, bytes, word2);
     return cuda_ok(cudaGetLastError(), "tp publish bulk launch");
@@ -469,7 +469,7 @@ int pulsar_gpu_tp_bulk_combine_sum(pulsar_gpu_tensor *dst, TensorBytes dst_off_b
                                    const void *peer_dev, TensorBytes bytes_b, const void *done_dev,
                                    uint64_t exch, const void *err_dev) {
     /* L438: the typed slot / offsets end at the launch */
-    const uint64_t dst_off = dst_off_b.raw(), bytes = bytes_b.raw();
+    const uint64_t dst_off = dst_off_b.raw(), bytes = bytes_b.raw();   /* raw: a bare local for the arithmetic below */
     if (!dst || !own_dev || !peer_dev || !done_dev || !err_dev || bytes == 0 ||
         bytes % sizeof(float) != 0 || dst_off % sizeof(float) != 0 || dst_off > dst->bytes ||
         bytes > dst->bytes - dst_off) return 0;
@@ -488,7 +488,7 @@ int pulsar_gpu_tp_combine_gather_blocks(const pulsar_tp_gather_block *blocks, ui
                                         uint64_t first_msg, uint32_t n_slots, const void *done_dev,
                                         uint64_t exch, const void *err_dev) {
     /* L438: the typed slot / offsets end at the launch */
-    const uint64_t in_off = in_off_s.raw(), vec_bytes = vec_bytes_t.raw();
+    const uint64_t in_off = in_off_s.raw(), vec_bytes = vec_bytes_t.raw();   /* raw: a bare local for the arithmetic below */
     const uint64_t vf = vec_bytes / sizeof(float);
     if (!blocks || n_blocks == 0 || n_blocks > PULSAR_TP_GATHER_BLOCKS_MAX || rows == 0 || !own ||
         !slab_dev || !done_dev || !err_dev || vf == 0 || n_slots == 0) return 0;

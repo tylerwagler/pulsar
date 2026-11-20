@@ -903,12 +903,12 @@ typedef struct {
  *  offsets into the GPU API's model map (the loader's directory entries).
  *  @param off the offset in the file */
 /// @return the same offset in the file's mapping
-static inline MapOff pulsar_map_off_of_file(FileOff off) { return MapOff{off.raw()}; }
+static inline MapOff pulsar_map_off_of_file(FileOff off) { return MapOff{off.raw()}; }   /* raw: the named crossing pulsar_map_off_of_file() */
 /** L438: the reverse of pulsar_map_off_of_file, for a map offset into a mapped FILE (never a key a TP half is
  *  registered under, which no file holds).
  *  @param off the offset in the file's mapping */
 /// @return the same offset in the file
-static inline FileOff pulsar_file_off_of_map(MapOff off) { return FileOff{off.raw()}; }
+static inline FileOff pulsar_file_off_of_map(MapOff off) { return FileOff{off.raw()}; }   /* raw: the named crossing pulsar_file_off_of_map() */
 /** L438: where tensor t's stored bytes start in the file they are read from (a shard or an overlay donor): the
  *  readers that pread instead of mapping (the content sample).
  *  @param t the directory entry */
@@ -920,7 +920,7 @@ static inline FileOff pulsar_tensor_file_off(const pulsar_tensor *t) { return pu
  *  @param off the offset into it */
 /// @return the address
 static inline const uint8_t *pulsar_map_at(const void *map, MapOff off) {
-    return static_cast<const uint8_t *>(map) + off.before().raw();
+    return static_cast<const uint8_t *>(map) + off.before().raw();   /* raw: returned bare to its caller */
 }
 /** L438: tensor t's stored bytes, as the one byte unit (L445: pulsar_tensor::bytes is TensorBytes itself now).
  *  @param t the directory entry */
@@ -2052,7 +2052,7 @@ static inline BankId gpu_graph_cur_bank(const pulsar_gpu_graph *g) {
 /// @param il    the layer
 /// @return the row count, ms_n_comp[bank][il] (L334 P2b S8: CompRows; the array stays raw behind the two accessors)
 static inline CompRows gpu_graph_n_comp(const pulsar_gpu_graph *g, BankId bank, TrunkLayer il) {
-    return CompRows{(int)g->ms_n_comp[bank.raw()][il]};   /* L334 P4: the per-bank array stays raw behind it */
+    return CompRows{(int)g->ms_n_comp[bank.raw()][il]};   /* raw: L334 P4: the per-bank array stays raw behind it */
 }
 /** The one writer of a bank's compressed frontier: sets ms_n_comp and raises the
  * bank's resident high-water (ms_comp_hw) with it, so no write can move the
@@ -2062,8 +2062,8 @@ static inline CompRows gpu_graph_n_comp(const pulsar_gpu_graph *g, BankId bank, 
 /// @param il    the layer
 /// @param rows_n the new compressed row count
 static inline void gpu_graph_set_n_comp(pulsar_gpu_graph *g, BankId bank_at, TrunkLayer il, CompRows rows_n) {
-    const uint32_t bank = (uint32_t)bank_at.raw();   /* L334 P4: the per-bank arrays and the store stay raw */
-    const uint32_t rows = (uint32_t)rows_n.raw();
+    const uint32_t bank = (uint32_t)bank_at.raw();   /* raw: L334 P4: the per-bank arrays and the store stay raw */
+    const uint32_t rows = (uint32_t)rows_n.raw();   /* raw: a bare local for the arithmetic below */
     /* L264: rows below a checkpoint's frontier may be rewritten once the counter
      * drops under them, so the checkpoint goes with them -- here, where every
      * rewind, cut and invalidate already passes.  The intact rows [0, rows) serve
@@ -3528,7 +3528,7 @@ struct pulsar_session {
     /** Set where the committed history ends -- the token_vec's length, nothing else (trim_history is the cut that
      *  drops what described the positions above).  A spec round's undo / commit moves it so. */
     /// @param end the history's new end
-    void hist_set_end(TokPos end) { checkpoint.len = end.before().raw(); }
+    void hist_set_end(TokPos end) { checkpoint.len = end.before().raw(); }   /* raw: into the bare field len */
     /** Allocated context length, in tokens. */
     /// @return ctx_size.
     int ctx();
@@ -3823,11 +3823,11 @@ static inline TensorBytes pulsar_kv_row_bytes(pulsar_kv_row_kind kind) {
  * index row is the FP4 index row.  A caller that needs the raw RING row should
  * call pulsar_kv_row_bytes(PULSAR_KV_ROW_RING) directly. */
 /// Legacy name: bytes of a compressed attention (COMP) KV row.
-#define PULSAR_ENGINE_MAINKV_ROWBYTES  (pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP).raw())
+#define PULSAR_ENGINE_MAINKV_ROWBYTES  (pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP).raw())   /* raw: into PULSAR_ENGINE_MAINKV_ROWBYTES()'s bare parameter */
 /// Legacy name: bytes of an FP4 index-key (INDEX) row.
-#define PULSAR_ENGINE_IDXFP4_ROWBYTES  (pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX).raw())
+#define PULSAR_ENGINE_IDXFP4_ROWBYTES  (pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX).raw())   /* raw: into PULSAR_ENGINE_IDXFP4_ROWBYTES()'s bare parameter */
 /// Legacy name: bytes of a raw sliding-window (RING) KV row.
-#define PULSAR_ENGINE_WINKV_ROWBYTES   (pulsar_kv_row_bytes(PULSAR_KV_ROW_RING).raw())
+#define PULSAR_ENGINE_WINKV_ROWBYTES   (pulsar_kv_row_bytes(PULSAR_KV_ROW_RING).raw())   /* raw: into PULSAR_ENGINE_WINKV_ROWBYTES()'s bare parameter */
 
 /// The layer whose caches layer `il` reads (see the CSA2 ownership comment above pulsar_kv_row_bytes).
 /// @param il  the layer
@@ -5556,41 +5556,41 @@ bool gpu_graph_needs_ffn_out(const pulsar_gpu_graph *g, uint32_t il, uint32_t po
  *  @param name the tensor's dump name  @param il the trunk layer  @param pos the position */
 /// @return true when an observer reads the bytes
 static inline bool gpu_graph_f32_store_observed(const char *name, TrunkLayer il, uint32_t pos) {
-    return gpu_graph_f32_store_observed(name, il.raw(), pos);
+    return gpu_graph_f32_store_observed(name, il.raw(), pos);   /* raw: a device-API argument (gpu_graph_f32_store_observed) */
 }
 /** L436: gpu_graph_debug_dump_hc_tensor for a trunk layer.
  *  @param name the dump name  @param t the tensor  @param n_elems its elements  @param il the trunk layer
  *  @param pos the position */
 static inline void gpu_graph_debug_dump_hc_tensor(const char *name, pulsar_gpu_tensor *t, uint64_t n_elems, TrunkLayer il,
                                                   uint32_t pos) {
-    gpu_graph_debug_dump_hc_tensor(name, t, n_elems, il.raw(), pos);
+    gpu_graph_debug_dump_hc_tensor(name, t, n_elems, il.raw(), pos);   /* raw: a device-API argument (gpu_graph_debug_dump_hc_tensor) */
 }
 /** L436: gpu_graph_debug_dump_q_tensor for a trunk layer.
  *  @param name the dump name  @param t the tensor  @param n_elems its elements  @param il the trunk layer
  *  @param pos the position */
 static inline void gpu_graph_debug_dump_q_tensor(const char *name, pulsar_gpu_tensor *t, uint64_t n_elems, TrunkLayer il,
                                                  uint32_t pos) {
-    gpu_graph_debug_dump_q_tensor(name, t, n_elems, il.raw(), pos);
+    gpu_graph_debug_dump_q_tensor(name, t, n_elems, il.raw(), pos);   /* raw: a device-API argument (gpu_graph_debug_dump_q_tensor) */
 }
 /** L436: gpu_graph_debug_dump_tensor for a trunk layer.
  *  @param name the dump name  @param t the tensor  @param n_f32 its floats  @param il the trunk layer
  *  @param pos the position */
 static inline void gpu_graph_debug_dump_tensor(const char *name, pulsar_gpu_tensor *t, uint64_t n_f32, TrunkLayer il,
                                                uint32_t pos) {
-    gpu_graph_debug_dump_tensor(name, t, n_f32, il.raw(), pos);
+    gpu_graph_debug_dump_tensor(name, t, n_f32, il.raw(), pos);   /* raw: a device-API argument (gpu_graph_debug_dump_tensor) */
 }
 /** L436: gpu_graph_debug_dump_i32_tensor for a trunk layer.
  *  @param name the dump name  @param t the tensor  @param n_i32 its ints  @param il the trunk layer
  *  @param pos the position */
 static inline void gpu_graph_debug_dump_i32_tensor(const char *name, pulsar_gpu_tensor *t, uint64_t n_i32, TrunkLayer il,
                                                    uint32_t pos) {
-    gpu_graph_debug_dump_i32_tensor(name, t, n_i32, il.raw(), pos);
+    gpu_graph_debug_dump_i32_tensor(name, t, n_i32, il.raw(), pos);   /* raw: a device-API argument (gpu_graph_debug_dump_i32_tensor) */
 }
 /** L436: gpu_graph_needs_ffn_out for a trunk layer.
  *  @param g the graph  @param il the trunk layer  @param pos the position */
 /// @return true when the FFN output must be stored
 static inline bool gpu_graph_needs_ffn_out(const pulsar_gpu_graph *g, TrunkLayer il, uint32_t pos) {
-    return gpu_graph_needs_ffn_out(g, il.raw(), pos);
+    return gpu_graph_needs_ffn_out(g, il.raw(), pos);   /* raw: a device-API argument (gpu_graph_needs_ffn_out) */
 }
 bool gpu_graph_ensure_batch_ffn_out(pulsar_gpu_graph *g);
 bool gpu_graph_alloc_raw_cap(
@@ -6104,12 +6104,12 @@ bool pulsar_tp_vocab_gather(const pulsar_tp_vocab *x, uint32_t n_rows, const pul
 /** A trunk layer's tensor-parallel exchange slot: its number (ds4_tp_shape sizes the slab for PULSAR_N_LAYER slots).
  *  @param il the trunk layer */
 /// @return its exchange slot
-static inline TpSlot gpu_graph_tp_slot(TrunkLayer il) { return TpSlot{il.raw()}; }
+static inline TpSlot gpu_graph_tp_slot(TrunkLayer il) { return TpSlot{il.raw()}; }   /* raw: the named crossing gpu_graph_tp_slot() */
 /** The DSpark drafter's layer `li` exchanges in the trunk's slot of the SAME NUMBER: the slab has no slots of the
  *  drafter's own, and its three layers run between the trunk's steps, never beside them.
  *  @param li the drafter's layer */
 /// @return the exchange slot it borrows
-static inline TpSlot gpu_graph_drafter_tp_slot(DraftLayer li) { return TpSlot{li.raw()}; }
+static inline TpSlot gpu_graph_drafter_tp_slot(DraftLayer li) { return TpSlot{li.raw()}; }   /* raw: the named crossing gpu_graph_drafter_tp_slot() */
 /** The DSpark drafter's layer `li` as the layer argument of the trunk's shared FFN (gpu_graph_encode_layer_ffn_batch,
  *  "reuses existing function"): the trunk layer of the SAME NUMBER.  The two are different layers -- this is the
  *  crossing L236#2 was (the drafter's 0..2 once indexed the trunk's expert-count table through it).  Inside the FFN
@@ -6117,7 +6117,7 @@ static inline TpSlot gpu_graph_drafter_tp_slot(DraftLayer li) { return TpSlot{li
  *  it indexes there is the TRUNK layer's (today: the FFN steering direction, when FFN steering is on).
  *  @param li the drafter's layer */
 /// @return the trunk layer of the same number
-static inline TrunkLayer gpu_graph_drafter_ffn_layer(DraftLayer li) { return TrunkLayer{li.raw()}; }
+static inline TrunkLayer gpu_graph_drafter_ffn_layer(DraftLayer li) { return TrunkLayer{li.raw()}; }   /* raw: the named crossing gpu_graph_drafter_ffn_layer() */
 bool gpu_graph_tp_allreduce_rows(pulsar_gpu_graph *g, TpSlot slot, uint32_t n_tokens,
                                  pulsar_gpu_tensor *t, pulsar_gpu_tensor *addend,
                                  const char *what);

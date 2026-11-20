@@ -155,7 +155,7 @@ bool linears(const pulsar_engine *e, const pulsar_nemotron_enc_run *r, int n, co
         st[j] = stage;
         stage += (size_t)rows * (size_t)out[j];
     }
-    return pulsar_rows_linear_multi_bf16_launch(lp, n, x, (int)rows, st, yb, dp(r->sc->t[B_LWS]), r->sc->bytes[B_LWS].raw(),
+    return pulsar_rows_linear_multi_bf16_launch(lp, n, x, (int)rows, st, yb, dp(r->sc->t[B_LWS]), r->sc->bytes[B_LWS].raw(),   /* raw: a device-API argument (pulsar_rows_linear_multi_bf16_launch) */
                                                 0) == 0;
 }
 
@@ -210,7 +210,7 @@ bool forward(pulsar_engine *e, const pulsar_tokens *in, uint32_t n, uint32_t row
     io.out_bf16 = a;
     io.ld_out = Q;
     io.workspace = dp(r->sc->t[B_AWS]);
-    io.workspace_bytes = r->sc->bytes[B_AWS].raw();
+    io.workspace_bytes = r->sc->bytes[B_AWS].raw();   /* raw: into the bare field workspace_bytes */
     for (TrunkLayer il{0u}; il.below(s.n_layer); ++il) {
         const pulsar_nemotron_enc_layer &L = w->layer[il];
         const uint16_t *next = il.next().below(s.n_layer) ? wp(w->layer[il.next()].attn_norm, "nemotron_enc attn_norm")

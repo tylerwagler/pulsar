@@ -81,7 +81,7 @@ bool encode_into(const pulsar_engine *e, const char *text, size_t len, const pul
  *  @return false when the tokenizer refused the text (encode_into) */
 bool encode_text(pulsar_engine *e, const char *text, pulsar_tokens *out) {
     const pulsar_text_span all = {PromptOff{0u}, PromptOff::after(TextBytes{text ? strlen(text) : 0})};
-    return encode_into(e, text, all.len().raw(), all.empty() ? NULL : &all, all.empty() ? 0u : 1u, out);
+    return encode_into(e, text, all.len().raw(), all.empty() ? NULL : &all, all.empty() ? 0u : 1u, out);   /* raw: into encode_into()'s bare parameter */
 }
 
 /** pulsar_family_tokenizer::encode_rendered: added tokens match outside `spans`.
@@ -277,7 +277,7 @@ void dump(pulsar_engine *e, FILE *fp, const pulsar_tokens *tokens) {
     fprintf(fp, "]\n");
     for (int i = 0; i < tokens->len; i++) {
         size_t n = 0;
-        char *piece = token_text(e, tokens->v[i].raw(), &n);
+        char *piece = token_text(e, tokens->v[i].raw(), &n);   /* raw: into token_text()'s bare parameter */
         fprintf(fp, "%6d  ", tokens->v[i].raw());
         pulsar_dump_piece_quoted(fp, piece, n);
         fputc('\n', fp);
@@ -294,12 +294,12 @@ int n_tokens(pulsar_engine *e) { return bpe_tokenizer_n_tokens(TOK(e)); }
 
 /* L334 P3: the family's ids leave the tokenizer here, typed (its internals stay raw). */
 /** pulsar_family_tokenizer::is_stop, typed.  @param e the engine  @param t the token  @return is_stop's */
-static bool is_stop_op(pulsar_engine *e, TokId t) { return is_stop(e, t.raw()); }
+static bool is_stop_op(pulsar_engine *e, TokId t) { return is_stop(e, t.raw()); }   /* raw: into is_stop()'s bare parameter */
 /** pulsar_family_tokenizer::eos, typed.  @param e the engine  @return eos's (-1 enters as none()) */
 static TokId eos_op(pulsar_engine *e) { return TokId{eos(e)}; }
 /** pulsar_family_tokenizer::token_text, typed.  @param e the engine  @param t the token  @param len its length
  *  @return token_text's */
-static char *token_text_op(pulsar_engine *e, TokId t, size_t *len) { return token_text(e, t.raw(), len); }
+static char *token_text_op(pulsar_engine *e, TokId t, size_t *len) { return token_text(e, t.raw(), len); }   /* raw: into token_text()'s bare parameter */
 /** pulsar_family_tokenizer::think_close, typed.  @param e the engine  @return think_close's (-1: none()) */
 static TokId think_close_op(pulsar_engine *e) { return TokId{think_close(e)}; }
 

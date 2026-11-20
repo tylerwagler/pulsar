@@ -421,7 +421,7 @@ bool server_judge_step(server *s) {
         jb->started = true;
         pulsar_prefix_match m;
         pulsar_session_prefix_match(pool, &P, &m);
-        int have = m.prompt_cut.raw();
+        int have = m.prompt_cut.raw();   /* raw: a bare local for the arithmetic below */
         jb->cached[jb->at] = have;
         if (have >= P.len) {   /* an exact repeat: one token short first, so the head reruns on the last row */
             pulsar_tokens cut = {P.v, P.len - 1, P.len - 1};

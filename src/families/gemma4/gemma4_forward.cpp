@@ -522,7 +522,7 @@ bool constants(const pulsar_engine *e, g4_state *st) {
         if (!src) return false;
         for (uint32_t x = 0; x < s.n_expert; x++) {
             const uint32_t u = (uint32_t)src[x] << 16;
-            memcpy(&es[(size_t)il.raw() * s.n_expert + x], &u, 4);
+            memcpy(&es[(size_t)il.raw() * s.n_expert + x], &u, 4);   /* raw: an index into a bare array */
         }
     }
     return pulsar_gpu_tensor_write(st->rope_tab, TensorBytes{0u}, tab.data(), bytes_of<float>(P)) &&
@@ -557,7 +557,7 @@ pulsar_driver_state *create(pulsar_session *s, uint32_t n_banks) {
     st->attn_desc_max = a256(TensorBytes{pulsar_gqa_desc_bytes((uint32_t)R)});
     st->attn_call = (pulsar_gqa_call *)xcalloc(2u * NL, sizeof(pulsar_gqa_call));
     st->attn_off = (SlabOff *)xcalloc(2u * NL, sizeof(SlabOff));
-    st->attn_desc_host = (uint8_t *)xmalloc(st->attn_desc_max.times(2u * NL).raw());
+    st->attn_desc_host = (uint8_t *)xmalloc(st->attn_desc_max.times(2u * NL).raw());   /* raw: an allocation / copy size */
     st->attn_desc = pulsar_gpu_tensor_alloc(st->attn_desc_max.times(2u * NL));
     st->last_hidden = pulsar_gpu_tensor_alloc(bytes_of<uint16_t>(sh.n_embd));
     const bool ok = st->h && st->xa && st->rope_tab && st->ones && st->escale && st->attn_desc && st->last_hidden &&
@@ -660,7 +660,7 @@ bool step_linears(const g4_step *st, int n, const pulsar_tensor *const *t, int i
             yr[j] = y[j] + (size_t)r0 * (size_t)out[j];
             br[j] = yb[j] + (size_t)r0 * (size_t)out[j];
         }
-        return pulsar_rows_linear_multi_bf16_launch(lp, n, x + (size_t)r0 * in, (int)m, yr, br, ws, ws_bytes.raw(), 0) == 0;
+        return pulsar_rows_linear_multi_bf16_launch(lp, n, x + (size_t)r0 * in, (int)m, yr, br, ws, ws_bytes.raw(), 0) == 0;   /* raw: a device-API argument (pulsar_rows_linear_multi_bf16_launch) */
     });
 }
 
@@ -741,7 +741,7 @@ uint32_t attn_bound(const g4_step *st) {
 /** @param il      a trunk layer
  *  @param prompt  the prompt rows' call (else the decode rows')
  *  @return the call's index in attn_call / attn_off */
-uint32_t attn_call_of(TrunkLayer il, bool prompt) { return 2u * il.raw() + (prompt ? 1u : 0u); }
+uint32_t attn_call_of(TrunkLayer il, bool prompt) { return 2u * il.raw() + (prompt ? 1u : 0u); }   /* raw: a bare local for the arithmetic below */
 
 /** @param st      the step
  *  @param il      the layer
@@ -768,10 +768,10 @@ bool plan_call(const g4_step *st, TrunkLayer il, uint32_t bound, SlabOff off, Te
             pulsar_gpu_tensor *pool = pulsar_state_pool(st->states, pulsar_layer_slot_of(il), PULSAR_GEMMA4_STATE_KV_FULL, q->seq_bank[j]);
             if (!pool) return failf("a global layer's pool is evicted", il);
             sq.kv = dptr(pool);
-            sq.bytes = pulsar_gpu_tensor_bytes(pool).raw();
+            sq.bytes = pulsar_gpu_tensor_bytes(pool).raw();   /* raw: into the bare field bytes */
         } else {
-            sq.kv = (uint8_t *)dptr(ring) + ring_bank.times(bank).raw();
-            sq.bytes = ring_bank.raw();
+            sq.kv = (uint8_t *)dptr(ring) + ring_bank.times(bank).raw();   /* raw: into the bare field kv */
+            sq.bytes = ring_bank.raw();   /* raw: into the bare field bytes */
         }
         sq.cap = (uint32_t)(sq.bytes / tb);
     }
@@ -781,7 +781,7 @@ bool plan_call(const g4_step *st, TrunkLayer il, uint32_t bound, SlabOff off, Te
         const uint32_t c = attn_call_of(il, prompt);
         q->attn_off[c] = off + (prompt ? stride : TensorBytes{});
         return pulsar_gqa_plan(&G1, q->seqs, q->n_seq, q->row_seq + r0, q->row_pos + r0, m, bound,
-                               pulsar_slab_at(q->attn_desc_host, q->attn_off[c]), stride.raw(), &q->attn_call[c]) == 0 ||
+                               pulsar_slab_at(q->attn_desc_host, q->attn_off[c]), stride.raw(), &q->attn_call[c]) == 0 ||   /* raw: into pulsar_gqa_plan()'s bare parameter */
                failf("the attention's plan refused", il);
     });
 }
@@ -801,7 +801,7 @@ bool stage(const pulsar_driver_step *st0, uint64_t *graph_key) {
     const uint32_t bound = attn_bound(st);
     const TensorBytes stride = a256(TensorBytes{pulsar_gqa_desc_bytes(st->n_rows)});
     for (TrunkLayer il{0u}; il.below(st->plan->n_layer); ++il)
-        if (!plan_call(st, il, bound, SlabOff::after(stride.times((uint64_t)il.raw() * 2u)), stride)) return false;
+        if (!plan_call(st, il, bound, SlabOff::after(stride.times((uint64_t)il.raw() * 2u)), stride)) return false;   /* raw: a scale factor */
     if (pulsar_gpu_tensor_write_async(q->attn_desc, TensorBytes{0u}, q->attn_desc_host,
                                       stride.times((uint64_t)st->plan->n_layer * 2u)) == 0)
         return fail("could not upload the attention descriptors");
@@ -868,7 +868,7 @@ bool lora_rows(const g4_step *st, const pulsar_gemma4_lora &l, const uint16_t *x
     const uint8_t *rows = pulsar_slab_at<const uint8_t>(dptr(st->st->scratch[ARENA_ROWS]), rows_layout(st->st->max_rows).ad);
     return d.A && d.B && arm_segments(st, 0, st->n_rows, [&](bool prompt, uint32_t r0, uint32_t m) {
         return pulsar_rows_lora_launch(x + (size_t)r0 * ld_x, ld_x, (int)m, &d, y + (size_t)r0 * ld_y, ld_y, rows + r0,
-                                       prompt, ws, ws_bytes.raw(), 0) == 0;
+                                       prompt, ws, ws_bytes.raw(), 0) == 0;   /* raw: a device-API argument (pulsar_rows_lora_launch) */
     });
 }
 
@@ -931,13 +931,13 @@ bool attention(const g4_step *st, TrunkLayer il, uint8_t *base, const mix_scratc
             io.out_bf16 = ab + (uint64_t)r0 * Q;
             io.ld_out = Q;
             io.workspace = pulsar_slab_at(base, M.gqa);
-            io.workspace_bytes = M.gqa_bytes.raw();
+            io.workspace_bytes = M.gqa_bytes.raw();   /* raw: into the bare field workspace_bytes */
             io.decode_rows = prompt ? 0 : 1;        /* L338: decode rows: the wide heads' flash-decoding */
             io.decode_group = st->verify ? 4 : 1;   /* L338: a verify's rows (one sequence each run) load each key once
                                                      * a group of 4; a decode step's rows are sequences of their own */
             /* O59: the step's non-finite flag (step_end reads it); bit 23 marks an attention operand */
             io.nf_flag = pulsar_slab_at<uint32_t>(dptr(st->st->scratch[ARENA_ROWS]), rows_layout(st->st->max_rows).nf);
-            io.nf_code = 0x47800000u | il.raw();
+            io.nf_code = 0x47800000u | il.raw();   /* raw: into the bare field nf_code */
             return pulsar_gqa_launch(&G1, &q->attn_call[c], pulsar_slab_at<const uint8_t>(dptr(q->attn_desc), q->attn_off[c]), &io,
                                      0) == 0;
         }))
@@ -986,7 +986,7 @@ bool ffn(const g4_step *st, TrunkLayer il, uint8_t *base, const ffn_scratch &F) 
     /* the three inputs xd / xm / xr came with the attention's add (block) */
     const pulsar_moe_block_shape bs = moe_shape(s);
     pulsar_moe_block_parts parts;
-    if (pulsar_moe_block_carve(&bs, (int)n, pulsar_slab_at(base, F.u), F.moe_bytes.raw(), &parts) != 0) return failf("the MoE workspace", il);
+    if (pulsar_moe_block_carve(&bs, (int)n, pulsar_slab_at(base, F.u), F.moe_bytes.raw(), &parts) != 0) return failf("the MoE workspace", il);   /* raw: into pulsar_moe_block_carve()'s bare parameter */
     /* the dense MLP: down(gelu_tanh(gate xd) * up xd), per row-kind segment, through the block's shared-expert buffers */
     /* L338 P2: the adapter's LoRAs on the dense MLP's three Linears (the shared producer adds them to its f32 outputs) */
     const uint8_t *ad_rows =
@@ -1013,7 +1013,7 @@ bool ffn(const g4_step *st, TrunkLayer il, uint8_t *base, const ffn_scratch &F) 
             qd.lora_down = &ld;
             qd.lora_rows = ad_rows + r0;
             qd.lora_ws = pulsar_slab_at(base, F.lora);
-            qd.lora_ws_bytes = F.lora_bytes.raw();
+            qd.lora_ws_bytes = F.lora_bytes.raw();   /* raw: into the bare field lora_ws_bytes */
         }
         qd.act = PULSAR_FFN_ACT_GEGLU_TANH;
         qd.scale = NULL;
@@ -1032,7 +1032,7 @@ bool ffn(const g4_step *st, TrunkLayer il, uint8_t *base, const ffn_scratch &F) 
     /* the router: bf16 logits of xr (x hidden^-1/2), softmax, top-8, renormalised, x per_expert_scale */
     const pulsar_router_cfg rc = router_cfg(s);
     pulsar_router_layer rl{};
-    rl.expert_scale = (const float *)dptr(st->st->escale) + (size_t)il.raw() * s.n_expert;
+    rl.expert_scale = (const float *)dptr(st->st->escale) + (size_t)il.raw() * s.n_expert;   /* raw: into the bare field expert_scale */
     const uint16_t *rw = (const uint16_t *)wp(st, L.router, "gemma4 router");
     /* L336: the logits take the row-kind segments (a prompt chunk's on the tensor cores, where the device has bf16
      * ones); the select stays whole */
@@ -1055,7 +1055,7 @@ bool ffn(const g4_step *st, TrunkLayer il, uint8_t *base, const ffn_scratch &F) 
     c.ws = parts.routed;
     c.ws_bytes = parts.routed_bytes;
     c.nf_flag = pulsar_slab_at<uint32_t>(dptr(st->st->scratch[ARENA_ROWS]), R.nf);
-    c.nf_code = 0x47000000u | il.raw();
+    c.nf_code = 0x47000000u | il.raw();   /* raw: into the bare field nf_code */
     if (!arm_segments(st, 0, n, [&](bool prompt, uint32_t r0, uint32_t rows) {
             c.selected = parts.sel + (size_t)r0 * K;
             c.weights = parts.wts + (size_t)r0 * K;
@@ -1130,7 +1130,7 @@ bool block(const pulsar_driver_step *st0, TrunkLayer il) {
  *  @return true = launched; false = refused (said) */
 bool head(const pulsar_driver_step *st0, StepRow row0_at, StepRows n_rows, HeadRow out0_at) {
     /* the step's row / logits-row indices for the kernels (L334 P2b S7b: typed at the op) */
-    const uint32_t row0 = pulsar_row_index(row0_at), n = (uint32_t)n_rows.raw(), out0 = pulsar_row_index(out0_at);
+    const uint32_t row0 = pulsar_row_index(row0_at), n = (uint32_t)n_rows.raw(), out0 = pulsar_row_index(out0_at);   /* raw: a bare local for the arithmetic below */
     const g4_step *st = S(st0);
     const pulsar_gemma4_shape &s = st->w->shape;
     if (n == 0 || row0 + n > st->n_rows || out0 + n > PULSAR_DRIVER_HEADS_MAX) return fail("head rows out of range");
@@ -1140,7 +1140,7 @@ bool head(const pulsar_driver_step *st0, StepRow row0_at, StepRows n_rows, HeadR
     float *logits = (float *)dptr(st->buf->logits) + (size_t)out0 * s.n_vocab;
     const uint16_t *xb = (const uint16_t *)dptr(st->st->xa) + (size_t)row0 * s.n_embd;
     if (!pulsar_linear_rows_ref(st->model, st->w->head, (int)s.n_embd, (int)s.n_vocab, false, "gemma4 lm_head", &l) ||
-        pulsar_rows_linear_launch(&l, xb, (int)n, logits, pulsar_slab_at(base, H.lin), H.lin_bytes.raw(), 0) != 0)
+        pulsar_rows_linear_launch(&l, xb, (int)n, logits, pulsar_slab_at(base, H.lin), H.lin_bytes.raw(), 0) != 0)   /* raw: a device-API argument (pulsar_rows_linear_launch) */
         return fail("the head linear refused");
     const pulsar_head_decl hd = head_decl(s);
     if (pulsar_head_logits_finish_launch(&hd, logits, n, s.n_vocab, 0) != 0) return fail("the logits finish refused");
@@ -1211,7 +1211,7 @@ bool step_end(const pulsar_driver_step *st0, bool ok) {
  *  @param il   the layer just run */
 void dump(const pulsar_driver_step *st0, TrunkLayer il) {
     const g4_step *st = S(st0);
-    gpu_graph_debug_dump_hc_tensor("gemma4", st->st->h, (uint64_t)st->n_rows * st->w->shape.n_embd, il.raw(),
+    gpu_graph_debug_dump_hc_tensor("gemma4", st->st->h, (uint64_t)st->n_rows * st->w->shape.n_embd, il.raw(),   /* raw: a device-API argument (gpu_graph_debug_dump_hc_tensor) */
                                    (uint32_t)st->pos[st->n_rows - 1]);
 }
 

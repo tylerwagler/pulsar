@@ -106,7 +106,7 @@ void out_parser::probe_end(out_parser *probe) {
     if (!lent_out_ || probe->loan_ == LOAN_NONE) kit_die("probe_end() without its probe()");
     std::string &lent = probe->loan_ == LOAN_PARKED ? probe->parked_ : probe->block_;
     if (GenBytes{lent.size()} < probe->loan_len_) kit_die("a probe lost bytes of the body it borrowed");
-    lent.resize(probe->loan_len_.raw());
+    lent.resize(probe->loan_len_.raw());   /* raw: an allocation / copy size */
     block_.swap(lent);
     lent_out_ = false;
     delete probe;
@@ -222,7 +222,7 @@ void out_parser::emit_text(out_state st, const char *p, size_t n, StreamOff at, 
     }
     StreamOff end = at;
     if (sent >= carried) end += GenBytes{sent - carried};
-    else end -= GenBytes{std::min(carried - sent, at.before().raw())};   /* ends inside the carried bytes (invalid) */
+    else end -= GenBytes{std::min(carried - sent, at.before().raw())};   /* raw: the offset as the bytes before it; ends inside the carried bytes (invalid) */
     send(reasoning, std::move(out), end, ev);
 }
 
@@ -654,7 +654,7 @@ bool out_json_call_body::close(const std::string &b, int index, std::vector<out_
         ev->push_back(std::move(e));
     }
     call->name = name->s;
-    call->arguments = args && !args_hi_.is_none() ? b.substr(body_ix(args_lo_), (args_hi_ - args_lo_).raw()) : "{}";
+    call->arguments = args && !args_hi_.is_none() ? b.substr(body_ix(args_lo_), (args_hi_ - args_lo_).raw()) : "{}";   /* raw: into substr()'s bare parameter */
     return true;
 }
 

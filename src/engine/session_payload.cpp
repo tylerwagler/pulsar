@@ -201,7 +201,7 @@ static int payload_write_tensor_span(payload_io *io, const pulsar_gpu_tensor *te
             payload_set_err(err, errlen, "failed to read accelerator session tensor");
             return 1;
         }
-        if (payload_write_bytes(io, buf, n.raw(), err, errlen) != 0) return 1;
+        if (payload_write_bytes(io, buf, n.raw(), err, errlen) != 0) return 1;   /* raw: into payload_write_bytes()'s bare parameter */
         done += n;
     }
     return 0;
@@ -237,7 +237,7 @@ static int payload_read_tensor_span(payload_io *io, pulsar_gpu_tensor *tensor,
     }
     for (TensorBytes done{}; done < bytes;) {   /* the span, a staging buffer at a time */
         const TensorBytes n = bytes - done > TensorBytes{cap} ? TensorBytes{cap} : bytes - done;
-        if (payload_read_bytes(io, buf, n.raw(), remaining, err, errlen) != 0) return 1;
+        if (payload_read_bytes(io, buf, n.raw(), remaining, err, errlen) != 0) return 1;   /* raw: into payload_read_bytes()'s bare parameter */
         if (pulsar_gpu_tensor_write(tensor, (offset + done).before(), buf, n) == 0) {
             payload_set_err(err, errlen, "failed to restore accelerator session tensor");
             return 1;
@@ -331,9 +331,9 @@ static uint64_t segment_layout_digest(pulsar_ckpt_store *st, BankId bank) {
     if (st->bank_adapter && st->bank_adapter[pulsar_bank_index(bank)])
         for (const char *c = "runtime-adapter"; *c; c++) mix((uint8_t)*c);
     mix(st->ops->resume_grid);
-    mix(st->slot_bytes.raw());
+    mix(st->slot_bytes.raw());   /* raw: into mix()'s bare parameter */
     mix(n);
-    for (uint32_t i = 0; i < n; i++) { mix(pools[i].tokens_per_row.raw()); mix(pools[i].row_bytes.raw()); }
+    for (uint32_t i = 0; i < n; i++) { mix(pools[i].tokens_per_row.raw()); mix(pools[i].row_bytes.raw()); }   /* raw: into mix()'s bare parameter */
     return h;
 }
 
@@ -355,10 +355,10 @@ static pool_span pool_span_of(const pulsar_kv_pool &p, uint32_t t0, uint32_t t1)
     return {CompRow::after(from), to - from};
 }
 /** Bytes of `n` rows of pool `p`.  @param p the pool  @param n rows  @return bytes */
-static TensorBytes pool_bytes(const pulsar_kv_pool &p, CompRows n) { return p.row_bytes.times((uint64_t)n.raw()); }
+static TensorBytes pool_bytes(const pulsar_kv_pool &p, CompRows n) { return p.row_bytes.times((uint64_t)n.raw()); }   /* raw: a scale factor */
 /** Byte offset of row `r` in pool `p`'s tensor.  @param p the pool  @param r the row  @return its offset */
 static SlabOff pool_offset(const pulsar_kv_pool &p, CompRow r) {
-    return SlabOff::after(p.row_bytes.times((uint64_t)r.before().raw()));
+    return SlabOff::after(p.row_bytes.times((uint64_t)r.before().raw()));   /* raw: a scale factor */
 }
 
 /// @param pools [n] the pools
@@ -434,7 +434,7 @@ static uint64_t segment_bytes_for(pulsar_ckpt_store *st, uint32_t G_prev, uint32
     uint64_t bytes = (uint64_t)SEGMENT_U32_FIELDS * sizeof(uint32_t);
     bytes += (uint64_t)(G - G_prev) * sizeof(uint32_t);
     bytes += sizeof(uint32_t) + (uint64_t)n_images * SEGMENT_IMAGE_U32 * sizeof(uint32_t);
-    bytes += pools_span_bytes(pools, n, G_prev, G).raw();   /* tensor bytes enter the stream's length (L438) */
+    bytes += pools_span_bytes(pools, n, G_prev, G).raw();   /* raw: tensor bytes enter the stream's length (L438) */
     return bytes + sizeof(uint64_t);   /* the rows' digest */
 }
 
@@ -449,7 +449,7 @@ static uint64_t segment_bytes_for(pulsar_ckpt_store *st, uint32_t G_prev, uint32
 
 /** The bytes of a restore point: header, slot, digest.  @param st the store (its slot size)  @return bytes */
 static uint64_t restore_point_bytes_for(const pulsar_ckpt_store *st) {
-    return (uint64_t)RESTORE_POINT_U32_FIELDS * sizeof(uint32_t) + st->slot_bytes.raw() + sizeof(uint64_t);
+    return (uint64_t)RESTORE_POINT_U32_FIELDS * sizeof(uint32_t) + st->slot_bytes.raw() + sizeof(uint64_t);   /* raw: returned bare to its caller */
 }
 
 /* L353: a span's image content hashes, which its segment's key covers (pulsar_segstore_child_key_images) */
@@ -552,10 +552,10 @@ int pulsar_session::copy_out_restore_point(uint32_t G, uint8_t *dst, uint64_t by
     const uint64_t layout = segment_layout_digest(st, bank);
     const uint32_t header[RESTORE_POINT_U32_FIELDS] = {
         PULSAR_SESSION_RESTORE_POINT_MAGIC, PULSAR_SESSION_RESTORE_POINT_VERSION,
-        (uint32_t)layout, (uint32_t)(layout >> 32), (uint32_t)st->slot_bytes.raw(), st->ops->resume_grid, G, 0u,
+        (uint32_t)layout, (uint32_t)(layout >> 32), (uint32_t)st->slot_bytes.raw(), st->ops->resume_grid, G, 0u,   /* raw: a bare operand */
     };
     for (uint32_t i = 0; i < RESTORE_POINT_U32_FIELDS; i++) o.u32(header[i]);
-    uint8_t *slot_dst = o.take(st->slot_bytes.raw());
+    uint8_t *slot_dst = o.take(st->slot_bytes.raw());   /* raw: into take()'s bare parameter */
     uint8_t *dg = o.take(PULSAR_KVDIGEST_BYTES);
     if (!o.ok || o.at != bytes) {
         payload_set_err(err, errlen, "copy-out restore point: its layout overran the buffer");
@@ -603,11 +603,11 @@ int pulsar_session::copy_out_segment(uint32_t G_prev, uint32_t G, uint8_t *dst, 
     const uint64_t layout = segment_layout_digest(st, bank);
     const uint32_t header[SEGMENT_U32_FIELDS] = {
         PULSAR_SESSION_SEGMENT_MAGIC, PULSAR_SESSION_SEGMENT_VERSION,
-        (uint32_t)layout, (uint32_t)(layout >> 32), (uint32_t)st->slot_bytes.raw(), st->ops->resume_grid, G_prev, G,
+        (uint32_t)layout, (uint32_t)(layout >> 32), (uint32_t)st->slot_bytes.raw(), st->ops->resume_grid, G_prev, G,   /* raw: a bare operand */
         0u,
     };
     for (uint32_t i = 0; i < SEGMENT_U32_FIELDS; i++) o.u32(header[i]);
-    for (uint32_t p = G_prev; p < G; p++) o.u32((uint32_t)s->checkpoint.v[p].raw());
+    for (uint32_t p = G_prev; p < G; p++) o.u32((uint32_t)s->checkpoint.v[p].raw());   /* raw: into u32()'s bare parameter */
     o.u32(n_img);
     for (uint32_t i = 0; i < n_img; i++) {   /* L281: the span's image records */
         uint32_t rec[SEGMENT_IMAGE_U32];
@@ -627,7 +627,7 @@ int pulsar_session::copy_out_segment(uint32_t G_prev, uint32_t G, uint8_t *dst, 
             return 1;
         }
         const TensorBytes span = pool_bytes(pools[i], sp.n);
-        spans[n_spans++] = { pools[i].rows, pool_offset(pools[i], sp.first).before(), o.take(span.raw()), span };
+        spans[n_spans++] = { pools[i].rows, pool_offset(pools[i], sp.first).before(), o.take(span.raw()), span };   /* raw: into take()'s bare parameter */
     }
     uint8_t *dg = o.take(PULSAR_KVDIGEST_BYTES);
     if (!o.ok || o.at != bytes) {
@@ -664,7 +664,7 @@ static int restore_point_header_read(mem_in *in, pulsar_ckpt_store *st, BankId b
         return 1;
     }
     const uint64_t layout = segment_layout_digest(st, bank);
-    if (h[2] != (uint32_t)layout || h[3] != (uint32_t)(layout >> 32) || h[4] != (uint32_t)st->slot_bytes.raw() ||
+    if (h[2] != (uint32_t)layout || h[3] != (uint32_t)(layout >> 32) || h[4] != (uint32_t)st->slot_bytes.raw() ||   /* raw: compared with a bare value */
         h[5] != st->ops->resume_grid) {
         payload_set_err(err, errlen, "load segment: restore point written for a different state layout");
         return 1;
@@ -725,7 +725,7 @@ static pulsar_segment_status segment_parse(pulsar_ckpt_store *st, BankId bank, i
         return PULSAR_SEGMENT_BAD_ROWS;
     }
     const uint64_t layout = segment_layout_digest(st, bank);
-    if (h[2] != (uint32_t)layout || h[3] != (uint32_t)(layout >> 32) || h[4] != (uint32_t)st->slot_bytes.raw() ||
+    if (h[2] != (uint32_t)layout || h[3] != (uint32_t)(layout >> 32) || h[4] != (uint32_t)st->slot_bytes.raw() ||   /* raw: compared with a bare value */
         h[5] != st->ops->resume_grid) {
         payload_set_err(err, errlen, "load segment: written for a different state layout");
         return PULSAR_SEGMENT_BAD_ROWS;
@@ -839,7 +839,7 @@ pulsar_segment_status pulsar_session::load_segment(const uint8_t *seg, uint64_t 
             return fail(PULSAR_SEGMENT_TRANSIENT);
         }
         const TensorBytes span = pool_bytes(pools[i], sp.n);
-        const uint8_t *src = in.take(span.raw());
+        const uint8_t *src = in.take(span.raw());   /* raw: into take()'s bare parameter */
         if (!src || pulsar_gpu_tensor_write(pools[i].rows, pool_offset(pools[i], sp.first).before(), src, span) == 0) {
             payload_set_err(err, errlen, "load segment: restoring a pool's rows failed");
             return fail(src ? PULSAR_SEGMENT_TRANSIENT : PULSAR_SEGMENT_BAD_ROWS);
@@ -852,7 +852,7 @@ pulsar_segment_status pulsar_session::load_segment(const uint8_t *seg, uint64_t 
     /* L347: the chain's last segment -- the state at G from its restore point */
     if (last) {
         pulsar_stall_mark("segment load: restore point to the checkpoint slot");
-        const uint8_t *slot_src = rin.take(st->slot_bytes.raw());
+        const uint8_t *slot_src = rin.take(st->slot_bytes.raw());   /* raw: into take()'s bare parameter */
         if (!slot_src || rp_bytes - rin.at != PULSAR_KVDIGEST_BYTES) {
             payload_set_err(err, errlen, "load segment: the restore point's slot does not end at its digest");
             return fail(PULSAR_SEGMENT_BAD_RP);
@@ -979,11 +979,11 @@ static uint64_t kvp_layout_digest(pulsar_ckpt_store *st, const pulsar_kv_pool *p
     auto mix = [&h](uint64_t v) { for (int i = 0; i < 8; i++) { h ^= (uint8_t)(v >> (8 * i)); h *= 1099511628211ull; } };
     mix(n);
     for (uint32_t i = 0; i < n; i++) {
-        mix(pools[i].tokens_per_row.raw());
-        mix(pools[i].row_bytes.raw());
+        mix(pools[i].tokens_per_row.raw());   /* raw: into mix()'s bare parameter */
+        mix(pools[i].row_bytes.raw());   /* raw: into mix()'s bare parameter */
         mix(pools[i].whole_rows);
     }
-    mix(kvp_frontier_bytes(st).raw());
+    mix(kvp_frontier_bytes(st).raw());   /* raw: into mix()'s bare parameter */
     mix(width);
     return h;
 }
@@ -1005,7 +1005,7 @@ static uint64_t kvp_bytes_for(const pulsar_ckpt_store *st, const pulsar_kv_pool 
     bytes += (uint64_t)KVP_SPEC_U32 * sizeof(uint32_t);
     bytes += (uint64_t)width * sizeof(float);
     /* the resume checkpoint, the frontier, the pools' rows: tensor bytes enter the stream's length (L438) */
-    bytes += ((G ? st->slot_bytes : TensorBytes{}) + kvp_frontier_bytes(st) + pools_span_bytes(pools, n, 0u, T)).raw();
+    bytes += ((G ? st->slot_bytes : TensorBytes{}) + kvp_frontier_bytes(st) + pools_span_bytes(pools, n, 0u, T)).raw();   /* raw: into a bare variable */
     return bytes + sizeof(uint64_t);   /* the trailing digest */
 }
 
@@ -1055,7 +1055,7 @@ static bool kvp_plan_save(pulsar_session *s, kvp_plan *p, char *err, size_t errl
         payload_set_err(err, errlen, msg);
         return false;
     }
-    p->PF = (uint32_t)pulsar_session_bank_prefill_frontier(s, p->bank).raw();   /* L334: the payload's raw field */
+    p->PF = (uint32_t)pulsar_session_bank_prefill_frontier(s, p->bank).raw();   /* raw: L334: the payload's raw field */
     if (p->PF > p->T) {
         payload_set_err(err, errlen, "session payload: the prefill frontier lies past the session's tokens");
         return false;
@@ -1099,7 +1099,7 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
      * always saves the same bytes) */
     const TensorBytes fb = kvp_frontier_bytes(st);
     pulsar_gpu_tensor *front = pulsar_gpu_tensor_alloc(fb);
-    if (!front || pulsar_gpu_tensor_fill_f32(front, 0.0f, fb.raw() / sizeof(float)) == 0 ||
+    if (!front || pulsar_gpu_tensor_fill_f32(front, 0.0f, fb.raw() / sizeof(float)) == 0 ||   /* raw: a device-API argument (pulsar_gpu_tensor_fill_f32) */
         !st->ops->walk(st->state, 0, true, front, SlabOff{}, pulsar_ckpt_pos(p.T), NULL) ||
         pulsar_gpu_synchronize() == 0) {
         pulsar_gpu_tensor_free(front);
@@ -1118,7 +1118,7 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
     int rc = 0;
     for (uint32_t i = 0; rc == 0 && i < KVP_U32_FIELDS; i++) rc = payload_write_u32(&io, header[i], err, errlen);
     for (uint32_t i = 0; rc == 0 && i < p.T; i++)
-        rc = payload_write_u32(&io, (uint32_t)s->checkpoint.v[i].raw(), err, errlen);
+        rc = payload_write_u32(&io, (uint32_t)s->checkpoint.v[i].raw(), err, errlen);   /* raw: into payload_write_u32()'s bare parameter */
     if (rc == 0) rc = payload_write_images(&io, s->live_images.b, s->live_images.n, err, errlen);
     uint32_t spec_rec[KVP_SPEC_U32];
     kvp_spec_pack(&s->spec, spec_rec);
@@ -1131,7 +1131,7 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
     if (rc == 0) rc = payload_write_bytes(&io, live, (uint64_t)p.width * sizeof(float), err, errlen);
     uint8_t *buf = s->io_buf;   /* pinned once at create (pulsar_session::io_buf) */
     if (rc == 0 && p.G)   /* L347 I4: a host-tier slot is written from its pinned bytes */
-        rc = at.host ? payload_write_bytes(&io, at.host, st->slot_bytes.raw(), err, errlen)
+        rc = at.host ? payload_write_bytes(&io, at.host, st->slot_bytes.raw(), err, errlen)   /* raw: into payload_write_bytes()'s bare parameter */
                      : payload_write_tensor_span(&io, at.slab, at.off, st->slot_bytes, buf, PULSAR_SESSION_IO_CHUNK, err,
                                                  errlen);
     if (rc == 0) rc = payload_write_tensor_span(&io, front, SlabOff{}, fb, buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
@@ -1251,7 +1251,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     uint8_t *buf = s->io_buf;   /* pinned once at create (pulsar_session::io_buf) */
     int rc = 0;
     if (G)   /* L347 I4: a host-tier slot is read into its pinned bytes */
-        rc = at.host ? payload_read_bytes(&io, at.host, st->slot_bytes.raw(), &remaining, err, errlen)
+        rc = at.host ? payload_read_bytes(&io, at.host, st->slot_bytes.raw(), &remaining, err, errlen)   /* raw: into payload_read_bytes()'s bare parameter */
                      : payload_read_tensor_span(&io, at.slab, at.off, st->slot_bytes, buf, PULSAR_SESSION_IO_CHUNK,
                                                 &remaining, err, errlen);
     if (rc == 0) rc = payload_read_tensor_span(&io, front, SlabOff{}, fb, buf, PULSAR_SESSION_IO_CHUNK,

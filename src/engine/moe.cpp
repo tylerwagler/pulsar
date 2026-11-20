@@ -241,7 +241,7 @@ bool pulsar_moe_routed_rows(const pulsar_moe_rows_call *c) {
                     t->name.ptr, (unsigned long long)n_expert, tensor_type_name(t->type));
             return NULL;
         }
-        const void *p = pulsar_gpu_weight_range_ptr(tensor_map_base(c->m, t), t->abs_offset.raw() + lo * *stride,
+        const void *p = pulsar_gpu_weight_range_ptr(tensor_map_base(c->m, t), t->abs_offset.raw() + lo * *stride,   /* raw: a device-API argument (pulsar_gpu_weight_range_ptr) */
                                                     (hi - lo) * *stride, what);
         if (!p)
             fprintf(stderr, "pulsar: routed MoE: no device copy of experts [%llu, %llu) of %.*s -- refusing\n",

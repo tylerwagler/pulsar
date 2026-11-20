@@ -8,7 +8,7 @@
 #include <thread>
 
 void pulsar_content_sample(int fd, FileOff off, TensorBytes bytes_t, std::vector<pulsar_content_read> *plan) {
-    const uint64_t B = PULSAR_CONTENT_SAMPLE_BLOCK, bytes = bytes_t.raw();   /* the rule's arithmetic, on the length */
+    const uint64_t B = PULSAR_CONTENT_SAMPLE_BLOCK, bytes = bytes_t.raw();   /* raw: the rule's arithmetic, on the length */
     if (bytes <= 2u * B) {   /* the first and last block would cover it: every byte */
         for (uint64_t at = 0; at < bytes; at += B)
             plan->push_back({fd, off + TensorBytes{at}, (uint32_t)(bytes - at < B ? bytes - at : B)});
@@ -33,7 +33,7 @@ bool pulsar_content_sample_fold(const std::vector<pulsar_content_read> &plan, pu
         for (size_t i; (i = next.fetch_add(1)) < n && !failed.load();) {
             for (uint64_t got = 0; got < plan[i].bytes;) {
                 const ssize_t r = pread(plan[i].fd, buf.data() + at[i] + got, (size_t)(plan[i].bytes - got),
-                                        (off_t)(plan[i].off + TensorBytes{got}).raw());
+                                        (off_t)(plan[i].off + TensorBytes{got}).raw());   /* raw: a file read */
                 if (r < 0 && errno == EINTR) continue;
                 if (r <= 0) {
                     int none = 0;

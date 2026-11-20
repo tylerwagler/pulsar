@@ -448,7 +448,7 @@ int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
     if ((size_t)n_llm * T > f32_elems) f32_elems = (size_t)n_llm * T;
     int ok = 0;
 
-#define WT(off) ((const bf16 *)(const void *)((const char *)map + (off).raw()))   /* L438: a MapOff, raw at the launch */
+#define WT(off) ((const bf16 *)(const void *)((const char *)map + (off).raw()))   /* raw: L438: a MapOff, raw at the launch */
 #define CUDA_ALLOC(p, bytes) do { if (cudaMalloc(&(p), (bytes)) != cudaSuccess) goto done; } while (0)
 #define CUDA_LAUNCH(what) do { if (!cuda_ok(cudaGetLastError(), what)) goto done; } while (0)
 /* The optional stage dump: `row` indexes a (2 + dbg_blocks) x n_tok*D block. */

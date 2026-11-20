@@ -29,6 +29,11 @@ tier = "check"
 budget = 120
 
 [[test]]
+name = "units-gate"
+tier = "check"
+budget = 30   # L445: a grep over src (~5 s)
+
+[[test]]
 name = "unit-test-gate"
 tier = "release"
 budget = 240

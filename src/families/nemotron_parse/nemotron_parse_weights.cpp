@@ -103,7 +103,7 @@ bool pulsar_nemotron_parse_bind(const pulsar_model *m, pulsar_nemotron_parse_mod
     w->cls = pulsar_role_bind(b, top("vit_cls"), A_F32, 2, D, s->n_cls);
     w->pos = pulsar_role_bind(b, top("vit_pos"), A_F32, 2, D, (uint64_t)s->pos_grid * s->pos_grid);
     for (VisLayer il{0u}; il.below(s->vit_depth); ++il) {
-        auto k = [&](const char *r) { return pulsar_role_in(r, "vit", (int32_t)il.raw()); };
+        auto k = [&](const char *r) { return pulsar_role_in(r, "vit", (int32_t)il.raw()); };   /* raw: into pulsar_role_in()'s bare parameter */
         pulsar_vit_block &B = w->vit[il];
         B.norm1 = pulsar_role_bind(b, k("vit_norm1"), A_F32, 1, D);
         B.norm1_b = pulsar_role_bind(b, k("vit_norm1_bias"), A_F32, 1, D);
@@ -135,7 +135,7 @@ bool pulsar_nemotron_parse_bind(const pulsar_model *m, pulsar_nemotron_parse_mod
     w->output_norm = pulsar_role_bind(b, top("output_norm"), A_F32, 1, E);
     w->output_norm_b = pulsar_role_bind(b, top("output_norm_bias"), A_F32, 1, E);
     for (TrunkLayer il{0u}; il.below(s->n_layer); ++il) {
-        auto k = [&](const char *r) { return pulsar_role_in(r, "layers", (int32_t)il.raw()); };
+        auto k = [&](const char *r) { return pulsar_role_in(r, "layers", (int32_t)il.raw()); };   /* raw: into pulsar_role_in()'s bare parameter */
         pulsar_nemotron_parse_dec_layer &L = w->layer[il];
         L.attn_norm = pulsar_role_bind(b, k("attn_norm"), A_F32, 1, E);
         L.attn_norm_b = pulsar_role_bind(b, k("attn_norm_bias"), A_F32, 1, E);

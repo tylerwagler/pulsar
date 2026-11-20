@@ -60,7 +60,7 @@ put_rc kvchain_put(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, con
                    const pulsar_kvchain_writer *writer, pulsar_kvchain_persist_result *r, char key_out[41]) {
     const uint64_t payload = pulsar_session_segment_bytes(s, G_prev, G, NULL);
     if (payload == 0) return PUT_NO_CUT;
-    const pulsar_tokens span = view(toks, G_prev.raw(), G.raw());
+    const pulsar_tokens span = view(toks, G_prev.raw(), G.raw());   /* raw: into view()'s bare parameter */
     TextBytes text_len{0u};
     char *text = pulsar_kvtext_render_tokens_text(e, &span, &text_len);
     if (!text) {
@@ -179,7 +179,7 @@ TokCount pulsar_kvchain_grid(pulsar_session *s) { return pulsar_session_prefill_
 int pulsar_kvchain_segment_ends(TokPos prev, TokPos deepest, TokCount grid, bool tail, TokPos *ends, int cap) {
     /* L334 P7: a grid point is a multiple of the grid -- a scaled position, int arithmetic on the raw values (a
      * negative prev, none() included, writes nothing, as the int did) */
-    const int p = prev.raw(), d = deepest.raw(), gr = grid.raw();
+    const int p = prev.raw(), d = deepest.raw(), gr = grid.raw();   /* raw: a bare local for the arithmetic below */
     if (gr <= 0 || p < 0 || d <= p) return 0;
     int m = 0;
     for (int g = (p / gr + 1) * gr; g <= d && m < cap; g += gr) ends[m++] = TokPos{g};
@@ -189,7 +189,7 @@ int pulsar_kvchain_segment_ends(TokPos prev, TokPos deepest, TokCount grid, bool
 
 bool pulsar_kvchain_rp_periodic(TokPos G, TokCount grid) {
     /* a multiple of whole cells: raw int arithmetic, as for the grid points */
-    return grid.raw() > 0 && G.raw() > 0 && G.raw() % (grid.raw() * PULSAR_KVCHAIN_RP_EVERY_CELLS) == 0;
+    return grid.raw() > 0 && G.raw() > 0 && G.raw() % (grid.raw() * PULSAR_KVCHAIN_RP_EVERY_CELLS) == 0;   /* raw: returned bare to its caller */
 }
 
 void pulsar_kvchain_place_rps(pulsar_segstore *st, const pulsar_kvchain_link *links, int n, TokCount grid,
@@ -244,9 +244,9 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
         if (out) *out = r;
         return 0;
     }
-    const TokPos deepest = end_pos.raw() > 0 ? pulsar_session_checkpoint_best(s, end_pos) : TokPos{0};
+    const TokPos deepest = end_pos.raw() > 0 ? pulsar_session_checkpoint_best(s, end_pos) : TokPos{0};   /* raw: into a bare variable */
     const TokCount grid = pulsar_kvchain_grid(s);
-    if (deepest.raw() <= 0 || deepest.before() < min_tokens || grid.raw() <= 0) {
+    if (deepest.raw() <= 0 || deepest.before() < min_tokens || grid.raw() <= 0) {   /* raw: compared with a bare value */
         if (out) *out = r;
         return 0;
     }
@@ -254,7 +254,7 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
     char parent[41] = "";
     TokPos prev{0};
     {
-        const pulsar_tokens head = view(toks, 0, deepest.raw());
+        const pulsar_tokens head = view(toks, 0, deepest.raw());   /* raw: into view()'s bare parameter */
         TextBytes full_len{0u};
         char *full = pulsar_kvtext_render_tokens_text(e, &head, &full_len);
         const pulsar_segstore_end grid_end = { grid, false };
@@ -267,7 +267,7 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
                                             : 0;
         free(full);
         if (c > 0 && chain[c - 1].G <= deepest) {
-            const pulsar_tokens upto = view(toks, 0, chain[c - 1].G.raw());
+            const pulsar_tokens upto = view(toks, 0, chain[c - 1].G.raw());   /* raw: into view()'s bare parameter */
             TextBytes upto_len{0u};
             free(pulsar_kvtext_render_tokens_text(e, &upto, &upto_len));
             if (upto_len == chain[c - 1].text_end) {
@@ -513,7 +513,7 @@ TokPos pulsar_kvchain_load_check(pulsar_segstore *st, pulsar_engine *e, pulsar_s
     const pulsar_tokens *loaded = pulsar_session_tokens(s);
     /* L196: a chain whose text ends with an EOS its tokens never sampled (or the
      * reverse) would have the rest tokenised from the wrong byte. */
-    if (!loaded || loaded->len != chain[n - 1].G.raw() ||
+    if (!loaded || loaded->len != chain[n - 1].G.raw() ||   /* raw: compared with a bare value */
         !pulsar_kvtext_text_ends_with_live(e, text, chain[n - 1].text_end, loaded)) {
         if (err && errlen)
             snprintf(err, errlen, "chain to %d disagrees with its tokens at the boundary -- dropped",

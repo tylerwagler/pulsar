@@ -577,7 +577,7 @@ static bool accelerator_prepare_model_tensor_spans(const pulsar_model *m,
             memcmp(t->name.ptr, skip_prefix, strlen(skip_prefix)) == 0) continue;
         const uint8_t *base = t->ext_map ? t->ext_map : m->map;
         const uint64_t map_size = t->ext_map ? t->ext_size : m->size;
-        const uint64_t at = t->abs_offset.raw();   /* checked raw: against the mapping's size and the filter's spans */
+        const uint64_t at = t->abs_offset.raw();   /* raw: checked raw: against the mapping's size and the filter's spans */
         const uint64_t tb = t->bytes.raw();   /* raw: checked beside the raw offset, against the mapping's size */
         if (at > map_size || tb > map_size - at) {
             free(spans);
@@ -650,7 +650,7 @@ static bool accelerator_prepare_model_tensor_spans(const pulsar_model *m,
             free(spans);
             return false;
         }
-        prepared += (end - off).raw();
+        prepared += (end - off).raw();   /* raw: into a bare variable */
         merged++;
 
         const double now = pulsar_mono_sec();

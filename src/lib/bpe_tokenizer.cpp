@@ -1176,8 +1176,8 @@ bool bpe_tokenizer_encode(const bpe_tokenizer *t, const char *text, size_t len, 
         }
         if (hit) {
             /* L223: a match that touches a client range is client text, not a marker */
-            while (si < n_spans && spans[si].hi.raw() <= pos) si++;   /* L440: pos is the size_t cursor over text */
-            if (si < n_spans && spans[si].lo.raw() < pos + hit->text.size()) hit = NULL;
+            while (si < n_spans && spans[si].hi.raw() <= pos) si++;   /* raw: L440: pos is the size_t cursor over text */
+            if (si < n_spans && spans[si].lo.raw() < pos + hit->text.size()) hit = NULL;   /* raw: compared with a bare value */
         }
         if (!hit) { pos++; continue; }
         encode_run(t, text + run, pos - run, out);

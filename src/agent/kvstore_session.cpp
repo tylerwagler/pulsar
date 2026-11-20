@@ -79,7 +79,7 @@ bool agent_session_file_write(const char *path, const agent_session_file *f, cha
     agent_put64(buf + 28, f->last_used);
     if (title_len) memcpy(buf + AGENT_SESSION_HEADER, f->title, title_len);
     for (uint32_t i = 0; i < n; i++)
-        agent_put32(buf + AGENT_SESSION_HEADER + title_len + (size_t)i * 4u, (uint32_t)f->tokens.v[i].raw());
+        agent_put32(buf + AGENT_SESSION_HEADER + title_len + (size_t)i * 4u, (uint32_t)f->tokens.v[i].raw());   /* raw: into agent_put32()'s bare parameter */
     agent_put64(buf + bytes, agent_fnv(1469598103934665603ull, buf, bytes));
 
     const bool ok = agent_write_file_atomic(path, buf, bytes + 8u, 0600, err, err_len);
@@ -167,7 +167,7 @@ int agent_kv_load(agent_worker *w, const pulsar_tokens *tokens) {
     if (G == TokPos{0} && err[0]) agent_trace(w, "kv restore refused: %s", err);
     /* L434: the caller counts this against `tokens`, so it is THEIR count the chain's text holds -- the chain's own
      * end counts its writer's tokens (the same in a session saved and loaded on one spelling, not by law) */
-    const int cached = G > TokPos{0} ? pulsar_prompt_held_by_text(w->engine, tokens, text, chain[n - 1].text_end).raw()
+    const int cached = G > TokPos{0} ? pulsar_prompt_held_by_text(w->engine, tokens, text, chain[n - 1].text_end).raw()   /* raw: a bare local for the arithmetic below */
                                      : 0;
     free(text);
     return cached;
@@ -470,7 +470,7 @@ int agent_worker_sync_tokens(agent_worker *w, const pulsar_tokens *tokens,
                                     char *err, size_t err_len) {
     const TokPos old_pos = pulsar_session_pos(w->session);
     const TokCount common = pulsar_session_common_prefix(w->session, tokens);
-    int cached = TokPos::after(common) == old_pos && TokPos{tokens->len} >= old_pos ? common.raw() : 0;
+    int cached = TokPos::after(common) == old_pos && TokPos{tokens->len} >= old_pos ? common.raw() : 0;   /* raw: a bare local for the arithmetic below */
     int suffix = tokens->len - cached;
     if (suffix < 0) suffix = tokens->len;
 
@@ -580,7 +580,7 @@ bool agent_worker_save_session_now(agent_worker *w, char sha_out[41],
         char *text = pulsar_kvtext_render_tokens_text(w->engine, &w->transcript, &text_len);
         agent_turn_marks marks;
         agent_turn_marks_init(w->engine, &marks);
-        w->session_title = agent_session_title_from_text(&marks, text ? text : "", text ? (size_t)text_len.raw() : 0,
+        w->session_title = agent_session_title_from_text(&marks, text ? text : "", text ? (size_t)text_len.raw() : 0,   /* raw: into agent_session_title_from_text()'s bare parameter */
                                                          0);
         free(text);
     }

@@ -121,7 +121,7 @@ static const char *plan_refusal(const pulsar_state_plan *p) {
             bad = "has rows the resume grid does not close";
         else if (d.host && (d.kind != PULSAR_STATE_FIXED || on_slot)) bad = "is host state that is not session-wide FIXED";
         else if (!d.host && has(p->session, id)) bad = "is session-wide device state (a layer slot holds it)";
-        else if (d.kind != PULSAR_STATE_POOL && !d.host && pulsar_state_decl_bank_bytes(&d).raw() % sizeof(float))
+        else if (d.kind != PULSAR_STATE_POOL && !d.host && pulsar_state_decl_bank_bytes(&d).raw() % sizeof(float))   /* raw: compared with a bare value */
             bad = "is not a whole number of floats a bank (the reset fills f32 zeros)";
         else if ((d.capture == PULSAR_STATE_CAPTURE_SNAPSHOT || d.capture == PULSAR_STATE_CAPTURE_DELTA) &&
                  (d.kind != PULSAR_STATE_FIXED || d.host)) bad = "captures rows but is not device FIXED state";
@@ -217,7 +217,7 @@ KvBytes pulsar_state_pool_bytes_at(const pulsar_state_set *ss, KvRows rows) {
     for (LayerSlot k{0u}; k.below(p->n_slots); ++k)
         for (uint32_t id = 0; id < p->n_decl; id++)
             if (has(p->slot[k], id) && p->decl[id].kind == PULSAR_STATE_POOL)
-                bytes += p->decl[id].bytes.times(ceil_div(rows.raw(), p->decl[id].tokens));
+                bytes += p->decl[id].bytes.times(ceil_div(rows.raw(), p->decl[id].tokens));   /* raw: into ceil_div()'s bare parameter */
     return kv_bytes_of(bytes);
 }
 
@@ -256,7 +256,7 @@ bool pulsar_state_reset_bank(pulsar_state_set *ss, BankId bank) {
             if (!has(p->slot[k], id) || p->decl[id].kind == PULSAR_STATE_POOL || !ss->t[k][id]) continue;
             const TensorBytes bb = pulsar_state_decl_bank_bytes(&p->decl[id]);
             pulsar_gpu_tensor *v = pulsar_gpu_tensor_view(ss->t[k][id], bb.times(b), bb);
-            ok = v && pulsar_gpu_tensor_fill_f32(v, 0.0f, bb.raw() / sizeof(float)) != 0;
+            ok = v && pulsar_gpu_tensor_fill_f32(v, 0.0f, bb.raw() / sizeof(float)) != 0;   /* raw: a device-API argument (pulsar_gpu_tensor_fill_f32) */
             pulsar_gpu_tensor_free(v);
         }
     }
@@ -264,7 +264,7 @@ bool pulsar_state_reset_bank(pulsar_state_set *ss, BankId bank) {
         if (!has(p->session, id)) continue;
         void *h = pulsar_state_host(ss, id, bank);
         if (p->decl[id].init) p->decl[id].init(ss->engine, h);
-        else memset(h, 0, p->decl[id].bytes.raw());
+        else memset(h, 0, p->decl[id].bytes.raw());   /* raw: a memset length */
     }
     if (ss->fold_host) ss->fold_host[2 + 2 * b] = 0;   /* L339: its pending rows went with its state */
     pulsar_state_set_pos(ss, bank, TokPos{0});
@@ -292,7 +292,7 @@ SlabOff pulsar_state_capture_offset(const pulsar_state_set *ss, LayerSlot slot, 
         abort();
     }
     const pulsar_state_decl *d = &ss->plan->decl[id];
-    return SlabOff::after(capture_row_bytes(d).times((uint64_t)pulsar_state_slot_ord(ss, slot, id).raw() * capture_gens(d) *
+    return SlabOff::after(capture_row_bytes(d).times((uint64_t)pulsar_state_slot_ord(ss, slot, id).raw() * capture_gens(d) *   /* raw: a scale factor */
                                                      ss->verify_rows));
 }
 
@@ -312,8 +312,8 @@ void pulsar_state_verify_begin(pulsar_state_set *ss, uint32_t n_runs, const uint
         ss->run_pos0[k] = pos[run_first[k]];
         for (uint32_t id = 0; id < p->n_decl; id++)
             if (ss->cap_host[id])
-                memcpy(ss->cap_host[id] + p->decl[id].bytes.times(k).raw(),
-                       pulsar_state_host(ss, id, ss->run_bank[k]), p->decl[id].bytes.raw());
+                memcpy(ss->cap_host[id] + p->decl[id].bytes.times(k).raw(),   /* raw: a memcpy length / offset */
+                       pulsar_state_host(ss, id, ss->run_bank[k]), p->decl[id].bytes.raw());   /* raw: a memcpy length / offset */
     }
 }
 
@@ -352,7 +352,7 @@ bool pulsar_state_fold_flush(pulsar_state_set *ss, BankId bank) {
             if (has(p->slot[k], id) && p->decl[id].capture == PULSAR_STATE_CAPTURE_DELTA)
                 ok = p->decl[id].commit(dptr(ss->t[k][id]), bank,
                                         (const uint8_t *)pulsar_state_capture_rows(ss, k, id) +
-                                            p->decl[id].capture_bytes.times((uint64_t)row).raw(),
+                                            p->decl[id].capture_bytes.times((uint64_t)row).raw(),   /* raw: into commit()'s bare parameter */
                                         (uint32_t)keep);
     if (!ok) {
         fprintf(stderr, "pulsar: %s: bank %d's pending delta rows could not be applied\n", p->name, bank.raw());
@@ -454,7 +454,7 @@ bool pulsar_state_commit(pulsar_state_set *ss, BankId bank, const TokId *tokens,
     for (uint32_t id = 0; ok && id < p->n_decl; id++) {
         if (!ss->cap_host[id]) continue;
         void *h = pulsar_state_host(ss, id, bank);
-        memcpy(h, ss->cap_host[id] + p->decl[id].bytes.times(run).raw(), p->decl[id].bytes.raw());
+        memcpy(h, ss->cap_host[id] + p->decl[id].bytes.times(run).raw(), p->decl[id].bytes.raw());   /* raw: a memcpy length / offset */
         ok = p->decl[id].replay(ss->engine, h, tokens, keep);
     }
     return ok;
@@ -717,13 +717,13 @@ pulsar_state_set *pulsar_state_create(const void *engine, const pulsar_state_pla
         }
     }
     for (uint32_t id = 0; id < plan->n_decl; id++)
-        if (has(plan->session, id)) ss->host[id] = (uint8_t *)xcalloc(n_banks, plan->decl[id].bytes.raw());
+        if (has(plan->session, id)) ss->host[id] = (uint8_t *)xcalloc(n_banks, plan->decl[id].bytes.raw());   /* raw: an allocation / copy size */
     /* the verify capture: per decl, [the trunk slots carrying it][verify rows] */
     for (uint32_t id = 0; ok && verify_rows && id < plan->n_decl; id++) {
         const pulsar_state_decl &d = plan->decl[id];
         if (d.capture == PULSAR_STATE_CAPTURE_NONE) continue;
         if (d.capture == PULSAR_STATE_CAPTURE_REPLAY) {
-            ss->cap_host[id] = (uint8_t *)xcalloc(verify_rows, d.bytes.raw());
+            ss->cap_host[id] = (uint8_t *)xcalloc(verify_rows, d.bytes.raw());   /* raw: an allocation / copy size */
             continue;
         }
         uint32_t n_l = 0;

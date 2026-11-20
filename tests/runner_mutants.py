@@ -52,9 +52,9 @@ MUTANTS = {
     "adopt-rows": (
         "src/engine/checkpoint.cpp",
         "--only=bank-adopt-gate",
-        "        ok = pulsar_gpu_tensor_copy_async(dp[i].rows, TensorBytes{0}, sp[i].rows, TensorBytes{0},\n"
+        "        ok = pulsar_gpu_tensor_copy_async(dp[i].rows, TensorBytes{0u}, sp[i].rows, TensorBytes{0u},\n"
         "                                          sp[i].row_bytes.times(rows)) != 0;\n",
-        "        ok = pulsar_gpu_tensor_copy_async(dp[i].rows, TensorBytes{0}, sp[i].rows, TensorBytes{0},\n"
+        "        ok = pulsar_gpu_tensor_copy_async(dp[i].rows, TensorBytes{0u}, sp[i].rows, TensorBytes{0u},\n"
         "                                          /* L317 MUTANT: one row too few */\n"
         "                                          sp[i].row_bytes.times(rows - 1u)) != 0;\n"),
     "spec-emit": (

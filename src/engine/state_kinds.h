@@ -176,7 +176,7 @@ bool pulsar_state_plan_drafter_first(pulsar_state_plan *p, const char *who);
 /** The layer slot of trunk layer `il`: the same number (the plan's first n_trunk slots are the trunk's layers).
  *  @param il a trunk layer */
 /// @return its layer slot
-static inline LayerSlot pulsar_layer_slot_of(TrunkLayer il) { return LayerSlot{il.raw()}; }
+static inline LayerSlot pulsar_layer_slot_of(TrunkLayer il) { return LayerSlot{il.raw()}; }   /* raw: the named crossing pulsar_layer_slot_of() */
 /** The layer slot of a drafter's layer / module `l`: n_trunk + l -- the drafter's slots follow the trunk's, in the
  *  drafter's own order.  It assumes ONE drafter's slots after the trunk's (a family appends the selected drafter's
  *  only: the chained-MTP lane checks n_slots == n_trunk + its modules, spec_mtp.cpp).
@@ -184,7 +184,7 @@ static inline LayerSlot pulsar_layer_slot_of(TrunkLayer il) { return LayerSlot{i
  *  @param l the drafter's layer */
 /// @return its layer slot
 static inline LayerSlot pulsar_drafter_slot(const pulsar_state_plan *p, DraftLayer l) {
-    return LayerSlot{p->n_trunk + l.raw()};
+    return LayerSlot{p->n_trunk + l.raw()};   /* raw: the named crossing pulsar_drafter_slot() */
 }
 /** Is `slot` one of the trunk's (below n_trunk)?
  *  @param p    the state plan
@@ -202,7 +202,7 @@ static inline TrunkLayer pulsar_slot_trunk_layer(const pulsar_state_plan *p, Lay
                         "layer\n", slot.raw(), p->n_trunk);
         abort();
     }
-    return TrunkLayer{slot.raw()};
+    return TrunkLayer{slot.raw()};   /* raw: the named crossing pulsar_slot_trunk_layer() */
 }
 /** L375 O48: the load-time verdict on a built plan's slots -- false, said, when a drafter's slots did not fit beside
  *  the trunk's.  Every family's load calls it after building its plan and refuses the model on false. */
@@ -308,7 +308,7 @@ static inline pulsar_gpu_tensor *pulsar_state_pool(const pulsar_state_set *ss, L
 /// @param bank the bank
 /// @return a pointer to the bank's decl[id].bytes host bytes (the set's)
 static inline void *pulsar_state_host(const pulsar_state_set *ss, uint32_t id, BankId bank) {
-    return ss->host[id] + ss->plan->decl[id].bytes.times(pulsar_bank_index(bank)).raw();
+    return ss->host[id] + ss->plan->decl[id].bytes.times(pulsar_bank_index(bank)).raw();   /* raw: returned bare to its caller */
 }
 /** The verify capture's rows of decl `id` on slot `slot` (device; step row r at + r * the row's bytes): where a
  *  verify's op writes them -- as a pointer, or as its tensor and the byte offset into it (a copy's destination). */

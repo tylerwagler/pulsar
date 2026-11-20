@@ -358,8 +358,8 @@ static bool ckpt_capture(pulsar_ckpt_store *st, uint32_t bank, uint32_t G) {
 }
 
 bool pulsar_ckpt_landed(pulsar_ckpt_store *st, BankId bank, TokPos T_at) {
-    const uint32_t b = (uint32_t)bank.raw();   /* raw inside; none() is out of range there, as before */
-    const uint32_t T = (uint32_t)T_at.before().raw();   /* L334 P2b: the store keeps raw uint32 inside (0 = empty slot / free record); typed at its API */
+    const uint32_t b = (uint32_t)bank.raw();   /* raw: raw inside; none() is out of range there, as before */
+    const uint32_t T = (uint32_t)T_at.before().raw();   /* raw: L334 P2b: the store keeps raw uint32 inside (0 = empty slot / free record); typed at its API */
     bool capture = false;
     char why[192] = "";
     if (!st->ops->noted_at(st->state, T_at, &capture, why, sizeof(why))) {
@@ -381,8 +381,8 @@ static void ckpt_records_drop_above(pulsar_ckpt_store *st, BankId bank, uint32_t
 }
 
 bool pulsar_ckpt_restore(pulsar_ckpt_store *st, BankId bank, TokPos G_at) {
-    const uint32_t b = (uint32_t)bank.raw();   /* raw inside; none() is out of range there, as before */
-    const uint32_t G = (uint32_t)G_at.before().raw();   /* L334 P2b: the store keeps raw uint32 inside (0 = empty slot / free record); typed at its API */
+    const uint32_t b = (uint32_t)bank.raw();   /* raw: raw inside; none() is out of range there, as before */
+    const uint32_t G = (uint32_t)G_at.before().raw();   /* raw: L334 P2b: the store keeps raw uint32 inside (0 = empty slot / free record); typed at its API */
     const uint32_t s = ckpt_find(st, b, G);
     if (s == PULSAR_CKPT_SLOTS_MAX) return false;
     uint32_t staged = 0;
@@ -414,8 +414,8 @@ static pulsar_ckpt_record *ckpt_record_pick(pulsar_ckpt_store *st) {
 bool pulsar_ckpt_record_capture(pulsar_ckpt_store *st, BankId bank, pulsar_ckpt_record_kind kind, TokPos T_at,
                                 const TokId *tokens, const float *logits, uint32_t width,
                                 const struct pulsar_image_identity *img) {
-    const uint32_t b = (uint32_t)bank.raw();   /* raw inside; none() is out of range there, as before */
-    const uint32_t T = (uint32_t)T_at.before().raw();   /* L334 P2b: the store keeps raw uint32 inside (0 = empty slot / free record); typed at its API */
+    const uint32_t b = (uint32_t)bank.raw();   /* raw: raw inside; none() is out of range there, as before */
+    const uint32_t T = (uint32_t)T_at.before().raw();   /* raw: L334 P2b: the store keeps raw uint32 inside (0 = empty slot / free record); typed at its API */
     if (b >= PULSAR_MSEQ_MAX || T == 0u || !tokens || st->n_rec == 0u ||
         (kind == PULSAR_CKPT_REC_END) != (logits != NULL && width != 0u))
         return false;
@@ -523,8 +523,8 @@ const pulsar_ckpt_record *pulsar_ckpt_record_best(const pulsar_ckpt_store *st, B
                                                   TokCount len_n, TokPos limit_at, TokCount prompt_n,
                                                   const struct pulsar_image_identity *want) {
     /* L334 P2b: the store keeps raw uint32 inside (0 = empty slot / free record); typed at its API */
-    const uint32_t len = (uint32_t)len_n.raw(), limit = (uint32_t)limit_at.before().raw(),
-                   prompt_len = (uint32_t)prompt_n.raw();
+    const uint32_t len = (uint32_t)len_n.raw(), limit = (uint32_t)limit_at.before().raw(),   /* raw: a bare local for the arithmetic below */
+                   prompt_len = (uint32_t)prompt_n.raw();   /* raw: into a bare variable */
     const pulsar_ckpt_record *best = NULL;
     for (uint32_t i = 0; st && i < st->n_rec; i++) {
         const pulsar_ckpt_record *r = &st->rec[i];
@@ -537,7 +537,7 @@ const pulsar_ckpt_record *pulsar_ckpt_record_best(const pulsar_ckpt_store *st, B
 
 bool pulsar_ckpt_record_restore(pulsar_ckpt_store *st, BankId bank, const pulsar_ckpt_record *r, float *logits,
                                 uint32_t width) {
-    const uint32_t b = (uint32_t)bank.raw();   /* raw inside; none() is out of range there, as before */
+    const uint32_t b = (uint32_t)bank.raw();   /* raw: raw inside; none() is out of range there, as before */
     if (!r || r < st->rec || r >= st->rec + st->n_rec || r->T == 0u || r->bank != bank ||
         (logits && (!r->logits || width != st->end_width)))
         return false;
@@ -567,8 +567,8 @@ bool pulsar_ckpt_record_restore(pulsar_ckpt_store *st, BankId bank, const pulsar
 
 bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, BankId dst, BankId src, TokPos T_at, const pulsar_ckpt_record *r,
                        bool *moved) {
-    const uint32_t d = (uint32_t)dst.raw(), sb = (uint32_t)src.raw();   /* raw inside; none() is out of range */
-    const uint32_t T = (uint32_t)T_at.before().raw();   /* L334 P2b: the store keeps raw uint32 inside (0 = empty slot / free record); typed at its API */
+    const uint32_t d = (uint32_t)dst.raw(), sb = (uint32_t)src.raw();   /* raw: raw inside; none() is out of range */
+    const uint32_t T = (uint32_t)T_at.before().raw();   /* raw: L334 P2b: the store keeps raw uint32 inside (0 = empty slot / free record); typed at its API */
     const char *why = NULL;
     ckpt_place from = {};
     *moved = false;
@@ -591,7 +591,7 @@ bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, BankId dst, BankId src, TokPos T_a
         const uint32_t m = st->ops->bank_pools(st->state, dst, dp, CKPT_ADOPT_POOLS);
         if (n == 0 || n != m || n > CKPT_ADOPT_POOLS) why = "the banks' pools do not pair";
         for (uint32_t i = 0; !why && i < n; i++) {
-            const uint64_t rows = (uint64_t)pulsar_comp_rows_cover(TokCount{(int)T}, sp[i].tokens_per_row).raw();
+            const uint64_t rows = (uint64_t)pulsar_comp_rows_cover(TokCount{(int)T}, sp[i].tokens_per_row).raw();   /* raw: a bare local for the arithmetic below */
             if (!sp[i].rows || !dp[i].rows) why = "a bank's physical is freed";
             else if (sp[i].tokens_per_row != dp[i].tokens_per_row || sp[i].row_bytes != dp[i].row_bytes ||
                      dp[i].row_bytes.times(rows) > pulsar_gpu_tensor_bytes(dp[i].rows) ||
@@ -612,7 +612,7 @@ bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, BankId dst, BankId src, TokPos T_a
     bool ok = r ? st->ops->install_frontier(st->state, pulsar_ckpt_pos(T), TokCount{(int)T})
                  : st->ops->prepare_restore(st->state, pulsar_ckpt_pos(T));
     for (uint32_t i = 0; ok && i < n; i++) {
-        const uint64_t rows = (uint64_t)pulsar_comp_rows_cover(TokCount{(int)T}, sp[i].tokens_per_row).raw();
+        const uint64_t rows = (uint64_t)pulsar_comp_rows_cover(TokCount{(int)T}, sp[i].tokens_per_row).raw();   /* raw: a bare local for the arithmetic below */
         ok = pulsar_gpu_tensor_copy_async(dp[i].rows, TensorBytes{0u}, sp[i].rows, TensorBytes{0u},
                                           sp[i].row_bytes.times(rows)) != 0;
     }
@@ -686,20 +686,20 @@ static uint32_t ckpt_best_raw(const pulsar_ckpt_store *st, uint32_t bank, uint32
 }
 
 TokPos pulsar_ckpt_best(const pulsar_ckpt_store *st, BankId bank, TokPos limit) {
-    const uint32_t b = (uint32_t)bank.raw();   /* raw inside; none() is out of range there, as before */
-    const uint32_t g = ckpt_best_raw(st, b, (uint32_t)limit.before().raw());
+    const uint32_t b = (uint32_t)bank.raw();   /* raw: raw inside; none() is out of range there, as before */
+    const uint32_t g = ckpt_best_raw(st, b, (uint32_t)limit.before().raw());   /* raw: into ckpt_best_raw()'s bare parameter */
     return g ? TokPos{(int)g} : TokPos::none();
 }
 
 TokPos pulsar_ckpt_deepest(const pulsar_ckpt_store *st, BankId bank) {
-    const uint32_t b = (uint32_t)bank.raw();   /* raw inside; none() is out of range there, as before */
+    const uint32_t b = (uint32_t)bank.raw();   /* raw: raw inside; none() is out of range there, as before */
     const uint32_t g = ckpt_best_raw(st, b, UINT32_MAX);
     return g ? TokPos{(int)g} : TokPos::none();
 }
 
 void pulsar_ckpt_frontier_lowered(pulsar_ckpt_store *st, BankId bank, TokCount tokens_n) {
-    const uint32_t b = (uint32_t)bank.raw();   /* raw inside; none() is out of range there, as before */
-    const uint32_t tokens = (uint32_t)tokens_n.raw();   /* L334 P2b: the store keeps raw uint32 inside (0 = empty slot / free record); typed at its API */
+    const uint32_t b = (uint32_t)bank.raw();   /* raw: raw inside; none() is out of range there, as before */
+    const uint32_t tokens = (uint32_t)tokens_n.raw();   /* raw: L334 P2b: the store keeps raw uint32 inside (0 = empty slot / free record); typed at its API */
     if (b >= PULSAR_MSEQ_MAX) return;
     for (uint32_t k = 0; k < PULSAR_CKPT_SLOTS_MAX; k++)
         if (st->pos[b][k] > tokens) st->pos[b][k] = 0u;
@@ -707,7 +707,7 @@ void pulsar_ckpt_frontier_lowered(pulsar_ckpt_store *st, BankId bank, TokCount t
 }
 
 void pulsar_ckpt_drop_bank(pulsar_ckpt_store *st, BankId bank) {
-    const uint32_t b = (uint32_t)bank.raw();   /* raw inside; none() is out of range there, as before */
+    const uint32_t b = (uint32_t)bank.raw();   /* raw: raw inside; none() is out of range there, as before */
     if (b >= PULSAR_MSEQ_MAX) return;
     memset(st->pos[b], 0, sizeof(st->pos[b]));
     ckpt_records_drop_above(st, bank, 0u);
@@ -730,19 +730,19 @@ static bool ckpt_hand_to_host(pulsar_ckpt_store *st, uint32_t bank, uint32_t s, 
 }
 
 bool pulsar_ckpt_holds(const pulsar_ckpt_store *st, BankId bank, TokPos G) {
-    const uint32_t b = (uint32_t)bank.raw();   /* raw inside; none() is out of range there, as before */
-    return ckpt_find(st, b, (uint32_t)G.before().raw()) != PULSAR_CKPT_SLOTS_MAX;
+    const uint32_t b = (uint32_t)bank.raw();   /* raw: raw inside; none() is out of range there, as before */
+    return ckpt_find(st, b, (uint32_t)G.before().raw()) != PULSAR_CKPT_SLOTS_MAX;   /* raw: into ckpt_find()'s bare parameter */
 }
 
 bool pulsar_ckpt_locate(pulsar_ckpt_store *st, BankId bank, TokPos G, pulsar_ckpt_slot_at *at) {
-    const uint32_t b = (uint32_t)bank.raw();   /* raw inside; none() is out of range there, as before */
-    const uint32_t s = ckpt_find(st, b, (uint32_t)G.before().raw());
+    const uint32_t b = (uint32_t)bank.raw();   /* raw: raw inside; none() is out of range there, as before */
+    const uint32_t s = ckpt_find(st, b, (uint32_t)G.before().raw());   /* raw: into ckpt_find()'s bare parameter */
     return s != PULSAR_CKPT_SLOTS_MAX && ckpt_hand_to_host(st, b, s, at);
 }
 
 bool pulsar_ckpt_claim(pulsar_ckpt_store *st, BankId bank, TokPos G_at, pulsar_ckpt_slot_at *at) {
-    const uint32_t b = (uint32_t)bank.raw();   /* raw inside; none() is out of range there, as before */
-    const uint32_t G = (uint32_t)G_at.before().raw();   /* L334 P2b: the store keeps raw uint32 inside (0 = empty slot / free record); typed at its API */
+    const uint32_t b = (uint32_t)bank.raw();   /* raw: raw inside; none() is out of range there, as before */
+    const uint32_t G = (uint32_t)G_at.before().raw();   /* raw: L334 P2b: the store keeps raw uint32 inside (0 = empty slot / free record); typed at its API */
     if (!ckpt_grid_ok(st, b, G)) return false;
     const uint32_t k = ckpt_pick_slot(st, b, G);
     st->pos[b][k] = 0u;   /* filled by the caller, committed after */
@@ -751,7 +751,7 @@ bool pulsar_ckpt_claim(pulsar_ckpt_store *st, BankId bank, TokPos G_at, pulsar_c
 
 bool pulsar_ckpt_slot_get(const pulsar_ckpt_store *st, const pulsar_ckpt_slot_at *at, void *dst) {
     if (st->host) {
-        memcpy(dst, at->host, st->slot_bytes.raw());
+        memcpy(dst, at->host, st->slot_bytes.raw());   /* raw: a memcpy length / offset */
         return true;
     }
     const pulsar_gpu_copy_span span = {at->slab, at->off.before(), dst, st->slot_bytes};
@@ -760,13 +760,13 @@ bool pulsar_ckpt_slot_get(const pulsar_ckpt_store *st, const pulsar_ckpt_slot_at
 
 bool pulsar_ckpt_slot_put(const pulsar_ckpt_store *st, const pulsar_ckpt_slot_at *at, const void *src) {
     if (st->host) {
-        memcpy(at->host, src, st->slot_bytes.raw());
+        memcpy(at->host, src, st->slot_bytes.raw());   /* raw: a memcpy length / offset */
         return true;
     }
     return pulsar_gpu_tensor_write(at->slab, at->off.before(), src, st->slot_bytes) != 0;
 }
 
 void pulsar_ckpt_commit(pulsar_ckpt_store *st, BankId bank, uint32_t slot, TokPos G) {
-    const uint32_t b = (uint32_t)bank.raw();   /* raw inside; none() is out of range there, as before */
-    if (b < PULSAR_MSEQ_MAX && slot < st->ops->ckpt_slots) st->pos[b][slot] = (uint32_t)G.before().raw();
+    const uint32_t b = (uint32_t)bank.raw();   /* raw: raw inside; none() is out of range there, as before */
+    if (b < PULSAR_MSEQ_MAX && slot < st->ops->ckpt_slots) st->pos[b][slot] = (uint32_t)G.before().raw();   /* raw: a bare operand */
 }

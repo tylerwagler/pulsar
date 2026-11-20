@@ -686,14 +686,14 @@ static bool chat_tmpl_marker(const pulsar_vocab *v, int id) {
  *  @return the run's first index (0 when no marker) */
 static int chat_tmpl_run_start(const pulsar_vocab *v, const pulsar_tokens *t) {
     for (int i = t->len - 1; i >= 0; i--)
-        if (chat_tmpl_marker(v, t->v[i].raw())) return i + 1;
+        if (chat_tmpl_marker(v, t->v[i].raw())) return i + 1;   /* raw: into chat_tmpl_marker()'s bare parameter */
     return 0;
 }
 
 /** The last marker's id.  @param v the vocab  @param t the tokens  @return the id, -1 when none */
 static int chat_tmpl_last_marker(const pulsar_vocab *v, const pulsar_tokens *t) {
     for (int i = t->len - 1; i >= 0; i--)
-        if (chat_tmpl_marker(v, t->v[i].raw())) return t->v[i].raw();
+        if (chat_tmpl_marker(v, t->v[i].raw())) return t->v[i].raw();   /* raw: into chat_tmpl_marker()'s bare parameter */
     return -1;
 }
 
@@ -717,7 +717,7 @@ static char *chat_tmpl_run_text(const pulsar_vocab *v, const pulsar_tokens *t,
     size_t n = 0;
     for (int i = start; i < t->len; i++) {
         size_t l = 0;
-        char *p = vocab_token_text(v, t->v[i].raw(), &l);
+        char *p = vocab_token_text(v, t->v[i].raw(), &l);   /* raw: into vocab_token_text()'s bare parameter */
         n += l;
         free(p);
     }
@@ -725,7 +725,7 @@ static char *chat_tmpl_run_text(const pulsar_vocab *v, const pulsar_tokens *t,
     size_t at = 0;
     for (int i = start; i < t->len; i++) {
         size_t l = 0;
-        char *p = vocab_token_text(v, t->v[i].raw(), &l);
+        char *p = vocab_token_text(v, t->v[i].raw(), &l);   /* raw: into vocab_token_text()'s bare parameter */
         memcpy(out + at, p, l);
         at += l;
         free(p);
@@ -988,9 +988,9 @@ void pulsar_vocab::tokenize_rendered_chat_spans_vocab(const char *text,
     while (*p) {
         const size_t off = (size_t)(p - base);
         /* L440: `off` is the byte cursor over the whole text (a size_t); a span's offsets meet it as raw indices */
-        while (si < n_spans && (off >= spans[si].hi.raw() || spans[si].empty())) si++;
-        if (si < n_spans && off >= spans[si].lo.raw()) {
-            const char *end = base + spans[si].hi.raw();
+        while (si < n_spans && (off >= spans[si].hi.raw() || spans[si].empty())) si++;   /* raw: compared with a bare value */
+        if (si < n_spans && off >= spans[si].lo.raw()) {   /* raw: compared with a bare value */
+            const char *end = base + spans[si].hi.raw();   /* raw: a bare local for the arithmetic below */
             if (end > end_of_text) end = end_of_text;   /* clamp to the string */
             vocab->tokenize_span(span, (size_t)(p - span), out);   /* flush the pending plain run */
             vocab->tokenize_span(p, (size_t)(end - p), out);       /* client text: BPE only */
@@ -1001,7 +1001,7 @@ void pulsar_vocab::tokenize_rendered_chat_spans_vocab(const char *text,
         int token = -1;
         size_t len = 0;
         /* spans[si], when there is one, is the next client range: off < its lo here */
-        if (vocab->special_token_at(p, &token, &len) && !(si < n_spans && off + len > spans[si].lo.raw())) {
+        if (vocab->special_token_at(p, &token, &len) && !(si < n_spans && off + len > spans[si].lo.raw())) {   /* raw: compared with a bare value */
             vocab->tokenize_span(span, (size_t)(p - span), out);
             token_vec_push(out, TokId{token});
             p += len;
@@ -1342,7 +1342,7 @@ void dump_tokens_fp(FILE *fp, const pulsar_vocab *vocab, const token_vec *tokens
     fprintf(fp, "]\n");
 
     for (int i = 0; i < tokens->len; i++) {
-        int id = tokens->v[i].raw();
+        int id = tokens->v[i].raw();   /* raw: a bare local for the arithmetic below */
         if (id >= 0 && id < vocab->n_vocab) {
             size_t n = 0;
             char *piece = vocab_token_text(vocab, id, &n);
@@ -1632,13 +1632,13 @@ static int ds4_tok_n_tokens(pulsar_engine *e) { return e->vocab.n_vocab; }
 
 /* L334 P3: the family's ids leave the tokenizer here, typed (its internals stay raw). */
 /** pulsar_family_tokenizer::is_stop, typed.  @param e the engine  @param t the token  @return ds4_tok_is_stop's */
-static bool ds4_tok_is_stop_op(pulsar_engine *e, TokId t) { return ds4_tok_is_stop(e, t.raw()); }
+static bool ds4_tok_is_stop_op(pulsar_engine *e, TokId t) { return ds4_tok_is_stop(e, t.raw()); }   /* raw: into ds4_tok_is_stop()'s bare parameter */
 /** pulsar_family_tokenizer::eos, typed.  @param e the engine  @return ds4_tok_eos's (-1 enters as none()) */
 static TokId ds4_tok_eos_op(pulsar_engine *e) { return TokId{ds4_tok_eos(e)}; }
 /** pulsar_family_tokenizer::token_text, typed.  @param e the engine  @param t the token  @param len its length
  *  @return ds4_tok_token_text's */
 static char *ds4_tok_token_text_op(pulsar_engine *e, TokId t, size_t *len) {
-    return ds4_tok_token_text(e, t.raw(), len);
+    return ds4_tok_token_text(e, t.raw(), len);   /* raw: into ds4_tok_token_text()'s bare parameter */
 }
 /** pulsar_family_tokenizer::think_close, typed.  @param e the engine  @return ds4_tok_think_close's (-1: none()) */
 static TokId ds4_tok_think_close_op(pulsar_engine *e) { return TokId{ds4_tok_think_close(e)}; }

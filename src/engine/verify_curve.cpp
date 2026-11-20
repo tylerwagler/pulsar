@@ -547,7 +547,7 @@ static uint64_t vc_key(const pulsar_session *s, const char *build_id) {
     const char *dn = e->drafter_ops && e->drafter_ops->name ? e->drafter_ops->name : "";
     mix(dn, strlen(dn) + 1u);
     const uint32_t v[3] = {pulsar_engine_fused_heads_max(e), (uint32_t)pulsar_session_bank_count((pulsar_session *)s),
-                           (uint32_t)pulsar_session_ctx((pulsar_session *)s).raw()};
+                           (uint32_t)pulsar_session_ctx((pulsar_session *)s).raw()};   /* raw: a bare operand */
     mix(v, sizeof v);
     /* L315: a pair's forward is both ranks' (one Spark's curve is not a pair's) */
     if (e->tp) {
@@ -657,7 +657,7 @@ bool pulsar_session_verify_profile_local(pulsar_session *s, uint32_t rows_max, d
                  PULSAR_SPEC_LOGITS_ROWS);
         return false;
     }
-    if (P < TokPos{1} || (int64_t)P.raw() + rows_max > (int64_t)pulsar_session_ctx(s).raw()) {
+    if (P < TokPos{1} || (int64_t)P.raw() + rows_max > (int64_t)pulsar_session_ctx(s).raw()) {   /* raw: compared with a bare value */
         snprintf(err, errlen, "the bank holds %d tokens: no room for a %u-row verify", P.raw(), rows_max);
         return false;
     }
@@ -671,7 +671,7 @@ bool pulsar_session_verify_profile_local(pulsar_session *s, uint32_t rows_max, d
     spec_bank_save(s, bank);
     for (uint32_t rows = rows_max; ok && rows >= 1u; rows--) {
         for (uint32_t k = 0; k < rows; k++)
-            reqs[k] = {bank, P + TokCount{(int)k}, s->checkpoint.v[k % (uint32_t)P.raw()]};
+            reqs[k] = {bank, P + TokCount{(int)k}, s->checkpoint.v[k % (uint32_t)P.raw()]};   /* raw: an index into a bare array */
         double ms[VC_PROFILE_REPS];
         uint32_t timed = 0;
         bool warm = false;
@@ -765,7 +765,7 @@ int pulsar_session_verify_curve_open(pulsar_session *s, const char *cache_dir, c
     pulsar_verify_curve *c = pulsar_verify_curve_new(rows_max, base);
     c->key = key;
     c->cached = cached;
-    c->profile_depth = (uint32_t)pulsar_session_pos(s).raw();   /* the walk's frontier (the warmup bank's) */
+    c->profile_depth = (uint32_t)pulsar_session_pos(s).raw();   /* raw: the walk's frontier (the warmup bank's) */
     pulsar_verify_curve_free(e->verify_curve);
     e->verify_curve = c;
     /* rule 5: the curve the pick prices with, and where it came from */

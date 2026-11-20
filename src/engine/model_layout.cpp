@@ -40,7 +40,7 @@ static pulsar_shape g_source_profile;
 
 SrcBlock pulsar_layer_source(TrunkLayer il) {
     if (!il.below(PULSAR_N_LAYER)) pulsar_die("DeepSeek4 layer index is outside the loaded model layout");
-    return g_layer_subset ? SrcBlock{g_layer_source[il]} : SrcBlock{il.raw()};
+    return g_layer_subset ? SrcBlock{g_layer_source[il]} : SrcBlock{il.raw()};   /* raw: the named crossing pulsar_layer_source() */
 }
 
 
@@ -162,7 +162,7 @@ bool pulsar_engine::is_pruned() const {
 /// @param block an artifact block (asked of its source layer)
 /// @return the expected ratio (0 = window-only); dies on an unknown variant
 static uint32_t expected_layer_compress_ratio(TrunkLayer block) {
-    const uint32_t il = pulsar_layer_source(block).raw();   /* the profile speaks of source layers: its number */
+    const uint32_t il = pulsar_layer_source(block).raw();   /* raw: the profile speaks of source layers: its number */
     if (il < 2) return 0;   /* both profiles: the first two layers are window-only */
     switch (g_pulsar_shape.variant) {
     case PULSAR_VARIANT_V4:
@@ -269,8 +269,8 @@ bool pulsar_attn_layout_install(const uint32_t *ratios_raw,
             return false;
         }
         a->ratio = ratios[il];
-        a->kv_source = TrunkLayer{latest_source(il.raw(), kv_sources, n_kv)};   /* PULSAR_NO_LAYER enters as none() */
-        a->index_source = TrunkLayer{latest_source(il.raw(), index_sources, n_index)};
+        a->kv_source = TrunkLayer{latest_source(il.raw(), kv_sources, n_kv)};   /* raw: PULSAR_NO_LAYER enters as none() */
+        a->index_source = TrunkLayer{latest_source(il.raw(), index_sources, n_index)};   /* raw: latest_source works on raw layer numbers; PULSAR_NO_LAYER enters as none() */
         const bool is_kv = a->kv_source == il;
         const bool is_index = a->index_source == il;
 
@@ -316,19 +316,19 @@ bool pulsar_attn_layout_install(const uint32_t *ratios_raw,
             pulsar_load_refuse();
             return false;
         }
-        a->candidate_source = candidate_source >= 0 && (uint32_t)candidate_source == il.raw();
-        a->uses_candidates = is_index && candidate_source >= 0 && (uint32_t)candidate_source < il.raw();
+        a->candidate_source = candidate_source >= 0 && (uint32_t)candidate_source == il.raw();   /* raw: into the bare field candidate_source */
+        a->uses_candidates = is_index && candidate_source >= 0 && (uint32_t)candidate_source < il.raw();   /* raw: into the bare field uses_candidates */
         if (g_layer_subset) {
             /* A fixture block reads what its SOURCE layer reads in the full model, or it is refused: the latest
              * kept source at or below it is a different cache when the real one was dropped. */
             const pulsar_shape *f = &g_source_profile;
-            const uint32_t s = pulsar_layer_source(il).raw();   /* the block's source layer, in the full profile's numbers */
+            const uint32_t s = pulsar_layer_source(il).raw();   /* raw: the block's source layer, in the full profile's numbers */
             const uint32_t want_kv = latest_source(s, f->kv_source_layer, f->n_kv_source);
             const uint32_t want_ix = latest_source(s, f->index_source_layer, f->n_index_source);
             const bool want_cand = s == want_ix && f->candidate_source_layer >= 0 &&
                                    (uint32_t)f->candidate_source_layer < s;
-            const char *dropped = pulsar_layer_source(a->kv_source).raw() != want_kv ? "kv source"
-                                : pulsar_attn_reads_index(a->mode) && pulsar_layer_source(a->index_source).raw() != want_ix
+            const char *dropped = pulsar_layer_source(a->kv_source).raw() != want_kv ? "kv source"   /* raw: a bare local for the arithmetic below */
+                                : pulsar_attn_reads_index(a->mode) && pulsar_layer_source(a->index_source).raw() != want_ix   /* raw: a bare operand */
                                       ? "index source"
                                 : want_cand && !a->uses_candidates ? "candidate source" : NULL;
             if (dropped) {

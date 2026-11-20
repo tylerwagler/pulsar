@@ -304,7 +304,7 @@ static void append_model_json(buf *b, const server *s, const char *id) {
     append_model_json_values(b,
                              id,
                              server_served_model_name(s),
-                             pulsar_session_ctx(s->sess).raw(),
+                             pulsar_session_ctx(s->sess).raw(),   /* raw: into append_model_json_values()'s bare parameter */
                              s->default_tokens);
 }
 
@@ -414,14 +414,14 @@ bool server::send_health(int fd) {
     double kv = 0.0; /* max KV utilization across provisioned slots */
     pthread_mutex_lock(&s->mu);
     draining = s->stopping;
-    n_slots  = s->n_slots.raw();   /* the provisioned slots' high-water, as reported */
+    n_slots  = s->n_slots.raw();   /* raw: the provisioned slots' high-water, as reported */
     /* The pool the run was sized for, not the number of banks provisioned so
      * far. Banks 1..pool_banks-1 are provisioned lazily as conversations
      * arrive, so `total` ramps from 1 while this does not move — and a reader
      * that wants to reserve space for the pool (pulsar-gui draws one row per
      * slot) needs the number that will not change under it. Classic mode is a
      * pool of one. */
-    capacity = s->pool_banks.any() ? s->pool_banks.raw() : 1;
+    capacity = s->pool_banks.any() ? s->pool_banks.raw() : 1;   /* raw: into a bare variable */
     running  = s->n_generating;
     waiting  = s->n_queued;
     started_sec = s->started_sec;
@@ -650,9 +650,9 @@ bool server::send_metrics(int fd) {
     const unsigned long long restore_failures = (unsigned long long)s->m_restore_failures;
     const unsigned long long restore_slices = (unsigned long long)s->m_restore_slices;    /* L330 */
     const double restore_stall_max_s = pulsar_sec_of_ms((double)s->m_restore_stall_max_ms);
-    const unsigned long long kv_touched = (unsigned long long)s->m_kv_touched.raw();      /* L328 */
-    const unsigned long long kv_reserved = (unsigned long long)s->m_kv_reserved.raw();
-    const unsigned long long kv_budget_live = (unsigned long long)s->m_kv_budget.raw();   /* 2026-10-29 */
+    const unsigned long long kv_touched = (unsigned long long)s->m_kv_touched.raw();      /* raw: L328 */
+    const unsigned long long kv_reserved = (unsigned long long)s->m_kv_reserved.raw();   /* raw: a bare local for the arithmetic below */
+    const unsigned long long kv_budget_live = (unsigned long long)s->m_kv_budget.raw();   /* raw: 2026-10-29 */
     const unsigned long long persist_skipped = (unsigned long long)s->m_persist_skipped;
     const unsigned long long persist_no_room = (unsigned long long)s->m_persist_no_room;   /* L347 I3a */
     const unsigned long long spill_no_room = (unsigned long long)s->m_spill_no_room;
@@ -694,15 +694,15 @@ bool server::send_metrics(int fd) {
     const unsigned long long readmissions = (unsigned long long)s->m_readmissions;
     const kv_dup_census dup = s->m_dup;                                              /* L324 */
     const unsigned long long dup_censuses = (unsigned long long)s->m_dup_censuses;
-    const unsigned long long dup_bytes_peak = (unsigned long long)s->m_dup_bytes_peak.raw();
+    const unsigned long long dup_bytes_peak = (unsigned long long)s->m_dup_bytes_peak.raw();   /* raw: a bare local for the arithmetic below */
     unsigned long long prefix_waits[PREFIX_WAIT_OUTCOMES];                          /* L329 (a) */
     for (int i = 0; i < PREFIX_WAIT_OUTCOMES; i++) prefix_waits[i] = (unsigned long long)s->m_prefix_waits[i];
     const unsigned long long prefix_wait_gain = (unsigned long long)s->m_prefix_wait_gain;
     uint64_t refusals[PROVISION_REFUSAL_COUNT];
     for (int i = 0; i < PROVISION_REFUSAL_COUNT; i++) refusals[i] = s->m_refusals[i];
     const int block_reason = s->m_queue_block_reason;
-    const unsigned long long ledger_committed = (unsigned long long)s->kv_committed_bytes.raw();
-    const unsigned long long ledger_budget = (unsigned long long)s->kv_budget_bytes.raw();
+    const unsigned long long ledger_committed = (unsigned long long)s->kv_committed_bytes.raw();   /* raw: a bare local for the arithmetic below */
+    const unsigned long long ledger_budget = (unsigned long long)s->kv_budget_bytes.raw();   /* raw: a bare local for the arithmetic below */
     const unsigned long long gen_tokens = (unsigned long long)s->m_gen_tokens;
     const unsigned long long prefill_chunk_tokens =
         (unsigned long long)s->m_prefill_chunk_tokens;
@@ -1421,7 +1421,7 @@ bool server::send_metrics(int fd) {
         static uint64_t base_census = 0;
         static bool base_set = false;
         const HostBytes avail = pulsar_mem_available();   /* L442: the one reading */
-        const uint64_t census = pulsar_gpu_tensor_alloc_bytes_current().raw();
+        const uint64_t census = pulsar_gpu_tensor_alloc_bytes_current().raw();   /* raw: a bare local for the arithmetic below */
         if (!base_set && server_uptime_sec(s->started_sec, pulsar_mono_sec()) >= 60 &&
             avail > HostBytes{}) {
             base_avail = avail;
@@ -1430,7 +1430,7 @@ bool server::send_metrics(int fd) {
         }
         if (base_set && avail > HostBytes{}) {
             const long long box_delta =
-                (long long)base_avail.raw() - (long long)avail.raw();
+                (long long)base_avail.raw() - (long long)avail.raw();   /* raw: a bare operand */
             const long long census_delta =
                 (long long)census - (long long)base_census;
             buf_puts(&b, "# HELP pulsar:mem_reconcile_residual_bytes Box consumption since baseline minus census-explained bytes (signed; page-cache drift included).\n");
@@ -1782,7 +1782,7 @@ void *client_main(void *arg) {
     TokCount ctx_size;
     ctx_size = pulsar_session_ctx(s->sess);
     if (request_exceeds_context(&req, ctx_size)) {
-        http_error_context_length_exceeded(fd, &req, request_prompt_toks(&req).raw(), ctx_size.raw());
+        http_error_context_length_exceeded(fd, &req, request_prompt_toks(&req).raw(), ctx_size.raw());   /* raw: into http_error_context_length_exceeded()'s bare parameter */
         request_free(&req);
         goto done;
     }

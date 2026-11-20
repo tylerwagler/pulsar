@@ -160,7 +160,7 @@ int pulsar_prefill_walk_run(const pulsar_prefill_walk *w, TokPos start_at, TokPo
 static uint64_t read_ahead_hash(const TokId *v, uint32_t from, uint32_t to) {
     uint64_t h = 1469598103934665603ull;
     for (uint32_t i = from >= 2u ? from - 2u : 0u; i < to; i++) {
-        h ^= (uint32_t)v[i].raw();
+        h ^= (uint32_t)v[i].raw();   /* raw: a bare operand */
         h *= 1099511628211ull;
     }
     return h ^ ((uint64_t)from << 32) ^ to;
