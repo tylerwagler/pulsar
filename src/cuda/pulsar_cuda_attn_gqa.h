@@ -276,9 +276,10 @@ typedef struct {
 } pulsar_gqa_call;
 
 /** L446: an instrument's forced prompt arm for a layer the Turing f16 arm serves (head 512, FULL, BF16 rows, a build
- *  that widens): 0 the launch's pick (the f16 arm), 1 the MMA tile (gqa_attn_wide_kernel), 2 the f16 arm.  The
+ *  that widens): 0 the launch's pick (B when G = 8, else A), 1 the MMA tile (gqa_attn_wide_kernel), 2 the f16 arm (A), 3 the
+ *  Turing global-layer kernel (B).  The
  *  engine never calls it.
- *  @param arm 0, 1 or 2
+ *  @param arm 0 .. 3
  *  @return 0, -1 out of range */
 int pulsar_gqa_prompt_arm_force(int arm);
 

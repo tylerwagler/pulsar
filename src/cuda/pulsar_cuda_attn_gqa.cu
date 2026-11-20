@@ -1761,6 +1761,185 @@ __global__ void __launch_bounds__(256) gqa_f16_out_kernel(const __half2 *o16, ui
     }
 }
 
+/* ---- L446 B: the Turing global-layer prompt kernel (head 512, G = 8) ----------------------------------------------
+ * A CTA is one plan tile (up to 8 consecutive positions of one sequence; 64 / G with G = 8) x one KV head: 64 MMA rows
+ * (position, query head), 256 threads.  Warp w: row group rg = w / 2 (positions 2 rg, 2 rg + 1: MMA rows 0..7 and 8..15,
+ * the lane's two rows the SAME head lane / 4 at consecutive positions) and dimension half dh = w % 2 (dims 256 dh ..).
+ *   registers   the warp's q (16 rows x 256 dims, f16 A fragments: 64 regs) and its output (16 rows x 256 dims f32:
+ *               128 regs) -- the whole head's output stays in the CTA, so S is computed ONCE (the MMA tile's 4 passes
+ *               and CUTLASS's f32 round trip through global memory are both gone)
+ *   S = q k^T   each warp of a pair takes its 256 dims; the pair sums the halves through shared memory in a fixed
+ *               order (half 0 + half 1), so both hold the same S bits
+ *   keys        absolute 8-key blocks from position 0, double-buffered in shared memory (K and V widened to f16 with
+ *               gqa_opc: the MMA tile's bits and its O59 check); a row walks blocks in order, and a block past its
+ *               position is an exact no-op (rescale exactly 1, P exactly 0) -- a row's bytes are a function of its
+ *               position and data alone, whatever its tile or call
+ *   P V         P as ONE f16 operand (m16n8k8), the output f32; y = O / l rounded once to bf16. */
+constexpr uint32_t GQA_T75_KB = 8u;                 /* keys a block */
+constexpr uint32_t GQA_T75_P = 512u + 8u;           /* f16 smem pitch: 1040 B rows, conflict-free ldmatrix */
+
+/// m16n8k8 f16 MMA, f32 accumulate: d += a b.
+__device__ __forceinline__ void t75_mma(float (&d)[4], uint32_t a0, uint32_t a1, uint32_t b0) {
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a0), "r"(a1), "r"(b0));
+}
+
+/// The prompt rows of one tile x KV head (see above).  Grid (n_tiles, n_kv), 256 threads.
+/// @param a the attention arguments (rows, tiles, q, fresh, out, tap, scale, n_q, n_kv, token_bytes, the flag).
+__global__ void __launch_bounds__(256, 1) gqa_attn_t75_kernel(const gqa_args a) {
+    constexpr int HD = 512, G = 8, KB = (int)GQA_T75_KB, P = (int)GQA_T75_P;
+    __shared__ __align__(16) __half ks[2][KB][P];
+    __shared__ __align__(16) __half vs[2][KB][P];
+    __shared__ float sx[8][32][4];
+    const uint32_t tid = threadIdx.x, lane = tid & 31u, w = tid >> 5, rg = w >> 1, dh = w & 1u;
+    const uint32_t g = blockIdx.y;
+    const gqa_tile T = a.tiles[blockIdx.x];
+    const gqa_row R0 = a.rows[T.row0];
+    const uint32_t p_first = R0.pos, p_tile_last = R0.pos + T.n - 1u;
+    /* the lane's two rows: positions 2 rg (MMA row lane / 4) and 2 rg + 1 (row lane / 4 + 8), head g * G + lane / 4 */
+    const uint32_t jh = lane >> 2, q4 = lane & 3u;
+    const uint32_t ti0 = 2u * rg, ti1 = 2u * rg + 1u;
+    const bool v0 = ti0 < T.n, v1 = ti1 < T.n;
+    const uint32_t pos0 = p_first + ti0, pos1 = p_first + ti1;
+    const uint32_t head = g * G + jh;
+    uint32_t bad = 0u;
+
+    /* q fragments: 32 k8 steps over the warp's 256 dims, a0 row 0 / a1 row 1 */
+    uint32_t qa[32][2];
+    {
+        const uint32_t *q0 = reinterpret_cast<const uint32_t *>(a.q + ((uint64_t)(T.row0 + ti0) * a.n_q + head) * HD + 256u * dh);
+        const uint32_t *q1 = reinterpret_cast<const uint32_t *>(a.q + ((uint64_t)(T.row0 + ti1) * a.n_q + head) * HD + 256u * dh);
+        #pragma unroll
+        for (int s = 0; s < 32; s++) {
+            qa[s][0] = v0 ? gqa_opc(q0[4 * s + q4], bad) : 0u;
+            qa[s][1] = v1 ? gqa_opc(q1[4 * s + q4], bad) : 0u;
+        }
+    }
+    float o[32][4];
+    #pragma unroll
+    for (int n = 0; n < 32; n++) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.f;
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;
+    const float sl2 = a.scale * GQA_LOG2E;
+
+    /* K / V block loader: 8 keys x (K, V) x 64 uint4 = 1024 vectors, 4 a thread */
+    const uint32_t tb = a.token_bytes;
+    auto key_row = [&](uint32_t x) -> const uint8_t * {
+        if (x > R0.p_last) return nullptr;   /* past the call's rows: never attended, zero */
+        return x < R0.p0 ? R0.cache + (uint64_t)x * tb : a.fresh + (uint64_t)(R0.fresh0 + x - R0.p0) * tb;
+    };
+    uint4 pre[4];
+    auto fetch = [&](uint32_t blk) {
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const uint32_t idx = tid + 256u * i, kv = idx >> 9, key = (idx >> 6) & 7u, e = idx & 63u;
+            const uint8_t *row = key_row(blk * KB + key);
+            pre[i] = row ? reinterpret_cast<const uint4 *>(row + ((uint64_t)(kv ? a.n_kv + g : g) * HD) * 2u)[e]
+                         : make_uint4(0u, 0u, 0u, 0u);
+        }
+    };
+    auto stash = [&](uint32_t buf) {
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const uint32_t idx = tid + 256u * i, kv = idx >> 9, key = (idx >> 6) & 7u, e = idx & 63u;
+            __half *dst = kv ? &vs[buf][key][8u * e] : &ks[buf][key][8u * e];
+            *reinterpret_cast<uint4 *>(dst) = gqa_opc4(pre[i], bad);
+        }
+    };
+
+    const uint32_t nb = p_tile_last / KB + 1u;   /* blocks 0 .. the tile's last position's */
+    fetch(0u);
+    stash(0u);
+    __syncthreads();
+    /* ldmatrix lane addresses: matrix i = lane / 8 at dims + 8 i, its row lane % 8 (a key) */
+    const uint32_t lm_key = lane & 7u, lm_mat = lane >> 3;
+    for (uint32_t b = 0; b < nb; b++) {
+        const uint32_t buf = b & 1u;
+        if (b + 1u < nb) fetch(b + 1u);
+        /* ---- partial S over the warp's 256 dims: two accumulators (k steps even / odd), summed once */
+        float sa[4] = {0.f, 0.f, 0.f, 0.f}, sb[4] = {0.f, 0.f, 0.f, 0.f};
+        #pragma unroll
+        for (int s4 = 0; s4 < 8; s4++) {   /* 4 k8 steps an ldmatrix.x4 */
+            uint32_t kb[4];
+            const uint32_t addr = (uint32_t)__cvta_generic_to_shared(&ks[buf][lm_key][256u * dh + 32u * s4 + 8u * lm_mat]);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                         : "=r"(kb[0]), "=r"(kb[1]), "=r"(kb[2]), "=r"(kb[3]) : "r"(addr));
+            t75_mma(sa, qa[4 * s4 + 0][0], qa[4 * s4 + 0][1], kb[0]);
+            t75_mma(sb, qa[4 * s4 + 1][0], qa[4 * s4 + 1][1], kb[1]);
+            t75_mma(sa, qa[4 * s4 + 2][0], qa[4 * s4 + 2][1], kb[2]);
+            t75_mma(sb, qa[4 * s4 + 3][0], qa[4 * s4 + 3][1], kb[3]);
+        }
+        float sp[4];
+        #pragma unroll
+        for (int e = 0; e < 4; e++) { sp[e] = __fadd_rn(sa[e], sb[e]); sx[w][lane][e] = sp[e]; }
+        asm volatile("bar.sync %0, 64;\n" :: "r"(1u + rg));   /* the pair's halves written */
+        float sc[4];
+        #pragma unroll
+        for (int e = 0; e < 4; e++) {
+            const float other = sx[w ^ 1u][lane][e];
+            sc[e] = dh == 0u ? __fadd_rn(sp[e], other) : __fadd_rn(other, sp[e]);   /* half 0 + half 1, both warps */
+        }
+        /* ---- online softmax (log2 units); keys x = 8 b + 2 q4 + {0, 1}; row 0 at pos0, row 1 at pos1 */
+        const uint32_t x0 = b * KB + 2u * q4;
+        float s00 = (v0 && x0 <= pos0) ? __fmul_rn(sc[0], sl2) : -INFINITY;
+        float s01 = (v0 && x0 + 1u <= pos0) ? __fmul_rn(sc[1], sl2) : -INFINITY;
+        float s10 = (v1 && x0 <= pos1) ? __fmul_rn(sc[2], sl2) : -INFINITY;
+        float s11 = (v1 && x0 + 1u <= pos1) ? __fmul_rn(sc[3], sl2) : -INFINITY;
+        float mx0 = fmaxf(s00, s01), mx1 = fmaxf(s10, s11);
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1)); mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1)); mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
+        const float n0 = fmaxf(m0, mx0), n1 = fmaxf(m1, mx1);
+        /* a block that does not raise the max rescales by exactly 1 (skipped): masked blocks are no-ops */
+        const float c0 = (n0 == m0 || n0 == -INFINITY) ? 1.f : exp2f(m0 - n0);
+        const float c1 = (n1 == m1 || n1 == -INFINITY) ? 1.f : exp2f(m1 - n1);
+        const float p00 = n0 == -INFINITY ? 0.f : exp2f(s00 - n0), p01 = n0 == -INFINITY ? 0.f : exp2f(s01 - n0);
+        const float p10 = n1 == -INFINITY ? 0.f : exp2f(s10 - n1), p11 = n1 == -INFINITY ? 0.f : exp2f(s11 - n1);
+        float r0 = __fadd_rn(p00, p01), r1 = __fadd_rn(p10, p11);
+        r0 = __fadd_rn(r0, __shfl_xor_sync(0xffffffffu, r0, 1)); r0 = __fadd_rn(r0, __shfl_xor_sync(0xffffffffu, r0, 2));
+        r1 = __fadd_rn(r1, __shfl_xor_sync(0xffffffffu, r1, 1)); r1 = __fadd_rn(r1, __shfl_xor_sync(0xffffffffu, r1, 2));
+        l0 = __fadd_rn(__fmul_rn(l0, c0), r0);
+        l1 = __fadd_rn(__fmul_rn(l1, c1), r1);
+        m0 = n0; m1 = n1;
+        if (c0 != 1.f || c1 != 1.f) {
+            #pragma unroll
+            for (int n = 0; n < 32; n++) {
+                o[n][0] = __fmul_rn(o[n][0], c0); o[n][1] = __fmul_rn(o[n][1], c0);
+                o[n][2] = __fmul_rn(o[n][2], c1); o[n][3] = __fmul_rn(o[n][3], c1);
+            }
+        }
+        const __half2 pa0 = __floats2half2_rn(p00, p01), pa1 = __floats2half2_rn(p10, p11);
+        const uint32_t A0 = *reinterpret_cast<const uint32_t *>(&pa0), A1 = *reinterpret_cast<const uint32_t *>(&pa1);
+        /* ---- O[256 dims] += P V: 32 n-tiles, 4 an ldmatrix.x4.trans */
+        #pragma unroll
+        for (int n4 = 0; n4 < 8; n4++) {
+            uint32_t vb[4];
+            const uint32_t addr = (uint32_t)__cvta_generic_to_shared(&vs[buf][lm_key][256u * dh + 32u * n4 + 8u * lm_mat]);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                         : "=r"(vb[0]), "=r"(vb[1]), "=r"(vb[2]), "=r"(vb[3]) : "r"(addr));
+            #pragma unroll
+            for (int j = 0; j < 4; j++) t75_mma(o[4 * n4 + j], A0, A1, vb[j]);
+        }
+        if (b + 1u < nb) stash(buf ^ 1u);
+        __syncthreads();
+    }
+    if (bad) atomicCAS(a.nf, 0u, a.nf_code);
+    /* ---- y = O / l -> bf16 (one rounding); the tap in f32 */
+    #pragma unroll
+    for (int r = 0; r < 2; r++) {
+        if (!(r ? v1 : v0)) continue;
+        const float inv_l = r ? l1 : l0;
+        const uint64_t row = T.row0 + (r ? ti1 : ti0);
+        __nv_bfloat16 *dst = a.out + row * a.ld_out + (uint64_t)head * HD + 256u * dh + 2u * q4;
+        float *tp = a.tap ? a.tap + row * a.n_q * HD + (uint64_t)head * HD + 256u * dh + 2u * q4 : nullptr;
+        #pragma unroll
+        for (int n = 0; n < 32; n++) {
+            const float y0 = __fdiv_rn(o[n][2 * r], inv_l), y1 = __fdiv_rn(o[n][2 * r + 1], inv_l);
+            *reinterpret_cast<__nv_bfloat162 *>(dst + 8 * n) = __floats2bfloat162_rn(y0, y1);
+            if (tp) *reinterpret_cast<float2 *>(tp + 8 * n) = make_float2(y0, y1);
+        }
+    }
+}
+
 /* ---- workspace geometry: ONE function sizes it and carves it ---------------------- */
 /// The workspace carve (gqa_ws_layout); every region 256-byte aligned.
 struct gqa_ws {
@@ -2213,6 +2392,44 @@ static int gqa_launch_f16(const pulsar_gqa_layer *L, const gqa_prep_args &pa, co
     return 0;
 }
 
+/// L446 B: a planned call's prompt rows on the Turing global-layer kernel (gqa_attn_t75_kernel): the prep (as gqa_launch),
+/// a CTA a (tile, KV head), the commit.  Reads the prepped q and the fresh rows in place: no scratch.
+/// @param L the layer (gqa_f16_arm, G = 8).
+/// @param pa the prep arguments.
+/// @param aa the attention arguments.
+/// @param call the plan.
+/// @param st the stream.
+/// @param ws the workspace carve (rows, tiles, fresh).
+/// @return 0, or -3 on a launch failure.
+static int gqa_launch_t75(const pulsar_gqa_layer *L, const gqa_prep_args &pa, const gqa_args &aa,
+                          const pulsar_gqa_call *call, cudaStream_t st, const gqa_ws &ws) {
+    constexpr uint32_t HD = 512u;
+    const uint32_t n_rows = call->n_rows, jobs = L->n_q + 2u * L->n_kv;
+    static bool announced = false;
+    if (!announced) {
+        announced = true;
+        fprintf(stderr, "pulsar: gqa attention: %uq/%ukv/%u prompt rows on the Turing global-layer kernel (L446 B: S once "
+                        "a CTA, q and the output in registers, 8-key blocks, f32 output rounded once to bf16)\n",
+                L->n_q, L->n_kv, HD);
+    }
+    if (L->rope_inv_freq) {
+        gqa_prep_table_args ta;
+        static_cast<gqa_prep_args &>(ta) = pa;
+        ta.rope_inv = L->rope_inv_freq;
+        gqa_prep_kernel<HD, gqa_prep_table_args><<<dim3(n_rows, (jobs + 7u) / 8u), 256, 0, st>>>(ta);
+    } else {
+        gqa_prep_kernel<HD, gqa_prep_args><<<dim3(n_rows, (jobs + 7u) / 8u), 256, 0, st>>>(pa);
+    }
+    gqa_attn_t75_kernel<<<dim3(call->n_tiles, L->n_kv), 256, 0, st>>>(aa);
+    gqa_commit_kernel<<<n_rows, 128, 0, st>>>(ws.rows, ws.fresh, aa.token_bytes);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        fprintf(stderr, "pulsar: gqa attention (Turing global-layer kernel) launch failed: %s\n", cudaGetErrorString(e));
+        return -3;
+    }
+    return 0;
+}
+
 int pulsar_gqa_launch(const pulsar_gqa_layer *L, const pulsar_gqa_call *call, const void *desc_dev,
                       const pulsar_gqa_io *io, cudaStream_t st) {
     if (!L || !call || !desc_dev || !io || call->n_rows == 0 || call->n_tiles == 0) {
@@ -2320,6 +2537,9 @@ int pulsar_gqa_launch(const pulsar_gqa_layer *L, const pulsar_gqa_call *call, co
      * prompt row's bytes never depend on where its prompt was cut.  A call with more sequence runs than the plan
      * records (none in the served families: Gemma's banks are fewer) takes the MMA tile, said once. */
     if (io->decode_rows == 0 && g_prompt_arm_force != 1 && gqa_f16_arm(L)) {
+        /* L446 B: the purpose-built kernel serves G = 8 (Gemma 4's global layers) unless an instrument forces A */
+        if (G == 8u && g_prompt_arm_force != 2) return gqa_launch_t75(L, pa, aa, call, st, ws);
+        if (g_prompt_arm_force == 3) return gqa_refuse("the Turing prompt kernel (L446 B) forced on a layer whose G is not 8");
         if (call->n_runs > 0) return gqa_launch_f16(L, pa, aa, call, st, ws);
         if (g_prompt_arm_force == 2) return gqa_refuse("the f16 prompt arm forced on a call with too many sequence runs");
         static bool said = false;
@@ -2391,8 +2611,8 @@ int pulsar_gqa_forward(const pulsar_gqa_layer *L, const pulsar_gqa_seq *seqs, ui
 int pulsar_gqa_widens(void) { return gqa_build_widens() ? 1 : 0; }
 
 int pulsar_gqa_prompt_arm_force(int arm) {
-    if (arm < 0 || arm > 2) {
-        fprintf(stderr, "pulsar: gqa prompt arm force: %d is not 0 (the pick), 1 (the MMA tile) or 2 (the f16 arm) -- "
+    if (arm < 0 || arm > 3) {
+        fprintf(stderr, "pulsar: gqa prompt arm force: %d is not 0 (the pick), 1 (the MMA tile), 2 (the f16 arm, A) or 3 (the Turing kernel, B) -- "
                         "refusing\n", arm);
         return -1;
     }
