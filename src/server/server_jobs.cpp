@@ -359,8 +359,11 @@ void server::send_prefill_failure_response(const job *j,
      * is about the client's image context (an image the tower cannot accept, a
      * span that will not fit a chunk) -- a 400, not a server fault.  O34: except the one refusal that is not the
      * image's: the decode budget held by other requests, which the same request passes on a retry. */
-    if (busy) http_error_retry(j->fd, 503, err, HTTP_RETRY_BUSY_S);
-    else http_error(j->fd, j->req.n_images > 0 ? 400 : 500, err);
+    const int code = busy ? 503 : j->req.n_images > 0 ? 400 : 500;
+    /* L252 P5: the Messages surface answers in Anthropic's envelope here too (its SDK keys on "type":"error") */
+    if (j->req.api == API_ANTHROPIC) http_error_anthropic_retry(j->fd, code, err, HTTP_RETRY_BUSY_S);
+    else if (busy) http_error_retry(j->fd, code, err, HTTP_RETRY_BUSY_S);
+    else http_error(j->fd, code, err);
 }
 
 

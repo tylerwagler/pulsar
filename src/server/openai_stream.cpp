@@ -165,10 +165,14 @@ static void anthropic_error_body(buf *b, int code, const char *msg) {
 /// @param msg   the message
 /// @return false when a write failed
 bool http_error_anthropic(int fd, int code, const char *msg) {
+    return http_error_anthropic_retry(fd, code, msg, HTTP_RETRY_GOING_AWAY_S);
+}
+
+bool http_error_anthropic_retry(int fd, int code, const char *msg, int retry_after_s) {
     buf b = {0};
     anthropic_error_body(&b, code, msg);
     const bool retry = code == 429 || code == 503 || code == 529;
-    bool ok = retry ? http_response_retry(fd, code, "application/json", b.ptr, HTTP_RETRY_GOING_AWAY_S)
+    bool ok = retry ? http_response_retry(fd, code, "application/json", b.ptr, retry_after_s)
                     : http_response(fd, code, "application/json", b.ptr);
     buf_free(&b);
     return ok;

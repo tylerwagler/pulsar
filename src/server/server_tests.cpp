@@ -21879,6 +21879,52 @@ static void test_l252_api_key_gate(void) {
     }
 }
 
+/* L252 P5: a prefill refusal before any byte went out answers a /v1/messages request in Anthropic's envelope (it was
+ * OpenAI's): busy = 503 overloaded_error with Retry-After 1 / X-Should-Retry, an image refusal 400
+ * invalid_request_error, another failure 500 api_error.  The OpenAI surfaces keep their shape. */
+static void test_l252_prefill_failure_envelope(void) {
+    const struct {
+        api_style api;
+        bool busy;
+        int n_images;
+        const char *want[3];
+    } cases[] = {
+        { API_ANTHROPIC, true, 0,
+          { "HTTP/1.1 503 ", "Retry-After: 1\r\nX-Should-Retry: true\r\n",
+            "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"why\"}}" } },
+        { API_ANTHROPIC, false, 1,
+          { "HTTP/1.1 400 ", "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"why\"}}",
+            "" } },
+        { API_ANTHROPIC, false, 0,
+          { "HTTP/1.1 500 ", "{\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"why\"}}", "" } },
+        { API_OPENAI, true, 0,
+          { "HTTP/1.1 503 ", "Retry-After: 1\r\n", "{\"error\":{\"message\":\"why\",\"type\":\"invalid_request_error\"}}" } },
+        { API_OPENAI, false, 0, { "HTTP/1.1 500 ", "{\"error\":{\"message\":\"why\"", "" } },
+    };
+    for (const auto &c : cases) {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        server s;
+        memset(&s, 0, sizeof s);
+        job j;
+        memset(&j, 0, sizeof j);
+        j.fd = sv[0];
+        j.req.api = c.api;
+        j.req.n_images = c.n_images;
+        s.send_prefill_failure_response(&j, NULL, "ctx", "", "why", c.busy);
+        shutdown(sv[0], SHUT_WR);
+        char *text = read_socket_text(sv[1]);
+        TEST_ASSERT(text != NULL);
+        if (text)
+            for (const char *w : c.want)
+                if (w[0]) TEST_ASSERT(strstr(text, w) != NULL);
+        if (text && c.api == API_ANTHROPIC) TEST_ASSERT(!strstr(text, "{\"error\":{\"message\""));
+        free(text);
+        close(sv[0]);
+        close(sv[1]);
+    }
+}
+
 /* (2) read-only writes nothing, for every trigger -- but its pinned anchor -- and its BANK's history writes nothing at
  * a later loss (evict, spill, abandon, shutdown: the slot's mark, kv_cache_persist) until a request without the token
  * takes the bank; a spill of it may free the bank (nothing to keep).  pin-anchor alone writes as without it, its
@@ -24636,6 +24682,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l252_api_key_file();
     test_l252_api_key_headers();
     test_l252_api_key_gate();
+    test_l252_prefill_failure_envelope();
     test_l347_i3b_read_only_writes_nothing();
     test_l347_i3b_pinned_anchor();
     test_l347_i3b_pinned_ram();

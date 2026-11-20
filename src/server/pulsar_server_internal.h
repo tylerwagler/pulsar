@@ -6029,6 +6029,14 @@ bool http_response_retry(int fd, int code, const char *type, const char *body,
                          int retry_after_s);
 bool http_error_retry(int fd, int code, const char *msg, int retry_after_s);
 bool http_error_anthropic(int fd, int code, const char *msg);
+/** L252 P5: http_error_anthropic with the Retry-After a capacity refusal (429 / 503 / 529) carries named by the
+ *  caller (HTTP_RETRY_BUSY_S for a request that passes once other decodes finish).
+ *  @param fd             the client socket
+ *  @param code           the HTTP status
+ *  @param msg            the message
+ *  @param retry_after_s  the Retry-After value, whole seconds (sent only on 429 / 503 / 529)
+ *  @return false when a write failed */
+bool http_error_anthropic_retry(int fd, int code, const char *msg, int retry_after_s);
 /** L252 P3: a 401 for a missing or wrong API key, with `WWW-Authenticate: Bearer`: Anthropic's envelope
  *  (authentication_error) or OpenAI's (type authentication_error, code invalid_api_key).
  *  @param fd        the client socket
